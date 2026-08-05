@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jModGuard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="login-view" class="hidden">
+    <div class="login-card">
+      <h1>jModGuard</h1>
+      <p>Discord moderation bot control panel</p>
+      <a class="btn primary" href="/login">Login with Discord</a>
+    </div>
+  </div>
+
+  <div id="main-view" class="hidden">
+    <header>
+      <div class="brand"><span class="logo">&#128737;</span> jModGuard</div>
+      <div class="header-right">
+        <select id="guild-select" title="Select server"></select>
+        <span id="user-chip"></span>
+        <button id="logout-btn" class="btn small">Logout</button>
+      </div>
+    </header>
+
+    <nav id="tabs">
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="rules">Automod Rules</button>
+      <button data-tab="badwords">Badwords</button>
+      <button data-tab="commands">Commands</button>
+      <button data-tab="templates">Templates</button>
+      <button data-tab="logchannels">Log Channels</button>
+      <button data-tab="members">Members</button>
+      <button data-tab="events">Audit Log</button>
+      <button data-tab="bans">Bans</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+
+    <main id="content"></main>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

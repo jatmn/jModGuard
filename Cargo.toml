@@ -1,0 +1,34 @@
+[package]
+name = "jmodguard"
+version = "0.1.0"
+edition = "2024"
+description = "A data-driven Discord moderation bot: automod, spam protection, multi-server config with global scoping, WebUI."
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+parking_lot = "0.12"
+percent-encoding = "2"
+r2d2 = "0.8"
+r2d2_sqlite = "0.35"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "form"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "cache", "model", "builder", "http", "utils", "chrono", "rustls_backend"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "process"] }
+toml = "1"
+tower-http = { version = "0.7", features = ["cors"] }
+tower-sessions = { version = "0.14", features = ["memory-store"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tower = "0.5.3"

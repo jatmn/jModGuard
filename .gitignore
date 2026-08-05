@@ -1,0 +1,6 @@
+/target
+jmodguard.db
+jmodguard.db-*
+logs/
+config.toml
+jmodguard.secret

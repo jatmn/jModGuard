@@ -1,0 +1,43 @@
+# jModGuard configuration.
+# Copy this file to `config.toml` and fill in your values.
+
+[discord]
+# Bot token from https://discord.com/developers/applications
+# (Bot -> Token -> Reset Token). Also overridable via JMODGUARD_DISCORD_TOKEN.
+token = ""
+
+[db]
+# SQLite database file path (WAL mode is enabled automatically).
+path = "jmodguard.db"
+# Connection pool size. Default 8 is fine for a single server;
+# raise it for very busy servers.
+pool_size = 8
+
+[web]
+# Address the WebUI listens on. Keep 127.0.0.1 unless you have
+# a reverse proxy in front of it.
+bind = "127.0.0.1:8080"
+# Public URL used for the OAuth redirect (must match the redirect URI
+# configured in the Discord developer portal).
+base_url = "http://localhost:8080"
+# Discord OAuth2 application credentials:
+# https://discord.com/developers/applications -> OAuth2 -> General
+oauth_client_id = ""
+oauth_client_secret = ""
+
+[bot]
+# Default command prefix (can be changed per server via WebUI/!prefix).
+default_prefix = "!"
+# Your Discord user ID (owner). Owner-only commands are gated on this.
+# Enable Developer Mode in Discord, right-click your avatar -> Copy User ID.
+owner_id = 0
+# How many days of raw message content to retain for edit/delete evidence.
+retention_days = 7
+# Presence status text shown under the bot's name.
+status = "moderating"
+
+[log]
+# tracing level: trace | debug | info | warn | error
+level = "info"
+# Directory for rolling log files (empty = console only).
+directory = "logs"

@@ -1,0 +1,459 @@
+//! Seeded defaults for rules, commands, and event templates.
+//! These are the global (guild_id = 0) fallbacks written on first boot.
+//! Every value here is fully editable at runtime via the WebUI / bot commands.
+
+use crate::types::{
+    ActionDef, Behavior, CommandDef, PlanStep, RuleDef, RULE_IDS,
+};
+use serde_json::json;
+
+pub fn default_rules() -> Vec<RuleDef> {
+    let mut out = Vec::with_capacity(RULE_IDS.len());
+    for id in RULE_IDS {
+        out.push(rule(id));
+    }
+    out
+}
+
+fn rule(id: &str) -> RuleDef {
+    let (name, description, params, actions) = match id {
+        "mention_spam" => (
+            "Mention spam",
+            "Messages pinging @everyone/@here or flooding role/channel mentions.",
+            json!({"window_secs": 10, "max_everyone_mentions": 0, "max_mentions_in_window": 5}),
+            vec![action(1, "ban", "Ping spam (@everyone/@here)", 0, 1)],
+        ),
+        "attachment_flood" => (
+            "Attachment flood",
+            "Many messages with 2+ attachments across multiple channels in a short window (crypto/money scam pattern).",
+            json!({"window_secs": 60, "min_messages": 2, "min_attachments": 2, "min_channels": 2}),
+            vec![action(1, "ban", "Attachment spam (likely scam)", 0, 1)],
+        ),
+        "new_member_url" => (
+            "New-member URL",
+            "A member posts a link or invite within the first minutes after joining.",
+            json!({"grace_secs": 120}),
+            vec![action(1, "kick", "Posted a link right after joining", 0, 0)],
+        ),
+        "badword" => (
+            "Badwords",
+            "Admin-defined regex patterns matched against normalized text (bypass-resistant).",
+            json!({}),
+            vec![
+                action(1, "delete", "Banned word", 0, 0),
+                action(2, "warn", "Repeated banned words", 0, 0),
+                action(4, "timeout", "Repeated banned words", 60, 0),
+            ],
+        ),
+        "invite" => (
+            "Invite links",
+            "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).",
+            json!({"allowlist_guilds": []}),
+            vec![
+                action(1, "delete", "Invite link", 0, 0),
+                action(2, "warn", "Repeated invite links", 0, 0),
+                action(4, "timeout", "Repeated invite links", 60, 0),
+            ],
+        ),
+        "velocity" => (
+            "Message velocity",
+            "Too many messages in a short window.",
+            json!({"window_secs": 10, "max_messages": 8}),
+            vec![
+                action(1, "delete", "Message velocity", 0, 0),
+                action(2, "timeout", "Message velocity", 30, 0),
+                action(4, "kick", "Message velocity", 0, 0),
+            ],
+        ),
+        "account_age" => (
+            "Account age",
+            "Accounts younger than the allowed minimum age (report-only by default).",
+            json!({"min_age_days": 3}),
+            vec![action(1, "log", "Account younger than the configured minimum age", 0, 0)],
+        ),
+        _ => unreachable!(),
+    };
+    RuleDef {
+        name: name.into(),
+        description: description.into(),
+        enabled: true,
+        dry_run: false,
+        params,
+        actions,
+        whitelist_roles: vec![],
+        whitelist_channels: vec![],
+        whitelist_users: vec![],
+    }
+}
+
+fn action(at: u32, action: &str, reason: &str, duration_minutes: u32, delete_days: u8) -> ActionDef {
+    ActionDef {
+        at,
+        action: action.into(),
+        duration_minutes,
+        delete_days,
+        reason: reason.into(),
+    }
+}
+
+#[allow(clippy::vec_init_then_push)]
+pub fn default_commands() -> Vec<CommandDef> {
+    let mut out = Vec::new();
+    out.push(cmd(
+        "ban",
+        "Moderation",
+        "Ban a user from the server.",
+        "!ban <user> [reason]",
+        "mod",
+        Behavior::Ban { default_reason: "Banned by a moderator".into(), delete_days: 0 },
+        "Banned {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "unban",
+        "Moderation",
+        "Unban a user from the server.",
+        "!unban <user> [reason]",
+        "mod",
+        Behavior::Unban { default_reason: "Unbanned".into() },
+        "Unbanned {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "kick",
+        "Moderation",
+        "Kick a user from the server.",
+        "!kick <user> [reason]",
+        "mod",
+        Behavior::Kick { default_reason: "Kicked by a moderator".into() },
+        "Kicked {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "timeout",
+        "Moderation",
+        "Timeout a user (0 minutes removes the timeout).",
+        "!timeout <user> <minutes> [reason]",
+        "mod",
+        Behavior::Timeout { default_minutes: 60 },
+        "Timed out {target} for {minutes} minutes | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "warn",
+        "Moderation",
+        "Warn a user.",
+        "!warn <user> <reason>",
+        "mod",
+        Behavior::Warn { default_reason: "Warning from moderator".into() },
+        "Warned {target} | {reason}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "warns",
+        "Moderation",
+        "List a user's active warnings.",
+        "!warns <user>",
+        "mod",
+        Behavior::Warns,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "warnclear",
+        "Moderation",
+        "Clear all warnings for a user.",
+        "!warnclear <user>",
+        "mod",
+        Behavior::WarnClear,
+        "Cleared all warnings for {target}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "purge",
+        "Moderation",
+        "Delete the last N messages in this channel.",
+        "!purge [count]",
+        "mod",
+        Behavior::Purge { default_count: 50 },
+        "Deleted {count} messages",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "say",
+        "Moderation",
+        "Post a message as the bot (optional #channel).",
+        "!say [#channel] <text>",
+        "mod",
+        Behavior::Say,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "slowmode",
+        "Moderation",
+        "Set slowmode on this channel in seconds.",
+        "!slowmode <seconds>",
+        "mod",
+        Behavior::Slowmode { default_seconds: 5 },
+        "Slowmode set to {seconds}s",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "banlist",
+        "Moderation",
+        "List recent bans tracked by the bot.",
+        "!banlist [limit]",
+        "mod",
+        Behavior::Banlist,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "setname",
+        "Admin",
+        "Set the bot's nickname in this server.",
+        "!setname <name>",
+        "admin",
+        Behavior::Setname,
+        "Bot nickname set to {name}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "prefix",
+        "Admin",
+        "Set this server's command prefix.",
+        "!prefix <prefix>",
+        "admin",
+        Behavior::SetPrefix,
+        "Prefix set to {prefix}",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "template",
+        "Admin",
+        "View or edit log event templates: !template <get|set|list|reset> [event] [text]",
+        "!template <get|set|list|reset> [event] [text]",
+        "admin",
+        Behavior::Template { action: "list".into() },
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "rule",
+        "Admin",
+        "Automod rule controls: !rule <list|toggle|dryrun> [rule]",
+        "!rule <list|toggle|dryrun> [rule]",
+        "admin",
+        Behavior::Rule { action: "list".into() },
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "logchannel",
+        "Admin",
+        "Route log events to channels: !logchannel <list|set|unset> [event] [#channel]",
+        "!logchannel <list|set|unset> [event] [#channel]",
+        "admin",
+        Behavior::Logchannel { action: "list".into() },
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "testregex",
+        "Admin",
+        "Test a regex against a sample (raw and normalized).",
+        "!testregex <pattern> <sample>",
+        "admin",
+        Behavior::Testregex,
+        "",
+        "mod_action",
+        vec![],
+    ));
+    out.push(cmd(
+        "help",
+        "Utility",
+        "List commands and their descriptions.",
+        "!help [command]",
+        "everyone",
+        Behavior::Help,
+        "",
+        "",
+        vec![],
+    ));
+    out.push(cmd(
+        "about",
+        "Utility",
+        "About this bot.",
+        "!about",
+        "everyone",
+        Behavior::About,
+        "",
+        "",
+        vec![],
+    ));
+    out.push(cmd(
+        "stats",
+        "Utility",
+        "Bot statistics.",
+        "!stats",
+        "everyone",
+        Behavior::Stats,
+        "",
+        "",
+        vec![],
+    ));
+
+    for c in &mut out {
+        c.aliases = aliases_for(&c.name);
+    }
+    out
+}
+
+fn aliases_for(name: &str) -> Vec<String> {
+    match name {
+        "ban" => vec!["yeet".into(), "b".into()],
+        "kick" => vec!["k".into()],
+        "timeout" => vec!["mute".into(), "t".into()],
+        "unban" => vec!["ub".into()],
+        "warn" => vec!["w".into()],
+        "purge" => vec!["clear".into(), "p".into()],
+        "say" => vec!["echo".into()],
+        "banlist" => vec!["bans".into()],
+        "help" => vec!["commands".into(), "h".into()],
+        _ => vec![],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd(
+    name: &str,
+    category: &str,
+    description: &str,
+    usage: &str,
+    permission: &str,
+    behavior: Behavior,
+    response: &str,
+    log_event: &str,
+    _roles: Vec<u64>,
+) -> CommandDef {
+    CommandDef {
+        name: name.into(),
+        aliases: vec![],
+        category: category.into(),
+        description: description.into(),
+        usage: usage.into(),
+        enabled: true,
+        permission: permission.into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 0,
+        behavior,
+        response: response.into(),
+        log_event: log_event.into(),
+    }
+}
+
+/// Default event templates (rendered into the configured log channels).
+pub fn default_templates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "member_join",
+            "**:inbox_tray: {user} joined**\nUser: {mention} (`{user_id}`)\nAccount created: {account_created} ({account_age})\nJoined at: {time}",
+        ),
+        (
+            "member_leave",
+            "**:outbox_tray: {user} left**\nUser: {mention} (`{user_id}`)\nWas in server: {duration}\nLeft at: {time}",
+        ),
+        (
+            "member_ban",
+            "**:hammer: {user} banned**\nModerator: {actor}\nReason: {reason}",
+        ),
+        (
+            "member_unban",
+            "**:unlock: {user} unbanned**\nModerator: {actor}\nReason: {reason}",
+        ),
+        (
+            "member_kick",
+            "**:boot: {user} kicked**\nModerator: {actor}\nReason: {reason}",
+        ),
+        (
+            "message_edit",
+            "**:pencil2: Message edited in {channel}**\nAuthor: {mention}\nBefore: {before}\nAfter: {after}",
+        ),
+        (
+            "message_delete",
+            "**:wastebasket: Message deleted in {channel}**\nAuthor: {mention}\nContent: {content}",
+        ),
+        (
+            "message_bulk_delete",
+            "**:wastebasket: {count} messages deleted in {channel}**",
+        ),
+        (
+            "automod",
+            "**:shield: Automod: {rule}**\nUser: {mention}\nAction: {action}\nReason: {reason}\nEvidence: {content}\nChannel: {channel}",
+        ),
+        (
+            "mod_action",
+            "**:judge: {action}**\nUser: {mention}\nModerator: {actor}\nReason: {reason}",
+        ),
+        (
+            "timeout_add",
+            "**:timer: {user} timed out**\nModerator: {actor}\nDuration: {duration}\nReason: {reason}",
+        ),
+        (
+            "timeout_remove",
+            "**:alarm_clock: {user} timeout removed**\nModerator: {actor}",
+        ),
+        (
+            "plan_executed",
+            "**:robot: Custom command `{command}` executed by {actor}**\n{content}",
+        ),
+        ("system", "**:gear: {content}"),
+    ]
+}
+
+/// A sample custom command plan, used to demonstrate the step editor.
+#[allow(dead_code)]
+pub fn sample_plan_command() -> CommandDef {
+    CommandDef {
+        name: "welcome".into(),
+        aliases: vec![],
+        category: "Custom".into(),
+        description: "Greet the user and ping a staff role.".into(),
+        usage: "!welcome".into(),
+        enabled: false,
+        permission: "everyone".into(),
+        roles: vec![],
+        channels: vec![],
+        cooldown_secs: 30,
+        behavior: Behavior::Plan {
+            steps: vec![
+                PlanStep::Reply { template: "Hi {user}, welcome to **{guild}**!".into() },
+                PlanStep::React { emoji: "👋".into() },
+                PlanStep::Log {
+                    event: "plan_executed".into(),
+                    template: "`{actor}` ran `{command}`".into(),
+                },
+            ],
+        },
+        response: String::new(),
+        log_event: String::new(),
+    }
+}

@@ -1,0 +1,216 @@
+# jModGuard Setup Guide
+
+A data-driven Discord moderation bot: automod against spam bots, per-server
+config with global fallback, editable commands/events/templates, and a WebUI.
+
+This guide covers everything from zero to a running bot on **Windows** or
+**Linux**.
+
+---
+
+## 1. Prerequisites
+
+- Rust toolchain (rustup): <https://rustup.rs> — the bot needs Rust 1.74+.
+- A Discord account (the bot owner).
+- Somewhere to run it: any Windows/Linux machine that stays online (VPS,
+  home server, Raspberry Pi class box is fine).
+
+## 2. Create the Discord application
+
+1. Go to <https://discord.com/developers/applications> → **New Application** →
+   give it a name (this becomes the bot's name; you can also set a per-server
+   nickname later via the WebUI/`!setname`).
+2. Left sidebar → **Bot**:
+   - Click **Reset Token** and copy the token. Treat it like a password.
+   - Enable the three **Privileged Gateway Intents** (all are required):
+     - **Presence Intent** (optional — not used, safe to leave off)
+     - **Server Members Intent** — **required** (join/leave tracking)
+     - **Message Content Intent** — **required** (message filtering)
+3. Left sidebar → **OAuth2 → General**:
+   - Copy the **Client ID** and **Client Secret** (needed for the WebUI login).
+4. Left sidebar → **OAuth2 → URL Generator** (or use the invite URL below).
+
+## 3. Invite the bot to your server
+
+Use the **URL Generator** (OAuth2 → URL Generator):
+
+- Scopes: `bot`, `applications.commands`
+- Bot permissions (minimum set; add more if you want `!lockdown`-style power later):
+  - `Kick Members`
+  - `Ban Members`
+  - `Moderate Members` (timeouts)
+  - `Manage Messages` (delete/purge)
+  - `Read Message History`
+  - `View Channels`
+  - `Send Messages` (log events, command responses)
+  - `Manage Roles` (only if you use the `add_role`/`remove_role` plan steps)
+  - `Manage Nicknames` (only for `!setname`)
+
+Open the generated URL in a browser, pick your server, authorize.
+
+> **Note:** Once the bot is in **100+ servers** Discord requires
+> [verification](https://support.discord.com/hc/en-us/articles/360040720412)
+> to keep using the privileged intents. For a handful of your own servers you
+> are fine unverified.
+
+## 4. Add the OAuth redirect URI (for the WebUI login)
+
+Discord OAuth2 → **General** → scroll to **Redirects**:
+
+- Add `http://localhost:8080/oauth/callback` if you run it locally, or
+  `http://YOUR_SERVER_IP_OR_DOMAIN:8080/oauth/callback` for a remote host.
+- It must match `web.base_url` in `config.toml` exactly.
+
+## 5. Build
+
+```bash
+git clone <your-repo-url> jModGuard
+cd jModGuard
+cargo build --release
+```
+
+The binary is at `target/release/jmodguard` (`jmodguard.exe` on Windows).
+There are **no system dependencies** — SQLite is compiled in, TLS is rustls.
+
+## 6. Configure
+
+```bash
+cp config.example.toml config.toml
+```
+
+Edit `config.toml`:
+
+```toml
+[discord]
+token = "PASTE_BOT_TOKEN_HERE"
+
+[web]
+base_url = "http://localhost:8080"          # must match the OAuth redirect
+oauth_client_id = "PASTE_CLIENT_ID"
+oauth_client_secret = "PASTE_CLIENT_SECRET"
+
+[bot]
+owner_id = 123456789012345678               # your Discord user ID
+```
+
+- **Find your user ID**: Discord → Settings → Advanced → enable **Developer
+  Mode**, then right-click your avatar → **Copy User ID**.
+- The bot token can also be set via the environment: `JMODGUARD_DISCORD_TOKEN`.
+
+## 7. Run
+
+```bash
+./jmodguard            # Windows: jmodguard.exe
+```
+
+First boot:
+- creates `jmodguard.db` (SQLite, WAL mode) and applies migrations,
+- seeds default rules, commands, and event templates (all editable later),
+- syncs slash commands into every server it is in,
+- starts the WebUI on `127.0.0.1:8080`.
+
+### Windows (run as a service)
+
+1. **Task Scheduler**: Create Basic Task → Program: path to `jmodguard.exe`,
+   trigger: *At startup*, settings: *Run whether user is logged on or not*.
+2. Or use **NSSM** for a proper service: `nssm install jModGuard
+   C:\path\to\jmodguard.exe`.
+
+### Linux (systemd)
+
+`/etc/systemd/system/jmodguard.service`:
+
+```ini
+[Unit]
+Description=jModGuard Discord bot
+After=network-online.target
+
+[Service]
+User=jmodguard
+WorkingDirectory=/opt/jmodguard
+ExecStart=/opt/jmodguard/jmodguard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now jmodguard
+journalctl -u jmodguard -f    # logs
+```
+
+## 8. Open the WebUI
+
+1. Browse to `http://localhost:8080` (or your remote host).
+2. **Login with Discord** → authorize.
+3. Only servers where you have **Manage Server** permission appear in the
+   dropdown.
+
+> **Security:** the WebUI binds to `127.0.0.1` by default. If you expose it
+> over the internet, put a reverse proxy (nginx/Caddy) in front with HTTPS,
+> and consider setting `web.bind = "0.0.0.0:8080"` behind the proxy.
+
+## 9. Recommended first-time configuration
+
+1. **Tune automod in dry-run first.** Every rule has a dry-run toggle in the
+   WebUI (Automod Rules → Edit → Dry-run). Dry-run logs what *would* happen
+   without acting. Run it a few days, watch the audit log, then switch rules
+   live.
+2. Set up **log channels** (Log Channels tab): at minimum `automod`,
+   `mod_action`, `member_join`, `member_leave`, `message_delete`.
+3. Add your **badwords** (Badwords tab) and test them with the live tester.
+4. Change the prefix / bot nickname if you like (Settings tab).
+5. Point the slash commands at your mods and try `/ban`, `/kick`, `/warn`.
+
+## 10. Updating
+
+```bash
+git pull
+cargo build --release
+# restart the service/binary; the database and config persist
+```
+
+## 11. Troubleshooting
+
+**The bot ignores all commands / nothing happens when I type `!about`**
+
+Work through these in order (each one is logged, so check
+`logs/jmodguard.log.YYYY-MM-DD` first):
+
+1. **Is the bot running at all?** The log file should show
+   `database ready`, `WebUI listening`, and `starting shards` on boot. If the
+   log is empty, the process never started (check the service/working
+   directory — the bot creates `logs/` and `jmodguard.db` in its *current
+   working directory*).
+2. **Privileged intents.** If you see `received messages with empty content...`
+   in the log, the **Server Members** and **Message Content** intents are not
+   enabled in the developer portal (Bot → Privileged Gateway Intents).
+   Enable them and restart. Without Message Content the bot literally cannot
+   see what you type, so every command is ignored silently.
+3. **Stale binary.** The running process may predate your last build —
+   restart it.
+4. **Send Messages permission.** If the log shows command dispatches
+   (`command "about" invoked by …`) but no reply appears, the bot lacks
+   **Send Messages** in that channel (server role/override). Give it the
+   permission and try again.
+5. **Wrong prefix.** A message starting with `!` that is not a known command
+   now gets the reply `Unknown command … Use !help …` — if you see that, your
+   prefix is right and the registry is loaded.
+
+**The log file is full of garbage characters** — older builds wrote ANSI
+color codes. Rebuild with the current code (`.with_ansi(false)`); the lines
+are plain `timestamp LEVEL message`.
+
+**The WebUI audit log is empty** — the bot now writes a `system` "Bot started"
+event into every server's audit log on boot, so the tab should never be empty
+once the bot has started once. No events afterwards means nothing tracked
+happened yet (member joins/leaves, message edits/deletes, automod hits, mod
+actions are what populate it).
+
+**Diagnostics in the log:** with the default `log.level = "info"`, the bot
+logs every command invocation, unknown-prefix attempts, empty-content
+warnings, and per-message debug lines (`jmodguard=debug` is always enabled
+for its own crate). Set `log.level = "debug"` for full tracing.
