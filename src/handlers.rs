@@ -14,7 +14,7 @@ use serenity::model::prelude::{ChannelId, User};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::automod::{execute_pending, MsgCtx};
+use crate::automod::{MsgCtx, execute_pending};
 use crate::commands;
 use crate::db;
 use crate::logging;
@@ -61,7 +61,10 @@ static LAST_EMPTY_WARN: parking_lot::Mutex<Option<std::time::Instant>> =
 fn warn_empty_content_once() {
     let mut last = LAST_EMPTY_WARN.lock();
     let now = std::time::Instant::now();
-    if last.map(|t| now.duration_since(t) > std::time::Duration::from_secs(120)).unwrap_or(true) {
+    if last
+        .map(|t| now.duration_since(t) > std::time::Duration::from_secs(120))
+        .unwrap_or(true)
+    {
         *last = Some(now);
         tracing::warn!(
             "received messages with empty content. If commands/automod do not react, \
@@ -86,7 +89,11 @@ impl EventHandler for Handler {
         );
 
         // Per-shard startup: seed + sync each guild once.
-        if !self.app.slash_synced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .app
+            .slash_synced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             let app = Arc::clone(self.app());
             tokio::spawn(async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
@@ -97,11 +104,14 @@ impl EventHandler for Handler {
                     ctx.cache.current_user().name,
                     guild_ids.len()
                 );
+                let mut failed = false;
                 for gid in guild_ids {
-                    if let Err(e) = db::ensure_guild(&app.db, gid.get() as i64).await {
-                        tracing::warn!("seed guild {gid} failed: {e:#}");
+                    // Joining/ready does not insert guild_settings — inheritance
+                    // from global must remain unblocked until an operator sets
+                    // an intentional override.
+                    if !commands::sync_slash_commands(&app, &ctx, gid).await {
+                        failed = true;
                     }
-                    commands::sync_slash_commands(&app, &ctx, gid).await;
                     let _ = db::insert_event(
                         &app.db,
                         gid.get() as i64,
@@ -114,6 +124,9 @@ impl EventHandler for Handler {
                     )
                     .await;
                 }
+                if failed {
+                    app.retry_slash_registry_version();
+                }
                 tracing::info!("startup slash sync + backfill complete");
             });
         }
@@ -122,18 +135,33 @@ impl EventHandler for Handler {
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
         let app = Arc::clone(self.app());
         let gid = guild.id;
-        let _ = db::ensure_guild(&app.db, gid.get() as i64).await;
-        let _ = commands::sync_slash_commands(&app, &ctx, gid).await;
+        // No guild_settings seed on join — global inheritance stays unblocked.
+        if !commands::sync_slash_commands(&app, &ctx, gid).await {
+            app.retry_slash_registry_version();
+        }
 
         // Apply configured bot nickname for this guild.
         if let Ok(settings) = db::get_settings(&app.db, gid.get() as i64).await
-            && !settings.bot_name.is_empty() {
-                let me = ctx.cache.current_user().id;
-                let name = settings.bot_name.clone();
-                let _ = gid
-                    .edit_member(&ctx.http, me, EditMember::new().nickname(name))
-                    .await;
+            && !settings.bot_name.is_empty()
+        {
+            let me = ctx.cache.current_user().id;
+            let name = settings.bot_name.clone();
+            let guild_id = gid.get();
+            if let Err(e) = crate::discord::with_retries("Discord nickname", guild_id, || {
+                let name = name.clone();
+                async {
+                    gid.edit_member(&ctx.http, me, EditMember::new().nickname(name))
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            {
+                tracing::warn!(
+                    "failed to apply Discord nickname on guild_create (guild={guild_id}): {e}"
+                );
             }
+        }
 
         // Backfill member tracking from cache (bounded batch).
         if !guild.members.is_empty() {
@@ -157,7 +185,13 @@ impl EventHandler for Handler {
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
         app.automod.member_joined(guild_id.get(), uid);
-        let _ = db::member_joined(&app.db, guild_id.get() as i64, uid as i64, &new_member.user.name).await;
+        let _ = db::member_joined(
+            &app.db,
+            guild_id.get() as i64,
+            uid as i64,
+            &new_member.user.name,
+        )
+        .await;
         let _ = db::upsert_user(
             &app.db,
             uid as i64,
@@ -166,7 +200,15 @@ impl EventHandler for Handler {
             None,
         )
         .await;
-        logging::emit_member_event(&app, &ctx, guild_id, "member_join", &new_member.user, BTreeMap::new()).await;
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_join",
+            &new_member.user,
+            BTreeMap::new(),
+        )
+        .await;
     }
 
     async fn guild_member_removal(
@@ -179,13 +221,15 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let _ = db::member_left(&app.db, guild_id.get() as i64, user.id.get() as i64).await;
         let mut extra = BTreeMap::new();
-        if let Ok(Some(row)) = db::member_row(&app.db, guild_id.get() as i64, user.id.get() as i64).await
-            && let (Some(first), Some(last)) = (&row.first_joined_at, &row.last_joined_at) {
-                extra.insert(
-                    "duration".into(),
-                    format!("{first} → {last} ({} joins)", row.join_count),
-                );
-            }
+        if let Ok(Some(row)) =
+            db::member_row(&app.db, guild_id.get() as i64, user.id.get() as i64).await
+            && let (Some(first), Some(last)) = (&row.first_joined_at, &row.last_joined_at)
+        {
+            extra.insert(
+                "duration".into(),
+                format!("{first} → {last} ({} joins)", row.join_count),
+            );
+        }
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra).await;
     }
 
@@ -206,10 +250,16 @@ impl EventHandler for Handler {
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
         let app = Arc::clone(self.app());
-        let _ = db::mark_unbanned(&app.db, guild_id.get() as i64, unbanned_user.id.get() as i64).await;
+        let _ = db::mark_unbanned(
+            &app.db,
+            guild_id.get() as i64,
+            unbanned_user.id.get() as i64,
+        )
+        .await;
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "unbanned".into());
-        logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra).await;
+        logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)
+            .await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -283,7 +333,10 @@ impl EventHandler for Handler {
 
         // automod
         let member: Option<Member> = msg.member.clone().map(|m| Member::from(*m));
-        let member_roles: Vec<u64> = member.as_ref().map(|m| m.roles.iter().map(|r| r.get()).collect()).unwrap_or_default();
+        let member_roles: Vec<u64> = member
+            .as_ref()
+            .map(|m| m.roles.iter().map(|r| r.get()).collect())
+            .unwrap_or_default();
         let joined_secs_ago = app
             .automod
             .member_joined_at(guild_id.get(), msg.author.id.get())
@@ -342,7 +395,9 @@ impl EventHandler for Handler {
         event: MessageUpdateEvent,
     ) {
         let app = Arc::clone(self.app());
-        let Some(guild_id) = event.guild_id else { return };
+        let Some(guild_id) = event.guild_id else {
+            return;
+        };
         let Some(new_content) = new
             .as_ref()
             .map(|m| m.content.clone())
@@ -386,11 +441,18 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let id = deleted_message_id.get() as i64;
-        let content = db::get_message(&app.db, id).await.ok().flatten().map(|(c, _)| c);
+        let content = db::get_message(&app.db, id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(c, _)| c);
         let _ = db::mark_deleted(&app.db, id).await;
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
-        vars.insert("content".into(), truncate_2000(content.as_deref().unwrap_or("*unknown*")));
+        vars.insert(
+            "content".into(),
+            truncate_2000(content.as_deref().unwrap_or("*unknown*")),
+        );
         logging::emit(&app, &ctx, guild_id, "message_delete", vars).await;
         let _ = db::insert_event(
             &app.db,
@@ -444,11 +506,8 @@ impl EventHandler for Handler {
         let old_to = old_if_available.and_then(|o| o.communication_disabled_until);
         let new_to = new.communication_disabled_until;
         if old_to != new_to {
-            let mut vars = templates::user_vars(
-                new.user.id.get(),
-                &new.user.name,
-                new.display_name(),
-            );
+            let mut vars =
+                templates::user_vars(new.user.id.get(), &new.user.name, new.display_name());
             if new_to.is_some() {
                 vars.insert("duration".into(), "timed out".into());
                 vars.insert("reason".into(), "moderation action".into());

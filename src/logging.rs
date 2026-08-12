@@ -1,5 +1,5 @@
 //! Event routing: renders a template for an event type and posts it to the
-//! configured log channel (guild or global scope), plus audit-log recording.
+//! configured guild-scoped log channel, plus audit-log recording.
 
 use serenity::client::Context;
 use serenity::model::id::GuildId;
@@ -10,7 +10,10 @@ use crate::state::AppState;
 use crate::{db, templates};
 
 /// Resolves the log channel for an event type from the cached config.
-fn channel_for(cfg: &crate::state::CachedGuildConfig, event: &str) -> Option<serenity::model::id::ChannelId> {
+fn channel_for(
+    cfg: &crate::state::CachedGuildConfig,
+    event: &str,
+) -> Option<serenity::model::id::ChannelId> {
     cfg.log_channels.get(event).copied()
 }
 
@@ -92,9 +95,8 @@ pub async fn emit_member_event(
     extra: BTreeMap<String, String>,
 ) {
     let account_created = user.created_at();
-    let account_age_days = (chrono::Utc::now().timestamp() - account_created.unix_timestamp())
-        .max(0) as u64
-        / 86400;
+    let account_age_days =
+        (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64 / 86400;
 
     let mut vars = templates::user_vars(
         user.id.get(),

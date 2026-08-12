@@ -10,14 +10,15 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '{'
-            && let Some(end) = chars[i + 1..].iter().position(|&c| c == '}') {
-                let key: String = chars[i + 1..i + 1 + end].iter().collect();
-                if let Some(v) = vars.get(&key) {
-                    out.push_str(v);
-                    i += end + 2;
-                    continue;
-                }
+            && let Some(end) = chars[i + 1..].iter().position(|&c| c == '}')
+        {
+            let key: String = chars[i + 1..i + 1 + end].iter().collect();
+            if let Some(v) = vars.get(&key) {
+                out.push_str(v);
+                i += end + 2;
+                continue;
             }
+        }
         out.push(chars[i]);
         i += 1;
     }
@@ -25,11 +26,7 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
 }
 
 /// Builds the standard variable map for a user.
-pub fn user_vars(
-    user_id: u64,
-    username: &str,
-    display_name: &str,
-) -> BTreeMap<String, String> {
+pub fn user_vars(user_id: u64, username: &str, display_name: &str) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("user".into(), display_name.to_string());
     m.insert("user_id".into(), user_id.to_string());

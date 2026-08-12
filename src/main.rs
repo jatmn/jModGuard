@@ -31,9 +31,24 @@ async fn main() -> Result<()> {
 
     init_tracing(&cfg);
 
-    let db = Db::open(&cfg.db.path, cfg.db.pool_size)
-        .with_context(|| format!("failed to open database {}", cfg.db.path.display()))?;
-    tracing::info!("database ready at {}", cfg.db.path.display());
+    let db = Db::open_with(cfg.db_open_options(true)).with_context(|| {
+        format!(
+            "failed to open database {}",
+            if cfg.db.url.is_empty() {
+                cfg.db.path.display().to_string()
+            } else {
+                cfg.db.url.clone()
+            }
+        )
+    })?;
+    tracing::info!(
+        "database ready at {}",
+        if cfg.db.url.is_empty() {
+            cfg.db.path.display().to_string()
+        } else {
+            cfg.db.url.clone()
+        }
+    );
 
     let app = AppState::new(cfg.clone(), db)?;
 
@@ -51,7 +66,6 @@ async fn main() -> Result<()> {
     });
 
     // --- periodic cleanup ----------------------------------------------------
-    let retention_default = cfg.bot.retention_days;
     {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
@@ -60,13 +74,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 app.automod.prune();
-                let retention = app
-                    .configs
-                    .get(&app.db, 0)
-                    .await
-                    .map(|c| c.settings.retention_days)
-                    .unwrap_or(retention_default);
-                if let Err(e) = db::purge_old_messages(&app.db, retention).await {
+                if let Err(e) = db::purge_old_messages(&app.db).await {
                     tracing::warn!("message retention cleanup failed: {e:#}");
                 }
                 if let Ok(stats) = db::stats(&app.db).await {
@@ -98,6 +106,72 @@ async fn main() -> Result<()> {
         .event_handler(Handler { app: Arc::clone(&app) })
         .await
         .context("failed to create discord client")?;
+
+    // Poll durable versions so WebUI writes are visible without a restart.
+    // Keep slash-command retries per guild: a transient Discord failure must
+    // not leave the whole registry permanently stale.
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&client.http);
+        let cache = Arc::clone(&client.cache);
+        let poll_secs = cfg.bot.config_poll_secs.max(1);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let config_changed = match app.poll_config_version().await {
+                    Ok(true) => {
+                        tracing::info!("config_version changed; guild config cache invalidated");
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(e) => {
+                        tracing::warn!("config_version poll failed: {e:#}");
+                        false
+                    }
+                };
+                match app.pending_slash_registry_version().await {
+                    Ok(Some(remote)) => {
+                        let cached: Vec<u64> =
+                            cache.guilds().into_iter().map(|g| g.get()).collect();
+                        match app.plan_slash_resync(remote, &cached) {
+                            jmodguard::state::SlashResyncPlan::Defer => {
+                                tracing::debug!("slash re-sync deferred: guild cache empty (will retry)");
+                            }
+                            jmodguard::state::SlashResyncPlan::Done => {
+                                app.commit_slash_registry_version(remote);
+                            }
+                            jmodguard::state::SlashResyncPlan::Sync { guilds, invalidate } => {
+                                if invalidate && !config_changed {
+                                    app.invalidate_configs();
+                                }
+                                let mut failed = std::collections::HashSet::new();
+                                for gid in guilds {
+                                    if !jmodguard::commands::sync_slash_commands_http(
+                                        &app,
+                                        &http,
+                                        serenity::model::id::GuildId::new(gid),
+                                    )
+                                    .await
+                                    {
+                                        failed.insert(gid);
+                                    }
+                                }
+                                if app.finish_slash_resync(remote, failed) {
+                                    app.commit_slash_registry_version(remote);
+                                } else {
+                                    tracing::warn!("slash re-sync incomplete; will retry failed guilds");
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("slash_registry_version poll failed: {e:#}"),
+                }
+            }
+        });
+    }
 
     tracing::info!("starting shards");
     client.start().await.context("discord client error")?;

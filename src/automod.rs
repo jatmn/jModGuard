@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::normalize;
 use crate::state::{AppState, CachedGuildConfig};
-use crate::types::{ActionDef, RuleDef, RULE_IDS};
+use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
 
 pub struct AutomodEngine {
@@ -69,7 +69,10 @@ pub struct PendingAction {
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"(?i)(?:https?://|www\.)[^\s<>]+|(?:discord\.gg|discord(?:app)?\.com/invite)/[^\s<>]+").unwrap()
+    Regex::new(
+        r"(?i)(?:https?://|www\.)[^\s<>]+|(?:discord\.gg|discord(?:app)?\.com/invite)/[^\s<>]+",
+    )
+    .unwrap()
 });
 
 static INVITE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -106,12 +109,15 @@ impl AutomodEngine {
         self.state.retain(|_, rules| {
             rules.retain(|_, s| {
                 s.events.retain(|e| now.duration_since(e.at) < keep);
-                s.last_event.map(|t| now.duration_since(t) < keep).unwrap_or(false)
+                s.last_event
+                    .map(|t| now.duration_since(t) < keep)
+                    .unwrap_or(false)
                     || !s.events.is_empty()
             });
             !rules.is_empty()
         });
-        self.member_joins.retain(|_, t| now.duration_since(*t) < Duration::from_secs(24 * 3600));
+        self.member_joins
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(24 * 3600));
         *self.last_prune.lock() = now;
     }
 
@@ -123,11 +129,7 @@ impl AutomodEngine {
     }
 
     /// Evaluates all enabled rules for a message. Returns the pending action
-    pub fn evaluate(
-        &self,
-        cfg: &CachedGuildConfig,
-        ctx: &MsgCtx<'_>,
-    ) -> Option<PendingAction> {
+    pub fn evaluate(&self, cfg: &CachedGuildConfig, ctx: &MsgCtx<'_>) -> Option<PendingAction> {
         let now = Instant::now();
         let normalized = normalize::normalize_lenient(ctx.content);
         let compact = normalize::normalize_compact(ctx.content);
@@ -136,13 +138,18 @@ impl AutomodEngine {
 
         let mut best: Option<PendingAction> = None;
         for rule_id in RULE_IDS {
-            let Some(rule) = cfg.rules.get(rule_id) else { continue };
+            let Some(rule) = cfg.rules.get(rule_id) else {
+                continue;
+            };
             if !rule.enabled {
                 continue;
             }
             if rule.whitelist_users.contains(&ctx.author_id)
                 || rule.whitelist_channels.contains(&ctx.channel_id)
-                || rule.whitelist_roles.iter().any(|r| ctx.member_roles.contains(r))
+                || rule
+                    .whitelist_roles
+                    .iter()
+                    .any(|r| ctx.member_roles.contains(r))
             {
                 continue;
             }
@@ -166,9 +173,10 @@ impl AutomodEngine {
                 }
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
                 "velocity" => self.trigger_velocity(rule, ctx, now),
-                "account_age" => {
-                    ctx.account_age_days.map(|d| d < param_u64(rule, "min_age_days", 3)).unwrap_or(false)
-                }
+                "account_age" => ctx
+                    .account_age_days
+                    .map(|d| d < param_u64(rule, "min_age_days", 3))
+                    .unwrap_or(false),
                 _ => false,
             };
 
@@ -176,10 +184,7 @@ impl AutomodEngine {
                 continue;
             }
 
-            let mut bucket = self
-                .state
-                .entry((ctx.guild_id, ctx.author_id))
-                .or_default();
+            let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
             let state = bucket.entry(rule_id).or_default();
             state.strikes += 1;
             state.last_event = Some(now);
@@ -225,7 +230,11 @@ impl AutomodEngine {
         if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
             for (rid, s) in bucket.iter() {
                 if *rid == "mention_spam" {
-                    total += s.events.iter().filter(|e| now.duration_since(e.at) < window).count();
+                    total += s
+                        .events
+                        .iter()
+                        .filter(|e| now.duration_since(e.at) < window)
+                        .count();
                 }
             }
         }
@@ -282,9 +291,11 @@ impl AutomodEngine {
         if allow.is_empty() {
             return false;
         }
-        INVITE_RE
-            .captures_iter(content)
-            .any(|c| c.get(1).map(|m| allow.iter().any(|a| a == m.as_str())).unwrap_or(false))
+        INVITE_RE.captures_iter(content).any(|c| {
+            c.get(1)
+                .map(|m| allow.iter().any(|a| a == m.as_str()))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -309,7 +320,10 @@ fn is_more_severe(cand: &PendingAction, best: &Option<PendingAction>) -> bool {
 }
 
 fn param_u64(rule: &RuleDef, key: &str, default: u64) -> u64 {
-    rule.params.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
+    rule.params
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -356,7 +370,13 @@ pub async fn execute_pending(
             "action".into(),
             format!("[DRY RUN] would {}: {}", rule.action, rule.reason),
         );
-        v.insert("content".into(), pending.evidence["content"].as_str().unwrap_or("").to_string());
+        v.insert(
+            "content".into(),
+            pending.evidence["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        );
         logging::emit(app, ctx, guild_id, "automod", v).await;
         let _ = db::insert_event(
             &app.db,
@@ -374,10 +394,7 @@ pub async fn execute_pending(
         "log" => {}
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-                let _ = ctx
-                    .http
-                    .delete_message(ch.into(), id.into(), None)
-                    .await;
+                let _ = ctx.http.delete_message(ch.into(), id.into(), None).await;
             }
         }
         "warn" => {
@@ -392,20 +409,29 @@ pub async fn execute_pending(
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
-            if let Some(mut member) = ctx.cache.guild(guild_id).and_then(|g| g.members.get(&target.id).cloned()) {
-                let until = Timestamp::from_unix_timestamp(
-                    chrono::Utc::now().timestamp() + minutes * 60,
-                )
-                .ok();
+            if let Some(mut member) = ctx
+                .cache
+                .guild(guild_id)
+                .and_then(|g| g.members.get(&target.id).cloned())
+            {
+                let until =
+                    Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
+                        .ok();
                 if let Some(until) = until {
-                    let _ = member.disable_communication_until_datetime(&ctx.http, until).await;
+                    let _ = member
+                        .disable_communication_until_datetime(&ctx.http, until)
+                        .await;
                 }
             } else {
                 tracing::warn!("automod timeout: member {} not cached", target.id);
             }
         }
         "kick" => {
-            if let Some(member) = ctx.cache.guild(guild_id).and_then(|g| g.members.get(&target.id).cloned()) {
+            if let Some(member) = ctx
+                .cache
+                .guild(guild_id)
+                .and_then(|g| g.members.get(&target.id).cloned())
+            {
                 let _ = member.kick_with_reason(&ctx.http, &reason).await;
             }
         }
@@ -438,6 +464,12 @@ pub async fn execute_pending(
     .await;
 
     let mut v = vars;
-    v.insert("content".into(), pending.evidence["content"].as_str().unwrap_or("").to_string());
+    v.insert(
+        "content".into(),
+        pending.evidence["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    );
     logging::emit(app, ctx, guild_id, "automod", v).await;
 }

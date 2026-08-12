@@ -60,11 +60,11 @@ with `!logchannel`:
 !logchannel set mod_action #mod-log
 !logchannel set member_join #welcome-log
 !logchannel list
-!logchannel unset automod        # falls back to the global mapping
+!logchannel unset automod        # clears this server's mapping
 ```
 
-A mapping made "global" in the WebUI applies to every server that doesn't
-override it.
+Log-channel mappings are always per-server: Discord channel IDs cannot safely
+be shared as global defaults.
 
 ## Example customizations
 

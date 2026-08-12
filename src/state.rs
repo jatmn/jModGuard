@@ -3,17 +3,48 @@
 
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use regex::Regex;
 use serenity::model::id::ChannelId;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::automod::AutomodEngine;
 use crate::config::Config;
 use crate::db::{self, Db};
 use crate::types::{CommandDef, GuildSettings, RuleDef};
+
+/// In-flight Discord slash re-sync for one durable `slash_registry_version`.
+///
+/// Success is per-guild; remembering only the failures avoids re-POSTing
+/// `set_commands` for every cached guild on every poll (rate-limit feedback)
+/// while still refusing to commit the observed version until nothing remains.
+struct SlashSyncProgress {
+    target: u64,
+    /// `None` = first pass (sync every cached guild). `Some` = retry set.
+    remaining: Option<HashSet<u64>>,
+    /// Config cache already invalidated once for this target.
+    invalidated: bool,
+}
+
+/// Plan for one poll tick of slash re-sync work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashResyncPlan {
+    /// Serenity guild cache is still empty (pre-READY); do not invalidate.
+    Defer,
+    /// Nothing left to sync for this version (all succeeded, or failures left
+    /// the cache). Caller should commit the observed version.
+    Done,
+    /// Attempt `set_commands` for these guild ids. `invalidate` is true on the
+    /// first non-empty attempt for this target (skip if `config_version` already
+    /// cleared the cache this tick).
+    Sync {
+        guilds: Vec<u64>,
+        invalidate: bool,
+    },
+}
 
 pub struct AppState {
     pub db: Db,
@@ -23,9 +54,25 @@ pub struct AppState {
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
     #[allow(dead_code)]
     pub http: reqwest::Client,
+    /// Lazy Discord REST client (bot token). Created on first API use
+    /// (nickname / unban) so the bot process does not allocate unused Http.
+    discord_http_cell: std::sync::OnceLock<Arc<serenity::http::Http>>,
+    /// Cached bot user id after first Discord `/users/@me` (API nickname apply).
+    /// `tokio::sync::OnceCell` so concurrent first callers share one REST fetch.
+    bot_user_id: tokio::sync::OnceCell<serenity::model::id::UserId>,
     pub oauth: OAuthClient,
     pub start: Instant,
     pub slash_synced: AtomicBool,
+    /// Last observed durable `config_version` from the DB.
+    /// Primed at construction from the live DB so the first poll has no
+    /// "unobserved" window where a warm cache can miss a cross-process bump.
+    pub last_config_version: AtomicU64,
+    /// Last observed durable `slash_registry_version` (commands table changes).
+    /// Bot re-syncs Discord slash commands only when this advances — not on
+    /// every generic `config_version` bump (rules/templates/settings/…).
+    pub last_slash_registry_version: AtomicU64,
+    /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
+    slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     /// Per-user OAuth guild-list cache (discord_user_id -> (fetched_at, guilds)).
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -44,6 +91,14 @@ impl AppState {
             redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
             http: http.clone(),
         };
+        // Prime from DB at construction — never leave an "unobserved" sentinel.
+        // Cache population is independent of the poll task; skipping the first
+        // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
+        // that landed before the first successful poll.
+        let primed = db::get_config_version_sync(&db)
+            .context("failed to read config_version while building AppState")?;
+        let primed_slash = db::get_slash_registry_version_sync(&db)
+            .context("failed to read slash_registry_version while building AppState")?;
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
@@ -52,16 +107,158 @@ impl AppState {
             cooldowns: DashMap::new(),
             oauth,
             http,
+            discord_http_cell: std::sync::OnceLock::new(),
+            bot_user_id: tokio::sync::OnceCell::new(),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
+            last_config_version: AtomicU64::new(primed),
+            last_slash_registry_version: AtomicU64::new(primed_slash),
+            slash_sync_progress: Mutex::new(None),
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
         }))
     }
 
+    /// Discord REST client for API-side bot-token calls (lazy).
+    pub fn discord_http(&self) -> &serenity::http::Http {
+        self.discord_http_cell
+            .get_or_init(|| {
+                let token = format!("Bot {}", self.cfg.discord.token);
+                Arc::new(serenity::http::Http::new(&token))
+            })
+            .as_ref()
+    }
+
+    /// Bot's Discord user id (cached after first REST lookup).
+    pub async fn bot_user_id(&self) -> Result<serenity::model::id::UserId> {
+        self.bot_user_id
+            .get_or_try_init(|| async {
+                let me = self
+                    .discord_http()
+                    .get_current_user()
+                    .await
+                    .context("failed to fetch bot user id from Discord")?;
+                Ok::<_, anyhow::Error>(me.id)
+            })
+            .await
+            .copied()
+    }
+
     /// Invalidates the config cache (call after any config write).
     pub fn invalidate_configs(&self) {
         self.configs.invalidate();
+    }
+
+    /// Loads durable `config_version` from the DB. When it differs from the
+    /// last observation (primed at startup), invalidates the guild config cache.
+    /// Returns `true` when a change triggered invalidation.
+    pub async fn poll_config_version(&self) -> Result<bool> {
+        let remote = db::get_config_version(&self.db).await?;
+        let prev = self.last_config_version.swap(remote, Ordering::SeqCst);
+        if prev != remote {
+            self.invalidate_configs();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Loads durable `slash_registry_version`. Returns the remote version when
+    /// it differs from the last **committed** observation (does not advance).
+    ///
+    /// Callers must [`commit_slash_registry_version`] only after Discord slash
+    /// re-sync succeeds. Advancing before sync left failed guilds stale until
+    /// the next command-registry write.
+    pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
+        let remote = db::get_slash_registry_version(&self.db).await?;
+        let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
+        if prev != remote {
+            Ok(Some(remote))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Marks `version` as observed after a successful slash re-sync pass.
+    pub fn commit_slash_registry_version(&self, version: u64) {
+        self.last_slash_registry_version
+            .store(version, Ordering::SeqCst);
+        // Drop any stale retry set for an older target.
+        let mut progress = self.slash_sync_progress.lock();
+        if progress.as_ref().is_some_and(|p| p.target == version) {
+            *progress = None;
+        }
+    }
+
+    /// Make the next poll re-sync the current durable command registry. Used
+    /// after a transient startup/guild-join sync failure, when no write may
+    /// otherwise advance the durable version to trigger another attempt.
+    pub fn retry_slash_registry_version(&self) {
+        self.last_slash_registry_version.store(u64::MAX, Ordering::SeqCst);
+        *self.slash_sync_progress.lock() = None;
+    }
+
+    /// Decide which guilds to `set_commands` for pending registry `remote`.
+    ///
+    /// `cached` is the current serenity guild-id list (owned `u64`s — never hold
+    /// a CacheRef across await). Empty cache → [`SlashResyncPlan::Defer`] without
+    /// invalidating. A new `remote` resets progress so every guild is attempted
+    /// once; later polls only retry the failure set.
+    pub fn plan_slash_resync(&self, remote: u64, cached: &[u64]) -> SlashResyncPlan {
+        let mut guard = self.slash_sync_progress.lock();
+        if guard.as_ref().map(|p| p.target) != Some(remote) {
+            *guard = Some(SlashSyncProgress {
+                target: remote,
+                remaining: None,
+                invalidated: false,
+            });
+        }
+        if cached.is_empty() {
+            return SlashResyncPlan::Defer;
+        }
+        let progress = guard.as_mut().expect("progress set above");
+        let guilds = match &progress.remaining {
+            None => cached.to_vec(),
+            Some(rem) => {
+                let pending: Vec<u64> = cached
+                    .iter()
+                    .copied()
+                    .filter(|g| rem.contains(g))
+                    .collect();
+                if pending.is_empty() {
+                    // Prior failures left the cache — nothing left to retry.
+                    *guard = None;
+                    return SlashResyncPlan::Done;
+                }
+                pending
+            }
+        };
+        let invalidate = !progress.invalidated;
+        if invalidate {
+            progress.invalidated = true;
+        }
+        SlashResyncPlan::Sync {
+            guilds,
+            invalidate,
+        }
+    }
+
+    /// Record guilds that failed `set_commands` for `remote`.
+    /// Returns `true` when the caller should [`commit_slash_registry_version`].
+    pub fn finish_slash_resync(&self, remote: u64, failed: HashSet<u64>) -> bool {
+        let mut guard = self.slash_sync_progress.lock();
+        let Some(progress) = guard.as_mut() else {
+            return failed.is_empty();
+        };
+        if progress.target != remote {
+            return false;
+        }
+        if failed.is_empty() {
+            *guard = None;
+            true
+        } else {
+            progress.remaining = Some(failed);
+            false
+        }
     }
 }
 
@@ -144,7 +341,10 @@ impl DiscordGuild {
         if self.owner {
             return true;
         }
-        self.permissions.as_ref().map(|p| p.as_u64() & MANAGE_GUILD != 0).unwrap_or(false)
+        self.permissions
+            .as_ref()
+            .map(|p| p.as_u64() & MANAGE_GUILD != 0)
+            .unwrap_or(false)
     }
 }
 
@@ -156,10 +356,7 @@ impl OAuthClient {
         );
         format!(
             "https://discord.com/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
-            self.client_id,
-            redirect,
-            "identify%20guilds",
-            state
+            self.client_id, redirect, "identify%20guilds", state
         )
     }
 
@@ -168,7 +365,8 @@ impl OAuthClient {
     }
 
     pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
-        self.token_request("refresh_token", refresh_token, None).await
+        self.token_request("refresh_token", refresh_token, None)
+            .await
     }
 
     async fn token_request(
@@ -186,7 +384,11 @@ impl OAuthClient {
                 ("grant_type", grant_type),
                 ("redirect_uri", self.redirect_uri.as_str()),
                 (
-                    if grant_type == "authorization_code" { "code" } else { "refresh_token" },
+                    if grant_type == "authorization_code" {
+                        "code"
+                    } else {
+                        "refresh_token"
+                    },
                     value,
                 ),
             ])
@@ -219,17 +421,60 @@ impl OAuthClient {
     }
 
     pub async fn my_guilds(&self, access_token: &str) -> Result<Vec<DiscordGuild>> {
-        let resp = self
-            .http
-            .get("https://discord.com/api/users/@me/guilds")
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("discord guilds request failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("discord guilds request failed with {}", resp.status());
+        // Discord paginates at 200 guilds; a single GET silently drops every
+        // server past the first page and deny WebUI manage access for them.
+        const PAGE_LIMIT: usize = 200;
+        let mut all = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "https://discord.com/api/users/@me/guilds?limit={PAGE_LIMIT}"
+            );
+            if let Some(ref cursor) = after {
+                url.push_str("&after=");
+                url.push_str(cursor);
+            }
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(access_token)
+                .send()
+                .await
+                .context("discord guilds request failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("discord guilds request failed with {}", resp.status());
+            }
+            let page: Vec<DiscordGuild> = resp
+                .json()
+                .await
+                .context("invalid discord guilds response")?;
+            match next_guilds_after_cursor(&page, PAGE_LIMIT) {
+                Some(next) => {
+                    all.extend(page);
+                    after = Some(next);
+                }
+                None => {
+                    all.extend(page);
+                    break;
+                }
+            }
         }
-        resp.json().await.context("invalid discord guilds response")
+        Ok(all)
+    }
+}
+
+/// Cursor for the next Discord `/users/@me/guilds` page, or `None` when the
+/// current page is the last (`len < page_limit`, including empty).
+///
+/// Extracted so pagination termination is unit-tested without HTTP.
+pub(crate) fn next_guilds_after_cursor(
+    page: &[DiscordGuild],
+    page_limit: usize,
+) -> Option<String> {
+    if page.len() < page_limit {
+        None
+    } else {
+        page.last().map(|g| g.id.clone())
     }
 }
 
@@ -252,7 +497,9 @@ impl CachedGuildConfig {
     fn from_parts(version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
         for pattern in &parts.badwords {
-            match Regex::new(pattern) {
+            // Same compile limits as WebUI / add_badword — legacy DB rows that
+            // exceed the budget are skipped so cache load cannot DoS the bot.
+            match crate::normalize::compile_user_regex(pattern) {
                 Ok(re) => regexes.push(re),
                 Err(e) => {
                     tracing::warn!("badword pattern `{pattern}` failed to compile: {e}");
@@ -296,7 +543,8 @@ impl Default for ConfigCache {
 }
 
 impl ConfigCache {
-    pub fn new() -> Self {        Self {
+    pub fn new() -> Self {
+        Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
@@ -311,10 +559,10 @@ impl ConfigCache {
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
         if let Some(entry) = self.map.get(&(guild_id as i64))
             && entry.version == self.version.load(Ordering::Relaxed)
-                && entry.loaded_at.elapsed() < self.ttl
-            {
-                return Ok(Arc::clone(&entry));
-            }
+            && entry.loaded_at.elapsed() < self.ttl
+        {
+            return Ok(Arc::clone(&entry));
+        }
         let version = self.version.load(Ordering::Relaxed);
         let parts = db::load_config_parts(db, guild_id as i64).await?;
         let cfg = Arc::new(CachedGuildConfig::from_parts(version, parts));
@@ -326,13 +574,279 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::db::{self, Db, DbOpenOptions};
+    use crate::types::GuildSettings;
+
+    fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn poll_config_version_invalidates_after_cross_process_write() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_poll_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bot_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let api_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        // Already primed at construction — unchanged version must not invalidate.
+        assert!(!tokio_test_block_on(bot.poll_config_version()).unwrap());
+        tokio_test_block_on(db::upsert_settings(
+            &api_db,
+            7,
+            &GuildSettings::default(),
+        ))
+        .unwrap();
+        assert!(tokio_test_block_on(bot.poll_config_version()).unwrap());
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn poll_invalidates_warm_cache_even_before_first_poll() {
+        // Regression: old u64::MAX "first observation" skip left a warm cache
+        // stale when a cross-process write landed before the first successful poll.
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_poll_warm_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bot_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let api_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let guild_id = 99u64;
+
+        // Warm cache with default prefix — no poll yet.
+        let before = tokio_test_block_on(bot.configs.get(&bot.db, guild_id)).unwrap();
+        assert_eq!(before.settings.prefix, "!");
+
+        let mut settings = GuildSettings::default();
+        settings.prefix = "!api-wrote".into();
+        tokio_test_block_on(db::upsert_settings(&api_db, guild_id as i64, &settings)).unwrap();
+
+        // First poll after a write must invalidate (primed baseline ≠ remote).
+        assert!(tokio_test_block_on(bot.poll_config_version()).unwrap());
+        let after = tokio_test_block_on(bot.configs.get(&bot.db, guild_id)).unwrap();
+        assert_eq!(after.settings.prefix, "!api-wrote");
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn pending_slash_registry_does_not_advance_until_commit() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_slash_pending_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        assert_eq!(
+            tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
+            None
+        );
+        let cmd = crate::defaults::default_commands()
+            .into_iter()
+            .next()
+            .expect("defaults");
+        tokio_test_block_on(db::upsert_command(&app.db, 1, &cmd.name, &cmd)).unwrap();
+        let pending = tokio_test_block_on(app.pending_slash_registry_version())
+            .unwrap()
+            .expect("command write must surface pending slash version");
+        assert_eq!(pending, 1);
+        // Peek again — must still be pending (no auto-advance).
+        assert_eq!(
+            tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
+            Some(1)
+        );
+        app.commit_slash_registry_version(pending);
+        assert_eq!(
+            tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn slash_resync_retries_only_failures_and_defers_empty_cache() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_slash_plan_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        let remote = 7u64;
+
+        assert_eq!(
+            app.plan_slash_resync(remote, &[]),
+            SlashResyncPlan::Defer,
+            "empty cache must not invalidate or sync"
+        );
+
+        match app.plan_slash_resync(remote, &[10, 20, 30]) {
+            SlashResyncPlan::Sync {
+                guilds,
+                invalidate,
+            } => {
+                assert_eq!(guilds, vec![10, 20, 30]);
+                assert!(invalidate, "first non-empty pass invalidates once");
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+        // Second plan before finish — still full set, but no second invalidate.
+        match app.plan_slash_resync(remote, &[10, 20, 30]) {
+            SlashResyncPlan::Sync {
+                guilds,
+                invalidate,
+            } => {
+                assert_eq!(guilds, vec![10, 20, 30]);
+                assert!(!invalidate);
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+
+        assert!(!app.finish_slash_resync(remote, [20u64].into_iter().collect()));
+        match app.plan_slash_resync(remote, &[10, 20, 30]) {
+            SlashResyncPlan::Sync {
+                guilds,
+                invalidate,
+            } => {
+                assert_eq!(guilds, vec![20], "only failures are retried");
+                assert!(!invalidate);
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+
+        // Failed guild left the cache → Done (commit).
+        assert_eq!(
+            app.plan_slash_resync(remote, &[10, 30]),
+            SlashResyncPlan::Done
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn guild_page_cursor_stops_on_short_page() {
+        fn g(id: &str) -> DiscordGuild {
+            DiscordGuild {
+                id: id.into(),
+                name: "n".into(),
+                icon: None,
+                owner: false,
+                permissions: None,
+            }
+        }
+        let full: Vec<_> = (0..200).map(|i| g(&i.to_string())).collect();
+        assert_eq!(
+            next_guilds_after_cursor(&full, 200).as_deref(),
+            Some("199")
+        );
+        let short = vec![g("200"), g("201")];
+        assert_eq!(next_guilds_after_cursor(&short, 200), None);
+        assert_eq!(next_guilds_after_cursor(&[], 200), None);
+
+        // Simulate two-page merge the way my_guilds does.
+        let mut all = Vec::new();
+        let mut after = next_guilds_after_cursor(&full, 200);
+        all.extend(full);
+        assert_eq!(after.as_deref(), Some("199"));
+        let page2 = vec![g("200")];
+        after = next_guilds_after_cursor(&page2, 200);
+        all.extend(page2);
+        assert!(after.is_none());
+        assert_eq!(all.len(), 201);
+        assert_eq!(all.last().unwrap().id, "200");
+    }
 
     #[test]
     fn guild_permissions_accepts_integer_and_string() {
         // Discord actually returns an integer here (docs say string).
-        let g: DiscordGuild =
-            serde_json::from_str(r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#)
-                .unwrap();
+        let g: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#,
+        )
+        .unwrap();
         assert!(g.manage_permission(), "MANAGE_GUILD (32) set");
         let g: DiscordGuild = serde_json::from_str(
             r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":"32"}"#,
@@ -344,9 +858,10 @@ mod tests {
         )
         .unwrap();
         assert!(!g.manage_permission(), "no MANAGE_GUILD");
-        let g: DiscordGuild =
-            serde_json::from_str(r#"{"id":"1","name":"x","icon":null,"owner":true,"permissions":0}"#)
-                .unwrap();
+        let g: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":true,"permissions":0}"#,
+        )
+        .unwrap();
         assert!(g.manage_permission(), "owner bypass");
     }
 }

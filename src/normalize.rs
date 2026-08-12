@@ -32,10 +32,24 @@ fn leetspeak(c: char) -> Option<char> {
 }
 
 fn is_zero_width(c: char) -> bool {
-    matches!(c,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}'
-        | '\u{202A}' | '\u{202B}' | '\u{202C}' | '\u{202D}' | '\u{202E}'
-        | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' | '\u{034F}' | '\u{180E}')
+    matches!(
+        c,
+        '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            | '\u{034F}'
+            | '\u{180E}'
+    )
 }
 
 /// Nonspacing combining marks (Mn category ranges): after NFD decomposition
@@ -94,6 +108,41 @@ pub fn matches_badword(raw: &str, normalized: &str, pattern: &regex::Regex) -> b
         || pattern.is_match(&normalize_compact(raw))
 }
 
+// ---------------------------------------------------------------------------
+// Untrusted / WebUI regex input (ReDoS / resource guards)
+// ---------------------------------------------------------------------------
+
+/// Max length of a user-supplied regex pattern (WebUI tester + badword add).
+pub const USER_REGEX_MAX_PATTERN_BYTES: usize = 512;
+/// Max length of sample text for the live regex tester.
+pub const USER_REGEX_MAX_SAMPLE_BYTES: usize = 4096;
+/// Approximate compiled NFA size cap (bytes) for user patterns.
+const USER_REGEX_SIZE_LIMIT: usize = 100_000;
+/// AST nesting depth cap for user patterns.
+const USER_REGEX_NEST_LIMIT: u32 = 50;
+
+/// Compiles a user-supplied regex with length + compile-size limits.
+///
+/// The `regex` crate matches in linear time, but untrusted patterns can still
+/// exhaust memory/CPU at compile time (counted repetitions, deep nesting).
+/// Call this for WebUI tester and before persisting badword patterns.
+pub fn compile_user_regex(pattern: &str) -> Result<regex::Regex, String> {
+    if pattern.is_empty() {
+        return Err("pattern is empty".into());
+    }
+    if pattern.len() > USER_REGEX_MAX_PATTERN_BYTES {
+        return Err(format!(
+            "pattern too long (max {USER_REGEX_MAX_PATTERN_BYTES} bytes)"
+        ));
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(USER_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(USER_REGEX_SIZE_LIMIT)
+        .nest_limit(USER_REGEX_NEST_LIMIT)
+        .build()
+        .map_err(|e| format!("invalid regex: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +176,35 @@ mod tests {
     #[test]
     fn matches_obfuscated_word() {
         let re = regex::Regex::new(r"scam").unwrap();
-        assert!(matches_badword("s c a m", &normalize_lenient("s c a m"), &re));
+        assert!(matches_badword(
+            "s c a m",
+            &normalize_lenient("s c a m"),
+            &re
+        ));
         assert!(matches_badword("s5c@m", &normalize_lenient("s5c@m"), &re));
+    }
+
+    #[test]
+    fn compile_user_regex_accepts_simple_patterns() {
+        let re = compile_user_regex(r"(?i)scam|pump").unwrap();
+        assert!(re.is_match("Pump and dump"));
+    }
+
+    #[test]
+    fn compile_user_regex_rejects_empty_and_oversized() {
+        assert!(compile_user_regex("").is_err());
+        let huge = "a".repeat(USER_REGEX_MAX_PATTERN_BYTES + 1);
+        let err = compile_user_regex(&huge).unwrap_err();
+        assert!(err.contains("too long"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn compile_user_regex_rejects_pathological_compile() {
+        // Counted repetition expands at compile time past size_limit.
+        let err = compile_user_regex(r"\w{100000}").unwrap_err();
+        assert!(
+            err.contains("invalid regex") || err.contains("size"),
+            "unexpected: {err}"
+        );
     }
 }
