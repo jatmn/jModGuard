@@ -183,8 +183,8 @@ WantedBy=multi-user.target
 ```
 
 `After=jmodguard-bot.service` only waits for the bot **process** to exist, not
-for migrations to finish. The API retries schema-not-ready for about 30 seconds
-so a first-boot race does not crash-loop.
+for bootstrap to finish. The API retries incomplete-bootstrap and transient
+SQLite-lock states for about 30 seconds so a first-boot race does not crash-loop.
 
 ```bash
 sudo systemctl daemon-reload

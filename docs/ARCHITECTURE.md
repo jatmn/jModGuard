@@ -39,10 +39,12 @@ is by design.
 
 ## Migrations
 
-- Bot applies migrations and seeds globals.
-- API opens with `migrate=false`. If the schema or terminal-defaults meta is
-  missing, that is a typed `SchemaNotReady` error: the API retries for about
-  30 seconds, then exits. Other open failures (remote URL, I/O) fail immediately.
+- Bot applies migrations, seeds globals, heals settings, then publishes a
+  bootstrap-complete marker.
+- API opens with `migrate=false`. Until the schema, terminal-defaults meta, and
+  bootstrap-complete marker exist—or while SQLite is transiently locked by bot
+  startup—it retries for about 30 seconds. Other open failures (remote URL,
+  I/O) fail immediately.
 - Always start (or migrate with) the bot before the API on a new or upgraded DB.
 
 ## WebUI auth (summary)

@@ -26,8 +26,8 @@ This release **removes that entrypoint**. You must run two binaries:
    instead of a single `jmodguard.log`.
 5. Fill in Discord OAuth client id/secret. The API process **refuses to start**
    without them; the old monolith could still run Discord without WebUI login.
-6. Start the bot first (it migrates). The API waits about 30 seconds for that
-   schema, then exits if the bot never migrates.
+6. Start the bot first (it migrates and completes default-data bootstrap). The
+   API waits about 30 seconds for that work, then exits if the bot never completes it.
 
 Then continue with backup / rollout below as for any later upgrade.
 
@@ -115,8 +115,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    on open when `guild_settings` checksum is unchanged (backup restores still
    re-run heal when row data differs).
 4. Confirm bot logs show `database ready (migrate=true)` and gateway/shards.
-5. **Start the API** — it opens with `migrate=false` and will fail if the
-   schema is still behind.
+5. **Start the API** — it opens with `migrate=false` and waits for the bot to
+   finish the schema/default-data bootstrap.
 6. Confirm API logs show `API/WebUI listening` and OAuth login still works.
 7. Sanity check: change a setting in the WebUI; within `config_poll_secs` the
    bot should pick it up (prefix, rules, etc.).

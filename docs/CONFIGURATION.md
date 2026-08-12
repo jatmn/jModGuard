@@ -30,7 +30,8 @@ database (everything server-related, editable at runtime).
 All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0003_archive_global_log_channels.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
-an unmigrated DB, then exits).
+the bot to finish bootstrap or release a transient SQLite startup lock, then
+exits).
 
 | Table | Holds |
 |---|---|
