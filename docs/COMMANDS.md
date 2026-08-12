@@ -54,9 +54,10 @@ Extra per-command restrictions: `roles` (must hold one of these role IDs) and
 ## Custom commands (action plans)
 
 The WebUI **Commands → New custom command** editor builds a command whose
-behavior is a **list of steps** executed in order. Plans accept an optional
-first user argument (or slash `user` option). When supplied, it is the target
-for target-capable steps; otherwise those self-service steps use the caller.
+behavior is a **list of steps** executed in order. Plans with target-capable
+steps accept an optional first user argument (or slash `user` option). When
+supplied, it is the target; targeted plans require the command's permission to
+be at least `mod`. Without a target, self-service steps use the caller.
 `timeout`, `kick`, and `ban` require a target.
 
 | Step | Behavior |

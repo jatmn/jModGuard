@@ -34,9 +34,6 @@ struct SlashSyncProgress {
 pub enum SlashResyncPlan {
     /// Serenity guild cache is still empty (pre-READY); do not invalidate.
     Defer,
-    /// Nothing left to sync for this version (all succeeded, or failures left
-    /// the cache). Caller should commit the observed version.
-    Done,
     /// Attempt `set_commands` for these guild ids. `invalidate` is true on the
     /// first non-empty attempt for this target (skip if `config_version` already
     /// cleared the cache this tick).
@@ -220,9 +217,10 @@ impl AppState {
                 let pending: Vec<u64> =
                     cached.iter().copied().filter(|g| rem.contains(g)).collect();
                 if pending.is_empty() {
-                    // Prior failures left the cache — nothing left to retry.
-                    *guard = None;
-                    return SlashResyncPlan::Done;
+                    // A guild can disappear from Serenity's cache while it is
+                    // unavailable or reconnecting. Keep its failed sync owned
+                    // by this durable version until it reappears and succeeds.
+                    return SlashResyncPlan::Defer;
                 }
                 pending
             }
@@ -779,11 +777,19 @@ mod tests {
             other => panic!("expected Sync, got {other:?}"),
         }
 
-        // Failed guild left the cache → Done (commit).
+        // A temporarily unavailable guild must keep the durable version
+        // pending; otherwise its slash registry is never retried on return.
         assert_eq!(
             app.plan_slash_resync(remote, &[10, 30]),
-            SlashResyncPlan::Done
+            SlashResyncPlan::Defer
         );
+        match app.plan_slash_resync(remote, &[10, 20, 30]) {
+            SlashResyncPlan::Sync { guilds, invalidate } => {
+                assert_eq!(guilds, vec![20]);
+                assert!(!invalidate);
+            }
+            other => panic!("expected retry after guild returns, got {other:?}"),
+        }
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));

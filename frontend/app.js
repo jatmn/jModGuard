@@ -811,20 +811,20 @@ function tabSettings() {
     try {
       await api(`/api/guilds/${state.guildId}/settings`, "PUT", { [field]: null });
       await loadConfig();
-      toast(`Using global ${field === "bot_name" ? "nickname" : field.replaceAll("_", " ")}`, "success");
+      toast(`Using global ${field.replaceAll("_", " ")}`, "success");
       renderTab();
     } catch (e) {
       toast(e.message || String(e), "error");
     }
   }
 
-  function settingsField(labelText, input, overrideKey, hint) {
+  function settingsField(labelText, input, overrideKey, hint, allowInheritance = true) {
     const hasOv = ov[overrideKey] != null;
     return el("div", { class: "field" },
       el("label", { text: labelText }),
       input,
       hint ? el("p", { class: "muted", style: "margin:4px 0 0;font-size:12px", text: hint }) : null,
-      hasOv
+      hasOv && allowInheritance
         ? el("button", {
             class: "btn small",
             type: "button",
@@ -850,7 +850,8 @@ function tabSettings() {
           "Bot nickname",
           botName,
           "bot_name",
-          "Empty clears the Discord nickname. Use global inherits the global nickname.",
+          "Empty clears the Discord nickname. Nicknames are configured per server.",
+          false,
         ),
         settingsField(
           "Message retention (days)",
