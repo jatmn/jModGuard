@@ -1,14 +1,15 @@
 # jModGuard configuration.
 # Copy this file to `config.toml` and fill in your values.
 #
-# Run locally with:
-#   cargo run --locked
+# Dual-process local run:
+#   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway
+#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (expects migrated DB)
 
 [discord]
 # Bot token from https://discord.com/developers/applications
 # (Bot -> Token -> Reset Token). Also overridable via JMODGUARD_DISCORD_TOKEN.
-# Required by the bot and WebUI unban (Discord REST).
-# Env: JMODGUARD_DISCORD_TOKEN.
+# Required by jmodguard-bot. Also required by jmodguard-api for WebUI unban
+# (Discord REST). Env: JMODGUARD_DISCORD_TOKEN.
 token = ""
 
 [db]
@@ -24,13 +25,13 @@ token = ""
 pool_size = 8
 
 [web]
-# Address the WebUI listens on. Keep 127.0.0.1 unless you have a reverse proxy
-# in front of it.
+# Address the API/WebUI listens on (jmodguard-api). Keep 127.0.0.1 unless you have
+# a reverse proxy in front of it.
 bind = "127.0.0.1:8080"
 # Public URL used for the OAuth redirect (must match the redirect URI
 # configured in the Discord developer portal).
 base_url = "http://localhost:8080"
-# Discord OAuth2 application credentials for the WebUI.
+# Required by jmodguard-api (Discord OAuth2 application credentials).
 # https://discord.com/developers/applications -> OAuth2 -> General
 # Env: JMODGUARD_OAUTH_CLIENT_ID / JMODGUARD_OAUTH_CLIENT_SECRET.
 oauth_client_id = ""
@@ -56,7 +57,7 @@ owner_id = 0
 retention_days = 7
 # Presence status text shown under the bot's name.
 status = "moderating"
-# How often the bot polls durable config_version for WebUI changes.
+# How often the bot polls durable config_version (cross-process cache invalidation).
 # Env: JMODGUARD_CONFIG_POLL_SECS.
 config_poll_secs = 5
 

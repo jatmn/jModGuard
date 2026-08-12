@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main, bunny]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep artifacts off /tmp when runners are constrained.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  TMPDIR: ${{ github.workspace }}/.tmp
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pin matches rust-toolchain.toml / Dockerfiles (not floating @stable).
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create temp dir
+        run: mkdir -p "$TMPDIR"
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+      - name: cargo clippy --locked --bins -- -D warnings
+        run: cargo clippy --locked --bins -- -D warnings
+
+      - name: cargo clippy slim bot (no web feature)
+        run: cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
+
+      - name: dual-process smoke (no Discord)
+        run: cargo test --locked --test dual_process_smoke -- --nocapture
+
+      - name: bot builds without web feature
+        run: cargo build --locked --bin jmodguard-bot --no-default-features
+
+      - name: api builds with web feature
+        run: cargo build --locked --bin jmodguard-api

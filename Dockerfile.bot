@@ -1,0 +1,16 @@
+# Multi-stage build for jmodguard-bot.
+# Pins Rust 1.96 (lockfile MSRV; edition 2024). Builds without the `web` feature so the
+# Discord binary does not embed the SPA or link axum/tower-sessions.
+FROM rust:1.96-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+RUN cargo build --locked --release --bin jmodguard-bot --no-default-features
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/jmodguard-bot /usr/local/bin/jmodguard-bot
+ENTRYPOINT ["jmodguard-bot"]
