@@ -913,11 +913,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("event", Str, false, "Event type"),
             opt("channel", Channel, false, "Target channel"),
         ],
-        // Plans may contain moderation steps. Keep the target optional so
-        // self-service plans (for example, add-role) and reply-only plans
-        // remain ergonomic, while the executor rejects target-required steps
-        // when it is omitted.
-        Behavior::Plan { .. } => vec![opt("user", User, false, "Target user")],
+        // Only advertise a target when a step can consume it. Otherwise a
+        // reply/log-only plan has no user parameter at all.
+        Behavior::Plan { steps } if crate::commands::plans::plan_accepts_target(steps) => {
+            vec![opt("user", User, false, "Target user")]
+        }
+        Behavior::Plan { .. } => vec![],
         Behavior::Testregex => vec![
             opt("pattern", Str, true, "Regex pattern"),
             opt("sample", Str, true, "Sample text"),
@@ -944,11 +945,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_slash_user_option_is_optional() {
-        let specs = slash_spec(&Behavior::Plan { steps: vec![] });
+    fn target_capable_plan_slash_user_option_is_optional() {
+        let specs = slash_spec(&Behavior::Plan {
+            steps: vec![crate::types::PlanStep::AddRole { role_id: 1 }],
+        });
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "user");
         assert_eq!(specs[0].kind, CommandOptionType::User);
         assert!(!specs[0].required);
+    }
+
+    #[test]
+    fn reply_only_plan_has_no_user_option() {
+        let specs = slash_spec(&Behavior::Plan {
+            steps: vec![crate::types::PlanStep::Reply {
+                template: "hello".into(),
+            }],
+        });
+        assert!(specs.is_empty());
     }
 }

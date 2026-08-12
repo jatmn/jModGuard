@@ -6,16 +6,31 @@
 use anyhow::{Result, anyhow};
 use serenity::model::id::{RoleId, UserId};
 
-use super::{BehaviorOutcome, CmdEnv};
+use super::{BehaviorOutcome, CmdEnv, PermLevel};
 use crate::types::PlanStep;
 use crate::{db, logging};
 
 pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome> {
     let mut vars = super::behaviors::behaviors_base_vars(env);
-    let target = resolve_target(env).await?;
+    // A plan's first argument is a target only when one of its steps can act
+    // on another user. Reply/log-only plans must remain free to accept normal
+    // command text without trying to parse it as a Discord user.
+    let target = if plan_accepts_target(steps) {
+        resolve_target(env).await?
+    } else {
+        None
+    };
     if plan_requires_target(steps) && target.is_none() {
         return Err(anyhow!(
             "this action plan requires a target user for timeout, kick, or ban steps"
+        ));
+    }
+    // Public plans are self-service by design. Supplying a target turns a
+    // state-changing plan into a moderation operation, so never let an
+    // `everyone` command grant roles, DM, or moderate another member.
+    if target.is_some() && PermLevel::parse(&env.cmd.permission) < PermLevel::Mod {
+        return Err(anyhow!(
+            "targeted action plans require the command permission to be mod or higher"
         ));
     }
     if let Some(target) = target {
@@ -83,6 +98,20 @@ fn plan_requires_target(steps: &[PlanStep]) -> bool {
     })
 }
 
+pub(crate) fn plan_accepts_target(steps: &[PlanStep]) -> bool {
+    steps.iter().any(|step| {
+        matches!(
+            step,
+            PlanStep::Dm { .. }
+                | PlanStep::AddRole { .. }
+                | PlanStep::RemoveRole { .. }
+                | PlanStep::Timeout { .. }
+                | PlanStep::Kick
+                | PlanStep::Ban { .. }
+        )
+    })
+}
+
 async fn resolve_target(env: &CmdEnv<'_>) -> Result<Option<UserId>> {
     let Some(token) = env.args.clone().next_arg() else {
         return Ok(None);
@@ -96,11 +125,19 @@ async fn resolve_target(env: &CmdEnv<'_>) -> Result<Option<UserId>> {
         .ok_or_else(|| anyhow!("could not resolve user `{token}`"))
 }
 
-fn target_member(env: &CmdEnv<'_>, target: UserId) -> Option<serenity::model::guild::Member> {
-    env.ctx
+async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::model::guild::Member> {
+    if let Some(member) = env
+        .ctx
         .cache
         .guild(env.guild_id)
         .and_then(|guild| guild.members.get(&target).cloned())
+    {
+        return Ok(member);
+    }
+    env.guild_id
+        .member(&env.ctx.http, target)
+        .await
+        .map_err(|e| anyhow!("target is not available in this server: {e}"))
 }
 
 #[cfg(test)]
@@ -118,6 +155,15 @@ mod tests {
         assert!(plan_requires_target(&[PlanStep::Timeout { minutes: 5 }]));
         assert!(plan_requires_target(&[PlanStep::Kick]));
         assert!(plan_requires_target(&[PlanStep::Ban { delete_days: 0 }]));
+    }
+
+    #[test]
+    fn only_target_capable_steps_consume_the_first_argument() {
+        assert!(!plan_accepts_target(&[PlanStep::Reply {
+            template: "hello".into(),
+        }]));
+        assert!(plan_accepts_target(&[PlanStep::AddRole { role_id: 1 }]));
+        assert!(plan_accepts_target(&[PlanStep::Timeout { minutes: 5 }]));
     }
 }
 
@@ -151,58 +197,54 @@ async fn run_step(
             logging::emit(env.app, env.ctx, guild_id, event, v).await;
         }
         PlanStep::AddRole { role_id } => {
-            let member = target_member(env, target.unwrap_or(env.actor));
-            if let Some(m) = member {
-                let _ = m.add_role(&env.ctx.http, RoleId::new(*role_id)).await;
-            }
+            let member = target_member(env, target.unwrap_or(env.actor)).await?;
+            member
+                .add_role(&env.ctx.http, RoleId::new(*role_id))
+                .await?;
         }
         PlanStep::RemoveRole { role_id } => {
-            let member = target_member(env, target.unwrap_or(env.actor));
-            if let Some(m) = member {
-                let _ = m.remove_role(&env.ctx.http, RoleId::new(*role_id)).await;
-            }
+            let member = target_member(env, target.unwrap_or(env.actor)).await?;
+            member
+                .remove_role(&env.ctx.http, RoleId::new(*role_id))
+                .await?;
         }
         PlanStep::Timeout { minutes } => {
+            let mut member = target_member(
+                env,
+                target.expect("target-required plan steps are validated before execution"),
+            )
+            .await?;
+            let until = serenity::model::Timestamp::from_unix_timestamp(
+                chrono::Utc::now().timestamp() + (*minutes as i64) * 60,
+            )
+            .map_err(|e| anyhow!("invalid timeout: {e}"))?;
+            member
+                .disable_communication_until_datetime(&env.ctx.http, until)
+                .await?;
+        }
+        PlanStep::Kick => {
             let member = target_member(
                 env,
                 target.expect("target-required plan steps are validated before execution"),
-            );
-            if let Some(mut m) = member {
-                let until = serenity::model::Timestamp::from_unix_timestamp(
-                    chrono::Utc::now().timestamp() + (*minutes as i64) * 60,
-                )
-                .ok();
-                if let Some(until) = until {
-                    let _ = m
-                        .disable_communication_until_datetime(&env.ctx.http, until)
-                        .await;
-                }
-            }
-        }
-        PlanStep::Kick => {
-            if let Some(member) = target_member(
-                env,
-                target.expect("target-required plan steps are validated before execution"),
-            ) {
-                let _ = member
-                    .kick_with_reason(&env.ctx.http, "custom command")
-                    .await;
-            }
+            )
+            .await?;
+            member
+                .kick_with_reason(&env.ctx.http, "custom command")
+                .await?;
         }
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
-            let _ = env
-                .guild_id
+            env.guild_id
                 .ban_with_reason(&env.ctx.http, target, *delete_days, "custom command")
-                .await;
-            let _ = db::record_ban(
+                .await?;
+            db::record_ban(
                 &env.app.db,
                 guild_id.get() as i64,
                 target.get() as i64,
                 Some(env.actor.get() as i64),
                 "custom command",
             )
-            .await;
+            .await?;
         }
         PlanStep::DeleteCommandMessage => {
             if let Some(id) = env.source_message {
