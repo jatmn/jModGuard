@@ -1459,6 +1459,7 @@ pub async fn copy_guild_config(
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
+            tx.execute("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
             for (rid, data) in rows {
                 tx.execute(
                     "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
@@ -1501,6 +1502,7 @@ pub async fn copy_guild_config(
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
+            tx.execute("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
             for (name, data) in rows {
                 tx.execute(
                     "INSERT INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)
@@ -1518,6 +1520,7 @@ pub async fn copy_guild_config(
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
+            tx.execute("DELETE FROM templates WHERE guild_id = ?1", params![dst])?;
             for (event, template) in rows {
                 tx.execute(
                     "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
@@ -3531,6 +3534,55 @@ mod tests {
         assert_eq!(ov.prefix.as_deref(), Some("!"));
         assert!(ov.bot_name.is_none());
         assert_eq!(ov.retention_days, Some(7));
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn copy_sections_remove_destination_only_overrides() {
+        let tmp = tmp_db_path("copy_sections_replace");
+        let db = Db::open(&tmp, 2).unwrap();
+
+        // The source inherits every section from global defaults, while the
+        // destination has local rows. A copy must clear those rows rather than
+        // leave them silently winning effective resolution.
+        let mut rule = crate::defaults::default_rules().into_iter().next().unwrap();
+        let rule_id = crate::types::RULE_IDS[0];
+        rule.enabled = false;
+        tokio_test_block_on(crate::db::upsert_rule(&db, 22, rule_id, &rule)).unwrap();
+
+        let command = crate::defaults::sample_plan_command();
+        tokio_test_block_on(crate::db::upsert_command(&db, 22, &command.name, &command)).unwrap();
+        tokio_test_block_on(crate::db::upsert_template(
+            &db,
+            22,
+            "member_join",
+            "destination-only template",
+        ))
+        .unwrap();
+
+        tokio_test_block_on(crate::db::copy_guild_config(
+            &db,
+            11,
+            22,
+            vec!["rules".into(), "commands".into(), "templates".into()],
+        ))
+        .unwrap();
+
+        assert!(
+            tokio_test_block_on(crate::db::get_rule(&db, 22, rule_id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tokio_test_block_on(crate::db::get_command_row(&db, 22, &command.name))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tokio_test_block_on(crate::db::get_template_row(&db, 22, "member_join"))
+                .unwrap()
+                .is_none()
+        );
         cleanup_db(&tmp);
     }
 

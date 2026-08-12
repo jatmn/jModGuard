@@ -51,7 +51,14 @@ pub async fn validate_log_channel_guild(
         .await
         .map_err(|e| anyhow!("failed to resolve log channel {channel_id}: {e}"))?;
     match channel {
-        Channel::Guild(channel) if channel.guild_id.get() == guild_id => Ok(()),
+        Channel::Guild(channel)
+            if channel.guild_id.get() == guild_id && channel.is_text_based() =>
+        {
+            Ok(())
+        }
+        Channel::Guild(channel) if channel.guild_id.get() == guild_id => {
+            anyhow::bail!("log channel {channel_id} cannot receive messages")
+        }
         Channel::Guild(channel) => anyhow::bail!(
             "log channel {channel_id} belongs to guild {}, not {guild_id}",
             channel.guild_id

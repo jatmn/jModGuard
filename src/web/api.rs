@@ -76,10 +76,7 @@ pub async fn guild_config(
     // Runtime enforcement combines global and guild badwords. Return that
     // same set so global rows created in this UI remain inspectable and
     // removable through it.
-    let mut badwords = db::list_badwords(&app.db, GLOBAL_SCOPE).await?;
-    if guild != GLOBAL_SCOPE {
-        badwords.extend(db::list_badwords(&app.db, guild).await?);
-    }
+    let badwords = db::list_badwords(&app.db, guild).await?;
     let badwords: Vec<_> = badwords.iter().map(|w| w.with_status()).collect();
 
     // commands: union of guild + global rows, effective resolution
@@ -220,6 +217,11 @@ pub async fn update_settings(
     // Track the nick Discord currently has after the pre-patch step so a
     // post-commit re-sync can close parent-read→patch TOCTOU on inherit
     // (copy_config already does this).
+    let _nickname_guard = if body.bot_name.is_some() && guild_id != 0 {
+        Some(app.lock_nickname_update().await)
+    } else {
+        None
+    };
     let mut nickname_applied: Option<bool> = None;
     let mut previous_nick: Option<String> = None;
     let mut discord_nick: Option<String> = None;
@@ -437,10 +439,7 @@ pub async fn list_badwords(
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _auth = guild_scope(&app, &session, guild_id).await?;
-    let mut words = db::list_badwords(&app.db, GLOBAL_SCOPE).await?;
-    if guild_id as i64 != GLOBAL_SCOPE {
-        words.extend(db::list_badwords(&app.db, guild_id as i64).await?);
-    }
+    let words = db::list_badwords(&app.db, guild_id as i64).await?;
     let words: Vec<_> = words.iter().map(|w| w.with_status()).collect();
     Ok(Json(serde_json::json!(words)))
 }
@@ -818,6 +817,14 @@ pub async fn copy_config(
     )
     .await
     .map_err(ApiError)?;
+
+    // Keep the external Discord mutation and the settings transaction ordered
+    // with every other nickname writer in this process.
+    let _nickname_guard = if wants_settings && guild_id != 0 {
+        Some(app.lock_nickname_update().await)
+    } else {
+        None
+    };
 
     // Apply Discord nickname *before* SQLite (same contract as update_settings
     // / !setname). Doing it after left copied settings committed when Discord

@@ -129,7 +129,27 @@ impl Config {
         };
 
         cfg.apply_env();
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Reject CORS values which would otherwise make tower-http panic while
+    /// building a credentialed `AllowOrigin::list` layer.
+    fn validate(&self) -> Result<()> {
+        for origin in &self.web.cors_origins {
+            let origin = origin.trim();
+            if origin.is_empty() {
+                anyhow::bail!("web.cors_origins cannot contain an empty origin");
+            }
+            if origin == "*" {
+                anyhow::bail!(
+                    "web.cors_origins cannot contain `*`; credentialed CORS requires explicit origins"
+                );
+            }
+            axum::http::HeaderValue::from_str(origin)
+                .with_context(|| format!("invalid web.cors_origins entry `{origin}`"))?;
+        }
+        Ok(())
     }
 
     /// Builds DB open options for this process (`migrate=true` for bot, `false` for API).
@@ -190,5 +210,18 @@ impl Config {
         if let Ok(v) = env::var("JMODGUARD_LOG_LEVEL") {
             self.log.level = v;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn rejects_wildcard_credentialed_cors_origin() {
+        let mut cfg = Config::default();
+        cfg.web.cors_origins = vec!["*".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("cannot contain `*`"));
     }
 }

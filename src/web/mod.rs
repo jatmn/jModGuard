@@ -472,7 +472,15 @@ pub fn router(app: Arc<AppState>) -> Router {
         .web
         .cors_origins
         .iter()
-        .filter_map(|o| HeaderValue::from_str(o.trim()).ok())
+        .filter_map(|o| {
+            let origin = o.trim();
+            if origin == "*" {
+                tracing::warn!("ignoring wildcard web.cors_origins entry; credentialed CORS requires explicit origins");
+                None
+            } else {
+                HeaderValue::from_str(origin).ok()
+            }
+        })
         .collect();
     if !app.cfg.web.cors_origins.is_empty() && cors_origins.is_empty() {
         tracing::warn!(
