@@ -11,6 +11,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::load()?;
+    cfg.validate_cors()?;
 
     if cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty() {
         anyhow::bail!(
@@ -39,8 +40,11 @@ async fn main() -> Result<()> {
     }
 
     // API expects the bot (or a one-shot migrate) to have applied schema already.
+    // Wait briefly so systemd/container start order can race the bot's first migrate.
     let opts = cfg.db_open_options(false);
-    let db = Db::open_with(opts).with_context(|| {
+    let db = Db::open_with_until_ready(opts, 30, Duration::from_secs(1))
+        .await
+        .with_context(|| {
         format!(
             "failed to open database {} (API opens with migrate=false — start jmodguard-bot once first, or apply migrations)",
             if cfg.db.url.is_empty() {

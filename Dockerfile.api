@@ -13,4 +13,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/jmodguard-api /usr/local/bin/jmodguard-api
+WORKDIR /data
+VOLUME ["/data"]
+ENV JMODGUARD_DB_PATH=/data/jmodguard.db
+ENV JMODGUARD_CONFIG=/data/config.toml
+ENV JMODGUARD_WEB_BIND=0.0.0.0:8080
+EXPOSE 8080
 ENTRYPOINT ["jmodguard-api"]

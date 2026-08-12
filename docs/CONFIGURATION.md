@@ -11,7 +11,7 @@ database (everything server-related, editable at runtime).
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
 | `db.url` | — | Remote libSQL / Bunny Database URL (env: `JMODGUARD_DB_URL`). Empty = local path. Not wired yet — setting it fails at open |
 | `db.token` | — | Remote DB access token (env: `JMODGUARD_DB_TOKEN`) |
-| `db.pool_size` | `8` | connection pool size |
+| `db.pool_size` | `8` | connection pool size (each process; bot and API each open their own pool) |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
@@ -29,8 +29,8 @@ database (everything server-related, editable at runtime).
 
 All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0003_archive_global_log_channels.sql`) and is applied by
-`jmodguard-bot` on startup (API opens with `migrate=false` and refuses an
-unmigrated DB).
+`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
+an unmigrated DB, then exits).
 
 | Table | Holds |
 |---|---|

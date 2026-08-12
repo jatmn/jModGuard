@@ -32,6 +32,9 @@ jobs:
       - name: cargo test --locked
         run: cargo test --locked
 
+      - name: cargo test --locked --no-default-features --lib
+        run: cargo test --locked --no-default-features --lib
+
       - name: cargo clippy --locked --bins -- -D warnings
         run: cargo clippy --locked --bins -- -D warnings
 

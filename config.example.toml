@@ -3,7 +3,7 @@
 #
 # Dual-process local run:
 #   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway
-#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (expects migrated DB)
+#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (waits ~30s for bot migrate)
 
 [discord]
 # Bot token from https://discord.com/developers/applications
@@ -57,7 +57,7 @@ owner_id = 0
 retention_days = 7
 # Presence status text shown under the bot's name.
 status = "moderating"
-# How often the bot polls durable config_version (cross-process cache invalidation).
+# How often each process polls durable config_version (cross-process cache invalidation).
 # Env: JMODGUARD_CONFIG_POLL_SECS.
 config_poll_secs = 5
 

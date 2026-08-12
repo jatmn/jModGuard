@@ -129,13 +129,15 @@ impl Config {
         };
 
         cfg.apply_env();
-        cfg.validate()?;
         Ok(cfg)
     }
 
     /// Reject CORS values which would otherwise make tower-http panic while
     /// building a credentialed `AllowOrigin::list` layer.
-    fn validate(&self) -> Result<()> {
+    ///
+    /// Call this from `jmodguard-api` only. The bot never serves HTTP, so a
+    /// typo in `web.cors_origins` must not take down the Discord gateway.
+    pub fn validate_cors(&self) -> Result<()> {
         for origin in &self.web.cors_origins {
             let origin = origin.trim();
             if origin.is_empty() {
@@ -222,7 +224,7 @@ mod tests {
     fn rejects_wildcard_credentialed_cors_origin() {
         let mut cfg = Config::default();
         cfg.web.cors_origins = vec!["*".into()];
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate_cors().unwrap_err();
         assert!(err.to_string().contains("cannot contain `*`"));
     }
 }
