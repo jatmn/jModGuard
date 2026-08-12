@@ -146,7 +146,8 @@ impl Config {
                     "web.cors_origins cannot contain `*`; credentialed CORS requires explicit origins"
                 );
             }
-            axum::http::HeaderValue::from_str(origin)
+            origin
+                .parse::<reqwest::header::HeaderValue>()
                 .with_context(|| format!("invalid web.cors_origins entry `{origin}`"))?;
         }
         Ok(())
