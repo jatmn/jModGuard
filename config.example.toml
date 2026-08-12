@@ -36,7 +36,7 @@ base_url = "http://localhost:8080"
 oauth_client_id = ""
 oauth_client_secret = ""
 # Comma-separated browser origins for a CDN-hosted SPA that calls this API
-# cross-origin (must match the page Origin). Empty = same-origin only.
+# cross-origin (must be explicit page Origins; `*` is not allowed). Empty = same-origin only.
 # Also set via JMODGUARD_CORS_ORIGINS. Requires https base_url for Secure cookies.
 # cors_origins = ["https://admin.example.com"]
 

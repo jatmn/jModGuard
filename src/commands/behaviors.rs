@@ -336,6 +336,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let name = if clear { "" } else { trimmed };
             let me = env.ctx.cache.current_user().id;
             let guild_id = env.guild_id.get();
+            let _nickname_guard = env.app.lock_nickname_update().await;
             // Discord before SQLite (AGENTS contract). Always apply Discord on
             // an explicit !setname / /setname — even when DB already matches —
             // so operators can repair Discord↔DB nick drift. Capture previous

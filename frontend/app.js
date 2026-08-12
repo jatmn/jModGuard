@@ -801,7 +801,7 @@ function tabSettings() {
     srcSel.append(el("option", { value: "", text: "No other servers" }));
   }
   const sectionSel = el("select", {},
-    ["all", "rules", "badwords", "commands", "templates", "logchannels", "settings"]
+    ["all", "rules", "badwords", "commands", "templates", "settings"]
       .map((s) => el("option", { value: s, text: s === "all" ? "everything" : s })),
   );
   const globalPrefix = el("input", { type: "text", value: cfg.global_settings.prefix });
@@ -956,7 +956,7 @@ function tabSettings() {
   cards.push(el("div", { class: "card" },
       el("h3", { text: "Copy configuration from another server" }),
       el("p", { class: "muted", style: "margin-bottom:8px" },
-        "Carry rules, badwords, commands, templates, log channels, or everything over to this server. Source must be a server you manage."),
+        "Replace rules, badwords, commands, templates, settings, or everything with another server's configuration. Log channels are server-specific and are not copied. Source must be a server you manage."),
       el("div", { class: "row" },
         srcSel, sectionSel,
         el("button", { class: "btn primary", text: "Copy", onclick: async () => {

@@ -37,10 +37,10 @@ scope or **global** scope:
 **Log channels are always per-server.** Discord channel IDs belong to one
 server, so they cannot be global defaults or copied between servers.
 
-The **Settings → Copy configuration from another server** action copies any
-subset (everything / rules / badwords / commands / templates / log channels /
-settings) from one of your other servers into the current one — one-click
-carry-over between servers.
+The **Settings → Copy configuration from another server** action replaces any
+selected subset (everything / rules / badwords / commands / templates /
+settings) in the current server. Log channels are intentionally excluded
+because their Discord channel IDs are server-specific.
 
 ## API
 
