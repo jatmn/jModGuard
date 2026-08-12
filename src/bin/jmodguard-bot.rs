@@ -109,13 +109,6 @@ async fn main() -> Result<()> {
                                     "slash re-sync deferred: guild cache empty (will retry)"
                                 );
                             }
-                            jmodguard::state::SlashResyncPlan::Done => {
-                                tracing::info!(
-                                    "slash_registry_version {remote}: no guilds left to sync; \
-                                     committing observation"
-                                );
-                                app.commit_slash_registry_version(remote);
-                            }
                             jmodguard::state::SlashResyncPlan::Sync {
                                 guilds,
                                 invalidate,
