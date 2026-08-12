@@ -51,8 +51,9 @@ cargo run --bin jmodguard-api                         # expects migrated schema 
   commands for cached guilds when it advances, committing the observed
   version only after a successful sync pass (failed guilds retry next poll;
   retries are limited to the failure set so one bad guild cannot re-POST all
-  guilds every tick). Empty guild cache defers without invalidating. When
-  previously-failed guilds leave the cache, the observation is committed.
+  guilds every tick). Empty guild cache defers without invalidating. A failed
+  guild that leaves the cache keeps the observation pending; retry it when it
+  returns, then commit only after every failed guild syncs successfully.
   `AppState::new` primes both version baselines from the DB so the first poll
   has no unobserved window (never use a “skip first observation” sentinel).
 - Runtime writers (messages/members/events/warns/bans/users) must **not** bump
