@@ -53,9 +53,10 @@ badwords (read-only) because the bot enforces them. Badword list entries include
 `valid` / `error` — patterns that fail compile limits are shown as **not enforced**.
 
 The **Settings → Copy configuration from another server** action copies any
-subset (everything / rules / badwords / commands / templates / log channels /
-settings) from one of your other servers into the current one — one-click
-carry-over between servers. You must have Manage Server on the source guild.
+subset (everything / rules / badwords / commands / templates / settings) from
+one of your other servers into the current one — one-click carry-over between
+servers. Log channels are intentionally excluded because their Discord channel
+IDs are server-specific. You must have Manage Server on the source guild.
 
 Badwords copy is **validate-then-replace**: the destination is replaced with
 the enforceable subset of source patterns. Invalid source patterns are counted
