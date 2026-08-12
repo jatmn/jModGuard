@@ -422,7 +422,8 @@ function editCommand(c) {
   const descIn = el("input", { type: "text", value: data.description, placeholder: "description" });
   const usageIn = el("input", { type: "text", value: data.usage, placeholder: "usage" });
   const aliasesIn = el("input", { type: "text", value: (data.aliases || []).join(","), placeholder: "aliases, comma separated" });
-  const respIn = el("textarea", { value: data.response || "", placeholder: "response template, e.g. Banned {target} | {reason}" });
+  const respIn = el("textarea", { placeholder: "response template, e.g. Banned {target} | {reason}" });
+  respIn.value = data.response || "";
   const permIn = el("select", {},
     ["everyone", "mod", "admin", "owner"].map((p) => el("option", { value: p, text: p, selected: data.permission === p })),
   );
@@ -440,6 +441,13 @@ function editCommand(c) {
     behaviorArea.value = JSON.stringify(data.behavior || {}, null, 2);
   }
 
+  // The structured step editor and advanced JSON editor represent the same
+  // state. Keep structured edits reflected in the JSON before Save makes the
+  // latter authoritative.
+  const syncPlanJson = () => {
+    if (isPlan) behaviorArea.value = JSON.stringify(data.behavior.params || {}, null, 2);
+  };
+
   const renderSteps = () => {
     if (!isPlan) return;
     stepsBox.innerHTML = "";
@@ -449,7 +457,7 @@ function editCommand(c) {
         ["reply", "dm", "log", "add_role", "remove_role", "timeout", "kick", "ban", "delete_command_message", "react", "wait"].map((t) =>
           el("option", { value: t, text: t, selected: s.type === t })),
       );
-      const field = el("input", { type: "text", value: s.template ?? s.role_id ?? s.minutes ?? s.emoji ?? s.secs ?? "", placeholder: typePlaceholder(type), style: "flex:1" });
+      const field = el("input", { type: "text", value: s.template ?? s.role_id ?? s.minutes ?? s.delete_days ?? s.emoji ?? s.secs ?? "", placeholder: typePlaceholder(s.type), style: "flex:1" });
       type.onchange = () => {
         const t = type.value;
         const n = { type: t };
@@ -461,6 +469,7 @@ function editCommand(c) {
         if (t === "wait") n.secs = Math.max(1, Number(field.value) || 1);
         if (t === "log") n.event = "plan_executed";
         steps[i] = n;
+        syncPlanJson();
         field.placeholder = typePlaceholder(t);
         field.value = field.placeholder === "…" ? "" : String(n.template ?? n.role_id ?? n.minutes ?? n.delete_days ?? n.emoji ?? n.secs ?? "");
       };
@@ -472,10 +481,11 @@ function editCommand(c) {
         if (t === "ban") steps[i].delete_days = Math.min(7, Math.max(0, Number(field.value) || 0));
         if (t === "react") steps[i].emoji = field.value;
         if (t === "wait") steps[i].secs = Math.max(1, Number(field.value) || 1);
+        syncPlanJson();
       };
       stepsBox.append(el("div", { class: "step-card" },
         el("div", { class: "row" }, type, field,
-          el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); renderSteps(); } })),
+          el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); syncPlanJson(); renderSteps(); } })),
       ));
     });
   };
@@ -485,6 +495,24 @@ function editCommand(c) {
     delete_command_message: "…", react: "emoji", wait: "seconds",
   }[t] || "value");
   renderSteps();
+  if (isPlan) {
+    behaviorArea.onchange = () => {
+      try {
+        const params = JSON.parse(behaviorArea.value || "{}");
+        if (!params || typeof params !== "object" || Array.isArray(params)) {
+          throw new Error("plan parameters must be an object");
+        }
+        if (params.steps !== undefined && !Array.isArray(params.steps)) {
+          throw new Error("plan steps must be an array");
+        }
+        params.steps = params.steps || [];
+        data.behavior.params = params;
+        renderSteps();
+      } catch (e) {
+        toast("Invalid behavior JSON: " + e.message, "error");
+      }
+    };
+  }
 
   modal.append(el("div", { class: "modal-box" },
     el("h3", { text: isNew ? "New custom command" : `Edit command: ${c.name}` }),
@@ -499,6 +527,7 @@ function editCommand(c) {
       el("label", { text: "Action plan steps" }), stepsBox,
       el("button", { class: "btn small", text: "+ add step", onclick: () => {
         data.behavior.params.steps.push({ type: "reply", template: "" });
+        syncPlanJson();
         renderSteps();
       } })) : null,
     el("div", { class: "field" },

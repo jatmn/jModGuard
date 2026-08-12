@@ -40,10 +40,7 @@ pub enum SlashResyncPlan {
     /// Attempt `set_commands` for these guild ids. `invalidate` is true on the
     /// first non-empty attempt for this target (skip if `config_version` already
     /// cleared the cache this tick).
-    Sync {
-        guilds: Vec<u64>,
-        invalidate: bool,
-    },
+    Sync { guilds: Vec<u64>, invalidate: bool },
 }
 
 pub struct AppState {
@@ -193,7 +190,8 @@ impl AppState {
     /// after a transient startup/guild-join sync failure, when no write may
     /// otherwise advance the durable version to trigger another attempt.
     pub fn retry_slash_registry_version(&self) {
-        self.last_slash_registry_version.store(u64::MAX, Ordering::SeqCst);
+        self.last_slash_registry_version
+            .store(u64::MAX, Ordering::SeqCst);
         *self.slash_sync_progress.lock() = None;
     }
 
@@ -219,11 +217,8 @@ impl AppState {
         let guilds = match &progress.remaining {
             None => cached.to_vec(),
             Some(rem) => {
-                let pending: Vec<u64> = cached
-                    .iter()
-                    .copied()
-                    .filter(|g| rem.contains(g))
-                    .collect();
+                let pending: Vec<u64> =
+                    cached.iter().copied().filter(|g| rem.contains(g)).collect();
                 if pending.is_empty() {
                     // Prior failures left the cache — nothing left to retry.
                     *guard = None;
@@ -236,10 +231,7 @@ impl AppState {
         if invalidate {
             progress.invalidated = true;
         }
-        SlashResyncPlan::Sync {
-            guilds,
-            invalidate,
-        }
+        SlashResyncPlan::Sync { guilds, invalidate }
     }
 
     /// Record guilds that failed `set_commands` for `remote`.
@@ -427,9 +419,7 @@ impl OAuthClient {
         let mut all = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let mut url = format!(
-                "https://discord.com/api/users/@me/guilds?limit={PAGE_LIMIT}"
-            );
+            let mut url = format!("https://discord.com/api/users/@me/guilds?limit={PAGE_LIMIT}");
             if let Some(ref cursor) = after {
                 url.push_str("&after=");
                 url.push_str(cursor);
@@ -467,10 +457,7 @@ impl OAuthClient {
 /// current page is the last (`len < page_limit`, including empty).
 ///
 /// Extracted so pagination termination is unit-tested without HTTP.
-pub(crate) fn next_guilds_after_cursor(
-    page: &[DiscordGuild],
-    page_limit: usize,
-) -> Option<String> {
+pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize) -> Option<String> {
     if page.len() < page_limit {
         None
     } else {
@@ -516,7 +503,17 @@ impl CachedGuildConfig {
             log_channels: parts
                 .log_channels
                 .into_iter()
-                .map(|(k, v)| (k, ChannelId::new(v as u64)))
+                .filter_map(|(event, channel_id)| {
+                    match u64::try_from(channel_id).ok().filter(|id| *id != 0) {
+                        Some(channel_id) => Some((event, ChannelId::new(channel_id))),
+                        None => {
+                            tracing::warn!(
+                                "ignoring invalid persisted log channel id {channel_id} for event {event}"
+                            );
+                            None
+                        }
+                    }
+                })
                 .collect(),
             regexes,
         }
@@ -619,12 +616,7 @@ mod tests {
         let bot = AppState::new(Config::default(), bot_db).unwrap();
         // Already primed at construction — unchanged version must not invalidate.
         assert!(!tokio_test_block_on(bot.poll_config_version()).unwrap());
-        tokio_test_block_on(db::upsert_settings(
-            &api_db,
-            7,
-            &GuildSettings::default(),
-        ))
-        .unwrap();
+        tokio_test_block_on(db::upsert_settings(&api_db, 7, &GuildSettings::default())).unwrap();
         assert!(tokio_test_block_on(bot.poll_config_version()).unwrap());
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
@@ -763,10 +755,7 @@ mod tests {
         );
 
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
-            SlashResyncPlan::Sync {
-                guilds,
-                invalidate,
-            } => {
+            SlashResyncPlan::Sync { guilds, invalidate } => {
                 assert_eq!(guilds, vec![10, 20, 30]);
                 assert!(invalidate, "first non-empty pass invalidates once");
             }
@@ -774,10 +763,7 @@ mod tests {
         }
         // Second plan before finish — still full set, but no second invalidate.
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
-            SlashResyncPlan::Sync {
-                guilds,
-                invalidate,
-            } => {
+            SlashResyncPlan::Sync { guilds, invalidate } => {
                 assert_eq!(guilds, vec![10, 20, 30]);
                 assert!(!invalidate);
             }
@@ -786,10 +772,7 @@ mod tests {
 
         assert!(!app.finish_slash_resync(remote, [20u64].into_iter().collect()));
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
-            SlashResyncPlan::Sync {
-                guilds,
-                invalidate,
-            } => {
+            SlashResyncPlan::Sync { guilds, invalidate } => {
                 assert_eq!(guilds, vec![20], "only failures are retried");
                 assert!(!invalidate);
             }
@@ -819,10 +802,7 @@ mod tests {
             }
         }
         let full: Vec<_> = (0..200).map(|i| g(&i.to_string())).collect();
-        assert_eq!(
-            next_guilds_after_cursor(&full, 200).as_deref(),
-            Some("199")
-        );
+        assert_eq!(next_guilds_after_cursor(&full, 200).as_deref(), Some("199"));
         let short = vec![g("200"), g("201")];
         assert_eq!(next_guilds_after_cursor(&short, 200), None);
         assert_eq!(next_guilds_after_cursor(&[], 200), None);

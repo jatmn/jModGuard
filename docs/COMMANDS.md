@@ -54,16 +54,19 @@ Extra per-command restrictions: `roles` (must hold one of these role IDs) and
 ## Custom commands (action plans)
 
 The WebUI **Commands → New custom command** editor builds a command whose
-behavior is a **list of steps** executed in order:
+behavior is a **list of steps** executed in order. Plans accept an optional
+first user argument (or slash `user` option). When supplied, it is the target
+for target-capable steps; otherwise those self-service steps use the caller.
+`timeout`, `kick`, and `ban` require a target.
 
 | Step | Behavior |
 |---|---|
 | `reply` | send a message in the invoking channel (templates supported) |
-| `dm` | DM the target user (first argument, or the caller) |
+| `dm` | DM the target user (or the caller when omitted) |
 | `log` | emit a log event to its configured channel |
-| `add_role` / `remove_role` | grant/revoke a role on the caller |
-| `timeout` | timeout the caller |
-| `kick` / `ban` | kick/ban the caller (gated by the command's permission) |
+| `add_role` / `remove_role` | grant/revoke a role on the target (or caller when omitted) |
+| `timeout` | timeout the required target |
+| `kick` / `ban` | kick/ban the required target (gated by the command's permission) |
 | `delete_command_message` | delete the message that invoked the command |
 | `react` | add an emoji reaction to the invoking message |
 | `wait` | sleep N seconds before the next step |

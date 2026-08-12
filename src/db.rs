@@ -238,11 +238,9 @@ pub async fn bump_config_version(db: &Db) -> Result<()> {
 
 fn get_meta_version_conn(conn: &Connection, key: &str) -> Result<u64> {
     let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
+        .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+            r.get(0)
+        })
         .optional()?;
     Ok(value.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0))
 }
@@ -281,16 +279,14 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 /// whenever the two processes loaded different config values.
 const META_TERMINAL_DEFAULTS: &str = "settings_terminal_defaults";
 /// Bump when heal logic changes so every DB re-runs migration once.
-const SETTINGS_HEAL_GENERATION: &str = "2";
+const SETTINGS_HEAL_GENERATION: &str = "3";
 const META_SETTINGS_HEAL_GENERATION: &str = "settings_heal_generation";
 const META_SETTINGS_HEAL_CHECKSUM: &str = "settings_heal_checksum";
 
 fn meta_string_conn(conn: &Connection, key: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = ?1",
-        params![key],
-        |r| r.get(0),
-    )
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+        r.get(0)
+    })
     .optional()
     .context("meta lookup failed")
 }
@@ -346,9 +342,7 @@ fn read_terminal_defaults_meta(conn: &Connection) -> Result<Option<GuildSettings
 /// Terminal defaults for settings resolution — always read from durable meta.
 fn terminal_defaults_conn(conn: &Connection) -> Result<GuildSettings> {
     read_terminal_defaults_meta(conn)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "meta.settings_terminal_defaults is missing; start jmodguard-bot first"
-        )
+        anyhow::anyhow!("meta.settings_terminal_defaults is missing; start jmodguard-bot first")
     })
 }
 
@@ -367,7 +361,8 @@ fn fnv1a64_mix(hash: u64, bytes: &[u8]) -> u64 {
 }
 
 fn guild_settings_checksum_conn(conn: &Connection) -> Result<u64> {
-    let mut stmt = conn.prepare("SELECT guild_id, settings FROM guild_settings ORDER BY guild_id")?;
+    let mut stmt =
+        conn.prepare("SELECT guild_id, settings FROM guild_settings ORDER BY guild_id")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     // FNV-1a offset basis — fixed seed so bot and API agree on the same DB.
     let mut hash = 0xcbf29ce484222325u64;
@@ -384,12 +379,12 @@ fn guild_settings_checksum_conn(conn: &Connection) -> Result<u64> {
 /// Keep heal fast-path accurate after any committed `guild_settings` mutation.
 fn refresh_settings_heal_checksum_conn(conn: &Connection) -> Result<()> {
     let checksum = guild_settings_checksum_conn(conn)?;
-    write_meta_string_conn(conn, META_SETTINGS_HEAL_GENERATION, SETTINGS_HEAL_GENERATION)?;
     write_meta_string_conn(
         conn,
-        META_SETTINGS_HEAL_CHECKSUM,
-        &checksum.to_string(),
+        META_SETTINGS_HEAL_GENERATION,
+        SETTINGS_HEAL_GENERATION,
     )?;
+    write_meta_string_conn(conn, META_SETTINGS_HEAL_CHECKSUM, &checksum.to_string())?;
     Ok(())
 }
 
@@ -456,20 +451,27 @@ fn normalize_settings_override_against_parent(
     parent: &GuildSettings,
 ) -> GuildSettingsOverride {
     GuildSettingsOverride {
-        prefix: ov
-            .prefix
-            .as_ref()
-            .filter(|p| *p != &parent.prefix)
-            .cloned(),
+        prefix: ov.prefix.as_ref().filter(|p| *p != &parent.prefix).cloned(),
         bot_name: ov
             .bot_name
             .as_ref()
             .filter(|n| *n != &parent.bot_name)
             .cloned(),
-        retention_days: ov
-            .retention_days
-            .filter(|&r| r != parent.retention_days),
+        retention_days: ov.retention_days.filter(|&r| r != parent.retention_days),
     }
+}
+
+/// `bot_name` is a Discord guild nickname, never a global default. Keep this
+/// invariant in the data layer as well as the HTTP layer: settings can also be
+/// copied or written by command/runtime paths that do not pass through the API.
+fn normalize_settings_override_for_scope(
+    guild_id: i64,
+    mut override_: GuildSettingsOverride,
+) -> GuildSettingsOverride {
+    if guild_id == GLOBAL_SCOPE {
+        override_.bot_name = None;
+    }
+    override_
 }
 
 /// Normalize a legacy settings row against its parent layer.
@@ -488,10 +490,7 @@ fn heal_settings_override(
 ///
 /// Corrupt rows are not valid overrides: callers clear them so inheritance
 /// resumes instead of leaving `get_settings` permanently broken.
-fn parse_settings_override_json(
-    guild_id: i64,
-    json: &str,
-) -> Option<GuildSettingsOverride> {
+fn parse_settings_override_json(guild_id: i64, json: &str) -> Option<GuildSettingsOverride> {
     match serde_json::from_str::<GuildSettingsOverride>(json) {
         Ok(ov) => Some(ov),
         Err(e) => {
@@ -520,16 +519,12 @@ fn parse_settings_override_json(
 /// Order: migrate **global first** (parent = config terminal defaults), then
 /// guild rows against the healed global. When any row changes, bumps
 /// `config_version` so an already-running API process invalidates its cache.
-fn heal_default_guild_settings_conn(
-    conn: &mut Connection,
-    defaults: &GuildSettings,
-) -> Result<()> {
+fn heal_default_guild_settings_conn(conn: &mut Connection, defaults: &GuildSettings) -> Result<()> {
     let checksum = guild_settings_checksum_conn(conn)?;
     let stored_gen = meta_string_conn(conn, META_SETTINGS_HEAL_GENERATION)?;
-    let stored_checksum = meta_string_conn(conn, META_SETTINGS_HEAL_CHECKSUM)?
-        .and_then(|s| s.parse::<u64>().ok());
-    if stored_gen.as_deref() == Some(SETTINGS_HEAL_GENERATION)
-        && stored_checksum == Some(checksum)
+    let stored_checksum =
+        meta_string_conn(conn, META_SETTINGS_HEAL_CHECKSUM)?.and_then(|s| s.parse::<u64>().ok());
+    if stored_gen.as_deref() == Some(SETTINGS_HEAL_GENERATION) && stored_checksum == Some(checksum)
     {
         return Ok(());
     }
@@ -548,18 +543,17 @@ fn heal_default_guild_settings_conn(
     if let Some(json) = global_raw {
         match parse_settings_override_json(GLOBAL_SCOPE, &json) {
             Some(ov) => {
-                let normalized = heal_settings_override(&ov, defaults);
+                let normalized = normalize_settings_override_for_scope(
+                    GLOBAL_SCOPE,
+                    heal_settings_override(&ov, defaults),
+                );
                 if normalized != ov {
                     write_settings_override_conn(&tx, GLOBAL_SCOPE, &normalized)?;
                     changed += 1;
                 }
             }
             None => {
-                write_settings_override_conn(
-                    &tx,
-                    GLOBAL_SCOPE,
-                    &GuildSettingsOverride::default(),
-                )?;
+                write_settings_override_conn(&tx, GLOBAL_SCOPE, &GuildSettingsOverride::default())?;
                 changed += 1;
             }
         }
@@ -570,9 +564,8 @@ fn heal_default_guild_settings_conn(
         let global = read_settings_override_conn(&tx, GLOBAL_SCOPE)?;
         resolve_settings(&None, &global, defaults)
     };
-    let mut stmt = tx.prepare(
-        "SELECT guild_id, settings FROM guild_settings WHERE guild_id != ?1",
-    )?;
+    let mut stmt =
+        tx.prepare("SELECT guild_id, settings FROM guild_settings WHERE guild_id != ?1")?;
     let rows: Vec<(i64, String)> = stmt
         .query_map(params![GLOBAL_SCOPE], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
@@ -590,11 +583,7 @@ fn heal_default_guild_settings_conn(
             }
             None => {
                 // Corrupt guild override → delete (inherit global).
-                write_settings_override_conn(
-                    &tx,
-                    guild_id,
-                    &GuildSettingsOverride::default(),
-                )?;
+                write_settings_override_conn(&tx, guild_id, &GuildSettingsOverride::default())?;
                 changed += 1;
             }
         }
@@ -805,6 +794,7 @@ fn write_settings_override_conn(
     guild_id: i64,
     override_: &GuildSettingsOverride,
 ) -> Result<()> {
+    let override_ = normalize_settings_override_for_scope(guild_id, override_.clone());
     if override_.is_empty() {
         if guild_id != GLOBAL_SCOPE {
             conn.execute(
@@ -821,7 +811,7 @@ fn write_settings_override_conn(
         }
         return Ok(());
     }
-    let json = serde_json::to_string(override_)?;
+    let json = serde_json::to_string(&override_)?;
     conn.execute(
         "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)
          ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
@@ -858,7 +848,8 @@ fn settings_web_bundle_conn(conn: &Connection, guild_id: i64) -> Result<Settings
 }
 
 pub async fn get_settings_web_bundle(db: &Db, guild_id: i64) -> Result<SettingsWebBundle> {
-    db.with_conn(move |conn| settings_web_bundle_conn(conn, guild_id)).await
+    db.with_conn(move |conn| settings_web_bundle_conn(conn, guild_id))
+        .await
 }
 
 pub async fn get_settings(db: &Db, guild_id: i64) -> Result<GuildSettings> {
@@ -912,7 +903,11 @@ pub async fn preview_settings_after_copy(db: &Db, src: i64, dst: i64) -> Result<
 /// partial override (same durable contract as `patch_settings`). Test helper
 /// only — production writers must use `patch_settings`.
 #[cfg(test)]
-pub(crate) async fn upsert_settings(db: &Db, guild_id: i64, settings: &GuildSettings) -> Result<()> {
+pub(crate) async fn upsert_settings(
+    db: &Db,
+    guild_id: i64,
+    settings: &GuildSettings,
+) -> Result<()> {
     let override_ = GuildSettingsOverride::from_complete(settings);
     db.with_conn(move |conn| {
         let defaults = terminal_defaults_conn(conn)?;
@@ -956,9 +951,7 @@ pub async fn patch_settings(
     if let Some(Some(days)) = retention_days
         && days > MAX_RETENTION_DAYS
     {
-        anyhow::bail!(
-            "retention_days must be between 0 and {MAX_RETENTION_DAYS}"
-        );
+        anyhow::bail!("retention_days must be between 0 and {MAX_RETENTION_DAYS}");
     }
     // No-op patch: return current effective settings without bumping versions.
     if prefix.is_none() && bot_name.is_none() && retention_days.is_none() {
@@ -1159,6 +1152,9 @@ pub async fn upsert_log_channel(
     event: &str,
     channel_id: i64,
 ) -> Result<()> {
+    if channel_id <= 0 {
+        anyhow::bail!("channel_id must be a positive Discord snowflake");
+    }
     let event = event.to_string();
     db.with_conn(move |conn| {
         let tx = conn.transaction()?;
@@ -1378,8 +1374,7 @@ fn preflight_copy_guild_config_conn(
     sections: &[String],
 ) -> Result<()> {
     if section_wanted(sections, "badwords") {
-        let mut stmt =
-            conn.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1")?;
         let rows: Vec<(String, Option<String>)> = stmt
             .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
@@ -1453,13 +1448,13 @@ pub async fn copy_guild_config(
                 }
                 _ => GuildSettingsOverride::default(),
             };
+            let to_write = normalize_settings_override_for_scope(dst, to_write);
             write_settings_override_conn(&tx, dst, &to_write)?;
             result.copied.push("settings");
         }
 
         if wants("rules") {
-            let mut stmt =
-                tx.prepare("SELECT rule_id, data FROM rules WHERE guild_id = ?1")?;
+            let mut stmt = tx.prepare("SELECT rule_id, data FROM rules WHERE guild_id = ?1")?;
             let rows: Vec<(String, String)> = stmt
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
@@ -1475,9 +1470,7 @@ pub async fn copy_guild_config(
         }
 
         if wants("badwords") {
-            let mut stmt = tx.prepare(
-                "SELECT pattern, note FROM badwords WHERE guild_id = ?1",
-            )?;
+            let mut stmt = tx.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1")?;
             let rows: Vec<(String, Option<String>)> = stmt
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
@@ -1503,8 +1496,7 @@ pub async fn copy_guild_config(
         }
 
         if wants("commands") {
-            let mut stmt =
-                tx.prepare("SELECT name, data FROM commands WHERE guild_id = ?1")?;
+            let mut stmt = tx.prepare("SELECT name, data FROM commands WHERE guild_id = ?1")?;
             let rows: Vec<(String, String)> = stmt
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
@@ -1520,9 +1512,8 @@ pub async fn copy_guild_config(
         }
 
         if wants("templates") {
-            let mut stmt = tx.prepare(
-                "SELECT event_type, template FROM templates WHERE guild_id = ?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT event_type, template FROM templates WHERE guild_id = ?1")?;
             let rows: Vec<(String, String)> = stmt
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
@@ -2566,10 +2557,7 @@ mod tests {
         .err()
         .expect("unmigrated open should fail");
         let msg = err.to_string();
-        assert!(
-            msg.contains("schema is behind"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("schema is behind"), "unexpected error: {msg}");
         cleanup_db(&tmp);
     }
 
@@ -2582,18 +2570,15 @@ mod tests {
         let err = tokio_test_block_on(crate::db::delete_badword(&db, id_a, 22))
             .err()
             .expect("cross-guild delete should fail");
-        assert!(
-            err.to_string().contains("not found"),
-            "unexpected: {err:#}"
-        );
+        assert!(err.to_string().contains("not found"), "unexpected: {err:#}");
         assert!(
             !err.to_string().contains("for this guild"),
             "must not leak guild-scope detail: {err:#}"
         );
         tokio_test_block_on(crate::db::delete_badword(&db, id_b, 22)).unwrap();
         // Global rows only delete when the exact GLOBAL_SCOPE is passed.
-        let id_g = tokio_test_block_on(crate::db::add_badword(&db, GLOBAL_SCOPE, "global", None))
-            .unwrap();
+        let id_g =
+            tokio_test_block_on(crate::db::add_badword(&db, GLOBAL_SCOPE, "global", None)).unwrap();
         let err = tokio_test_block_on(crate::db::delete_badword(&db, id_g, 11))
             .err()
             .expect("guild context must not delete global via exact match");
@@ -2643,11 +2628,14 @@ mod tests {
             &db,
             11,
             22,
-            vec!["badwords".into()]
+            vec!["badwords".into()],
         ))
         .unwrap();
         assert_eq!(result.copied, vec!["badwords"]);
-        assert_eq!(result.skipped_badwords, 1, "pathological pattern must be counted");
+        assert_eq!(
+            result.skipped_badwords, 1,
+            "pathological pattern must be counted"
+        );
         let words = tokio_test_block_on(crate::db::list_badwords(&db, 22)).unwrap();
         assert_eq!(words.len(), 1, "only valid pattern should copy: {words:?}");
         assert_eq!(words[0].pattern, "scam");
@@ -2680,12 +2668,13 @@ mod tests {
             &db,
             11,
             22,
-            vec!["badwords".into()]
+            vec!["badwords".into()],
         ))
         .err()
         .expect("all-invalid source must refuse copy");
         assert!(
-            err.to_string().contains("refused") || err.to_string().contains("destination left unchanged"),
+            err.to_string().contains("refused")
+                || err.to_string().contains("destination left unchanged"),
             "unexpected: {err:#}"
         );
 
@@ -2705,7 +2694,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["badwords".into()]
+            vec!["badwords".into()],
         ))
         .unwrap();
         assert_eq!(result.copied, vec!["badwords"]);
@@ -2737,7 +2726,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["all".into()]
+            vec!["all".into()],
         ))
         .err()
         .expect("all-invalid badwords must refuse entire copy");
@@ -3015,7 +3004,8 @@ mod tests {
         ))
         .unwrap();
 
-        let rows = tokio_test_block_on(crate::db::query_events(&db, guild, None, None, 10)).unwrap();
+        let rows =
+            tokio_test_block_on(crate::db::query_events(&db, guild, None, None, 10)).unwrap();
         assert_eq!(rows.len(), 1);
         let data: serde_json::Value =
             serde_json::from_str(rows[0].data.as_deref().unwrap()).unwrap();
@@ -3038,9 +3028,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
                  VALUES (1, 'message_edit', NULL, NULL, ?1, 't')",
-                params![format!(
-                    r#"{{"channel_id":{snow},"message_id":1}}"#
-                )],
+                params![format!(r#"{{"channel_id":{snow},"message_id":1}}"#)],
             )?;
             Ok(())
         }))
@@ -3107,7 +3095,7 @@ mod tests {
         assert!(ov.retention_days.is_none());
         let effective = tokio_test_block_on(crate::db::get_settings(&db, guild)).unwrap();
         assert_eq!(effective.prefix, "p");
-        assert_eq!(effective.bot_name, "GlobalBot");
+        assert_eq!(effective.bot_name, "");
         assert_eq!(effective.retention_days, 14);
 
         // Saving a value equal to the parent clears that override field.
@@ -3416,7 +3404,7 @@ mod tests {
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (77, ?1)",
                 params![serde_json::to_string(&GuildSettingsOverride {
                     prefix: Some("g".into()),
-                    bot_name: Some("GlobalBot".into()),
+                    bot_name: None,
                     retention_days: Some(14),
                 })?],
             )?;
@@ -3466,7 +3454,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["settings".into()]
+            vec!["settings".into()],
         ))
         .unwrap();
         assert_eq!(result.copied, vec!["settings"]);
@@ -3495,7 +3483,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["settings".into()]
+            vec!["settings".into()],
         ))
         .unwrap();
         assert_eq!(result.copied, vec!["settings"]);
@@ -3524,8 +3512,8 @@ mod tests {
             Some(Some(d.retention_days)),
         ))
         .unwrap();
-        let preview = tokio_test_block_on(crate::db::preview_settings_after_copy(&db, 11, 22))
-            .unwrap();
+        let preview =
+            tokio_test_block_on(crate::db::preview_settings_after_copy(&db, 11, 22)).unwrap();
         assert_eq!(preview.prefix, "!");
         assert_eq!(preview.bot_name, "");
         assert_eq!(preview.retention_days, 7);
@@ -3533,7 +3521,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["settings".into()]
+            vec!["settings".into()],
         ))
         .unwrap();
         assert_eq!(result.copied, vec!["settings"]);
@@ -3541,8 +3529,53 @@ mod tests {
             .unwrap()
             .expect("intentional hardcoded-default pin must copy");
         assert_eq!(ov.prefix.as_deref(), Some("!"));
-        assert_eq!(ov.bot_name.as_deref(), Some(""));
+        assert!(ov.bot_name.is_none());
         assert_eq!(ov.retention_days, Some(7));
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn global_settings_never_persist_a_guild_nickname() {
+        let tmp = tmp_db_path("global_settings_no_nickname");
+        let db = Db::open(&tmp, 2).unwrap();
+
+        // The shared write path enforces the invariant even when a caller does
+        // not go through the Web API.
+        tokio_test_block_on(crate::db::patch_settings(
+            &db,
+            GLOBAL_SCOPE,
+            Some(Some("?".into())),
+            Some(Some("not-global".into())),
+            None,
+        ))
+        .unwrap();
+        let global = tokio_test_block_on(crate::db::get_settings_override(&db, GLOBAL_SCOPE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(global.prefix.as_deref(), Some("?"));
+        assert!(global.bot_name.is_none());
+
+        // Copy uses the same invariant, so a per-guild nickname cannot regain
+        // global scope through this alternate writer.
+        tokio_test_block_on(crate::db::patch_settings(
+            &db,
+            11,
+            None,
+            Some(Some("guild-only".into())),
+            None,
+        ))
+        .unwrap();
+        tokio_test_block_on(crate::db::copy_guild_config(
+            &db,
+            11,
+            GLOBAL_SCOPE,
+            vec!["settings".into()],
+        ))
+        .unwrap();
+        let global = tokio_test_block_on(crate::db::get_settings_override(&db, GLOBAL_SCOPE))
+            .unwrap()
+            .unwrap();
+        assert!(global.bot_name.is_none());
         cleanup_db(&tmp);
     }
 
@@ -3555,7 +3588,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["logchannels".into()]
+            vec!["logchannels".into()],
         ))
         .err()
         .expect("cross-guild logchannels must refuse");
@@ -3571,7 +3604,7 @@ mod tests {
             &db,
             11,
             22,
-            vec!["all".into()]
+            vec!["all".into()],
         ))
         .unwrap();
         assert!(result.skipped_logchannels);
@@ -3584,7 +3617,7 @@ mod tests {
             &db,
             11,
             11,
-            vec!["logchannels".into()]
+            vec!["logchannels".into()],
         ))
         .unwrap();
         assert!(
@@ -3592,6 +3625,21 @@ mod tests {
             "same-guild logchannels must not report copied"
         );
         assert!(!result.skipped_logchannels);
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn log_channels_require_positive_snowflakes() {
+        let tmp = tmp_db_path("positive_log_channel");
+        let db = Db::open(&tmp, 2).unwrap();
+        let err = tokio_test_block_on(crate::db::upsert_log_channel(&db, 11, "member_join", -1))
+            .unwrap_err();
+        assert!(err.to_string().contains("positive Discord snowflake"));
+        assert!(
+            tokio_test_block_on(crate::db::list_log_channels(&db, 11))
+                .unwrap()
+                .is_empty()
+        );
         cleanup_db(&tmp);
     }
 
@@ -3657,7 +3705,7 @@ mod tests {
             .unwrap()
             .expect("intentional hardcoded-default override must survive write path");
         assert_eq!(ov.prefix.as_deref(), Some("!"));
-        assert_eq!(ov.bot_name.as_deref(), Some(""));
+        assert!(ov.bot_name.is_none());
         assert_eq!(ov.retention_days, Some(7));
         let effective = tokio_test_block_on(crate::db::get_settings(&db, 42)).unwrap();
         assert_eq!(effective.prefix, "!");
@@ -3765,15 +3813,17 @@ mod tests {
         .unwrap();
         // get_settings must succeed and persist the clear (no restart / heal needed).
         let effective = tokio_test_block_on(crate::db::get_settings(&db, 44)).unwrap();
-        assert_eq!(effective.prefix, db.read_terminal_defaults().unwrap().prefix);
+        assert_eq!(
+            effective.prefix,
+            db.read_terminal_defaults().unwrap().prefix
+        );
         assert!(
             tokio_test_block_on(crate::db::get_settings_override(&db, 44))
                 .unwrap()
                 .is_none(),
             "corrupt row must be deleted on read"
         );
-        let v_after_clear =
-            tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
+        let v_after_clear = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
         drop(db);
         let db2 = Db::open_with(DbOpenOptions {
             path: tmp.clone(),
@@ -3785,8 +3835,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let v_after_reopen =
-            tokio_test_block_on(crate::db::get_config_version(&db2)).unwrap();
+        let v_after_reopen = tokio_test_block_on(crate::db::get_config_version(&db2)).unwrap();
         assert_eq!(
             v_after_clear, v_after_reopen,
             "corrupt clear must refresh heal checksum so reopen skips heal"
@@ -3948,7 +3997,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            tokio_test_block_on(crate::db::get_settings(&api, 1)).unwrap().prefix,
+            tokio_test_block_on(crate::db::get_settings(&api, 1))
+                .unwrap()
+                .prefix,
             "a!"
         );
         drop(db);
@@ -3965,7 +4016,9 @@ mod tests {
         .unwrap();
         // API process still open — must see bot's new meta without restart.
         assert_eq!(
-            tokio_test_block_on(crate::db::get_settings(&api, 1)).unwrap().prefix,
+            tokio_test_block_on(crate::db::get_settings(&api, 1))
+                .unwrap()
+                .prefix,
             "b!"
         );
         cleanup_db(&tmp);

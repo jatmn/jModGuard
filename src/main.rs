@@ -103,7 +103,9 @@ async fn main() -> Result<()> {
 
     let mut client = serenity::client::ClientBuilder::new(&cfg.discord.token, intents)
         .cache_settings(cache_settings)
-        .event_handler(Handler { app: Arc::clone(&app) })
+        .event_handler(Handler {
+            app: Arc::clone(&app),
+        })
         .await
         .context("failed to create discord client")?;
 
@@ -137,7 +139,9 @@ async fn main() -> Result<()> {
                             cache.guilds().into_iter().map(|g| g.get()).collect();
                         match app.plan_slash_resync(remote, &cached) {
                             jmodguard::state::SlashResyncPlan::Defer => {
-                                tracing::debug!("slash re-sync deferred: guild cache empty (will retry)");
+                                tracing::debug!(
+                                    "slash re-sync deferred: guild cache empty (will retry)"
+                                );
                             }
                             jmodguard::state::SlashResyncPlan::Done => {
                                 app.commit_slash_registry_version(remote);
@@ -161,7 +165,9 @@ async fn main() -> Result<()> {
                                 if app.finish_slash_resync(remote, failed) {
                                     app.commit_slash_registry_version(remote);
                                 } else {
-                                    tracing::warn!("slash re-sync incomplete; will retry failed guilds");
+                                    tracing::warn!(
+                                        "slash re-sync incomplete; will retry failed guilds"
+                                    );
                                 }
                             }
                         }

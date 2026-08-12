@@ -168,7 +168,9 @@ async fn require_auth_with(
             match app.oauth.my_guilds(&tok.access_token).await {
                 Ok(g) => (tok.access_token, g),
                 Err(e2) => {
-                    tracing::warn!("webui auth: refresh guilds fetch failed for user {user_id}: {e2:#}");
+                    tracing::warn!(
+                        "webui auth: refresh guilds fetch failed for user {user_id}: {e2:#}"
+                    );
                     return Err(ApiError(e2));
                 }
             }
@@ -912,12 +914,16 @@ mod tests {
     #[test]
     fn session_cookie_secure_follows_base_url() {
         // Mirror router() policy: https base_url → Secure cookies.
-        assert!(!"http://localhost:8080"
-            .to_ascii_lowercase()
-            .starts_with("https://"));
-        assert!("https://bot.example.com"
-            .to_ascii_lowercase()
-            .starts_with("https://"));
+        assert!(
+            !"http://localhost:8080"
+                .to_ascii_lowercase()
+                .starts_with("https://")
+        );
+        assert!(
+            "https://bot.example.com"
+                .to_ascii_lowercase()
+                .starts_with("https://")
+        );
     }
 
     #[test]
