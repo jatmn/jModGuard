@@ -401,7 +401,11 @@ fn sanitize_slash_name(name: &str) -> String {
         .chars()
         .take(32)
         .collect();
-    if out.is_empty() { "command".to_string() } else { out }
+    if out.is_empty() {
+        "command".to_string()
+    } else {
+        out
+    }
 }
 
 fn slash_description(description: &str) -> String {

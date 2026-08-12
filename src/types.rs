@@ -77,10 +77,7 @@ impl GuildSettingsOverride {
     /// Apply this override on top of `base` (only `Some` fields replace).
     pub fn merge_into(&self, base: &GuildSettings) -> GuildSettings {
         GuildSettings {
-            prefix: self
-                .prefix
-                .clone()
-                .unwrap_or_else(|| base.prefix.clone()),
+            prefix: self.prefix.clone().unwrap_or_else(|| base.prefix.clone()),
             bot_name: self
                 .bot_name
                 .clone()
@@ -129,7 +126,9 @@ pub type SettingsPatchField<T> = Option<Option<T>>;
 /// - absent + `#[serde(default)]` → `None` (unchanged)
 /// - `null` → `Some(None)` (clear override / inherit parent)
 /// - value → `Some(Some(v))` (set override)
-pub fn de_settings_patch_field<'de, D, T>(deserializer: D) -> Result<SettingsPatchField<T>, D::Error>
+pub fn de_settings_patch_field<'de, D, T>(
+    deserializer: D,
+) -> Result<SettingsPatchField<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -151,7 +150,10 @@ where
             Ok(Some(None))
         }
 
-        fn visit_some<D2: Deserializer<'de>>(self, deserializer: D2) -> Result<Self::Value, D2::Error> {
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
             T::deserialize(deserializer).map(|v| Some(Some(v)))
         }
     }
@@ -317,9 +319,16 @@ pub enum Behavior {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlanStep {
-    Reply { template: String },
-    Dm { template: String },
-    Log { event: String, template: String },
+    Reply {
+        template: String,
+    },
+    Dm {
+        template: String,
+    },
+    Log {
+        event: String,
+        template: String,
+    },
     AddRole {
         #[serde(
             deserialize_with = "crate::ids::de_u64",
@@ -334,12 +343,20 @@ pub enum PlanStep {
         )]
         role_id: u64,
     },
-    Timeout { minutes: u32 },
+    Timeout {
+        minutes: u32,
+    },
     Kick,
-    Ban { delete_days: u8 },
+    Ban {
+        delete_days: u8,
+    },
     DeleteCommandMessage,
-    React { emoji: String },
-    Wait { secs: u64 },
+    React {
+        emoji: String,
+    },
+    Wait {
+        secs: u64,
+    },
 }
 
 fn default_true() -> bool {

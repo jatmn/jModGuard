@@ -227,9 +227,11 @@ pub async fn update_settings(
         previous_nick = Some(current.bot_name.clone());
         discord_nick = Some(current.bot_name.clone());
         let target_nick = match bot_name_patch {
-            None => db::get_parent_settings(&app.db, guild_id as i64)
-                .await?
-                .bot_name,
+            None => {
+                db::get_parent_settings(&app.db, guild_id as i64)
+                    .await?
+                    .bot_name
+            }
             Some(n) => n.clone(),
         };
         if current.bot_name != target_nick || body.sync_nickname {
@@ -323,11 +325,7 @@ async fn apply_bot_nickname(app: &AppState, guild_id: u64, bot_name: &str) -> an
             let me = app.bot_user_id().await?;
             use serenity::builder::EditMember;
             serenity::model::id::GuildId::new(guild_id)
-                .edit_member(
-                    app.discord_http(),
-                    me,
-                    EditMember::new().nickname(nick),
-                )
+                .edit_member(app.discord_http(), me, EditMember::new().nickname(nick))
                 .await?;
             Ok(())
         }
@@ -522,10 +520,7 @@ pub async fn get_command(
     let def = crate::defaults::default_commands()
         .into_iter()
         .find(|c| c.name == name);
-    let effective = guild_override
-        .clone()
-        .or_else(|| global.clone())
-        .or(def);
+    let effective = guild_override.clone().or_else(|| global.clone()).or(def);
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
@@ -536,7 +531,8 @@ pub async fn get_command(
 fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
     let valid_name = !cmd.name.is_empty()
         && cmd.name.len() <= 32
-        && cmd.name
+        && cmd
+            .name
             .bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_');
     if !valid_name {
@@ -633,10 +629,7 @@ pub async fn get_template(
         .into_iter()
         .find(|(e, _)| *e == event)
         .map(|(_, t)| t.to_string());
-    let effective = guild_override
-        .clone()
-        .or_else(|| global.clone())
-        .or(def);
+    let effective = guild_override.clone().or_else(|| global.clone()).or(def);
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
@@ -800,10 +793,7 @@ pub async fn copy_config(
         )));
     }
 
-    let wants_settings = body
-        .sections
-        .iter()
-        .any(|s| s == "settings" || s == "all");
+    let wants_settings = body.sections.iter().any(|s| s == "settings" || s == "all");
 
     // Refuse known hard-fail cases *before* Discord nickname mutation.
     // Without this, Discord-then-SQLite left nick updated when badwords /
@@ -830,12 +820,9 @@ pub async fn copy_config(
     let mut previous_nick: Option<String> = None;
     let mut preview_nick: Option<String> = None;
     if wants_settings && guild_id != 0 {
-        let preview = db::preview_settings_after_copy(
-            &app.db,
-            body.from_guild_id as i64,
-            guild_id as i64,
-        )
-        .await?;
+        let preview =
+            db::preview_settings_after_copy(&app.db, body.from_guild_id as i64, guild_id as i64)
+                .await?;
         let current = db::get_settings(&app.db, guild_id as i64).await?;
         previous_nick = Some(current.bot_name.clone());
         preview_nick = Some(preview.bot_name.clone());
@@ -847,9 +834,7 @@ pub async fn copy_config(
                         "failed to apply Discord nickname before settings copy \
                          (guild={guild_id}): {e:#}"
                     );
-                    ApiError(anyhow::anyhow!(
-                        "failed to update Discord nickname: {e:#}"
-                    ))
+                    ApiError(anyhow::anyhow!("failed to update Discord nickname: {e:#}"))
                 })?;
             nickname_applied = Some(true);
         }
@@ -1096,8 +1081,7 @@ mod tests {
         assert_eq!(omit.retention_days, None);
 
         let set: SettingsBody =
-            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot","retention_days":0}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot","retention_days":0}"#).unwrap();
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
         assert_eq!(set.retention_days, Some(Some(0)));

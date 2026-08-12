@@ -62,12 +62,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .http
                 .remove_ban(env.guild_id, target, Some(&reason))
                 .await?;
-            if let Err(e) = db::mark_unbanned(
-                &env.app.db,
-                env.guild_id.get() as i64,
-                target.get() as i64,
-            )
-            .await
+            if let Err(e) =
+                db::mark_unbanned(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await
             {
                 tracing::warn!(
                     "local ban mirror update failed after Discord unban \
@@ -107,7 +103,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Timeout { default_minutes } => {
             let mut args = env.args.clone();
             let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
+                    .await?;
             let minutes: u64 = args
                 .next_arg()
                 .and_then(|m| m.parse().ok())
@@ -155,7 +152,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Warn { default_reason } => {
             let mut args = env.args.clone();
             let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
+                    .await?;
             let reason = if args.is_empty() {
                 default_reason.clone()
             } else {
@@ -181,7 +179,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Warns => {
             let mut args = env.args.clone();
             let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
+                    .await?;
             let target_user = user_lookup(env, target).await?;
             let warns =
                 db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
@@ -213,7 +212,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::WarnClear => {
             let mut args = env.args.clone();
             let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
+                    .await?;
             let target_user = user_lookup(env, target).await?;
             let n = db::clear_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
                 .await?;
@@ -331,9 +331,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let raw = env.args.clone().rest();
             let trimmed = raw.trim();
             // Empty / `clear` / `-` clears the Discord nickname (same as WebUI).
-            let clear = trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("clear")
-                || trimmed == "-";
+            let clear =
+                trimmed.is_empty() || trimmed.eq_ignore_ascii_case("clear") || trimmed == "-";
             let name = if clear { "" } else { trimmed };
             let me = env.ctx.cache.current_user().id;
             let guild_id = env.guild_id.get();
@@ -351,11 +350,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     let nick = nick.clone();
                     async {
                         env.guild_id
-                            .edit_member(
-                                &env.ctx.http,
-                                me,
-                                EditMember::new().nickname(nick),
-                            )
+                            .edit_member(&env.ctx.http, me, EditMember::new().nickname(nick))
                             .await
                             .map(|_| ())
                     }
@@ -375,10 +370,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             {
                 if discord_applied && me.get() != 0 {
                     let prev = previous.clone();
-                    if let Err(re) = crate::discord::with_retries(
-                        "Discord nickname restore",
-                        guild_id,
-                        || {
+                    if let Err(re) =
+                        crate::discord::with_retries("Discord nickname restore", guild_id, || {
                             let prev = prev.clone();
                             async {
                                 env.guild_id
@@ -390,9 +383,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                                     .await
                                     .map(|_| ())
                             }
-                        },
-                    )
-                    .await
+                        })
+                        .await
                     {
                         tracing::error!(
                             "failed to restore Discord nickname after !setname DB error \
@@ -452,8 +444,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 ));
             }
             // Same compile budget as WebUI /api/.../testregex and add_badword.
-            let re = crate::normalize::compile_user_regex(&pattern)
-                .map_err(|e| anyhow!(e))?;
+            let re = crate::normalize::compile_user_regex(&pattern).map_err(|e| anyhow!(e))?;
             let normalized = crate::normalize::normalize_lenient(&sample);
             let raw_match = re.is_match(&sample);
             let norm_match = re.is_match(&normalized);
@@ -579,7 +570,8 @@ async fn target_and_reason(
     default_reason: &str,
 ) -> Result<(serenity::model::id::UserId, String)> {
     let mut args = env.args.clone();
-    let target = resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+    let target =
+        resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
     let reason = if args.is_empty() {
         default_reason.to_string()
     } else {
@@ -640,7 +632,9 @@ async fn log_mod(
 
 async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let action = args.next_arg().unwrap_or_else(|| default_action.to_string());
+    let action = args
+        .next_arg()
+        .unwrap_or_else(|| default_action.to_string());
     let vars = std::collections::BTreeMap::new();
     match action.as_str() {
         "list" => {
@@ -700,7 +694,9 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
 
 async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let mut action = args.next_arg().unwrap_or_else(|| default_action.to_string());
+    let mut action = args
+        .next_arg()
+        .unwrap_or_else(|| default_action.to_string());
     let mut rule_id = args.next_arg().unwrap_or_default();
     // Slash options arrive as (name, action); prefix as (action, name).
     // Accept both orders.
@@ -782,7 +778,9 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
 
 async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let action = args.next_arg().unwrap_or_else(|| default_action.to_string());
+    let action = args
+        .next_arg()
+        .unwrap_or_else(|| default_action.to_string());
     let vars = std::collections::BTreeMap::new();
     let guild = env.guild_id.get() as i64;
     match action.as_str() {
@@ -915,6 +913,11 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("event", Str, false, "Event type"),
             opt("channel", Channel, false, "Target channel"),
         ],
+        // Plans may contain moderation steps. Keep the target optional so
+        // self-service plans (for example, add-role) and reply-only plans
+        // remain ergonomic, while the executor rejects target-required steps
+        // when it is omitted.
+        Behavior::Plan { .. } => vec![opt("user", User, false, "Target user")],
         Behavior::Testregex => vec![
             opt("pattern", Str, true, "Regex pattern"),
             opt("sample", Str, true, "Sample text"),
@@ -938,5 +941,14 @@ mod tests {
             !specs[0].required,
             "optional name lets /setname clear like prefix !setname with no args"
         );
+    }
+
+    #[test]
+    fn plan_slash_user_option_is_optional() {
+        let specs = slash_spec(&Behavior::Plan { steps: vec![] });
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "user");
+        assert_eq!(specs[0].kind, CommandOptionType::User);
+        assert!(!specs[0].required);
     }
 }

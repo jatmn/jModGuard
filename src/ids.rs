@@ -121,7 +121,10 @@ where
             Ok(None)
         }
 
-        fn visit_some<D2: Deserializer<'de>>(self, deserializer: D2) -> Result<Option<i64>, D2::Error> {
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Option<i64>, D2::Error> {
             de_i64(deserializer).map(Some)
         }
 
@@ -165,7 +168,10 @@ where
             Ok(None)
         }
 
-        fn visit_some<D2: Deserializer<'de>>(self, deserializer: D2) -> Result<Option<u64>, D2::Error> {
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Option<u64>, D2::Error> {
             de_u64(deserializer).map(Some)
         }
 
@@ -284,11 +290,7 @@ pub fn stringify_js_unsafe_integers(value: &serde_json::Value) -> serde_json::Va
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(
-            arr.iter()
-                .map(stringify_js_unsafe_integers)
-                .collect(),
-        ),
+        Value::Array(arr) => Value::Array(arr.iter().map(stringify_js_unsafe_integers).collect()),
         Value::Number(n) => {
             if let Some(u) = n.as_u64() {
                 if u > JS_MAX_SAFE_INTEGER {
@@ -344,8 +346,7 @@ mod tests {
             #[serde(deserialize_with = "de_u64_vec")]
             roles: Vec<u64>,
         }
-        let w: W =
-            serde_json::from_str(r#"{"roles":["1329331947876479006", 99]}"#).unwrap();
+        let w: W = serde_json::from_str(r#"{"roles":["1329331947876479006", 99]}"#).unwrap();
         assert_eq!(w.roles, vec![1329331947876479006, 99]);
     }
 
