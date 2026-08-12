@@ -121,6 +121,9 @@ owner_id = 123456789012345678               # your Discord user ID
 # Windows: target\release\jmodguard-bot.exe / target\release\jmodguard-api.exe
 ```
 
+Run the bot and API in separate terminals (or as the services below): the bot
+is a long-running Discord gateway, so it does not return before the API command.
+
 First boot (bot):
 - creates `jmodguard.db` (SQLite, WAL mode) and applies migrations,
 - seeds default rules, commands, and event templates (all editable later),
@@ -131,10 +134,10 @@ The API process serves the WebUI on `127.0.0.1:8080` (expects a migrated DB).
 ### Windows (run as a service)
 
 1. **Task Scheduler**: Create Basic Tasks for both binaries → Program: path to
-   `jmodguard-bot.exe` / `jmodguard-api.exe`, trigger: *At startup*.
+   `target\release\jmodguard-bot.exe` / `target\release\jmodguard-api.exe`, trigger: *At startup*.
 2. Or use **NSSM** for proper services:
-   `nssm install jModGuardBot C:\path\to\jmodguard-bot.exe` and
-   `nssm install jModGuardApi C:\path\to\jmodguard-api.exe`.
+   `nssm install jModGuardBot C:\path\to\target\release\jmodguard-bot.exe` and
+   `nssm install jModGuardApi C:\path\to\target\release\jmodguard-api.exe`.
 
 ### Linux (systemd)
 
@@ -148,7 +151,7 @@ After=network-online.target
 [Service]
 User=jmodguard
 WorkingDirectory=/opt/jmodguard
-ExecStart=/opt/jmodguard/jmodguard-bot
+ExecStart=/opt/jmodguard/target/release/jmodguard-bot
 Restart=on-failure
 RestartSec=5
 
@@ -166,7 +169,7 @@ After=network-online.target jmodguard-bot.service
 [Service]
 User=jmodguard
 WorkingDirectory=/opt/jmodguard
-ExecStart=/opt/jmodguard/jmodguard-api
+ExecStart=/opt/jmodguard/target/release/jmodguard-api
 Restart=on-failure
 RestartSec=5
 
