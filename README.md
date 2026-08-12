@@ -39,9 +39,10 @@ cp config.example.toml config.toml     # add your token + OAuth ids
 # open http://localhost:8080 and login with Discord
 ```
 
-Start the bot once before the API so migrations are applied. The API waits
-about 30 seconds if the schema is not ready yet. Both processes share the same
-SQLite file (`db.path`).
+Start the bot once before the API so migrations and default-data bootstrap are
+complete. The API waits about 30 seconds while the bot is migrating or holds a
+transient SQLite startup lock. Both processes share the same SQLite file
+(`db.path`).
 
 Full walkthrough (Discord developer portal, intents, invite URL, systemd /
 Task Scheduler): **[docs/SETUP.md](docs/SETUP.md)**.

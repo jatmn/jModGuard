@@ -126,8 +126,8 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   authority) and read from that meta row on every settings resolve (not cached
   at process open) as the final fallback when neither guild nor global sets a
   field — shared by WebUI / `get_settings` / config cache / purge so bot and
-  API cannot diverge. The API refuses to open when that meta row is missing
-  (start the bot first).
+  API cannot diverge. The API refuses to open until that meta row and the
+  bot-written bootstrap-complete marker exist (start the bot first).
 - Cross-process config lag up to `config_poll_secs` after a successful baseline
   is expected (not a bug).
 - Log channel IDs are Discord-guild-scoped and are **not** copied between

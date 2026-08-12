@@ -83,16 +83,22 @@ Both images use `WORKDIR /data`, `VOLUME ["/data"]`,
 The API image also sets `JMODGUARD_WEB_BIND=0.0.0.0:8080` and exposes 8080 —
 the host default `127.0.0.1` is unreachable from outside the container.
 
-Mount **one** shared volume on `/data` for both containers (config + SQLite):
+Mount **one** shared volume on `/data` for both containers. The commands below
+use environment-injected secrets and defaults, so a fresh volume does not need
+`config.toml`; mount or create that file first if you need non-default TOML
+settings.
 
 ```bash
 docker volume create jmodguard-data
 docker run -d --name jmodguard-bot \
   -v jmodguard-data:/data \
   -e JMODGUARD_DISCORD_TOKEN=… \
+  -e JMODGUARD_OWNER_ID=123456789012345678 \
   your-registry/jmodguard-bot:tag
 docker run -d --name jmodguard-api -p 8080:8080 \
   -v jmodguard-data:/data \
+  -e JMODGUARD_DISCORD_TOKEN=… \
+  -e JMODGUARD_OWNER_ID=123456789012345678 \
   -e JMODGUARD_OAUTH_CLIENT_ID=… \
   -e JMODGUARD_OAUTH_CLIENT_SECRET=… \
   -e JMODGUARD_WEB_BASE_URL=https://admin.example.com \

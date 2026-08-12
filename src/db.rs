@@ -47,6 +47,25 @@ pub fn is_schema_not_ready(err: &anyhow::Error) -> bool {
         .any(|e| e.downcast_ref::<SchemaNotReady>().is_some())
 }
 
+/// SQLite can be temporarily locked while the bot is applying migrations.
+/// That is an expected API-startup race, unlike other SQLite failures.
+fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        matches!(
+            e.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+fn is_api_startup_retryable(err: &anyhow::Error) -> bool {
+    is_schema_not_ready(err) || is_sqlite_startup_lock(err)
+}
+
 /// Options for opening a database (local path today; remote URL reserved).
 #[derive(Debug, Clone)]
 pub struct DbOpenOptions {
@@ -114,6 +133,11 @@ impl Db {
                  PRAGMA busy_timeout=5000;",
             )?;
             if opts.migrate {
+                // A previous successful boot may have left this marker behind.
+                // Clear it before any new migration/default work so an API
+                // restarting concurrently cannot mistake stale readiness for
+                // completion of this bootstrap.
+                clear_bootstrap_complete(&bootstrap)?;
                 migrate_conn(&mut bootstrap)?;
                 // Bot is authority for terminal defaults: sync from config every
                 // migrate-open so both processes resolve empty global fields from
@@ -127,6 +151,7 @@ impl Db {
                 )?;
             } else {
                 ensure_schema_current(&bootstrap)?;
+                ensure_bootstrap_complete(&bootstrap)?;
             }
             // API must never seed terminal defaults — that poisoned meta when API
             // opened before the bot with a different config.toml.
@@ -139,6 +164,12 @@ impl Db {
             })?;
             // Idempotent when guild_settings changed; skipped via checksum when not.
             heal_default_guild_settings_conn(&mut bootstrap, &defaults)?;
+            // Only publish readiness after all migrations, durable defaults,
+            // default rows, and the settings heal have completed. Otherwise an
+            // API process can serve an incomplete registry during first boot.
+            if opts.migrate {
+                write_meta_string_conn(&bootstrap, META_BOOTSTRAP_COMPLETE, "1")?;
+            }
         }
 
         let manager = SqliteConnectionManager::file(path).with_init(|c| {
@@ -175,9 +206,9 @@ impl Db {
         for i in 0..attempts {
             match Self::open_with(opts.clone()) {
                 Ok(db) => return Ok(db),
-                Err(err) if is_schema_not_ready(&err) => {
+                Err(err) if is_api_startup_retryable(&err) => {
                     tracing::info!(
-                        "database schema not ready (attempt {}/{attempts}); waiting for jmodguard-bot",
+                        "database not ready for API (attempt {}/{attempts}); waiting for jmodguard-bot: {err:#}",
                         i + 1
                     );
                     last = Some(err);
@@ -188,9 +219,8 @@ impl Db {
                 Err(err) => return Err(err),
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("database schema not ready"))).context(
-            "timed out waiting for jmodguard-bot to migrate the database",
-        )
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("database schema not ready")))
+            .context("timed out waiting for jmodguard-bot to migrate the database")
     }
 
     /// Runs a blocking closure on a pooled connection off the async runtime.
@@ -255,8 +285,7 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
             [],
             |r| r.get(0),
-        )
-        .unwrap_or(0);
+        )?;
     if has_meta == 0 {
         return Err(SchemaNotReady(
             "database is missing meta table (config_version). \
@@ -334,6 +363,9 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 /// settings override is empty. Process-local config alone caused split-brain
 /// whenever the two processes loaded different config values.
 const META_TERMINAL_DEFAULTS: &str = "settings_terminal_defaults";
+/// Written only after a bot has completed the entire bootstrap sequence.
+/// The API must not treat schema version alone as a readiness signal.
+const META_BOOTSTRAP_COMPLETE: &str = "bootstrap_complete";
 /// Bump when heal logic changes so every DB re-runs migration once.
 const SETTINGS_HEAL_GENERATION: &str = "3";
 const META_SETTINGS_HEAL_GENERATION: &str = "settings_heal_generation";
@@ -393,6 +425,34 @@ fn read_terminal_defaults_meta(conn: &Connection) -> Result<Option<GuildSettings
             .map(|r| r as u32)
             .unwrap_or(GuildSettings::default().retention_days),
     }))
+}
+
+fn ensure_bootstrap_complete(conn: &Connection) -> Result<()> {
+    if meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref() != Some("1") {
+        return Err(SchemaNotReady(
+            "database bootstrap is incomplete. Start jmodguard-bot once first, then start jmodguard-api."
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
+    let has_meta: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_meta != 0 {
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![META_BOOTSTRAP_COMPLETE],
+        )?;
+    }
+    Ok(())
 }
 
 /// Terminal defaults for settings resolution — always read from durable meta.
@@ -2652,6 +2712,75 @@ mod tests {
         ))
         .expect("API must succeed once bot migrations finish");
         handle.join().expect("bot migrate thread panicked");
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn api_waits_for_completed_bot_bootstrap() {
+        let tmp = tmp_db_path("api_bootstrap_marker");
+        let mut conn = Connection::open(&tmp).unwrap();
+        migrate_conn(&mut conn).unwrap();
+        write_terminal_defaults_meta(&conn, &GuildSettings::default()).unwrap();
+
+        let api_opts = DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        };
+        let err = Db::open_with(api_opts.clone())
+            .err()
+            .expect("API must not open before default rows are seeded");
+        assert!(is_schema_not_ready(&err), "unexpected error: {err:#}");
+        assert!(
+            err.to_string().contains("bootstrap is incomplete"),
+            "unexpected error: {err:#}"
+        );
+
+        Db::open_with(DbOpenOptions {
+            migrate: true,
+            ..api_opts.clone()
+        })
+        .expect("bot bootstrap must complete");
+        Db::open_with(api_opts).expect("API must open after bot bootstrap completes");
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn api_open_retries_while_bot_holds_sqlite_lock() {
+        let tmp = tmp_db_path("api_retry_locked");
+        let db = Db::open(&tmp, 2).unwrap();
+        drop(db);
+
+        let lock_path = tmp.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(lock_path).unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        tokio_test_block_on(Db::open_with_until_ready(
+            DbOpenOptions {
+                path: tmp.clone(),
+                url: String::new(),
+                token: String::new(),
+                pool_size: 2,
+                migrate: false,
+                default_prefix: "!".into(),
+                retention_days: 7,
+            },
+            10,
+            std::time::Duration::from_millis(25),
+        ))
+        .expect("API must wait for a transient bot bootstrap lock");
+        holder.join().unwrap();
         cleanup_db(&tmp);
     }
 
