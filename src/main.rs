@@ -7,29 +7,16 @@
 //! - Per-event log channels with editable templates.
 //! - Multi-server: per-guild config with global scoping and copy-from-server.
 
-mod automod;
-mod commands;
-mod config;
-mod db;
-mod defaults;
-mod handlers;
-mod logging;
-mod normalize;
-mod state;
-mod templates;
-mod types;
-mod web;
-
 use anyhow::{Context as _, Result};
+use jmodguard::config::Config;
+use jmodguard::db::{self, Db};
+use jmodguard::handlers::Handler;
+use jmodguard::state::AppState;
+use jmodguard::{init_tracing, web};
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
 use std::sync::Arc;
 use std::time::Duration;
-
-use crate::config::Config;
-use crate::db::Db;
-use crate::handlers::Handler;
-use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -115,39 +102,4 @@ async fn main() -> Result<()> {
     tracing::info!("starting shards");
     client.start().await.context("discord client error")?;
     Ok(())
-}
-
-fn init_tracing(cfg: &Config) {
-    let level = cfg.log.level.clone();
-    let dir = cfg.log.directory.clone();
-    // Our crate logs per-message diagnostics at debug; everything else at the
-    // configured level. This keeps the log file useful without drowning in
-    // serenity internals.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("{level},jmodguard=debug")));
-
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(false);
-
-    if dir.as_os_str().is_empty() {
-        fmt.try_init().ok();
-        return;
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(
-            "failed to create log dir {}: {e}; falling back to console",
-            dir.display()
-        );
-        fmt.try_init().ok();
-        return;
-    }
-    let file_appender = tracing_appender::rolling::daily(&dir, "jmodguard.log");
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    // The guard must live for the process lifetime: dropping it shuts down
-    // the writer thread and silently loses all log output.
-    std::mem::forget(guard);
-    fmt.with_writer(non_blocking).try_init().ok();
 }
