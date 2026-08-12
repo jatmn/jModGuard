@@ -78,6 +78,29 @@ Repo Dockerfiles:
 - `Dockerfile.bot` — `cargo build --release --bin jmodguard-bot --no-default-features`
 - `Dockerfile.api` — `cargo build --release --bin jmodguard-api` (feature `web`)
 
+Both images use `WORKDIR /data`, `VOLUME ["/data"]`,
+`JMODGUARD_DB_PATH=/data/jmodguard.db`, and `JMODGUARD_CONFIG=/data/config.toml`.
+The API image also sets `JMODGUARD_WEB_BIND=0.0.0.0:8080` and exposes 8080 —
+the host default `127.0.0.1` is unreachable from outside the container.
+
+Mount **one** shared volume on `/data` for both containers (config + SQLite):
+
+```bash
+docker volume create jmodguard-data
+docker run -d --name jmodguard-bot \
+  -v jmodguard-data:/data \
+  -e JMODGUARD_DISCORD_TOKEN=… \
+  your-registry/jmodguard-bot:tag
+docker run -d --name jmodguard-api -p 8080:8080 \
+  -v jmodguard-data:/data \
+  -e JMODGUARD_OAUTH_CLIENT_ID=… \
+  -e JMODGUARD_OAUTH_CLIENT_SECRET=… \
+  -e JMODGUARD_WEB_BASE_URL=https://admin.example.com \
+  your-registry/jmodguard-api:tag
+```
+
+Do not give each container its own anonymous volume: that is two databases.
+
 Push images to a registry your chosen host can pull. Pin tags to jModGuard
 releases (`vX.Y.Z`).
 

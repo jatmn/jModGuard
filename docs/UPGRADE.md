@@ -7,6 +7,30 @@ deploy, see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). If you maintain your own
 registry/CDN/secrets pipeline, follow this guide for product steps, then apply
 your operator runbook for promote and rollout.
 
+## 0. Upgrading from the single `jmodguard` binary
+
+Older builds shipped one process: `target/release/jmodguard` (or `jmodguard.exe`)
+and typically one service unit (`jmodguard.service` / one Task Scheduler task).
+This release **removes that entrypoint**. You must run two binaries:
+
+| Old | New |
+|-----|-----|
+| `jmodguard` | `jmodguard-bot` (Discord gateway, migrations) **and** `jmodguard-api` (WebUI) |
+
+1. Stop the old `jmodguard` process/service (there is no “old API” yet).
+2. Build both new binaries (`jmodguard-bot` with `--no-default-features`,
+   `jmodguard-api` with the default `web` feature). See [SETUP.md](SETUP.md).
+3. Keep the same working directory and `config.toml` / `jmodguard.db`.
+4. Replace the one unit/task with **two** (`jmodguard-bot` then `jmodguard-api`).
+   Logs are now `logs/jmodguard-bot.log.*` and `logs/jmodguard-api.log.*`
+   instead of a single `jmodguard.log`.
+5. Fill in Discord OAuth client id/secret. The API process **refuses to start**
+   without them; the old monolith could still run Discord without WebUI login.
+6. Start the bot first (it migrates). The API waits about 30 seconds for that
+   schema, then exits if the bot never migrates.
+
+Then continue with backup / rollout below as for any later upgrade.
+
 ## 1. Pick a version
 
 Prefer a **git tag** or release (`vX.Y.Z`) over an arbitrary `main` commit.

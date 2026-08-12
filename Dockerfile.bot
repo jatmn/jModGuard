@@ -13,4 +13,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/jmodguard-bot /usr/local/bin/jmodguard-bot
+WORKDIR /data
+VOLUME ["/data"]
+ENV JMODGUARD_DB_PATH=/data/jmodguard.db
+ENV JMODGUARD_CONFIG=/data/config.toml
 ENTRYPOINT ["jmodguard-bot"]

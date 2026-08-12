@@ -11,8 +11,8 @@ Neither process calls the other. The **database is the source of truth**.
 
 ```
 jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jmodguard-api
-       │                           │
-       └──── polls config_version ─┘
+       │                           │                           │
+       └──── polls config_version ─┴── both processes poll ────┘
 ```
 
 ## Feature split
@@ -40,7 +40,9 @@ is by design.
 ## Migrations
 
 - Bot applies migrations and seeds globals.
-- API refuses to start if `user_version` is behind or `meta` is missing.
+- API opens with `migrate=false`. If the schema or terminal-defaults meta is
+  missing, that is a typed `SchemaNotReady` error: the API retries for about
+  30 seconds, then exits. Other open failures (remote URL, I/O) fail immediately.
 - Always start (or migrate with) the bot before the API on a new or upgraded DB.
 
 ## WebUI auth (summary)
@@ -58,7 +60,7 @@ src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 frontend/                  SPA (served by API locally; CDN-ready)
-migrations/                0001_init + 0002_config_version
+migrations/                0001_init + 0002_config_version + 0003_archive_global_log_channels
 Dockerfile.bot
 Dockerfile.api
 ```

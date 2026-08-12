@@ -129,15 +129,20 @@ First boot (bot):
 - seeds default rules, commands, and event templates (all editable later),
 - syncs slash commands into every server it is in.
 
-The API process serves the WebUI on `127.0.0.1:8080` (expects a migrated DB).
+The API process serves the WebUI on `127.0.0.1:8080`. It **requires** Discord
+OAuth client id/secret (it exits immediately if they are empty). If the bot is
+still migrating, the API waits about 30 seconds, then exits.
 
 ### Windows (run as a service)
 
 1. **Task Scheduler**: Create Basic Tasks for both binaries → Program: path to
    `target\release\jmodguard-bot.exe` / `target\release\jmodguard-api.exe`, trigger: *At startup*.
+   Set the working directory to the folder that contains `config.toml` and the database.
 2. Or use **NSSM** for proper services:
    `nssm install jModGuardBot C:\path\to\target\release\jmodguard-bot.exe` and
    `nssm install jModGuardApi C:\path\to\target\release\jmodguard-api.exe`.
+   Set `AppDirectory` on **both** to that same folder (`nssm set … AppDirectory C:\path\to\jmodguard`)
+   so they share `jmodguard.db` and `config.toml`.
 
 ### Linux (systemd)
 
@@ -176,6 +181,10 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+`After=jmodguard-bot.service` only waits for the bot **process** to exist, not
+for migrations to finish. The API retries schema-not-ready for about 30 seconds
+so a first-boot race does not crash-loop.
 
 ```bash
 sudo systemctl daemon-reload

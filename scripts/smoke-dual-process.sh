@@ -13,6 +13,9 @@ mkdir -p "$TMPDIR"
 echo "==> cargo test --locked"
 cargo test --locked
 
+echo "==> cargo test --locked --no-default-features --lib"
+cargo test --locked --no-default-features --lib
+
 echo "==> cargo clippy --locked --bins -- -D warnings"
 cargo clippy --locked --bins -- -D warnings
 

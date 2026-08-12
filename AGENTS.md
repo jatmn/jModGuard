@@ -7,6 +7,7 @@ Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Upgrades: `docs/UPGRADE.md`.
 
 ```bash
 cargo test --locked
+cargo test --locked --no-default-features --lib
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
 cargo build --locked --bin jmodguard-bot --no-default-features
@@ -18,7 +19,7 @@ Local dual-process:
 
 ```bash
 cargo run --bin jmodguard-bot --no-default-features   # migrates DB; Discord gateway
-cargo run --bin jmodguard-api                         # expects migrated schema (migrate=false)
+cargo run --bin jmodguard-api                         # waits ~30s for bot migrate, then serves HTTP
 ```
 
 ## Version pins (verified)
@@ -82,7 +83,9 @@ cargo run --bin jmodguard-api                         # expects migrated schema 
   restart. Shared session store is a future multi-replica concern.
 - Cross-origin CDN SPA: set `web.cors_origins` / `JMODGUARD_CORS_ORIGINS` and
   `https` `web.base_url`; frontend uses `credentials: "include"`. Prefer
-  same-origin reverse proxy when possible.
+  same-origin reverse proxy when possible. `Config::validate_cors` runs in
+  `jmodguard-api` only — invalid CORS must not prevent `jmodguard-bot` from
+  starting.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /

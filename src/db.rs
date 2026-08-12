@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
@@ -28,6 +29,23 @@ pub type Pool = r2d2::Pool<SqliteConnectionManager>;
 /// Largest supported retention period. It stays below chrono's representable
 /// duration range and is also enforced at the WebUI/database write boundary.
 pub const MAX_RETENTION_DAYS: u32 = 100_000;
+
+/// API-open failure that is expected until the bot finishes migrations.
+#[derive(Debug)]
+pub struct SchemaNotReady(pub String);
+
+impl std::fmt::Display for SchemaNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaNotReady {}
+
+pub fn is_schema_not_ready(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<SchemaNotReady>().is_some())
+}
 
 /// Options for opening a database (local path today; remote URL reserved).
 #[derive(Debug, Clone)]
@@ -113,9 +131,10 @@ impl Db {
             // API must never seed terminal defaults — that poisoned meta when API
             // opened before the bot with a different config.toml.
             let defaults = read_terminal_defaults_meta(&bootstrap)?.ok_or_else(|| {
-                anyhow::anyhow!(
+                SchemaNotReady(
                     "database is missing meta.settings_terminal_defaults. \
                      Start jmodguard-bot once first, then start jmodguard-api."
+                        .into(),
                 )
             })?;
             // Idempotent when guild_settings changed; skipped via checksum when not.
@@ -138,6 +157,40 @@ impl Db {
         Ok(Self {
             pool: Arc::new(pool),
         })
+    }
+
+    /// Retries `open_with` while the bot is still applying schema.
+    ///
+    /// systemd `After=jmodguard-bot.service` only waits for the bot *process*
+    /// to exist, not for migrate to finish. Fail-fast plus `Restart=on-failure`
+    /// turns that into a crash loop. Other errors (remote URL, I/O) still fail
+    /// immediately.
+    pub async fn open_with_until_ready(
+        opts: DbOpenOptions,
+        attempts: u32,
+        delay: Duration,
+    ) -> Result<Self> {
+        let attempts = attempts.max(1);
+        let mut last = None;
+        for i in 0..attempts {
+            match Self::open_with(opts.clone()) {
+                Ok(db) => return Ok(db),
+                Err(err) if is_schema_not_ready(&err) => {
+                    tracing::info!(
+                        "database schema not ready (attempt {}/{attempts}); waiting for jmodguard-bot",
+                        i + 1
+                    );
+                    last = Some(err);
+                    if i + 1 < attempts {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("database schema not ready"))).context(
+            "timed out waiting for jmodguard-bot to migrate the database",
+        )
     }
 
     /// Runs a blocking closure on a pooled connection off the async runtime.
@@ -190,10 +243,11 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
     let required = MIGRATIONS.len() as i64;
     if version < required {
-        anyhow::bail!(
+        return Err(SchemaNotReady(format!(
             "database schema is behind (user_version={version}, required={required}). \
              Start jmodguard-bot once first so migrations run, then start jmodguard-api."
-        );
+        ))
+        .into());
     }
     // Require durable config_version marker so cross-process invalidation works.
     let has_meta: i64 = conn
@@ -204,10 +258,12 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
         )
         .unwrap_or(0);
     if has_meta == 0 {
-        anyhow::bail!(
+        return Err(SchemaNotReady(
             "database is missing meta table (config_version). \
              Start jmodguard-bot once so migrations run, then start jmodguard-api."
-        );
+                .into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -2561,6 +2617,72 @@ mod tests {
         .expect("unmigrated open should fail");
         let msg = err.to_string();
         assert!(msg.contains("schema is behind"), "unexpected error: {msg}");
+        assert!(
+            crate::db::is_schema_not_ready(&err),
+            "unmigrated API open must be retryable SchemaNotReady"
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn api_open_retries_until_bot_migrates() {
+        let tmp = tmp_db_path("api_retry_migrate");
+        Connection::open(&tmp).unwrap();
+        let api_opts = DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        };
+        let bot_opts = DbOpenOptions {
+            migrate: true,
+            ..api_opts.clone()
+        };
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            Db::open_with(bot_opts).expect("bot migrate must succeed");
+        });
+        tokio_test_block_on(Db::open_with_until_ready(
+            api_opts,
+            40,
+            std::time::Duration::from_millis(25),
+        ))
+        .expect("API must succeed once bot migrations finish");
+        handle.join().expect("bot migrate thread panicked");
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn api_open_until_ready_times_out_without_bot() {
+        let tmp = tmp_db_path("api_retry_timeout");
+        Connection::open(&tmp).unwrap();
+        let err = tokio_test_block_on(Db::open_with_until_ready(
+            DbOpenOptions {
+                path: tmp.clone(),
+                url: String::new(),
+                token: String::new(),
+                pool_size: 2,
+                migrate: false,
+                default_prefix: "!".into(),
+                retention_days: 7,
+            },
+            2,
+            std::time::Duration::from_millis(1),
+        ))
+        .err()
+        .expect("must not succeed without bot migrate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out waiting for jmodguard-bot"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            crate::db::is_schema_not_ready(&err),
+            "timeout must still chain SchemaNotReady"
+        );
         cleanup_db(&tmp);
     }
 
