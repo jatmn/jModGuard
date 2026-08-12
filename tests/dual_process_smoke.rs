@@ -54,76 +54,78 @@ fn open_dual(path: &PathBuf) -> (Db, Db) {
 #[tokio::test]
 async fn smoke_dual_process_config_sync() {
     let tmp = tmp_db_path("e2e");
-    let (bot_db, api_db) = open_dual(&tmp);
+    {
+        let (bot_db, api_db) = open_dual(&tmp);
 
-    let mut cfg = Config::default();
-    cfg.bot.config_poll_secs = 1;
-    let bot = AppState::new(cfg.clone(), bot_db).expect("bot AppState");
-    let api = AppState::new(cfg, api_db).expect("api AppState");
+        let mut cfg = Config::default();
+        cfg.bot.config_poll_secs = 1;
+        let bot = AppState::new(cfg.clone(), bot_db).expect("bot AppState");
+        let api = AppState::new(cfg, api_db).expect("api AppState");
 
-    let guild_id: u64 = 55_555;
+        let guild_id: u64 = 55_555;
 
-    // --- check 1: shared DB, version baseline --------------------------------
-    assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 0);
-    assert_eq!(db::get_config_version(&api.db).await.unwrap(), 0);
+        // --- check 1: shared DB, version baseline ----------------------------
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 0);
+        assert_eq!(db::get_config_version(&api.db).await.unwrap(), 0);
 
-    // Already primed at AppState::new — unchanged version must not invalidate.
-    assert!(!bot.poll_config_version().await.unwrap());
-    assert!(!api.poll_config_version().await.unwrap());
+        // Already primed at AppState::new — unchanged version must not invalidate.
+        assert!(!bot.poll_config_version().await.unwrap());
+        assert!(!api.poll_config_version().await.unwrap());
 
-    // Warm bot cache with default prefix.
-    let before = bot.configs.get(&bot.db, guild_id).await.unwrap();
-    assert_eq!(before.settings.prefix, "!");
+        // Warm bot cache with default prefix.
+        let before = bot.configs.get(&bot.db, guild_id).await.unwrap();
+        assert_eq!(before.settings.prefix, "!");
 
-    // --- check 2: API write → version bump → bot cache refresh ----------------
-    db::patch_settings(
-        &api.db,
-        guild_id as i64,
-        Some(Some("!from-api".into())),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    api.invalidate_configs();
-
-    assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 1);
-    assert!(
-        bot.poll_config_version().await.unwrap(),
-        "bot must detect API config_version bump"
-    );
-
-    let after_api = bot.configs.get(&bot.db, guild_id).await.unwrap();
-    assert_eq!(
-        after_api.settings.prefix, "!from-api",
-        "bot cache must reload after cross-process write"
-    );
-
-    // --- check 3: bot command write visible to API (guild_config reads DB) ----
-    db::patch_settings(
-        &bot.db,
-        guild_id as i64,
-        Some(Some("!from-bot".into())),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    bot.invalidate_configs();
-
-    let api_read = db::get_settings(&api.db, guild_id as i64)
+        // --- check 2: API write → version bump → bot cache refresh ------------
+        db::patch_settings(
+            &api.db,
+            guild_id as i64,
+            Some(Some("!from-api".into())),
+            None,
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(
-        api_read.prefix, "!from-bot",
-        "API must read bot-side config write from shared DB"
-    );
+        api.invalidate_configs();
 
-    assert_eq!(db::get_config_version(&api.db).await.unwrap(), 2);
-    assert!(
-        api.poll_config_version().await.unwrap(),
-        "API must detect bot config_version bump"
-    );
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 1);
+        assert!(
+            bot.poll_config_version().await.unwrap(),
+            "bot must detect API config_version bump"
+        );
 
+        let after_api = bot.configs.get(&bot.db, guild_id).await.unwrap();
+        assert_eq!(
+            after_api.settings.prefix, "!from-api",
+            "bot cache must reload after cross-process write"
+        );
+
+        // --- check 3: bot command write visible to API (guild_config reads DB)
+        db::patch_settings(
+            &bot.db,
+            guild_id as i64,
+            Some(Some("!from-bot".into())),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        bot.invalidate_configs();
+
+        let api_read = db::get_settings(&api.db, guild_id as i64).await.unwrap();
+        assert_eq!(
+            api_read.prefix, "!from-bot",
+            "API must read bot-side config write from shared DB"
+        );
+
+        assert_eq!(db::get_config_version(&api.db).await.unwrap(), 2);
+        assert!(
+            api.poll_config_version().await.unwrap(),
+            "API must detect bot config_version bump"
+        );
+    }
+
+    // The DB pools above must be dropped before removing SQLite/WAL/SHM files;
+    // Windows cannot unlink an open database file.
     cleanup_db(&tmp);
 }
