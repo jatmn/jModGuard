@@ -2,6 +2,10 @@
 
 use std::future::Future;
 
+use anyhow::{Result, anyhow};
+use serenity::model::channel::Channel;
+use serenity::model::id::ChannelId;
+
 /// Retry a Discord REST call a few times with short backoff.
 ///
 /// Nickname apply/restore (WebUI and `!setname`) share this so a transient
@@ -31,4 +35,28 @@ where
         }
     }
     Err(last_err.expect("at least one attempt ran"))
+}
+
+/// Ensures a configured log destination belongs to the guild whose events it
+/// will receive. A channel snowflake alone is not a safe ownership boundary
+/// when the bot is installed in multiple guilds.
+pub async fn validate_log_channel_guild(
+    http: impl AsRef<serenity::http::Http>,
+    guild_id: u64,
+    channel_id: ChannelId,
+) -> Result<()> {
+    let channel = http
+        .as_ref()
+        .get_channel(channel_id)
+        .await
+        .map_err(|e| anyhow!("failed to resolve log channel {channel_id}: {e}"))?;
+    match channel {
+        Channel::Guild(channel) if channel.guild_id.get() == guild_id => Ok(()),
+        Channel::Guild(channel) => anyhow::bail!(
+            "log channel {channel_id} belongs to guild {}, not {guild_id}",
+            channel.guild_id
+        ),
+        Channel::Private(_) => anyhow::bail!("log channel {channel_id} is not a guild channel"),
+        _ => anyhow::bail!("log channel {channel_id} is not a guild channel"),
+    }
 }

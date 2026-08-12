@@ -336,6 +336,18 @@ impl DiscordGuild {
             .map(|p| p.as_u64() & MANAGE_GUILD != 0)
             .unwrap_or(false)
     }
+
+    /// WebUI configuration rights do not imply authority to remove bans.
+    pub fn ban_members_permission(&self) -> bool {
+        const ADMINISTRATOR: u64 = 1 << 3;
+        const BAN_MEMBERS: u64 = 1 << 2;
+        self.owner
+            || self
+                .permissions
+                .as_ref()
+                .map(|p| p.as_u64() & (ADMINISTRATOR | BAN_MEMBERS) != 0)
+                .unwrap_or(false)
+    }
 }
 
 impl OAuthClient {
@@ -849,5 +861,21 @@ mod tests {
         )
         .unwrap();
         assert!(g.manage_permission(), "owner bypass");
+    }
+
+    #[test]
+    fn ban_permission_is_not_implied_by_manage_guild() {
+        let manage_only: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#,
+        )
+        .unwrap();
+        assert!(manage_only.manage_permission());
+        assert!(!manage_only.ban_members_permission());
+
+        let ban: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":4}"#,
+        )
+        .unwrap();
+        assert!(ban.ban_members_permission());
     }
 }

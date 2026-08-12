@@ -3,7 +3,7 @@
 pub mod api;
 
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -68,6 +68,12 @@ impl AuthCtx {
         self.manageable_guilds()
             .iter()
             .any(|g| g.id == guild_id.to_string())
+    }
+
+    pub fn can_ban_members(&self, guild_id: u64) -> bool {
+        self.guilds
+            .iter()
+            .any(|g| g.id == guild_id.to_string() && g.ban_members_permission())
     }
 
     pub fn discord_user_id(&self) -> u64 {
@@ -270,11 +276,36 @@ async fn login(
 async fn logout(
     session: Session,
     state: axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ReturnToQuery>,
 ) -> Response {
+    if !trusted_web_origin(&state.cfg, &headers) {
+        return error_page("untrusted request origin");
+    }
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
     let _ = session.delete().await;
     Json(serde_json::json!({ "return_to": return_to })).into_response()
+}
+
+/// CORS only governs whether a browser may read a response. It does not stop a
+/// simple cross-site form POST, which matters when a hosted SPA requires
+/// SameSite=None session cookies. Validate the origin at this mutation gate.
+fn trusted_web_origin(cfg: &crate::config::Config, headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return false;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let base_origin = reqwest::Url::parse(&cfg.web.base_url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization());
+    base_origin.as_deref() == Some(origin)
+        || cfg
+            .web
+            .cors_origins
+            .iter()
+            .any(|allowed| allowed.trim_end_matches('/') == origin)
 }
 
 /// Session-bound OAuth state must be unguessable; timestamps and PIDs are not
@@ -577,6 +608,27 @@ pub async fn authorize_manage_guild(
     Ok(auth)
 }
 
+/// Authorizes a bot-token unban with fresh Discord ban authority, rather than
+/// configuration-only MANAGE_GUILD authority.
+pub async fn authorize_ban_members(
+    app: &Arc<AppState>,
+    session: &Session,
+    guild_id: u64,
+) -> ApiResult<AuthCtx> {
+    if guild_id == 0 {
+        return Err(ApiError(anyhow::anyhow!(
+            "this operation requires a Discord server"
+        )));
+    }
+    let auth = require_auth_fresh(app, session).await?;
+    if !auth.can_ban_members(guild_id) {
+        return Err(ApiError(anyhow::anyhow!(
+            "you cannot unban members in this server (needs BAN_MEMBERS permission)"
+        )));
+    }
+    Ok(auth)
+}
+
 /// Parses a guild id path segment, checking the session can manage it.
 ///
 /// Real guild ids always re-fetch Discord guild permissions (`MustRefresh`) so
@@ -605,7 +657,7 @@ pub async fn guild_scope(
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use tower::ServiceExt;
 
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -961,5 +1013,31 @@ mod tests {
             "/"
         );
         assert_eq!(return_to_or_root(&cfg, None), "/");
+    }
+
+    #[test]
+    fn logout_origin_must_be_the_ui_or_configured_spa() {
+        let mut cfg = crate::config::Config::default();
+        cfg.web.base_url = "https://api.example.com/control".into();
+        cfg.web.cors_origins = vec!["https://admin.example.com".into()];
+
+        let with_origin = |origin: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("origin", origin.parse().unwrap());
+            headers
+        };
+        assert!(trusted_web_origin(
+            &cfg,
+            &with_origin("https://api.example.com")
+        ));
+        assert!(trusted_web_origin(
+            &cfg,
+            &with_origin("https://admin.example.com")
+        ));
+        assert!(!trusted_web_origin(
+            &cfg,
+            &with_origin("https://attacker.example.com")
+        ));
+        assert!(!trusted_web_origin(&cfg, &HeaderMap::new()));
     }
 }
