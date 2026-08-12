@@ -32,7 +32,7 @@ All of this is managed via the WebUI or bot commands; the schema lives in
 | `rules` | the 7 automod rules (server + global rows) |
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
-| `log_channels` | event type → channel mapping (server + global) |
+| `log_channels` | event type → channel mapping (per server only) |
 | `badwords` | regex patterns (server + global) |
 | `members` | join/leave history, join count, message count, last seen |
 | `messages` | recent message content + attachments (retention-limited) |

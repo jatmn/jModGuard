@@ -19,7 +19,7 @@ instance manages all your servers.
 | **Badwords** | add/remove regex patterns (server or global), live tester showing raw/normalized/compact matches |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
 | **Templates** | edit event templates with live preview; server or global scope |
-| **Log Channels** | map each event type to a channel ID; server or global |
+| **Log Channels** | map each event type to a channel ID for that server |
 | **Members** | search members: join count, message count, first/last seen |
 | **Audit Log** | filterable event history (type, user, actor) |
 | **Bans** | ban history + unban via the bot |
@@ -27,12 +27,15 @@ instance manages all your servers.
 
 ## Global vs per-server config
 
-Every item (rule, badword, command, template, log channel) is stored either
-at **server** scope or **global** scope:
+Rules, badwords, commands, and templates are stored either at **server**
+scope or **global** scope:
 
 - global values act as defaults for all servers;
 - a server value overrides the global one;
 - editors show which scope applies ("server override" / "global" badges).
+
+**Log channels are always per-server.** Discord channel IDs belong to one
+server, so they cannot be global defaults or copied between servers.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / log channels /

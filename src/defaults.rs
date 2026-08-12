@@ -2,9 +2,7 @@
 //! These are the global (guild_id = 0) fallbacks written on first boot.
 //! Every value here is fully editable at runtime via the WebUI / bot commands.
 
-use crate::types::{
-    ActionDef, Behavior, CommandDef, PlanStep, RuleDef, RULE_IDS,
-};
+use crate::types::{ActionDef, Behavior, CommandDef, PlanStep, RULE_IDS, RuleDef};
 use serde_json::json;
 
 pub fn default_rules() -> Vec<RuleDef> {
@@ -69,7 +67,13 @@ fn rule(id: &str) -> RuleDef {
             "Account age",
             "Accounts younger than the allowed minimum age (report-only by default).",
             json!({"min_age_days": 3}),
-            vec![action(1, "log", "Account younger than the configured minimum age", 0, 0)],
+            vec![action(
+                1,
+                "log",
+                "Account younger than the configured minimum age",
+                0,
+                0,
+            )],
         ),
         _ => unreachable!(),
     };
@@ -86,7 +90,13 @@ fn rule(id: &str) -> RuleDef {
     }
 }
 
-fn action(at: u32, action: &str, reason: &str, duration_minutes: u32, delete_days: u8) -> ActionDef {
+fn action(
+    at: u32,
+    action: &str,
+    reason: &str,
+    duration_minutes: u32,
+    delete_days: u8,
+) -> ActionDef {
     ActionDef {
         at,
         action: action.into(),
@@ -105,7 +115,10 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Ban a user from the server.",
         "!ban <user> [reason]",
         "mod",
-        Behavior::Ban { default_reason: "Banned by a moderator".into(), delete_days: 0 },
+        Behavior::Ban {
+            default_reason: "Banned by a moderator".into(),
+            delete_days: 0,
+        },
         "Banned {target} | {reason}",
         "mod_action",
         vec![],
@@ -116,7 +129,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Unban a user from the server.",
         "!unban <user> [reason]",
         "mod",
-        Behavior::Unban { default_reason: "Unbanned".into() },
+        Behavior::Unban {
+            default_reason: "Unbanned".into(),
+        },
         "Unbanned {target} | {reason}",
         "mod_action",
         vec![],
@@ -127,7 +142,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Kick a user from the server.",
         "!kick <user> [reason]",
         "mod",
-        Behavior::Kick { default_reason: "Kicked by a moderator".into() },
+        Behavior::Kick {
+            default_reason: "Kicked by a moderator".into(),
+        },
         "Kicked {target} | {reason}",
         "mod_action",
         vec![],
@@ -138,7 +155,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Timeout a user (0 minutes removes the timeout).",
         "!timeout <user> <minutes> [reason]",
         "mod",
-        Behavior::Timeout { default_minutes: 60 },
+        Behavior::Timeout {
+            default_minutes: 60,
+        },
         "Timed out {target} for {minutes} minutes | {reason}",
         "mod_action",
         vec![],
@@ -149,7 +168,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Warn a user.",
         "!warn <user> <reason>",
         "mod",
-        Behavior::Warn { default_reason: "Warning from moderator".into() },
+        Behavior::Warn {
+            default_reason: "Warning from moderator".into(),
+        },
         "Warned {target} | {reason}",
         "mod_action",
         vec![],
@@ -223,8 +244,8 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "setname",
         "Admin",
-        "Set the bot's nickname in this server.",
-        "!setname <name>",
+        "Set the bot's nickname in this server (omit / clear / - to reset).",
+        "!setname [name|clear|-]",
         "admin",
         Behavior::Setname,
         "Bot nickname set to {name}",
@@ -248,7 +269,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "View or edit log event templates: !template <get|set|list|reset> [event] [text]",
         "!template <get|set|list|reset> [event] [text]",
         "admin",
-        Behavior::Template { action: "list".into() },
+        Behavior::Template {
+            action: "list".into(),
+        },
         "",
         "mod_action",
         vec![],
@@ -259,7 +282,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Automod rule controls: !rule <list|toggle|dryrun> [rule]",
         "!rule <list|toggle|dryrun> [rule]",
         "admin",
-        Behavior::Rule { action: "list".into() },
+        Behavior::Rule {
+            action: "list".into(),
+        },
         "",
         "mod_action",
         vec![],
@@ -270,7 +295,9 @@ pub fn default_commands() -> Vec<CommandDef> {
         "Route log events to channels: !logchannel <list|set|unset> [event] [#channel]",
         "!logchannel <list|set|unset> [event] [#channel]",
         "admin",
-        Behavior::Logchannel { action: "list".into() },
+        Behavior::Logchannel {
+            action: "list".into(),
+        },
         "",
         "mod_action",
         vec![],
@@ -311,7 +338,7 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "stats",
         "Utility",
-        "Bot statistics.",
+        "This server's stats (members, messages, events, warns, bans).",
         "!stats",
         "everyone",
         Behavior::Stats,
@@ -445,8 +472,12 @@ pub fn sample_plan_command() -> CommandDef {
         cooldown_secs: 30,
         behavior: Behavior::Plan {
             steps: vec![
-                PlanStep::Reply { template: "Hi {user}, welcome to **{guild}**!".into() },
-                PlanStep::React { emoji: "👋".into() },
+                PlanStep::Reply {
+                    template: "Hi {user}, welcome to **{guild}**!".into(),
+                },
+                PlanStep::React {
+                    emoji: "👋".into()
+                },
                 PlanStep::Log {
                     event: "plan_executed".into(),
                     template: "`{actor}` ran `{command}`".into(),

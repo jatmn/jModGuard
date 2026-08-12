@@ -1,7 +1,7 @@
 //! Built-in command behavior executors, plus the slash-option spec used to
 //! mirror commands to Discord.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serenity::builder::{EditChannel, EditMember};
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
@@ -16,12 +16,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
 
     match &env.cmd.behavior {
-        Behavior::Ban { default_reason, delete_days } => {
+        Behavior::Ban {
+            default_reason,
+            delete_days,
+        } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
-            let member = env.ctx.cache.guild(env.guild_id).and_then(|g| g.members.get(&target).cloned());
+            let member = env
+                .ctx
+                .cache
+                .guild(env.guild_id)
+                .and_then(|g| g.members.get(&target).cloned());
             if let Some(m) = member {
-                let _ = m.ban_with_reason(&env.ctx.http, *delete_days, &reason).await;
+                let _ = m
+                    .ban_with_reason(&env.ctx.http, *delete_days, &reason)
+                    .await;
             } else {
                 env.guild_id
                     .ban_with_reason(&env.ctx.http, target, *delete_days, &reason)
@@ -39,18 +48,42 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Unban { default_reason } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
             let target_user = user_lookup(env, target).await?;
-            env.ctx.http.remove_ban(env.guild_id, target, Some(&reason)).await?;
-            db::mark_unbanned(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
+            // Discord is authoritative; local bans table is a mirror healed by
+            // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
+            env.ctx
+                .http
+                .remove_ban(env.guild_id, target, Some(&reason))
+                .await?;
+            if let Err(e) = db::mark_unbanned(
+                &env.app.db,
+                env.guild_id.get() as i64,
+                target.get() as i64,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "local ban mirror update failed after Discord unban \
+                     (guild={} user={}): {e:#}",
+                    env.guild_id,
+                    target
+                );
+            }
             log_mod(env, "unban", target, &target_user.name, &reason).await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Kick { default_reason } => {
             let (target, reason) = target_and_reason(env, default_reason).await?;
@@ -66,16 +99,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Timeout { default_minutes } => {
             let mut args = env.args.clone();
-            let target = resolve_target(env, args.next().ok_or_else(|| anyhow!("missing user"))?).await?;
+            let target =
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
             let minutes: u64 = args
-                .next()
+                .next_arg()
                 .and_then(|m| m.parse().ok())
                 .unwrap_or(*default_minutes as u64);
-            let reason = if args.is_empty() { "timed out".to_string() } else { args.rest() };
+            let reason = if args.is_empty() {
+                "timed out".to_string()
+            } else {
+                args.rest()
+            };
             let target_user = user_lookup(env, target).await?;
             let mut member = env
                 .ctx
@@ -94,7 +135,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     chrono::Utc::now().timestamp() + (minutes as i64) * 60,
                 )
                 .map_err(|e| anyhow!("invalid timeout: {e}"))?;
-                member.disable_communication_until_datetime(&env.ctx.http, until).await?;
+                member
+                    .disable_communication_until_datetime(&env.ctx.http, until)
+                    .await?;
                 let mut v = vars.clone();
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
@@ -104,12 +147,20 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("minutes".into(), minutes.to_string());
             vars.insert("reason".into(), reason);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Warn { default_reason } => {
             let mut args = env.args.clone();
-            let target = resolve_target(env, args.next().ok_or_else(|| anyhow!("missing user"))?).await?;
-            let reason = if args.is_empty() { default_reason.clone() } else { args.rest() };
+            let target =
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+            let reason = if args.is_empty() {
+                default_reason.clone()
+            } else {
+                args.rest()
+            };
             let target_user = user_lookup(env, target).await?;
             db::add_warn(
                 &env.app.db,
@@ -122,13 +173,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             log_mod(env, "warn", target, &target_user.name, &reason).await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("reason".into(), reason);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Warns => {
             let mut args = env.args.clone();
-            let target = resolve_target(env, args.next().ok_or_else(|| anyhow!("missing user"))?).await?;
+            let target =
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
             let target_user = user_lookup(env, target).await?;
-            let warns = db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
+            let warns =
+                db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
             if warns.is_empty() {
                 return Ok(BehaviorOutcome {
                     response: Some(format!("**{}** has no warnings.", target_user.name)),
@@ -143,14 +199,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     format!("`#{}` {reason} — {ts}", w.id)
                 })
                 .collect();
-            let response = format!("**{} warnings for {}:**\n{}", warns.len(), target_user.name, lines.join("\n"));
-            Ok(BehaviorOutcome { response: Some(response), vars })
+            let response = format!(
+                "**{} warnings for {}:**\n{}",
+                warns.len(),
+                target_user.name,
+                lines.join("\n")
+            );
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
         Behavior::WarnClear => {
             let mut args = env.args.clone();
-            let target = resolve_target(env, args.next().ok_or_else(|| anyhow!("missing user"))?).await?;
+            let target =
+                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
             let target_user = user_lookup(env, target).await?;
-            let n = db::clear_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
+            let n = db::clear_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
+                .await?;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("count".into(), n.to_string());
             log_mod(env, "warnclear", target, &target_user.name, &n.to_string()).await;
@@ -179,7 +245,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 })
                 .collect();
             let response = format!("**Recent bans ({}):**\n{}", bans.len(), lines.join("\n"));
-            Ok(BehaviorOutcome { response: Some(response), vars })
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
         Behavior::Purge { default_count } => {
             let count: u64 = env
@@ -205,7 +274,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             }
             log_mod(env, "purge", env.actor, "messages", &format!("{n} deleted")).await;
             vars.insert("count".into(), n.to_string());
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Say => {
             let mut args = env.args.clone();
@@ -213,7 +285,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let mut target = env.channel_id;
             if let Some(ch) = parse_channel_mention(text.split_whitespace().next().unwrap_or("")) {
                 target = ch;
-                text = text.split_once(char::is_whitespace).map(|x| x.1)
+                text = text
+                    .split_once(char::is_whitespace)
+                    .map(|x| x.1)
                     .unwrap_or("")
                     .to_string();
             }
@@ -222,7 +296,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             }
             target.say(&env.ctx.http, text.trim()).await?;
             vars.insert("channel".into(), format!("<#{}>", target));
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Slowmode { default_seconds } => {
             let seconds: u64 = env
@@ -231,96 +308,210 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(*default_seconds);
             env.channel_id
-                .edit(&env.ctx.http, EditChannel::new().rate_limit_per_user(seconds as u16))
+                .edit(
+                    &env.ctx.http,
+                    EditChannel::new().rate_limit_per_user(seconds as u16),
+                )
                 .await?;
             vars.insert("seconds".into(), seconds.to_string());
-            log_mod(env, "slowmode", env.actor, "channel", &format!("{seconds}s")).await;
-            Ok(BehaviorOutcome { response: None, vars })
+            log_mod(
+                env,
+                "slowmode",
+                env.actor,
+                "channel",
+                &format!("{seconds}s"),
+            )
+            .await;
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::Setname => {
-            let name = env.args.clone().rest();
-            if name.trim().is_empty() {
-                return Err(anyhow!("missing name"));
-            }
-            let name = name.trim();
+            let raw = env.args.clone().rest();
+            let trimmed = raw.trim();
+            // Empty / `clear` / `-` clears the Discord nickname (same as WebUI).
+            let clear = trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("clear")
+                || trimmed == "-";
+            let name = if clear { "" } else { trimmed };
             let me = env.ctx.cache.current_user().id;
+            let guild_id = env.guild_id.get();
+            // Discord before SQLite (AGENTS contract). Always apply Discord on
+            // an explicit !setname / /setname — even when DB already matches —
+            // so operators can repair Discord↔DB nick drift. Capture previous
+            // nick so a later SQLite failure can restore Discord.
+            let previous = db::get_settings(&env.app.db, guild_id as i64)
+                .await?
+                .bot_name;
+            let mut discord_applied = false;
             if me.get() != 0 {
-                env.guild_id
-                    .edit_member(&env.ctx.http, me, EditMember::new().nickname(name.to_string()))
-                    .await?;
+                let nick = name.to_string();
+                crate::discord::with_retries("Discord nickname", guild_id, || {
+                    let nick = nick.clone();
+                    async {
+                        env.guild_id
+                            .edit_member(
+                                &env.ctx.http,
+                                me,
+                                EditMember::new().nickname(nick),
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                })
+                .await?;
+                discord_applied = true;
             }
-            let mut settings = db::get_settings(&env.app.db, env.guild_id.get() as i64).await?;
-            settings.bot_name = name.to_string();
-            db::upsert_settings(&env.app.db, env.guild_id.get() as i64, &settings).await?;
+            // Patch only bot_name so prefix/retention keep inheriting from global.
+            if let Err(e) = db::patch_settings(
+                &env.app.db,
+                guild_id as i64,
+                None,
+                Some(Some(name.to_string())),
+                None,
+            )
+            .await
+            {
+                if discord_applied && me.get() != 0 {
+                    let prev = previous.clone();
+                    if let Err(re) = crate::discord::with_retries(
+                        "Discord nickname restore",
+                        guild_id,
+                        || {
+                            let prev = prev.clone();
+                            async {
+                                env.guild_id
+                                    .edit_member(
+                                        &env.ctx.http,
+                                        me,
+                                        EditMember::new().nickname(prev),
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "failed to restore Discord nickname after !setname DB error \
+                             (guild={guild_id}): {re:#} (save error: {e:#})"
+                        );
+                    }
+                }
+                return Err(e);
+            }
             env.app.invalidate_configs();
-            vars.insert("name".into(), name.to_string());
-            Ok(BehaviorOutcome { response: None, vars })
+            vars.insert(
+                "name".into(),
+                if clear {
+                    "(cleared)".to_string()
+                } else {
+                    name.to_string()
+                },
+            );
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
         Behavior::SetPrefix => {
-            let prefix = env.args.clone().next().ok_or_else(|| anyhow!("missing prefix"))?;
-            let mut settings = db::get_settings(&env.app.db, env.guild_id.get() as i64).await?;
-            settings.prefix = prefix.clone();
-            db::upsert_settings(&env.app.db, env.guild_id.get() as i64, &settings).await?;
+            let prefix = env
+                .args
+                .clone()
+                .next_arg()
+                .ok_or_else(|| anyhow!("missing prefix"))?;
+            // Patch only prefix so other fields keep inheriting from global.
+            db::patch_settings(
+                &env.app.db,
+                env.guild_id.get() as i64,
+                Some(Some(prefix.clone())),
+                None,
+                None,
+            )
+            .await?;
             env.app.invalidate_configs();
             vars.insert("prefix".into(), prefix);
-            Ok(BehaviorOutcome { response: None, vars })
+            Ok(BehaviorOutcome {
+                response: None,
+                vars,
+            })
         }
-        Behavior::Template { action } => {
-            run_template(env, action).await
-        }
-        Behavior::Rule { action } => {
-            run_rule(env, action).await
-        }
-        Behavior::Logchannel { action } => {
-            run_logchannel(env, action).await
-        }
+        Behavior::Template { action } => run_template(env, action).await,
+        Behavior::Rule { action } => run_rule(env, action).await,
+        Behavior::Logchannel { action } => run_logchannel(env, action).await,
         Behavior::Testregex => {
             let mut args = env.args.clone();
-            let pattern = args.next().ok_or_else(|| anyhow!("missing pattern"))?;
+            let pattern = args.next_arg().ok_or_else(|| anyhow!("missing pattern"))?;
             let sample = args.rest();
-            match regex::Regex::new(&pattern) {
-                Ok(re) => {
-                    let normalized = crate::normalize::normalize_lenient(&sample);
-                    let raw_match = re.is_match(&sample);
-                    let norm_match = re.is_match(&normalized);
-                    let response = format!(
-                        "Pattern `{pattern}`\nRaw match: {raw_match}\nNormalized match: {norm_match}\nNormalized sample: `{normalized}`"
-                    );
-                    Ok(BehaviorOutcome { response: Some(response), vars })
-                }
-                Err(e) => Err(anyhow!("invalid regex: {e}")),
+            if sample.len() > crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES {
+                return Err(anyhow!(
+                    "sample too long (max {} bytes)",
+                    crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES
+                ));
             }
+            // Same compile budget as WebUI /api/.../testregex and add_badword.
+            let re = crate::normalize::compile_user_regex(&pattern)
+                .map_err(|e| anyhow!(e))?;
+            let normalized = crate::normalize::normalize_lenient(&sample);
+            let raw_match = re.is_match(&sample);
+            let norm_match = re.is_match(&normalized);
+            let response = format!(
+                "Pattern `{pattern}`\nRaw match: {raw_match}\nNormalized match: {norm_match}\nNormalized sample: `{normalized}`"
+            );
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
         Behavior::Help => {
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let mut args = env.args.clone();
-            let response = if let Some(name) = args.next() {
+            let response = if let Some(name) = args.next_arg() {
                 match cfg.find_command(&name) {
                     Some(c) => format!(
                         "**!{}** {} `{}`\nAliases: {}\nUsage: `{}`\nRequires: {}",
                         c.name,
                         c.description,
                         c.category,
-                        if c.aliases.is_empty() { "-".to_string() } else { c.aliases.join(", ") },
+                        if c.aliases.is_empty() {
+                            "-".to_string()
+                        } else {
+                            c.aliases.join(", ")
+                        },
                         c.usage,
                         c.permission
                     ),
-                    None => format!("Unknown command `{name}`. Use `{}help` for the list.", cfg.settings.prefix),
+                    None => format!(
+                        "Unknown command `{name}`. Use `{}help` for the list.",
+                        cfg.settings.prefix
+                    ),
                 }
             } else {
-                let mut by_cat: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+                let mut by_cat: std::collections::BTreeMap<String, Vec<String>> =
+                    Default::default();
                 for c in cfg.commands.values() {
-                    by_cat.entry(c.category.clone()).or_default().push(format!("`{}` — {}", c.name, c.description));
+                    by_cat
+                        .entry(c.category.clone())
+                        .or_default()
+                        .push(format!("`{}` — {}", c.name, c.description));
                 }
                 let mut out = format!("**Commands** (prefix `{}`)\n", cfg.settings.prefix);
                 for (cat, cmds) in by_cat {
                     out.push_str(&format!("\n**{cat}**\n"));
                     out.push_str(&cmds.join("\n"));
                 }
-                out.push_str(&format!("\n\nUse `{}help <command>` for details. Slash equivalents exist too.", cfg.settings.prefix));
+                out.push_str(&format!(
+                    "\n\nUse `{}help <command>` for details. Slash equivalents exist too.",
+                    cfg.settings.prefix
+                ));
                 out
             };
-            Ok(BehaviorOutcome { response: Some(response), vars })
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
         Behavior::About => {
             let response = format!(
@@ -329,20 +520,26 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env!("CARGO_PKG_VERSION"),
                 env.app.start.elapsed()
             );
-            Ok(BehaviorOutcome { response: Some(response), vars })
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
         Behavior::Stats => {
-            let s = db::stats(&env.app.db).await?;
+            // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
+            // Never call process-wide `db::stats()` here (cross-guild leak to everyone).
+            let s = db::guild_stats(&env.app.db, env.guild_id.get() as i64).await?;
             let uptime = format!("{:?}", env.app.start.elapsed());
             let response = format!(
-                "**Stats**\nUptime: {uptime}\nGuilds (tracked): {}\nMembers tracked: {}\nMessages in store: {}\nEvents logged: {}\nWarns: {}\nBans: {}",
-                s.guilds, s.members, s.messages, s.events, s.warns, s.bans
+                "**Stats** (this server)\nUptime: {uptime}\nMembers tracked: {}\nMessages in store: {}\nEvents logged: {}\nWarns: {}\nBans: {}",
+                s.members, s.messages, s.events, s.warns, s.bans
             );
-            Ok(BehaviorOutcome { response: Some(response), vars })
+            Ok(BehaviorOutcome {
+                response: Some(response),
+                vars,
+            })
         }
-        Behavior::Plan { steps } => {
-            crate::commands::plans::run(env, steps).await
-        }
+        Behavior::Plan { steps } => crate::commands::plans::run(env, steps).await,
     }
 }
 
@@ -354,7 +551,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
 pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<String, String> {
     let mut vars = std::collections::BTreeMap::new();
     vars.insert("user".into(), env.actor_member.display_name().to_string());
-    vars.insert("actor".into(), format!("{} (<@{}>)", env.actor_member.display_name(), env.actor));
+    vars.insert(
+        "actor".into(),
+        format!("{} (<@{}>)", env.actor_member.display_name(), env.actor),
+    );
     vars.insert("actor_id".into(), env.actor.to_string());
     vars.insert(
         "guild".into(),
@@ -379,8 +579,12 @@ async fn target_and_reason(
     default_reason: &str,
 ) -> Result<(serenity::model::id::UserId, String)> {
     let mut args = env.args.clone();
-    let target = resolve_target(env, args.next().ok_or_else(|| anyhow!("missing user"))?).await?;
-    let reason = if args.is_empty() { default_reason.to_string() } else { args.rest() };
+    let target = resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+    let reason = if args.is_empty() {
+        default_reason.to_string()
+    } else {
+        args.rest()
+    };
     Ok((target, reason))
 }
 
@@ -436,7 +640,7 @@ async fn log_mod(
 
 async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let action = args.next().unwrap_or_else(|| default_action.to_string());
+    let action = args.next_arg().unwrap_or_else(|| default_action.to_string());
     let vars = std::collections::BTreeMap::new();
     match action.as_str() {
         "list" => {
@@ -454,16 +658,22 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(BehaviorOutcome { response: Some(format!("**Event templates:**\n{response}")), vars })
+            Ok(BehaviorOutcome {
+                response: Some(format!("**Event templates:**\n{response}")),
+                vars,
+            })
         }
         "get" => {
-            let event = args.next().ok_or_else(|| anyhow!("missing event"))?;
+            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let t = cfg.templates.get(&event).cloned().unwrap_or_default();
-            Ok(BehaviorOutcome { response: Some(format!("`{event}`:\n```\n{t}\n```")), vars })
+            Ok(BehaviorOutcome {
+                response: Some(format!("`{event}`:\n```\n{t}\n```")),
+                vars,
+            })
         }
         "set" => {
-            let event = args.next().ok_or_else(|| anyhow!("missing event"))?;
+            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
             let text = args.rest();
             if text.trim().is_empty() {
                 return Err(anyhow!("missing template text"));
@@ -476,7 +686,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             })
         }
         "reset" => {
-            let event = args.next().ok_or_else(|| anyhow!("missing event"))?;
+            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
             db::delete_template(&env.app.db, env.guild_id.get() as i64, &event).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
@@ -490,8 +700,8 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
 
 async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let mut action = args.next().unwrap_or_else(|| default_action.to_string());
-    let mut rule_id = args.next().unwrap_or_default();
+    let mut action = args.next_arg().unwrap_or_else(|| default_action.to_string());
+    let mut rule_id = args.next_arg().unwrap_or_default();
     // Slash options arrive as (name, action); prefix as (action, name).
     // Accept both orders.
     if crate::types::RULE_IDS.contains(&action.as_str()) {
@@ -527,7 +737,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             })
         }
         "toggle" => {
-            let rule_id = args.next().ok_or_else(|| anyhow!("missing rule"))?;
+            let rule_id = args.next_arg().ok_or_else(|| anyhow!("missing rule"))?;
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let mut rule = cfg
                 .rules
@@ -538,13 +748,16 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
-                response: Some(format!("Rule `{rule_id}` is now {}.", if rule.enabled { "enabled" } else { "disabled" })),
+                response: Some(format!(
+                    "Rule `{rule_id}` is now {}.",
+                    if rule.enabled { "enabled" } else { "disabled" }
+                )),
                 vars,
             })
         }
         "dryrun" => {
-            let rule_id = args.next().ok_or_else(|| anyhow!("missing rule"))?;
-            let on = match args.next().as_deref() {
+            let rule_id = args.next_arg().ok_or_else(|| anyhow!("missing rule"))?;
+            let on = match args.next_arg().as_deref() {
                 Some("on") | Some("true") => true,
                 Some("off") | Some("false") => false,
                 _ => true,
@@ -569,19 +782,18 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
 
 async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let action = args.next().unwrap_or_else(|| default_action.to_string());
+    let action = args.next_arg().unwrap_or_else(|| default_action.to_string());
     let vars = std::collections::BTreeMap::new();
     let guild = env.guild_id.get() as i64;
     match action.as_str() {
         "list" => {
-            let mut lc = db::list_log_channels(&env.app.db, guild).await?;
-            let global = db::list_log_channels(&env.app.db, 0).await?;
-            let existing: std::collections::HashSet<String> =
-                lc.iter().map(|(e, _)| e.clone()).collect();
-            lc.extend(global.into_iter().filter(|(e, _)| !existing.contains(e)));
+            let lc = db::list_log_channels(&env.app.db, guild).await?;
             if lc.is_empty() {
                 return Ok(BehaviorOutcome {
-                    response: Some("No log channels configured. Use `!logchannel set <event> <#channel>`.".into()),
+                    response: Some(
+                        "No log channels configured. Use `!logchannel set <event> <#channel>`."
+                            .into(),
+                    ),
                     vars,
                 });
             }
@@ -590,11 +802,14 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 .map(|(e, c)| format!("`{e}` -> <#{c}>"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(BehaviorOutcome { response: Some(format!("**Log channels:**\n{response}")), vars })
+            Ok(BehaviorOutcome {
+                response: Some(format!("**Log channels:**\n{response}")),
+                vars,
+            })
         }
         "set" => {
-            let event = args.next().ok_or_else(|| anyhow!("missing event"))?;
-            let token = args.next().ok_or_else(|| anyhow!("missing channel"))?;
+            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+            let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
             let channel = parse_channel_mention(&token)
                 .or_else(|| token.parse::<u64>().ok().map(Into::into))
                 .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
@@ -606,11 +821,11 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             })
         }
         "unset" => {
-            let event = args.next().ok_or_else(|| anyhow!("missing event"))?;
+            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
             db::delete_log_channel(&env.app.db, guild, &event).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
-                response: Some(format!("`{event}` logging cleared (falls back to global).")),
+                response: Some(format!("`{event}` logging cleared for this server.")),
                 vars,
             })
         }
@@ -629,8 +844,18 @@ pub struct OptionSpec {
     pub description: &'static str,
 }
 
-fn opt(name: &'static str, kind: CommandOptionType, required: bool, description: &'static str) -> OptionSpec {
-    OptionSpec { name, kind, required, description }
+fn opt(
+    name: &'static str,
+    kind: CommandOptionType,
+    required: bool,
+    description: &'static str,
+) -> OptionSpec {
+    OptionSpec {
+        name,
+        kind,
+        required,
+        description,
+    }
 }
 
 pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
@@ -650,7 +875,12 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         ],
         Behavior::Timeout { .. } => vec![
             opt("user", User, true, "User to timeout"),
-            opt("minutes", Integer, false, "Timeout length in minutes (0 = remove)"),
+            opt(
+                "minutes",
+                Integer,
+                false,
+                "Timeout length in minutes (0 = remove)",
+            ),
             opt("reason", Str, false, "Timeout reason"),
         ],
         Behavior::Warn { .. } => vec![
@@ -658,10 +888,18 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
             opt("reason", Str, true, "Warning reason"),
         ],
         Behavior::Warns | Behavior::WarnClear => vec![opt("user", User, true, "User")],
-        Behavior::Purge { .. } => vec![opt("count", Integer, false, "Number of messages (max 100)")],
+        Behavior::Purge { .. } => {
+            vec![opt("count", Integer, false, "Number of messages (max 100)")]
+        }
         Behavior::Say => vec![opt("text", Str, true, "Text to post")],
         Behavior::Slowmode { .. } => vec![opt("seconds", Integer, true, "Slowmode seconds")],
-        Behavior::Setname => vec![opt("name", Str, true, "Bot nickname")],
+        // Optional so omitting the option clears (same as prefix `!setname` with no args).
+        Behavior::Setname => vec![opt(
+            "name",
+            Str,
+            false,
+            "Bot nickname (omit, clear, or - to reset)",
+        )],
         Behavior::SetPrefix => vec![opt("prefix", Str, true, "New prefix")],
         Behavior::Template { .. } => vec![
             opt("action", Str, true, "list | get | set | reset"),
@@ -683,5 +921,22 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         ],
         Behavior::Help => vec![opt("command", Str, false, "Command name")],
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Behavior;
+
+    #[test]
+    fn setname_slash_name_option_is_optional() {
+        let specs = slash_spec(&Behavior::Setname);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "name");
+        assert!(
+            !specs[0].required,
+            "optional name lets /setname clear like prefix !setname with no args"
+        );
     }
 }
