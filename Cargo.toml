@@ -4,10 +4,26 @@ version = "0.1.0"
 edition = "2024"
 description = "A data-driven Discord moderation bot: automod, spam protection, multi-server config with global scoping, WebUI."
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+autobins = false
+rust-version = "1.96"
+
+[features]
+default = ["web"]
+# WebUI/API (axum + sessions + embedded SPA). Bot builds with --no-default-features.
+web = ["dep:axum", "dep:tower-sessions", "dep:tower-http"]
+
+[[bin]]
+name = "jmodguard-bot"
+path = "src/bin/jmodguard-bot.rs"
+
+[[bin]]
+name = "jmodguard-api"
+path = "src/bin/jmodguard-api.rs"
+required-features = ["web"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["json", "macros"] }
+axum = { version = "0.8", optional = true, features = ["json", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 parking_lot = "0.12"
@@ -23,8 +39,8 @@ serde_json = "1"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "cache", "model", "builder", "http", "utils", "chrono", "rustls_backend"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "process"] }
 toml = "1"
-tower-http = { version = "0.7", features = ["cors"] }
-tower-sessions = { version = "0.14", features = ["memory-store"] }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
+tower-sessions = { version = "0.14", optional = true, features = ["memory-store"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

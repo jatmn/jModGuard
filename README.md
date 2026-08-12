@@ -1,6 +1,11 @@
 # jModGuard
 
-A **data-driven Discord moderation bot** written in Rust.
+A **data-driven Discord moderation bot** written in Rust — open source, dual-process
+(bot + API/WebUI), SQLite-backed, multi-server.
+
+It is designed to self-host cleanly on a single machine. Bunny CDN/Storage can
+serve the static admin UI, but the bot and API currently need the same host or
+shared filesystem for their SQLite database. You do not need Bunny to run it.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
   attachment floods (crypto scams), links in the first minutes after joining,
@@ -24,21 +29,40 @@ A **data-driven Discord moderation bot** written in Rust.
 ## Quick start
 
 ```bash
-cargo build --release
+# Bot without the `web` feature (no axum / sessions / SPA embed).
+cargo build --release --bin jmodguard-bot --no-default-features
+# API with the default `web` feature.
+cargo build --release --bin jmodguard-api
 cp config.example.toml config.toml     # add your token + OAuth ids
-./target/release/jmodguard             # or jmodguard.exe
+./target/release/jmodguard-bot         # Discord gateway (migrates DB)
+./target/release/jmodguard-api         # WebUI/API on http://localhost:8080
 # open http://localhost:8080 and login with Discord
 ```
 
-Full walkthrough (Discord developer portal, intents, invite URL with the
-right permissions, systemd/Task Scheduler, first-run tuning):
-**docs/SETUP.md**
+Start the bot once before the API so migrations are applied. Both processes
+share the same SQLite file (`db.path`).
+
+Full walkthrough (Discord developer portal, intents, invite URL, systemd /
+Task Scheduler): **[docs/SETUP.md](docs/SETUP.md)**.
+
+Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
+
+## Deploy options
+
+| Path | Doc |
+|------|-----|
+| Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
+| Optional Bunny CDN/Storage front end for a shared-DB host | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
+| Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Windows & Linux |
+| [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |
+| [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | optional Bunny.net deployment guide |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
 | [docs/AUTOMOD.md](docs/AUTOMOD.md) | the 7 rules, escalation, whitelists, dry-run, evidence |
 | [docs/TEMPLATES.md](docs/TEMPLATES.md) | event templates + variable reference |
@@ -63,25 +87,37 @@ commercial licensing is granted by the author only.
 ## Development
 
 ```bash
-cargo test          # unit tests (normalizer, templates, db seeding, web)
-cargo clippy        # lint
-cargo build --release
+cargo test --locked
+cargo clippy --locked --bins -- -D warnings
+cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
+cargo build --locked --bin jmodguard-bot --no-default-features
+cargo build --locked --bin jmodguard-api
+# or: ./scripts/smoke-dual-process.sh
 ```
 
-## Architecture (src layout)
+Feature `web` (default) enables axum + tower-sessions + the embedded SPA.
+Always build the bot with `--no-default-features` so it does not link or embed
+the WebUI. The API binary requires `web` (`required-features = ["web"]`).
+
+## Source layout
 
 ```
-main.rs        startup: config → db → WebUI bind → Discord client
-config.rs      config.toml + env overrides
-db.rs          SQLite pool (WAL), migrations, data layer, config-parts loader
+lib.rs         shared crate root (modules + init_tracing; web behind feature)
+bin/jmodguard-bot.rs   Discord gateway only (migrate=true, config_version poll)
+bin/jmodguard-api.rs   axum API/WebUI only (migrate=false; requires feature web)
+config.rs      config.toml + env overrides (db.url/token, config_poll_secs)
+db.rs          SQLite pool (WAL), migrations, config_version, data layer
 defaults.rs    seeded rules / commands / templates
 types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)
-state.rs       AppState, OAuth client, per-guild config cache (global fallback)
+state.rs       AppState, OAuth client, per-guild config cache + version poll
 normalize.rs   bypass-resistant text normalization (NFD, zero-width, leetspeak)
 templates.rs   {variable} renderer shared by everything
 logging.rs     event → channel router + audit log
 automod.rs     rule engine (sliding windows, escalation) + action executor
 handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
-web/           axum WebUI: OAuth login, JSON API, static single-page app
+web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
+frontend/      SPA assets (served by API locally; CDN target when deployed)
+migrations/    0001_init + 0002_config_version
+Dockerfile.bot / Dockerfile.api
 ```

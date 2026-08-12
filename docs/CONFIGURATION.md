@@ -7,32 +7,40 @@ database (everything server-related, editable at runtime).
 
 | Key | Default | Description |
 |---|---|---|
-| `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`) |
-| `db.path` | `jmodguard.db` | SQLite file (env: `JMODGUARD_DB_PATH`) |
+| `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required by bot; also by API for WebUI unban |
+| `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
+| `db.url` | — | Remote libSQL / Bunny Database URL (env: `JMODGUARD_DB_URL`). Empty = local path. Not wired yet — setting it fails at open |
+| `db.token` | — | Remote DB access token (env: `JMODGUARD_DB_TOKEN`) |
 | `db.pool_size` | `8` | connection pool size |
-| `web.bind` | `127.0.0.1:8080` | WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
+| `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
 | `web.oauth_client_secret` | — | Discord OAuth client secret (env: `JMODGUARD_OAUTH_CLIENT_SECRET`) |
-| `bot.default_prefix` | `!` | default command prefix |
-| `bot.owner_id` | `0` | owner user ID (owner commands) (env: `JMODGUARD_OWNER_ID`) |
-| `bot.retention_days` | `7` | raw message retention for edit/delete evidence |
+| `web.cors_origins` | `[]` | Extra SPA origins for credentialed CORS (env: `JMODGUARD_CORS_ORIGINS`, comma-separated). Empty = same-origin only |
+| `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) |
+| `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
+| `bot.retention_days` | `7` | seeded into the global settings row on first boot; synced to the same meta terminal-defaults row (WebUI / config cache / purge share it; `0` = keep forever) |
 | `bot.status` | `moderating` | presence text |
+| `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
-| `log.directory` | `logs` | rolling log directory (empty = console only) |
+| `log.directory` | `logs` | rolling log directory (empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log` |
 
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
-`migrations/0001_init.sql` and is applied automatically.
+`migrations/` (`0001_init.sql` through `0003_archive_global_log_channels.sql`) and is applied by
+`jmodguard-bot` on startup (API opens with `migrate=false` and refuses an
+unmigrated DB).
 
 | Table | Holds |
 |---|---|
-| `guild_settings` | prefix, bot nickname, retention (row per server; `guild_id=0` = global) |
+| `meta` | durable keys (`config_version` for cross-process cache invalidation; `slash_registry_version` for Discord slash re-sync) |
+| `guild_settings` | prefix, bot nickname, retention as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
 | `rules` | the 7 automod rules (server + global rows) |
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
 | `log_channels` | event type → channel mapping (per server only) |
+| `legacy_global_log_channels` | global mappings retired by migration 0003; inspect them while recreating per-server mappings |
 | `badwords` | regex patterns (server + global) |
 | `members` | join/leave history, join count, message count, last seen |
 | `messages` | recent message content + attachments (retention-limited) |
@@ -49,6 +57,15 @@ and default templates. Servers inherit these until you override them.
 
 ## Backups
 
-The whole configuration lives in `jmodguard.db`. Stop the bot and copy the
-file (plus `jmodguard.db-wal`, if present) — or back it up while running with
-`VACUUM INTO` (SQLite is WAL-safe for hot copies).
+The whole configuration lives in `jmodguard.db`, shared by **both**
+`jmodguard-bot` and `jmodguard-api`. Either process can hold pooled WAL
+connections open.
+
+**Cold copy (preferred for restores):** stop **both** the bot and the API,
+then copy `jmodguard.db` plus `jmodguard.db-wal` / `jmodguard.db-shm` if
+present, then start both again.
+
+**Hot copy:** use SQLite's online backup API or
+`sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` while the
+processes keep running — do **not** file-copy the `.db` while either process
+is still writing.

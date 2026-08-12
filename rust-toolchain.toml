@@ -1,0 +1,8 @@
+# Single pin for local rustup + CI. Keep in sync with Dockerfile.bot /
+# Dockerfile.api and Cargo.toml `rust-version`.
+# Floating `@stable` in CI previously accepted code that a newer clippy
+# rejected; Docker's old `1.85` pin was already below this lockfile's MSRV
+# (`time` / `icu_*` / `libsqlite3-sys` need a current toolchain).
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]

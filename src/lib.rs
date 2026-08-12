@@ -1,8 +1,8 @@
-//! Shared jModGuard application library.
+//! jModGuard shared library: Discord bot logic, SQLite data layer, and WebUI/API.
 //!
-//! The current binary remains the monolithic bot and WebUI process. Keeping
-//! the application logic in a library is a behavior-preserving prerequisite
-//! for running those entrypoints as separate processes in the next change.
+//! Two binaries consume this crate:
+//! - `jmodguard-bot` — Discord gateway only
+//! - `jmodguard-api` — axum HTTP API / WebUI only
 
 pub mod automod;
 pub mod commands;
@@ -17,15 +17,21 @@ pub mod normalize;
 pub mod state;
 pub mod templates;
 pub mod types;
+#[cfg(feature = "web")]
 pub mod web;
 
 use crate::config::Config;
 
-/// Initializes tracing from config (console or rolling files under
-/// `log.directory`).
-pub fn init_tracing(cfg: &Config) {
+/// Initializes tracing from config (console or rolling files under `log.directory`).
+///
+/// `process` selects a per-binary log file stem (`jmodguard-bot` / `jmodguard-api`)
+/// so dual-process deploys do not contend on one shared appender.
+pub fn init_tracing(cfg: &Config, process: &str) {
     let level = cfg.log.level.clone();
     let dir = cfg.log.directory.clone();
+    // Our crate logs per-message diagnostics at debug; everything else at the
+    // configured level. This keeps the log file useful without drowning in
+    // serenity internals.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("{level},jmodguard=debug")));
 
@@ -47,8 +53,11 @@ pub fn init_tracing(cfg: &Config) {
         fmt.try_init().ok();
         return;
     }
-    let file_appender = tracing_appender::rolling::daily(&dir, "jmodguard.log");
+    let file_stem = format!("jmodguard-{process}.log");
+    let file_appender = tracing_appender::rolling::daily(&dir, &file_stem);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    // The guard must live for the process lifetime: dropping it shuts down
+    // the writer thread and silently loses all log output.
     std::mem::forget(guard);
     fmt.with_writer(non_blocking).try_init().ok();
 }

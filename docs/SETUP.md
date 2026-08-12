@@ -10,7 +10,10 @@ This guide covers everything from zero to a running bot on **Windows** or
 
 ## 1. Prerequisites
 
-- Rust toolchain (rustup): <https://rustup.rs> — the bot needs Rust 1.74+.
+- Rust toolchain (rustup): <https://rustup.rs> — the repo pins **Rust 1.96.0**
+  via `rust-toolchain.toml` (same as `Cargo.toml` `rust-version` and the
+  Docker builder images). `rustup` will select that pin automatically in this
+  directory.
 - A Discord account (the bot owner).
 - Somewhere to run it: any Windows/Linux machine that stays online (VPS,
   home server, Raspberry Pi class box is fine).
@@ -18,14 +21,15 @@ This guide covers everything from zero to a running bot on **Windows** or
 ## 2. Create the Discord application
 
 1. Go to <https://discord.com/developers/applications> → **New Application** →
-   give it a name (this becomes the bot's name; you can also set a per-server
-   nickname later via the WebUI/`!setname`).
+   give it a name (this becomes the bot's name; you can also set or clear a
+   per-server nickname later via the WebUI Settings tab or `!setname` /
+   `/setname` — empty / omit / `clear` / `-` resets).
 2. Left sidebar → **Bot**:
    - Click **Reset Token** and copy the token. Treat it like a password.
-   - Enable the three **Privileged Gateway Intents** (all are required):
-     - **Presence Intent** (optional — not used, safe to leave off)
+   - Enable these **Privileged Gateway Intents**:
      - **Server Members Intent** — **required** (join/leave tracking)
      - **Message Content Intent** — **required** (message filtering)
+     - **Presence Intent** — not used by jModGuard (safe to leave off)
 3. Left sidebar → **OAuth2 → General**:
    - Copy the **Client ID** and **Client Secret** (needed for the WebUI login).
 4. Left sidebar → **OAuth2 → URL Generator** (or use the invite URL below).
@@ -44,7 +48,7 @@ Use the **URL Generator** (OAuth2 → URL Generator):
   - `View Channels`
   - `Send Messages` (log events, command responses)
   - `Manage Roles` (only if you use the `add_role`/`remove_role` plan steps)
-  - `Manage Nicknames` (only for `!setname`)
+  - `Manage Nicknames` (WebUI nickname apply/clear and `!setname` / `/setname`)
 
 Open the generated URL in a browser, pick your server, authorize.
 
@@ -66,11 +70,20 @@ Discord OAuth2 → **General** → scroll to **Redirects**:
 ```bash
 git clone <your-repo-url> jModGuard
 cd jModGuard
-cargo build --release
+# Bot without the `web` feature (no axum / sessions / SPA embed).
+cargo build --release --bin jmodguard-bot --no-default-features
+# API with the default `web` feature.
+cargo build --release --bin jmodguard-api
 ```
 
-The binary is at `target/release/jmodguard` (`jmodguard.exe` on Windows).
+Binaries:
+- `target/release/jmodguard-bot` — Discord gateway (applies migrations)
+- `target/release/jmodguard-api` — WebUI/API
+
 There are **no system dependencies** — SQLite is compiled in, TLS is rustls.
+Start the bot once before the API so the schema is migrated. Do **not** use
+`cargo build --bins` for production: that builds the bot with the default
+`web` feature and embeds the SPA into the Discord process.
 
 ## 6. Configure
 
@@ -95,30 +108,37 @@ owner_id = 123456789012345678               # your Discord user ID
 
 - **Find your user ID**: Discord → Settings → Advanced → enable **Developer
   Mode**, then right-click your avatar → **Copy User ID**.
+- **`owner_id` is required for global config.** Leaving it at `0` blocks every
+  WebUI “Global” edit (global prefix, global rules/commands/templates/badwords).
+  The API logs a startup warning when `owner_id` is unset.
 - The bot token can also be set via the environment: `JMODGUARD_DISCORD_TOKEN`.
 
 ## 7. Run
 
 ```bash
-./jmodguard            # Windows: jmodguard.exe
+./jmodguard-bot        # Discord gateway; migrates DB
+./jmodguard-api        # WebUI/API on 127.0.0.1:8080
+# Windows: jmodguard-bot.exe / jmodguard-api.exe
 ```
 
-First boot:
+First boot (bot):
 - creates `jmodguard.db` (SQLite, WAL mode) and applies migrations,
 - seeds default rules, commands, and event templates (all editable later),
-- syncs slash commands into every server it is in,
-- starts the WebUI on `127.0.0.1:8080`.
+- syncs slash commands into every server it is in.
+
+The API process serves the WebUI on `127.0.0.1:8080` (expects a migrated DB).
 
 ### Windows (run as a service)
 
-1. **Task Scheduler**: Create Basic Task → Program: path to `jmodguard.exe`,
-   trigger: *At startup*, settings: *Run whether user is logged on or not*.
-2. Or use **NSSM** for a proper service: `nssm install jModGuard
-   C:\path\to\jmodguard.exe`.
+1. **Task Scheduler**: Create Basic Tasks for both binaries → Program: path to
+   `jmodguard-bot.exe` / `jmodguard-api.exe`, trigger: *At startup*.
+2. Or use **NSSM** for proper services:
+   `nssm install jModGuardBot C:\path\to\jmodguard-bot.exe` and
+   `nssm install jModGuardApi C:\path\to\jmodguard-api.exe`.
 
 ### Linux (systemd)
 
-`/etc/systemd/system/jmodguard.service`:
+`/etc/systemd/system/jmodguard-bot.service`:
 
 ```ini
 [Unit]
@@ -128,7 +148,25 @@ After=network-online.target
 [Service]
 User=jmodguard
 WorkingDirectory=/opt/jmodguard
-ExecStart=/opt/jmodguard/jmodguard
+ExecStart=/opt/jmodguard/jmodguard-bot
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/jmodguard-api.service`:
+
+```ini
+[Unit]
+Description=jModGuard API / WebUI
+After=network-online.target jmodguard-bot.service
+
+[Service]
+User=jmodguard
+WorkingDirectory=/opt/jmodguard
+ExecStart=/opt/jmodguard/jmodguard-api
 Restart=on-failure
 RestartSec=5
 
@@ -138,8 +176,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now jmodguard
-journalctl -u jmodguard -f    # logs
+sudo systemctl enable --now jmodguard-bot jmodguard-api
+journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
 ```
 
 ## 8. Open the WebUI
@@ -169,8 +207,9 @@ journalctl -u jmodguard -f    # logs
 
 ```bash
 git pull
-cargo build --release
-# restart the service/binary; the database and config persist
+cargo build --release --bin jmodguard-bot --no-default-features
+cargo build --release --bin jmodguard-api
+# restart both services; the database and config persist
 ```
 
 ## 11. Troubleshooting
@@ -178,13 +217,16 @@ cargo build --release
 **The bot ignores all commands / nothing happens when I type `!about`**
 
 Work through these in order (each one is logged, so check
-`logs/jmodguard.log.YYYY-MM-DD` first):
+`logs/jmodguard-bot.log.YYYY-MM-DD` / `logs/jmodguard-api.log.YYYY-MM-DD` first):
 
-1. **Is the bot running at all?** The log file should show
-   `database ready`, `WebUI listening`, and `starting shards` on boot. If the
-   log is empty, the process never started (check the service/working
-   directory — the bot creates `logs/` and `jmodguard.db` in its *current
-   working directory*).
+1. **Are the processes running?** Dual-process: check each log for its own
+   boot lines. The bot log should show `database ready (migrate=true)` and
+   `starting shards (bot process; no HTTP bind)`. The API log should show
+   `database ready (migrate=false)` and `API/WebUI listening on http://…`.
+   Looking for `WebUI listening` in the **bot** log is wrong — the bot never
+   binds HTTP. If a log is empty, that process never started (check the
+   service/working directory — each process creates `logs/` and uses
+   `jmodguard.db` relative to its *current working directory*).
 2. **Privileged intents.** If you see `received messages with empty content...`
    in the log, the **Server Members** and **Message Content** intents are not
    enabled in the developer portal (Bot → Privileged Gateway Intents).
