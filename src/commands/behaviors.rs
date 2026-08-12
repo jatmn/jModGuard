@@ -811,6 +811,8 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             let channel = parse_channel_mention(&token)
                 .or_else(|| token.parse::<u64>().ok().map(Into::into))
                 .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
+            crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
+                .await?;
             db::upsert_log_channel(&env.app.db, guild, &event, channel.get() as i64).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {

@@ -73,11 +73,14 @@ pub async fn guild_config(
         }));
     }
 
-    let badwords: Vec<_> = db::list_badwords(&app.db, guild)
-        .await?
-        .iter()
-        .map(|w| w.with_status())
-        .collect();
+    // Runtime enforcement combines global and guild badwords. Return that
+    // same set so global rows created in this UI remain inspectable and
+    // removable through it.
+    let mut badwords = db::list_badwords(&app.db, GLOBAL_SCOPE).await?;
+    if guild != GLOBAL_SCOPE {
+        badwords.extend(db::list_badwords(&app.db, guild).await?);
+    }
+    let badwords: Vec<_> = badwords.iter().map(|w| w.with_status()).collect();
 
     // commands: union of guild + global rows, effective resolution
     let g_cmds = db::list_commands(&app.db, guild).await?;
@@ -434,11 +437,11 @@ pub async fn list_badwords(
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _auth = guild_scope(&app, &session, guild_id).await?;
-    let words: Vec<_> = db::list_badwords(&app.db, guild_id as i64)
-        .await?
-        .iter()
-        .map(|w| w.with_status())
-        .collect();
+    let mut words = db::list_badwords(&app.db, GLOBAL_SCOPE).await?;
+    if guild_id as i64 != GLOBAL_SCOPE {
+        words.extend(db::list_badwords(&app.db, guild_id as i64).await?);
+    }
+    let words: Vec<_> = words.iter().map(|w| w.with_status()).collect();
     Ok(Json(serde_json::json!(words)))
 }
 
@@ -738,6 +741,13 @@ pub async fn put_logchannel(
     if !crate::types::EVENT_TYPES.contains(&event.as_str()) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
+    crate::discord::validate_log_channel_guild(
+        app.discord_http(),
+        guild_id,
+        serenity::model::id::ChannelId::new(body.channel_id as u64),
+    )
+    .await
+    .map_err(ApiError)?;
     db::upsert_log_channel(&app.db, scope, &event, body.channel_id).await?;
     app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1003,7 +1013,7 @@ pub async fn unban(
     Path(guild_id): Path<u64>,
     Json(body): Json<UnbanBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = super::authorize_ban_members(&app, &session, guild_id).await?;
     let reason = body.reason.unwrap_or_else(|| "unbanned via WebUI".into());
 
     // Discord is the source of truth for ban status. Local `bans` is a mirror
