@@ -116,9 +116,9 @@ owner_id = 123456789012345678               # your Discord user ID
 ## 7. Run
 
 ```bash
-./jmodguard-bot        # Discord gateway; migrates DB
-./jmodguard-api        # WebUI/API on 127.0.0.1:8080
-# Windows: jmodguard-bot.exe / jmodguard-api.exe
+./target/release/jmodguard-bot        # Discord gateway; migrates DB
+./target/release/jmodguard-api        # WebUI/API on 127.0.0.1:8080
+# Windows: target\release\jmodguard-bot.exe / target\release\jmodguard-api.exe
 ```
 
 First boot (bot):
