@@ -607,9 +607,14 @@ impl ConfigCache {
         let version = self.version.load(Ordering::Relaxed);
         let (durable_version, parts) =
             db::load_config_parts_with_version(db, guild_id as i64).await?;
-        if durable_version < required {
+        let required_after = self
+            .durable_floor
+            .load(Ordering::SeqCst)
+            .max(db.required_config_version());
+        let version_after = self.version.load(Ordering::Relaxed);
+        if durable_version < required_after || version_after != version {
             anyhow::bail!(
-                "database replica returned config_version {durable_version}, expected at least {required}"
+                "database config snapshot changed while loading (version {durable_version}, expected at least {required_after})"
             );
         }
         let cfg = Arc::new(CachedGuildConfig::from_parts(

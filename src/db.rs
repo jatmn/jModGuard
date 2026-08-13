@@ -255,9 +255,7 @@ impl Db {
                 // Clear it before any new migration/default work so an API
                 // restarting concurrently cannot mistake stale readiness for
                 // completion of this bootstrap.
-                if !remote {
-                    clear_bootstrap_complete(&bootstrap)?;
-                }
+                clear_bootstrap_complete(&bootstrap)?;
                 migrate_conn(&mut bootstrap)?;
                 // Bot is authority for terminal defaults: sync from config every
                 // migrate-open so both processes resolve empty global fields from
@@ -444,7 +442,11 @@ impl Db {
 
 fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
     if remote {
-        connection.execute_batch("PRAGMA foreign_keys=ON;")
+        // Hrana opens a new stream for each transaction, so a connection-level
+        // foreign_keys pragma would not carry into transactional writes. The
+        // current schema has no FOREIGN KEY clauses; add per-transaction stream
+        // setup if a future migration introduces them.
+        Ok(())
     } else {
         connection.execute_batch(
             "PRAGMA busy_timeout=5000;
