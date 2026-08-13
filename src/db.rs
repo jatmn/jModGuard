@@ -349,7 +349,8 @@ impl Db {
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);
-            if connection.is_tainted()
+            if connection.pool.remote && result.is_err()
+                || connection.is_tainted()
                 || result
                     .as_ref()
                     .err()
@@ -381,7 +382,8 @@ impl Db {
         let _permit = permit;
         let mut connection = ConnectionLease::checkout(Arc::clone(&self.connections))?;
         let result = f(&mut connection);
-        if connection.is_tainted()
+        if connection.pool.remote && result.is_err()
+            || connection.is_tainted()
             || result
                 .as_ref()
                 .err()
@@ -2692,6 +2694,26 @@ mod tests {
         let replacement = ConnectionLease::checkout(Arc::clone(&db.connections)).unwrap();
         drop((first, replacement));
         assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn failed_remote_operation_discards_connection_before_reuse() {
+        let tmp = tmp_db_path("discard_failed_remote_connection");
+        let mut db = Db::open(&tmp, 2).unwrap();
+        Arc::get_mut(&mut db.connections).unwrap().remote = true;
+
+        let error = tokio_test_block_on(
+            db.with_conn(|_| Err::<(), _>(anyhow::anyhow!("simulated transport failure"))),
+        )
+        .expect_err("simulated remote operation must fail");
+        assert!(error.to_string().contains("simulated transport failure"));
+        assert_eq!(
+            db.connections.idle.lock().unwrap().len(),
+            1,
+            "failed remote connection must not be returned to the idle pool"
+        );
 
         let _ = std::fs::remove_file(tmp);
     }
