@@ -52,9 +52,16 @@ from Bunny's documented failover-loss window without accepting a stale replica
 as authoritative. Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers.
 
+Nickname changes additionally enqueue a generation-numbered durable outbox row
+in the same settings transaction. The bot drains it through primary-routed
+reads and acknowledges only the generation it applied to Discord. This makes
+the final committed nickname win across bot/API races and survives a cancelled
+HTTP or command request.
+
 ## Migrations
 
-- Bot applies migrations, seeds globals, heals settings, then publishes a
+- Bot applies migrations, atomically seeds globals plus their config/command
+  versions, heals settings, then publishes a
   bootstrap-complete marker.
 - API opens with `migrate=false`. Until the schema, terminal-defaults meta, and
   bootstrap-complete marker exist—or while SQLite is transiently locked by bot

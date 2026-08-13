@@ -6,6 +6,7 @@ use jmodguard::db::Db;
 use jmodguard::handlers::Handler;
 use jmodguard::state::AppState;
 use jmodguard::{db, init_tracing};
+use serenity::builder::EditMember;
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
 use std::sync::Arc;
@@ -93,6 +94,62 @@ async fn main() -> Result<()> {
                         false
                     }
                 };
+                // Nickname writes are a Discord+database dual write performed
+                // by either process. Drain the durable generation-checked
+                // outbox every tick so the last committed DB value eventually
+                // wins even if requests interleave or are cancelled.
+                match db::pending_nickname_reconciles(&app.db).await {
+                    Ok(pending) => {
+                        let me = cache.current_user().id;
+                        for (guild_id, generation, nickname) in pending {
+                            let Ok(guild_id_u64) = u64::try_from(guild_id) else {
+                                tracing::error!(guild_id, "invalid guild id in nickname outbox");
+                                continue;
+                            };
+                            let guild = serenity::model::id::GuildId::new(guild_id_u64);
+                            let target = nickname.clone();
+                            match jmodguard::discord::with_retries(
+                                "Discord nickname reconciliation",
+                                guild_id_u64,
+                                || {
+                                    let target = target.clone();
+                                    async {
+                                        guild
+                                            .edit_member(
+                                                &http,
+                                                me,
+                                                EditMember::new().nickname(target),
+                                            )
+                                            .await
+                                            .map(|_| ())
+                                    }
+                                },
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    if let Err(error) = db::acknowledge_nickname_reconcile(
+                                        &app.db, guild_id, generation,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            guild_id,
+                                            "failed to acknowledge nickname reconciliation: {error:#}"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    guild_id,
+                                    "nickname reconciliation failed; will retry: {error:#}"
+                                ),
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("failed to load pending nickname reconciliations: {error:#}")
+                    }
+                }
                 // Peek slash registry every tick (not gated on config_version) so a
                 // future slash-only bump cannot be missed. Do not commit the observed
                 // version until Discord re-sync has nothing left to retry — otherwise

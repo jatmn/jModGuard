@@ -25,6 +25,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_config_version.sql"),
     include_str!("../migrations/0003_archive_global_log_channels.sql"),
+    include_str!("../migrations/0004_nickname_reconcile.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.
@@ -599,6 +600,18 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
     db.with_conn_sync(|conn| get_slash_registry_version_conn(conn))
 }
 
+/// Primary-routed startup baseline. A replica can expose schema metadata before
+/// the atomically seeded command registry has converged.
+pub fn get_primary_versions_sync(db: &Db) -> Result<(u64, u64)> {
+    db.with_conn_sync(|conn| {
+        let tx = conn.transaction_immediate()?;
+        let config = get_config_version_conn(&tx)?;
+        let slash = get_slash_registry_version_conn(&tx)?;
+        tx.commit()?;
+        Ok((config, slash))
+    })
+}
+
 /// Durable terminal settings fallback (`bot.default_prefix` / `bot.retention_days`).
 ///
 /// Stored in `meta` so bot and API share one source of truth when the global
@@ -767,6 +780,8 @@ fn seed_globals_conn(
     retention_days: u32,
     terminal: &GuildSettings,
 ) -> Result<()> {
+    let tx = conn.transaction_immediate()?;
+    let conn = &tx;
     // Seed only config-driven fields, then strip anything equal to terminal
     // defaults (not hardcoded `GuildSettings::default()`). Never pin empty
     // bot_name as a global override — that blocked inheritance.
@@ -781,13 +796,13 @@ fn seed_globals_conn(
     } else {
         serde_json::to_string(&global_settings)?
     };
-    conn.execute(
+    let mut changed = conn.execute(
         "INSERT OR IGNORE INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
         params![GLOBAL_SCOPE, json],
     )?;
     let rules = crate::defaults::default_rules();
     for (i, rule) in rules.iter().enumerate() {
-        conn.execute(
+        changed += conn.execute(
             "INSERT OR IGNORE INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
             params![
                 GLOBAL_SCOPE,
@@ -796,8 +811,9 @@ fn seed_globals_conn(
             ],
         )?;
     }
+    let mut commands_changed = 0usize;
     for cmd in crate::defaults::default_commands() {
-        conn.execute(
+        commands_changed += conn.execute(
             "INSERT OR IGNORE INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
             params![
                 GLOBAL_SCOPE,
@@ -807,11 +823,19 @@ fn seed_globals_conn(
         )?;
     }
     for (event, template) in crate::defaults::default_templates() {
-        conn.execute(
+        changed += conn.execute(
             "INSERT OR IGNORE INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)",
             params![GLOBAL_SCOPE, event, template],
         )?;
     }
+    changed += commands_changed;
+    if changed > 0 {
+        bump_config_version_conn(conn)?;
+    }
+    if commands_changed > 0 {
+        bump_slash_registry_version_conn(conn)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1233,6 +1257,62 @@ pub async fn get_settings(db: &Db, guild_id: i64) -> Result<GuildSettings> {
     .await
 }
 
+/// Reads effective settings from a primary-routed snapshot for side-effect
+/// reconciliation after independently running bot/API writers.
+pub async fn get_settings_primary(db: &Db, guild_id: i64) -> Result<GuildSettings> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
+        let settings = effective_settings_conn(&tx, guild_id, &defaults)?;
+        tx.commit()?;
+        Ok(settings)
+    })
+    .await
+}
+
+fn enqueue_nickname_reconcile_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO nickname_reconcile (guild_id, generation) VALUES (?1, 1)
+         ON CONFLICT(guild_id) DO UPDATE SET generation = generation + 1",
+        params![guild_id],
+    )?;
+    Ok(())
+}
+
+/// Primary-routed durable nickname work. The generation prevents an older
+/// Discord request from acknowledging a newer cross-process settings commit.
+pub async fn pending_nickname_reconciles(db: &Db) -> Result<Vec<(i64, i64, String)>> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
+        let mut stmt =
+            tx.prepare("SELECT guild_id, generation FROM nickname_reconcile ORDER BY guild_id")?;
+        let pending = stmt.query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?)))?;
+        let mut out = Vec::new();
+        for row in pending {
+            let (guild_id, generation) = row?;
+            let name = effective_settings_conn(&tx, guild_id, &defaults)?.bot_name;
+            out.push((guild_id, generation, name));
+        }
+        tx.commit()?;
+        Ok(out)
+    })
+    .await
+}
+
+pub async fn acknowledge_nickname_reconcile(db: &Db, guild_id: i64, generation: i64) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute(
+            "DELETE FROM nickname_reconcile WHERE guild_id = ?1 AND generation = ?2",
+            params![guild_id, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 pub async fn get_settings_override(
     db: &Db,
     guild_id: i64,
@@ -1330,6 +1410,7 @@ pub async fn patch_settings(
     if prefix.is_none() && bot_name.is_none() && retention_days.is_none() {
         return get_settings(db, guild_id).await;
     }
+    let nickname_changed = bot_name.is_some() && guild_id != GLOBAL_SCOPE;
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
@@ -1355,6 +1436,9 @@ pub async fn patch_settings(
         let ov = normalize_settings_override_against_parent(&ov, &parent);
 
         write_settings_override_conn(&tx, guild_id, &ov)?;
+        if nickname_changed {
+            enqueue_nickname_reconcile_conn(&tx, guild_id)?;
+        }
         bump_config_version_conn(&tx)?;
         let effective = effective_settings_conn(&tx, guild_id, &defaults)?;
         refresh_settings_heal_checksum_conn(&tx)?;
@@ -1825,6 +1909,9 @@ pub async fn copy_guild_config(
             };
             let to_write = normalize_settings_override_for_scope(dst, to_write);
             write_settings_override_conn(&tx, dst, &to_write)?;
+            if dst != GLOBAL_SCOPE {
+                enqueue_nickname_reconcile_conn(&tx, dst)?;
+            }
             result.copied.push("settings");
         }
 
@@ -3048,7 +3135,7 @@ mod tests {
         let tmp = tmp_db_path("cfgver");
         let db = Db::open(&tmp, 2).unwrap();
         let v0 = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
-        assert_eq!(v0, 0);
+        assert!(v0 > 0, "initial seed publishes its config version");
         tokio_test_block_on(crate::db::upsert_settings(
             &db,
             1,
@@ -3056,7 +3143,7 @@ mod tests {
         ))
         .unwrap();
         let v1 = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
-        assert_eq!(v1, 1);
+        assert_eq!(v1, v0 + 1);
         // A remote database must never be opened without credentials.
         let err = Db::open_with(DbOpenOptions {
             path: tmp.clone(),
@@ -3463,10 +3550,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        assert_eq!(
-            tokio_test_block_on(crate::db::get_config_version(&bot)).unwrap(),
-            0
-        );
+        let baseline = tokio_test_block_on(crate::db::get_config_version(&bot)).unwrap();
         tokio_test_block_on(crate::db::upsert_settings(
             &api,
             42,
@@ -3475,11 +3559,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             tokio_test_block_on(crate::db::get_config_version(&bot)).unwrap(),
-            1
+            baseline + 1
         );
         assert_eq!(
             tokio_test_block_on(crate::db::get_config_version(&api)).unwrap(),
-            1
+            baseline + 1
         );
         cleanup_db(&tmp);
     }
@@ -3600,7 +3684,10 @@ mod tests {
         let tmp = tmp_db_path("slashver");
         let db = Db::open(&tmp, 2).unwrap();
         let s0 = tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap();
-        assert_eq!(s0, 0);
+        assert!(
+            s0 > 0,
+            "initial command seed publishes its registry version"
+        );
 
         tokio_test_block_on(crate::db::upsert_settings(
             &db,
@@ -3610,7 +3697,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
-            0,
+            s0,
             "settings must not bump slash_registry_version"
         );
 
@@ -3621,7 +3708,7 @@ mod tests {
         tokio_test_block_on(crate::db::upsert_command(&db, 1, &cmd.name, &cmd)).unwrap();
         assert_eq!(
             tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
-            1,
+            s0 + 1,
             "command upsert must bump slash_registry_version"
         );
         assert!(
@@ -3630,7 +3717,7 @@ mod tests {
         );
         let (loaded_version, loaded_commands) =
             tokio_test_block_on(crate::db::load_slash_commands_with_version(&db, 1)).unwrap();
-        assert_eq!(loaded_version, 1);
+        assert_eq!(loaded_version, s0 + 1);
         assert_eq!(
             loaded_commands.get(&cmd.name).map(|loaded| &loaded.name),
             Some(&cmd.name)
@@ -3639,7 +3726,7 @@ mod tests {
         tokio_test_block_on(crate::db::delete_command(&db, 1, &cmd.name)).unwrap();
         assert_eq!(
             tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
-            2
+            s0 + 2
         );
         cleanup_db(&tmp);
     }
@@ -4663,6 +4750,54 @@ mod tests {
             tokio_test_block_on(crate::db::get_slash_registry_version(&db)).unwrap(),
             s0,
             "no-op command delete must not bump slash_registry_version"
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn seeded_commands_publish_a_primary_registry_version() {
+        let tmp = tmp_db_path("seed_registry_version");
+        let db = Db::open(&tmp, 2).unwrap();
+        let (config, slash) = get_primary_versions_sync(&db).unwrap();
+        assert!(config > 0, "atomic seed must publish config visibility");
+        assert!(
+            slash > 0,
+            "atomic command seed must publish slash visibility"
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn nickname_outbox_generation_cannot_ack_a_newer_write() {
+        let tmp = tmp_db_path("nickname_outbox_generation");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(patch_settings(
+            &db,
+            42,
+            None,
+            Some(Some("first".into())),
+            None,
+        ))
+        .unwrap();
+        let first = tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap();
+        assert_eq!(first, vec![(42, 1, "first".into())]);
+
+        tokio_test_block_on(patch_settings(
+            &db,
+            42,
+            None,
+            Some(Some("second".into())),
+            None,
+        ))
+        .unwrap();
+        tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 1)).unwrap();
+        let second = tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap();
+        assert_eq!(second, vec![(42, 2, "second".into())]);
+        tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 2)).unwrap();
+        assert!(
+            tokio_test_block_on(pending_nickname_reconciles(&db))
+                .unwrap()
+                .is_empty()
         );
         cleanup_db(&tmp);
     }

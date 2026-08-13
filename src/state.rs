@@ -94,10 +94,8 @@ impl AppState {
         // Cache population is independent of the poll task; skipping the first
         // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
         // that landed before the first successful poll.
-        let primed = db::get_config_version_sync(&db)
-            .context("failed to read config_version while building AppState")?;
-        let primed_slash = db::get_slash_registry_version_sync(&db)
-            .context("failed to read slash_registry_version while building AppState")?;
+        let (primed, primed_slash) = db::get_primary_versions_sync(&db)
+            .context("failed to read primary version baselines while building AppState")?;
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
@@ -829,6 +827,8 @@ mod tests {
         })
         .unwrap();
         let app = AppState::new(Config::default(), db).unwrap();
+        let initial_slash = app.acknowledged_slash_registry_version();
+        let initial_config = app.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
@@ -841,11 +841,11 @@ mod tests {
         let pending = tokio_test_block_on(app.pending_slash_registry_version())
             .unwrap()
             .expect("command write must surface pending slash version");
-        assert_eq!(pending, 1);
+        assert_eq!(pending, initial_slash + 1);
         // Peek again — must still be pending (no auto-advance).
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
-            Some(1)
+            Some(initial_slash + 1)
         );
         app.commit_slash_registry_version(pending);
         assert_eq!(
@@ -855,13 +855,16 @@ mod tests {
         app.commit_slash_registry_version(10);
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
-            Some(1),
+            Some(initial_slash + 1),
             "an immediate primary transaction confirms an authoritative rollback"
         );
         app.last_config_version.store(10, Ordering::SeqCst);
         app.configs.require_version(10);
         assert!(tokio_test_block_on(app.poll_config_version()).unwrap());
-        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.last_config_version.load(Ordering::SeqCst),
+            initial_config + 1
+        );
         tokio_test_block_on(app.configs.get(&app.db, 1)).expect("cache floor must rebaseline");
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
