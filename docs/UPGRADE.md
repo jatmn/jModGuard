@@ -54,11 +54,10 @@ Both `jmodguard-bot` and `jmodguard-api` can hold the shared DB open.
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` — do not file-copy
 the `.db` while either process is writing. See [CONFIGURATION.md](CONFIGURATION.md).
 
-For Bunny Database, create and verify a logical dump using the manual `bsql`
-procedure in [CONFIGURATION.md](CONFIGURATION.md#bunny-database). The local
-file-copy procedure does not apply to a remote database. Do not perform a
-production upgrade until an operator-controlled backup has passed a restore
-drill.
+For Bunny Database, the local file-copy procedure does not apply. A complete
+operator-controlled backup path is not yet available; `bsql .dump` alone is
+insufficient for the jModGuard schema. Do not perform a production upgrade
+until the acceptance drill in [BACKUP-RESTORE.md](BACKUP-RESTORE.md) passes.
 
 ## 3. Build or pull the new artifacts
 
@@ -159,4 +158,5 @@ from the same release. Generic topology:
 ## Related
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — dual-process and `config_version`
-- [CONFIGURATION.md](CONFIGURATION.md) — backups and config keys
+- [CONFIGURATION.md](CONFIGURATION.md) — config keys
+- [BACKUP-RESTORE.md](BACKUP-RESTORE.md) — provider backup status and restore gate

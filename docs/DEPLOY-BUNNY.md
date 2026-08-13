@@ -131,9 +131,9 @@ and cross-process visibility without requiring production credentials.
 
 - Bunny Database is currently documented as Public Preview. Review its current
   limits and availability before production use. Its internal snapshots are
-  not a substitute for an operator-controlled backup policy; the verified
-  manual `bsql` recovery path and its automation limits are documented in
-  [CONFIGURATION.md](CONFIGURATION.md#bunny-database).
+  not a substitute for an operator-controlled backup policy. The current
+  `bsql .dump` output is not a complete jModGuard backup; review the explicit
+  production blocker in [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
 - Run one bot app instance unless Discord sharding and singleton work have been
   deliberately redesigned and tested.
 - API sessions use an in-memory store. Restarting the API logs users out, and
@@ -160,5 +160,6 @@ later hosted on Bunny Storage/CDN under another origin:
 - [Bunny Database Rust client](https://docs.bunny.net/database/connect/rust)
 - [Bunny Database authentication](https://docs.bunny.net/database/connect/authorization)
 - [Magic Containers quickstart](https://docs.bunny.net/magic-containers/quickstart)
+- [Backup and restore status](BACKUP-RESTORE.md)
 - [Configuration reference](CONFIGURATION.md)
 - [Architecture](ARCHITECTURE.md)
