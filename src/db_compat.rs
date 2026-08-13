@@ -372,10 +372,20 @@ impl Drop for Transaction {
             "rollback transaction",
             self.inner().execute_batch("ROLLBACK"),
         );
-        drop_transaction_without_runtime(self.inner.take().expect("transaction already completed"));
-        if let Err(error) = result {
-            self.connection_tainted.store(true, Ordering::Release);
-            tracing::warn!(%error, "failed to roll back uncommitted database transaction");
+        let inner = self.inner.take().expect("transaction already completed");
+        match result {
+            Ok(_) => drop_transaction_without_runtime(inner),
+            Err(error) => {
+                // The local libSQL transaction destructor retries rollback with
+                // `unwrap()`, while the remote destructor may spawn unbounded
+                // best-effort cleanup. After our bounded rollback has already
+                // failed, neither behavior is safe. Leak only this failed
+                // wrapper; the owning connection is marked unusable and
+                // discarded by the pool.
+                std::mem::forget(inner);
+                self.connection_tainted.store(true, Ordering::Release);
+                tracing::warn!(%error, "failed to roll back uncommitted database transaction");
+            }
         }
     }
 }

@@ -30,7 +30,7 @@ const MIGRATIONS: &[&str] = &[
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
 /// because the server may have committed before the response was lost.
-const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Largest supported retention period. It stays below chrono's representable
 /// duration range and is also enforced at the WebUI/database write boundary.
@@ -163,6 +163,7 @@ impl Drop for ConnectionLease {
             return;
         };
         if !self.reusable {
+            drop_connection_without_runtime(connection);
             return;
         }
         match self.pool.idle.lock() {
@@ -171,6 +172,19 @@ impl Drop for ConnectionLease {
                 tracing::error!("database connection pool lock poisoned while returning lease")
             }
         }
+    }
+}
+
+fn drop_connection_without_runtime(connection: Connection) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || drop(connection))
+                .join()
+                .expect("database connection drop thread panicked")
+        });
+    } else {
+        drop(connection);
     }
 }
 
@@ -2488,8 +2502,8 @@ pub struct ConfigParts {
 
 /// Loads `(key, value)` rows where the value column holds JSON-serialized
 /// config (rules, commands). The value column name varies per table.
-fn rows_map_json<T: DeserializeOwned>(
-    conn: &Connection,
+fn rows_map_json<T: DeserializeOwned + Send + 'static>(
+    conn: &impl SqlExecutor,
     table: &str,
     key_col: &str,
     value_col: &str,
@@ -2639,6 +2653,27 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
             log_channels,
             badwords,
         })
+    })
+    .await
+}
+
+/// Loads the effective command registry and its durable version from one
+/// read transaction. This prevents a remote replica from supplying version N
+/// on one pooled connection and stale N-1 command rows on another.
+pub async fn load_slash_commands_with_version(
+    db: &Db,
+    guild_id: i64,
+) -> Result<(u64, std::collections::HashMap<String, CommandDef>)> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction()?;
+        let version = get_slash_registry_version_conn(&tx)?;
+        let guild: std::collections::HashMap<String, CommandDef> =
+            rows_map_json(&tx, "commands", "name", "data", guild_id)?;
+        let mut commands: std::collections::HashMap<String, CommandDef> =
+            rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
+        commands.extend(guild);
+        tx.commit()?;
+        Ok((version, commands))
     })
     .await
 }
@@ -3488,6 +3523,13 @@ mod tests {
         assert!(
             tokio_test_block_on(crate::db::get_config_version(&db)).unwrap() >= 2,
             "command upsert still bumps config_version"
+        );
+        let (loaded_version, loaded_commands) =
+            tokio_test_block_on(crate::db::load_slash_commands_with_version(&db, 1)).unwrap();
+        assert_eq!(loaded_version, 1);
+        assert_eq!(
+            loaded_commands.get(&cmd.name).map(|loaded| &loaded.name),
+            Some(&cmd.name)
         );
 
         tokio_test_block_on(crate::db::delete_command(&db, 1, &cmd.name)).unwrap();

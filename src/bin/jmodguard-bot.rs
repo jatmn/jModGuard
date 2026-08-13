@@ -109,10 +109,7 @@ async fn main() -> Result<()> {
                                     "slash re-sync deferred: guild cache empty (will retry)"
                                 );
                             }
-                            jmodguard::state::SlashResyncPlan::Sync {
-                                guilds,
-                                invalidate,
-                            } => {
+                            jmodguard::state::SlashResyncPlan::Sync { guilds, invalidate } => {
                                 tracing::info!(
                                     "slash_registry_version changed; re-syncing Discord slash \
                                      commands ({} guild(s))",
@@ -123,10 +120,11 @@ async fn main() -> Result<()> {
                                 }
                                 let mut failed = std::collections::HashSet::new();
                                 for gid in guilds {
-                                    if !jmodguard::commands::sync_slash_commands_http(
+                                    if !jmodguard::commands::sync_slash_commands_versioned_http(
                                         &app,
                                         &http,
                                         serenity::model::id::GuildId::new(gid),
+                                        remote,
                                     )
                                     .await
                                     {

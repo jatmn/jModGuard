@@ -14,10 +14,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::logging;
 use crate::state::{AppState, CachedGuildConfig};
 use crate::templates;
 use crate::types::CommandDef;
+use crate::{db, logging};
 
 use std::collections::HashMap as StdHashMap;
 
@@ -355,8 +355,44 @@ pub async fn sync_slash_commands_http(
             return false;
         }
     };
+    set_slash_commands(http, guild_id, &cfg.commands).await
+}
+
+/// Registry-poll variant: command rows and the version that identifies them
+/// are read from one database snapshot. A lagging replica is retried instead
+/// of allowing Discord to accept stale rows under a newer acknowledged version.
+pub async fn sync_slash_commands_versioned_http(
+    app: &Arc<AppState>,
+    http: impl AsRef<serenity::http::Http>,
+    guild_id: GuildId,
+    target_version: u64,
+) -> bool {
+    let (loaded_version, commands) =
+        match db::load_slash_commands_with_version(&app.db, guild_id.get() as i64).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    "slash sync: versioned registry load failed for {guild_id}: {error:#}"
+                );
+                return false;
+            }
+        };
+    if loaded_version != target_version {
+        tracing::warn!(
+            "slash sync: replica returned registry version {loaded_version} for {guild_id}, expected {target_version}; will retry"
+        );
+        return false;
+    }
+    set_slash_commands(http, guild_id, &commands).await
+}
+
+async fn set_slash_commands(
+    http: impl AsRef<serenity::http::Http>,
+    guild_id: GuildId,
+    registry: &std::collections::HashMap<String, CommandDef>,
+) -> bool {
     let mut commands: Vec<CreateCommand> = Vec::new();
-    for cmd in cfg.commands.values() {
+    for cmd in registry.values() {
         if !cmd.enabled {
             continue;
         }
