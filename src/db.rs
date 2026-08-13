@@ -407,9 +407,7 @@ fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
 }
 
 fn migrate_conn(conn: &mut Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))
-        .unwrap_or(0);
+    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version < target {
@@ -425,9 +423,7 @@ fn migrate_conn(conn: &mut Connection) -> Result<()> {
 }
 
 fn ensure_schema_current(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))
-        .unwrap_or(0);
+    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let required = MIGRATIONS.len() as i64;
     if version < required {
         return Err(SchemaNotReady(format!(
@@ -595,13 +591,11 @@ fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
 }
 
 fn clear_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
-    let has_meta: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            (),
-            |r| Ok(r.get(0)?),
-        )
-        .unwrap_or(0);
+    let has_meta: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
     if has_meta != 0 {
         conn.execute(
             "DELETE FROM meta WHERE key = ?1",

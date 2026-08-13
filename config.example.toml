@@ -15,8 +15,8 @@ token = ""
 [db]
 # Local SQLite database file path (WAL mode is enabled automatically).
 path = "jmodguard.db"
-# Remote libSQL URL. Empty = use local `path`. Bunny Database is the tested,
-# documented first-class provider.
+# Remote libSQL URL. Empty = use local `path`. Bunny Database is the documented
+# first-class provider; see docs/DEPLOY-BUNNY.md for its acceptance test.
 # Portable env: JMODGUARD_DB_URL. Bunny also injects BUNNY_DATABASE_URL.
 url = ""
 # Remote DB access token (server-side only). Portable env: JMODGUARD_DB_TOKEN.

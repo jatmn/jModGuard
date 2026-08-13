@@ -17,7 +17,9 @@ jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jm
 
 For a single-host install, both processes open the same local SQLite file. For
 distributed deployment, both connect to one remote libSQL database. Bunny
-Database is the tested, documented first-class remote provider. Local SQLite
+Database is the documented first-class remote provider; its environment
+mapping and generic protocol path have automated coverage, while production
+TLS/authentication is verified during deployment acceptance. Local SQLite
 uses WAL mode, so its file must not be placed on a network filesystem or opened
 by processes on different hosts.
 
