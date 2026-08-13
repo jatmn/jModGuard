@@ -15,7 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         # Pin matches rust-toolchain.toml / Dockerfiles (not floating @stable).
@@ -63,7 +63,7 @@ jobs:
       JMODGUARD_REMOTE_TEST_URL: http://127.0.0.1:8080
       JMODGUARD_REMOTE_TEST_TOKEN: local-ci-token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
