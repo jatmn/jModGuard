@@ -1,4 +1,4 @@
-//! libSQL data layer: local SQLite or remote Bunny Database persistence.
+//! libSQL data layer: local SQLite or remote libSQL persistence.
 //!
 //! Every async function runs its work on a libSQL connection via
 //! `spawn_blocking`; parameters are moved (owned) into the closures so no

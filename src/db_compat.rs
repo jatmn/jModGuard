@@ -2,7 +2,7 @@
 //!
 //! The data layer predates remote database support and intentionally performs
 //! each logical operation inside a blocking closure. Keeping that boundary
-//! lets local SQLite and Bunny Database share the exact same SQL paths while
+//! lets local SQLite and remote libSQL share the exact same SQL paths while
 //! the libSQL runtime handles either transport underneath.
 
 use anyhow::{Context as _, Result};

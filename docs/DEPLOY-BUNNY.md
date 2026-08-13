@@ -1,10 +1,12 @@
 # Deploy on Bunny.net
 
-jModGuard supports a remote [Bunny Database](https://docs.bunny.net/database)
-through Bunny's documented Rust `libsql` client. The bot and API run as two
-independent Magic Container apps and use the database as their shared source
-of truth. This is the intended Bunny topology; no shared disk or existing-data
-migration is needed for a first deployment.
+jModGuard's remote backend uses the standard libSQL protocol rather than a
+provider-specific data API. [Bunny Database](https://docs.bunny.net/database)
+is the first tested, documented remote provider and works out of the box with
+Bunny's standard injected credentials. The bot and API run as two independent
+Magic Container apps and use the database as their shared source of truth.
+This is the intended Bunny topology; no shared disk or existing-data migration
+is needed for a first deployment.
 
 ```text
 Discord Gateway                         Public HTTPS endpoint

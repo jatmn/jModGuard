@@ -27,7 +27,7 @@ pub struct DiscordConfig {
 #[serde(default)]
 pub struct DbConfig {
     pub path: PathBuf,
-    /// Remote libSQL / Bunny Database URL. Empty = local SQLite file at `path`.
+    /// Remote libSQL URL. Empty = local SQLite file at `path`.
     pub url: String,
     /// Access token for remote DB (never send to the browser).
     pub token: String,

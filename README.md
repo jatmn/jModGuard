@@ -3,10 +3,11 @@
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
 (bot + API/WebUI), libSQL-backed, multi-server.
 
-It can use a local SQLite file for single-host self-hosting or a remote Bunny
-Database. On Bunny, the bot and API may run as independent Magic Container
-apps connected to the same database. The API embeds the admin UI, so Bunny
-CDN/Storage is optional. You do not need Bunny to run it.
+It can use a local SQLite file for single-host self-hosting or a remote libSQL
+service. Bunny Database is the first tested, documented remote provider and is
+supported out of the box. On Bunny, the bot and API may run as independent
+Magic Container apps connected to the same database. The API embeds the admin
+UI, so Bunny CDN/Storage is optional. You do not need Bunny to run it.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
   attachment floods (crypto scams), links in the first minutes after joining,

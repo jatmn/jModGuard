@@ -9,7 +9,7 @@ database (everything server-related, editable at runtime).
 |---|---|---|
 | `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required by bot; also by API for WebUI unban |
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
-| `db.url` | — | Remote libSQL / Bunny Database URL. `JMODGUARD_DB_URL` takes precedence over Bunny's injected `BUNNY_DATABASE_URL`; empty = local path |
+| `db.url` | — | Remote libSQL URL. `JMODGUARD_DB_URL` takes precedence over Bunny's injected `BUNNY_DATABASE_URL`; empty = local path |
 | `db.token` | — | Remote DB access token. `JMODGUARD_DB_TOKEN` takes precedence over Bunny's injected `BUNNY_DATABASE_AUTH_TOKEN`; required with `db.url` |
 | `db.pool_size` | `8` | maximum concurrent database operations in each process |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
@@ -50,6 +50,19 @@ then exits).
 | `users` | username/avatar cache |
 
 Environment variables override `config.toml` values (see table).
+
+## Remote providers
+
+The remote transport uses the standard libSQL protocol; the portable
+configuration contract is `db.url` / `db.token` or `JMODGUARD_DB_URL` /
+`JMODGUARD_DB_TOKEN`. It is not hard-coded to a Bunny hostname.
+
+Bunny Database is the first-class launch provider: its Rust connection path,
+injected environment names, CI protocol test, container topology, and manual
+recovery path are documented and tested. Other libSQL-compatible services may
+work through the portable settings, but they are not claimed as supported
+until their authentication, consistency behavior, deployment, and recovery
+workflow have provider-specific tests and documentation.
 
 ## Behavior on first boot
 
