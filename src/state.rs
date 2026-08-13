@@ -148,13 +148,6 @@ impl AppState {
         self.configs.invalidate();
     }
 
-    /// Invalidates after a successful local writer and advances the minimum
-    /// acceptable remote snapshot. Writers bump config_version exactly once.
-    pub fn invalidate_configs_after_write(&self) {
-        let floor = self.last_config_version.fetch_add(1, Ordering::SeqCst) + 1;
-        self.configs.require_version(floor);
-    }
-
     /// Hold this across a complete Discord nickname/settings update. Prefix
     /// and retention-only writes do not need it.
     pub async fn lock_nickname_update(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -599,7 +592,10 @@ impl ConfigCache {
         let version = self.version.load(Ordering::Relaxed);
         let (durable_version, parts) =
             db::load_config_parts_with_version(db, guild_id as i64).await?;
-        let required = self.durable_floor.load(Ordering::SeqCst);
+        let required = self
+            .durable_floor
+            .load(Ordering::SeqCst)
+            .max(db.required_config_version());
         if durable_version < required {
             anyhow::bail!(
                 "database replica returned config_version {durable_version}, expected at least {required}"

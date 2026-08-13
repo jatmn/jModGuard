@@ -120,8 +120,9 @@ For the first deployment:
 3. Request `/`; it must return the embedded jModGuard UI over HTTPS.
 4. Complete Discord OAuth login and open a guild where the user has Manage
    Server permission.
-5. Change a harmless guild prefix in the UI. Confirm the bot observes it within
-   `config_poll_secs`, exercise the new prefix in Discord, then restore it.
+5. Change a harmless guild prefix in the UI. Confirm the bot eventually
+   observes it after polling and any replica convergence, exercise the new
+   prefix in Discord, then restore it.
 6. Configure a dry-run moderation rule and verify its audit event.
 7. Restart each app independently and confirm both reconnect to the same data.
 

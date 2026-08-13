@@ -100,6 +100,7 @@ pub struct Db {
     connections: Arc<ConnectionPool>,
     permits: Arc<tokio::sync::Semaphore>,
     permit_timeout: Option<Duration>,
+    required_config_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct ConnectionPool {
@@ -309,6 +310,7 @@ impl Db {
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
             permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
+            required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -361,6 +363,7 @@ impl Db {
         }
         .context("database connection limiter closed")?;
         let connections = Arc::clone(&self.connections);
+        let required_config_version = Arc::clone(&self.required_config_version);
         tokio::task::spawn_blocking(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
             // cannot cancel blocking work, so an aborted request must not let
@@ -368,6 +371,12 @@ impl Db {
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);
+            if result.is_ok() {
+                required_config_version.fetch_max(
+                    connection.take_config_version(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
             if connection.pool.remote && result.is_err()
                 || connection.is_tainted()
                 || result
@@ -401,6 +410,12 @@ impl Db {
         let _permit = permit;
         let mut connection = ConnectionLease::checkout(Arc::clone(&self.connections))?;
         let result = f(&mut connection);
+        if result.is_ok() {
+            self.required_config_version.fetch_max(
+                connection.take_config_version(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         if connection.pool.remote && result.is_err()
             || connection.is_tainted()
             || result
@@ -411,6 +426,11 @@ impl Db {
             connection.discard();
         }
         result
+    }
+
+    pub fn required_config_version(&self) -> u64 {
+        self.required_config_version
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -472,7 +492,15 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
 
 /// Bumps durable `config_version` on an open connection (config writers only).
 pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
-    bump_meta_version_conn(conn, "config_version")
+    let version: u64 = conn.query_row(
+        "INSERT INTO meta (key, value) VALUES ('config_version', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+         RETURNING CAST(value AS INTEGER)",
+        (),
+        |row| Ok(row.get::<i64>(0)? as u64),
+    )?;
+    conn.record_config_version(version);
+    Ok(())
 }
 
 /// Bumps durable `slash_registry_version` when the Discord slash command

@@ -286,7 +286,7 @@ pub async fn update_settings(
             return Err(ApiError(e));
         }
     };
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
 
     // Post-commit re-sync: committed effective bot_name is authoritative.
     // Inherit (null) re-reads parent inside patch_settings and can diverge from
@@ -385,7 +385,7 @@ pub async fn put_rule(
     }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     db::upsert_rule(&app.db, scope, &rule_id, &body.data).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -454,7 +454,7 @@ pub async fn add_badword(
     let auth = guild_scope(&app, &session, guild_id).await?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let id = db::add_badword(&app.db, scope, &body.pattern, body.note.as_deref()).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -482,7 +482,7 @@ pub async fn delete_badword(
     // surface guild-scoped DB wording if the layer ever diverges again.
     match db::delete_badword(&app.db, word_id, word.guild_id).await {
         Ok(()) => {
-            app.invalidate_configs_after_write();
+            app.invalidate_configs();
             Ok(Json(serde_json::json!({ "ok": true })))
         }
         Err(e) if e.to_string().contains("badword not found") => Err(not_found()),
@@ -565,7 +565,7 @@ pub async fn put_command(
     data.name = name.clone();
     validate_command_descriptor(&data)?;
     db::upsert_command(&app.db, scope, &name, &data).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -582,7 +582,7 @@ pub async fn create_command(
     data.name = name.clone();
     validate_command_descriptor(&data)?;
     db::upsert_command(&app.db, scope, &name, &data).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
@@ -652,7 +652,7 @@ pub async fn put_template(
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
     db::upsert_template(&app.db, scope, &event, &body.template).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -749,7 +749,7 @@ pub async fn put_logchannel(
     .await
     .map_err(ApiError)?;
     db::upsert_log_channel(&app.db, scope, &event, body.channel_id).await?;
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -868,7 +868,8 @@ pub async fn copy_config(
     {
         Ok(r) => r,
         Err(e) => {
-            if nickname_applied == Some(true)
+            if !db::is_database_commit_indeterminate(&e)
+                && nickname_applied == Some(true)
                 && let Some(ref prev) = previous_nick
                 && let Err(re) = apply_bot_nickname(&app, guild_id, prev).await
             {
@@ -880,14 +881,14 @@ pub async fn copy_config(
             return Err(ApiError(e));
         }
     };
-    app.invalidate_configs_after_write();
+    app.invalidate_configs();
 
     // Close preview→copy TOCTOU: committed bot_name is the source of truth.
     // SQLite already committed — surface Discord re-sync failure in the body
     // (not a hard 5xx) so operators see the partial outcome instead of a silent
     // success while Discord lags.
     if wants_settings && guild_id != 0 {
-        let after = db::get_settings(&app.db, guild_id as i64).await?;
+        let after = app.configs.get(&app.db, guild_id).await?.settings.clone();
         let applied = preview_nick.as_deref().unwrap_or("");
         if after.bot_name != applied {
             match apply_bot_nickname(&app, guild_id, &after.bot_name).await {

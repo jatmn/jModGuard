@@ -42,8 +42,8 @@ tick and re-syncs Discord slash commands only when it advances (not on every
 settings/rules/template write). `AppState::new` primes both baselines from the
 DB so the first poll has no unobserved window.
 
-Expect at least one poll interval of lag after a cross-process config write;
-remote deployments can additionally wait for provider replica convergence.
+Expect up to one poll interval of lag locally after a cross-process config
+write; remote deployments can additionally wait for provider replica convergence.
 Slash-command resync reads its registry version and command rows in one
 transaction and retries when that snapshot has not reached the target version.
 

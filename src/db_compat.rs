@@ -185,6 +185,7 @@ pub struct Connection {
     inner: libsql::Connection,
     runtime: DbRuntime,
     tainted: Arc<AtomicBool>,
+    config_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub trait SqlExecutor {
@@ -199,6 +200,7 @@ pub trait SqlExecutor {
     fn prepare(&self, sql: &str) -> Result<Statement>;
 
     fn is_autocommit(&self) -> bool;
+    fn record_config_version(&self, version: u64);
 }
 
 impl Connection {
@@ -211,6 +213,7 @@ impl Connection {
             inner,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
+            config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -219,6 +222,7 @@ impl Connection {
             inner: database.connect()?,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
+            config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -236,6 +240,7 @@ impl Connection {
             inner: Some(inner),
             runtime: self.runtime.clone(),
             connection_tainted: Arc::clone(&self.tainted),
+            config_version: Arc::clone(&self.config_version),
         })
     }
 
@@ -258,6 +263,10 @@ impl Connection {
 
     pub fn is_tainted(&self) -> bool {
         self.tainted.load(Ordering::Acquire)
+    }
+
+    pub fn take_config_version(&self) -> u64 {
+        self.config_version.swap(0, Ordering::AcqRel)
     }
 }
 
@@ -293,6 +302,10 @@ impl SqlExecutor for Connection {
 
     fn is_autocommit(&self) -> bool {
         self.inner.is_autocommit()
+    }
+
+    fn record_config_version(&self, version: u64) {
+        self.config_version.fetch_max(version, Ordering::SeqCst);
     }
 }
 
@@ -334,6 +347,7 @@ pub struct Transaction {
     inner: Option<libsql::Transaction>,
     runtime: DbRuntime,
     connection_tainted: Arc<AtomicBool>,
+    config_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Transaction {
@@ -366,7 +380,7 @@ impl Transaction {
             );
         }
         result.map(|_| ()).map_err(|error| {
-            if is_database_operation_timeout(&error) {
+            if self.runtime.is_remote() {
                 DatabaseCommitIndeterminate(error).into()
             } else {
                 error
@@ -463,6 +477,10 @@ impl SqlExecutor for Transaction {
 
     fn is_autocommit(&self) -> bool {
         self.inner().is_autocommit()
+    }
+
+    fn record_config_version(&self, version: u64) {
+        self.config_version.fetch_max(version, Ordering::SeqCst);
     }
 }
 
