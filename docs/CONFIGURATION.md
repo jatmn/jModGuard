@@ -52,7 +52,8 @@ then exits).
 Environment variables override `config.toml` values (see table).
 
 Remote database calls and waits for a pooled connection have a fixed 75-second
-deadline. A timed-out operation returns an error; a connection whose operation
+per-request deadline. Transaction rollback cleanup can use one additional
+deadline before the logical operation returns an error. A connection whose operation
 timed out is discarded rather than reused with potentially stale remote stream
 state. jModGuard does not automatically retry a timed-out write because the
 server may have committed it before the response was lost; callers may retry

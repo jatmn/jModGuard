@@ -127,7 +127,9 @@ For the first deployment:
 
 The repository's CI also runs `tests/remote_database_smoke.rs` against a pinned
 libSQL server. That test proves bot bootstrap, a remote write, API schema-open,
-and cross-process visibility without requiring production credentials.
+and visibility across independent database handles without requiring
+production credentials. `tests/dual_process_smoke.rs` separately exercises
+the bot/API process contract against local SQLite.
 
 ## Operating constraints
 

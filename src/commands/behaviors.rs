@@ -369,7 +369,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await
             {
-                if discord_applied && me.get() != 0 {
+                if !db::is_database_commit_indeterminate(&e) && discord_applied && me.get() != 0 {
                     let prev = previous.clone();
                     if let Err(re) =
                         crate::discord::with_retries("Discord nickname restore", guild_id, || {
@@ -395,7 +395,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
                 return Err(e);
             }
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             vars.insert(
                 "name".into(),
                 if clear {
@@ -424,7 +424,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 None,
             )
             .await?;
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             vars.insert("prefix".into(), prefix);
             Ok(BehaviorOutcome {
                 response: None,
@@ -674,7 +674,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 return Err(anyhow!("missing template text"));
             }
             db::upsert_template(&env.app.db, env.guild_id.get() as i64, &event, &text).await?;
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` updated for this server.")),
                 vars,
@@ -743,7 +743,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 .ok_or_else(|| anyhow!("unknown rule `{rule_id}`"))?;
             rule.enabled = !rule.enabled;
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             Ok(BehaviorOutcome {
                 response: Some(format!(
                     "Rule `{rule_id}` is now {}.",
@@ -767,7 +767,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 .ok_or_else(|| anyhow!("unknown rule `{rule_id}`"))?;
             rule.dry_run = on;
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
                 vars,
@@ -815,7 +815,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
                 .await?;
             db::upsert_log_channel(&env.app.db, guild, &event, channel.get() as i64).await?;
-            env.app.invalidate_configs();
+            env.app.invalidate_configs_after_write();
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` now logs to <#{channel}>.")),
                 vars,

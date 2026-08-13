@@ -27,10 +27,22 @@ pub struct DatabaseOperationTimedOut {
     timeout: Duration,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote database commit outcome is indeterminate: {0}")]
+pub struct DatabaseCommitIndeterminate(#[source] anyhow::Error);
+
 pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>().is_some())
+}
+
+pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DatabaseCommitIndeterminate>()
+            .is_some()
+    })
 }
 
 pub(crate) fn database_operation_timed_out(
@@ -353,7 +365,13 @@ impl Transaction {
                 self.inner.take().expect("transaction already completed"),
             );
         }
-        result.map(|_| ())
+        result.map(|_| ()).map_err(|error| {
+            if is_database_operation_timeout(&error) {
+                DatabaseCommitIndeterminate(error).into()
+            } else {
+                error
+            }
+        })
     }
 
     fn inner(&self) -> &libsql::Transaction {

@@ -61,6 +61,10 @@ pub fn is_database_operation_timeout(err: &anyhow::Error) -> bool {
     crate::db_compat::is_database_operation_timeout(err)
 }
 
+pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
+    crate::db_compat::is_database_commit_indeterminate(err)
+}
+
 /// Local SQLite can be temporarily locked while the bot is applying migrations.
 /// That is an expected API-startup race, unlike other SQLite failures.
 fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
@@ -267,13 +271,14 @@ impl Db {
             }
             // API must never seed terminal defaults — that poisoned meta when API
             // opened before the bot with a different config.toml.
-            let defaults = read_terminal_defaults_meta(&bootstrap)?.ok_or_else(|| {
-                SchemaNotReady(
-                    "database is missing meta.settings_terminal_defaults. \
+            let defaults =
+                read_terminal_defaults_meta_with_retry(&bootstrap, remote)?.ok_or_else(|| {
+                    SchemaNotReady(
+                        "database is missing meta.settings_terminal_defaults. \
                      Start jmodguard-bot once first, then start jmodguard-api."
-                        .into(),
-                )
-            })?;
+                            .into(),
+                    )
+                })?;
             // Idempotent when guild_settings changed; skipped via checksum when not.
             heal_default_guild_settings_conn(&mut bootstrap, &defaults)?;
             // Only publish readiness after all migrations, durable defaults,
@@ -593,6 +598,22 @@ fn read_terminal_defaults_meta(conn: &impl SqlExecutor) -> Result<Option<GuildSe
             .map(|r| r as u32)
             .unwrap_or(GuildSettings::default().retention_days),
     }))
+}
+
+fn read_terminal_defaults_meta_with_retry(
+    conn: &impl SqlExecutor,
+    remote: bool,
+) -> Result<Option<GuildSettings>> {
+    let attempts = if remote { 10 } else { 1 };
+    for attempt in 0..attempts {
+        if let Some(defaults) = read_terminal_defaults_meta(conn)? {
+            return Ok(Some(defaults));
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(None)
 }
 
 fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
@@ -1198,8 +1219,8 @@ pub(crate) async fn upsert_settings(
         let ov = normalize_settings_override_against_parent(&override_, &parent);
         write_settings_override_conn(&tx, guild_id, &ov)?;
         bump_config_version_conn(&tx)?;
+        refresh_settings_heal_checksum_conn(&tx)?;
         tx.commit()?;
-        refresh_settings_heal_checksum_conn(conn)?;
         Ok(())
     })
     .await
@@ -1837,10 +1858,10 @@ pub async fn copy_guild_config(
                 bump_slash_registry_version_conn(&tx)?;
             }
         }
-        tx.commit()?;
         if copied_settings {
-            refresh_settings_heal_checksum_conn(conn)?;
+            refresh_settings_heal_checksum_conn(&tx)?;
         }
+        tx.commit()?;
         Ok(result)
     })
     .await

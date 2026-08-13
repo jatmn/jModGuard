@@ -148,6 +148,13 @@ impl AppState {
         self.configs.invalidate();
     }
 
+    /// Invalidates after a successful local writer and advances the minimum
+    /// acceptable remote snapshot. Writers bump config_version exactly once.
+    pub fn invalidate_configs_after_write(&self) {
+        let floor = self.last_config_version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.configs.require_version(floor);
+    }
+
     /// Hold this across a complete Discord nickname/settings update. Prefix
     /// and retention-only writes do not need it.
     pub async fn lock_nickname_update(&self) -> tokio::sync::MutexGuard<'_, ()> {

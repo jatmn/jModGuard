@@ -26,7 +26,9 @@ token = ""
 # operations in this process. Both the bot and API apply this independently.
 pool_size = 8
 # Remote database calls and waits for a pooled connection have a fixed
-# 75-second deadline (longer than Bunny's documented failover window). A timed-out write is reported but not automatically
+# 75-second per-request deadline (longer than Bunny's documented failover
+# window). Transaction rollback cleanup may use one additional deadline.
+# A timed-out write is reported but not automatically
 # retried because its commit status may be unknown.
 
 [web]
