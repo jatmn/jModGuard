@@ -228,6 +228,7 @@ pub async fn update_settings(
     if let Some(ref bot_name_patch) = body.bot_name
         && guild_id != 0
     {
+        db::request_nickname_reconcile(&app.db, guild_id as i64).await?;
         let current = db::get_settings(&app.db, guild_id as i64).await?;
         previous_nick = Some(current.bot_name.clone());
         discord_nick = Some(current.bot_name.clone());
@@ -838,6 +839,7 @@ pub async fn copy_config(
     let mut previous_nick: Option<String> = None;
     let mut preview_nick: Option<String> = None;
     if wants_settings && guild_id != 0 {
+        db::request_nickname_reconcile(&app.db, guild_id as i64).await?;
         let preview =
             db::preview_settings_after_copy(&app.db, body.from_guild_id as i64, guild_id as i64)
                 .await?;

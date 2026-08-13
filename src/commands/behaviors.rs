@@ -344,6 +344,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let previous = db::get_settings(&env.app.db, guild_id as i64)
                 .await?
                 .bot_name;
+            db::request_nickname_reconcile(&env.app.db, guild_id as i64).await?;
             let mut discord_applied = false;
             if me.get() != 0 {
                 let nick = name.to_string();

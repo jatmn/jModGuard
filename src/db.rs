@@ -1279,6 +1279,19 @@ fn enqueue_nickname_reconcile_conn(conn: &impl SqlExecutor, guild_id: i64) -> Re
     Ok(())
 }
 
+/// Persists reconciliation work before any Discord nickname side effect. If
+/// the following settings transaction rolls back (including an indeterminate
+/// remote commit), the bot restores the still-authoritative database value.
+pub async fn request_nickname_reconcile(db: &Db, guild_id: i64) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        enqueue_nickname_reconcile_conn(&tx, guild_id)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 /// Primary-routed durable nickname work. The generation prevents an older
 /// Discord request from acknowledging a newer cross-process settings commit.
 pub async fn pending_nickname_reconciles(db: &Db) -> Result<Vec<(i64, i64, String)>> {
@@ -4798,6 +4811,19 @@ mod tests {
             tokio_test_block_on(pending_nickname_reconciles(&db))
                 .unwrap()
                 .is_empty()
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn nickname_reconcile_exists_before_settings_commit() {
+        let tmp = tmp_db_path("nickname_outbox_precommit");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(request_nickname_reconcile(&db, 43)).unwrap();
+        assert_eq!(
+            tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap(),
+            vec![(43, 1, String::new())],
+            "a cancelled Discord-first request must retain work for the old authoritative value"
         );
         cleanup_db(&tmp);
     }

@@ -84,7 +84,7 @@ src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 frontend/                  SPA (served by API locally; CDN-ready)
-migrations/                0001_init + 0002_config_version + 0003_archive_global_log_channels
+migrations/                0001_init through 0004_nickname_reconcile
 Dockerfile.bot
 Dockerfile.api
 ```

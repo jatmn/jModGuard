@@ -28,7 +28,7 @@ database (everything server-related, editable at runtime).
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0003_archive_global_log_channels.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0004_nickname_reconcile.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
 the bot to finish bootstrap or release a transient local SQLite startup lock,
 then exits).
@@ -36,6 +36,7 @@ then exits).
 | Table | Holds |
 |---|---|
 | `meta` | durable keys (`config_version` for cross-process cache invalidation; `slash_registry_version` for Discord slash re-sync) |
+| `nickname_reconcile` | generation-numbered durable work for reconciling Discord nicknames to committed settings across bot/API races |
 | `guild_settings` | prefix, bot nickname, retention as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
 | `rules` | the 7 automod rules (server + global rows) |
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
