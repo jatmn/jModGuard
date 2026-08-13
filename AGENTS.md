@@ -144,7 +144,8 @@ src/lib.rs              shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 src/config.rs           config.toml + env (db.url/token, config_poll_secs)
-src/db.rs               SQLite (WAL) + migrations + config_version
+src/db.rs               local/remote libSQL + migrations + pooling/versioning
+src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/discord.rs          Discord REST helpers (nickname retries)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
