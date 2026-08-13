@@ -335,27 +335,14 @@ pub async fn handle_prefix(
 
 /// Registers guild slash commands from the command registry.
 pub async fn sync_slash_commands(app: &Arc<AppState>, ctx: &Context, guild_id: GuildId) -> bool {
-    sync_slash_commands_http(app, &ctx.http, guild_id).await
-}
-
-/// Same as [`sync_slash_commands`] but usable from the config_version poll task
-/// (which has `Http` + cache, not a full `Context`).
-///
-/// Returns `true` when Discord accepted the command set. `false` means the
-/// caller should retry — do not advance `slash_registry_version` observation.
-pub async fn sync_slash_commands_http(
-    app: &Arc<AppState>,
-    http: impl AsRef<serenity::http::Http>,
-    guild_id: GuildId,
-) -> bool {
-    let cfg = match app.configs.get(&app.db, guild_id.get()).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("slash sync: config load failed for {guild_id}: {e:#}");
+    let target = match db::get_slash_registry_version(&app.db).await {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!("slash sync: registry version load failed for {guild_id}: {error:#}");
             return false;
         }
     };
-    set_slash_commands(http, guild_id, &cfg.commands).await
+    sync_slash_commands_versioned_http(app, &ctx.http, guild_id, target).await
 }
 
 /// Registry-poll variant: command rows and the version that identifies them

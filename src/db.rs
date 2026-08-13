@@ -2542,7 +2542,7 @@ impl PlainValue for i64 {
 }
 
 fn rows_map_plain<T: PlainValue + Send + 'static>(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     table: &str,
     key_col: &str,
     value_col: &str,
@@ -2563,7 +2563,14 @@ fn rows_map_plain<T: PlainValue + Send + 'static>(
 }
 
 pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
+    Ok(load_config_parts_with_version(db, guild_id).await?.1)
+}
+
+pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u64, ConfigParts)> {
     db.with_conn(move |conn| {
+        let tx = conn.transaction()?;
+        let version = get_config_version_conn(&tx)?;
+        let conn = &tx;
         let defaults = terminal_defaults_conn(conn)?;
         // settings (effective: field-level guild → global → config terminal defaults)
         let g_settings = if guild_id == GLOBAL_SCOPE {
@@ -2645,14 +2652,16 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
             }
         }
 
-        Ok(ConfigParts {
+        let parts = ConfigParts {
             settings,
             rules,
             commands,
             templates,
             log_channels,
             badwords,
-        })
+        };
+        tx.commit()?;
+        Ok((version, parts))
     })
     .await
 }

@@ -163,6 +163,10 @@ impl DbRuntime {
             None => self.block_on(future).map_err(Into::into),
         }
     }
+
+    fn is_remote(&self) -> bool {
+        self.operation_timeout.is_some()
+    }
 }
 
 pub struct Connection {
@@ -378,11 +382,16 @@ impl Drop for Transaction {
             Err(error) => {
                 // The local libSQL transaction destructor retries rollback with
                 // `unwrap()`, while the remote destructor may spawn unbounded
-                // best-effort cleanup. After our bounded rollback has already
-                // failed, neither behavior is safe. Leak only this failed
-                // wrapper; the owning connection is marked unusable and
-                // discarded by the pool.
-                std::mem::forget(inner);
+                // best-effort cleanup when dropped inside Tokio. Drop remote
+                // wrappers on a plain thread; for the exceptional local
+                // rollback-I/O failure, retaining the wrapper is safer than a
+                // process-aborting destructor panic. The owning connection is
+                // marked unusable either way.
+                if self.runtime.is_remote() {
+                    drop_transaction_without_runtime(inner);
+                } else {
+                    std::mem::forget(inner);
+                }
                 self.connection_tainted.store(true, Ordering::Release);
                 tracing::warn!(%error, "failed to roll back uncommitted database transaction");
             }

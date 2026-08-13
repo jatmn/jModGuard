@@ -12,6 +12,23 @@ env:
   TMPDIR: ${{ github.workspace }}/.tmp
 
 jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Add Git for Windows Unix tools
+        shell: pwsh
+        run: '"C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Check Windows builds
+        run: |
+          cargo check --locked --bin jmodguard-bot --no-default-features
+          cargo check --locked --bin jmodguard-api
+
   test:
     runs-on: ubuntu-latest
     steps:

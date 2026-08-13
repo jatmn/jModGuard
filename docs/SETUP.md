@@ -14,6 +14,9 @@ This guide covers everything from zero to a running bot on **Windows** or
   via `rust-toolchain.toml` (same as `Cargo.toml` `rust-version` and the
   Docker builder images). `rustup` will select that pin automatically in this
   directory.
+- Windows source builds also need Git for Windows, with its `usr\\bin`
+  directory on `PATH`. The pinned libSQL native build currently invokes the
+  Unix `cp` utility; the Windows CI job configures this path explicitly.
 - A Discord account (the bot owner).
 - Somewhere to run it: any Windows/Linux machine that stays online (VPS,
   home server, Raspberry Pi class box is fine).

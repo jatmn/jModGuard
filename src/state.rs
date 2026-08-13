@@ -100,7 +100,7 @@ impl AppState {
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
-            configs: ConfigCache::new(),
+            configs: ConfigCache::new(primed),
             automod: AutomodEngine::new(),
             cooldowns: DashMap::new(),
             oauth,
@@ -159,9 +159,10 @@ impl AppState {
     /// Returns `true` when a change triggered invalidation.
     pub async fn poll_config_version(&self) -> Result<bool> {
         let remote = db::get_config_version(&self.db).await?;
-        let prev = self.last_config_version.swap(remote, Ordering::SeqCst);
-        if prev != remote {
-            self.invalidate_configs();
+        let prev = self.last_config_version.load(Ordering::SeqCst);
+        if remote > prev {
+            self.last_config_version.store(remote, Ordering::SeqCst);
+            self.configs.require_version(remote);
             return Ok(true);
         }
         Ok(false)
@@ -176,7 +177,7 @@ impl AppState {
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
         let remote = db::get_slash_registry_version(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        if prev != remote {
+        if prev == u64::MAX || remote > prev {
             Ok(Some(remote))
         } else {
             Ok(None)
@@ -552,26 +553,33 @@ pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
     version: Arc<AtomicU64>,
     ttl: Duration,
+    durable_floor: Arc<AtomicU64>,
 }
 
 impl Default for ConfigCache {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
 impl ConfigCache {
-    pub fn new() -> Self {
+    pub fn new(durable_floor: u64) -> Self {
         Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
+            durable_floor: Arc::new(AtomicU64::new(durable_floor)),
         }
     }
 
     pub fn invalidate(&self) {
         self.version.fetch_add(1, Ordering::Relaxed);
         self.map.clear();
+    }
+
+    pub fn require_version(&self, version: u64) {
+        self.durable_floor.fetch_max(version, Ordering::SeqCst);
+        self.invalidate();
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
@@ -582,7 +590,14 @@ impl ConfigCache {
             return Ok(Arc::clone(&entry));
         }
         let version = self.version.load(Ordering::Relaxed);
-        let parts = db::load_config_parts(db, guild_id as i64).await?;
+        let (durable_version, parts) =
+            db::load_config_parts_with_version(db, guild_id as i64).await?;
+        let required = self.durable_floor.load(Ordering::SeqCst);
+        if durable_version < required {
+            anyhow::bail!(
+                "database replica returned config_version {durable_version}, expected at least {required}"
+            );
+        }
         let cfg = Arc::new(CachedGuildConfig::from_parts(version, parts));
         self.map.insert(guild_id as i64, Arc::clone(&cfg));
         Ok(cfg)
@@ -741,6 +756,15 @@ mod tests {
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
         );
+        app.commit_slash_registry_version(10);
+        assert_eq!(
+            tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
+            None,
+            "a stale lower replica observation must not regress slash state"
+        );
+        app.last_config_version.store(10, Ordering::SeqCst);
+        assert!(!tokio_test_block_on(app.poll_config_version()).unwrap());
+        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 10);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
