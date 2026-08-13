@@ -240,7 +240,8 @@ impl Connection {
             inner: Some(inner),
             runtime: self.runtime.clone(),
             connection_tainted: Arc::clone(&self.tainted),
-            config_version: Arc::clone(&self.config_version),
+            connection_config_version: Arc::clone(&self.config_version),
+            pending_config_version: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -347,7 +348,8 @@ pub struct Transaction {
     inner: Option<libsql::Transaction>,
     runtime: DbRuntime,
     connection_tainted: Arc<AtomicBool>,
-    config_version: Arc<std::sync::atomic::AtomicU64>,
+    connection_config_version: Arc<std::sync::atomic::AtomicU64>,
+    pending_config_version: std::sync::atomic::AtomicU64,
 }
 
 impl Transaction {
@@ -374,18 +376,32 @@ impl Transaction {
         let result = self
             .runtime
             .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
-        if result.is_ok() {
-            drop_transaction_without_runtime(
-                self.inner.take().expect("transaction already completed"),
-            );
-        }
-        result.map(|_| ()).map_err(|error| {
-            if self.runtime.is_remote() {
-                DatabaseCommitIndeterminate(error).into()
-            } else {
-                error
+        match result {
+            Ok(_) => {
+                self.connection_config_version.fetch_max(
+                    self.pending_config_version.load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+                drop_transaction_without_runtime(
+                    self.inner.take().expect("transaction already completed"),
+                );
+                Ok(())
             }
-        })
+            Err(commit_error) if self.runtime.is_remote() => {
+                let rollback = self.runtime.block_on_database(
+                    "rollback after failed commit",
+                    self.inner().execute_batch("ROLLBACK"),
+                );
+                let inner = self.inner.take().expect("transaction already completed");
+                drop_transaction_without_runtime(inner);
+                if rollback.is_ok() {
+                    Err(commit_error)
+                } else {
+                    Err(DatabaseCommitIndeterminate(commit_error).into())
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn inner(&self) -> &libsql::Transaction {
@@ -480,7 +496,8 @@ impl SqlExecutor for Transaction {
     }
 
     fn record_config_version(&self, version: u64) {
-        self.config_version.fetch_max(version, Ordering::SeqCst);
+        self.pending_config_version
+            .fetch_max(version, Ordering::SeqCst);
     }
 }
 

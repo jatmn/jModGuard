@@ -65,6 +65,7 @@ pub struct AppState {
     /// Bot re-syncs Discord slash commands only when this advances — not on
     /// every generic `config_version` bump (rules/templates/settings/…).
     pub last_slash_registry_version: AtomicU64,
+    force_slash_registry_retry: AtomicBool,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     /// Serializes each Discord nickname + SQLite settings transaction. These
@@ -111,6 +112,7 @@ impl AppState {
             slash_synced: AtomicBool::new(false),
             last_config_version: AtomicU64::new(primed),
             last_slash_registry_version: AtomicU64::new(primed_slash),
+            force_slash_registry_retry: AtomicBool::new(false),
             slash_sync_progress: Mutex::new(None),
             nickname_update_lock: tokio::sync::Mutex::new(()),
             guild_cache: DashMap::new(),
@@ -177,8 +179,8 @@ impl AppState {
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
         let remote = db::get_slash_registry_version(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        if prev == u64::MAX || remote > prev {
-            Ok(Some(remote))
+        if self.force_slash_registry_retry.load(Ordering::SeqCst) || remote > prev {
+            Ok(Some(remote.max(prev)))
         } else {
             Ok(None)
         }
@@ -188,6 +190,8 @@ impl AppState {
     pub fn commit_slash_registry_version(&self, version: u64) {
         self.last_slash_registry_version
             .store(version, Ordering::SeqCst);
+        self.force_slash_registry_retry
+            .store(false, Ordering::SeqCst);
         // Drop any stale retry set for an older target.
         let mut progress = self.slash_sync_progress.lock();
         if progress.as_ref().is_some_and(|p| p.target == version) {
@@ -199,9 +203,13 @@ impl AppState {
     /// after a transient startup/guild-join sync failure, when no write may
     /// otherwise advance the durable version to trigger another attempt.
     pub fn retry_slash_registry_version(&self) {
-        self.last_slash_registry_version
-            .store(u64::MAX, Ordering::SeqCst);
+        self.force_slash_registry_retry
+            .store(true, Ordering::SeqCst);
         *self.slash_sync_progress.lock() = None;
+    }
+
+    pub fn acknowledged_slash_registry_version(&self) -> u64 {
+        self.last_slash_registry_version.load(Ordering::SeqCst)
     }
 
     /// Decide which guilds to `set_commands` for pending registry `remote`.

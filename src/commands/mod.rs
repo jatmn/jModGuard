@@ -336,7 +336,7 @@ pub async fn handle_prefix(
 /// Registers guild slash commands from the command registry.
 pub async fn sync_slash_commands(app: &Arc<AppState>, ctx: &Context, guild_id: GuildId) -> bool {
     let target = match db::get_slash_registry_version(&app.db).await {
-        Ok(version) => version,
+        Ok(version) => version.max(app.acknowledged_slash_registry_version()),
         Err(error) => {
             tracing::warn!("slash sync: registry version load failed for {guild_id}: {error:#}");
             return false;

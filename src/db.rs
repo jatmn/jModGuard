@@ -1313,8 +1313,8 @@ pub async fn patch_settings(
         write_settings_override_conn(&tx, guild_id, &ov)?;
         bump_config_version_conn(&tx)?;
         let effective = effective_settings_conn(&tx, guild_id, &defaults)?;
+        refresh_settings_heal_checksum_conn(&tx)?;
         tx.commit()?;
-        refresh_settings_heal_checksum_conn(conn)?;
         Ok(effective)
     })
     .await
