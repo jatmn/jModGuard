@@ -47,11 +47,14 @@ precedence when both forms are present. Never commit an access token.
 Build both images from the same reviewed commit or release tag:
 
 ```bash
-docker build -f Dockerfile.bot -t REGISTRY/jmodguard-bot:TAG .
-docker build -f Dockerfile.api -t REGISTRY/jmodguard-api:TAG .
+docker build --platform linux/amd64 -f Dockerfile.bot -t REGISTRY/jmodguard-bot:TAG .
+docker build --platform linux/amd64 -f Dockerfile.api -t REGISTRY/jmodguard-api:TAG .
 docker push REGISTRY/jmodguard-bot:TAG
 docker push REGISTRY/jmodguard-api:TAG
 ```
+
+Magic Containers currently requires `linux/amd64`; keep that platform flag
+when building from ARM hosts such as Apple Silicon.
 
 Record immutable image digests in the private ops repository. Do not deploy
 floating `main` or `latest` tags.

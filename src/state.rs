@@ -501,6 +501,7 @@ pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize)
 
 pub struct CachedGuildConfig {
     pub version: u64,
+    pub durable_version: u64,
     pub loaded_at: Instant,
     pub settings: GuildSettings,
     pub rules: HashMap<String, RuleDef>,
@@ -511,7 +512,7 @@ pub struct CachedGuildConfig {
 }
 
 impl CachedGuildConfig {
-    fn from_parts(version: u64, parts: db::ConfigParts) -> Self {
+    fn from_parts(version: u64, durable_version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
         for pattern in &parts.badwords {
             // Same compile limits as WebUI / add_badword — legacy DB rows that
@@ -525,6 +526,7 @@ impl CachedGuildConfig {
         }
         Self {
             version,
+            durable_version,
             loaded_at: Instant::now(),
             settings: parts.settings,
             rules: parts.rules,
@@ -591,25 +593,30 @@ impl ConfigCache {
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
+        let required = self
+            .durable_floor
+            .load(Ordering::SeqCst)
+            .max(db.required_config_version());
         if let Some(entry) = self.map.get(&(guild_id as i64))
             && entry.version == self.version.load(Ordering::Relaxed)
             && entry.loaded_at.elapsed() < self.ttl
+            && entry.durable_version >= required
         {
             return Ok(Arc::clone(&entry));
         }
         let version = self.version.load(Ordering::Relaxed);
         let (durable_version, parts) =
             db::load_config_parts_with_version(db, guild_id as i64).await?;
-        let required = self
-            .durable_floor
-            .load(Ordering::SeqCst)
-            .max(db.required_config_version());
         if durable_version < required {
             anyhow::bail!(
                 "database replica returned config_version {durable_version}, expected at least {required}"
             );
         }
-        let cfg = Arc::new(CachedGuildConfig::from_parts(version, parts));
+        let cfg = Arc::new(CachedGuildConfig::from_parts(
+            version,
+            durable_version,
+            parts,
+        ));
         self.map.insert(guild_id as i64, Arc::clone(&cfg));
         Ok(cfg)
     }

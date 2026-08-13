@@ -101,6 +101,7 @@ pub struct Db {
     permits: Arc<tokio::sync::Semaphore>,
     permit_timeout: Option<Duration>,
     required_config_version: Arc<std::sync::atomic::AtomicU64>,
+    settings_write_lock: Arc<Mutex<()>>,
 }
 
 struct ConnectionPool {
@@ -254,7 +255,6 @@ impl Db {
                 // Clear it before any new migration/default work so an API
                 // restarting concurrently cannot mistake stale readiness for
                 // completion of this bootstrap.
-                clear_bootstrap_complete(&bootstrap)?;
                 migrate_conn(&mut bootstrap)?;
                 // Bot is authority for terminal defaults: sync from config every
                 // migrate-open so both processes resolve empty global fields from
@@ -311,6 +311,7 @@ impl Db {
             permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
             permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
             required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            settings_write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -651,21 +652,6 @@ fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
                 .into(),
         )
         .into());
-    }
-    Ok(())
-}
-
-fn clear_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
-    let has_meta: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-        (),
-        |r| Ok(r.get(0)?),
-    )?;
-    if has_meta != 0 {
-        conn.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![META_BOOTSTRAP_COMPLETE],
-        )?;
     }
     Ok(())
 }
@@ -1288,7 +1274,11 @@ pub async fn patch_settings(
     if prefix.is_none() && bot_name.is_none() && retention_days.is_none() {
         return get_settings(db, guild_id).await;
     }
+    let settings_write_lock = Arc::clone(&db.settings_write_lock);
     db.with_conn(move |conn| {
+        let _write_guard = settings_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("settings write lock poisoned"))?;
         let defaults = terminal_defaults_conn(conn)?;
         let tx = conn.transaction()?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
@@ -1753,7 +1743,11 @@ pub async fn copy_guild_config(
     dst: i64,
     sections: Vec<String>,
 ) -> Result<CopyResult> {
+    let settings_write_lock = Arc::clone(&db.settings_write_lock);
     db.with_conn(move |conn| {
+        let _write_guard = settings_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("settings write lock poisoned"))?;
         let defaults = terminal_defaults_conn(conn)?;
         // Always re-validate inside the write path (closes preflight TOCTOU).
         preflight_copy_guild_config_conn(conn, src, dst, &sections)?;
