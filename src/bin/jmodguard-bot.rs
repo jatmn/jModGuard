@@ -94,10 +94,9 @@ async fn main() -> Result<()> {
                         false
                     }
                 };
-                // Nickname writes are a Discord+database dual write performed
-                // by either process. Drain the durable generation-checked
-                // outbox every tick so the last committed DB value eventually
-                // wins even if requests interleave or are cancelled.
+                // The bot is the sole nickname side-effect worker. Drain the
+                // durable generation-checked outbox every tick so the last
+                // committed DB value wins and Discord failures are retried.
                 match db::pending_nickname_reconciles(&app.db).await {
                     Ok(pending) => {
                         let me = cache.current_user().id;

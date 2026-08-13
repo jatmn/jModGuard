@@ -209,135 +209,33 @@ pub async fn update_settings(
         )));
     }
 
-    // Apply Discord nickname before persisting (same ordering as !setname).
-    // Persisting first left durable bot_name that skipped retry on Discord failure.
-    // If SQLite fails after Discord succeeds, restore the previous nick so the
-    // two stores do not permanently diverge.
-    //
-    // Track the nick Discord currently has after the pre-patch step so a
-    // post-commit re-sync can close parent-read→patch TOCTOU on inherit
-    // (copy_config already does this).
-    let _nickname_guard = if body.bot_name.is_some() && guild_id != 0 {
-        Some(app.lock_nickname_update().await)
-    } else {
-        None
-    };
-    let mut nickname_applied: Option<bool> = None;
-    let mut previous_nick: Option<String> = None;
-    let mut discord_nick: Option<String> = None;
-    if let Some(ref bot_name_patch) = body.bot_name
-        && guild_id != 0
-    {
+    // A repair without a settings mutation still needs durable work. Normal
+    // nickname patches enqueue it atomically in patch_settings.
+    if body.sync_nickname && body.bot_name.is_none() && guild_id != 0 {
         db::request_nickname_reconcile(&app.db, guild_id as i64).await?;
-        let current = db::get_settings(&app.db, guild_id as i64).await?;
-        previous_nick = Some(current.bot_name.clone());
-        discord_nick = Some(current.bot_name.clone());
-        let target_nick = match bot_name_patch {
-            None => {
-                db::get_parent_settings(&app.db, guild_id as i64)
-                    .await?
-                    .bot_name
-            }
-            Some(n) => n.clone(),
-        };
-        if current.bot_name != target_nick || body.sync_nickname {
-            match apply_bot_nickname(&app, guild_id, &target_nick).await {
-                Ok(()) => {
-                    nickname_applied = Some(true);
-                    discord_nick = Some(target_nick);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to apply Discord nickname before WebUI settings save \
-                         (guild={guild_id}): {e:#}"
-                    );
-                    return Err(ApiError(anyhow::anyhow!(
-                        "failed to update Discord nickname: {e:#}"
-                    )));
-                }
-            }
-        }
     }
 
     // Persist only the fields present in the body as a parent-relative
     // override. Values equal to the parent layer are stripped so global
     // inheritance keeps working.
-    let patched_bot_name = body.bot_name.is_some();
-    let settings = match db::patch_settings(
+    let nickname_queued = (body.bot_name.is_some() || body.sync_nickname) && guild_id != 0;
+    let settings = db::patch_settings(
         &app.db,
         guild_id as i64,
         body.prefix,
         body.bot_name,
         body.retention_days,
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            if !db::is_database_commit_indeterminate(&e)
-                && nickname_applied == Some(true)
-                && let Some(ref prev) = previous_nick
-                && let Err(re) = apply_bot_nickname(&app, guild_id, prev).await
-            {
-                tracing::error!(
-                    "failed to restore Discord nickname after settings save error \
-                     (guild={guild_id}): {re:#} (save error: {e:#})"
-                );
-            }
-            return Err(ApiError(e));
-        }
-    };
+    .await?;
     app.invalidate_configs();
-
-    // Post-commit re-sync: committed effective bot_name is authoritative.
-    // Inherit (null) re-reads parent inside patch_settings and can diverge from
-    // the pre-patch Discord apply when global nick changes concurrently.
-    let mut nickname_error: Option<String> = None;
-    if patched_bot_name && guild_id != 0 {
-        let want = settings.bot_name.as_str();
-        let have = discord_nick.as_deref().unwrap_or("");
-        if have != want {
-            match apply_bot_nickname(&app, guild_id, want).await {
-                Ok(()) => {
-                    let prev = previous_nick.as_deref().unwrap_or("");
-                    nickname_applied = Some(want != prev);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "failed to re-sync Discord nickname after settings save \
-                         (guild={guild_id}, want={want:?}): {e:#}"
-                    );
-                    nickname_error = Some(format!(
-                        "settings saved but Discord nickname sync failed: {e:#}"
-                    ));
-                }
-            }
-        }
-    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "settings": settings,
-        "nickname_applied": nickname_applied,
-        "nickname_error": nickname_error,
+        "nickname_applied": null,
+        "nickname_queued": nickname_queued,
+        "nickname_error": null,
     })))
-}
-
-/// Sets (or clears, when empty) the bot's Discord nickname for `guild_id` via REST.
-async fn apply_bot_nickname(app: &AppState, guild_id: u64, bot_name: &str) -> anyhow::Result<()> {
-    let nick = bot_name.to_string();
-    crate::discord::with_retries("Discord nickname", guild_id, || {
-        let nick = nick.clone();
-        async move {
-            let me = app.bot_user_id().await?;
-            use serenity::builder::EditMember;
-            serenity::model::id::GuildId::new(guild_id)
-                .edit_member(app.discord_http(), me, EditMember::new().nickname(nick))
-                .await?;
-            Ok(())
-        }
-    })
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -806,9 +704,7 @@ pub async fn copy_config(
 
     let wants_settings = body.sections.iter().any(|s| s == "settings" || s == "all");
 
-    // Refuse known hard-fail cases *before* Discord nickname mutation.
-    // Without this, Discord-then-SQLite left nick updated when badwords /
-    // logchannels-only refused inside the copy transaction.
+    // Refuse known hard-fail cases before starting the copy.
     // copy_guild_config also re-runs preflight so a concurrent source change
     // between this check and the write cannot skip validation.
     db::preflight_copy_guild_config(
@@ -820,105 +716,26 @@ pub async fn copy_config(
     .await
     .map_err(ApiError)?;
 
-    // Keep the external Discord mutation and the settings transaction ordered
-    // with every other nickname writer in this process.
-    let _nickname_guard = if wants_settings && guild_id != 0 {
-        Some(app.lock_nickname_update().await)
-    } else {
-        None
-    };
-
-    // Apply Discord nickname *before* SQLite (same contract as update_settings
-    // / !setname). Doing it after left copied settings committed when Discord
-    // failed, so operators saw an error while the DB already changed.
-    // If SQLite copy still fails after Discord, restore the previous nick.
-    // After a successful copy, re-read committed settings and re-sync Discord
-    // so a stale preview (source changed mid-copy) cannot leave nick drift.
-    let mut nickname_applied: Option<bool> = None;
-    let mut nickname_error: Option<String> = None;
-    let mut previous_nick: Option<String> = None;
-    let mut preview_nick: Option<String> = None;
-    if wants_settings && guild_id != 0 {
-        db::request_nickname_reconcile(&app.db, guild_id as i64).await?;
-        let preview =
-            db::preview_settings_after_copy(&app.db, body.from_guild_id as i64, guild_id as i64)
-                .await?;
-        let current = db::get_settings(&app.db, guild_id as i64).await?;
-        previous_nick = Some(current.bot_name.clone());
-        preview_nick = Some(preview.bot_name.clone());
-        if preview.bot_name != current.bot_name {
-            apply_bot_nickname(&app, guild_id, &preview.bot_name)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(
-                        "failed to apply Discord nickname before settings copy \
-                         (guild={guild_id}): {e:#}"
-                    );
-                    ApiError(anyhow::anyhow!("failed to update Discord nickname: {e:#}"))
-                })?;
-            nickname_applied = Some(true);
-        }
-    }
-
-    let result = match db::copy_guild_config(
+    // Settings copy atomically commits the desired nickname and outbox row;
+    // the bot applies Discord from that durable state.
+    let nickname_queued = wants_settings && guild_id != 0;
+    let result = db::copy_guild_config(
         &app.db,
         body.from_guild_id as i64,
         guild_id as i64,
         body.sections,
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            if !db::is_database_commit_indeterminate(&e)
-                && nickname_applied == Some(true)
-                && let Some(ref prev) = previous_nick
-                && let Err(re) = apply_bot_nickname(&app, guild_id, prev).await
-            {
-                tracing::error!(
-                    "failed to restore Discord nickname after copy error \
-                     (guild={guild_id}): {re:#} (copy error: {e:#})"
-                );
-            }
-            return Err(ApiError(e));
-        }
-    };
+    .await?;
     app.invalidate_configs();
-
-    // Close preview→copy TOCTOU: committed bot_name is the source of truth.
-    // SQLite already committed — surface Discord re-sync failure in the body
-    // (not a hard 5xx) so operators see the partial outcome instead of a silent
-    // success while Discord lags.
-    if wants_settings && guild_id != 0 {
-        let after = app.configs.get(&app.db, guild_id).await?.settings.clone();
-        let applied = preview_nick.as_deref().unwrap_or("");
-        if after.bot_name != applied {
-            match apply_bot_nickname(&app, guild_id, &after.bot_name).await {
-                Ok(()) => {
-                    let prev = previous_nick.as_deref().unwrap_or("");
-                    nickname_applied = Some(after.bot_name != prev);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "failed to re-sync Discord nickname after settings copy \
-                         (guild={guild_id}, want={:?}): {e:#}",
-                        after.bot_name
-                    );
-                    nickname_error = Some(format!(
-                        "settings copied but Discord nickname sync failed: {e:#}"
-                    ));
-                }
-            }
-        }
-    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "copied": result.copied,
         "skipped_badwords": result.skipped_badwords,
         "skipped_logchannels": result.skipped_logchannels,
-        "nickname_applied": nickname_applied,
-        "nickname_error": nickname_error,
+        "nickname_applied": null,
+        "nickname_queued": nickname_queued,
+        "nickname_error": null,
     })))
 }
 

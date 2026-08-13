@@ -52,11 +52,12 @@ from Bunny's documented failover-loss window without accepting a stale replica
 as authoritative. Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers.
 
-Nickname changes additionally enqueue a generation-numbered durable outbox row
-in the same settings transaction. The bot drains it through primary-routed
-reads and acknowledges only the generation it applied to Discord. This makes
-the final committed nickname win across bot/API races and survives a cancelled
-HTTP or command request.
+Nickname changes commit a generation-numbered durable outbox row in the same
+settings transaction. The bot is the sole Discord nickname writer: it drains
+the outbox through primary-routed reads and acknowledges only the generation it
+applied. This makes the final committed nickname win across bot/API races,
+survives cancelled requests, and retries Discord failures without rolling back
+durable settings.
 
 ## Migrations
 

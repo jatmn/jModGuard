@@ -1834,9 +1834,7 @@ fn section_wanted(sections: &[String], name: &str) -> bool {
 
 /// Read-only checks for copy refuse conditions (no writes).
 ///
-/// Call this *before* Discord nickname side effects. The dual-write contract is
-/// Discord-then-SQLite; without a preflight, a late refuse (badwords /
-/// logchannels-only) leaves Discord updated while SQLite rolls back.
+/// Validate known copy refusal conditions before starting the write.
 fn preflight_copy_guild_config_conn(
     conn: &impl SqlExecutor,
     src: i64,

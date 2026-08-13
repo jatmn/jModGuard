@@ -68,10 +68,6 @@ pub struct AppState {
     force_slash_registry_retry: AtomicBool,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
-    /// Serializes each Discord nickname + SQLite settings transaction. These
-    /// are one logical update even though Discord must be applied before the
-    /// durable row is written.
-    nickname_update_lock: tokio::sync::Mutex<()>,
     /// Per-user OAuth guild-list cache (discord_user_id -> (fetched_at, guilds)).
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -112,7 +108,6 @@ impl AppState {
             last_slash_registry_version: AtomicU64::new(primed_slash),
             force_slash_registry_retry: AtomicBool::new(false),
             slash_sync_progress: Mutex::new(None),
-            nickname_update_lock: tokio::sync::Mutex::new(()),
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
         }))
@@ -146,12 +141,6 @@ impl AppState {
     /// Invalidates the config cache (call after any config write).
     pub fn invalidate_configs(&self) {
         self.configs.invalidate();
-    }
-
-    /// Hold this across a complete Discord nickname/settings update. Prefix
-    /// and retention-only writes do not need it.
-    pub async fn lock_nickname_update(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.nickname_update_lock.lock().await
     }
 
     /// Loads durable `config_version` from the DB. When it differs from the
