@@ -167,6 +167,12 @@ impl AppState {
             self.configs.require_version(remote);
             return Ok(true);
         }
+        if remote < prev {
+            let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
+            return Ok(self
+                .reconcile_primary_versions(primary_config, primary_slash)
+                .0);
+        }
         Ok(false)
     }
 
@@ -181,9 +187,60 @@ impl AppState {
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
         if self.force_slash_registry_retry.load(Ordering::SeqCst) || remote > prev {
             Ok(Some(remote.max(prev)))
+        } else if remote < prev {
+            let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
+            let (_, slash_changed) = self.reconcile_primary_versions(primary_config, primary_slash);
+            let current = self.last_slash_registry_version.load(Ordering::SeqCst);
+            Ok(
+                (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
+                    .then_some(current),
+            )
         } else {
             Ok(None)
         }
+    }
+
+    fn reconcile_primary_versions(&self, config: u64, slash: u64) -> (bool, bool) {
+        let previous_config = self.last_config_version.load(Ordering::SeqCst);
+        let config_changed = config != previous_config
+            && self
+                .last_config_version
+                .compare_exchange(previous_config, config, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if config_changed {
+            if config < previous_config {
+                tracing::warn!(
+                    previous_config,
+                    primary_config = config,
+                    "primary database confirmed config version rollback; rebaselining after provider failover"
+                );
+                self.db
+                    .rebaseline_required_config_version(previous_config, config);
+                self.configs.rebaseline_version(previous_config, config);
+            } else {
+                self.configs.require_version(config);
+            }
+        }
+
+        let previous_slash = self.last_slash_registry_version.load(Ordering::SeqCst);
+        let slash_changed = slash != previous_slash
+            && self
+                .last_slash_registry_version
+                .compare_exchange(previous_slash, slash, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if slash_changed {
+            if slash < previous_slash {
+                tracing::warn!(
+                    previous_slash,
+                    primary_slash = slash,
+                    "primary database confirmed slash-registry rollback; forcing Discord reconciliation"
+                );
+            }
+            self.force_slash_registry_retry
+                .store(true, Ordering::SeqCst);
+            *self.slash_sync_progress.lock() = None;
+        }
+        (config_changed, slash_changed)
     }
 
     /// Marks `version` as observed after a successful slash re-sync pass.
@@ -592,6 +649,22 @@ impl ConfigCache {
         self.invalidate();
     }
 
+    fn rebaseline_version(&self, expected: u64, version: u64) {
+        let mut current = self.durable_floor.load(Ordering::SeqCst);
+        while current > version && current <= expected {
+            match self.durable_floor.compare_exchange(
+                current,
+                version,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.invalidate();
+    }
+
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
         let required = self
             .durable_floor
@@ -736,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_slash_registry_does_not_advance_until_commit() {
+    fn pending_slash_registry_rebaselines_only_after_primary_confirmation() {
         let tmp = std::env::temp_dir().join(format!(
             "jmodguard_slash_pending_{}_{}.db",
             std::process::id(),
@@ -782,12 +855,14 @@ mod tests {
         app.commit_slash_registry_version(10);
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
-            None,
-            "a stale lower replica observation must not regress slash state"
+            Some(1),
+            "an immediate primary transaction confirms an authoritative rollback"
         );
         app.last_config_version.store(10, Ordering::SeqCst);
-        assert!(!tokio_test_block_on(app.poll_config_version()).unwrap());
-        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 10);
+        app.configs.require_version(10);
+        assert!(tokio_test_block_on(app.poll_config_version()).unwrap());
+        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 1);
+        tokio_test_block_on(app.configs.get(&app.db, 1)).expect("cache floor must rebaseline");
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));

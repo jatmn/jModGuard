@@ -438,6 +438,23 @@ impl Db {
         self.required_config_version
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Lowers a process-local read-your-write floor only when it still equals
+    /// the value whose loss was confirmed by a primary-routed transaction.
+    pub fn rebaseline_required_config_version(&self, expected: u64, version: u64) {
+        let mut current = self.required_config_version();
+        while current > version && current <= expected {
+            match self.required_config_version.compare_exchange(
+                current,
+                version,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
@@ -462,7 +479,7 @@ fn migrate_conn(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version < target {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_immediate()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;
@@ -561,6 +578,20 @@ pub fn get_config_version_sync(db: &Db) -> Result<u64> {
 pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
     db.with_conn(|conn| get_slash_registry_version_conn(conn))
         .await
+}
+
+/// Reads both invalidation counters through an IMMEDIATE transaction. Bunny
+/// routes write transactions to the primary, so callers can distinguish an
+/// authoritative failover rollback from one stale replica observation.
+pub async fn get_primary_versions(db: &Db) -> Result<(u64, u64)> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction_immediate()?;
+        let config = get_config_version_conn(&tx)?;
+        let slash = get_slash_registry_version_conn(&tx)?;
+        tx.commit()?;
+        Ok((config, slash))
+    })
+    .await
 }
 
 /// Sync read for process startup (prime slash-registry poll baseline).
@@ -871,7 +902,7 @@ fn heal_default_guild_settings_conn(conn: &mut Connection, defaults: &GuildSetti
         return Ok(());
     }
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_immediate()?;
     let mut changed = 0usize;
 
     // 1) Global layer first — parent is config terminal defaults.
@@ -1019,7 +1050,7 @@ async fn upsert_row<T: Serialize + Send + 'static>(
             .collect::<Vec<_>>()
             .join(", ");
         let n = key_params.len() + 1;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         tx.execute(
             &format!(
                 "INSERT INTO {table} ({key_cols}, {data_col}) VALUES ({keys}, ?{n})
@@ -1051,7 +1082,7 @@ async fn delete_row(
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         let n = tx.execute(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
             params_from_iter(key_params),
@@ -1253,7 +1284,7 @@ pub(crate) async fn upsert_settings(
     let override_ = GuildSettingsOverride::from_complete(settings);
     db.with_conn(move |conn| {
         let defaults = terminal_defaults_conn(conn)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
         let ov = normalize_settings_override_against_parent(&override_, &parent);
         write_settings_override_conn(&tx, guild_id, &ov)?;
@@ -1303,7 +1334,7 @@ pub async fn patch_settings(
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
         let defaults = terminal_defaults_conn(conn)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
         let mut ov = read_settings_override_conn(&tx, guild_id)?.unwrap_or_default();
 
@@ -1432,7 +1463,7 @@ pub async fn list_templates(db: &Db, guild_id: i64) -> Result<Vec<(String, Strin
 pub async fn upsert_template(db: &Db, guild_id: i64, event: &str, template: &str) -> Result<()> {
     let (event, template) = (event.to_string(), template.to_string());
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         tx.execute(
             "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET template = excluded.template",
@@ -1500,7 +1531,7 @@ pub async fn upsert_log_channel(
     }
     let event = event.to_string();
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         tx.execute(
             "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET channel_id = excluded.channel_id",
@@ -1602,7 +1633,7 @@ pub async fn add_badword(db: &Db, guild_id: i64, pattern: &str, note: Option<&st
     crate::normalize::compile_user_regex(pattern).map_err(|e| anyhow::anyhow!(e))?;
     let (pattern, note) = (pattern.to_string(), note.map(|s| s.to_string()));
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         tx.execute(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
             params![guild_id, pattern, note],
@@ -1639,7 +1670,7 @@ pub async fn get_badword(db: &Db, id: i64) -> Result<Option<Badword>> {
 
 pub async fn delete_badword(db: &Db, id: i64, guild_id: i64) -> Result<()> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         let n = tx.execute(
             "DELETE FROM badwords WHERE id = ?1 AND guild_id = ?2",
             params![id, guild_id],
@@ -1773,7 +1804,7 @@ pub async fn copy_guild_config(
         // Always re-validate inside the write path (closes preflight TOCTOU).
         preflight_copy_guild_config_conn(conn, src, dst, &sections)?;
 
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_immediate()?;
         let mut result = CopyResult::default();
         let wants = |name: &str| section_wanted(&sections, name);
         let copied_settings = wants("settings");

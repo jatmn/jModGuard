@@ -236,13 +236,29 @@ impl Connection {
         let inner = self
             .runtime
             .block_on_database("begin transaction", self.inner.transaction())?;
-        Ok(Transaction {
+        Ok(self.wrap_transaction(inner))
+    }
+
+    /// Starts a write transaction at the primary immediately. Remote libSQL
+    /// can reject a deferred transaction when it must upgrade from a replica
+    /// read to a primary write while another writer is active.
+    pub fn transaction_immediate(&self) -> Result<Transaction> {
+        let inner = self.runtime.block_on_database(
+            "begin immediate transaction",
+            self.inner
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
+        )?;
+        Ok(self.wrap_transaction(inner))
+    }
+
+    fn wrap_transaction(&self, inner: libsql::Transaction) -> Transaction {
+        Transaction {
             inner: Some(inner),
             runtime: self.runtime.clone(),
             connection_tainted: Arc::clone(&self.tainted),
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
-        })
+        }
     }
 
     pub fn pragma_update<T: Display>(

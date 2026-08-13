@@ -46,6 +46,11 @@ Expect up to one poll interval of lag locally after a cross-process config
 write; remote deployments can additionally wait for provider replica convergence.
 Slash-command resync reads its registry version and command rows in one
 transaction and retries when that snapshot has not reached the target version.
+If a lower counter is observed, jModGuard confirms it through an `IMMEDIATE`
+transaction routed to the primary before rebaselining caches. This recovers
+from Bunny's documented failover-loss window without accepting a stale replica
+as authoritative. Mutating read-modify-write paths also use `IMMEDIATE`
+transactions so they begin on the primary and serialize with other writers.
 
 ## Migrations
 
