@@ -404,17 +404,17 @@ impl Transaction {
                 Ok(())
             }
             Err(commit_error) if self.runtime.is_remote() => {
-                let rollback = self.runtime.block_on_database(
+                // Cleanup only: a successful ROLLBACK response cannot prove a
+                // preceding COMMIT was not accepted when its response was
+                // lost. Callers must reconcile every remote commit error as
+                // an indeterminate outcome.
+                let _rollback = self.runtime.block_on_database(
                     "rollback after failed commit",
                     self.inner().execute_batch("ROLLBACK"),
                 );
                 let inner = self.inner.take().expect("transaction already completed");
                 drop_transaction_without_runtime(inner);
-                if rollback.is_ok() {
-                    Err(commit_error)
-                } else {
-                    Err(DatabaseCommitIndeterminate(commit_error).into())
-                }
+                Err(DatabaseCommitIndeterminate(commit_error).into())
             }
             Err(error) => Err(error),
         }
