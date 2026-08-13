@@ -1,162 +1,159 @@
-# Deploy on Bunny.net (optional)
+# Deploy on Bunny.net
 
-jModGuard is an open-source Discord moderation bot you can self-host anywhere.
-Today, run its bot and API processes on the **same host or shared filesystem**
-so they can open the same SQLite database. Bunny CDN/Storage can still serve
-the static WebUI in front of that API.
+jModGuard supports a remote [Bunny Database](https://docs.bunny.net/database)
+through Bunny's documented Rust `libsql` client. The bot and API run as two
+independent Magic Container apps and use the database as their shared source
+of truth. This is the intended Bunny topology; no shared disk or existing-data
+migration is needed for a first deployment.
 
-This document is **guidance**, not a managed service. You remain the operator
-(Discord app, secrets, billing, backups). For product install on a single host,
-use [SETUP.md](SETUP.md). To upgrade an existing deploy, use [UPGRADE.md](UPGRADE.md).
-
-Remote Bunny Database (libSQL) support is reserved in config (`db.url` /
-`db.token`) and currently **fails fast until a remote client is wired**.
-Consequently, the current release does not support bot and API in separate
-Magic Container apps: their local SQLite paths would be different databases.
-
-## Supported shape
-
-```
-admin.yourdomain.com
-   ├─ Bunny DNS + CDN (TLS)
-   │     SPA from Storage
-   │     /api/* and /oauth/* → your API host
-   └─ One host or shared volume
-         ├─ jmodguard-bot
-         ├─ jmodguard-api
-         └─ shared SQLite database
+```text
+Discord Gateway                         Public HTTPS endpoint
+       |                                         |
+       v                                         v
+jmodguard-bot app                         jmodguard-api app
+       |                                         |
+       +---------- Bunny Database ---------------+
+                  (remote libSQL)
 ```
 
-The two processes remain separately restartable on that host. Do not put them
-in separate containers unless their `db.path` resolves to the same shared
-filesystem. Independent Magic Container apps require the future libSQL backend.
+The API embeds `frontend/`, so an initial deployment does not require a Storage
+Zone, Pull Zone, or cross-origin CORS configuration.
 
-Bot never calls the API. Both talk to the DB. See [ARCHITECTURE.md](ARCHITECTURE.md).
+## 1. Create the database
 
-## Current layout
+Create a Bunny Database in the dashboard or with the Bunny CLI. In the
+database's **Access** page, generate full-access credentials for each app.
+Both apps need write access: the bot writes moderation state and migrations,
+while the API writes configuration changes.
 
-| Decision | Recommendation |
-|----------|----------------|
-| Bot host | Always-on process/container on the shared-DB host |
-| API host | Second process/container on that same host or shared volume |
-| Frontend | Static `frontend/` on Storage + CDN |
-| TLS / DNS | Bunny DNS + CDN on the admin hostname |
-| Images | `Dockerfile.bot` / `Dockerfile.api` (`rust:*-bookworm` → `debian:bookworm-slim`) |
-| Alpine | Avoid for this project (edition 2024 / current Dockerfiles use bookworm) |
+Bunny can inject these standard environment variables into a Magic Container
+app:
 
-## Components and secrets
+```dotenv
+BUNNY_DATABASE_URL=libsql://DATABASE_ID.lite.bunnydb.net
+BUNNY_DATABASE_AUTH_TOKEN=SECRET
+```
 
-| Component | Needs |
-|-----------|--------|
-| `jmodguard-bot` | Discord bot token, DB, `bot.owner_id`, poll interval |
-| `jmodguard-api` | DB, OAuth client id/secret, `web.base_url`, **bot token** (WebUI unban via Discord REST) |
-| SPA | No secrets |
+jModGuard reads those names directly. Its portable aliases
+`JMODGUARD_DB_URL` and `JMODGUARD_DB_TOKEN` are also supported and take
+precedence when both forms are present. Never commit an access token.
 
-Never commit tokens. Prefer platform secrets / env injection.
+## 2. Build and publish both images
 
-## CDN and OAuth
-
-1. Point the admin hostname at Bunny CDN.
-2. Serve SPA files from Storage (contents of `frontend/` for your release tag).
-3. Origin rules: `/api/*` and `/oauth/*` (and login routes you expose) → API container.
-4. Prefer same hostname for SPA + API so relative `fetch('/api/...')` works.
-   If the SPA is truly on another origin, set `window.JMODGUARD_API_BASE` **and**
-   configure `web.cors_origins` (or `JMODGUARD_CORS_ORIGINS`) to that SPA origin.
-   The SPA sends its configured origin to the API for login/logout return navigation;
-   only an exact configured CORS origin is accepted, so include the public SPA origin.
-   The API enables credentialed CORS only when `cors_origins` is non-empty;
-   `web.base_url` must be `https://…` so session cookies use `Secure` + `SameSite=None`.
-5. Discord OAuth redirect URI must match
-   `{web.base_url}/oauth/callback` (HTTPS in production).
-6. Session cookies use the `Secure` flag when `web.base_url` starts with
-   `https://`.
-
-## Containers
-
-Repo Dockerfiles:
-
-- `Dockerfile.bot` — `cargo build --release --bin jmodguard-bot --no-default-features`
-- `Dockerfile.api` — `cargo build --release --bin jmodguard-api` (feature `web`)
-
-Both images use `WORKDIR /data`, `VOLUME ["/data"]`,
-`JMODGUARD_DB_PATH=/data/jmodguard.db`, and `JMODGUARD_CONFIG=/data/config.toml`.
-The API image also sets `JMODGUARD_WEB_BIND=0.0.0.0:8080` and exposes 8080 —
-the host default `127.0.0.1` is unreachable from outside the container.
-
-Mount **one** shared volume on `/data` for both containers. The commands below
-use environment-injected secrets and defaults, so a fresh volume does not need
-`config.toml`; mount or create that file first if you need non-default TOML
-settings.
+Build both images from the same reviewed commit or release tag:
 
 ```bash
-docker volume create jmodguard-data
-docker run -d --name jmodguard-bot \
-  -v jmodguard-data:/data \
-  -e JMODGUARD_DISCORD_TOKEN=… \
-  -e JMODGUARD_OWNER_ID=123456789012345678 \
-  your-registry/jmodguard-bot:tag
-docker run -d --name jmodguard-api -p 8080:8080 \
-  -v jmodguard-data:/data \
-  -e JMODGUARD_DISCORD_TOKEN=… \
-  -e JMODGUARD_OWNER_ID=123456789012345678 \
-  -e JMODGUARD_OAUTH_CLIENT_ID=… \
-  -e JMODGUARD_OAUTH_CLIENT_SECRET=… \
-  -e JMODGUARD_WEB_BASE_URL=https://admin.example.com \
-  your-registry/jmodguard-api:tag
+docker build -f Dockerfile.bot -t REGISTRY/jmodguard-bot:TAG .
+docker build -f Dockerfile.api -t REGISTRY/jmodguard-api:TAG .
+docker push REGISTRY/jmodguard-bot:TAG
+docker push REGISTRY/jmodguard-api:TAG
 ```
 
-Do not give each container its own anonymous volume: that is two databases.
+Record immutable image digests in the private ops repository. Do not deploy
+floating `main` or `latest` tags.
 
-Push images to a registry your chosen host can pull. Pin tags to jModGuard
-releases (`vX.Y.Z`).
+The images default `JMODGUARD_LOG_DIRECTORY` to an empty value so logs go to
+stdout/stderr and appear in the Magic Containers log stream. A persistent
+volume is not required for the remote database topology.
 
-## Database notes
+## 3. Create the bot app
 
-- Config writers bump durable `config_version`; both processes poll it.
-  Command registry writers also bump `slash_registry_version`; the bot
-  re-syncs Discord slash commands when that advances.
-- Migrations run in the **bot**. Start/migrate bot before API.
-- Until remote open is implemented, leave `db.url` empty and configure both
-  processes with the exact same local `db.path` on a shared filesystem. A
-  separate container-local path is not a shared database.
-- Bunny Database/libSQL becomes an option only after the remote client is
-  implemented; then both processes can use `JMODGUARD_DB_URL` /
-  `JMODGUARD_DB_TOKEN` and run independently.
+Create a Magic Container app from the bot image. Start with one instance. Add
+the database credentials from step 1 and these secrets/settings:
 
-## Sessions
+```dotenv
+JMODGUARD_DISCORD_TOKEN=SECRET
+JMODGUARD_OWNER_ID=123456789012345678
+JMODGUARD_CONFIG_POLL_SECS=5
+JMODGUARD_LOG_LEVEL=info
+JMODGUARD_LOG_DIRECTORY=
+```
 
-API uses in-memory sessions (`MemoryStore`): fine for **one** API replica.
-Restarting the API logs everyone out. Multi-replica needs a shared session
-store (not shipped yet).
+The bot is the schema authority. On the first start it creates the schema,
+seeds defaults, and publishes a durable bootstrap marker before connecting to
+Discord. This is initial schema creation on an empty service, not a migration
+of an older deployment.
 
-## First-time checklist (operator)
+Wait for logs containing `database ready (migrate=true)` before starting the
+API app. A fake or invalid Discord token can still be used for a database-only
+smoke test; Discord will then reject the later gateway connection as expected.
 
-1. Discord application: bot token, privileged intents, OAuth2 redirect, invite.
-2. Build/push bot + API images from a release tag.
-3. Create the shared SQLite DB path; configure both processes with that exact
-   same path on the same host/shared filesystem.
-4. Upload SPA to Storage; configure CDN + origin to the API host.
-5. Set env / config: token, OAuth, `base_url`, `owner_id`, bind as required.
-6. Start **bot**, confirm migrate + shards; start **API**; login at the admin URL.
-7. Plan backups (export / `VACUUM INTO` / provider tools). Preview backup
-   tooling may be thin — automate exports yourself.
+## 4. Create the API app
 
-## Upgrade on this topology
+Create a separate Magic Container app from the API image. Attach credentials
+for the same Bunny Database and configure:
 
-Follow [UPGRADE.md](UPGRADE.md): backup → new images from tag → bot first
-(migrations) → API → refresh SPA on Storage/CDN → verify. Rollback = previous
-image tags + DB backup.
+```dotenv
+JMODGUARD_DISCORD_TOKEN=SECRET
+JMODGUARD_WEB_BIND=0.0.0.0:8080
+JMODGUARD_WEB_BASE_URL=https://YOUR-API-HOSTNAME
+JMODGUARD_OAUTH_CLIENT_ID=SECRET
+JMODGUARD_OAUTH_CLIENT_SECRET=SECRET
+JMODGUARD_OWNER_ID=123456789012345678
+JMODGUARD_CONFIG_POLL_SECS=5
+JMODGUARD_LOG_LEVEL=info
+JMODGUARD_LOG_DIRECTORY=
+```
 
-## Rough cost awareness
+The API also needs the Discord bot token because WebUI unban uses Discord's
+REST API. Add a public HTTPS endpoint for container port `8080`. In the Discord
+Developer Portal, set the OAuth redirect URI to this exact value:
 
-CDN and Storage are separate from your shared-DB bot/API host. Treat
-third-party pricing pages as source of truth; numbers go stale quickly.
-Anycast IPs add cost if you attach one — often unnecessary if CDN terminates
-TLS.
+```text
+https://YOUR-API-HOSTNAME/oauth/callback
+```
 
-## Related
+The API never applies migrations. It verifies the schema and bot bootstrap
+marker, retrying briefly if it starts while the bot is still bootstrapping.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [UPGRADE.md](UPGRADE.md)
-- [CONFIGURATION.md](CONFIGURATION.md)
-- [WEBUI.md](WEBUI.md)
+## 5. Acceptance test
+
+For the first deployment:
+
+1. Confirm bot logs show `database ready (migrate=true)` and then shard startup.
+2. Confirm API logs show `database ready (migrate=false)` and
+   `API/WebUI listening`.
+3. Request `/`; it must return the embedded jModGuard UI over HTTPS.
+4. Complete Discord OAuth login and open a guild where the user has Manage
+   Server permission.
+5. Change a harmless guild prefix in the UI. Confirm the bot observes it within
+   `config_poll_secs`, exercise the new prefix in Discord, then restore it.
+6. Configure a dry-run moderation rule and verify its audit event.
+7. Restart each app independently and confirm both reconnect to the same data.
+
+The repository's CI also runs `tests/remote_database_smoke.rs` against a pinned
+libSQL server. That test proves bot bootstrap, a remote write, API schema-open,
+and cross-process visibility without requiring production credentials.
+
+## Operating constraints
+
+- Bunny Database is currently documented as Public Preview. Review its current
+  limits, availability, and backup/restore facilities before production use.
+- Run one bot app instance unless Discord sharding and singleton work have been
+  deliberately redesigned and tested.
+- API sessions use an in-memory store. Restarting the API logs users out, and
+  multiple API replicas do not share sessions.
+- Both processes poll durable `config_version`; command changes additionally
+  bump `slash_registry_version` for Discord slash-command resync.
+- Keep bot and API on the exact same source/image version during rollout.
+
+## Optional separate SPA
+
+The embedded same-origin UI is the safest starting point. If `frontend/` is
+later hosted on Bunny Storage/CDN under another origin:
+
+1. Upload the frontend from the exact deployed source tag.
+2. Set `window.JMODGUARD_API_BASE` to the API origin.
+3. Set `JMODGUARD_CORS_ORIGINS` to the exact HTTPS SPA origin; never use `*`.
+4. Keep `JMODGUARD_WEB_BASE_URL` on HTTPS so cross-origin session cookies use
+   `Secure` and `SameSite=None`.
+5. Keep the Discord callback at `{web.base_url}/oauth/callback`.
+
+## References
+
+- [Bunny Database overview](https://docs.bunny.net/database)
+- [Bunny Database Rust client](https://docs.bunny.net/database/connect/rust)
+- [Bunny Database authentication](https://docs.bunny.net/database/connect/authorization)
+- [Magic Containers quickstart](https://docs.bunny.net/magic-containers/quickstart)
+- [Configuration reference](CONFIGURATION.md)
+- [Architecture](ARCHITECTURE.md)

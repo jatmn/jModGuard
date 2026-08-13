@@ -2,7 +2,7 @@
 
 How to move an existing jModGuard install to a newer version (git tag or release).
 
-For a **first** install, use [SETUP.md](SETUP.md). For an optional Bunny-shaped
+For a **first** install, use [SETUP.md](SETUP.md). For a Bunny
 deploy, see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). If you maintain your own
 registry/CDN/secrets pipeline, follow this guide for product steps, then apply
 your operator runbook for promote and rollout.
@@ -54,6 +54,9 @@ Both `jmodguard-bot` and `jmodguard-api` can hold the shared DB open.
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` — do not file-copy
 the `.db` while either process is writing. See [CONFIGURATION.md](CONFIGURATION.md).
 
+For Bunny Database, create and verify a provider-supported backup/export
+instead. The local file-copy procedure does not apply to a remote database.
+
 ## 3. Build or pull the new artifacts
 
 From the tagged source:
@@ -73,7 +76,7 @@ matching `frontend/` from the **same** tag as the API.
 ## 4. Config diff
 
 Compare your `config.toml` to `config.example.toml` at the new tag. Add any
-new keys (for example `bot.config_poll_secs`, `db.url` / `db.token` stubs).
+new keys (for example `bot.config_poll_secs` or `db.url` / `db.token`).
 Env overrides (`JMODGUARD_*`) still win over the file.
 
 ## 5. Rollout order
@@ -136,17 +139,18 @@ Do **not** run a new API against a DB that has not been migrated by a new bot
 If the upgrade fails:
 
 1. Stop both new processes.
-2. Restore the DB files from the backup taken in step 2.
+2. Restore the local DB files or remote database backup taken in step 2.
 3. Run the **previous** binaries/images (same version that matched that DB).
 4. Start bot, then API.
 
-Do not assume new migrations are reversible. Rollback = old code + old DB
-backup unless a release note says otherwise.
+Do not assume new migrations are reversible. Rollback = old code + matching
+database backup unless a release note says otherwise.
 
 ## Bunny / dual-container notes
 
-Same order: migrate with the bot container/app, then roll the API app. Update
-CDN/Storage SPA assets for the same release. Generic topology:
+Same order: migrate with the bot app, then roll the API app. Both must keep
+using the same Bunny Database. Update separate CDN/Storage SPA assets, if any,
+from the same release. Generic topology:
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
 ## Related

@@ -9,9 +9,9 @@ database (everything server-related, editable at runtime).
 |---|---|---|
 | `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required by bot; also by API for WebUI unban |
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
-| `db.url` | — | Remote libSQL / Bunny Database URL (env: `JMODGUARD_DB_URL`). Empty = local path. Not wired yet — setting it fails at open |
-| `db.token` | — | Remote DB access token (env: `JMODGUARD_DB_TOKEN`) |
-| `db.pool_size` | `8` | connection pool size (each process; bot and API each open their own pool) |
+| `db.url` | — | Remote libSQL / Bunny Database URL. `JMODGUARD_DB_URL` takes precedence over Bunny's injected `BUNNY_DATABASE_URL`; empty = local path |
+| `db.token` | — | Remote DB access token. `JMODGUARD_DB_TOKEN` takes precedence over Bunny's injected `BUNNY_DATABASE_AUTH_TOKEN`; required with `db.url` |
+| `db.pool_size` | `8` | maximum concurrent database operations in each process |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
@@ -23,15 +23,15 @@ database (everything server-related, editable at runtime).
 | `bot.status` | `moderating` | presence text |
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
-| `log.directory` | `logs` | rolling log directory (empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log` |
+| `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
 
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0003_archive_global_log_channels.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
-the bot to finish bootstrap or release a transient SQLite startup lock, then
-exits).
+the bot to finish bootstrap or release a transient local SQLite startup lock,
+then exits).
 
 | Table | Holds |
 |---|---|
@@ -58,9 +58,9 @@ and default templates. Servers inherit these until you override them.
 
 ## Backups
 
-The whole configuration lives in `jmodguard.db`, shared by **both**
-`jmodguard-bot` and `jmodguard-api`. Either process can hold pooled WAL
-connections open.
+For a local deployment, the whole configuration lives in `jmodguard.db`,
+shared by **both** `jmodguard-bot` and `jmodguard-api`. Either process can hold
+WAL connections open.
 
 **Cold copy (preferred for restores):** stop **both** the bot and the API,
 then copy `jmodguard.db` plus `jmodguard.db-wal` / `jmodguard.db-shm` if
@@ -70,3 +70,7 @@ present, then start both again.
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` while the
 processes keep running — do **not** file-copy the `.db` while either process
 is still writing.
+
+For Bunny Database, use Bunny's current backup/export and restore facilities;
+local SQLite file-copy instructions do not apply to a remote database. Test a
+restore before relying on it for production recovery.

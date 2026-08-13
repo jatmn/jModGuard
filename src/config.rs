@@ -177,8 +177,12 @@ impl Config {
         }
         if let Ok(v) = env::var("JMODGUARD_DB_URL") {
             self.db.url = v;
+        } else if let Ok(v) = env::var("BUNNY_DATABASE_URL") {
+            self.db.url = v;
         }
         if let Ok(v) = env::var("JMODGUARD_DB_TOKEN") {
+            self.db.token = v;
+        } else if let Ok(v) = env::var("BUNNY_DATABASE_AUTH_TOKEN") {
             self.db.token = v;
         }
         if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
@@ -212,6 +216,9 @@ impl Config {
         }
         if let Ok(v) = env::var("JMODGUARD_LOG_LEVEL") {
             self.log.level = v;
+        }
+        if let Ok(v) = env::var("JMODGUARD_LOG_DIRECTORY") {
+            self.log.directory = PathBuf::from(v);
         }
     }
 }

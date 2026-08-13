@@ -16,12 +16,13 @@ token = ""
 # Local SQLite database file path (WAL mode is enabled automatically).
 path = "jmodguard.db"
 # Remote libSQL / Bunny Database URL. Empty = use local `path`.
-# Env: JMODGUARD_DB_URL. Remote backend is not wired yet — setting this fails at open.
+# Env: JMODGUARD_DB_URL or Bunny's injected BUNNY_DATABASE_URL.
 url = ""
-# Remote DB access token (server-side only). Env: JMODGUARD_DB_TOKEN.
+# Remote DB access token (server-side only). Env: JMODGUARD_DB_TOKEN or
+# Bunny's injected BUNNY_DATABASE_AUTH_TOKEN. Required when url is set.
 token = ""
-# Connection pool size. Default 8 is fine for a single server;
-# raise it for very busy servers.
+# Maximum concurrent database operations in this process. Both the bot and API
+# apply this limit independently.
 pool_size = 8
 
 [web]
@@ -65,4 +66,6 @@ config_poll_secs = 5
 # tracing level: trace | debug | info | warn | error
 level = "info"
 # Directory for rolling log files (empty = console only).
+# Env: JMODGUARD_LOG_DIRECTORY. The container images set it to empty so logs
+# are visible in the platform log stream.
 directory = "logs"

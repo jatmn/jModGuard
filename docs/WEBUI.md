@@ -5,7 +5,7 @@ bot process). It manages everything the bot does — no config file editing
 needed beyond the token / OAuth credentials and `bot.owner_id`.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
-`jmodguard-api`. Both share the same SQLite file (`db.path`).
+`jmodguard-api`. Both use the same local SQLite file or remote libSQL database.
 
 ## Access
 

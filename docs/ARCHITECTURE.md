@@ -15,6 +15,11 @@ jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jm
        └──── polls config_version ─┴── both processes poll ────┘
 ```
 
+For a single-host install, both processes open the same local SQLite file. For
+distributed deployment, both connect to one remote Bunny Database using the
+libSQL protocol. Local SQLite uses WAL mode, so its file must not be placed on
+a network filesystem or opened by processes on different hosts.
+
 ## Feature split
 
 - Feature `web` (default): axum, tower-sessions, embedded SPA from `frontend/`.

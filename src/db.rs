@@ -1,19 +1,20 @@
-//! SQLite data layer: connection pool, migrations, and all persistence.
+//! libSQL data layer: local SQLite or remote Bunny Database persistence.
 //!
-//! Every async function runs its work on a pooled connection via
+//! Every async function runs its work on a libSQL connection via
 //! `spawn_blocking`; parameters are moved (owned) into the closures so no
 //! borrowed data ever crosses the async boundary.
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db_compat::{
+    Connection, DbRuntime, OptionalExtension, Row, SqlExecutor, Value, params, params_from_iter,
+};
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
 };
@@ -23,8 +24,6 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_config_version.sql"),
     include_str!("../migrations/0003_archive_global_log_channels.sql"),
 ];
-
-pub type Pool = r2d2::Pool<SqliteConnectionManager>;
 
 /// Largest supported retention period. It stays below chrono's representable
 /// duration range and is also enforced at the WebUI/database write boundary.
@@ -47,18 +46,12 @@ pub fn is_schema_not_ready(err: &anyhow::Error) -> bool {
         .any(|e| e.downcast_ref::<SchemaNotReady>().is_some())
 }
 
-/// SQLite can be temporarily locked while the bot is applying migrations.
+/// Local SQLite can be temporarily locked while the bot is applying migrations.
 /// That is an expected API-startup race, unlike other SQLite failures.
 fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
-    err.chain().any(|e| {
-        matches!(
-            e.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(code, _))
-                if matches!(
-                    code.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                )
-        )
+    err.chain().any(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("database is locked") || message.contains("database is busy")
     })
 }
 
@@ -66,7 +59,7 @@ fn is_api_startup_retryable(err: &anyhow::Error) -> bool {
     is_schema_not_ready(err) || is_sqlite_startup_lock(err)
 }
 
-/// Options for opening a database (local path today; remote URL reserved).
+/// Options for opening either local SQLite or a remote libSQL database.
 #[derive(Debug, Clone)]
 pub struct DbOpenOptions {
     pub path: PathBuf,
@@ -83,7 +76,10 @@ pub struct DbOpenOptions {
 
 #[derive(Clone)]
 pub struct Db {
-    pool: Arc<Pool>,
+    database: Arc<libsql::Database>,
+    runtime: DbRuntime,
+    permits: Arc<tokio::sync::Semaphore>,
+    remote: bool,
 }
 
 impl Db {
@@ -106,14 +102,18 @@ impl Db {
     }
 
     pub fn open_with(opts: DbOpenOptions) -> Result<Self> {
-        if !opts.url.trim().is_empty() {
-            anyhow::bail!(
-                "remote libSQL backend not enabled yet (db.url / JMODGUARD_DB_URL set). \
-                 Leave url empty to use the local SQLite path, or wire the libSQL client before deploying."
-            );
+        let remote = !opts.url.trim().is_empty();
+        if remote && opts.token.trim().is_empty() {
+            anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
         }
-        // `token` is reserved for the remote backend; ignored for local files.
-        let _ = opts.token;
+        let runtime = DbRuntime::new()?;
+        let database = if remote {
+            runtime.block_on(
+                libsql::Builder::new_remote(opts.url.clone(), opts.token.clone()).build(),
+            )?
+        } else {
+            runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?
+        };
 
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
@@ -121,17 +121,21 @@ impl Db {
             retention_days: opts.retention_days,
         };
 
-        let path = &opts.path;
-        // Migrate / schema-check on a dedicated connection first, so no pool
+        // Migrate / schema-check on a dedicated connection first, so no other
         // connections are racing the DDL at startup.
         {
-            let mut bootstrap = Connection::open(path)
-                .with_context(|| format!("failed to open database {}", path.display()))?;
-            bootstrap.execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA busy_timeout=5000;",
-            )?;
+            let mut bootstrap = Connection::from_database(&database, runtime.clone())
+                .context("failed to connect to database")?;
+            if !remote {
+                bootstrap.execute_batch(
+                    "PRAGMA busy_timeout=5000;
+                     PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=NORMAL;
+                     PRAGMA foreign_keys=ON;",
+                )?;
+            } else {
+                bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
+            }
             if opts.migrate {
                 // A previous successful boot may have left this marker behind.
                 // Clear it before any new migration/default work so an API
@@ -172,21 +176,11 @@ impl Db {
             }
         }
 
-        let manager = SqliteConnectionManager::file(path).with_init(|c| {
-            c.execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA busy_timeout=5000;
-                 PRAGMA foreign_keys=ON;",
-            )
-        });
-        let pool = r2d2::Pool::builder()
-            .max_size(opts.pool_size.max(2))
-            .build(manager)
-            .context("failed to create database pool")?;
-
         Ok(Self {
-            pool: Arc::new(pool),
+            database: Arc::new(database),
+            runtime,
+            permits: Arc::new(tokio::sync::Semaphore::new(opts.pool_size.max(2) as usize)),
+            remote,
         })
     }
 
@@ -223,15 +217,33 @@ impl Db {
             .context("timed out waiting for jmodguard-bot to migrate the database")
     }
 
-    /// Runs a blocking closure on a pooled connection off the async runtime.
+    /// Runs a blocking compatibility closure on a libSQL connection off the
+    /// application async runtime.
     pub async fn with_conn<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let pool = Arc::clone(&self.pool);
+        let _permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .context("database connection limiter closed")?;
+        let database = Arc::clone(&self.database);
+        let runtime = self.runtime.clone();
+        let remote = self.remote;
         tokio::task::spawn_blocking(move || {
-            let mut conn = pool.get().context("failed to get db connection")?;
+            let mut conn = Connection::from_database(&database, runtime)
+                .context("failed to get db connection")?;
+            if !remote {
+                conn.execute_batch(
+                    "PRAGMA busy_timeout=5000;
+                     PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=NORMAL;
+                     PRAGMA foreign_keys=ON;",
+                )?;
+            } else {
+                conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+            }
             f(&mut conn)
         })
         .await
@@ -244,14 +256,29 @@ impl Db {
     where
         F: FnOnce(&mut Connection) -> Result<T>,
     {
-        let mut conn = self.pool.get().context("failed to get db connection")?;
+        let _permit = self
+            .runtime
+            .block_on(Arc::clone(&self.permits).acquire_owned())
+            .context("database connection limiter closed")?;
+        let mut conn = Connection::from_database(&self.database, self.runtime.clone())
+            .context("failed to get db connection")?;
+        if !self.remote {
+            conn.execute_batch(
+                "PRAGMA busy_timeout=5000;
+                 PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA foreign_keys=ON;",
+            )?;
+        } else {
+            conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        }
         f(&mut conn)
     }
 }
 
 fn migrate_conn(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))
         .unwrap_or(0);
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
@@ -269,7 +296,7 @@ fn migrate_conn(conn: &mut Connection) -> Result<()> {
 
 fn ensure_schema_current(conn: &Connection) -> Result<()> {
     let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))
         .unwrap_or(0);
     let required = MIGRATIONS.len() as i64;
     if version < required {
@@ -280,12 +307,11 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
         .into());
     }
     // Require durable config_version marker so cross-process invalidation works.
-    let has_meta: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            [],
-            |r| r.get(0),
-        )?;
+    let has_meta: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
     if has_meta == 0 {
         return Err(SchemaNotReady(
             "database is missing meta table (config_version). \
@@ -298,17 +324,17 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
 }
 
 /// Bumps durable `config_version` on an open connection (config writers only).
-pub(crate) fn bump_config_version_conn(conn: &Connection) -> Result<()> {
+pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
     bump_meta_version_conn(conn, "config_version")
 }
 
 /// Bumps durable `slash_registry_version` when the Discord slash command
 /// registry may have changed (commands table writes / command copies).
-pub(crate) fn bump_slash_registry_version_conn(conn: &Connection) -> Result<()> {
+pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Result<()> {
     bump_meta_version_conn(conn, "slash_registry_version")
 }
 
-fn bump_meta_version_conn(conn: &Connection, key: &str) -> Result<()> {
+fn bump_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
@@ -321,20 +347,20 @@ pub async fn bump_config_version(db: &Db) -> Result<()> {
     db.with_conn(|conn| bump_config_version_conn(conn)).await
 }
 
-fn get_meta_version_conn(conn: &Connection, key: &str) -> Result<u64> {
+fn get_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<u64> {
     let value: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-            r.get(0)
+            Ok(r.get(0)?)
         })
         .optional()?;
     Ok(value.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0))
 }
 
-fn get_config_version_conn(conn: &Connection) -> Result<u64> {
+fn get_config_version_conn(conn: &impl SqlExecutor) -> Result<u64> {
     get_meta_version_conn(conn, "config_version")
 }
 
-fn get_slash_registry_version_conn(conn: &Connection) -> Result<u64> {
+fn get_slash_registry_version_conn(conn: &impl SqlExecutor) -> Result<u64> {
     get_meta_version_conn(conn, "slash_registry_version")
 }
 
@@ -371,15 +397,15 @@ const SETTINGS_HEAL_GENERATION: &str = "3";
 const META_SETTINGS_HEAL_GENERATION: &str = "settings_heal_generation";
 const META_SETTINGS_HEAL_CHECKSUM: &str = "settings_heal_checksum";
 
-fn meta_string_conn(conn: &Connection, key: &str) -> Result<Option<String>> {
+fn meta_string_conn(conn: &impl SqlExecutor, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-        r.get(0)
+        Ok(r.get(0)?)
     })
     .optional()
     .context("meta lookup failed")
 }
 
-fn write_meta_string_conn(conn: &Connection, key: &str, value: &str) -> Result<()> {
+fn write_meta_string_conn(conn: &impl SqlExecutor, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -388,7 +414,7 @@ fn write_meta_string_conn(conn: &Connection, key: &str, value: &str) -> Result<(
     Ok(())
 }
 
-fn write_terminal_defaults_meta(conn: &Connection, defaults: &GuildSettings) -> Result<()> {
+fn write_terminal_defaults_meta(conn: &impl SqlExecutor, defaults: &GuildSettings) -> Result<()> {
     let json = serde_json::json!({
         "prefix": defaults.prefix,
         "retention_days": defaults.retention_days,
@@ -405,7 +431,7 @@ fn write_terminal_defaults_meta(conn: &Connection, defaults: &GuildSettings) -> 
     Ok(())
 }
 
-fn read_terminal_defaults_meta(conn: &Connection) -> Result<Option<GuildSettings>> {
+fn read_terminal_defaults_meta(conn: &impl SqlExecutor) -> Result<Option<GuildSettings>> {
     let value = meta_string_conn(conn, META_TERMINAL_DEFAULTS)?;
     let Some(raw) = value else {
         return Ok(None);
@@ -427,7 +453,7 @@ fn read_terminal_defaults_meta(conn: &Connection) -> Result<Option<GuildSettings
     }))
 }
 
-fn ensure_bootstrap_complete(conn: &Connection) -> Result<()> {
+fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
     if meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref() != Some("1") {
         return Err(SchemaNotReady(
             "database bootstrap is incomplete. Start jmodguard-bot once first, then start jmodguard-api."
@@ -438,12 +464,12 @@ fn ensure_bootstrap_complete(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
+fn clear_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
     let has_meta: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            [],
-            |r| r.get(0),
+            (),
+            |r| Ok(r.get(0)?),
         )
         .unwrap_or(0);
     if has_meta != 0 {
@@ -456,7 +482,7 @@ fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
 }
 
 /// Terminal defaults for settings resolution — always read from durable meta.
-fn terminal_defaults_conn(conn: &Connection) -> Result<GuildSettings> {
+fn terminal_defaults_conn(conn: &impl SqlExecutor) -> Result<GuildSettings> {
     read_terminal_defaults_meta(conn)?.ok_or_else(|| {
         anyhow::anyhow!("meta.settings_terminal_defaults is missing; start jmodguard-bot first")
     })
@@ -476,10 +502,10 @@ fn fnv1a64_mix(hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-fn guild_settings_checksum_conn(conn: &Connection) -> Result<u64> {
+fn guild_settings_checksum_conn(conn: &impl SqlExecutor) -> Result<u64> {
     let mut stmt =
         conn.prepare("SELECT guild_id, settings FROM guild_settings ORDER BY guild_id")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map((), |r| Ok((r.get::<i64>(0)?, r.get::<String>(1)?)))?;
     // FNV-1a offset basis — fixed seed so bot and API agree on the same DB.
     let mut hash = 0xcbf29ce484222325u64;
     for row in rows {
@@ -493,7 +519,7 @@ fn guild_settings_checksum_conn(conn: &Connection) -> Result<u64> {
 }
 
 /// Keep heal fast-path accurate after any committed `guild_settings` mutation.
-fn refresh_settings_heal_checksum_conn(conn: &Connection) -> Result<()> {
+fn refresh_settings_heal_checksum_conn(conn: &impl SqlExecutor) -> Result<()> {
     let checksum = guild_settings_checksum_conn(conn)?;
     write_meta_string_conn(
         conn,
@@ -653,7 +679,7 @@ fn heal_default_guild_settings_conn(conn: &mut Connection, defaults: &GuildSetti
         .query_row(
             "SELECT settings FROM guild_settings WHERE guild_id = ?1",
             params![GLOBAL_SCOPE],
-            |r| r.get(0),
+            |r| Ok(r.get(0)?),
         )
         .optional()?;
     if let Some(json) = global_raw {
@@ -758,12 +784,12 @@ pub(crate) async fn load_rows<T: DeserializeOwned + Send + 'static>(
             format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1")
         };
         let mut stmt = conn.prepare(&sql)?;
-        let mut args: Vec<rusqlite::types::Value> = vec![guild_id.into()];
+        let mut args: Vec<Value> = vec![guild_id.into()];
         if let Some(kv) = &key_value {
             args.push(kv.to_string().into());
         }
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<String>(0)?, r.get::<String>(1)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -779,7 +805,7 @@ async fn upsert_row<T: Serialize + Send + 'static>(
     db: &Db,
     table: &'static str,
     key_cols: &'static str,
-    key_params: Vec<rusqlite::types::Value>,
+    key_params: Vec<Value>,
     data_col: &'static str,
     data: T,
     bump_slash_registry: bool,
@@ -799,7 +825,7 @@ async fn upsert_row<T: Serialize + Send + 'static>(
                 "INSERT INTO {table} ({key_cols}, {data_col}) VALUES ({keys}, ?{n})
                  ON CONFLICT({key_cols}) DO UPDATE SET {data_col} = excluded.{data_col}"
             ),
-            rusqlite::params_from_iter(key_params.into_iter().chain(std::iter::once(json.into()))),
+            params_from_iter(key_params.into_iter().chain(std::iter::once(json.into()))),
         )?;
         bump_config_version_conn(&tx)?;
         if bump_slash_registry {
@@ -815,7 +841,7 @@ async fn delete_row(
     db: &Db,
     table: &'static str,
     key_cols: &'static str,
-    key_params: Vec<rusqlite::types::Value>,
+    key_params: Vec<Value>,
     bump_slash_registry: bool,
 ) -> Result<()> {
     db.with_conn(move |conn| {
@@ -828,7 +854,7 @@ async fn delete_row(
         let tx = conn.transaction()?;
         let n = tx.execute(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
-            rusqlite::params_from_iter(key_params),
+            params_from_iter(key_params),
         )?;
         // No-op deletes must not bump versions — that forced cross-process
         // cache invalidation and slash re-sync sweeps for already-gone rows.
@@ -849,14 +875,14 @@ async fn delete_row(
 // ---------------------------------------------------------------------------
 
 fn read_settings_override_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     guild_id: i64,
 ) -> Result<Option<GuildSettingsOverride>> {
     let raw: Option<String> = conn
         .query_row(
             "SELECT settings FROM guild_settings WHERE guild_id = ?1",
             params![guild_id],
-            |r| r.get(0),
+            |r| Ok(r.get(0)?),
         )
         .optional()?;
     let Some(json) = raw else {
@@ -880,7 +906,7 @@ fn read_settings_override_conn(
 }
 
 fn effective_settings_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     guild_id: i64,
     defaults: &GuildSettings,
 ) -> Result<GuildSettings> {
@@ -894,7 +920,7 @@ fn effective_settings_conn(
 }
 
 fn parent_settings_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     guild_id: i64,
     defaults: &GuildSettings,
 ) -> Result<GuildSettings> {
@@ -906,7 +932,7 @@ fn parent_settings_conn(
 }
 
 fn write_settings_override_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     guild_id: i64,
     override_: &GuildSettingsOverride,
 ) -> Result<()> {
@@ -944,7 +970,7 @@ pub struct SettingsWebBundle {
     pub global_settings_override: Option<GuildSettingsOverride>,
 }
 
-fn settings_web_bundle_conn(conn: &Connection, guild_id: i64) -> Result<SettingsWebBundle> {
+fn settings_web_bundle_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<SettingsWebBundle> {
     let defaults = terminal_defaults_conn(conn)?;
     let global_override = read_settings_override_conn(conn, GLOBAL_SCOPE)?;
     let global_settings = resolve_settings(&None, &global_override, &defaults);
@@ -1190,7 +1216,7 @@ pub async fn list_templates(db: &Db, guild_id: i64) -> Result<Vec<(String, Strin
         let mut stmt =
             conn.prepare("SELECT event_type, template FROM templates WHERE guild_id = ?1")?;
         let rows = stmt.query_map(params![guild_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<String>(0)?, r.get::<String>(1)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1231,13 +1257,12 @@ pub async fn delete_template(db: &Db, guild_id: i64, event: &str) -> Result<()> 
 pub async fn get_template_row(db: &Db, guild_id: i64, event: &str) -> Result<Option<String>> {
     let (guild_id, event) = (guild_id, event.to_string());
     db.with_conn(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT template FROM templates WHERE guild_id = ?1 AND event_type = ?2",
-                params![guild_id, event],
-                |r| r.get(0),
-            )
-            .optional()?)
+        conn.query_row(
+            "SELECT template FROM templates WHERE guild_id = ?1 AND event_type = ?2",
+            params![guild_id, event],
+            |r| Ok(r.get(0)?),
+        )
+        .optional()
     })
     .await
 }
@@ -1251,7 +1276,7 @@ pub async fn list_log_channels(db: &Db, guild_id: i64) -> Result<Vec<(String, i6
         let mut stmt =
             conn.prepare("SELECT event_type, channel_id FROM log_channels WHERE guild_id = ?1")?;
         let rows = stmt.query_map(params![guild_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<String>(0)?, r.get::<i64>(1)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -1393,20 +1418,19 @@ pub async fn add_badword(db: &Db, guild_id: i64, pattern: &str, note: Option<&st
 /// enforce owner auth at the API layer.
 pub async fn get_badword(db: &Db, id: i64) -> Result<Option<Badword>> {
     db.with_conn(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT id, guild_id, pattern, note FROM badwords WHERE id = ?1",
-                params![id],
-                |r| {
-                    Ok(Badword {
-                        id: r.get(0)?,
-                        guild_id: r.get(1)?,
-                        pattern: r.get(2)?,
-                        note: r.get(3)?,
-                    })
-                },
-            )
-            .optional()?)
+        conn.query_row(
+            "SELECT id, guild_id, pattern, note FROM badwords WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(Badword {
+                    id: r.get(0)?,
+                    guild_id: r.get(1)?,
+                    pattern: r.get(2)?,
+                    note: r.get(3)?,
+                })
+            },
+        )
+        .optional()
     })
     .await
 }
@@ -1484,7 +1508,7 @@ fn section_wanted(sections: &[String], name: &str) -> bool {
 /// Discord-then-SQLite; without a preflight, a late refuse (badwords /
 /// logchannels-only) leaves Discord updated while SQLite rolls back.
 fn preflight_copy_guild_config_conn(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     src: i64,
     dst: i64,
     sections: &[String],
@@ -1602,7 +1626,7 @@ pub async fn copy_guild_config(
             for (pattern, note) in &replacement {
                 tx.execute(
                     "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
-                    params![dst, pattern, note],
+                    params![dst, pattern.clone(), note.clone()],
                 )?;
             }
             tracing::debug!(
@@ -1756,7 +1780,7 @@ pub async fn bump_message(db: &Db, guild_id: i64, user_id: i64, username: &str) 
     .await
 }
 
-fn row_to_member(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemberRow> {
+fn row_to_member(r: &Row) -> Result<MemberRow> {
     Ok(MemberRow {
         guild_id: r.get(0)?,
         user_id: r.get(1)?,
@@ -1767,7 +1791,7 @@ fn row_to_member(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemberRow> {
         join_count: r.get(6)?,
         message_count: r.get(7)?,
         last_seen_at: r.get(8)?,
-        currently_in: r.get::<_, i64>(9)? != 0,
+        currently_in: r.get::<i64>(9)? != 0,
     })
 }
 
@@ -1775,13 +1799,12 @@ const MEMBER_COLS: &str = "guild_id, user_id, username, first_joined_at, last_jo
 
 pub async fn member_row(db: &Db, guild_id: i64, user_id: i64) -> Result<Option<MemberRow>> {
     db.with_conn(move |conn| {
-        Ok(conn
-            .query_row(
-                &format!("SELECT {MEMBER_COLS} FROM members WHERE guild_id = ?1 AND user_id = ?2"),
-                params![guild_id, user_id],
-                row_to_member,
-            )
-            .optional()?)
+        conn.query_row(
+            &format!("SELECT {MEMBER_COLS} FROM members WHERE guild_id = ?1 AND user_id = ?2"),
+            params![guild_id, user_id],
+            row_to_member,
+        )
+        .optional()
     })
     .await
 }
@@ -1854,13 +1877,12 @@ pub async fn insert_message(
 
 pub async fn get_message(db: &Db, message_id: i64) -> Result<Option<(String, String)>> {
     db.with_conn(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT content, attachments FROM messages WHERE message_id = ?1",
-                params![message_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?)
+        conn.query_row(
+            "SELECT content, attachments FROM messages WHERE message_id = ?1",
+            params![message_id],
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+        )
+        .optional()
     })
     .await
 }
@@ -1894,7 +1916,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
         let defaults = terminal_defaults_conn(conn)?;
         let guild_ids: Vec<i64> = {
             let mut stmt = conn.prepare("SELECT DISTINCT guild_id FROM messages")?;
-            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            let rows = stmt.query_map((), |r| Ok(r.get::<i64>(0)?))?;
             let mut v = Vec::new();
             for row in rows {
                 v.push(row?);
@@ -1930,7 +1952,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
 
 /// Effective retention for a guild: field-level guild → global → config defaults.
 fn retention_days_for_guild(
-    conn: &Connection,
+    conn: &impl SqlExecutor,
     guild_id: i64,
     defaults: &GuildSettings,
 ) -> Result<u32> {
@@ -2007,7 +2029,7 @@ pub async fn query_events(
         "SELECT id, guild_id, event_type, user_id, actor_id, data, created_at
          FROM events WHERE guild_id = ?1",
     );
-    let mut args: Vec<rusqlite::types::Value> = vec![guild_id.into()];
+    let mut args: Vec<Value> = vec![guild_id.into()];
     if let Some(et) = &event_type {
         sql.push_str(" AND event_type = ?");
         args.push(et.to_string().into());
@@ -2021,7 +2043,7 @@ pub async fn query_events(
 
     db.with_conn(move |conn| {
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok(EventRow {
                 id: r.get(0)?,
                 guild_id: r.get(1)?,
@@ -2118,10 +2140,10 @@ pub async fn list_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<Vec<Warn
 
 pub async fn clear_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<usize> {
     db.with_conn(move |conn| {
-        Ok(conn.execute(
+        conn.execute(
             "DELETE FROM warns WHERE guild_id = ?1 AND user_id = ?2",
             params![guild_id, user_id],
-        )?)
+        )
     })
     .await
 }
@@ -2198,7 +2220,7 @@ pub async fn list_bans(db: &Db, guild_id: i64, limit: i64) -> Result<Vec<BanRow>
                 moderator_id: r.get(3)?,
                 reason: r.get(4)?,
                 created_at: r.get(5)?,
-                active: r.get::<_, i64>(6)? != 0,
+                active: r.get::<i64>(6)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -2248,13 +2270,12 @@ pub async fn upsert_user(
 #[allow(dead_code)]
 pub async fn get_user(db: &Db, user_id: i64) -> Result<Option<(String, Option<String>)>> {
     db.with_conn(move |conn| {
-        Ok(conn
-            .query_row(
-                "SELECT username, avatar FROM users WHERE user_id = ?1",
-                params![user_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?)
+        conn.query_row(
+            "SELECT username, avatar FROM users WHERE user_id = ?1",
+            params![user_id],
+            |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+        )
+        .optional()
     })
     .await
 }
@@ -2278,7 +2299,9 @@ pub struct Stats {
 pub async fn stats(db: &Db) -> Result<Stats> {
     db.with_conn(|conn| {
         let one = |sql: &str| -> Result<i64> {
-            Ok(conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0))
+            Ok(conn
+                .query_row(sql, (), |r| Ok(r.get::<i64>(0)?))
+                .unwrap_or(0))
         };
         Ok(Stats {
             messages: one("SELECT COUNT(*) FROM messages")?,
@@ -2297,7 +2320,7 @@ pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| {
         let one = |sql: &str| -> Result<i64> {
             Ok(conn
-                .query_row(sql, params![guild_id], |r| r.get::<_, i64>(0))
+                .query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?))
                 .unwrap_or(0))
         };
         Ok(Stats {
@@ -2358,7 +2381,7 @@ fn rows_map_json<T: DeserializeOwned>(
         "SELECT {key_col}, {value_col} FROM {table} WHERE guild_id = ?1"
     ))?;
     let rows = stmt.query_map(params![guild_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((r.get::<String>(0)?, r.get::<String>(1)?))
     })?;
     let mut out = std::collections::HashMap::new();
     for row in rows {
@@ -2370,7 +2393,23 @@ fn rows_map_json<T: DeserializeOwned>(
 
 /// Loads `(key, value)` rows where the value column is plain text
 /// (templates) or an integer (log_channels).
-fn rows_map_plain<T: rusqlite::types::FromSql + Send + 'static>(
+trait PlainValue: Sized {
+    fn get(row: &Row, index: i32) -> Result<Self>;
+}
+
+impl PlainValue for String {
+    fn get(row: &Row, index: i32) -> Result<Self> {
+        Ok(row.get(index)?)
+    }
+}
+
+impl PlainValue for i64 {
+    fn get(row: &Row, index: i32) -> Result<Self> {
+        Ok(row.get(index)?)
+    }
+}
+
+fn rows_map_plain<T: PlainValue + Send + 'static>(
     conn: &Connection,
     table: &str,
     key_col: &str,
@@ -2381,7 +2420,7 @@ fn rows_map_plain<T: rusqlite::types::FromSql + Send + 'static>(
         "SELECT {key_col}, {value_col} FROM {table} WHERE guild_id = ?1"
     ))?;
     let rows = stmt.query_map(params![guild_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, T>(1)?))
+        Ok((r.get::<String>(0)?, T::get(r, 1)?))
     })?;
     let mut out = std::collections::HashMap::new();
     for row in rows {
@@ -2468,7 +2507,7 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
         let mut badwords = Vec::new();
         for scope in [GLOBAL_SCOPE, guild_id] {
             let mut stmt = conn.prepare("SELECT pattern FROM badwords WHERE guild_id = ?1")?;
-            let rows = stmt.query_map(params![scope], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(params![scope], |r| Ok(r.get::<String>(0)?))?;
             for row in rows {
                 badwords.push(row?);
             }
@@ -2501,25 +2540,25 @@ mod tests {
                     .query_row(
                         "SELECT COUNT(*) FROM rules WHERE guild_id = ?1",
                         params![GLOBAL_SCOPE],
-                        |r| r.get(0),
+                        |r| Ok(r.get(0)?),
                     )
                     .unwrap();
                 let commands: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM commands WHERE guild_id = ?1",
                         params![GLOBAL_SCOPE],
-                        |r| r.get(0),
+                        |r| Ok(r.get(0)?),
                     )
                     .unwrap();
                 let templates: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM templates WHERE guild_id = ?1",
                         params![GLOBAL_SCOPE],
-                        |r| r.get(0),
+                        |r| Ok(r.get(0)?),
                     )
                     .unwrap();
                 let badwords: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM badwords", [], |r| r.get(0))
+                    .query_row("SELECT COUNT(*) FROM badwords", (), |r| Ok(r.get(0)?))
                     .unwrap();
                 Ok((rules, commands, templates, badwords))
             })
@@ -2576,7 +2615,7 @@ mod tests {
         db.with_conn_sync(|conn| {
             conn.execute(
                 "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (0, 'automod', 12345)",
-                [],
+                (),
             )?;
             // Simulate an installation that had reached migration 0002 before
             // the per-guild-only log-channel migration was released.
@@ -2585,12 +2624,12 @@ mod tests {
 
             let active: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM log_channels WHERE guild_id = 0",
-                [],
-                |r| r.get(0),
+                (),
+                |r| Ok(r.get(0)?),
             )?;
             let archived: (String, i64) = conn.query_row(
                 "SELECT event_type, channel_id FROM legacy_global_log_channels",
-                [],
+                (),
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!(active, 0);
@@ -2640,21 +2679,20 @@ mod tests {
         .unwrap();
         let v1 = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
         assert_eq!(v1, 1);
-        // Remote URL must fail clearly until libSQL is wired.
+        // A remote database must never be opened without credentials.
         let err = Db::open_with(DbOpenOptions {
             path: tmp.clone(),
             url: "libsql://example.invalid".into(),
-            token: "x".into(),
+            token: String::new(),
             pool_size: 2,
             migrate: true,
             default_prefix: "!".into(),
             retention_days: 7,
         })
         .err()
-        .expect("remote url should fail");
+        .expect("remote URL without a token should fail");
         assert!(
-            err.to_string()
-                .contains("remote libSQL backend not enabled yet"),
+            err.to_string().contains("JMODGUARD_DB_TOKEN is required"),
             "unexpected: {err:#}"
         );
         cleanup_db(&tmp);
@@ -3079,7 +3117,7 @@ mod tests {
             .with_conn_sync(|conn| {
                 let mut stmt =
                     conn.prepare("SELECT rule_id FROM rules WHERE guild_id = 0 ORDER BY rule_id")?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                let rows = stmt.query_map((), |r| Ok(r.get::<String>(0)?))?;
                 let mut v = Vec::new();
                 for r in rows {
                     v.push(r?);
@@ -3144,7 +3182,7 @@ mod tests {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM messages WHERE guild_id = ?1",
                     params![gid],
-                    |r| r.get::<_, i64>(0),
+                    |r| Ok(r.get::<i64>(0)?),
                 )?)
             }))
             .unwrap()
@@ -4068,7 +4106,7 @@ mod tests {
                 // Empty global override → effective falls through to terminal defaults.
                 conn.execute(
                     "UPDATE guild_settings SET settings = '{}' WHERE guild_id = 0",
-                    [],
+                    (),
                 )?;
                 Ok(())
             }))
@@ -4153,7 +4191,7 @@ mod tests {
         tokio_test_block_on(db.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM meta WHERE key = 'settings_terminal_defaults'",
-                [],
+                (),
             )?;
             Ok(())
         }))
@@ -4284,7 +4322,7 @@ mod tests {
         tokio_test_block_on(db.with_conn(|conn| {
             conn.execute(
                 "UPDATE guild_settings SET settings = '{}' WHERE guild_id = 0",
-                [],
+                (),
             )?;
             Ok(())
         }))
