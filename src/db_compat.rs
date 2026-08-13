@@ -10,6 +10,7 @@ use libsql::params::IntoParams;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -30,6 +31,13 @@ pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>().is_some())
+}
+
+pub(crate) fn database_operation_timed_out(
+    operation: &'static str,
+    timeout: Duration,
+) -> anyhow::Error {
+    DatabaseOperationTimedOut { operation, timeout }.into()
 }
 
 pub trait OptionalExtension<T> {
@@ -149,7 +157,7 @@ impl DbRuntime {
             Some(timeout) => {
                 match self.block_on(async move { tokio::time::timeout(timeout, future).await }) {
                     Ok(result) => result.map_err(Into::into),
-                    Err(_) => Err(DatabaseOperationTimedOut { operation, timeout }.into()),
+                    Err(_) => Err(database_operation_timed_out(operation, timeout)),
                 }
             }
             None => self.block_on(future).map_err(Into::into),
@@ -160,6 +168,7 @@ impl DbRuntime {
 pub struct Connection {
     inner: libsql::Connection,
     runtime: DbRuntime,
+    tainted: Arc<AtomicBool>,
 }
 
 pub trait SqlExecutor {
@@ -182,13 +191,18 @@ impl Connection {
         let path = path.as_ref().to_path_buf();
         let database = runtime.block_on(libsql::Builder::new_local(path).build())?;
         let inner = database.connect()?;
-        Ok(Self { inner, runtime })
+        Ok(Self {
+            inner,
+            runtime,
+            tainted: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn from_database(database: &libsql::Database, runtime: DbRuntime) -> Result<Self> {
         Ok(Self {
             inner: database.connect()?,
             runtime,
+            tainted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -205,6 +219,7 @@ impl Connection {
         Ok(Transaction {
             inner: Some(inner),
             runtime: self.runtime.clone(),
+            connection_tainted: Arc::clone(&self.tainted),
         })
     }
 
@@ -223,6 +238,10 @@ impl Connection {
 
     pub fn is_autocommit(&self) -> bool {
         self.inner.is_autocommit()
+    }
+
+    pub fn is_tainted(&self) -> bool {
+        self.tainted.load(Ordering::Acquire)
     }
 }
 
@@ -298,6 +317,7 @@ impl Statement {
 pub struct Transaction {
     inner: Option<libsql::Transaction>,
     runtime: DbRuntime,
+    connection_tainted: Arc<AtomicBool>,
 }
 
 impl Transaction {
@@ -321,10 +341,15 @@ impl Transaction {
     }
 
     pub fn commit(mut self) -> Result<()> {
-        let inner = self.inner.take().expect("transaction already completed");
-        self.runtime
-            .block_on_database("commit transaction", inner.commit())?;
-        Ok(())
+        let result = self
+            .runtime
+            .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
+        if result.is_ok() {
+            drop_transaction_without_runtime(
+                self.inner.take().expect("transaction already completed"),
+            );
+        }
+        result.map(|_| ())
     }
 
     fn inner(&self) -> &libsql::Transaction {
@@ -334,15 +359,37 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.take() else {
+        let Some(_) = self.inner.as_ref() else {
             return;
         };
-        if let Err(error) = self
-            .runtime
-            .block_on_database("rollback transaction", inner.rollback())
-        {
+        // Use a borrowed SQL rollback instead of libsql::Transaction::rollback,
+        // whose consuming future drops the transaction inside Tokio. libsql's
+        // Drop callback would then spawn a second, unbounded best-effort
+        // rollback. Once this bounded request ends, discard the libsql wrapper
+        // where no Tokio runtime is current so that callback cannot enqueue
+        // work outside the pool/timeout boundary.
+        let result = self.runtime.block_on_database(
+            "rollback transaction",
+            self.inner().execute_batch("ROLLBACK"),
+        );
+        drop_transaction_without_runtime(self.inner.take().expect("transaction already completed"));
+        if let Err(error) = result {
+            self.connection_tainted.store(true, Ordering::Release);
             tracing::warn!(%error, "failed to roll back uncommitted database transaction");
         }
+    }
+}
+
+fn drop_transaction_without_runtime(inner: libsql::Transaction) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || drop(inner))
+                .join()
+                .expect("database transaction drop thread panicked")
+        });
+    } else {
+        drop(inner);
     }
 }
 

@@ -37,12 +37,17 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     let error = bot
         .with_conn(|conn| -> anyhow::Result<()> {
             let tx = conn.transaction()?;
-            tx.execute_batch("UPDATE meta SET value = value WHERE key = 'config_version'")?;
+            tx.execute_batch("UPDATE meta SET value = '999999999' WHERE key = 'config_version'")?;
             anyhow::bail!("forced failure after remote transaction write");
         })
         .await
         .expect_err("transaction body must fail");
     assert!(error.to_string().contains("forced failure"));
+    assert_eq!(
+        get_config_version(&api).await.unwrap(),
+        before + 1,
+        "failed transaction must not persist its sentinel write"
+    );
 
     tokio::time::timeout(Duration::from_secs(2), bump_config_version(&bot))
         .await

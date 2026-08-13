@@ -25,8 +25,9 @@ token = ""
 # Number of reusable database connections and maximum concurrent database
 # operations in this process. Both the bot and API apply this independently.
 pool_size = 8
-# Remote database calls have a fixed 30-second deadline. A timed-out write is
-# reported but not automatically retried because its commit status may be unknown.
+# Remote database calls and waits for a pooled connection have a fixed
+# 30-second deadline. A timed-out write is reported but not automatically
+# retried because its commit status may be unknown.
 
 [web]
 # Address the API/WebUI listens on (jmodguard-api). Keep 127.0.0.1 unless you have

@@ -51,11 +51,13 @@ then exits).
 
 Environment variables override `config.toml` values (see table).
 
-Remote database calls have a fixed 30-second deadline. A timed-out operation
-returns an error and releases its connection after cleanup. jModGuard does not
-automatically retry a timed-out write because the server may have committed it
-before the response was lost; callers may retry reads and naturally recurring
-polls, while mutating requests report failure for operator reconciliation.
+Remote database calls and waits for a pooled connection have a fixed 30-second
+deadline. A timed-out operation returns an error; a connection whose operation
+timed out is discarded rather than reused with potentially stale remote stream
+state. jModGuard does not automatically retry a timed-out write because the
+server may have committed it before the response was lost; callers may retry
+reads and naturally recurring polls, while mutating requests report failure
+for operator reconciliation.
 
 ## Remote providers
 
@@ -63,9 +65,10 @@ The remote transport uses the standard libSQL protocol; the portable
 configuration contract is `db.url` / `db.token` or `JMODGUARD_DB_URL` /
 `JMODGUARD_DB_TOKEN`. It is not hard-coded to a Bunny hostname.
 
-Bunny Database is the first-class launch provider: its Rust connection path,
-injected environment names, CI protocol test, and container topology are
-documented and tested. Other libSQL-compatible services may
+Bunny Database is the first-class launch provider: its injected environment
+names and generic libSQL protocol path have automated tests, and its container
+topology is documented. CI's disposable server does not reproduce Bunny's
+production TLS/authentication service. Other libSQL-compatible services may
 work through the portable settings, but they are not claimed as supported
 until their authentication, consistency behavior, deployment, and recovery
 workflow have provider-specific tests and documentation.

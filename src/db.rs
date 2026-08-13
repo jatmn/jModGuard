@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db_compat::{
-    Connection, DbRuntime, OptionalExtension, Row, SqlExecutor, Value, params, params_from_iter,
+    Connection, DbRuntime, OptionalExtension, Row, SqlExecutor, Value,
+    database_operation_timed_out, params, params_from_iter,
 };
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
@@ -94,15 +95,20 @@ pub struct Db {
     runtime: DbRuntime,
     connections: Arc<ConnectionPool>,
     permits: Arc<tokio::sync::Semaphore>,
+    permit_timeout: Option<Duration>,
 }
 
 struct ConnectionPool {
     idle: Mutex<Vec<Connection>>,
+    database: Arc<libsql::Database>,
+    runtime: DbRuntime,
+    remote: bool,
 }
 
 struct ConnectionLease {
     connection: Option<Connection>,
     pool: Arc<ConnectionPool>,
+    reusable: bool,
 }
 
 impl ConnectionLease {
@@ -111,12 +117,25 @@ impl ConnectionLease {
             .idle
             .lock()
             .map_err(|_| anyhow::anyhow!("database connection pool lock poisoned"))?
-            .pop()
-            .context("database connection pool invariant violated")?;
+            .pop();
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                let connection = Connection::from_database(&pool.database, pool.runtime.clone())
+                    .context("failed to replace discarded database connection")?;
+                configure_connection(&connection, pool.remote)?;
+                connection
+            }
+        };
         Ok(Self {
             connection: Some(connection),
             pool,
+            reusable: true,
         })
+    }
+
+    fn discard(&mut self) {
+        self.reusable = false;
     }
 }
 
@@ -143,6 +162,9 @@ impl Drop for ConnectionLease {
         let Some(connection) = self.connection.take() else {
             return;
         };
+        if !self.reusable {
+            return;
+        }
         match self.pool.idle.lock() {
             Ok(mut idle) => idle.push(connection),
             Err(_) => {
@@ -185,6 +207,7 @@ impl Db {
         } else {
             runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?
         };
+        let database = Arc::new(database);
 
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
@@ -257,12 +280,16 @@ impl Db {
         }
 
         Ok(Self {
-            _database: Arc::new(database),
-            runtime,
+            _database: Arc::clone(&database),
+            runtime: runtime.clone(),
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
+                database,
+                runtime: runtime.clone(),
+                remote,
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+            permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
         })
     }
 
@@ -306,10 +333,14 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .context("database connection limiter closed")?;
+        let acquire = Arc::clone(&self.permits).acquire_owned();
+        let permit = match self.permit_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, acquire)
+                .await
+                .map_err(|_| database_operation_timed_out("waiting for connection", timeout))?,
+            None => acquire.await,
+        }
+        .context("database connection limiter closed")?;
         let connections = Arc::clone(&self.connections);
         tokio::task::spawn_blocking(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
@@ -317,7 +348,16 @@ impl Db {
             // another operation exceed the configured pool bound.
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
-            f(&mut connection)
+            let result = f(&mut connection);
+            if connection.is_tainted()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_database_operation_timeout)
+            {
+                connection.discard();
+            }
+            result
         })
         .await
         .context("db task panicked")?
@@ -329,13 +369,27 @@ impl Db {
     where
         F: FnOnce(&mut Connection) -> Result<T>,
     {
-        let permit = self
-            .runtime
-            .block_on(Arc::clone(&self.permits).acquire_owned())
-            .context("database connection limiter closed")?;
+        let acquire = Arc::clone(&self.permits).acquire_owned();
+        let permit = match self.permit_timeout {
+            Some(timeout) => self
+                .runtime
+                .block_on(async move { tokio::time::timeout(timeout, acquire).await })
+                .map_err(|_| database_operation_timed_out("waiting for connection", timeout))?,
+            None => self.runtime.block_on(acquire),
+        }
+        .context("database connection limiter closed")?;
         let _permit = permit;
         let mut connection = ConnectionLease::checkout(Arc::clone(&self.connections))?;
-        f(&mut connection)
+        let result = f(&mut connection);
+        if connection.is_tainted()
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(is_database_operation_timeout)
+        {
+            connection.discard();
+        }
+        result
     }
 }
 
@@ -2374,11 +2428,7 @@ pub struct Stats {
 /// Do **not** expose this to Discord commands or the WebUI — use [`guild_stats`].
 pub async fn stats(db: &Db) -> Result<Stats> {
     db.with_conn(|conn| {
-        let one = |sql: &str| -> Result<i64> {
-            Ok(conn
-                .query_row(sql, (), |r| Ok(r.get::<i64>(0)?))
-                .unwrap_or(0))
-        };
+        let one = |sql: &str| conn.query_row(sql, (), |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
             messages: one("SELECT COUNT(*) FROM messages")?,
             events: one("SELECT COUNT(*) FROM events")?,
@@ -2394,11 +2444,7 @@ pub async fn stats(db: &Db) -> Result<Stats> {
 /// Per-guild aggregates for the WebUI (avoids leaking other servers' data).
 pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| {
-        let one = |sql: &str| -> Result<i64> {
-            Ok(conn
-                .query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?))
-                .unwrap_or(0))
-        };
+        let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
             messages: one("SELECT COUNT(*) FROM messages WHERE guild_id = ?1")?,
             events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1")?,
@@ -2604,6 +2650,57 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_pool_admission_has_a_deadline() {
+        let tmp = tmp_db_path("pool_admission_timeout");
+        let mut db = Db::open(&tmp, 2).unwrap();
+        db.permit_timeout = Some(Duration::from_millis(50));
+
+        tokio_test_block_on(async {
+            let first = Arc::clone(&db.permits).acquire_owned().await.unwrap();
+            let second = Arc::clone(&db.permits).acquire_owned().await.unwrap();
+            let error = db
+                .with_conn(|_| Ok(()))
+                .await
+                .expect_err("pool admission must not wait forever");
+            assert!(
+                is_database_operation_timeout(&error),
+                "unexpected: {error:#}"
+            );
+            assert!(error.to_string().contains("waiting for connection"));
+            drop((first, second));
+        });
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn timed_out_connection_is_discarded_before_pool_reuse() {
+        let tmp = tmp_db_path("discard_timed_out_connection");
+        let db = Db::open(&tmp, 2).unwrap();
+
+        let error = tokio_test_block_on(db.with_conn(|_| {
+            Err::<(), _>(database_operation_timed_out(
+                "test operation",
+                Duration::from_millis(1),
+            ))
+        }))
+        .expect_err("simulated operation must time out");
+        assert!(is_database_operation_timeout(&error));
+        assert_eq!(
+            db.connections.idle.lock().unwrap().len(),
+            1,
+            "timed-out connection must not be returned to the idle pool"
+        );
+
+        let first = ConnectionLease::checkout(Arc::clone(&db.connections)).unwrap();
+        let replacement = ConnectionLease::checkout(Arc::clone(&db.connections)).unwrap();
+        drop((first, replacement));
+        assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(tmp);
+    }
 
     #[test]
     fn cancelled_caller_does_not_release_blocking_task_permit() {
