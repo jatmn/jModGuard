@@ -1,5 +1,6 @@
 use jmodguard::db::{Db, DbOpenOptions, bump_config_version, get_config_version};
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn remote_options(migrate: bool) -> DbOpenOptions {
     DbOpenOptions {
@@ -32,4 +33,20 @@ async fn bot_bootstrap_and_api_share_remote_database() {
         .await
         .expect("API should read config version");
     assert_eq!(observed, before + 1);
+
+    let error = bot
+        .with_conn(|conn| -> anyhow::Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute_batch("UPDATE meta SET value = value WHERE key = 'config_version'")?;
+            anyhow::bail!("forced failure after remote transaction write");
+        })
+        .await
+        .expect_err("transaction body must fail");
+    assert!(error.to_string().contains("forced failure"));
+
+    tokio::time::timeout(Duration::from_secs(2), bump_config_version(&bot))
+        .await
+        .expect("next write stalled behind an unrolled-back transaction")
+        .expect("next write should succeed after rollback");
+    assert_eq!(get_config_version(&bot).await.unwrap(), before + 2);
 }

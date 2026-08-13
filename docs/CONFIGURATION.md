@@ -11,7 +11,7 @@ database (everything server-related, editable at runtime).
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
 | `db.url` | — | Remote libSQL URL. `JMODGUARD_DB_URL` takes precedence over Bunny's injected `BUNNY_DATABASE_URL`; empty = local path |
 | `db.token` | — | Remote DB access token. `JMODGUARD_DB_TOKEN` takes precedence over Bunny's injected `BUNNY_DATABASE_AUTH_TOKEN`; required with `db.url` |
-| `db.pool_size` | `8` | maximum concurrent database operations in each process |
+| `db.pool_size` | `8` | reusable connections and maximum concurrent database operations in each process (minimum 2) |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
@@ -50,6 +50,12 @@ then exits).
 | `users` | username/avatar cache |
 
 Environment variables override `config.toml` values (see table).
+
+Remote database calls have a fixed 30-second deadline. A timed-out operation
+returns an error and releases its connection after cleanup. jModGuard does not
+automatically retry a timed-out write because the server may have committed it
+before the response was lost; callers may retry reads and naturally recurring
+polls, while mutating requests report failure for operator reconciliation.
 
 ## Remote providers
 

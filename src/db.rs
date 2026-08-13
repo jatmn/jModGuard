@@ -8,8 +8,9 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db_compat::{
@@ -24,6 +25,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_config_version.sql"),
     include_str!("../migrations/0003_archive_global_log_channels.sql"),
 ];
+
+/// A remote request that has not completed within this deadline is cancelled.
+/// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
+/// because the server may have committed before the response was lost.
+const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Largest supported retention period. It stays below chrono's representable
 /// duration range and is also enforced at the WebUI/database write boundary.
@@ -44,6 +50,14 @@ impl std::error::Error for SchemaNotReady {}
 pub fn is_schema_not_ready(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|e| e.downcast_ref::<SchemaNotReady>().is_some())
+}
+
+/// True when a remote operation exceeded the fixed request deadline.
+///
+/// Callers may retry reads. Mutating operations must not be retried blindly:
+/// the server could have committed before its response was lost.
+pub fn is_database_operation_timeout(err: &anyhow::Error) -> bool {
+    crate::db_compat::is_database_operation_timeout(err)
 }
 
 /// Local SQLite can be temporarily locked while the bot is applying migrations.
@@ -76,10 +90,66 @@ pub struct DbOpenOptions {
 
 #[derive(Clone)]
 pub struct Db {
-    database: Arc<libsql::Database>,
+    _database: Arc<libsql::Database>,
     runtime: DbRuntime,
+    connections: Arc<ConnectionPool>,
     permits: Arc<tokio::sync::Semaphore>,
-    remote: bool,
+}
+
+struct ConnectionPool {
+    idle: Mutex<Vec<Connection>>,
+}
+
+struct ConnectionLease {
+    connection: Option<Connection>,
+    pool: Arc<ConnectionPool>,
+}
+
+impl ConnectionLease {
+    fn checkout(pool: Arc<ConnectionPool>) -> Result<Self> {
+        let connection = pool
+            .idle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database connection pool lock poisoned"))?
+            .pop()
+            .context("database connection pool invariant violated")?;
+        Ok(Self {
+            connection: Some(connection),
+            pool,
+        })
+    }
+}
+
+impl Deref for ConnectionLease {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("connection lease already returned")
+    }
+}
+
+impl DerefMut for ConnectionLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("connection lease already returned")
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        match self.pool.idle.lock() {
+            Ok(mut idle) => idle.push(connection),
+            Err(_) => {
+                tracing::error!("database connection pool lock poisoned while returning lease")
+            }
+        }
+    }
 }
 
 impl Db {
@@ -106,7 +176,8 @@ impl Db {
         if remote && opts.token.trim().is_empty() {
             anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
         }
-        let runtime = DbRuntime::new()?;
+        let runtime =
+            DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
             runtime.block_on(
                 libsql::Builder::new_remote(opts.url.clone(), opts.token.clone()).build(),
@@ -176,11 +247,22 @@ impl Db {
             }
         }
 
+        let pool_size = opts.pool_size.max(2) as usize;
+        let mut connections = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let connection = Connection::from_database(&database, runtime.clone())
+                .context("failed to create pooled database connection")?;
+            configure_connection(&connection, remote)?;
+            connections.push(connection);
+        }
+
         Ok(Self {
-            database: Arc::new(database),
+            _database: Arc::new(database),
             runtime,
-            permits: Arc::new(tokio::sync::Semaphore::new(opts.pool_size.max(2) as usize)),
-            remote,
+            connections: Arc::new(ConnectionPool {
+                idle: Mutex::new(connections),
+            }),
+            permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
         })
     }
 
@@ -224,27 +306,18 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let _permit = Arc::clone(&self.permits)
+        let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
             .context("database connection limiter closed")?;
-        let database = Arc::clone(&self.database);
-        let runtime = self.runtime.clone();
-        let remote = self.remote;
+        let connections = Arc::clone(&self.connections);
         tokio::task::spawn_blocking(move || {
-            let mut conn = Connection::from_database(&database, runtime)
-                .context("failed to get db connection")?;
-            if !remote {
-                conn.execute_batch(
-                    "PRAGMA busy_timeout=5000;
-                     PRAGMA journal_mode=WAL;
-                     PRAGMA synchronous=NORMAL;
-                     PRAGMA foreign_keys=ON;",
-                )?;
-            } else {
-                conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-            }
-            f(&mut conn)
+            // The permit belongs to the blocking task, not its awaiter. Tokio
+            // cannot cancel blocking work, so an aborted request must not let
+            // another operation exceed the configured pool bound.
+            let _permit = permit;
+            let mut connection = ConnectionLease::checkout(connections)?;
+            f(&mut connection)
         })
         .await
         .context("db task panicked")?
@@ -256,23 +329,26 @@ impl Db {
     where
         F: FnOnce(&mut Connection) -> Result<T>,
     {
-        let _permit = self
+        let permit = self
             .runtime
             .block_on(Arc::clone(&self.permits).acquire_owned())
             .context("database connection limiter closed")?;
-        let mut conn = Connection::from_database(&self.database, self.runtime.clone())
-            .context("failed to get db connection")?;
-        if !self.remote {
-            conn.execute_batch(
-                "PRAGMA busy_timeout=5000;
-                 PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA foreign_keys=ON;",
-            )?;
-        } else {
-            conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        }
-        f(&mut conn)
+        let _permit = permit;
+        let mut connection = ConnectionLease::checkout(Arc::clone(&self.connections))?;
+        f(&mut connection)
+    }
+}
+
+fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
+    if remote {
+        connection.execute_batch("PRAGMA foreign_keys=ON;")
+    } else {
+        connection.execute_batch(
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;",
+        )
     }
 }
 
@@ -2528,6 +2604,56 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_caller_does_not_release_blocking_task_permit() {
+        let tmp = tmp_db_path("cancelled_permit");
+        let db = Db::open(&tmp, 2).unwrap();
+
+        tokio_test_block_on(async {
+            let worker_db = db.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(async move {
+                worker_db
+                    .with_conn(move |_conn| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            });
+
+            started_rx.await.unwrap();
+            assert_eq!(db.permits.available_permits(), 1);
+            assert_eq!(db.connections.idle.lock().unwrap().len(), 1);
+
+            task.abort();
+            tokio::task::yield_now().await;
+            assert_eq!(
+                db.permits.available_permits(),
+                1,
+                "aborting the async caller must not release blocking work's permit"
+            );
+            assert_eq!(
+                db.connections.idle.lock().unwrap().len(),
+                1,
+                "aborting the async caller must not return an in-use connection"
+            );
+
+            release_tx.send(()).unwrap();
+            for _ in 0..100 {
+                if db.permits.available_permits() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(db.permits.available_permits(), 2);
+            assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
+        });
+
+        cleanup_db(&tmp);
+    }
 
     #[test]
     fn seeds_globals_in_memory() {

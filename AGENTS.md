@@ -30,7 +30,7 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).
-- rusqlite 0.40 (bundled), r2d2_sqlite 0.35, axum 0.8, tower-sessions 0.14,
+- libsql 0.9.30 (`core`, `remote`, `tls`), axum 0.8, tower-sessions 0.14,
   reqwest 0.13, edition 2024.
 
 ## Invariants to respect

@@ -22,9 +22,11 @@ url = ""
 # Remote DB access token (server-side only). Portable env: JMODGUARD_DB_TOKEN.
 # Bunny also injects BUNNY_DATABASE_AUTH_TOKEN. Required when url is set.
 token = ""
-# Maximum concurrent database operations in this process. Both the bot and API
-# apply this limit independently.
+# Number of reusable database connections and maximum concurrent database
+# operations in this process. Both the bot and API apply this independently.
 pool_size = 8
+# Remote database calls have a fixed 30-second deadline. A timed-out write is
+# reported but not automatically retried because its commit status may be unknown.
 
 [web]
 # Address the API/WebUI listens on (jmodguard-api). Keep 127.0.0.1 unless you have

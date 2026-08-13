@@ -11,12 +11,26 @@ use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 pub use libsql::{Row, Value, params, params_from_iter};
 
 #[derive(Debug, thiserror::Error)]
 #[error("query returned no rows")]
 struct QueryReturnedNoRows;
+
+#[derive(Debug, thiserror::Error)]
+#[error("remote database {operation} timed out after {timeout:?}")]
+pub struct DatabaseOperationTimedOut {
+    operation: &'static str,
+    timeout: Duration,
+}
+
+pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>().is_some())
+}
 
 pub trait OptionalExtension<T> {
     fn optional(self) -> Result<Option<T>>;
@@ -52,10 +66,15 @@ impl Drop for RuntimeThread {
 pub struct DbRuntime {
     handle: tokio::runtime::Handle,
     _thread: Arc<RuntimeThread>,
+    operation_timeout: Option<Duration>,
 }
 
 impl DbRuntime {
     pub fn new() -> Result<Self> {
+        Self::with_operation_timeout(None)
+    }
+
+    pub fn with_operation_timeout(operation_timeout: Option<Duration>) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let join = std::thread::Builder::new()
@@ -91,6 +110,7 @@ impl DbRuntime {
                 shutdown: Mutex::new(Some(shutdown_tx)),
                 join: Mutex::new(Some(join)),
             }),
+            operation_timeout,
         })
     }
 
@@ -116,6 +136,23 @@ impl DbRuntime {
                     .expect("libSQL worker thread panicked")
             }),
             Err(_) => self.handle.block_on(future),
+        }
+    }
+
+    pub fn block_on_database<F, T, E>(&self, operation: &'static str, future: F) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>> + Send,
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        match self.operation_timeout {
+            Some(timeout) => {
+                match self.block_on(async move { tokio::time::timeout(timeout, future).await }) {
+                    Ok(result) => result.map_err(Into::into),
+                    Err(_) => Err(DatabaseOperationTimedOut { operation, timeout }.into()),
+                }
+            }
+            None => self.block_on(future).map_err(Into::into),
         }
     }
 }
@@ -156,14 +193,17 @@ impl Connection {
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.runtime.block_on(self.inner.execute_batch(sql))?;
+        self.runtime
+            .block_on_database("execute_batch", self.inner.execute_batch(sql))?;
         Ok(())
     }
 
     pub fn transaction(&self) -> Result<Transaction> {
-        let inner = self.runtime.block_on(self.inner.transaction())?;
+        let inner = self
+            .runtime
+            .block_on_database("begin transaction", self.inner.transaction())?;
         Ok(Transaction {
-            inner,
+            inner: Some(inner),
             runtime: self.runtime.clone(),
         })
     }
@@ -188,7 +228,9 @@ impl Connection {
 
 impl SqlExecutor for Connection {
     fn execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
-        Ok(self.runtime.block_on(self.inner.execute(sql, params))? as usize)
+        Ok(self
+            .runtime
+            .block_on_database("execute", self.inner.execute(sql, params))? as usize)
     }
 
     fn query_row<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
@@ -197,7 +239,7 @@ impl SqlExecutor for Connection {
         P: IntoParams + Send,
         F: FnOnce(&Row) -> Result<T> + Send,
     {
-        self.runtime.block_on(async {
+        self.runtime.block_on_database("query", async {
             let mut rows = self.inner.query(sql, params).await?;
             let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
             map(&row)
@@ -205,7 +247,9 @@ impl SqlExecutor for Connection {
     }
 
     fn prepare(&self, sql: &str) -> Result<Statement> {
-        let inner = self.runtime.block_on(self.inner.prepare(sql))?;
+        let inner = self
+            .runtime
+            .block_on_database("prepare", self.inner.prepare(sql))?;
         Ok(Statement {
             inner,
             runtime: self.runtime.clone(),
@@ -239,7 +283,7 @@ impl Statement {
         P: IntoParams + Send,
         F: FnMut(&Row) -> Result<T> + Send,
     {
-        let mapped = self.runtime.block_on(async {
+        let mapped = self.runtime.block_on_database("query", async {
             let mut cursor = self.inner.query(params).await?;
             let mut rows = Vec::new();
             while let Some(row) = cursor.next().await? {
@@ -252,13 +296,14 @@ impl Statement {
 }
 
 pub struct Transaction {
-    inner: libsql::Transaction,
+    inner: Option<libsql::Transaction>,
     runtime: DbRuntime,
 }
 
 impl Transaction {
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.runtime.block_on(self.inner.execute_batch(sql))?;
+        self.runtime
+            .block_on_database("transaction execute_batch", self.inner().execute_batch(sql))?;
         Ok(())
     }
 
@@ -272,18 +317,41 @@ impl Transaction {
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
-        self.inner.last_insert_rowid()
+        self.inner().last_insert_rowid()
     }
 
-    pub fn commit(self) -> Result<()> {
-        self.runtime.block_on(self.inner.commit())?;
+    pub fn commit(mut self) -> Result<()> {
+        let inner = self.inner.take().expect("transaction already completed");
+        self.runtime
+            .block_on_database("commit transaction", inner.commit())?;
         Ok(())
+    }
+
+    fn inner(&self) -> &libsql::Transaction {
+        self.inner.as_ref().expect("transaction already completed")
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .runtime
+            .block_on_database("rollback transaction", inner.rollback())
+        {
+            tracing::warn!(%error, "failed to roll back uncommitted database transaction");
+        }
     }
 }
 
 impl SqlExecutor for Transaction {
     fn execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
-        Ok(self.runtime.block_on(self.inner.execute(sql, params))? as usize)
+        Ok(self
+            .runtime
+            .block_on_database("transaction execute", self.inner().execute(sql, params))?
+            as usize)
     }
 
     fn query_row<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
@@ -292,15 +360,17 @@ impl SqlExecutor for Transaction {
         P: IntoParams + Send,
         F: FnOnce(&Row) -> Result<T> + Send,
     {
-        self.runtime.block_on(async {
-            let mut rows = self.inner.query(sql, params).await?;
+        self.runtime.block_on_database("transaction query", async {
+            let mut rows = self.inner().query(sql, params).await?;
             let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
             map(&row)
         })
     }
 
     fn prepare(&self, sql: &str) -> Result<Statement> {
-        let inner = self.runtime.block_on(self.inner.prepare(sql))?;
+        let inner = self
+            .runtime
+            .block_on_database("transaction prepare", self.inner().prepare(sql))?;
         Ok(Statement {
             inner,
             runtime: self.runtime.clone(),
@@ -308,6 +378,42 @@ impl SqlExecutor for Transaction {
     }
 
     fn is_autocommit(&self) -> bool {
-        self.inner.is_autocommit()
+        self.inner().is_autocommit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_database_call_has_a_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            let _ = release_rx.recv();
+        });
+
+        let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_millis(100))).unwrap();
+        let database = runtime
+            .block_on(
+                libsql::Builder::new_remote(format!("http://{address}"), "test-token".into())
+                    .build(),
+            )
+            .unwrap();
+        let connection = database.connect().unwrap();
+        let error = runtime
+            .block_on_database("execute", connection.execute("SELECT 1", ()))
+            .expect_err("blackholed remote request must time out");
+        assert!(
+            is_database_operation_timeout(&error),
+            "unexpected: {error:#}"
+        );
+        assert!(error.to_string().contains("100ms"), "unexpected: {error:#}");
+
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 }
