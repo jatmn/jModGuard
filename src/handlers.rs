@@ -2,7 +2,6 @@
 //! automod pipeline, and command dispatch.
 
 use serenity::async_trait;
-use serenity::builder::EditMember;
 use serenity::client::{Context, EventHandler};
 use serenity::gateway::ActivityData;
 use serenity::model::channel::Message;
@@ -140,27 +139,13 @@ impl EventHandler for Handler {
             app.retry_slash_registry_version();
         }
 
-        // Apply configured bot nickname for this guild.
-        if let Ok(settings) = db::get_settings(&app.db, gid.get() as i64).await
-            && !settings.bot_name.is_empty()
-        {
-            let me = ctx.cache.current_user().id;
-            let name = settings.bot_name.clone();
-            let guild_id = gid.get();
-            if let Err(e) = crate::discord::with_retries("Discord nickname", guild_id, || {
-                let name = name.clone();
-                async {
-                    gid.edit_member(&ctx.http, me, EditMember::new().nickname(name))
-                        .await
-                        .map(|_| ())
-                }
-            })
-            .await
-            {
-                tracing::warn!(
-                    "failed to apply Discord nickname on guild_create (guild={guild_id}): {e}"
-                );
-            }
+        // Route join/reconnect repair through the same generation-checked
+        // worker as every settings write (including clearing the nickname).
+        if let Err(error) = db::request_nickname_reconcile(&app.db, gid.get() as i64).await {
+            tracing::warn!(
+                guild_id = gid.get(),
+                "failed to queue nickname reconciliation on guild_create: {error:#}"
+            );
         }
 
         // Backfill member tracking from cache (bounded batch).

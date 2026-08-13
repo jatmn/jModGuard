@@ -1345,8 +1345,7 @@ pub async fn get_parent_settings(db: &Db, guild_id: i64) -> Result<GuildSettings
 }
 
 /// Effective settings the destination would have after a settings-section copy
-/// from `src` (without writing). Used so Discord nickname can be applied
-/// *before* the SQLite copy — same ordering contract as `update_settings`.
+/// from `src` (without writing).
 pub async fn preview_settings_after_copy(db: &Db, src: i64, dst: i64) -> Result<GuildSettings> {
     db.with_conn(move |conn| {
         let defaults = terminal_defaults_conn(conn)?;
@@ -1863,8 +1862,7 @@ fn preflight_copy_guild_config_conn(
     Ok(())
 }
 
-/// Public preflight for WebUI/API: refuse known hard-fail copy cases before
-/// applying Discord nickname (see [`preflight_copy_guild_config_conn`]).
+/// Public preflight for WebUI/API: refuse known hard-fail copy cases early.
 pub async fn preflight_copy_guild_config(
     db: &Db,
     src: i64,
@@ -1880,8 +1878,7 @@ pub async fn preflight_copy_guild_config(
 ///
 /// Always re-runs [`preflight_copy_guild_config`] inside this call so a
 /// concurrent source change between an earlier WebUI preflight and this write
-/// cannot skip validation. Callers may still preflight earlier to refuse
-/// before Discord nickname side effects.
+/// cannot skip validation. Callers may still preflight earlier for fast errors.
 ///
 /// Badwords use validate-then-atomic-replace: the destination is only cleared
 /// after a usable replacement set is prepared. If every source pattern fails

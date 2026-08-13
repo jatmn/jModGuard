@@ -92,12 +92,12 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   `EventRow` / `BadwordView` snowflake fields use the same string serde.
 - Bot nickname: WebUI empty field, `!setname` with no args / `clear` / `-`, and
   `/setname` with the optional `name` omitted all clear the Discord nickname and
-  persist `bot_name=""`. Discord is updated **before** SQLite (WebUI and
-  `!setname`); if SQLite then fails, Discord is restored to the previous nick
-  (shared retry helper). WebUI "Use global" sends `bot_name: null` to inherit
-  the parent nickname. Copy-config preflights refuse conditions (badwords /
-  logchannels-only) before any Discord nickname mutation. `guild_create` only
-  applies a nickname when `bot_name` is non-empty (does not re-clear on join).
+  persist `bot_name=""`. Settings and a generation-numbered outbox row commit
+  atomically; only the bot drains that row and mutates Discord. Failures retry
+  without rolling back durable settings, and generation-checked acknowledgement
+  makes the final committed value win across bot/API races. WebUI "Use global"
+  sends `bot_name: null` to inherit the parent nickname. `guild_create` queues
+  the same reconciliation path, including empty nicknames.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.

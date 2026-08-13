@@ -903,11 +903,7 @@ function tabSettings() {
         try {
           const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", body);
           await loadConfig();
-          if (res.nickname_error) {
-            toast(`Settings saved — ${res.nickname_error}`, "error");
-          } else {
-            toast("Settings saved", "success");
-          }
+          toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success");
           renderTab();
         } catch (e) {
           toast(e.message || String(e), "error");
@@ -919,7 +915,7 @@ function tabSettings() {
             bot_name: cfg.settings.bot_name,
             sync_nickname: true,
           });
-          toast(res.nickname_error || "Discord nickname re-synced", res.nickname_error ? "error" : "success");
+          toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success");
         } catch (e) {
           toast(e.message || String(e), "error");
         }
@@ -974,11 +970,8 @@ function tabSettings() {
             if (res.skipped_logchannels) {
               msg += " (log channels skipped — channel IDs are server-specific; set them here)";
             }
-            if (res.nickname_error) {
-              toast(`${msg} — ${res.nickname_error}`, "error");
-            } else {
-              toast(msg, (res.skipped_badwords > 0 || res.skipped_logchannels) ? "info" : "success");
-            }
+            if (res.nickname_queued) msg += " (Discord nickname queued)";
+            toast(msg, (res.skipped_badwords > 0 || res.skipped_logchannels) ? "info" : "success");
             renderTab();
           } catch (e) {
             toast(e.message || String(e), "error");

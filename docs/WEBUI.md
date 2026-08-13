@@ -26,7 +26,7 @@ instance manages all your servers.
 | **Members** | search members: join count, message count, first/last seen |
 | **Audit Log** | filterable event history (type, user, actor) |
 | **Bans** | ban history + unban via the bot token (API process) |
-| **Settings** | prefix, bot nickname (persisted **and** applied/cleared on Discord; empty / `!setname` with no args / `/setname` without `name` all clear), message retention (per-server purge); global prefix (owner only); **copy config from another server** |
+| **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; empty / `!setname` with no args / `/setname` without `name` all clear), message retention (per-server purge); global prefix (owner only); **copy config from another server** |
 
 ## Global vs per-server config
 
