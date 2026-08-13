@@ -155,7 +155,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (embeds frontend/)
 frontend/               SPA assets
-migrations/             0001_init + 0002_config_version
+migrations/             0001_init through 0004_nickname_reconcile
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```
