@@ -71,6 +71,33 @@ present, then start both again.
 processes keep running — do **not** file-copy the `.db` while either process
 is still writing.
 
-For Bunny Database, use Bunny's current backup/export and restore facilities;
-local SQLite file-copy instructions do not apply to a remote database. Test a
-restore before relying on it for production recovery.
+### Bunny Database
+
+Bunny's durability layer maintains service snapshots and WAL segments, but
+those are provider-managed recovery mechanisms rather than an
+operator-controlled backup with chosen retention.
+
+Bunny's `bsql` shell supports an interactive `.dump` that emits schema and data
+as SQL, and it can execute a `.sql` file against a new database. A manual round
+trip was verified with `@bunny.net/database-shell` 0.2.3:
+
+1. Stop both apps to prevent writes during the logical export.
+2. Connect with `bsql`, using environment-based credentials so the access token
+   is not stored in shell history.
+3. Run `.unmask`, then `.dump`, confirm the full-table read warning, and save
+   only the emitted `CREATE` and `INSERT` SQL in protected storage. `.unmask` is
+   necessary because the shell masks sensitive-looking columns by default.
+4. Create a separate empty Bunny Database and execute the dump file with
+   `bsql DATABASE_URL --token TOKEN backup.sql` (prefer environment-based
+   credentials during the real operation).
+5. Start the bot, then API, and verify known data plus one reversible write.
+
+`bsql .dump` currently requires an interactive TTY and confirmation; it rejects
+piped stdin. This is a usable manual staging recovery path, not scheduled,
+encrypted, monitored production backup automation. Establish retention,
+off-service storage, failure alerts, and a successful restore drill before
+production use. Local SQLite file-copy instructions do not apply to Bunny
+Database.
+
+References: [Bunny Database shell](https://docs.bunny.net/database/connect/database-shell)
+and [durability/consistency](https://docs.bunny.net/database/durability-and-consistency).

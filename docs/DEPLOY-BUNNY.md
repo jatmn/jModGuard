@@ -128,7 +128,10 @@ and cross-process visibility without requiring production credentials.
 ## Operating constraints
 
 - Bunny Database is currently documented as Public Preview. Review its current
-  limits, availability, and backup/restore facilities before production use.
+  limits and availability before production use. Its internal snapshots are
+  not a substitute for an operator-controlled backup policy; the verified
+  manual `bsql` recovery path and its automation limits are documented in
+  [CONFIGURATION.md](CONFIGURATION.md#bunny-database).
 - Run one bot app instance unless Discord sharding and singleton work have been
   deliberately redesigned and tested.
 - API sessions use an in-memory store. Restarting the API logs users out, and
