@@ -21,21 +21,21 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // Migration selection must be authoritative. A lagging remote replica can
     // otherwise report vN-1 after vN committed and make us replay a
     // non-idempotent CREATE/ALTER migration against the primary.
-    let version: i64 = {
-        let tx = conn.transaction_primary_read()?;
-        let version = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
-        tx.finish_read()?;
-        version
-    };
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
+        let tx = conn.transaction_primary_read()?;
+        // Recheck while holding the primary write lock. Separate bot
+        // processes can otherwise both decide to replay a non-idempotent
+        // migration from the same stale pre-lock user_version.
+        let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
         if version < target {
-            let tx = conn.transaction_primary_read()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;
             tx.commit()?;
             tracing::info!("applied migration {target}");
+        } else {
+            tx.finish_read()?;
         }
     }
     Ok(())
@@ -374,6 +374,21 @@ pub(super) fn seed_globals_conn(
     }
     let mut commands_changed = 0usize;
     for cmd in crate::defaults::default_commands() {
+        if cmd.name == "setname" {
+            let mut legacy = cmd.clone();
+            legacy.description =
+                "Set the bot's nickname in this server (omit / clear / - to reset).".into();
+            legacy.response = "Bot nickname set to {name}".into();
+            commands_changed += conn.execute(
+                "UPDATE commands SET data = ?1
+                 WHERE guild_id = ?2 AND name = 'setname' AND data = ?3",
+                params![
+                    serde_json::to_string(&cmd)?,
+                    GLOBAL_SCOPE,
+                    serde_json::to_string(&legacy)?
+                ],
+            )?;
+        }
         commands_changed += conn.execute(
             "INSERT OR IGNORE INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
             params![

@@ -2033,6 +2033,99 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
         1,
         "a genuine first guild join must create initial reconciliation work"
     );
+
+    tokio_test_block_on(request_nickname_reconcile(&db, 47)).unwrap();
+    let in_flight = tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.guild_id == 47)
+        .unwrap();
+    tokio_test_block_on(dormancy_nickname_reconcile(
+        &db,
+        47,
+        "departed during request",
+    ))
+    .unwrap();
+    tokio_test_block_on(finish_nickname_reconcile(
+        &db,
+        &in_flight,
+        "terminal",
+        "late_error",
+        "late Discord response",
+        20_001,
+    ))
+    .unwrap();
+    tokio_test_block_on(acknowledge_nickname_reconcile(
+        &db,
+        in_flight.guild_id,
+        in_flight.generation,
+    ))
+    .unwrap();
+    assert_eq!(
+        tokio_test_block_on(nickname_reconcile_status(&db, 47))
+            .unwrap()
+            .unwrap()
+            .state,
+        "dormant",
+        "late completion of an invalidated generation must not erase departure state"
+    );
+
+    tokio_test_block_on(request_nickname_reconcile(&db, 48)).unwrap();
+    let terminal = tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+        .unwrap()
+        .into_iter()
+        .find(|job| job.guild_id == 48)
+        .unwrap();
+    tokio_test_block_on(finish_nickname_reconcile(
+        &db,
+        &terminal,
+        "terminal",
+        "discord_50013",
+        "missing permissions",
+        20_000,
+    ))
+    .unwrap();
+    assert!(
+        tokio_test_block_on(patch_settings_with_nickname_reconcile(
+            &db,
+            48,
+            Some(Some(" ".into())),
+            None,
+            None,
+            true,
+        ))
+        .is_err()
+    );
+    assert_eq!(
+        tokio_test_block_on(nickname_reconcile_status(&db, 48))
+            .unwrap()
+            .unwrap()
+            .state,
+        "terminal",
+        "a rejected settings request must not reset terminal nickname work"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn bot_bootstrap_upgrades_only_unchanged_legacy_setname_seed() {
+    let tmp = tmp_db_path("legacy_setname_seed");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut legacy = tokio_test_block_on(get_command_row(&db, GLOBAL_SCOPE, "setname"))
+        .unwrap()
+        .unwrap();
+    legacy.description =
+        "Set the bot's nickname in this server (omit / clear / - to reset).".into();
+    legacy.response = "Bot nickname set to {name}".into();
+    tokio_test_block_on(upsert_command(&db, GLOBAL_SCOPE, "setname", &legacy)).unwrap();
+    drop(db);
+
+    let reopened = Db::open(&tmp, 2).unwrap();
+    let upgraded = tokio_test_block_on(get_command_row(&reopened, GLOBAL_SCOPE, "setname"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded.response, "Bot nickname queued: {name}");
+    assert!(upgraded.description.starts_with("Queue "));
     cleanup_db(&tmp);
 }
 

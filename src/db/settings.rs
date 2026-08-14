@@ -212,6 +212,20 @@ pub async fn patch_settings(
     bot_name: crate::types::SettingsPatchField<String>,
     retention_days: crate::types::SettingsPatchField<u32>,
 ) -> Result<GuildSettings> {
+    patch_settings_with_nickname_reconcile(db, guild_id, prefix, bot_name, retention_days, false)
+        .await
+}
+
+/// Applies one settings patch and, when requested, queues nickname repair in
+/// the same transaction. Validation completes before either mutation occurs.
+pub async fn patch_settings_with_nickname_reconcile(
+    db: &Db,
+    guild_id: i64,
+    prefix: crate::types::SettingsPatchField<String>,
+    bot_name: crate::types::SettingsPatchField<String>,
+    retention_days: crate::types::SettingsPatchField<u32>,
+    reconcile_nickname: bool,
+) -> Result<GuildSettings> {
     if let Some(Some(nickname)) = &bot_name {
         validate_discord_nickname(nickname)?;
     }
@@ -233,10 +247,11 @@ pub async fn patch_settings(
         anyhow::bail!("retention_days must be between 0 and {MAX_RETENTION_DAYS}");
     }
     // No-op patch: return current effective settings without bumping versions.
-    if prefix.is_none() && bot_name.is_none() && retention_days.is_none() {
+    let settings_changed = prefix.is_some() || bot_name.is_some() || retention_days.is_some();
+    if !settings_changed && !reconcile_nickname {
         return get_settings(db, guild_id).await;
     }
-    let nickname_changed = bot_name.is_some() && guild_id != GLOBAL_SCOPE;
+    let nickname_changed = (bot_name.is_some() || reconcile_nickname) && guild_id != GLOBAL_SCOPE;
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
@@ -261,13 +276,19 @@ pub async fn patch_settings(
         }
         let ov = normalize_settings_override_against_parent(&ov, &parent);
 
-        write_settings_override_conn(&tx, guild_id, &ov)?;
+        if settings_changed {
+            write_settings_override_conn(&tx, guild_id, &ov)?;
+        }
         if nickname_changed {
             enqueue_nickname_reconcile_conn(&tx, guild_id)?;
         }
-        bump_config_version_conn(&tx)?;
+        if settings_changed {
+            bump_config_version_conn(&tx)?;
+        }
         let effective = effective_settings_conn(&tx, guild_id, &defaults)?;
-        refresh_settings_heal_checksum_conn(&tx)?;
+        if settings_changed {
+            refresh_settings_heal_checksum_conn(&tx)?;
+        }
         tx.commit()?;
         Ok(effective)
     })

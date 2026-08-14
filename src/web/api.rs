@@ -215,22 +215,17 @@ pub async fn update_settings(
         )));
     }
 
-    // A repair without a settings mutation still needs durable work. Normal
-    // nickname patches enqueue it atomically in patch_settings.
-    if body.sync_nickname && body.bot_name.is_none() && guild_id != 0 {
-        db::request_nickname_reconcile(&app.db, guild_id as i64).await?;
-    }
-
     // Persist only the fields present in the body as a parent-relative
     // override. Values equal to the parent layer are stripped so global
     // inheritance keeps working.
     let nickname_queued = (body.bot_name.is_some() || body.sync_nickname) && guild_id != 0;
-    let settings = db::patch_settings(
+    let settings = db::patch_settings_with_nickname_reconcile(
         &app.db,
         guild_id as i64,
         body.prefix,
         body.bot_name,
         body.retention_days,
+        body.sync_nickname,
     )
     .await?;
     app.invalidate_configs();

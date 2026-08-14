@@ -12,6 +12,90 @@ use serenity::model::gateway::GatewayIntents;
 use std::sync::Arc;
 use std::time::Duration;
 
+async fn drain_nickname_reconciles(app: &Arc<AppState>, http: &Arc<serenity::http::Http>) {
+    // The bot is the sole nickname side-effect worker. Drain the
+    // durable generation-checked outbox every tick so the last
+    // committed DB value wins and Discord failures are retried.
+    let now = chrono::Utc::now().timestamp();
+    match db::pending_nickname_reconciles(&app.db, now, 25).await {
+        Ok(pending) => {
+            let me = match app.bot_user_id().await {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(
+                        "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                    );
+                    return;
+                }
+            };
+            for job in pending {
+                let Ok(guild_id_u64) = u64::try_from(job.guild_id) else {
+                    tracing::error!(
+                        guild_id = job.guild_id,
+                        "invalid guild id in nickname outbox"
+                    );
+                    continue;
+                };
+                let guild = serenity::model::id::GuildId::new(guild_id_u64);
+                match guild
+                    .edit_member(&http, me, EditMember::new().nickname(job.nickname.clone()))
+                    .await
+                {
+                    Ok(_) => {
+                        if let Err(error) = db::acknowledge_nickname_reconcile(
+                            &app.db,
+                            job.guild_id,
+                            job.generation,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                guild_id = job.guild_id,
+                                "failed to acknowledge nickname reconciliation: {error:#}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        use jmodguard::discord::NicknameFailureClass;
+                        let (class, code) = jmodguard::discord::classify_nickname_failure(&error);
+                        let message = error.to_string();
+                        let result = match class {
+                            NicknameFailureClass::Transient => {
+                                db::schedule_nickname_reconcile_retry(
+                                    &app.db, &job, now, &code, &message,
+                                )
+                                .await
+                                .map(|exhausted| {
+                                    if exhausted {
+                                        tracing::error!(guild_id = job.guild_id, attempts = job.attempt_count + 1, "nickname reconciliation exhausted its retry budget: {message}");
+                                    } else {
+                                        tracing::warn!(guild_id = job.guild_id, attempt = job.attempt_count + 1, "nickname reconciliation scheduled for retry: {message}");
+                                    }
+                                })
+                            }
+                            NicknameFailureClass::Dormant => db::finish_nickname_reconcile(
+                                &app.db, &job, "dormant", &code, &message, now,
+                            ).await.map(|()| tracing::warn!(guild_id = job.guild_id, "nickname reconciliation dormant until guild rejoin: {message}")),
+                            NicknameFailureClass::Terminal => db::finish_nickname_reconcile(
+                                &app.db, &job, "terminal", &code, &message, now,
+                            ).await.map(|()| tracing::error!(guild_id = job.guild_id, "nickname reconciliation needs operator action: {message}")),
+                        };
+                        if let Err(state_error) = result {
+                            tracing::error!(
+                                guild_id = job.guild_id,
+                                "failed to persist nickname reconciliation failure: {state_error:#}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("failed to load pending nickname reconciliations: {error:#}")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::load()?;
@@ -75,6 +159,18 @@ async fn main() -> Result<()> {
     {
         let app = Arc::clone(&app);
         let http = Arc::clone(&http);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                drain_nickname_reconciles(&app, &http).await;
+            }
+        });
+    }
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
         let cache = Arc::clone(&cache);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
@@ -94,92 +190,6 @@ async fn main() -> Result<()> {
                         false
                     }
                 };
-                // The bot is the sole nickname side-effect worker. Drain the
-                // durable generation-checked outbox every tick so the last
-                // committed DB value wins and Discord failures are retried.
-                let now = chrono::Utc::now().timestamp();
-                match db::pending_nickname_reconciles(&app.db, now, 25).await {
-                    Ok(pending) => {
-                        let me = match app.bot_user_id().await {
-                            Ok(id) => id,
-                            Err(error) => {
-                                tracing::warn!(
-                                    "nickname reconciliation deferred until Discord identity is available: {error:#}"
-                                );
-                                continue;
-                            }
-                        };
-                        for job in pending {
-                            let Ok(guild_id_u64) = u64::try_from(job.guild_id) else {
-                                tracing::error!(
-                                    guild_id = job.guild_id,
-                                    "invalid guild id in nickname outbox"
-                                );
-                                continue;
-                            };
-                            let guild = serenity::model::id::GuildId::new(guild_id_u64);
-                            match guild
-                                .edit_member(
-                                    &http,
-                                    me,
-                                    EditMember::new().nickname(job.nickname.clone()),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    if let Err(error) = db::acknowledge_nickname_reconcile(
-                                        &app.db,
-                                        job.guild_id,
-                                        job.generation,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            guild_id = job.guild_id,
-                                            "failed to acknowledge nickname reconciliation: {error:#}"
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    use jmodguard::discord::NicknameFailureClass;
-                                    let (class, code) =
-                                        jmodguard::discord::classify_nickname_failure(&error);
-                                    let message = error.to_string();
-                                    let result = match class {
-                                        NicknameFailureClass::Transient => {
-                                            db::schedule_nickname_reconcile_retry(
-                                                &app.db, &job, now, &code, &message,
-                                            )
-                                            .await
-                                            .map(|exhausted| {
-                                                if exhausted {
-                                                    tracing::error!(guild_id = job.guild_id, attempts = job.attempt_count + 1, "nickname reconciliation exhausted its retry budget: {message}");
-                                                } else {
-                                                    tracing::warn!(guild_id = job.guild_id, attempt = job.attempt_count + 1, "nickname reconciliation scheduled for retry: {message}");
-                                                }
-                                            })
-                                        }
-                                        NicknameFailureClass::Dormant => db::finish_nickname_reconcile(
-                                            &app.db, &job, "dormant", &code, &message, now,
-                                        ).await.map(|()| tracing::warn!(guild_id = job.guild_id, "nickname reconciliation dormant until guild rejoin: {message}")),
-                                        NicknameFailureClass::Terminal => db::finish_nickname_reconcile(
-                                            &app.db, &job, "terminal", &code, &message, now,
-                                        ).await.map(|()| tracing::error!(guild_id = job.guild_id, "nickname reconciliation needs operator action: {message}")),
-                                    };
-                                    if let Err(state_error) = result {
-                                        tracing::error!(
-                                            guild_id = job.guild_id,
-                                            "failed to persist nickname reconciliation failure: {state_error:#}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!("failed to load pending nickname reconciliations: {error:#}")
-                    }
-                }
                 // Peek slash registry every tick (not gated on config_version) so a
                 // future slash-only bump cannot be missed. Do not commit the observed
                 // version until Discord re-sync has nothing left to retry — otherwise

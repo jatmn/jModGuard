@@ -225,7 +225,7 @@ pub async fn finish_nickname_reconcile(
             "UPDATE nickname_reconcile SET state = ?1, attempt_count = attempt_count + 1,
                  next_attempt_at = 0, last_error_code = ?2,
                  last_error = ?3, last_error_at = ?4
-             WHERE guild_id = ?5 AND generation = ?6",
+             WHERE guild_id = ?5 AND generation = ?6 AND state = 'pending'",
             params![state, code, error, now, guild_id, generation],
         )?;
         tx.commit()?;
@@ -239,7 +239,8 @@ pub async fn dormancy_nickname_reconcile(db: &Db, guild_id: i64, reason: &str) -
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         tx.execute(
-            "UPDATE nickname_reconcile SET state = 'dormant', next_attempt_at = 0,
+            "UPDATE nickname_reconcile SET generation = generation + 1,
+                 state = 'dormant', next_attempt_at = 0,
                  last_error_code = 'guild_departed', last_error = ?1,
                  last_error_at = unixepoch() WHERE guild_id = ?2",
             params![reason, guild_id],
@@ -254,7 +255,8 @@ pub async fn acknowledge_nickname_reconcile(db: &Db, guild_id: i64, generation: 
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         tx.execute(
-            "DELETE FROM nickname_reconcile WHERE guild_id = ?1 AND generation = ?2",
+            "DELETE FROM nickname_reconcile
+             WHERE guild_id = ?1 AND generation = ?2 AND state = 'pending'",
             params![guild_id, generation],
         )?;
         tx.commit()?;

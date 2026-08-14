@@ -917,7 +917,6 @@ function tabSettings() {
       el("button", { class: "btn", text: "Re-sync Discord nickname", onclick: async () => {
         try {
           const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", {
-            bot_name: cfg.settings.bot_name,
             sync_nickname: true,
           });
           await loadConfig();

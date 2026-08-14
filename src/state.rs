@@ -628,6 +628,7 @@ pub struct ConfigCache {
     version: Arc<AtomicU64>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
+    publication_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl Default for ConfigCache {
@@ -643,10 +644,12 @@ impl ConfigCache {
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
+            publication_lock: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
     pub fn invalidate(&self) {
+        let _publication = self.publication_lock.lock();
         self.version.fetch_add(1, Ordering::Relaxed);
         self.map.clear();
     }
@@ -698,7 +701,6 @@ impl ConfigCache {
                 .durable_floor
                 .load(Ordering::SeqCst)
                 .max(db.required_config_version());
-            let version_after = self.version.load(Ordering::Relaxed);
             last_observed = durable_version;
             last_required = required_after;
 
@@ -709,19 +711,28 @@ impl ConfigCache {
                 primary = true;
                 continue;
             }
-            if version_after != version {
-                // A concurrent invalidation advanced while this snapshot was
-                // loading. Retry against the new generation and floor.
-                continue;
-            }
-
             let cfg = Arc::new(CachedGuildConfig::from_parts(
                 version,
                 durable_version,
                 parts,
             ));
-            self.map.insert(guild_id as i64, Arc::clone(&cfg));
-            return Ok(cfg);
+            {
+                // Publication and invalidation share one lock, closing the
+                // check→insert window that could republish a stale snapshot
+                // after a same-process write had cleared the cache.
+                let _publication = self.publication_lock.lock();
+                let required_now = self
+                    .durable_floor
+                    .load(Ordering::SeqCst)
+                    .max(db.required_config_version());
+                if self.version.load(Ordering::Relaxed) != version || durable_version < required_now
+                {
+                    primary |= durable_version < required_now;
+                    continue;
+                }
+                self.map.insert(guild_id as i64, Arc::clone(&cfg));
+                return Ok(cfg);
+            }
         }
         anyhow::bail!(
             "database config changed repeatedly while loading (version {last_observed}, expected at least {last_required})"
