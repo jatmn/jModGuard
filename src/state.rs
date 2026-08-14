@@ -68,6 +68,10 @@ pub struct AppState {
     pub last_slash_registry_version: AtomicU64,
     last_slash_registry_revision: parking_lot::Mutex<String>,
     force_slash_registry_retry: AtomicBool,
+    /// Serializes replica observation plus any primary confirmation. Config
+    /// and slash pollers run independently, but an older primary snapshot must
+    /// never reconcile after and overwrite a newer one.
+    version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     /// Per-user OAuth guild-list cache (discord_user_id -> (fetched_at, guilds)).
@@ -112,6 +116,7 @@ impl AppState {
             last_slash_registry_version: AtomicU64::new(primed.slash),
             last_slash_registry_revision: parking_lot::Mutex::new(primed.slash_revision),
             force_slash_registry_retry: AtomicBool::new(false),
+            version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
@@ -155,6 +160,7 @@ impl AppState {
     /// last observation (primed at startup), invalidates the guild config cache.
     /// Returns `true` when a change triggered invalidation.
     pub async fn poll_config_version(&self) -> Result<bool> {
+        let _version_reconcile = self.version_reconcile_lock.lock().await;
         let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_config_version.load(Ordering::SeqCst);
         let revision_changed = remote.config_revision != *self.last_config_revision.lock();
@@ -179,6 +185,7 @@ impl AppState {
     /// re-sync succeeds. Advancing before sync left failed guilds stale until
     /// the next command-registry write.
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
+        let _version_reconcile = self.version_reconcile_lock.lock().await;
         let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
         let config_revision_changed = remote.config_revision != *self.last_config_revision.lock();
