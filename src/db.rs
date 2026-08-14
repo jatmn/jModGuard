@@ -3259,16 +3259,6 @@ mod tests {
             "commands present: {}",
             parts.commands.len()
         );
-        let raw: String = db
-            .with_conn_sync(|conn| {
-                conn.query_row(
-                    "SELECT settings FROM guild_settings WHERE guild_id = 44",
-                    (),
-                    |row| Ok(row.get(0)?),
-                )
-            })
-            .unwrap();
-        assert_eq!(raw, "{not-json");
         assert_eq!(
             parts.templates.len(),
             crate::types::EVENT_TYPES.len(),
@@ -4848,6 +4838,16 @@ mod tests {
                 .is_none(),
             "corrupt row must not become an effective override"
         );
+        let raw: String = db
+            .with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT settings FROM guild_settings WHERE guild_id = 44",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+            })
+            .unwrap();
+        assert_eq!(raw, "{not-json");
         let v_before_heal = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
         drop(db);
         let db2 = Db::open_with(DbOpenOptions {
