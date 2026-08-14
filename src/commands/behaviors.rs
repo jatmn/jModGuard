@@ -2,7 +2,7 @@
 //! mirror commands to Discord.
 
 use anyhow::{Result, anyhow};
-use serenity::builder::{EditChannel, EditMember};
+use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
@@ -334,67 +334,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let clear =
                 trimmed.is_empty() || trimmed.eq_ignore_ascii_case("clear") || trimmed == "-";
             let name = if clear { "" } else { trimmed };
-            let me = env.ctx.cache.current_user().id;
             let guild_id = env.guild_id.get();
-            let _nickname_guard = env.app.lock_nickname_update().await;
-            // Discord before SQLite (AGENTS contract). Always apply Discord on
-            // an explicit !setname / /setname — even when DB already matches —
-            // so operators can repair Discord↔DB nick drift. Capture previous
-            // nick so a later SQLite failure can restore Discord.
-            let previous = db::get_settings(&env.app.db, guild_id as i64)
-                .await?
-                .bot_name;
-            let mut discord_applied = false;
-            if me.get() != 0 {
-                let nick = name.to_string();
-                crate::discord::with_retries("Discord nickname", guild_id, || {
-                    let nick = nick.clone();
-                    async {
-                        env.guild_id
-                            .edit_member(&env.ctx.http, me, EditMember::new().nickname(nick))
-                            .await
-                            .map(|_| ())
-                    }
-                })
-                .await?;
-                discord_applied = true;
-            }
-            // Patch only bot_name so prefix/retention keep inheriting from global.
-            if let Err(e) = db::patch_settings(
+            // Commit desired state plus a durable outbox row atomically. The
+            // bot is the sole Discord side-effect worker, so bot/API writers
+            // cannot apply nicknames out of commit order.
+            db::patch_settings(
                 &env.app.db,
                 guild_id as i64,
                 None,
                 Some(Some(name.to_string())),
                 None,
             )
-            .await
-            {
-                if discord_applied && me.get() != 0 {
-                    let prev = previous.clone();
-                    if let Err(re) =
-                        crate::discord::with_retries("Discord nickname restore", guild_id, || {
-                            let prev = prev.clone();
-                            async {
-                                env.guild_id
-                                    .edit_member(
-                                        &env.ctx.http,
-                                        me,
-                                        EditMember::new().nickname(prev),
-                                    )
-                                    .await
-                                    .map(|_| ())
-                            }
-                        })
-                        .await
-                    {
-                        tracing::error!(
-                            "failed to restore Discord nickname after !setname DB error \
-                             (guild={guild_id}): {re:#} (save error: {e:#})"
-                        );
-                    }
-                }
-                return Err(e);
-            }
+            .await?;
             env.app.invalidate_configs();
             vars.insert(
                 "name".into(),

@@ -1,11 +1,15 @@
 # jModGuard
 
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
-(bot + API/WebUI), SQLite-backed, multi-server.
+(bot + API/WebUI), libSQL-backed, multi-server.
 
-It is designed to self-host cleanly on a single machine. Bunny CDN/Storage can
-serve the static admin UI, but the bot and API currently need the same host or
-shared filesystem for their SQLite database. You do not need Bunny to run it.
+It can use a local SQLite file for single-host self-hosting or a remote libSQL
+service. Bunny Database is the first documented, first-class remote provider
+option and is supported out of the box. Its environment mapping and the
+generic libSQL protocol path are tested; production Bunny TLS/authentication
+still belongs in the deployment acceptance test. On Bunny, the bot and API
+may run as independent Magic Container apps connected to the same database. The API embeds the admin
+UI, so Bunny CDN/Storage is optional. You do not need Bunny to run it.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
   attachment floods (crypto scams), links in the first minutes after joining,
@@ -14,7 +18,7 @@ shared filesystem for their SQLite database. You do not need Bunny to run it.
   **action escalation table** (delete → warn → timeout → kick → ban) plus
   **dry-run mode** to tune safely.
 - **Everything is config**: commands, rules, badwords, log events, and
-  templates live in SQLite (not code) and are editable from the WebUI or in
+  templates live in the database (not code) and are editable from the WebUI or in
   chat. Rename `!ban` to `!yeet`, write custom commands as **action plans**
   (reply, dm, log, roles, timeouts…), reword every log message.
 - **Per-server config with global defaults**: one WebUI manages all your
@@ -39,10 +43,10 @@ cp config.example.toml config.toml     # add your token + OAuth ids
 # open http://localhost:8080 and login with Discord
 ```
 
-Start the bot once before the API so migrations and default-data bootstrap are
-complete. The API waits about 30 seconds while the bot is migrating or holds a
-transient SQLite startup lock. Both processes share the same SQLite file
-(`db.path`).
+Start the bot once before the API so schema creation/migrations and default-data
+bootstrap are complete. The API waits about 30 seconds for that work. Both
+processes use the same local SQLite file (`db.path`) or remote libSQL database
+(`db.url` and `db.token`).
 
 Full walkthrough (Discord developer portal, intents, invite URL, systemd /
 Task Scheduler): **[docs/SETUP.md](docs/SETUP.md)**.
@@ -54,7 +58,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | Path | Doc |
 |------|-----|
 | Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
-| Optional Bunny CDN/Storage front end for a shared-DB host | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
+| Bunny Database + two Magic Container apps | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
 | Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
 ## Documentation
@@ -63,6 +67,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Windows & Linux |
 | [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
+| [docs/BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) | local recovery procedure and Bunny production blocker |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |
 | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | optional Bunny.net deployment guide |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
@@ -108,7 +113,13 @@ lib.rs         shared crate root (modules + init_tracing; web behind feature)
 bin/jmodguard-bot.rs   Discord gateway only (migrate=true, config_version poll)
 bin/jmodguard-api.rs   axum API/WebUI only (migrate=false; requires feature web)
 config.rs      config.toml + env overrides (db.url/token, config_poll_secs)
-db.rs          SQLite pool (WAL), migrations, config_version, data layer
+db.rs          local/remote libSQL pool and public data-layer facade
+db/bootstrap.rs        migrations, startup fencing, versions, settings healing
+db/configuration.rs    rules, commands, templates, badwords, config snapshots
+db/settings.rs         inherited settings reads/writes
+db/nickname_jobs.rs    durable Discord nickname reconciliation jobs
+db/moderation.rs       members, messages, retention, audit, warns, and bans
+db_compat.rs   synchronous libSQL transaction/deadline/outcome facade
 defaults.rs    seeded rules / commands / templates
 types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)
 state.rs       AppState, OAuth client, per-guild config cache + version poll
@@ -120,6 +131,6 @@ handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
 frontend/      SPA assets (served by API locally; CDN target when deployed)
-migrations/    0001_init + 0002_config_version
+migrations/    0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 ```

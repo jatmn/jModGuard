@@ -5,7 +5,7 @@ bot process). It manages everything the bot does — no config file editing
 needed beyond the token / OAuth credentials and `bot.owner_id`.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
-`jmodguard-api`. Both share the same SQLite file (`db.path`).
+`jmodguard-api`. Both use the same local SQLite file or remote libSQL database.
 
 ## Access
 
@@ -26,7 +26,7 @@ instance manages all your servers.
 | **Members** | search members: join count, message count, first/last seen |
 | **Audit Log** | filterable event history (type, user, actor) |
 | **Bans** | ban history + unban via the bot token (API process) |
-| **Settings** | prefix, bot nickname (persisted **and** applied/cleared on Discord; empty / `!setname` with no args / `/setname` without `name` all clear), message retention (per-server purge); global prefix (owner only); **copy config from another server** |
+| **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear), message retention (per-server purge); global prefix (owner only); **copy config from another server** |
 
 ## Global vs per-server config
 

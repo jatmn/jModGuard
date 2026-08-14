@@ -46,6 +46,11 @@ pub struct AppState {
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
+    /// Human message-create handlers whose best-effort tracking write has not
+    /// finished yet. Lifecycle handlers use this to distinguish a genuine
+    /// create/edit/delete race from old, bot-authored, or otherwise untracked
+    /// messages that must not manufacture database rows.
+    pending_message_tracking: DashMap<u64, ()>,
     #[allow(dead_code)]
     pub http: reqwest::Client,
     /// Lazy Discord REST client (bot token). Created on first API use
@@ -61,16 +66,19 @@ pub struct AppState {
     /// Primed at construction from the live DB so the first poll has no
     /// "unobserved" window where a warm cache can miss a cross-process bump.
     pub last_config_version: AtomicU64,
+    last_config_revision: parking_lot::Mutex<String>,
     /// Last observed durable `slash_registry_version` (commands table changes).
     /// Bot re-syncs Discord slash commands only when this advances — not on
     /// every generic `config_version` bump (rules/templates/settings/…).
     pub last_slash_registry_version: AtomicU64,
+    last_slash_registry_revision: parking_lot::Mutex<String>,
+    force_slash_registry_retry: AtomicBool,
+    /// Serializes replica observation plus any primary confirmation. Config
+    /// and slash pollers run independently, but an older primary snapshot must
+    /// never reconcile after and overwrite a newer one.
+    version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
-    /// Serializes each Discord nickname + SQLite settings transaction. These
-    /// are one logical update even though Discord must be applied before the
-    /// durable row is written.
-    nickname_update_lock: tokio::sync::Mutex<()>,
     /// Per-user OAuth guild-list cache (discord_user_id -> (fetched_at, guilds)).
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -93,29 +101,44 @@ impl AppState {
         // Cache population is independent of the poll task; skipping the first
         // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
         // that landed before the first successful poll.
-        let primed = db::get_config_version_sync(&db)
-            .context("failed to read config_version while building AppState")?;
-        let primed_slash = db::get_slash_registry_version_sync(&db)
-            .context("failed to read slash_registry_version while building AppState")?;
+        let primed = db::get_primary_versions_sync(&db)
+            .context("failed to read primary version baselines while building AppState")?;
+        db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
-            configs: ConfigCache::new(),
+            configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
             cooldowns: DashMap::new(),
+            pending_message_tracking: DashMap::new(),
             oauth,
             http,
             discord_http_cell: std::sync::OnceLock::new(),
             bot_user_id: tokio::sync::OnceCell::new(),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
-            last_config_version: AtomicU64::new(primed),
-            last_slash_registry_version: AtomicU64::new(primed_slash),
+            last_config_version: AtomicU64::new(primed.config),
+            last_config_revision: parking_lot::Mutex::new(primed.config_revision),
+            last_slash_registry_version: AtomicU64::new(primed.slash),
+            last_slash_registry_revision: parking_lot::Mutex::new(primed.slash_revision),
+            force_slash_registry_retry: AtomicBool::new(false),
+            version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
-            nickname_update_lock: tokio::sync::Mutex::new(()),
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
         }))
+    }
+
+    pub fn begin_message_tracking(self: &Arc<Self>, message_id: u64) -> MessageTrackingGuard {
+        self.pending_message_tracking.insert(message_id, ());
+        MessageTrackingGuard {
+            app: Arc::clone(self),
+            message_id,
+        }
+    }
+
+    pub fn message_tracking_pending(&self, message_id: u64) -> bool {
+        self.pending_message_tracking.contains_key(&message_id)
     }
 
     /// Discord REST client for API-side bot-token calls (lazy).
@@ -132,11 +155,14 @@ impl AppState {
     pub async fn bot_user_id(&self) -> Result<serenity::model::id::UserId> {
         self.bot_user_id
             .get_or_try_init(|| async {
-                let me = self
-                    .discord_http()
-                    .get_current_user()
-                    .await
-                    .context("failed to fetch bot user id from Discord")?;
+                let me = self.discord_http();
+                let me = tokio::time::timeout(
+                    crate::discord::DISCORD_REST_TIMEOUT,
+                    me.get_current_user(),
+                )
+                .await
+                .context("timed out fetching bot user id from Discord")?
+                .context("failed to fetch bot user id from Discord")?;
                 Ok::<_, anyhow::Error>(me.id)
             })
             .await
@@ -148,21 +174,24 @@ impl AppState {
         self.configs.invalidate();
     }
 
-    /// Hold this across a complete Discord nickname/settings update. Prefix
-    /// and retention-only writes do not need it.
-    pub async fn lock_nickname_update(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.nickname_update_lock.lock().await
-    }
-
     /// Loads durable `config_version` from the DB. When it differs from the
     /// last observation (primed at startup), invalidates the guild config cache.
     /// Returns `true` when a change triggered invalidation.
     pub async fn poll_config_version(&self) -> Result<bool> {
-        let remote = db::get_config_version(&self.db).await?;
-        let prev = self.last_config_version.swap(remote, Ordering::SeqCst);
-        if prev != remote {
-            self.invalidate_configs();
-            return Ok(true);
+        let _version_reconcile = self.version_reconcile_lock.lock().await;
+        let remote = db::get_version_state(&self.db).await?;
+        let prev = self.last_config_version.load(Ordering::SeqCst);
+        let revision_changed = remote.config_revision != *self.last_config_revision.lock();
+        if revision_changed
+            || remote.config != prev
+            || remote.config < self.db.required_config_version()
+        {
+            let suspected_floor = prev.max(self.db.required_config_version());
+            let write_generation = self.db.config_write_generation();
+            let primary = db::get_primary_versions(&self.db).await?;
+            return Ok(self
+                .reconcile_primary_versions(primary, suspected_floor, write_generation)
+                .0);
         }
         Ok(false)
     }
@@ -174,19 +203,124 @@ impl AppState {
     /// re-sync succeeds. Advancing before sync left failed guilds stale until
     /// the next command-registry write.
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
-        let remote = db::get_slash_registry_version(&self.db).await?;
+        let _version_reconcile = self.version_reconcile_lock.lock().await;
+        let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        if prev != remote {
-            Ok(Some(remote))
+        let config_revision_changed = remote.config_revision != *self.last_config_revision.lock();
+        let slash_revision_changed =
+            remote.slash_revision != *self.last_slash_registry_revision.lock();
+        if config_revision_changed
+            || slash_revision_changed
+            || remote.config < self.db.required_config_version()
+            || remote.slash != prev
+        {
+            let suspected_floor = self
+                .last_config_version
+                .load(Ordering::SeqCst)
+                .max(self.db.required_config_version());
+            let write_generation = self.db.config_write_generation();
+            let primary = db::get_primary_versions(&self.db).await?;
+            let (_, slash_changed) =
+                self.reconcile_primary_versions(primary, suspected_floor, write_generation);
+            let current = self.last_slash_registry_version.load(Ordering::SeqCst);
+            Ok(
+                (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
+                    .then_some(current),
+            )
+        } else if self.force_slash_registry_retry.load(Ordering::SeqCst) {
+            Ok(Some(prev))
         } else {
             Ok(None)
         }
+    }
+
+    fn reconcile_primary_versions(
+        &self,
+        primary: db::VersionState,
+        suspected_floor: u64,
+        write_generation: u64,
+    ) -> (bool, bool) {
+        if !self.db.rebaseline_required_config_version(
+            suspected_floor,
+            primary.config,
+            write_generation,
+        ) {
+            tracing::debug!(
+                "discarding primary version snapshot because a local config write committed concurrently"
+            );
+            return (false, false);
+        }
+        let previous_config = self.last_config_version.load(Ordering::SeqCst);
+        if primary.config < suspected_floor {
+            tracing::warn!(
+                previous_config,
+                required_config = suspected_floor,
+                primary_config = primary.config,
+                "primary database confirmed config version below the local floor; rebaselining"
+            );
+            self.configs
+                .rebaseline_version(suspected_floor, primary.config);
+        }
+        let config_revision_changed = {
+            let mut revision = self.last_config_revision.lock();
+            if *revision != primary.config_revision {
+                *revision = primary.config_revision.clone();
+                true
+            } else {
+                false
+            }
+        };
+        let config_changed = config_revision_changed || primary.config != previous_config;
+        if config_changed {
+            self.last_config_version
+                .store(primary.config, Ordering::SeqCst);
+            if config_revision_changed {
+                // Snapshot acceptance carries the revision identity, so a
+                // higher pre-failover replica counter cannot bypass rollback
+                // recovery and later invalidations cannot forget lineage.
+                self.configs
+                    .require_primary_revision(primary.config, primary.config_revision.clone());
+            } else if primary.config >= previous_config {
+                self.configs.require_version(primary.config);
+            } else {
+                self.configs.invalidate();
+            }
+        }
+
+        let previous_slash = self.last_slash_registry_version.load(Ordering::SeqCst);
+        let slash_revision_changed = {
+            let mut revision = self.last_slash_registry_revision.lock();
+            if *revision != primary.slash_revision {
+                *revision = primary.slash_revision;
+                true
+            } else {
+                false
+            }
+        };
+        let slash_changed = slash_revision_changed || primary.slash != previous_slash;
+        if slash_changed {
+            self.last_slash_registry_version
+                .store(primary.slash, Ordering::SeqCst);
+            if primary.slash < previous_slash {
+                tracing::warn!(
+                    previous_slash,
+                    primary_slash = primary.slash,
+                    "primary database confirmed slash-registry rollback; forcing Discord reconciliation"
+                );
+            }
+            self.force_slash_registry_retry
+                .store(true, Ordering::SeqCst);
+            *self.slash_sync_progress.lock() = None;
+        }
+        (config_changed, slash_changed)
     }
 
     /// Marks `version` as observed after a successful slash re-sync pass.
     pub fn commit_slash_registry_version(&self, version: u64) {
         self.last_slash_registry_version
             .store(version, Ordering::SeqCst);
+        self.force_slash_registry_retry
+            .store(false, Ordering::SeqCst);
         // Drop any stale retry set for an older target.
         let mut progress = self.slash_sync_progress.lock();
         if progress.as_ref().is_some_and(|p| p.target == version) {
@@ -198,9 +332,18 @@ impl AppState {
     /// after a transient startup/guild-join sync failure, when no write may
     /// otherwise advance the durable version to trigger another attempt.
     pub fn retry_slash_registry_version(&self) {
-        self.last_slash_registry_version
-            .store(u64::MAX, Ordering::SeqCst);
-        *self.slash_sync_progress.lock() = None;
+        let mut progress = self.slash_sync_progress.lock();
+        self.force_slash_registry_retry
+            .store(true, Ordering::SeqCst);
+        *progress = None;
+    }
+
+    pub fn acknowledged_slash_registry_version(&self) -> u64 {
+        self.last_slash_registry_version.load(Ordering::SeqCst)
+    }
+
+    pub fn slash_registry_revision(&self) -> String {
+        self.last_slash_registry_revision.lock().clone()
     }
 
     /// Decide which guilds to `set_commands` for pending registry `remote`.
@@ -227,10 +370,10 @@ impl AppState {
             Some(rem) => {
                 let pending: Vec<u64> =
                     cached.iter().copied().filter(|g| rem.contains(g)).collect();
-                if pending.is_empty() {
-                    // A guild can disappear from Serenity's cache while it is
-                    // unavailable or reconnecting. Keep its failed sync owned
-                    // by this durable version until it reappears and succeeds.
+                if pending.len() != rem.len() {
+                    // Do not partially consume the failure set: otherwise a
+                    // successful present guild could acknowledge the version
+                    // while another failed guild remains absent from cache.
                     return SlashResyncPlan::Defer;
                 }
                 pending
@@ -243,23 +386,42 @@ impl AppState {
         SlashResyncPlan::Sync { guilds, invalidate }
     }
 
-    /// Record guilds that failed `set_commands` for `remote`.
-    /// Returns `true` when the caller should [`commit_slash_registry_version`].
+    /// Record guilds that failed `set_commands` for `remote`. A successful
+    /// finish commits the version and clears the force flag while holding the
+    /// progress lock, so a concurrent retry request cannot be erased.
     pub fn finish_slash_resync(&self, remote: u64, failed: HashSet<u64>) -> bool {
         let mut guard = self.slash_sync_progress.lock();
         let Some(progress) = guard.as_mut() else {
-            return failed.is_empty();
+            // A concurrent guild-create/startup failure clears progress to
+            // request a fresh attempt. Never let an older in-flight poll
+            // acknowledge and erase that newer retry request.
+            return false;
         };
         if progress.target != remote {
             return false;
         }
         if failed.is_empty() {
             *guard = None;
+            self.last_slash_registry_version
+                .store(remote, Ordering::SeqCst);
+            self.force_slash_registry_retry
+                .store(false, Ordering::SeqCst);
             true
         } else {
             progress.remaining = Some(failed);
             false
         }
+    }
+}
+
+pub struct MessageTrackingGuard {
+    app: Arc<AppState>,
+    message_id: u64,
+}
+
+impl Drop for MessageTrackingGuard {
+    fn drop(&mut self) {
+        self.app.pending_message_tracking.remove(&self.message_id);
     }
 }
 
@@ -492,6 +654,7 @@ pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize)
 
 pub struct CachedGuildConfig {
     pub version: u64,
+    pub durable_version: u64,
     pub loaded_at: Instant,
     pub settings: GuildSettings,
     pub rules: HashMap<String, RuleDef>,
@@ -502,7 +665,7 @@ pub struct CachedGuildConfig {
 }
 
 impl CachedGuildConfig {
-    fn from_parts(version: u64, parts: db::ConfigParts) -> Self {
+    fn from_parts(version: u64, durable_version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
         for pattern in &parts.badwords {
             // Same compile limits as WebUI / add_badword — legacy DB rows that
@@ -516,6 +679,7 @@ impl CachedGuildConfig {
         }
         Self {
             version,
+            durable_version,
             loaded_at: Instant::now(),
             settings: parts.settings,
             rules: parts.rules,
@@ -552,40 +716,134 @@ pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
     version: Arc<AtomicU64>,
     ttl: Duration,
+    durable_floor: Arc<AtomicU64>,
+    publication_lock: Arc<parking_lot::Mutex<()>>,
+    accepted_revision: Arc<parking_lot::Mutex<String>>,
 }
 
 impl Default for ConfigCache {
     fn default() -> Self {
-        Self::new()
+        Self::new(0, "legacy:0".into())
     }
 }
 
 impl ConfigCache {
-    pub fn new() -> Self {
+    pub fn new(durable_floor: u64, revision: String) -> Self {
         Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
+            durable_floor: Arc::new(AtomicU64::new(durable_floor)),
+            publication_lock: Arc::new(parking_lot::Mutex::new(())),
+            accepted_revision: Arc::new(parking_lot::Mutex::new(revision)),
         }
     }
 
     pub fn invalidate(&self) {
+        let _publication = self.publication_lock.lock();
         self.version.fetch_add(1, Ordering::Relaxed);
         self.map.clear();
     }
 
+    pub fn require_version(&self, version: u64) {
+        self.durable_floor.fetch_max(version, Ordering::SeqCst);
+        self.invalidate();
+    }
+
+    fn require_primary_revision(&self, version: u64, revision: String) {
+        let _publication = self.publication_lock.lock();
+        self.durable_floor.store(version, Ordering::SeqCst);
+        *self.accepted_revision.lock() = revision;
+        self.version.fetch_add(1, Ordering::Relaxed);
+        self.map.clear();
+    }
+
+    fn rebaseline_version(&self, expected: u64, version: u64) {
+        let mut current = self.durable_floor.load(Ordering::SeqCst);
+        while current > version && current <= expected {
+            match self.durable_floor.compare_exchange(
+                current,
+                version,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.invalidate();
+    }
+
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
+        let required = self
+            .durable_floor
+            .load(Ordering::SeqCst)
+            .max(db.required_config_version());
         if let Some(entry) = self.map.get(&(guild_id as i64))
             && entry.version == self.version.load(Ordering::Relaxed)
             && entry.loaded_at.elapsed() < self.ttl
+            && entry.durable_version >= required
         {
             return Ok(Arc::clone(&entry));
         }
-        let version = self.version.load(Ordering::Relaxed);
-        let parts = db::load_config_parts(db, guild_id as i64).await?;
-        let cfg = Arc::new(CachedGuildConfig::from_parts(version, parts));
-        self.map.insert(guild_id as i64, Arc::clone(&cfg));
-        Ok(cfg)
+        let mut primary = false;
+        let mut last_observed = 0;
+        let mut last_required = required;
+        for _ in 0..3 {
+            let version = self.version.load(Ordering::Relaxed);
+            let (durable_version, revision, parts) = if primary {
+                db::load_config_parts_with_version_primary(db, guild_id as i64).await?
+            } else {
+                db::load_config_parts_with_version(db, guild_id as i64).await?
+            };
+            let required_after = self
+                .durable_floor
+                .load(Ordering::SeqCst)
+                .max(db.required_config_version());
+            last_observed = durable_version;
+            last_required = required_after;
+            let accepted_revision = self.accepted_revision.lock().clone();
+
+            if primary && revision != accepted_revision {
+                self.require_primary_revision(durable_version, revision);
+                continue;
+            }
+            if durable_version < required_after || revision != accepted_revision {
+                // Replica lag is expected after a successful remote write. Do
+                // not drop moderation/commands while waiting for convergence:
+                // retry through one primary-routed, single-snapshot read.
+                primary = true;
+                continue;
+            }
+            let cfg = Arc::new(CachedGuildConfig::from_parts(
+                version,
+                durable_version,
+                parts,
+            ));
+            {
+                // Publication and invalidation share one lock, closing the
+                // check→insert window that could republish a stale snapshot
+                // after a same-process write had cleared the cache.
+                let _publication = self.publication_lock.lock();
+                let required_now = self
+                    .durable_floor
+                    .load(Ordering::SeqCst)
+                    .max(db.required_config_version());
+                let accepted_revision = self.accepted_revision.lock().clone();
+                if self.version.load(Ordering::Relaxed) != version
+                    || durable_version < required_now
+                    || revision != accepted_revision
+                {
+                    primary = true;
+                    continue;
+                }
+                self.map.insert(guild_id as i64, Arc::clone(&cfg));
+                return Ok(cfg);
+            }
+        }
+        anyhow::bail!(
+            "database config changed repeatedly while loading (version {last_observed}, expected at least {last_required})"
+        )
     }
 }
 
@@ -698,7 +956,121 @@ mod tests {
     }
 
     #[test]
-    fn pending_slash_registry_does_not_advance_until_commit() {
+    fn revision_token_detects_failover_aba_at_same_version() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_revision_aba_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bot_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let api_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let guild_id = 123u64;
+        let baseline = bot.last_config_version.load(Ordering::SeqCst);
+        assert_eq!(
+            tokio_test_block_on(bot.configs.get(&bot.db, guild_id))
+                .unwrap()
+                .settings
+                .prefix,
+            "!"
+        );
+
+        tokio_test_block_on(db::patch_settings(
+            &api_db,
+            guild_id as i64,
+            Some(Some("aba-visible".into())),
+            None,
+            None,
+        ))
+        .unwrap();
+        tokio_test_block_on(api_db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch(&format!(
+                "UPDATE meta SET value = '{baseline}' WHERE key = 'config_version'"
+            ))?;
+            tx.commit()
+        }))
+        .unwrap();
+
+        assert!(
+            tokio_test_block_on(bot.poll_config_version()).unwrap(),
+            "a new revision must invalidate even when the restored counter reuses the old value"
+        );
+        assert_eq!(
+            tokio_test_block_on(bot.configs.get(&bot.db, guild_id))
+                .unwrap()
+                .settings
+                .prefix,
+            "aba-visible"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn slash_revision_forces_sync_when_counter_is_reused() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_slash_revision_aba_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        let versions = db::get_primary_versions_sync(&app.db).unwrap();
+        let before_write = app.db.config_write_generation();
+        let replacement = "replacement-slash-revision".to_string();
+        let mut restored = versions.clone();
+        restored.slash_revision = replacement.clone();
+
+        assert_eq!(
+            app.reconcile_primary_versions(restored, versions.config, before_write,),
+            (false, true)
+        );
+        assert_eq!(app.slash_registry_revision(), replacement);
+        assert!(app.force_slash_registry_retry.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn pending_slash_registry_rebaselines_only_after_primary_confirmation() {
         let tmp = std::env::temp_dir().join(format!(
             "jmodguard_slash_pending_{}_{}.db",
             std::process::id(),
@@ -718,6 +1090,8 @@ mod tests {
         })
         .unwrap();
         let app = AppState::new(Config::default(), db).unwrap();
+        let initial_slash = app.acknowledged_slash_registry_version();
+        let initial_config = app.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
@@ -730,17 +1104,88 @@ mod tests {
         let pending = tokio_test_block_on(app.pending_slash_registry_version())
             .unwrap()
             .expect("command write must surface pending slash version");
-        assert_eq!(pending, 1);
+        assert_eq!(pending, initial_slash + 1);
         // Peek again — must still be pending (no auto-advance).
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
-            Some(1)
+            Some(initial_slash + 1)
         );
         app.commit_slash_registry_version(pending);
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
             None
         );
+        app.commit_slash_registry_version(10);
+        assert_eq!(
+            tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),
+            Some(initial_slash + 1),
+            "an immediate primary transaction confirms an authoritative rollback"
+        );
+        app.last_config_version.store(10, Ordering::SeqCst);
+        app.configs.require_version(10);
+        assert!(tokio_test_block_on(app.poll_config_version()).unwrap());
+        assert_eq!(
+            app.last_config_version.load(Ordering::SeqCst),
+            initial_config + 1
+        );
+        tokio_test_block_on(app.configs.get(&app.db, 1)).expect("cache floor must rebaseline");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn primary_rebaseline_rejects_snapshot_across_concurrent_local_write() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_rebaseline_generation_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        app.db.require_config_version(11);
+        app.configs.require_version(11);
+        app.last_config_version.store(11, Ordering::SeqCst);
+        let before_write = app.db.config_write_generation();
+
+        tokio_test_block_on(db::patch_settings(
+            &app.db,
+            77,
+            Some(Some("reused-version-write".into())),
+            None,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.reconcile_primary_versions(
+                db::VersionState {
+                    config: 9,
+                    slash: 9,
+                    config_revision: "rollback-config".into(),
+                    slash_revision: "rollback-slash".into(),
+                },
+                11,
+                before_write,
+            ),
+            (false, false),
+            "a primary snapshot taken before a concurrent local commit must be discarded"
+        );
+        assert_eq!(app.db.required_config_version(), 11);
+        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 11);
+
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
@@ -791,6 +1236,15 @@ mod tests {
             other => panic!("expected Sync, got {other:?}"),
         }
 
+        // A concurrent guild-create failure requests a fresh pass while this
+        // one is in flight. The older successful pass must not erase it.
+        app.retry_slash_registry_version();
+        assert!(!app.finish_slash_resync(remote, HashSet::new()));
+        match app.plan_slash_resync(remote, &[10, 20, 30, 40]) {
+            SlashResyncPlan::Sync { guilds, .. } => assert_eq!(guilds, vec![10, 20, 30, 40]),
+            other => panic!("expected fresh retry plan, got {other:?}"),
+        }
+
         assert!(!app.finish_slash_resync(remote, [20u64].into_iter().collect()));
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
             SlashResyncPlan::Sync { guilds, invalidate } => {
@@ -805,6 +1259,13 @@ mod tests {
         assert_eq!(
             app.plan_slash_resync(remote, &[10, 30]),
             SlashResyncPlan::Defer
+        );
+        assert_eq!(
+            app.plan_slash_resync(remote, &[10, 20, 30]),
+            SlashResyncPlan::Sync {
+                guilds: vec![20],
+                invalidate: false,
+            }
         );
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
             SlashResyncPlan::Sync { guilds, invalidate } => {

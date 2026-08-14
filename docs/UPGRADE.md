@@ -2,7 +2,7 @@
 
 How to move an existing jModGuard install to a newer version (git tag or release).
 
-For a **first** install, use [SETUP.md](SETUP.md). For an optional Bunny-shaped
+For a **first** install, use [SETUP.md](SETUP.md). For a Bunny
 deploy, see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). If you maintain your own
 registry/CDN/secrets pipeline, follow this guide for product steps, then apply
 your operator runbook for promote and rollout.
@@ -54,6 +54,11 @@ Both `jmodguard-bot` and `jmodguard-api` can hold the shared DB open.
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` — do not file-copy
 the `.db` while either process is writing. See [CONFIGURATION.md](CONFIGURATION.md).
 
+For Bunny Database, the local file-copy procedure does not apply. A complete
+operator-controlled backup path is not yet available; `bsql .dump` alone is
+insufficient for the jModGuard schema. Do not perform a production upgrade
+until the acceptance drill in [BACKUP-RESTORE.md](BACKUP-RESTORE.md) passes.
+
 ## 3. Build or pull the new artifacts
 
 From the tagged source:
@@ -73,7 +78,7 @@ matching `frontend/` from the **same** tag as the API.
 ## 4. Config diff
 
 Compare your `config.toml` to `config.example.toml` at the new tag. Add any
-new keys (for example `bot.config_poll_secs`, `db.url` / `db.token` stubs).
+new keys (for example `bot.config_poll_secs` or `db.url` / `db.token`).
 Env overrides (`JMODGUARD_*`) still win over the file.
 
 ## 5. Rollout order
@@ -90,7 +95,7 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    - legacy full blobs are normalized against their parent layer. A blob that
      differs from its parent is retained because old data cannot distinguish an
      automatic `ensure_guild` seed from an intentional operator override;
-   - the **global** row is migrated first (parent = hardcoded defaults), then
+   - the **global** row is migrated first (parent = configured terminal defaults), then
      guild rows against the healed global;
    - other full/effective blobs are rewritten as parent-relative partial
      overrides (fields equal to global/defaults are stripped);
@@ -104,9 +109,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    setting. New writers store parent-relative partial overrides, so this
    ambiguity does not recur for post-upgrade writes.
    Start the bot once after this upgrade before relying on global settings
-   inheritance. The API process also runs this heal idempotently on every open
-   (`migrate=false`), so a running API picks up healed rows without waiting
-   for a bot restart. The bot also writes durable
+   inheritance. Runtime reads ignore corrupt rows so inheritance remains
+   available, but only a bot migrate-open durably heals them. The bot also writes durable
    `meta.settings_terminal_defaults` from `bot.default_prefix` /
    `bot.retention_days` on every migrate-open; both processes read that meta
    row on each settings resolve (not cached at open). The API **refuses to
@@ -136,20 +140,22 @@ Do **not** run a new API against a DB that has not been migrated by a new bot
 If the upgrade fails:
 
 1. Stop both new processes.
-2. Restore the DB files from the backup taken in step 2.
+2. Restore the local DB files or remote database backup taken in step 2.
 3. Run the **previous** binaries/images (same version that matched that DB).
 4. Start bot, then API.
 
-Do not assume new migrations are reversible. Rollback = old code + old DB
-backup unless a release note says otherwise.
+Do not assume new migrations are reversible. Rollback = old code + matching
+database backup unless a release note says otherwise.
 
 ## Bunny / dual-container notes
 
-Same order: migrate with the bot container/app, then roll the API app. Update
-CDN/Storage SPA assets for the same release. Generic topology:
+Same order: migrate with the bot app, then roll the API app. Both must keep
+using the same Bunny Database. Update separate CDN/Storage SPA assets, if any,
+from the same release. Generic topology:
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
 ## Related
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — dual-process and `config_version`
-- [CONFIGURATION.md](CONFIGURATION.md) — backups and config keys
+- [CONFIGURATION.md](CONFIGURATION.md) — config keys
+- [BACKUP-RESTORE.md](BACKUP-RESTORE.md) — provider backup status and restore gate

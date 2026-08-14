@@ -244,11 +244,11 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "setname",
         "Admin",
-        "Set the bot's nickname in this server (omit / clear / - to reset).",
+        "Queue the bot's nickname in this server (omit / clear / - to reset).",
         "!setname [name|clear|-]",
         "admin",
         Behavior::Setname,
-        "Bot nickname set to {name}",
+        "Bot nickname queued: {name}",
         "mod_action",
         vec![],
     ));

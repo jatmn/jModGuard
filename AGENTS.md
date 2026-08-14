@@ -30,7 +30,7 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).
-- rusqlite 0.40 (bundled), r2d2_sqlite 0.35, axum 0.8, tower-sessions 0.14,
+- libsql 0.9.30 (`core`, `remote`, `tls`), axum 0.8, tower-sessions 0.14,
   reqwest 0.13, edition 2024.
 
 ## Invariants to respect
@@ -43,11 +43,13 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   per-message (per-(guild,user) buckets), no full-map scans.
 - All user-visible strings flow through the template renderer
   (`src/templates.rs`) — no hardcoded chat messages in behaviors.
-- Config writers bump durable `config_version` in the DB layer (same
+- Config writers bump durable `config_version` and replace its revision token
+  in the DB layer (same
   transaction as the write); call sites still call `app.invalidate_configs()`
   for same-process freshness. Both bot and API poll `config_version` for
   cross-process invalidation. Command registry writers (commands table /
-  command copies) also bump `slash_registry_version`; the bot peeks that
+  command copies) also bump `slash_registry_version` and replace its revision
+  token; the bot peeks that
   every tick (independently of `config_version`) and re-syncs Discord slash
   commands for cached guilds when it advances, committing the observed
   version only after a successful sync pass (failed guilds retry next poll;
@@ -92,12 +94,15 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   `EventRow` / `BadwordView` snowflake fields use the same string serde.
 - Bot nickname: WebUI empty field, `!setname` with no args / `clear` / `-`, and
   `/setname` with the optional `name` omitted all clear the Discord nickname and
-  persist `bot_name=""`. Discord is updated **before** SQLite (WebUI and
-  `!setname`); if SQLite then fails, Discord is restored to the previous nick
-  (shared retry helper). WebUI "Use global" sends `bot_name: null` to inherit
-  the parent nickname. Copy-config preflights refuse conditions (badwords /
-  logchannels-only) before any Discord nickname mutation. `guild_create` only
-  applies a nickname when `bot_name` is non-empty (does not re-clear on join).
+  persist `bot_name=""`. Settings and a generation-numbered outbox row commit
+  atomically; only the bot drains that row and mutates Discord. Transient failures
+  use persisted bounded backoff, permanent failures become terminal, and a real
+  guild departure makes the row dormant until rejoin. Generation-checked
+  acknowledgement makes the final committed value win across bot/API races.
+  Nicknames are deliberately guild-only; the WebUI does not offer a global
+  nickname override. `guild_create` uses a lifecycle-only transition: reconnects
+  preserve terminal failures, dormant work is reactivated, and a genuinely new
+  guild gets initial work (including an empty nickname).
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.
@@ -109,16 +114,16 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   clear-to-empty.
   Empty prefix values are rejected by `patch_settings`. Bot migrate-open
   rewrites legacy settings blobs (including global) to parent-relative
-  overrides without deleting ambiguous complete default blobs, and clears corrupt JSON (including at
-  runtime read), and bumps `config_version` when rows change. The API process
-  runs the same idempotent heal on open (`migrate=false`) so legacy rows are
-  fixed even if the bot has not restarted yet. Heal is skipped on open when
+  overrides without deleting ambiguous complete default blobs, clears corrupt JSON,
+  and bumps `config_version` when rows change. Runtime reads ignore corrupt rows
+  so inheritance remains available, but durable repair is bot-owned; restart the
+  bot to run it. Heal is skipped on bot open when
   `meta.settings_heal_generation` + `meta.settings_heal_checksum` match the
   current `guild_settings` table (fast-path; checksum is a stable FNV-1a so
   bot and API agree across process restarts); bump `SETTINGS_HEAL_GENERATION`
   in code when heal logic or the checksum algorithm changes to force one full
   re-pass. Every committed `guild_settings` mutation (patch, copy settings,
-  test upsert, heal, runtime corrupt clear on autocommit) calls
+  test upsert, heal) calls
   `refresh_settings_heal_checksum_conn` so the fast-path stays accurate.
 - Message retention purge is **per-guild** via the same field-level resolution
   (`0` keeps forever). `bot.retention_days` / `bot.default_prefix` are synced
@@ -144,7 +149,14 @@ src/lib.rs              shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 src/config.rs           config.toml + env (db.url/token, config_poll_secs)
-src/db.rs               SQLite (WAL) + migrations + config_version
+src/db.rs               local/remote libSQL pool + public data-layer facade
+src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
+src/db/configuration.rs config CRUD + resolved snapshots
+src/db/settings.rs      inherited settings reads/writes
+src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
+src/db/moderation.rs    members/messages/retention/audit/warns/bans
+src/db/tests.rs         database unit and regression tests
+src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/discord.rs          Discord REST helpers (nickname retries)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
@@ -154,7 +166,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (embeds frontend/)
 frontend/               SPA assets
-migrations/             0001_init + 0002_config_version
+migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

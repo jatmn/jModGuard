@@ -15,6 +15,14 @@ jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jm
        └──── polls config_version ─┴── both processes poll ────┘
 ```
 
+For a single-host install, both processes open the same local SQLite file. For
+distributed deployment, both connect to one remote libSQL database. Bunny
+Database is the documented first-class remote provider; its environment
+mapping and generic protocol path have automated coverage, while production
+TLS/authentication is verified during deployment acceptance. Local SQLite
+uses WAL mode, so its file must not be placed on a network filesystem or opened
+by processes on different hosts.
+
 ## Feature split
 
 - Feature `web` (default): axum, tower-sessions, embedded SPA from `frontend/`.
@@ -23,23 +31,44 @@ jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jm
 
 ## Config cache invalidation
 
-Config writers bump a durable `meta.config_version` row **inside the DB layer**
+Config writers bump a durable `meta.config_version` row and replace its
+`meta.config_revision` token **inside the DB layer**
 (same transaction as the write). Runtime writers (messages, members, events,
 warns, bans, users) do **not** bump it.
 
 Both processes poll `bot.config_poll_secs` (default 5) and invalidate their
 in-memory guild config cache when the version changes. Command registry writers
-also bump `meta.slash_registry_version`; the bot polls that independently each
+also bump `meta.slash_registry_version` and replace its revision token; the bot polls that independently each
 tick and re-syncs Discord slash commands only when it advances (not on every
 settings/rules/template write). `AppState::new` primes both baselines from the
 DB so the first poll has no unobserved window.
 
-Expect up to one poll interval of lag after a cross-process config write — that
-is by design.
+Expect up to one poll interval of lag locally after a cross-process config
+write; remote deployments can additionally wait for provider replica convergence.
+Slash-command resync reads its registry version and command rows in one
+transaction and retries when that snapshot has not reached the target version.
+If a lower counter is observed, jModGuard confirms it through an `IMMEDIATE`
+transaction routed to the primary before rebaselining caches. This recovers
+from Bunny's documented failover-loss window without accepting a stale replica
+as authoritative. Non-reusable revision tokens also distinguish counters that
+return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
+transactions so they begin on the primary and serialize with other writers.
+
+Nickname changes commit a generation-numbered durable outbox row in the same
+settings transaction. The bot is the sole Discord nickname writer: it drains
+due work through primary-routed reads and acknowledges only the generation it
+applied. Transient Discord failures use persisted exponential backoff with
+jitter and a bounded retry budget. Permanent rejections become terminal,
+operator-visible rows; guild departure makes work dormant until `guild_create`
+reactivates it. Reconnects leave terminal failures untouched; only a settings
+change or explicit operator repair supersedes them. This makes the final
+committed nickname win across bot/API races and survives cancelled requests
+without rolling back durable settings.
 
 ## Migrations
 
-- Bot applies migrations, seeds globals, heals settings, then publishes a
+- Bot applies migrations, atomically seeds globals plus their config/command
+  versions, heals settings, then publishes a
   bootstrap-complete marker.
 - API opens with `migrate=false`. Until the schema, terminal-defaults meta, and
   bootstrap-complete marker exist—or while SQLite is transiently locked by bot
@@ -62,7 +91,7 @@ src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 frontend/                  SPA (served by API locally; CDN-ready)
-migrations/                0001_init + 0002_config_version + 0003_archive_global_log_channels
+migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot
 Dockerfile.api
 ```

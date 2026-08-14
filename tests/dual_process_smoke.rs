@@ -65,8 +65,9 @@ async fn smoke_dual_process_config_sync() {
         let guild_id: u64 = 55_555;
 
         // --- check 1: shared DB, version baseline ----------------------------
-        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 0);
-        assert_eq!(db::get_config_version(&api.db).await.unwrap(), 0);
+        let baseline = db::get_config_version(&bot.db).await.unwrap();
+        assert!(baseline > 0, "initial seed must be versioned");
+        assert_eq!(db::get_config_version(&api.db).await.unwrap(), baseline);
 
         // Already primed at AppState::new — unchanged version must not invalidate.
         assert!(!bot.poll_config_version().await.unwrap());
@@ -88,7 +89,7 @@ async fn smoke_dual_process_config_sync() {
         .unwrap();
         api.invalidate_configs();
 
-        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), 1);
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), baseline + 1);
         assert!(
             bot.poll_config_version().await.unwrap(),
             "bot must detect API config_version bump"
@@ -118,7 +119,7 @@ async fn smoke_dual_process_config_sync() {
             "API must read bot-side config write from shared DB"
         );
 
-        assert_eq!(db::get_config_version(&api.db).await.unwrap(), 2);
+        assert_eq!(db::get_config_version(&api.db).await.unwrap(), baseline + 2);
         assert!(
             api.poll_config_version().await.unwrap(),
             "API must detect bot config_version bump"

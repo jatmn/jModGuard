@@ -14,10 +14,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::logging;
 use crate::state::{AppState, CachedGuildConfig};
 use crate::templates;
 use crate::types::CommandDef;
+use crate::{db, logging};
 
 use std::collections::HashMap as StdHashMap;
 
@@ -335,28 +335,67 @@ pub async fn handle_prefix(
 
 /// Registers guild slash commands from the command registry.
 pub async fn sync_slash_commands(app: &Arc<AppState>, ctx: &Context, guild_id: GuildId) -> bool {
-    sync_slash_commands_http(app, &ctx.http, guild_id).await
-}
-
-/// Same as [`sync_slash_commands`] but usable from the config_version poll task
-/// (which has `Http` + cache, not a full `Context`).
-///
-/// Returns `true` when Discord accepted the command set. `false` means the
-/// caller should retry — do not advance `slash_registry_version` observation.
-pub async fn sync_slash_commands_http(
-    app: &Arc<AppState>,
-    http: impl AsRef<serenity::http::Http>,
-    guild_id: GuildId,
-) -> bool {
-    let cfg = match app.configs.get(&app.db, guild_id.get()).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("slash sync: config load failed for {guild_id}: {e:#}");
+    let target = match db::get_slash_registry_version(&app.db).await {
+        Ok(version) => version.max(app.acknowledged_slash_registry_version()),
+        Err(error) => {
+            tracing::warn!("slash sync: registry version load failed for {guild_id}: {error:#}");
             return false;
         }
     };
+    sync_slash_commands_versioned_http(app, &ctx.http, guild_id, target).await
+}
+
+/// Registry-poll variant: command rows and the version that identifies them
+/// are read from one database snapshot. A lagging replica is retried instead
+/// of allowing Discord to accept stale rows under a newer acknowledged version.
+pub async fn sync_slash_commands_versioned_http(
+    app: &Arc<AppState>,
+    http: impl AsRef<serenity::http::Http>,
+    guild_id: GuildId,
+    target_version: u64,
+) -> bool {
+    let expected_revision = app.slash_registry_revision();
+    let (mut loaded_version, mut loaded_revision, mut commands) =
+        match db::load_slash_commands_with_version(&app.db, guild_id.get() as i64).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    "slash sync: versioned registry load failed for {guild_id}: {error:#}"
+                );
+                return false;
+            }
+        };
+    if loaded_version != target_version || loaded_revision != expected_revision {
+        match db::load_slash_commands_with_version_primary(&app.db, guild_id.get() as i64).await {
+            Ok((version, revision, primary_commands)) => {
+                loaded_version = version;
+                loaded_revision = revision;
+                commands = primary_commands;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "slash sync: primary registry load failed for {guild_id}: {error:#}"
+                );
+                return false;
+            }
+        }
+    }
+    if loaded_version != target_version || loaded_revision != expected_revision {
+        tracing::warn!(
+            "slash sync: registry snapshot {loaded_version}/{loaded_revision} for {guild_id} did not match expected {target_version}/{expected_revision}; will retry"
+        );
+        return false;
+    }
+    set_slash_commands(http, guild_id, &commands).await
+}
+
+async fn set_slash_commands(
+    http: impl AsRef<serenity::http::Http>,
+    guild_id: GuildId,
+    registry: &std::collections::HashMap<String, CommandDef>,
+) -> bool {
     let mut commands: Vec<CreateCommand> = Vec::new();
-    for cmd in cfg.commands.values() {
+    for cmd in registry.values() {
         if !cmd.enabled {
             continue;
         }
@@ -376,10 +415,19 @@ pub async fn sync_slash_commands_http(
         }
         commands.push(builder);
     }
-    match guild_id.set_commands(http.as_ref(), commands).await {
-        Ok(_) => true,
-        Err(e) => {
+    match tokio::time::timeout(
+        crate::discord::DISCORD_REST_TIMEOUT,
+        guild_id.set_commands(http.as_ref(), commands),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
             tracing::warn!("slash sync failed for {guild_id}: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("slash sync timed out for {guild_id}");
             false
         }
     }

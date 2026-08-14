@@ -46,11 +46,15 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 - Intents used: `GUILD_MEMBERS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MODERATION`.
   GUILD_MEMBERS and MESSAGE_CONTENT are privileged (enable in portal).
 
-## rusqlite 0.40 / r2d2_sqlite 0.35
+## libsql 0.9.30
 
-- `OptionalExtension` still exists; `.optional()` must be wrapped as
-  `Ok(conn.query_row(..).optional()?)` when returning anyhow::Result from a
-  `with_conn` closure.
+- Bunny Database uses the remote libSQL protocol. Build it with
+  `Builder::new_remote(url, token)`; local installs use `Builder::new_local`.
+- The libSQL API is async. `src/db_compat.rs` supplies a narrow synchronous
+  facade so the existing SQL paths can run unchanged inside `with_conn`'s
+  blocking closures.
+- A Tokio runtime must not be dropped from an async context. The compatibility
+  runtime is therefore owned and dropped by a dedicated OS thread.
 - `with_conn` closures need `Send + 'static` (spawn_blocking): convert all
   borrowed `&str` params to owned `String` before the closure.
 - Generic `load_rows` needs `T: Send + 'static`.
@@ -75,9 +79,10 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 - All automod state is per-(guild,user) dashmap buckets pruned every 60s;
   lookups are O(1) per message, never full-map scans.
 - Serenity message cache disabled (own SQLite store with retention).
-- DB writes are single-row through a bounded r2d2 pool (WAL); no unbounded
-  queues anywhere. If a future raid causes SQLite lock contention, batch
-  message inserts via a writer task with a bounded channel.
+- DB operations are limited by `db.pool_size` in each process. Local installs
+  use SQLite WAL; Bunny deployments use remote libSQL. There are no unbounded
+  queues. If a future raid causes write contention, batch message inserts via
+  a writer task with a bounded channel.
 - OAuth guild/user data cached in-memory for 60s to limit Discord API calls.
 
 ## Production bugfixes (2026-08-05)
@@ -88,9 +93,9 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 - **Empty log file**: the `tracing_appender::non_blocking` guard must outlive
   the process. Dropping it at the end of `init_tracing` killed the writer
   thread and silently lost every log line. Fix: `std::mem::forget(guard)`.
-- **Startup "database is locked"**: pool connections racing the migration
-  transaction. Fix: migrate + seed globals on a dedicated `Connection` before
-  building the r2d2 pool (`Db::open` in `src/db.rs`).
+- **Startup "database is locked"**: connections racing the migration
+  transaction. Fix: migrate + seed globals on a dedicated bootstrap connection
+  before normal database traffic (`Db::open` in `src/db.rs`).
 - **Bot silently ignored ALL commands**: `load_config_parts` used a
   hardcoded `data` value column for every table, but `templates` stores its
   value in `template` and `log_channels` in `channel_id`. Every config load

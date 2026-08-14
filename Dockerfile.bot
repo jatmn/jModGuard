@@ -17,4 +17,7 @@ WORKDIR /data
 VOLUME ["/data"]
 ENV JMODGUARD_DB_PATH=/data/jmodguard.db
 ENV JMODGUARD_CONFIG=/data/config.toml
+# Container platforms collect stdout/stderr. An empty directory disables
+# rolling files; override this if persistent file logs are desired.
+ENV JMODGUARD_LOG_DIRECTORY=""
 ENTRYPOINT ["jmodguard-bot"]

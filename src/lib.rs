@@ -1,4 +1,4 @@
-//! jModGuard shared library: Discord bot logic, SQLite data layer, and WebUI/API.
+//! jModGuard shared library: Discord bot logic, libSQL data layer, and WebUI/API.
 //!
 //! Two binaries consume this crate:
 //! - `jmodguard-bot` — Discord gateway only
@@ -8,6 +8,7 @@ pub mod automod;
 pub mod commands;
 pub mod config;
 pub mod db;
+mod db_compat;
 pub mod defaults;
 pub mod discord;
 pub mod handlers;
