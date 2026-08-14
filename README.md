@@ -113,7 +113,13 @@ lib.rs         shared crate root (modules + init_tracing; web behind feature)
 bin/jmodguard-bot.rs   Discord gateway only (migrate=true, config_version poll)
 bin/jmodguard-api.rs   axum API/WebUI only (migrate=false; requires feature web)
 config.rs      config.toml + env overrides (db.url/token, config_poll_secs)
-db.rs          local/remote libSQL, migrations, config_version, data layer
+db.rs          local/remote libSQL pool and public data-layer facade
+db/bootstrap.rs        migrations, startup fencing, versions, settings healing
+db/configuration.rs    rules, commands, templates, badwords, config snapshots
+db/settings.rs         inherited settings reads/writes
+db/nickname_jobs.rs    durable Discord nickname reconciliation jobs
+db/moderation.rs       members, messages, retention, audit, warns, and bans
+db_compat.rs   synchronous libSQL transaction/deadline/outcome facade
 defaults.rs    seeded rules / commands / templates
 types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)
 state.rs       AppState, OAuth client, per-guild config cache + version poll

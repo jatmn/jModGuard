@@ -146,7 +146,13 @@ src/lib.rs              shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 src/config.rs           config.toml + env (db.url/token, config_poll_secs)
-src/db.rs               local/remote libSQL + migrations + pooling/versioning
+src/db.rs               local/remote libSQL pool + public data-layer facade
+src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
+src/db/configuration.rs config CRUD + resolved snapshots
+src/db/settings.rs      inherited settings reads/writes
+src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
+src/db/moderation.rs    members/messages/retention/audit/warns/bans
+src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/discord.rs          Discord REST helpers (nickname retries)
 src/defaults.rs         seeded rules/commands/templates
