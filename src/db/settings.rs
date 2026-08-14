@@ -195,7 +195,7 @@ pub(crate) async fn upsert_settings(
         let ov = normalize_settings_override_against_parent(&override_, &parent);
         write_settings_override_conn(&tx, guild_id, &ov)?;
         bump_config_version_conn(&tx)?;
-        refresh_settings_heal_checksum_conn(&tx)?;
+        invalidate_settings_heal_checksum_conn(&tx)?;
         tx.commit()?;
         Ok(())
     })
@@ -290,7 +290,7 @@ pub async fn patch_settings_with_nickname_reconcile(
         }
         let effective = effective_settings_conn(&tx, guild_id, &defaults)?;
         if settings_changed {
-            refresh_settings_heal_checksum_conn(&tx)?;
+            invalidate_settings_heal_checksum_conn(&tx)?;
         }
         tx.commit()?;
         Ok(effective)

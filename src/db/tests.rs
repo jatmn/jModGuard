@@ -1344,7 +1344,7 @@ fn seed_globals_writes_parent_relative_partial_override() {
 }
 
 #[test]
-fn preflight_copy_refuses_all_invalid_badwords_before_writes() {
+fn copy_refuses_all_invalid_badwords_before_writes() {
     let tmp = tmp_db_path("preflight_badwords");
     let db = Db::open(&tmp, 2).unwrap();
     // Legacy row past the add gate — same shape that refuses a live copy.
@@ -1356,14 +1356,14 @@ fn preflight_copy_refuses_all_invalid_badwords_before_writes() {
         Ok(())
     }))
     .unwrap();
-    let err = tokio_test_block_on(crate::db::preflight_copy_guild_config(
+    let err = tokio_test_block_on(crate::db::copy_guild_config(
         &db,
         11,
         22,
         vec!["settings".into(), "badwords".into()],
     ))
     .err()
-    .expect("preflight must refuse");
+    .expect("copy transaction must refuse");
     assert!(err.to_string().contains("refused"), "unexpected: {err:#}");
     cleanup_db(&tmp);
 }

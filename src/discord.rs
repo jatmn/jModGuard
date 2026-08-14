@@ -29,9 +29,14 @@ pub fn classify_nickname_failure(error: &serenity::Error) -> (NicknameFailureCla
             serenity::http::HttpError::Request(_)
                 | serenity::http::HttpError::RateLimitI64F64
                 | serenity::http::HttpError::RateLimitUtf8
-        )
+        ) | serenity::Error::Io(_)
+            | serenity::Error::Json(_)
+            | serenity::Error::Decode(_, _)
     ) {
-        return (NicknameFailureClass::Transient, "transport".into());
+        return (
+            NicknameFailureClass::Transient,
+            "transport_or_decode".into(),
+        );
     }
     (NicknameFailureClass::Terminal, "client_error".into())
 }
@@ -41,7 +46,7 @@ fn classify_nickname_response(status: u16, discord_code: isize) -> (NicknameFail
     if matches!(discord_code, 10004 | 50001) {
         return (NicknameFailureClass::Dormant, code);
     }
-    if status == 429 || status >= 500 {
+    if status == 408 || status == 429 || status >= 500 {
         return (NicknameFailureClass::Transient, code);
     }
     (NicknameFailureClass::Terminal, code)
@@ -80,7 +85,7 @@ pub async fn validate_log_channel_guild(
 
 #[cfg(test)]
 mod tests {
-    use super::{NicknameFailureClass, classify_nickname_response};
+    use super::{NicknameFailureClass, classify_nickname_failure, classify_nickname_response};
 
     #[test]
     fn nickname_failure_lifecycle_classification() {
@@ -101,6 +106,10 @@ mod tests {
             NicknameFailureClass::Terminal
         );
         assert_eq!(
+            classify_nickname_response(408, 0).0,
+            NicknameFailureClass::Transient
+        );
+        assert_eq!(
             classify_nickname_response(429, 0).0,
             NicknameFailureClass::Transient
         );
@@ -109,10 +118,15 @@ mod tests {
             NicknameFailureClass::Transient
         );
         assert_eq!(
-            super::classify_nickname_failure(&serenity::Error::Http(
+            classify_nickname_failure(&serenity::Error::Http(
                 serenity::http::HttpError::RateLimitUtf8,
             ))
             .0,
+            NicknameFailureClass::Transient
+        );
+        let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(
+            classify_nickname_failure(&serenity::Error::Json(json_error)).0,
             NicknameFailureClass::Transient
         );
     }

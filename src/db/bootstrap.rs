@@ -381,6 +381,18 @@ pub(super) fn refresh_settings_heal_checksum_conn(conn: &impl SqlExecutor) -> Re
     Ok(())
 }
 
+/// Runtime settings writers already produce normalized rows. Invalidate the
+/// startup-heal fast-path cheaply instead of rescanning every guild's settings
+/// while holding the primary writer transaction; the next bot bootstrap will
+/// verify/heal once and publish a fresh checksum.
+pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key IN (?1, ?2)",
+        params![META_SETTINGS_HEAL_GENERATION, META_SETTINGS_HEAL_CHECKSUM],
+    )?;
+    Ok(())
+}
+
 pub(super) fn seed_globals_conn(
     conn: &mut Connection,
     default_prefix: &str,

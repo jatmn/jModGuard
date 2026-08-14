@@ -344,7 +344,7 @@ pub async fn delete_badword(
     // Uniform "not found" for missing / wrong-guild / non-owner global — never
     // distinguish existence across scopes (error-oracle / IDOR probe).
     let not_found = || ApiError(anyhow::anyhow!("badword not found"));
-    let Some(word) = db::get_badword(&app.db, word_id).await? else {
+    let Some(word) = db::get_badword_primary(&app.db, word_id).await? else {
         return Err(not_found());
     };
     let allowed = if word.guild_id == GLOBAL_SCOPE {
@@ -681,18 +681,6 @@ pub async fn copy_config(
     }
 
     let wants_settings = body.sections.iter().any(|s| s == "settings" || s == "all");
-
-    // Refuse known hard-fail cases before starting the copy.
-    // copy_guild_config also re-runs preflight so a concurrent source change
-    // between this check and the write cannot skip validation.
-    db::preflight_copy_guild_config(
-        &app.db,
-        body.from_guild_id as i64,
-        guild_id as i64,
-        body.sections.clone(),
-    )
-    .await
-    .map_err(ApiError)?;
 
     // Settings copy atomically commits the desired nickname and outbox row;
     // the bot applies Discord from that durable state.

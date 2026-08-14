@@ -405,28 +405,34 @@ pub async fn add_badword(db: &Db, guild_id: i64, pattern: &str, note: Option<&st
     .await
 }
 
-/// Deletes a badword only when `id` belongs to the exact `guild_id` scope.
-/// Callers that want to delete a global row must pass `GLOBAL_SCOPE` and
-/// enforce owner auth at the API layer.
-pub async fn get_badword(db: &Db, id: i64) -> Result<Option<Badword>> {
+/// Authoritative lookup used to authorize a following mutation. Ordinary
+/// replica reads can legitimately lag a just-committed add.
+pub async fn get_badword_primary(db: &Db, id: i64) -> Result<Option<Badword>> {
     db.with_conn(move |conn| {
-        conn.query_row(
-            "SELECT id, guild_id, pattern, note FROM badwords WHERE id = ?1",
-            params![id],
-            |r| {
-                Ok(Badword {
-                    id: r.get(0)?,
-                    guild_id: r.get(1)?,
-                    pattern: r.get(2)?,
-                    note: r.get(3)?,
-                })
-            },
-        )
-        .optional()
+        let tx = conn.transaction_primary_read()?;
+        let word = tx
+            .query_row(
+                "SELECT id, guild_id, pattern, note FROM badwords WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(Badword {
+                        id: r.get(0)?,
+                        guild_id: r.get(1)?,
+                        pattern: r.get(2)?,
+                        note: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        tx.finish_read()?;
+        Ok(word)
     })
     .await
 }
 
+/// Deletes a badword only when `id` belongs to the exact `guild_id` scope.
+/// Callers that want to delete a global row must pass `GLOBAL_SCOPE` and
+/// enforce owner auth at the API layer.
 pub async fn delete_badword(db: &Db, id: i64, guild_id: i64) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
@@ -494,24 +500,9 @@ fn section_wanted(sections: &[String], name: &str) -> bool {
     sections.iter().any(|s| s == name || s == "all")
 }
 
-/// Read-only checks for copy refuse conditions (no writes).
-///
-/// Validate known copy refusal conditions before starting the write.
-fn preflight_copy_guild_config_conn(
-    conn: &impl SqlExecutor,
-    src: i64,
-    dst: i64,
-    sections: &[String],
-) -> Result<()> {
-    if section_wanted(sections, "badwords") {
-        let mut stmt = conn.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1")?;
-        let rows: Vec<(String, Option<String>)> = stmt
-            .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(stmt);
-        let _ = prepare_badword_replacement(rows)?;
-    }
-
+/// Validate structural copy refusal conditions before changing rows. Any
+/// data-dependent validation stays inside the same primary write snapshot.
+fn validate_copy_sections(src: i64, dst: i64, sections: &[String]) -> Result<()> {
     if section_wanted(sections, "logchannels") && src != dst {
         let only_logchannels = sections.iter().all(|s| s == "logchannels");
         if only_logchannels {
@@ -525,23 +516,12 @@ fn preflight_copy_guild_config_conn(
     Ok(())
 }
 
-/// Public preflight for WebUI/API: refuse known hard-fail copy cases early.
-pub async fn preflight_copy_guild_config(
-    db: &Db,
-    src: i64,
-    dst: i64,
-    sections: Vec<String>,
-) -> Result<()> {
-    db.with_conn(move |conn| preflight_copy_guild_config_conn(conn, src, dst, &sections))
-        .await
-}
-
 /// Copies selected config sections from `src` to `dst` in one transaction
 /// with a single `config_version` bump (avoids mid-copy cache snapshots).
 ///
-/// Always re-runs [`preflight_copy_guild_config`] inside this call so a
-/// concurrent source change between an earlier WebUI preflight and this write
-/// cannot skip validation. Callers may still preflight earlier for fast errors.
+/// Validates refusal conditions inside the primary write snapshot so replica
+/// lag cannot falsely reject a copy and a concurrent source change cannot skip
+/// validation.
 ///
 /// Badwords use validate-then-atomic-replace: the destination is only cleared
 /// after a usable replacement set is prepared. If every source pattern fails
@@ -558,7 +538,7 @@ pub async fn copy_guild_config(
         let tx = conn.transaction_immediate()?;
         let defaults = terminal_defaults_conn(&tx)?;
         // Always re-validate in the same primary snapshot as the write.
-        preflight_copy_guild_config_conn(&tx, src, dst, &sections)?;
+        validate_copy_sections(src, dst, &sections)?;
         let mut result = CopyResult::default();
         let wants = |name: &str| section_wanted(&sections, name);
         let copied_settings = wants("settings");
@@ -588,40 +568,57 @@ pub async fn copy_guild_config(
         }
 
         if wants("rules") {
-            let mut stmt = tx.prepare("SELECT rule_id, data FROM rules WHERE guild_id = ?1")?;
-            let rows: Vec<(String, String)> = stmt
-                .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            drop(stmt);
-            tx.execute("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
-            for (rid, data) in rows {
+            if src != dst {
+                tx.execute("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 tx.execute(
-                    "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
-                    params![dst, rid, data],
+                    "INSERT INTO rules (guild_id, rule_id, data)
+                     SELECT ?1, rule_id, data FROM rules WHERE guild_id = ?2",
+                    params![dst, src],
                 )?;
             }
             result.copied.push("rules");
         }
 
         if wants("badwords") {
-            let mut stmt = tx.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1")?;
+            const MAX_COPY_BADWORDS: usize = 1_000;
+            let mut stmt =
+                tx.prepare("SELECT pattern, note FROM badwords WHERE guild_id = ?1 LIMIT 1001")?;
             let rows: Vec<(String, Option<String>)> = stmt
                 .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
+            if rows.len() > MAX_COPY_BADWORDS {
+                anyhow::bail!("badword copy is limited to {MAX_COPY_BADWORDS} rows per operation");
+            }
 
             // Validate BEFORE touching destination — DELETE-then-filter wiped
             // dest when every source pattern was invalid (recurring review bug).
             let (replacement, skipped) = prepare_badword_replacement(rows)?;
             result.skipped_badwords = skipped;
 
-            tx.execute("DELETE FROM badwords WHERE guild_id = ?1", params![dst])?;
-            for (pattern, note) in &replacement {
-                tx.execute(
-                    "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
-                    params![dst, pattern.clone(), note.clone()],
-                )?;
+            if src != dst {
+                tx.execute("DELETE FROM badwords WHERE guild_id = ?1", params![dst])?;
+                // Keep remote round trips bounded: validated rows are inserted
+                // in parameterized batches rather than one request per row.
+                for chunk in replacement.chunks(100) {
+                    let values = (0..chunk.len())
+                        .map(|i| {
+                            let n = i * 3 + 1;
+                            format!("(?{n}, ?{}, ?{})", n + 1, n + 2)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut args = Vec::with_capacity(chunk.len() * 3);
+                    for (pattern, note) in chunk {
+                        args.push(Value::Integer(dst));
+                        args.push(Value::Text(pattern.clone()));
+                        args.push(note.clone().map(Value::Text).unwrap_or(Value::Null));
+                    }
+                    tx.execute(
+                        &format!("INSERT INTO badwords (guild_id, pattern, note) VALUES {values}"),
+                        params_from_iter(args),
+                    )?;
+                }
             }
             tracing::debug!(
                 "copy_guild_config badwords src={src} dst={dst}: inserted={} skipped={skipped}",
@@ -631,35 +628,24 @@ pub async fn copy_guild_config(
         }
 
         if wants("commands") {
-            let mut stmt = tx.prepare("SELECT name, data FROM commands WHERE guild_id = ?1")?;
-            let rows: Vec<(String, String)> = stmt
-                .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            drop(stmt);
-            tx.execute("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
-            for (name, data) in rows {
+            if src != dst {
+                tx.execute("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
                 tx.execute(
-                    "INSERT INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(guild_id, name) DO UPDATE SET data = excluded.data",
-                    params![dst, name, data],
+                    "INSERT INTO commands (guild_id, name, data)
+                     SELECT ?1, name, data FROM commands WHERE guild_id = ?2",
+                    params![dst, src],
                 )?;
             }
             result.copied.push("commands");
         }
 
         if wants("templates") {
-            let mut stmt =
-                tx.prepare("SELECT event_type, template FROM templates WHERE guild_id = ?1")?;
-            let rows: Vec<(String, String)> = stmt
-                .query_map(params![src], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            drop(stmt);
-            tx.execute("DELETE FROM templates WHERE guild_id = ?1", params![dst])?;
-            for (event, template) in rows {
+            if src != dst {
+                tx.execute("DELETE FROM templates WHERE guild_id = ?1", params![dst])?;
                 tx.execute(
-                    "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(guild_id, event_type) DO UPDATE SET template = excluded.template",
-                    params![dst, event, template],
+                    "INSERT INTO templates (guild_id, event_type, template)
+                     SELECT ?1, event_type, template FROM templates WHERE guild_id = ?2",
+                    params![dst, src],
                 )?;
             }
             result.copied.push("templates");
@@ -692,7 +678,7 @@ pub async fn copy_guild_config(
             }
         }
         if copied_settings {
-            refresh_settings_heal_checksum_conn(&tx)?;
+            invalidate_settings_heal_checksum_conn(&tx)?;
         }
         tx.commit()?;
         Ok(result)
