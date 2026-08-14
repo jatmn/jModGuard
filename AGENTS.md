@@ -111,16 +111,16 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   clear-to-empty.
   Empty prefix values are rejected by `patch_settings`. Bot migrate-open
   rewrites legacy settings blobs (including global) to parent-relative
-  overrides without deleting ambiguous complete default blobs, and clears corrupt JSON (including at
-  runtime read), and bumps `config_version` when rows change. The API process
-  runs the same idempotent heal on open (`migrate=false`) so legacy rows are
-  fixed even if the bot has not restarted yet. Heal is skipped on open when
+  overrides without deleting ambiguous complete default blobs, clears corrupt JSON,
+  and bumps `config_version` when rows change. Runtime reads ignore corrupt rows
+  so inheritance remains available, but durable repair is bot-owned; restart the
+  bot to run it. Heal is skipped on bot open when
   `meta.settings_heal_generation` + `meta.settings_heal_checksum` match the
   current `guild_settings` table (fast-path; checksum is a stable FNV-1a so
   bot and API agree across process restarts); bump `SETTINGS_HEAL_GENERATION`
   in code when heal logic or the checksum algorithm changes to force one full
   re-pass. Every committed `guild_settings` mutation (patch, copy settings,
-  test upsert, heal, runtime corrupt clear on autocommit) calls
+  test upsert, heal) calls
   `refresh_settings_heal_checksum_conn` so the fast-path stays accurate.
 - Message retention purge is **per-guild** via the same field-level resolution
   (`0` keeps forever). `bot.retention_days` / `bot.default_prefix` are synced

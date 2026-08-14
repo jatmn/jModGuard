@@ -109,9 +109,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    setting. New writers store parent-relative partial overrides, so this
    ambiguity does not recur for post-upgrade writes.
    Start the bot once after this upgrade before relying on global settings
-   inheritance. The API process also runs this heal idempotently on every open
-   (`migrate=false`), so a running API picks up healed rows without waiting
-   for a bot restart. The bot also writes durable
+   inheritance. Runtime reads ignore corrupt rows so inheritance remains
+   available, but only a bot migrate-open durably heals them. The bot also writes durable
    `meta.settings_terminal_defaults` from `bot.default_prefix` /
    `bot.retention_days` on every migrate-open; both processes read that meta
    row on each settings resolve (not cached at open). The API **refuses to

@@ -174,7 +174,10 @@ impl AppState {
         let remote = db::get_slash_registry_version(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
         if remote < prev {
-            let suspected_floor = prev.max(self.db.required_config_version());
+            let suspected_floor = self
+                .last_config_version
+                .load(Ordering::SeqCst)
+                .max(self.db.required_config_version());
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
             let (_, slash_changed) =
                 self.reconcile_primary_versions(primary_config, primary_slash, suspected_floor);
