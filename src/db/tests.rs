@@ -471,6 +471,8 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     );
     let refused = anyhow::anyhow!("tcp connect error: connection refused");
     assert!(crate::db::is_api_startup_retryable(&refused, true));
+    let waking = anyhow::anyhow!("http error: status code: 503");
+    assert!(crate::db::is_api_startup_retryable(&waking, true));
     let auth = anyhow::anyhow!("unauthorized: invalid token");
     assert!(!crate::db::is_api_startup_retryable(&auth, true));
     let handshake = anyhow::anyhow!("tls handshake: client authentication timed out");

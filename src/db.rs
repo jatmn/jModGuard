@@ -125,6 +125,9 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
             "tls handshake",
             "handshake timed",
             "server is unavailable",
+            "bad gateway",
+            "status code: 502",
+            "status code: 503",
             "goaway",
             "stream closed",
         ];

@@ -5,7 +5,7 @@
 //! `GET /`) with 200 once the process has bound the port, without cookies,
 //! routing, or a database round-trip. The API exposes the same path on its
 //! public bind via axum, and answers probes on that socket while the
-//! database is still opening. Application routes (`/api`, `/login`,
+//! database is still opening. Application routes (`/`, `/api`, `/login`,
 //! `/oauth`, …) must not look successful during that window: they get
 //! `503` until axum takes over. `/health` is liveness, not database
 //! readiness: a pooled remote `SELECT 1` can wait tens of seconds and
@@ -88,10 +88,11 @@ where
     }
 }
 
-/// Answers one HTTP connection. `GET`/`HEAD` `/health` and `/` return
-/// `200 ok` (process liveness). Every other path returns `503` so a
-/// shared API bind cannot fake success for OAuth or `/api` during
-/// database open.
+/// Answers one HTTP connection. `GET`/`HEAD` `/health` return `200 ok`
+/// (process liveness). Every other path returns `503` so a shared API
+/// bind cannot fake success for `/`, OAuth, or `/api` during database
+/// open. `/` is not liveness: Bunny serves the admin UI from Storage,
+/// and the API image has no `/` route after axum takes over.
 pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
     let mut buf = [0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
@@ -120,7 +121,7 @@ fn is_liveness_request(buf: &[u8]) -> bool {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let path = target.split('?').next().unwrap_or("");
-    matches!(method, "GET" | "HEAD") && (path == "/health" || path == "/")
+    matches!(method, "GET" | "HEAD") && (path == "/health" || path == "/health/")
 }
 
 #[cfg(test)]
@@ -236,6 +237,67 @@ mod tests {
                 "unexpected: {text}"
             );
             assert!(text.contains("\r\n\r\nnot ready"), "unexpected: {text}");
+        };
+        super::serve_while(&listener, work).await;
+    }
+
+    #[tokio::test]
+    async fn serve_while_rejects_root_as_not_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let mut stream = None;
+            for _ in 0..50 {
+                if let Ok(connected) = TcpStream::connect(addr).await {
+                    stream = Some(connected);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut stream = stream.expect("health listener never accepted");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                text.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "unexpected: {text}"
+            );
+        };
+        super::serve_while(&listener, work).await;
+    }
+
+    #[tokio::test]
+    async fn health_trailing_slash_is_liveness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let mut stream = None;
+            for _ in 0..50 {
+                if let Ok(connected) = TcpStream::connect(addr).await {
+                    stream = Some(connected);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut stream = stream.expect("health listener never accepted");
+            stream
+                .write_all(b"GET /health/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         };
         super::serve_while(&listener, work).await;
     }
