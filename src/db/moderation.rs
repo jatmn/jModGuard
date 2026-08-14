@@ -160,8 +160,15 @@ pub async fn insert_message(
     );
     db.with_conn(move |conn| {
         conn.execute(
-            "INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(message_id) DO UPDATE SET
+               guild_id = excluded.guild_id,
+               channel_id = excluded.channel_id,
+               author_id = excluded.author_id,
+               content = CASE WHEN messages.edited_at IS NULL THEN excluded.content ELSE messages.content END,
+               attachments = excluded.attachments,
+               created_at = excluded.created_at",
             params![message_id, guild_id, channel_id, author_id, content, attachments, created_at],
         )?;
         Ok(())
@@ -206,8 +213,15 @@ pub async fn record_message_activity(
             params![guild_id, author_id, username.clone(), now.clone()],
         )?;
         tx.execute(
-            "INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(message_id) DO UPDATE SET
+               guild_id = excluded.guild_id,
+               channel_id = excluded.channel_id,
+               author_id = excluded.author_id,
+               content = CASE WHEN messages.edited_at IS NULL THEN excluded.content ELSE messages.content END,
+               attachments = excluded.attachments,
+               created_at = excluded.created_at",
             params![message_id, guild_id, channel_id, author_id, content, attachments, created_at],
         )?;
         tx.execute(
@@ -229,6 +243,9 @@ pub async fn record_message_activity(
 pub async fn mark_edited_with_previous(
     db: &Db,
     message_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    author_id: Option<i64>,
     content: &str,
 ) -> Result<Option<(String, String)>> {
     let (now, content) = (now_str(), content.to_string());
@@ -246,6 +263,16 @@ pub async fn mark_edited_with_previous(
                 "UPDATE messages SET content = ?1, edited_at = ?2 WHERE message_id = ?3",
                 params![content, now, message_id],
             )?;
+        } else {
+            // Gateway lifecycle events can overtake delayed best-effort message
+            // tracking. Keep a mergeable tombstone so the later create cannot
+            // erase this edit.
+            tx.execute(
+                "INSERT INTO messages
+                   (message_id, guild_id, channel_id, author_id, content, attachments, created_at, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6)",
+                params![message_id, guild_id, channel_id, author_id.unwrap_or(0), content, now],
+            )?;
         }
         tx.commit()?;
         Ok(previous)
@@ -256,6 +283,8 @@ pub async fn mark_edited_with_previous(
 pub async fn mark_deleted_with_previous(
     db: &Db,
     message_id: i64,
+    guild_id: i64,
+    channel_id: i64,
 ) -> Result<Option<(String, String)>> {
     let now = now_str();
     db.with_conn(move |conn| {
@@ -272,6 +301,13 @@ pub async fn mark_deleted_with_previous(
                 "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
                 params![now, message_id],
             )?;
+        } else {
+            tx.execute(
+                "INSERT INTO messages
+                   (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
+                 VALUES (?1, ?2, ?3, 0, '', '', ?4, ?4)",
+                params![message_id, guild_id, channel_id, now],
+            )?;
         }
         tx.commit()?;
         Ok(previous)
@@ -279,12 +315,16 @@ pub async fn mark_deleted_with_previous(
     .await
 }
 
-pub async fn mark_deleted(db: &Db, message_id: i64) -> Result<()> {
+pub async fn mark_deleted(db: &Db, message_id: i64, guild_id: i64, channel_id: i64) -> Result<()> {
     let now = now_str();
     db.with_conn(move |conn| {
         conn.execute(
-            "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
-            params![now, message_id],
+            "INSERT INTO messages
+               (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
+             VALUES (?1, ?2, ?3, 0, '', '', ?4, ?4)
+             ON CONFLICT(message_id) DO UPDATE SET
+               deleted_at = COALESCE(messages.deleted_at, excluded.deleted_at)",
+            params![message_id, guild_id, channel_id, now],
         )?;
         Ok(())
     })

@@ -729,6 +729,66 @@ fn config_parts_loads_effective_rules() {
 }
 
 #[test]
+fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
+    let tmp = tmp_db_path("message_lifecycle_reordering");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    assert!(
+        tokio_test_block_on(crate::db::mark_edited_with_previous(
+            &db,
+            101,
+            42,
+            7,
+            Some(9),
+            "edited first",
+        ))
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        tokio_test_block_on(crate::db::mark_deleted_with_previous(&db, 102, 42, 7))
+            .unwrap()
+            .is_none()
+    );
+
+    for (message_id, original) in [(101, "original edit"), (102, "original delete")] {
+        tokio_test_block_on(crate::db::record_message_activity(
+            &db,
+            message_id,
+            42,
+            7,
+            9,
+            "user",
+            None,
+            original,
+            "[]",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    }
+
+    let rows = tokio_test_block_on(db.with_conn(|conn| {
+        let edit = conn.query_row(
+            "SELECT content, edited_at IS NOT NULL, deleted_at IS NOT NULL
+             FROM messages WHERE message_id = 101",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<bool>(1)?, r.get::<bool>(2)?)),
+        )?;
+        let delete = conn.query_row(
+            "SELECT content, edited_at IS NOT NULL, deleted_at IS NOT NULL
+             FROM messages WHERE message_id = 102",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<bool>(1)?, r.get::<bool>(2)?)),
+        )?;
+        Ok((edit, delete))
+    }))
+    .unwrap();
+    assert_eq!(rows.0, ("edited first".to_string(), true, false));
+    assert_eq!(rows.1, ("original delete".to_string(), false, true));
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn purge_old_messages_respects_per_guild_retention() {
     let tmp = tmp_db_path("purge_guild");
     let db = Db::open(&tmp, 2).unwrap();

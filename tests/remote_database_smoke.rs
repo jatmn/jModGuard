@@ -160,14 +160,42 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     )
     .await
     .unwrap();
-    let edited = mark_edited_with_previous(&api, 9_001, "after edit")
+    let edited = mark_edited_with_previous(&api, 9_001, 42, 300, Some(100), "after edit")
         .await
         .unwrap()
         .expect("primary edit transaction should find the inserted message");
     assert_eq!(edited.0, "before edit");
-    let deleted = mark_deleted_with_previous(&api, 9_001)
+    let deleted = mark_deleted_with_previous(&api, 9_001, 42, 300)
         .await
         .unwrap()
         .expect("primary delete transaction should find the edited message");
     assert_eq!(deleted.0, "after edit");
+
+    // Lifecycle gateway events can overtake the best-effort activity write.
+    // Their tombstones must survive the eventual message upsert remotely too.
+    assert!(
+        mark_edited_with_previous(&api, 9_002, 42, 300, Some(100), "early edit")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    record_message_activity(
+        &bot,
+        9_002,
+        42,
+        300,
+        100,
+        "remote-user",
+        Some("Remote User"),
+        "original content",
+        "[]",
+        "2026-01-01T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let after_reorder = mark_deleted_with_previous(&api, 9_002, 42, 300)
+        .await
+        .unwrap()
+        .expect("late activity upsert must preserve the earlier edit tombstone");
+    assert_eq!(after_reorder.0, "early edit");
 }

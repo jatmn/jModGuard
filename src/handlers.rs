@@ -409,8 +409,15 @@ impl EventHandler for Handler {
             return;
         };
         let id = event.id.get() as i64;
-        if let Ok(Some((old_content, _))) =
-            db::mark_edited_with_previous(&app.db, id, &new_content).await
+        if let Ok(Some((old_content, _))) = db::mark_edited_with_previous(
+            &app.db,
+            id,
+            guild_id.get() as i64,
+            event.channel_id.get() as i64,
+            event.author.as_ref().map(|a| a.id.get() as i64),
+            &new_content,
+        )
+        .await
             && old_content != new_content
         {
             let mut vars = BTreeMap::new();
@@ -444,11 +451,16 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let id = deleted_message_id.get() as i64;
-        let content = db::mark_deleted_with_previous(&app.db, id)
-            .await
-            .ok()
-            .flatten()
-            .map(|(c, _)| c);
+        let content = db::mark_deleted_with_previous(
+            &app.db,
+            id,
+            guild_id.get() as i64,
+            channel_id.get() as i64,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|(c, _)| c);
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
         vars.insert(
@@ -478,7 +490,13 @@ impl EventHandler for Handler {
         let Some(guild_id) = guild_id else { return };
         let n = multiple_deleted_messages_ids.len();
         for id in &multiple_deleted_messages_ids {
-            let _ = db::mark_deleted(&app.db, id.get() as i64).await;
+            let _ = db::mark_deleted(
+                &app.db,
+                id.get() as i64,
+                guild_id.get() as i64,
+                channel_id.get() as i64,
+            )
+            .await;
         }
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
