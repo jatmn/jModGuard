@@ -95,7 +95,7 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    - legacy full blobs are normalized against their parent layer. A blob that
      differs from its parent is retained because old data cannot distinguish an
      automatic `ensure_guild` seed from an intentional operator override;
-   - the **global** row is migrated first (parent = hardcoded defaults), then
+   - the **global** row is migrated first (parent = configured terminal defaults), then
      guild rows against the healed global;
    - other full/effective blobs are rewritten as parent-relative partial
      overrides (fields equal to global/defaults are stripped);

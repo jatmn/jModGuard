@@ -58,7 +58,8 @@ per-wire-attempt deadline. Transaction rollback cleanup and an authoritative
 receipt check after a failed COMMIT can each use an additional deadline before
 the logical operation returns. A connection whose operation timed out is
 discarded rather than reused with potentially stale remote stream state. Each
-remote mutation carries a receipt in its transaction. If a COMMIT
+normal post-bootstrap application mutation carries a receipt in its transaction;
+idempotent migrations and bootstrap fencing are reverified on startup instead. If a COMMIT
 response is lost, jModGuard checks that receipt in a fresh primary-routed
 transaction and returns the established result rather than inviting a duplicate
 retry. If that authoritative check also fails, the operation remains explicitly
