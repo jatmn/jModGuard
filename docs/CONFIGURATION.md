@@ -9,8 +9,8 @@ database (everything server-related, editable at runtime).
 |---|---|---|
 | `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required by bot; also by API for WebUI unban |
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
-| `db.url` | — | Remote libSQL URL. `JMODGUARD_DB_URL` takes precedence over Bunny's injected `BUNNY_DATABASE_URL`; empty = local path |
-| `db.token` | — | Remote DB access token. `JMODGUARD_DB_TOKEN` takes precedence over Bunny's injected `BUNNY_DATABASE_AUTH_TOKEN`; required with `db.url` |
+| `db.url` | — | Remote libSQL URL; empty = local path. Environment overrides are accepted only as a complete URL/token pair. |
+| `db.token` | — | Remote DB access token; required with `db.url`. Complete `JMODGUARD_DB_URL`/`JMODGUARD_DB_TOKEN` takes precedence over the complete Bunny-injected pair. |
 | `db.pool_size` | `8` | reusable connections and maximum concurrent database operations in each process (minimum 2) |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
