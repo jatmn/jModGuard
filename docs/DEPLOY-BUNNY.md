@@ -146,8 +146,10 @@ the bot/API process contract against local SQLite.
   deliberately redesigned and tested.
 - API sessions use an in-memory store. Restarting the API logs users out, and
   multiple API replicas do not share sessions.
-- Both processes poll durable `config_version`; command changes additionally
-  bump `slash_registry_version` for Discord slash-command resync.
+- Both processes poll durable `config_version` plus its revision token;
+  command changes additionally update `slash_registry_version` and its token
+  for Discord slash-command resync. Tokens distinguish counters reused after
+  a provider failover rollback.
 - Keep bot and API on the exact same source/image version during rollout.
 
 ## Optional separate SPA

@@ -91,6 +91,11 @@ pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
         (),
         |row| Ok(row.get::<i64>(0)? as u64),
     )?;
+    write_meta_string_conn(
+        conn,
+        "config_revision",
+        &format!("{:032x}", rand::random::<u128>()),
+    )?;
     conn.record_config_version(version);
     Ok(())
 }
@@ -98,7 +103,12 @@ pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
 /// Bumps durable `slash_registry_version` when the Discord slash command
 /// registry may have changed (commands table writes / command copies).
 pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Result<()> {
-    bump_meta_version_conn(conn, "slash_registry_version")
+    bump_meta_version_conn(conn, "slash_registry_version")?;
+    write_meta_string_conn(
+        conn,
+        "slash_registry_revision",
+        &format!("{:032x}", rand::random::<u128>()),
+    )
 }
 
 pub(super) fn bump_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<()> {
@@ -111,7 +121,12 @@ pub(super) fn bump_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Resu
 }
 
 pub async fn bump_config_version(db: &Db) -> Result<()> {
-    db.with_conn(|conn| bump_config_version_conn(conn)).await
+    db.with_conn(|conn| {
+        let tx = conn.transaction_immediate()?;
+        bump_config_version_conn(&tx)?;
+        tx.commit()
+    })
+    .await
 }
 
 pub(super) fn get_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<u64> {
@@ -131,6 +146,29 @@ pub(super) fn get_slash_registry_version_conn(conn: &impl SqlExecutor) -> Result
     get_meta_version_conn(conn, "slash_registry_version")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionState {
+    pub config: u64,
+    pub slash: u64,
+    pub config_revision: String,
+    pub slash_revision: String,
+}
+
+fn get_version_state_conn(conn: &impl SqlExecutor) -> Result<VersionState> {
+    let config = get_config_version_conn(conn)?;
+    let slash = get_slash_registry_version_conn(conn)?;
+    let config_revision =
+        meta_string_conn(conn, "config_revision")?.unwrap_or_else(|| format!("legacy:{config}"));
+    let slash_revision = meta_string_conn(conn, "slash_registry_revision")?
+        .unwrap_or_else(|| format!("legacy:{slash}"));
+    Ok(VersionState {
+        config,
+        slash,
+        config_revision,
+        slash_revision,
+    })
+}
+
 pub async fn get_config_version(db: &Db) -> Result<u64> {
     db.with_conn(|conn| get_config_version_conn(conn)).await
 }
@@ -145,16 +183,25 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
         .await
 }
 
+pub async fn get_version_state(db: &Db) -> Result<VersionState> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction()?;
+        let state = get_version_state_conn(&tx)?;
+        tx.finish_read()?;
+        Ok(state)
+    })
+    .await
+}
+
 /// Reads both invalidation counters through an IMMEDIATE transaction. Bunny
 /// routes write transactions to the primary, so callers can distinguish an
 /// authoritative failover rollback from one stale replica observation.
-pub async fn get_primary_versions(db: &Db) -> Result<(u64, u64)> {
+pub async fn get_primary_versions(db: &Db) -> Result<VersionState> {
     db.with_conn(|conn| {
         let tx = conn.transaction_primary_read()?;
-        let config = get_config_version_conn(&tx)?;
-        let slash = get_slash_registry_version_conn(&tx)?;
+        let state = get_version_state_conn(&tx)?;
         tx.finish_read()?;
-        Ok((config, slash))
+        Ok(state)
     })
     .await
 }
@@ -166,13 +213,12 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 
 /// Primary-routed startup baseline. A replica can expose schema metadata before
 /// the atomically seeded command registry has converged.
-pub fn get_primary_versions_sync(db: &Db) -> Result<(u64, u64)> {
+pub fn get_primary_versions_sync(db: &Db) -> Result<VersionState> {
     db.with_conn_sync(|conn| {
         let tx = conn.transaction_primary_read()?;
-        let config = get_config_version_conn(&tx)?;
-        let slash = get_slash_registry_version_conn(&tx)?;
+        let state = get_version_state_conn(&tx)?;
         tx.finish_read()?;
-        Ok((config, slash))
+        Ok(state)
     })
 }
 

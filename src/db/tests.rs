@@ -1895,10 +1895,13 @@ fn delete_noop_does_not_bump_config_or_slash_versions() {
 fn seeded_commands_publish_a_primary_registry_version() {
     let tmp = tmp_db_path("seed_registry_version");
     let db = Db::open(&tmp, 2).unwrap();
-    let (config, slash) = get_primary_versions_sync(&db).unwrap();
-    assert!(config > 0, "atomic seed must publish config visibility");
+    let versions = get_primary_versions_sync(&db).unwrap();
     assert!(
-        slash > 0,
+        versions.config > 0,
+        "atomic seed must publish config visibility"
+    );
+    assert!(
+        versions.slash > 0,
         "atomic command seed must publish slash visibility"
     );
     cleanup_db(&tmp);

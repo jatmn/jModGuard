@@ -35,7 +35,7 @@ then exits).
 
 | Table | Holds |
 |---|---|
-| `meta` | durable keys (`config_version` for cross-process cache invalidation; `slash_registry_version` for Discord slash re-sync) |
+| `meta` | durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
 | `nickname_reconcile` | generation-numbered nickname jobs with pending/dormant/terminal state, persisted retry schedule, attempt count, and last operator-visible error |
 | `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
 | `guild_settings` | prefix, bot nickname, retention as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |

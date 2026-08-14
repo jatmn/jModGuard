@@ -10,11 +10,13 @@ use libsql::params::IntoParams;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 pub use libsql::{Row, Value, params, params_from_iter};
+
+static RECEIPT_PRUNE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 #[error("query returned no rows")]
@@ -272,11 +274,17 @@ impl Connection {
                 "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
                 params![receipt],
             )?;
-            // Amortize receipt retention cleanup; doing a global prune on
-            // every message/event write scales quadratically with traffic.
-            if rand::random::<u16>() & 1023 == 0 {
+            // Deterministic, bounded cleanup: receipts are only needed for an
+            // immediate ambiguous-COMMIT reconciliation. Prune at a rate that
+            // exceeds creation without turning each message write into a
+            // global delete or retaining a full day of indexed rows.
+            if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
                 transaction.execute(
-                    "DELETE FROM mutation_receipts WHERE created_at < unixepoch() - 86400",
+                    "DELETE FROM mutation_receipts WHERE receipt_id IN (
+                         SELECT receipt_id FROM mutation_receipts
+                         WHERE created_at < unixepoch() - 600
+                         ORDER BY created_at LIMIT 1000
+                     )",
                     (),
                 )?;
             }
@@ -538,7 +546,7 @@ impl Transaction {
             });
         // The primary snapshot itself establishes the original outcome. Do
         // not make receipt consumption another mutation whose COMMIT could in
-        // turn be ambiguous; normal writes prune old receipts after 24 hours.
+        // turn be ambiguous; normal writes prune old receipts after 10 minutes.
         let cleanup = self.runtime.block_on_database(
             "finish commit reconciliation",
             transaction

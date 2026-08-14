@@ -43,11 +43,13 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   per-message (per-(guild,user) buckets), no full-map scans.
 - All user-visible strings flow through the template renderer
   (`src/templates.rs`) — no hardcoded chat messages in behaviors.
-- Config writers bump durable `config_version` in the DB layer (same
+- Config writers bump durable `config_version` and replace its revision token
+  in the DB layer (same
   transaction as the write); call sites still call `app.invalidate_configs()`
   for same-process freshness. Both bot and API poll `config_version` for
   cross-process invalidation. Command registry writers (commands table /
-  command copies) also bump `slash_registry_version`; the bot peeks that
+  command copies) also bump `slash_registry_version` and replace its revision
+  token; the bot peeks that
   every tick (independently of `config_version`) and re-syncs Discord slash
   commands for cached guilds when it advances, committing the observed
   version only after a successful sync pass (failed guilds retry next poll;

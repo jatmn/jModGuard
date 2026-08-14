@@ -31,13 +31,14 @@ by processes on different hosts.
 
 ## Config cache invalidation
 
-Config writers bump a durable `meta.config_version` row **inside the DB layer**
+Config writers bump a durable `meta.config_version` row and replace its
+`meta.config_revision` token **inside the DB layer**
 (same transaction as the write). Runtime writers (messages, members, events,
 warns, bans, users) do **not** bump it.
 
 Both processes poll `bot.config_poll_secs` (default 5) and invalidate their
 in-memory guild config cache when the version changes. Command registry writers
-also bump `meta.slash_registry_version`; the bot polls that independently each
+also bump `meta.slash_registry_version` and replace its revision token; the bot polls that independently each
 tick and re-syncs Discord slash commands only when it advances (not on every
 settings/rules/template write). `AppState::new` primes both baselines from the
 DB so the first poll has no unobserved window.
@@ -49,7 +50,8 @@ transaction and retries when that snapshot has not reached the target version.
 If a lower counter is observed, jModGuard confirms it through an `IMMEDIATE`
 transaction routed to the primary before rebaselining caches. This recovers
 from Bunny's documented failover-loss window without accepting a stale replica
-as authoritative. Mutating read-modify-write paths also use `IMMEDIATE`
+as authoritative. Non-reusable revision tokens also distinguish counters that
+return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers.
 
 Nickname changes commit a generation-numbered durable outbox row in the same

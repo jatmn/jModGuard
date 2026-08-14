@@ -61,10 +61,12 @@ pub struct AppState {
     /// Primed at construction from the live DB so the first poll has no
     /// "unobserved" window where a warm cache can miss a cross-process bump.
     pub last_config_version: AtomicU64,
+    last_config_revision: parking_lot::Mutex<String>,
     /// Last observed durable `slash_registry_version` (commands table changes).
     /// Bot re-syncs Discord slash commands only when this advances — not on
     /// every generic `config_version` bump (rules/templates/settings/…).
     pub last_slash_registry_version: AtomicU64,
+    last_slash_registry_revision: parking_lot::Mutex<String>,
     force_slash_registry_retry: AtomicBool,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
@@ -90,13 +92,13 @@ impl AppState {
         // Cache population is independent of the poll task; skipping the first
         // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
         // that landed before the first successful poll.
-        let (primed, primed_slash) = db::get_primary_versions_sync(&db)
+        let primed = db::get_primary_versions_sync(&db)
             .context("failed to read primary version baselines while building AppState")?;
-        db.require_config_version(primed);
+        db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
-            configs: ConfigCache::new(primed),
+            configs: ConfigCache::new(primed.config),
             automod: AutomodEngine::new(),
             cooldowns: DashMap::new(),
             oauth,
@@ -105,8 +107,10 @@ impl AppState {
             bot_user_id: tokio::sync::OnceCell::new(),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
-            last_config_version: AtomicU64::new(primed),
-            last_slash_registry_version: AtomicU64::new(primed_slash),
+            last_config_version: AtomicU64::new(primed.config),
+            last_config_revision: parking_lot::Mutex::new(primed.config_revision),
+            last_slash_registry_version: AtomicU64::new(primed.slash),
+            last_slash_registry_revision: parking_lot::Mutex::new(primed.slash_revision),
             force_slash_registry_retry: AtomicBool::new(false),
             slash_sync_progress: Mutex::new(None),
             guild_cache: DashMap::new(),
@@ -151,24 +155,18 @@ impl AppState {
     /// last observation (primed at startup), invalidates the guild config cache.
     /// Returns `true` when a change triggered invalidation.
     pub async fn poll_config_version(&self) -> Result<bool> {
-        let remote = db::get_config_version(&self.db).await?;
+        let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_config_version.load(Ordering::SeqCst);
-        if remote > prev {
-            self.last_config_version.store(remote, Ordering::SeqCst);
-            self.configs.require_version(remote);
-            return Ok(true);
-        }
-        if remote < prev || remote < self.db.required_config_version() {
+        let revision_changed = remote.config_revision != *self.last_config_revision.lock();
+        if revision_changed
+            || remote.config != prev
+            || remote.config < self.db.required_config_version()
+        {
             let suspected_floor = prev.max(self.db.required_config_version());
             let write_generation = self.db.config_write_generation();
-            let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
+            let primary = db::get_primary_versions(&self.db).await?;
             return Ok(self
-                .reconcile_primary_versions(
-                    primary_config,
-                    primary_slash,
-                    suspected_floor,
-                    write_generation,
-                )
+                .reconcile_primary_versions(primary, suspected_floor, write_generation)
                 .0);
         }
         Ok(false)
@@ -181,28 +179,31 @@ impl AppState {
     /// re-sync succeeds. Advancing before sync left failed guilds stale until
     /// the next command-registry write.
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
-        let remote = db::get_slash_registry_version(&self.db).await?;
+        let remote = db::get_version_state(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        if remote < prev {
+        let config_revision_changed = remote.config_revision != *self.last_config_revision.lock();
+        let slash_revision_changed =
+            remote.slash_revision != *self.last_slash_registry_revision.lock();
+        if config_revision_changed
+            || slash_revision_changed
+            || remote.config < self.db.required_config_version()
+            || remote.slash != prev
+        {
             let suspected_floor = self
                 .last_config_version
                 .load(Ordering::SeqCst)
                 .max(self.db.required_config_version());
             let write_generation = self.db.config_write_generation();
-            let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
-            let (_, slash_changed) = self.reconcile_primary_versions(
-                primary_config,
-                primary_slash,
-                suspected_floor,
-                write_generation,
-            );
+            let primary = db::get_primary_versions(&self.db).await?;
+            let (_, slash_changed) =
+                self.reconcile_primary_versions(primary, suspected_floor, write_generation);
             let current = self.last_slash_registry_version.load(Ordering::SeqCst);
             Ok(
                 (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
                     .then_some(current),
             )
-        } else if self.force_slash_registry_retry.load(Ordering::SeqCst) || remote > prev {
-            Ok(Some(remote.max(prev)))
+        } else if self.force_slash_registry_retry.load(Ordering::SeqCst) {
+            Ok(Some(prev))
         } else {
             Ok(None)
         }
@@ -210,50 +211,74 @@ impl AppState {
 
     fn reconcile_primary_versions(
         &self,
-        config: u64,
-        slash: u64,
+        primary: db::VersionState,
         suspected_floor: u64,
         write_generation: u64,
     ) -> (bool, bool) {
-        if !self
-            .db
-            .rebaseline_required_config_version(suspected_floor, config, write_generation)
-        {
+        if !self.db.rebaseline_required_config_version(
+            suspected_floor,
+            primary.config,
+            write_generation,
+        ) {
             tracing::debug!(
                 "discarding primary version snapshot because a local config write committed concurrently"
             );
             return (false, false);
         }
         let previous_config = self.last_config_version.load(Ordering::SeqCst);
-        if config < suspected_floor {
+        if primary.config < suspected_floor {
             tracing::warn!(
                 previous_config,
                 required_config = suspected_floor,
-                primary_config = config,
+                primary_config = primary.config,
                 "primary database confirmed config version below the local floor; rebaselining"
             );
-            self.configs.rebaseline_version(suspected_floor, config);
+            self.configs
+                .rebaseline_version(suspected_floor, primary.config);
         }
-        let config_changed = config != previous_config
-            && self
-                .last_config_version
-                .compare_exchange(previous_config, config, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-        if config_changed && config > previous_config {
-            self.configs.require_version(config);
+        let config_revision_changed = {
+            let mut revision = self.last_config_revision.lock();
+            if *revision != primary.config_revision {
+                *revision = primary.config_revision.clone();
+                true
+            } else {
+                false
+            }
+        };
+        let config_changed = config_revision_changed || primary.config != previous_config;
+        if config_changed {
+            self.last_config_version
+                .store(primary.config, Ordering::SeqCst);
+            if config_revision_changed && primary.config <= previous_config {
+                // A rollback/reused counter cannot distinguish pre- and
+                // post-failover replica snapshots numerically. Every guild
+                // loaded in this cache generation must use the primary.
+                self.configs.require_primary_revision(primary.config);
+            } else if primary.config >= previous_config {
+                self.configs.require_version(primary.config);
+            } else {
+                self.configs.invalidate();
+            }
         }
 
         let previous_slash = self.last_slash_registry_version.load(Ordering::SeqCst);
-        let slash_changed = slash != previous_slash
-            && self
-                .last_slash_registry_version
-                .compare_exchange(previous_slash, slash, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
+        let slash_revision_changed = {
+            let mut revision = self.last_slash_registry_revision.lock();
+            if *revision != primary.slash_revision {
+                *revision = primary.slash_revision;
+                true
+            } else {
+                false
+            }
+        };
+        let slash_changed = slash_revision_changed || primary.slash != previous_slash;
         if slash_changed {
-            if slash < previous_slash {
+            self.last_slash_registry_version
+                .store(primary.slash, Ordering::SeqCst);
+            if primary.slash < previous_slash {
                 tracing::warn!(
                     previous_slash,
-                    primary_slash = slash,
+                    primary_slash = primary.slash,
                     "primary database confirmed slash-registry rollback; forcing Discord reconciliation"
                 );
             }
@@ -652,6 +677,7 @@ pub struct ConfigCache {
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
+    primary_generation: Arc<AtomicU64>,
 }
 
 impl Default for ConfigCache {
@@ -668,6 +694,7 @@ impl ConfigCache {
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
+            primary_generation: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -680,6 +707,14 @@ impl ConfigCache {
     pub fn require_version(&self, version: u64) {
         self.durable_floor.fetch_max(version, Ordering::SeqCst);
         self.invalidate();
+    }
+
+    fn require_primary_revision(&self, version: u64) {
+        let _publication = self.publication_lock.lock();
+        self.durable_floor.store(version, Ordering::SeqCst);
+        let generation = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.primary_generation.store(generation, Ordering::SeqCst);
+        self.map.clear();
     }
 
     fn rebaseline_version(&self, expected: u64, version: u64) {
@@ -710,7 +745,8 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
-        let mut primary = false;
+        let mut primary =
+            self.primary_generation.load(Ordering::SeqCst) == self.version.load(Ordering::Relaxed);
         let mut last_observed = 0;
         let mut last_required = required;
         for _ in 0..3 {
@@ -872,6 +908,81 @@ mod tests {
     }
 
     #[test]
+    fn revision_token_detects_failover_aba_at_same_version() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_revision_aba_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bot_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let api_db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let guild_id = 123u64;
+        let baseline = bot.last_config_version.load(Ordering::SeqCst);
+        assert_eq!(
+            tokio_test_block_on(bot.configs.get(&bot.db, guild_id))
+                .unwrap()
+                .settings
+                .prefix,
+            "!"
+        );
+
+        tokio_test_block_on(db::patch_settings(
+            &api_db,
+            guild_id as i64,
+            Some(Some("aba-visible".into())),
+            None,
+            None,
+        ))
+        .unwrap();
+        tokio_test_block_on(api_db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch(&format!(
+                "UPDATE meta SET value = '{baseline}' WHERE key = 'config_version'"
+            ))?;
+            tx.commit()
+        }))
+        .unwrap();
+
+        assert!(
+            tokio_test_block_on(bot.poll_config_version()).unwrap(),
+            "a new revision must invalidate even when the restored counter reuses the old value"
+        );
+        assert_eq!(
+            tokio_test_block_on(bot.configs.get(&bot.db, guild_id))
+                .unwrap()
+                .settings
+                .prefix,
+            "aba-visible"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
     fn pending_slash_registry_rebaselines_only_after_primary_confirmation() {
         let tmp = std::env::temp_dir().join(format!(
             "jmodguard_slash_pending_{}_{}.db",
@@ -972,7 +1083,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            app.reconcile_primary_versions(9, 9, 11, before_write),
+            app.reconcile_primary_versions(
+                db::VersionState {
+                    config: 9,
+                    slash: 9,
+                    config_revision: "rollback-config".into(),
+                    slash_revision: "rollback-slash".into(),
+                },
+                11,
+                before_write,
+            ),
             (false, false),
             "a primary snapshot taken before a concurrent local commit must be discarded"
         );
