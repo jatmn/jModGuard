@@ -1,8 +1,8 @@
 use jmodguard::db::{
     Db, DbOpenOptions, add_badword, add_warn, bump_config_version, get_config_version,
-    get_settings_primary, insert_event, insert_message, list_badwords, list_warns,
-    load_config_parts_with_version, mark_deleted_with_previous, mark_edited_with_previous,
-    patch_settings, query_events, test_drop_next_commit_response,
+    get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
+    mark_deleted_with_previous, mark_edited_with_previous, patch_settings, query_events,
+    record_message_activity, test_drop_next_commit_response,
 };
 use jmodguard::state::ConfigCache;
 use std::path::PathBuf;
@@ -146,12 +146,14 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     // Edit/delete lookups are causally dependent on the original insert. They
     // must read and mark through one primary-routed transaction rather than
     // lose audit context to a lagging replica.
-    insert_message(
+    record_message_activity(
         &bot,
         9_001,
         42,
         300,
         100,
+        "remote-user",
+        Some("Remote User"),
         "before edit",
         "[]",
         "2026-01-01T00:00:00Z",

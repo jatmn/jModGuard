@@ -447,9 +447,24 @@ impl Transaction {
     }
 
     pub fn commit(mut self) -> Result<()> {
-        let mut result = self
-            .runtime
-            .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
+        // Refresh the receipt in the same wire batch as COMMIT. Receipts are
+        // created when a transaction begins, but large copy/config operations
+        // can legitimately outlive the pruning window. Timestamping at commit
+        // keeps the proof available for the bounded reconciliation that starts
+        // after a lost response, without adding another remote round trip.
+        let commit_sql = self.mutation_receipt.as_ref().map_or_else(
+            || "COMMIT".to_string(),
+            |receipt| {
+                format!(
+                    "UPDATE mutation_receipts SET created_at = unixepoch() \
+                     WHERE receipt_id = '{receipt}'; COMMIT"
+                )
+            },
+        );
+        let mut result = self.runtime.block_on_database(
+            "commit transaction",
+            self.inner().execute_batch(&commit_sql),
+        );
         #[cfg(debug_assertions)]
         if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
             result = Err(database_operation_timed_out(

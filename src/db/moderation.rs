@@ -169,6 +169,63 @@ pub async fn insert_message(
     .await
 }
 
+/// Persists one message's member counter, message row, and user cache in one
+/// transaction. The gateway runs moderation before awaiting this best-effort
+/// tracking operation, so a remote outage cannot delay enforcement by three
+/// independent database deadlines.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_message_activity(
+    db: &Db,
+    message_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    author_id: i64,
+    username: &str,
+    global_name: Option<&str>,
+    content: &str,
+    attachments: &str,
+    created_at: &str,
+) -> Result<()> {
+    let now = now_str();
+    let (username, global_name, content, attachments, created_at) = (
+        username.to_string(),
+        global_name.map(str::to_string),
+        content.to_string(),
+        attachments.to_string(),
+        created_at.to_string(),
+    );
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute(
+            "INSERT INTO members (guild_id, user_id, username, join_count, message_count, last_seen_at, currently_in)
+             VALUES (?1, ?2, ?3, 0, 1, ?4, 1)
+             ON CONFLICT(guild_id, user_id) DO UPDATE SET
+               username = excluded.username,
+               message_count = members.message_count + 1,
+               last_seen_at = excluded.last_seen_at",
+            params![guild_id, author_id, username.clone(), now.clone()],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![message_id, guild_id, channel_id, author_id, content, attachments, created_at],
+        )?;
+        tx.execute(
+            "INSERT INTO users (user_id, username, global_name, avatar, updated_at)
+             VALUES (?1, ?2, ?3, NULL, ?4)
+             ON CONFLICT(user_id) DO UPDATE SET
+               username = excluded.username,
+               global_name = excluded.global_name,
+               updated_at = excluded.updated_at
+             WHERE users.username IS NOT excluded.username
+                OR users.global_name IS NOT excluded.global_name",
+            params![author_id, username, global_name, now],
+        )?;
+        tx.commit()
+    })
+    .await
+}
+
 pub async fn mark_edited_with_previous(
     db: &Db,
     message_id: i64,

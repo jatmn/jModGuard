@@ -301,35 +301,6 @@ impl EventHandler for Handler {
 
         app.automod.maybe_prune();
 
-        // tracking
-        let _ = db::bump_message(
-            &app.db,
-            guild_id.get() as i64,
-            msg.author.id.get() as i64,
-            &msg.author.name,
-        )
-        .await;
-        let created_at = msg.timestamp.to_string();
-        let _ = db::insert_message(
-            &app.db,
-            msg.id.get() as i64,
-            guild_id.get() as i64,
-            msg.channel_id.get() as i64,
-            msg.author.id.get() as i64,
-            &msg.content,
-            &attachments_json(&msg),
-            &created_at,
-        )
-        .await;
-        let _ = db::upsert_user(
-            &app.db,
-            msg.author.id.get() as i64,
-            &msg.author.name,
-            msg.author.global_name.as_deref(),
-            None,
-        )
-        .await;
-
         let cfg = match app.configs.get(&app.db, guild_id.get()).await {
             Ok(c) => c,
             Err(e) => {
@@ -376,6 +347,7 @@ impl EventHandler for Handler {
             account_age_days: Some(account_age_days),
             member_roles: &member_roles,
         };
+        let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
             let display = member
                 .as_ref()
@@ -392,14 +364,30 @@ impl EventHandler for Handler {
                 &pending,
             )
             .await;
-            if matches!(pending.action.action.as_str(), "ban" | "kick" | "timeout") {
-                return;
-            }
+            stop_commands = matches!(pending.action.action.as_str(), "ban" | "kick" | "timeout");
         }
 
-        // commands
-        let cfg_arc = Arc::clone(&cfg);
-        let _ = commands::handle_prefix(&app, &ctx, cfg_arc, &msg).await;
+        if !stop_commands {
+            let cfg_arc = Arc::clone(&cfg);
+            let _ = commands::handle_prefix(&app, &ctx, cfg_arc, &msg).await;
+        }
+
+        // Best-effort tracking runs after moderation and command dispatch, and
+        // uses one transaction/deadline rather than three sequential remote
+        // mutations. A database outage must not hold the enforcement path.
+        let _ = db::record_message_activity(
+            &app.db,
+            msg.id.get() as i64,
+            guild_id.get() as i64,
+            msg.channel_id.get() as i64,
+            msg.author.id.get() as i64,
+            &msg.author.name,
+            msg.author.global_name.as_deref(),
+            &msg.content,
+            &attachments_json(&msg),
+            &msg.timestamp.to_string(),
+        )
+        .await;
     }
 
     async fn message_update(
