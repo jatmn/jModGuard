@@ -37,11 +37,27 @@ async fn drain_nickname_reconciles(app: &Arc<AppState>, http: &Arc<serenity::htt
                     continue;
                 };
                 let guild = serenity::model::id::GuildId::new(guild_id_u64);
-                match guild
-                    .edit_member(&http, me, EditMember::new().nickname(job.nickname.clone()))
-                    .await
-                {
-                    Ok(_) => {
+                let edit = tokio::time::timeout(
+                    jmodguard::discord::DISCORD_REST_TIMEOUT,
+                    guild.edit_member(&http, me, EditMember::new().nickname(job.nickname.clone())),
+                )
+                .await;
+                match edit {
+                    Err(_) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let message = "Discord nickname request timed out";
+                        if let Err(error) = db::schedule_nickname_reconcile_retry(
+                            &app.db, &job, now, "timeout", message,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                guild_id = job.guild_id,
+                                "failed to persist nickname reconciliation timeout: {error:#}"
+                            );
+                        }
+                    }
+                    Ok(Ok(_)) => {
                         if let Err(error) = db::acknowledge_nickname_reconcile(
                             &app.db,
                             job.guild_id,
@@ -55,7 +71,8 @@ async fn drain_nickname_reconciles(app: &Arc<AppState>, http: &Arc<serenity::htt
                             );
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
+                        let now = chrono::Utc::now().timestamp();
                         use jmodguard::discord::NicknameFailureClass;
                         let (class, code) = jmodguard::discord::classify_nickname_failure(&error);
                         let message = error.to_string();

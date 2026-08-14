@@ -140,26 +140,31 @@ pub async fn nickname_reconcile_status(
     db: &Db,
     guild_id: i64,
 ) -> Result<Option<NicknameReconcileStatus>> {
-    db.with_conn(move |conn| {
-        conn.query_row(
-            "SELECT state, attempt_count, next_attempt_at,
+    db.with_conn(move |conn| nickname_reconcile_status_conn(conn, guild_id))
+        .await
+}
+
+pub(super) fn nickname_reconcile_status_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+) -> Result<Option<NicknameReconcileStatus>> {
+    conn.query_row(
+        "SELECT state, attempt_count, next_attempt_at,
                     last_error_code, last_error, last_error_at
              FROM nickname_reconcile WHERE guild_id = ?1",
-            params![guild_id],
-            |row| {
-                Ok(NicknameReconcileStatus {
-                    state: row.get(0)?,
-                    attempt_count: row.get::<i64>(1)? as u32,
-                    next_attempt_at: row.get(2)?,
-                    last_error_code: row.get(3)?,
-                    last_error: row.get(4)?,
-                    last_error_at: row.get(5)?,
-                })
-            },
-        )
-        .optional()
-    })
-    .await
+        params![guild_id],
+        |row| {
+            Ok(NicknameReconcileStatus {
+                state: row.get(0)?,
+                attempt_count: row.get::<i64>(1)? as u32,
+                next_attempt_at: row.get(2)?,
+                last_error_code: row.get(3)?,
+                last_error: row.get(4)?,
+                last_error_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
 }
 
 fn nickname_retry_delay_secs(job: &NicknameReconcileJob) -> i64 {

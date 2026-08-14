@@ -714,6 +714,23 @@ pub struct ConfigParts {
     pub badwords: Vec<String>,
 }
 
+/// Raw and effective data needed by one WebUI config response. Every field is
+/// read in the same versioned transaction so the UI cannot combine replica
+/// snapshots from different points in time.
+pub struct WebConfigSnapshot {
+    pub version: u64,
+    pub settings: SettingsWebBundle,
+    pub nickname_reconcile: Option<NicknameReconcileStatus>,
+    pub guild_rules: std::collections::HashMap<String, RuleDef>,
+    pub global_rules: std::collections::HashMap<String, RuleDef>,
+    pub badwords: Vec<Badword>,
+    pub guild_commands: std::collections::HashMap<String, CommandDef>,
+    pub global_commands: std::collections::HashMap<String, CommandDef>,
+    pub guild_templates: std::collections::HashMap<String, String>,
+    pub global_templates: std::collections::HashMap<String, String>,
+    pub guild_log_channels: std::collections::HashMap<String, i64>,
+}
+
 /// Loads `(key, value)` rows where the value column holds JSON-serialized
 /// config (rules, commands). The value column name varies per table.
 fn rows_map_json<T: DeserializeOwned + Send + 'static>(
@@ -778,6 +795,84 @@ fn rows_map_plain<T: PlainValue + Send + 'static>(
 
 pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
     Ok(load_config_parts_with_version(db, guild_id).await?.1)
+}
+
+async fn load_web_config_snapshot_routed(
+    db: &Db,
+    guild_id: i64,
+    primary: bool,
+) -> Result<WebConfigSnapshot> {
+    db.with_conn(move |conn| {
+        let tx = if primary {
+            conn.transaction_primary_read()?
+        } else {
+            conn.transaction()?
+        };
+        let version = get_config_version_conn(&tx)?;
+        let settings = settings_web_bundle_conn(&tx, guild_id)?;
+        let nickname_reconcile = if guild_id == GLOBAL_SCOPE {
+            None
+        } else {
+            nickname_reconcile_status_conn(&tx, guild_id)?
+        };
+        let guild_rules = rows_map_json(&tx, "rules", "rule_id", "data", guild_id)?;
+        let global_rules = rows_map_json(&tx, "rules", "rule_id", "data", GLOBAL_SCOPE)?;
+        let guild_commands = rows_map_json(&tx, "commands", "name", "data", guild_id)?;
+        let global_commands = rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
+        let guild_templates = rows_map_plain(&tx, "templates", "event_type", "template", guild_id)?;
+        let global_templates =
+            rows_map_plain(&tx, "templates", "event_type", "template", GLOBAL_SCOPE)?;
+        let guild_log_channels =
+            rows_map_plain(&tx, "log_channels", "event_type", "channel_id", guild_id)?;
+        let mut stmt = tx.prepare(
+            "SELECT id, guild_id, pattern, note FROM badwords
+             WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![guild_id, GLOBAL_SCOPE], |r| {
+            Ok(Badword {
+                id: r.get(0)?,
+                guild_id: r.get(1)?,
+                pattern: r.get(2)?,
+                note: r.get(3)?,
+            })
+        })?;
+        let mut badwords = Vec::new();
+        for row in rows {
+            badwords.push(row?);
+        }
+        tx.finish_read()?;
+        Ok(WebConfigSnapshot {
+            version,
+            settings,
+            nickname_reconcile,
+            guild_rules,
+            global_rules,
+            badwords,
+            guild_commands,
+            global_commands,
+            guild_templates,
+            global_templates,
+            guild_log_channels,
+        })
+    })
+    .await
+}
+
+/// Loads one coherent WebUI bundle. Replica reads remain the fast path, but a
+/// stale/before-schema snapshot or any below-floor result is retried against
+/// the primary so a successful mutation cannot be followed by stale UI data.
+pub async fn load_web_config_snapshot(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
+    match load_web_config_snapshot_routed(db, guild_id, false).await {
+        Ok(snapshot) if snapshot.version >= db.required_config_version() => Ok(snapshot),
+        Ok(_) | Err(_) => {
+            let snapshot = load_web_config_snapshot_routed(db, guild_id, true).await?;
+            anyhow::ensure!(
+                snapshot.version >= db.required_config_version(),
+                "primary WebUI config snapshot is below the process's committed-version floor"
+            );
+            Ok(snapshot)
+        }
+    }
 }
 
 async fn load_config_parts_with_version_routed(

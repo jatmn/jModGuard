@@ -399,10 +399,19 @@ async fn set_slash_commands(
         }
         commands.push(builder);
     }
-    match guild_id.set_commands(http.as_ref(), commands).await {
-        Ok(_) => true,
-        Err(e) => {
+    match tokio::time::timeout(
+        crate::discord::DISCORD_REST_TIMEOUT,
+        guild_id.set_commands(http.as_ref(), commands),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
             tracing::warn!("slash sync failed for {guild_id}: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("slash sync timed out for {guild_id}");
             false
         }
     }

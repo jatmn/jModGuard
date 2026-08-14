@@ -45,28 +45,15 @@ pub async fn guild_config(
     let _auth = guild_scope(&app, &session, guild_id).await?;
     let guild = guild_id as i64;
 
-    let settings_bundle = db::get_settings_web_bundle(&app.db, guild).await?;
-    let nickname_reconcile = if guild == GLOBAL_SCOPE {
-        None
-    } else {
-        db::nickname_reconcile_status(&app.db, guild).await?
-    };
+    let snapshot = db::load_web_config_snapshot(&app.db, guild).await?;
 
     // rules: effective + scope info
-    let g_rules = db::list_rules(&app.db, guild).await?;
-    let gl_rules = db::list_rules(&app.db, GLOBAL_SCOPE).await?;
     let default_rules = crate::defaults::default_rules();
     let mut rules = Vec::new();
     for (i, rid) in crate::types::RULE_IDS.iter().enumerate() {
         let def = default_rules[i].clone();
-        let guild_row = g_rules
-            .iter()
-            .find(|(k, _)| k == rid)
-            .map(|(_, v)| v.clone());
-        let global_row = gl_rules
-            .iter()
-            .find(|(k, _)| k == rid)
-            .map(|(_, v)| v.clone());
+        let guild_row = snapshot.guild_rules.get(*rid).cloned();
+        let global_row = snapshot.global_rules.get(*rid).cloned();
         let effective = db::resolve(&guild_row, &global_row, &def);
         rules.push(serde_json::json!({
             "rule_id": rid,
@@ -81,17 +68,15 @@ pub async fn guild_config(
     // Runtime enforcement combines global and guild badwords. Return that
     // same set so global rows created in this UI remain inspectable and
     // removable through it.
-    let badwords = db::list_badwords(&app.db, guild).await?;
-    let badwords: Vec<_> = badwords.iter().map(|w| w.with_status()).collect();
+    let badwords: Vec<_> = snapshot.badwords.iter().map(|w| w.with_status()).collect();
 
     // commands: union of guild + global rows, effective resolution
-    let g_cmds = db::list_commands(&app.db, guild).await?;
-    let gl_cmds = db::list_commands(&app.db, GLOBAL_SCOPE).await?;
     let defaults = crate::defaults::default_commands();
     let mut commands: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, def) in &gl_cmds {
-        let guild_row = g_cmds
+    for (name, def) in &snapshot.global_commands {
+        let guild_row = snapshot
+            .guild_commands
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone());
@@ -104,9 +89,10 @@ pub async fn guild_config(
         }));
         seen.insert(name.to_lowercase());
     }
-    for (name, def) in &g_cmds {
+    for (name, def) in &snapshot.guild_commands {
         if seen.insert(name.to_lowercase()) {
-            let global_row = gl_cmds
+            let global_row = snapshot
+                .global_commands
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.clone());
@@ -134,18 +120,10 @@ pub async fn guild_config(
         }));
     }
 
-    let g_tpl = db::list_templates(&app.db, guild).await?;
-    let gl_tpl = db::list_templates(&app.db, GLOBAL_SCOPE).await?;
     let mut templates = Vec::new();
     for (event, def) in crate::defaults::default_templates() {
-        let guild_row = g_tpl
-            .iter()
-            .find(|(k, _)| k == event)
-            .map(|(_, v)| v.clone());
-        let global_row = gl_tpl
-            .iter()
-            .find(|(k, _)| k == event)
-            .map(|(_, v)| v.clone());
+        let guild_row = snapshot.guild_templates.get(event).cloned();
+        let global_row = snapshot.global_templates.get(event).cloned();
         templates.push(serde_json::json!({
             "event": event,
             "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
@@ -154,10 +132,9 @@ pub async fn guild_config(
         }));
     }
 
-    let g_lc = db::list_log_channels(&app.db, guild).await?;
     let mut log_channels = Vec::new();
     for event in crate::types::EVENT_TYPES {
-        let guild_row = g_lc.iter().find(|(k, _)| k == event).map(|(_, v)| *v);
+        let guild_row = snapshot.guild_log_channels.get(event).copied();
         let effective = guild_row.unwrap_or(0);
         // Strings so JS never coerces snowflakes through IEEE-754 Number.
         log_channels.push(serde_json::json!({
@@ -169,11 +146,11 @@ pub async fn guild_config(
     }
 
     Ok(Json(serde_json::json!({
-        "settings": settings_bundle.settings,
-        "settings_override": settings_bundle.settings_override,
-        "global_settings": settings_bundle.global_settings,
-        "global_settings_override": settings_bundle.global_settings_override,
-        "nickname_reconcile": nickname_reconcile,
+        "settings": snapshot.settings.settings,
+        "settings_override": snapshot.settings.settings_override,
+        "global_settings": snapshot.settings.global_settings,
+        "global_settings_override": snapshot.settings.global_settings_override,
+        "nickname_reconcile": snapshot.nickname_reconcile,
         "rules": rules,
         "badwords": badwords,
         "commands": commands,

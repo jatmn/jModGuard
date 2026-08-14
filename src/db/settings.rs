@@ -92,7 +92,10 @@ pub struct SettingsWebBundle {
     pub global_settings_override: Option<GuildSettingsOverride>,
 }
 
-fn settings_web_bundle_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<SettingsWebBundle> {
+pub(super) fn settings_web_bundle_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+) -> Result<SettingsWebBundle> {
     let defaults = terminal_defaults_conn(conn)?;
     let global_override = read_settings_override_conn(conn, GLOBAL_SCOPE)?;
     let global_settings = resolve_settings(&None, &global_override, &defaults);

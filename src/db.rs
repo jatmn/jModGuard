@@ -480,6 +480,11 @@ impl Db {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn require_config_version(&self, version: u64) {
+        self.required_config_version
+            .fetch_max(version, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Lowers a process-local read-your-write floor only when it still equals
     /// the value whose loss was confirmed by a primary-routed transaction.
     pub fn rebaseline_required_config_version(&self, expected: u64, version: u64) {

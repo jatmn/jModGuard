@@ -92,6 +92,7 @@ impl AppState {
         // that landed before the first successful poll.
         let (primed, primed_slash) = db::get_primary_versions_sync(&db)
             .context("failed to read primary version baselines while building AppState")?;
+        db.require_config_version(primed);
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
@@ -127,11 +128,14 @@ impl AppState {
     pub async fn bot_user_id(&self) -> Result<serenity::model::id::UserId> {
         self.bot_user_id
             .get_or_try_init(|| async {
-                let me = self
-                    .discord_http()
-                    .get_current_user()
-                    .await
-                    .context("failed to fetch bot user id from Discord")?;
+                let me = self.discord_http();
+                let me = tokio::time::timeout(
+                    crate::discord::DISCORD_REST_TIMEOUT,
+                    me.get_current_user(),
+                )
+                .await
+                .context("timed out fetching bot user id from Discord")?
+                .context("failed to fetch bot user id from Discord")?;
                 Ok::<_, anyhow::Error>(me.id)
             })
             .await

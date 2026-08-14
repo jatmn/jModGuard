@@ -4,6 +4,10 @@ use anyhow::{Result, anyhow};
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 
+/// Bounds every reconciliation REST attempt so one half-open Discord request
+/// cannot stall durable work for every guild indefinitely.
+pub const DISCORD_REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicknameFailureClass {
     Transient,
