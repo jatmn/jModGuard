@@ -169,14 +169,55 @@ pub async fn insert_message(
     .await
 }
 
-pub async fn get_message(db: &Db, message_id: i64) -> Result<Option<(String, String)>> {
+pub async fn mark_edited_with_previous(
+    db: &Db,
+    message_id: i64,
+    content: &str,
+) -> Result<Option<(String, String)>> {
+    let (now, content) = (now_str(), content.to_string());
     db.with_conn(move |conn| {
-        conn.query_row(
-            "SELECT content, attachments FROM messages WHERE message_id = ?1",
-            params![message_id],
-            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
-        )
-        .optional()
+        let tx = conn.transaction_immediate()?;
+        let previous = tx
+            .query_row(
+                "SELECT content, attachments FROM messages WHERE message_id = ?1",
+                params![message_id],
+                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+            )
+            .optional()?;
+        if previous.is_some() {
+            tx.execute(
+                "UPDATE messages SET content = ?1, edited_at = ?2 WHERE message_id = ?3",
+                params![content, now, message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(previous)
+    })
+    .await
+}
+
+pub async fn mark_deleted_with_previous(
+    db: &Db,
+    message_id: i64,
+) -> Result<Option<(String, String)>> {
+    let now = now_str();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let previous = tx
+            .query_row(
+                "SELECT content, attachments FROM messages WHERE message_id = ?1",
+                params![message_id],
+                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+            )
+            .optional()?;
+        if previous.is_some() {
+            tx.execute(
+                "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
+                params![now, message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(previous)
     })
     .await
 }
@@ -187,18 +228,6 @@ pub async fn mark_deleted(db: &Db, message_id: i64) -> Result<()> {
         conn.execute(
             "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
             params![now, message_id],
-        )?;
-        Ok(())
-    })
-    .await
-}
-
-pub async fn mark_edited(db: &Db, message_id: i64, content: &str) -> Result<()> {
-    let (now, content) = (now_str(), content.to_string());
-    db.with_conn(move |conn| {
-        conn.execute(
-            "UPDATE messages SET content = ?1, edited_at = ?2 WHERE message_id = ?3",
-            params![content, now, message_id],
         )?;
         Ok(())
     })

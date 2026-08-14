@@ -421,7 +421,9 @@ impl EventHandler for Handler {
             return;
         };
         let id = event.id.get() as i64;
-        if let Ok(Some((old_content, _))) = db::get_message(&app.db, id).await {
+        if let Ok(Some((old_content, _))) =
+            db::mark_edited_with_previous(&app.db, id, &new_content).await
+        {
             if old_content != new_content {
                 let mut vars = BTreeMap::new();
                 vars.insert("channel".into(), format!("<#{}>", event.channel_id));
@@ -442,7 +444,6 @@ impl EventHandler for Handler {
                 )
                 .await;
             }
-            let _ = db::mark_edited(&app.db, id, &new_content).await;
         }
     }
 
@@ -456,12 +457,11 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let id = deleted_message_id.get() as i64;
-        let content = db::get_message(&app.db, id)
+        let content = db::mark_deleted_with_previous(&app.db, id)
             .await
             .ok()
             .flatten()
             .map(|(c, _)| c);
-        let _ = db::mark_deleted(&app.db, id).await;
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
         vars.insert(

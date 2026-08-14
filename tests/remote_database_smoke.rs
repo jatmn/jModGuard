@@ -1,6 +1,7 @@
 use jmodguard::db::{
     Db, DbOpenOptions, add_badword, add_warn, bump_config_version, get_config_version,
-    get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
+    get_settings_primary, insert_event, insert_message, list_badwords, list_warns,
+    load_config_parts_with_version, mark_deleted_with_previous, mark_edited_with_previous,
     patch_settings, query_events, test_drop_next_commit_response,
 };
 use jmodguard::state::ConfigCache;
@@ -141,4 +142,30 @@ async fn bot_bootstrap_and_api_share_remote_database() {
             .iter()
             .any(|row| row.id == warn_id)
     );
+
+    // Edit/delete lookups are causally dependent on the original insert. They
+    // must read and mark through one primary-routed transaction rather than
+    // lose audit context to a lagging replica.
+    insert_message(
+        &bot,
+        9_001,
+        42,
+        300,
+        100,
+        "before edit",
+        "[]",
+        "2026-01-01T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let edited = mark_edited_with_previous(&api, 9_001, "after edit")
+        .await
+        .unwrap()
+        .expect("primary edit transaction should find the inserted message");
+    assert_eq!(edited.0, "before edit");
+    let deleted = mark_deleted_with_previous(&api, 9_001)
+        .await
+        .unwrap()
+        .expect("primary delete transaction should find the edited message");
+    assert_eq!(deleted.0, "after edit");
 }
