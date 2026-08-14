@@ -1996,6 +1996,15 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .is_empty(),
         "terminal work must not make another API attempt"
     );
+    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 44, false)).unwrap();
+    assert_eq!(
+        tokio_test_block_on(nickname_reconcile_status(&db, 44))
+            .unwrap()
+            .unwrap()
+            .state,
+        "terminal",
+        "a gateway reconnect must preserve an operator-actionable terminal failure"
+    );
 
     tokio_test_block_on(request_nickname_reconcile(&db, 45)).unwrap();
     tokio_test_block_on(dormancy_nickname_reconcile(&db, 45, "departed")).unwrap();
@@ -2005,13 +2014,24 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .is_empty(),
         "departed guild work must remain dormant"
     );
-    tokio_test_block_on(request_nickname_reconcile(&db, 45)).unwrap();
+    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 45, false)).unwrap();
     assert_eq!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
             .unwrap()
             .len(),
         1,
-        "guild_create must reactivate dormant work"
+        "guild_create must reactivate dormant work without resetting terminal rows"
+    );
+
+    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 46, true)).unwrap();
+    assert_eq!(
+        tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+            .unwrap()
+            .iter()
+            .filter(|job| job.guild_id == 46)
+            .count(),
+        1,
+        "a genuine first guild join must create initial reconciliation work"
     );
     cleanup_db(&tmp);
 }

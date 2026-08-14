@@ -684,26 +684,48 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
-        let version = self.version.load(Ordering::Relaxed);
-        let (durable_version, parts) =
-            db::load_config_parts_with_version(db, guild_id as i64).await?;
-        let required_after = self
-            .durable_floor
-            .load(Ordering::SeqCst)
-            .max(db.required_config_version());
-        let version_after = self.version.load(Ordering::Relaxed);
-        if durable_version < required_after || version_after != version {
-            anyhow::bail!(
-                "database config snapshot changed while loading (version {durable_version}, expected at least {required_after})"
-            );
+        let mut primary = false;
+        let mut last_observed = 0;
+        let mut last_required = required;
+        for _ in 0..3 {
+            let version = self.version.load(Ordering::Relaxed);
+            let (durable_version, parts) = if primary {
+                db::load_config_parts_with_version_primary(db, guild_id as i64).await?
+            } else {
+                db::load_config_parts_with_version(db, guild_id as i64).await?
+            };
+            let required_after = self
+                .durable_floor
+                .load(Ordering::SeqCst)
+                .max(db.required_config_version());
+            let version_after = self.version.load(Ordering::Relaxed);
+            last_observed = durable_version;
+            last_required = required_after;
+
+            if durable_version < required_after {
+                // Replica lag is expected after a successful remote write. Do
+                // not drop moderation/commands while waiting for convergence:
+                // retry through one primary-routed, single-snapshot read.
+                primary = true;
+                continue;
+            }
+            if version_after != version {
+                // A concurrent invalidation advanced while this snapshot was
+                // loading. Retry against the new generation and floor.
+                continue;
+            }
+
+            let cfg = Arc::new(CachedGuildConfig::from_parts(
+                version,
+                durable_version,
+                parts,
+            ));
+            self.map.insert(guild_id as i64, Arc::clone(&cfg));
+            return Ok(cfg);
         }
-        let cfg = Arc::new(CachedGuildConfig::from_parts(
-            version,
-            durable_version,
-            parts,
-        ));
-        self.map.insert(guild_id as i64, Arc::clone(&cfg));
-        Ok(cfg)
+        anyhow::bail!(
+            "database config changed repeatedly while loading (version {last_observed}, expected at least {last_required})"
+        )
     }
 }
 

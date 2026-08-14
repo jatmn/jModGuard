@@ -117,6 +117,8 @@ pub struct Db {
     permit_timeout: Option<Duration>,
     required_config_version: Arc<std::sync::atomic::AtomicU64>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(debug_assertions)]
+    test_config_snapshot: Arc<Mutex<Option<(u64, ConfigParts)>>>,
 }
 
 struct ConnectionPool {
@@ -325,7 +327,28 @@ impl Db {
             permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
             required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(debug_assertions)]
+            test_config_snapshot: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Fault injection for remote replica-lag regression coverage. The next
+    /// ordinary config read returns this previously captured snapshot; a
+    /// primary-routed fallback must still satisfy the process's durable floor.
+    #[cfg(debug_assertions)]
+    pub fn test_inject_next_config_snapshot(&self, snapshot: (u64, ConfigParts)) {
+        *self
+            .test_config_snapshot
+            .lock()
+            .expect("test config snapshot lock poisoned") = Some(snapshot);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn take_test_config_snapshot(&self) -> Option<(u64, ConfigParts)> {
+        self.test_config_snapshot
+            .lock()
+            .expect("test config snapshot lock poisoned")
+            .take()
     }
 
     /// Retries `open_with` while the bot is still applying schema.

@@ -139,9 +139,16 @@ impl EventHandler for Handler {
             app.retry_slash_registry_version();
         }
 
-        // Route join/reconnect repair through the same generation-checked
-        // worker as every settings write (including clearing the nickname).
-        if let Err(error) = db::request_nickname_reconcile(&app.db, gid.get() as i64).await {
+        // Guild lifecycle is distinct from settings/explicit repair. A
+        // reconnect preserves terminal operator errors; dormant work is
+        // reactivated, and a genuinely new guild receives initial work.
+        if let Err(error) = db::activate_nickname_reconcile_for_guild_create(
+            &app.db,
+            gid.get() as i64,
+            is_new.unwrap_or(false),
+        )
+        .await
+        {
             tracing::warn!(
                 guild_id = gid.get(),
                 "failed to queue nickname reconciliation on guild_create: {error:#}"

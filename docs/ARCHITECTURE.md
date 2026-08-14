@@ -58,8 +58,10 @@ due work through primary-routed reads and acknowledges only the generation it
 applied. Transient Discord failures use persisted exponential backoff with
 jitter and a bounded retry budget. Permanent rejections become terminal,
 operator-visible rows; guild departure makes work dormant until `guild_create`
-reactivates it. This makes the final committed nickname win across bot/API
-races and survives cancelled requests without rolling back durable settings.
+reactivates it. Reconnects leave terminal failures untouched; only a settings
+change or explicit operator repair supersedes them. This makes the final
+committed nickname win across bot/API races and survives cancelled requests
+without rolling back durable settings.
 
 ## Migrations
 

@@ -320,10 +320,6 @@ impl Connection {
         self.execute_batch(&format!("PRAGMA {pragma} = {value}"))
     }
 
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.inner.last_insert_rowid()
-    }
-
     pub fn is_autocommit(&self) -> bool {
         self.inner.is_autocommit()
     }

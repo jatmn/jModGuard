@@ -780,9 +780,17 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
     Ok(load_config_parts_with_version(db, guild_id).await?.1)
 }
 
-pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u64, ConfigParts)> {
+async fn load_config_parts_with_version_routed(
+    db: &Db,
+    guild_id: i64,
+    primary: bool,
+) -> Result<(u64, ConfigParts)> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = if primary {
+            conn.transaction_primary_read()?
+        } else {
+            conn.transaction()?
+        };
         let version = get_config_version_conn(&tx)?;
         let conn = &tx;
         let defaults = terminal_defaults_conn(conn)?;
@@ -878,6 +886,24 @@ pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u
         Ok((version, parts))
     })
     .await
+}
+
+pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u64, ConfigParts)> {
+    #[cfg(debug_assertions)]
+    if let Some(snapshot) = db.take_test_config_snapshot() {
+        return Ok(snapshot);
+    }
+    load_config_parts_with_version_routed(db, guild_id, false).await
+}
+
+/// Loads one internally consistent snapshot from the primary. Config-cache
+/// callers use this only after an ordinary replica snapshot is below their
+/// committed-version floor, so normal reads retain replica scalability.
+pub async fn load_config_parts_with_version_primary(
+    db: &Db,
+    guild_id: i64,
+) -> Result<(u64, ConfigParts)> {
+    load_config_parts_with_version_routed(db, guild_id, true).await
 }
 
 /// Loads the effective command registry and its durable version from one

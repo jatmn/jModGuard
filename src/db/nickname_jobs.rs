@@ -31,6 +31,39 @@ pub async fn request_nickname_reconcile(db: &Db, guild_id: i64) -> Result<()> {
     .await
 }
 
+/// Applies only guild-lifecycle transitions. Reconnects must not reset a
+/// terminal operator error; a real join may create missing work, while any
+/// guild-create event can reactivate work made dormant by a prior departure.
+pub async fn activate_nickname_reconcile_for_guild_create(
+    db: &Db,
+    guild_id: i64,
+    is_new: bool,
+) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let reactivated = tx.execute(
+            "UPDATE nickname_reconcile SET
+                 generation = generation + 1, state = 'pending',
+                 attempt_count = 0, next_attempt_at = 0,
+                 last_error_code = NULL, last_error = NULL, last_error_at = NULL
+             WHERE guild_id = ?1 AND state = 'dormant'",
+            params![guild_id],
+        )?;
+        if reactivated == 0 && is_new {
+            tx.execute(
+                "INSERT OR IGNORE INTO nickname_reconcile
+                     (guild_id, generation, state, attempt_count, next_attempt_at,
+                      last_error_code, last_error, last_error_at)
+                 VALUES (?1, 1, 'pending', 0, 0, NULL, NULL, NULL)",
+                params![guild_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NicknameReconcileJob {
     pub guild_id: i64,

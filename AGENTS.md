@@ -98,8 +98,9 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   guild departure makes the row dormant until rejoin. Generation-checked
   acknowledgement makes the final committed value win across bot/API races.
   Nicknames are deliberately guild-only; the WebUI does not offer a global
-  nickname override. `guild_create` queues the same reconciliation path,
-  including empty nicknames.
+  nickname override. `guild_create` uses a lifecycle-only transition: reconnects
+  preserve terminal failures, dormant work is reactivated, and a genuinely new
+  guild gets initial work (including an empty nickname).
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.

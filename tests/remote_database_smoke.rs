@@ -1,7 +1,9 @@
 use jmodguard::db::{
-    Db, DbOpenOptions, add_badword, bump_config_version, get_config_version, get_settings_primary,
-    list_badwords, patch_settings, test_drop_next_commit_response,
+    Db, DbOpenOptions, add_badword, add_warn, bump_config_version, get_config_version,
+    get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
+    patch_settings, query_events, test_drop_next_commit_response,
 };
+use jmodguard::state::ConfigCache;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -81,5 +83,62 @@ async fn bot_bootstrap_and_api_share_remote_database() {
         rows.iter().filter(|row| row.id == id).count(),
         1,
         "lost COMMIT response must not invite a duplicate insert retry"
+    );
+
+    // Ordinary config reads may land on a stale replica immediately after a
+    // write. Inject an actual pre-write snapshot and prove the cache falls
+    // back to one primary-routed snapshot instead of dropping the request.
+    let guild_id = 4_242_u64;
+    let stale = load_config_parts_with_version(&bot, guild_id as i64)
+        .await
+        .expect("capture pre-write config snapshot");
+    let cache = ConfigCache::new(stale.0);
+    patch_settings(
+        &bot,
+        guild_id as i64,
+        Some(Some("replica-safe".into())),
+        None,
+        None,
+    )
+    .await
+    .expect("commit config change before stale replica read");
+    bot.test_inject_next_config_snapshot(stale);
+    let loaded = cache
+        .get(&bot, guild_id)
+        .await
+        .expect("stale replica must trigger a primary snapshot, not a config-load failure");
+    assert_eq!(loaded.settings.prefix, "replica-safe");
+
+    // Insert identity belongs to the transaction stream that executed the
+    // statement. Verify both runtime insert APIs return their persisted IDs.
+    let event_id = insert_event(
+        &bot,
+        42,
+        "remote-id-sentinel",
+        Some(100),
+        Some(200),
+        &serde_json::json!({"source": "remote-smoke"}),
+    )
+    .await
+    .expect("remote event insert should return its transaction-owned id");
+    assert!(event_id > 0);
+    assert!(
+        query_events(&api, 42, Some("remote-id-sentinel"), None, 20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == event_id)
+    );
+
+    let warn_id = add_warn(&bot, 42, 100, 200, "remote-id-sentinel")
+        .await
+        .expect("remote warn insert should return its transaction-owned id");
+    assert!(warn_id > 0);
+    assert!(
+        list_warns(&api, 42, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == warn_id)
     );
 }

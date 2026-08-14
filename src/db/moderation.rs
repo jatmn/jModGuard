@@ -307,12 +307,16 @@ pub async fn insert_event(
         Some(crate::ids::stringify_js_unsafe_integers(data).to_string())
     };
     db.with_conn(move |conn| {
-        conn.execute(
+        let tx = conn.transaction_immediate()?;
+        let id = tx.query_row(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             RETURNING id",
             params![guild_id, event_type, user_id, actor_id, data, now],
+            |row| Ok(row.get::<i64>(0)?),
         )?;
-        Ok(conn.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     })
     .await
 }
@@ -404,12 +408,16 @@ pub async fn add_warn(
 ) -> Result<i64> {
     let (now, reason) = (now_str(), reason.to_string());
     db.with_conn(move |conn| {
-        conn.execute(
+        let tx = conn.transaction_immediate()?;
+        let id = tx.query_row(
             "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             RETURNING id",
             params![guild_id, user_id, moderator_id, reason, now],
+            |row| Ok(row.get::<i64>(0)?),
         )?;
-        Ok(conn.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     })
     .await
 }
