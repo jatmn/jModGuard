@@ -378,7 +378,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
             )?;
             // 0 = keep completed messages forever (UI allows min 0).
             if days == 0 {
-                tx.finish_read()?;
+                tx.commit()?;
                 continue;
             }
             let Some(duration) = chrono::Duration::try_days(days as i64) else {
@@ -386,7 +386,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
                     "skipping invalid retention_days={days} for guild {guild_id}; \
                      set it to at most {MAX_RETENTION_DAYS}"
                 );
-                tx.finish_read()?;
+                tx.commit()?;
                 continue;
             };
             let cutoff = (Utc::now() - duration).to_rfc3339();

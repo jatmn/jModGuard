@@ -871,6 +871,12 @@ fn purge_retention_zero_keeps_messages() {
             conn.execute(
                 "INSERT INTO messages (message_id, guild_id, channel_id, author_id, content, attachments, created_at)
                  VALUES (1, 9, 1, 1, 'x', '[]', ?1)",
+                params![old.clone()],
+            )?;
+            conn.execute(
+                "INSERT INTO messages
+                   (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
+                 VALUES (2, 9, 1, 0, '', '', '', ?1)",
                 params![old],
             )?;
             Ok(())
@@ -881,7 +887,16 @@ fn purge_retention_zero_keeps_messages() {
     s.retention_days = 0;
     tokio_test_block_on(crate::db::upsert_settings(&db, 9, &s)).unwrap();
     let n = tokio_test_block_on(crate::db::purge_old_messages(&db)).unwrap();
-    assert_eq!(n, 0);
+    assert_eq!(n, 1, "stale lifecycle tombstones must still be purged");
+    let remaining = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT message_id FROM messages WHERE guild_id = 9",
+            (),
+            |r| Ok(r.get::<i64>(0)?),
+        )
+    }))
+    .unwrap();
+    assert_eq!(remaining, 1, "the completed message must be kept forever");
     cleanup_db(&tmp);
 }
 
