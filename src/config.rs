@@ -171,7 +171,8 @@ impl Config {
             anyhow::bail!(
                 "jmodguard-api is bound on `{}` but web.base_url is `{}`. \
                  Set JMODGUARD_WEB_BASE_URL to the public HTTPS origin \
-                 (the Magic Containers endpoint) that matches the Discord OAuth redirect.",
+                 (the CDN hostname browsers open, not a Magic Container). \
+                 It must match the Discord OAuth redirect.",
                 self.web.bind,
                 self.web.base_url
             );

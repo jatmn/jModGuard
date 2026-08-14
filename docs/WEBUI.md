@@ -1,8 +1,10 @@
 # WebUI
 
-The WebUI is a single-page app served by **`jmodguard-api`** (not the Discord
-bot process). It manages everything the bot does — no config file editing
-needed beyond the token / OAuth credentials and `bot.owner_id`.
+The WebUI is a single-page admin app. On a laptop it is served by
+**`jmodguard-api`** (feature `embed-ui`). On Bunny it is files in `frontend/`
+on Storage/CDN; the API container stays private and only answers `/api`,
+login, and OAuth. The pages never open SQL from the browser. They call the
+API; the API (and the bot) open the database.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
 `jmodguard-api`. Both use the same local SQLite file or remote libSQL database.

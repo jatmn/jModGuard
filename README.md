@@ -4,12 +4,10 @@ A **data-driven Discord moderation bot** written in Rust — open source, dual-p
 (bot + API/WebUI), libSQL-backed, multi-server.
 
 It can use a local SQLite file for single-host self-hosting or a remote libSQL
-service. Bunny Database is the first documented, first-class remote provider
-option and is supported out of the box. Its environment mapping and the
-generic libSQL protocol path are tested; production Bunny TLS/authentication
-still belongs in the deployment acceptance test. On Bunny, the bot and API
-may run as independent Magic Container apps connected to the same database. The API embeds the admin
-UI, so Bunny CDN/Storage is optional. You do not need Bunny to run it.
+service. **Bunny.net is the first-class cloud provider**: Bunny Database, private
+Magic Containers for the bot and API, and the admin UI on Storage/CDN published
+from a private GitHub Actions repo. You do not need Bunny to run it
+([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider path.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
   attachment floods (crypto scams), links in the first minutes after joining,
@@ -59,7 +57,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | Path | Doc |
 |------|-----|
 | Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
-| Bunny Database + two Magic Container apps | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) — images `ghcr.io/jatmn/jmodguard-bot` and `ghcr.io/jatmn/jmodguard-api` |
+| Bunny Database + private Magic Containers + CDN admin UI | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
 | Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
 ## Documentation
@@ -70,7 +68,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
 | [docs/BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) | local recovery procedure and Bunny production blocker |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |
-| [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | optional Bunny.net deployment guide |
+| [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | Bunny: CDN admin UI, private bot/API containers, Database |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
 | [docs/AUTOMOD.md](docs/AUTOMOD.md) | the 7 rules, escalation, whitelists, dry-run, evidence |
 | [docs/TEMPLATES.md](docs/TEMPLATES.md) | event templates + variable reference |
@@ -98,14 +96,17 @@ commercial licensing is granted by the author only.
 cargo test --locked
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
+cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
 cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
 # or: ./scripts/smoke-dual-process.sh
 ```
 
-Feature `web` (default) enables axum + tower-sessions + the embedded SPA.
-Always build the bot with `--no-default-features` so it does not link or embed
-the WebUI. The API binary requires `web` (`required-features = ["web"]`).
+Feature `web` enables axum + tower-sessions. Default also enables `embed-ui`,
+which bakes `frontend/` into the API for a local SETUP.md run. Always build
+the bot with `--no-default-features`. The Bunny API image builds
+`--no-default-features --features web` so the container has no admin UI.
+The API binary requires `web` (`required-features = ["web"]`).
 
 ## Source layout
 
@@ -131,8 +132,8 @@ automod.rs     rule engine (sliding windows, escalation) + action executor
 handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
 health.rs      bot GET /health liveness listener (no axum; API serves the same path)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
-web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
-frontend/      SPA assets (served by API locally; CDN target when deployed)
+web/           axum API + OAuth (feature web; embed-ui serves frontend/ locally)
+frontend/      admin SPA (Bunny Storage/CDN; local API embed)
 migrations/    0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 ```

@@ -54,6 +54,9 @@ jobs:
       - name: cargo clippy slim bot (no web feature)
         run: cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
 
+      - name: cargo clippy API without embedded UI
+        run: cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
+
       - name: dual-process smoke (no Discord)
         run: cargo test --locked --test dual_process_smoke -- --nocapture
 
@@ -62,6 +65,9 @@ jobs:
 
       - name: api builds with web feature
         run: cargo build --locked --bin jmodguard-api
+
+      - name: api container shape (no embedded UI)
+        run: cargo build --locked --bin jmodguard-api --no-default-features --features web
 
   remote-database:
     runs-on: ubuntu-latest

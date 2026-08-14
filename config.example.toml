@@ -45,9 +45,9 @@ base_url = "http://localhost:8080"
 # Env: JMODGUARD_OAUTH_CLIENT_ID / JMODGUARD_OAUTH_CLIENT_SECRET.
 oauth_client_id = ""
 oauth_client_secret = ""
-# Comma-separated browser origins for a CDN-hosted SPA that calls this API
-# cross-origin (must be explicit page Origins; `*` is not allowed). Empty = same-origin only.
-# Also set via JMODGUARD_CORS_ORIGINS. Requires https base_url for Secure cookies.
+# Comma-separated browser origins only if the admin UI is on a *different*
+# hostname than the API (not the Bunny design). Bunny same-origin CDN proxy
+# leaves this empty. Env: JMODGUARD_CORS_ORIGINS. `*` is not allowed.
 # cors_origins = ["https://admin.example.com"]
 
 [bot]

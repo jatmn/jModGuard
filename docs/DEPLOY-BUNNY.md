@@ -1,55 +1,96 @@
 # Deploy on Bunny.net
 
-jModGuard's remote backend uses the standard libSQL protocol rather than a
-provider-specific data API. [Bunny Database](https://docs.bunny.net/database)
-is the first documented, first-class remote provider and works out of the box
-with Bunny's standard injected credentials. Automated tests cover those
-environment names and the generic libSQL protocol; the acceptance steps below
-cover Bunny's production TLS/authentication service. The bot and API run as
-two independent Magic Container apps and use the database as their shared source of truth.
-This is the intended Bunny topology; no shared disk or existing-data migration
-is needed for a first deployment.
+Bunny.net is the first-class, out-of-the-box cloud provider: Bunny Database,
+private Magic Containers for the bot and API, and the admin WebUI on Bunny
+Storage served through a Pull Zone / CDN.
+
+You can still self-host or use another provider ([SETUP.md](SETUP.md)).
+Those paths are supported. They are not the designed Bunny install.
+
+The admin UI is the only public HTTPS site. Magic Containers are private
+workers: they talk to Bunny Database and (outbound) to Discord. They do not
+contain `frontend/`, and they do not get public hostnames for people to
+browse.
+
+The UI files are published by **GitHub Actions in your private ops repo**
+(not by this public repository). That private runner checks out a jModGuard
+tag and uploads `frontend/` to Storage. Bunny credentials stay in that
+private repo’s secrets. This public repo is the source; it is not the
+place those keys live.
 
 ```text
-Discord Gateway                         Public HTTPS endpoint
-       |                                         |
-       v                                         v
-jmodguard-bot app                         jmodguard-api app
-       |                                         |
-       +---------- Bunny Database ---------------+
-                  (remote libSQL)
+Browser  →  Bunny CDN (Pull Zone)
+              │
+              ├─ /  /app.js  /style.css   ← Storage Zone (frontend/)
+              └─ /api  /login  /oauth/*   ← API Magic Container (origin only)
+                                              │
+Discord  ←  bot Magic Container               │
+              │                               │
+              └──────── Bunny Database ───────┘
+                       (remote libSQL)
 ```
 
-The API embeds `frontend/`, so an initial deployment does not require a Storage
-Zone, Pull Zone, or cross-origin CORS configuration.
+The pages never open the database from the browser. A database token in
+the webpage would be public. The browser talks to the API; the API (and
+the bot) are what open SQL.
+
+The bot and the API also never call each other. They share the database.
+The bot’s extra outbound is the Discord gateway. The API’s extra outbound
+is Discord OAuth, guild listing, and unban.
+
+Local `cargo run` still embeds `frontend/` in the API for SETUP.md. That
+is a laptop / self-host convenience. It is not the Bunny deploy.
 
 ## 1. Create the database
 
-Create a Bunny Database in the dashboard or with the Bunny CLI. In the
-database's **Access** page, generate full-access credentials for each app.
-Both apps need write access: the bot writes moderation state and migrations,
-while the API writes configuration changes.
+Create a Bunny Database. In **Access**, generate full-access credentials
+for each container. Both need write access: the bot writes moderation
+state and migrations; the API writes configuration changes from the UI.
 
-Bunny can inject these standard environment variables into a Magic Container
-app:
+Bunny can inject:
 
 ```dotenv
 BUNNY_DATABASE_URL=libsql://DATABASE_ID.lite.bunnydb.net
 BUNNY_DATABASE_AUTH_TOKEN=SECRET
 ```
 
-jModGuard reads those names directly. Its portable aliases
-`JMODGUARD_DB_URL` and `JMODGUARD_DB_TOKEN` are also supported and take
-precedence when both are non-empty. URL and token are an atomic pair: setting
-only one non-empty portable alias fails startup rather than borrowing a Bunny
-or TOML credential, and the Bunny pair is likewise required in full. Blank or
-whitespace-only values count as unset, so an empty portable alias does not
-block Bunny credentials. Never commit an access token.
+jModGuard reads those names. Portable aliases `JMODGUARD_DB_URL` and
+`JMODGUARD_DB_TOKEN` take precedence when both are non-empty. URL and
+token are an atomic pair. Blank values count as unset. Never commit an
+access token.
 
-## 2. Build and publish both images
+## 2. Publish the admin UI to Storage + CDN
 
-CI builds `linux/amd64` images and, on `main` and version tags, pushes them to
-GHCR:
+Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
+The Pull Zone hostname (or a custom domain on it) is what operators open.
+
+`frontend/` in this public repo is the source of those files. **Publishing
+them is done by GitHub Actions in your private ops repo**, using
+[docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
+and [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh).
+Copy the workflow into the private repo. Store these secrets there:
+
+| Secret | What it is |
+|---|---|
+| `BUNNY_STORAGE_ZONE` | Storage zone name |
+| `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
+| `BUNNY_STORAGE_ENDPOINT` | Regional host, default `storage.bunnycdn.com` |
+| `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
+| `BUNNY_API_KEY` | Account API key, used only for the purge |
+
+Dispatch the workflow with the same jModGuard git tag as the container
+images. The runner checks out that tag and uploads `index.html`, `app.js`,
+and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
+
+Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
+`/login`, `/logout`, and `/oauth/callback` to the API container (step 6),
+so the UI and API are same-origin. Do not put a database URL or token in
+these files.
+
+## 3. Build and publish both images
+
+CI builds `linux/amd64` images and, on `main` and version tags, pushes
+them to GHCR as packages of this public repo:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:<tag>
@@ -57,17 +98,18 @@ ghcr.io/jatmn/jmodguard-api:<tag>
 ```
 
 Use the short git SHA tag (or `main` after that commit is on the default
-branch). Do not deploy a floating `latest` tag; `latest` is only applied to
-version tags (`v*`).
+branch). `latest` is only applied to version tags (`v*`).
 
-Magic Containers already trusts public GitHub Container Registry. The `images`
-workflow tries to mark `jmodguard-bot` and `jmodguard-api` **public** after the
-first push. If that API call is denied, open each package at
+The API image is JSON + OAuth only. It does not embed `frontend/`.
+
+Magic Containers trusts public GHCR. The `images` workflow tries to mark
+those packages public after the first push. If that is denied, set
+visibility on
 `https://github.com/jatmn/jModGuard/pkgs/container/jmodguard-bot` and
-`.../jmodguard-api` and set visibility to public. If you keep them private, add
-a GitHub registry in Magic Containers with a read-only PAT.
+`.../jmodguard-api`. If you keep them private, add a GitHub registry PAT
+in Magic Containers.
 
-To build locally instead of using GHCR:
+To build locally:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.bot -t ghcr.io/jatmn/jmodguard-bot:TAG .
@@ -76,25 +118,18 @@ docker push ghcr.io/jatmn/jmodguard-bot:TAG
 docker push ghcr.io/jatmn/jmodguard-api:TAG
 ```
 
-Magic Containers currently requires `linux/amd64`; keep that platform flag
-when building from ARM hosts such as Apple Silicon.
-
-Record immutable image digests in the private ops repository.
+Magic Containers currently requires `linux/amd64`.
 
 The images default `JMODGUARD_LOG_DIRECTORY` to empty so logs go to
-stdout/stderr. They also set `JMODGUARD_REQUIRE_REMOTE_DB=1`: if Bunny (or
-portable) database credentials are missing, the process **exits** instead of
-opening a private SQLite file on ephemeral disk. A persistent volume is not
-required for the remote database topology. Unset that variable only when you
-intentionally run the image against local SQLite.
+stdout/stderr. They set `JMODGUARD_REQUIRE_REMOTE_DB=1`: missing Bunny
+secrets exit instead of opening SQLite on ephemeral disk.
 
-## 3. Create the bot app
+## 4. Create the bot app (no public endpoint)
 
-Create a Magic Container app from the bot image. Choose **Single region
-deployment** and exactly one instance; this mode does not autoscale. If you
-use Advanced deployment instead, enable only one region and set both minimum
-and maximum replicas to `1`. Multiple bot replicas are not supported. Add the
-database credentials from step 1 and these secrets/settings:
+Create a Magic Container app from the bot image. **Single region**,
+exactly one instance. Do **not** add a CDN or Anycast endpoint. The bot
+is not a website. Platform health checks (Monitoring → HTTP GET `/health`
+on port `8080`) stay inside Bunny; they are not a public URL.
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
@@ -104,35 +139,26 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
-The bot image already requires remote DB credentials and binds a process-local
-health listener on container port `8080` (`GET /health`). Bind failure is fatal
-so Magic Containers cannot see a running bot with no probe port. `/health`
-returns `ok` as soon as the process is listening; it does not wait on the
-database. In **Monitoring**, enable HTTP GET health checks on path `/health`
-port `8080` (startup + liveness are enough; the bot has no public endpoint).
+Plus the database pair from step 1.
 
-The bot is the schema authority. On the first start it creates the schema,
-seeds defaults, and publishes a durable bootstrap marker before connecting to
-Discord. Remote connect/bootstrap failures retry for about six minutes so a
-slow first database wake does not immediately crash-loop. This is initial
-schema creation on an empty service, not a migration of an older deployment.
+The bot is the schema authority. Wait for logs containing
+`database ready (migrate=true)` before expecting the API to open.
 
-Wait for logs containing `database ready (migrate=true)` before starting the
-API app. A fake or invalid Discord token can still be used for a database-only
-smoke test; Discord will then reject the later gateway connection as expected.
+## 5. Create the API app (origin only, no public website)
 
-## 4. Create the API app
+Create a second Magic Container app from the API image. Same
+single-region, exactly-one-instance topology (sessions are in-memory).
+Do **not** attach a custom domain or a browseable Magic Containers CDN
+hostname. The Pull Zone from step 2 is the public URL.
 
-Create a separate Magic Container app from the API image. Use the same
-single-region, exactly-one-instance topology as the bot (or one Advanced
-region with minimum and maximum replicas both `1`); API sessions are
-process-local and do not support multiple replicas. Attach credentials for the
-same Bunny Database and configure:
+The API still listens on container port `8080` so Bunny can origin-pull
+it and so platform health checks can hit `GET /health`. Enable sticky
+sessions on that origin: sessions live in that one process.
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
 JMODGUARD_WEB_BIND=0.0.0.0:8080
-JMODGUARD_WEB_BASE_URL=https://YOUR-API-HOSTNAME
+JMODGUARD_WEB_BASE_URL=https://YOUR-CDN-HOSTNAME
 JMODGUARD_OAUTH_CLIENT_ID=SECRET
 JMODGUARD_OAUTH_CLIENT_SECRET=SECRET
 JMODGUARD_OWNER_ID=123456789012345678
@@ -141,85 +167,80 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
-The API also needs the Discord bot token because WebUI unban uses Discord's
-REST API. `JMODGUARD_WEB_BASE_URL` is required: the image binds `0.0.0.0:8080`,
-and the process refuses to start if that public bind still has the localhost
-OAuth default. Add a public HTTPS endpoint for container port `8080`. Enable
-HTTP GET health checks on path `/health` port `8080`. In the Discord
-Developer Portal, set the OAuth redirect URI to this exact value:
+`JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators open, not a
+container hostname. Discord OAuth redirect URI:
 
 ```text
-https://YOUR-API-HOSTNAME/oauth/callback
+https://YOUR-CDN-HOSTNAME/oauth/callback
 ```
 
-The API never applies migrations. It verifies the schema and bot bootstrap
-marker, retrying incomplete schema and transient remote connect errors for
-about six minutes on a remote database (about 30 seconds for local SQLite).
+Leave `JMODGUARD_CORS_ORIGINS` unset. Same-origin via the Pull Zone does
+not need CORS. The API still needs the Discord bot token for OAuth, the
+guild list, and WebUI unban.
 
-## 5. Acceptance test
+The API never applies migrations. It waits for the bot bootstrap marker
+(about six minutes on a remote database).
 
-For the first deployment:
+## 6. Point API paths on the Pull Zone at the API container
 
-1. Confirm bot logs show `database ready (migrate=true)` and then shard startup.
-2. Confirm API logs show `database ready (migrate=false)` and
-   `API/WebUI listening`.
-3. In **Regions and Scaling**, confirm each app has one region and exactly one
-   running replica, with no scale-up above `1`.
-4. Request `/health`; it must return `ok` over HTTPS. Request `/`; it must
-   return the embedded jModGuard UI.
-5. Complete Discord OAuth login and open a guild where the user has Manage
-   Server permission.
-6. Change a harmless guild prefix in the UI. Confirm the bot eventually
-   observes it after polling and any replica convergence, exercise the new
-   prefix in Discord, then restore it.
-7. Configure a dry-run moderation rule and verify its audit event.
-8. Restart each app independently and confirm both reconnect to the same data.
+On the Pull Zone from step 2 (Storage origin for the files):
 
-The repository's CI also runs `tests/remote_database_smoke.rs` against a pinned
-libSQL server. That test proves bot bootstrap, a remote write, API schema-open,
-and visibility across independent database handles without requiring
-production credentials. `tests/dual_process_smoke.rs` separately exercises
-the bot/API process contract against local SQLite.
+1. Add the API Magic Container as an alternate origin (Magic Containers
+   origin / endpoint for container port `8080`).
+2. Add edge rules so these paths go to that origin and are **not**
+   cached:
+   - `/api*`
+   - `/login*`
+   - `/logout*`
+   - `/oauth*`
+   - `/health*`
+3. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
+4. Disable caching / bypass Perma-Cache on the API paths. Cached
+   `/api/me` would leak sessions.
+
+After this, a browser on the CDN hostname loads the admin UI from
+Storage and calls `/api/...` on the same host; Bunny forwards those
+requests to the private API container.
+
+## 7. Acceptance test
+
+1. Bot logs: `database ready (migrate=true)`, then shard startup. No
+   public hostname.
+2. API logs: `database ready (migrate=false)` and listening. No public
+   website hostname on the container.
+3. Each app: one region, one replica.
+4. Open the **CDN** hostname. The admin UI loads from Storage. Login
+   with Discord. OAuth returns to the CDN origin.
+5. Change a harmless guild prefix. Confirm the bot picks it up, then
+   restore it.
+6. Configure a dry-run rule and check the audit event.
+7. Restart each container. Both reconnect to the same database. The UI
+   still comes from CDN.
+
+CI’s `tests/remote_database_smoke.rs` proves bot bootstrap and API
+schema-open against a local libSQL server, not Bunny TLS.
+`tests/dual_process_smoke.rs` covers the local SQLite process contract.
 
 ## Operating constraints
 
-- Bunny Database is currently documented as Public Preview. Review its current
-  limits and availability before production use. Its internal snapshots are
-  not a substitute for an operator-controlled backup policy. The current
-  `bsql .dump` output is not a complete jModGuard backup; review the explicit
-  production blocker in [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
-- Run one bot app instance unless Discord sharding and singleton work have been
-  deliberately redesigned and tested.
-- API sessions use an in-memory store. Restarting the API logs users out, and
-  multiple API replicas do not share sessions. SIGTERM from Magic Containers
-  stops the Discord gateway and the API listener cleanly.
-- Container images refuse to start without a complete remote database URL/token
-  pair (`JMODGUARD_REQUIRE_REMOTE_DB=1`). Missing Bunny secrets must not fall
-  through to an ephemeral local SQLite file.
-- Both processes poll durable `config_version` plus its revision token;
-  command changes additionally update `slash_registry_version` and its token
-  for Discord slash-command resync. Tokens distinguish counters reused after
-  a provider failover rollback.
-- Keep bot and API on the exact same source/image version during rollout.
-
-## Optional separate SPA
-
-The embedded same-origin UI is the safest starting point. If `frontend/` is
-later hosted on Bunny Storage/CDN under another origin:
-
-1. Upload the frontend from the exact deployed source tag.
-2. Set `window.JMODGUARD_API_BASE` to the API origin.
-3. Set `JMODGUARD_CORS_ORIGINS` to the exact HTTPS SPA origin; never use `*`.
-4. Keep `JMODGUARD_WEB_BASE_URL` on HTTPS so cross-origin session cookies use
-   `Secure` and `SameSite=None`.
-5. Keep the Discord callback at `{web.base_url}/oauth/callback`.
+- Bunny Database is Public Preview. Internal snapshots are not an
+  operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+- One bot replica. One API replica (in-memory sessions).
+- SIGTERM stops the Discord gateway and the API listener cleanly.
+- Missing Bunny DB secrets must not fall through to local SQLite
+  (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
+- Keep bot image, API image, and Storage `frontend/` on the same git
+  tag. Pin image digests in the private ops repo if you want an
+  immutable rollout record.
+- Do not add public Magic Container endpoints for the bot. Do not use a
+  Magic Container hostname as the product URL.
 
 ## References
 
 - [Bunny Database overview](https://docs.bunny.net/database)
-- [Bunny Database Rust client](https://docs.bunny.net/database/connect/rust)
-- [Bunny Database authentication](https://docs.bunny.net/database/connect/authorization)
-- [Magic Containers quickstart](https://docs.bunny.net/magic-containers/quickstart)
+- [Bunny Storage static sites](https://docs.bunny.net/storage/static-site-hosting)
+- [Magic Containers endpoints](https://docs.bunny.net/magic-containers/endpoints)
+- [Magic Containers health checks](https://docs.bunny.net/magic-containers/health-checks)
 - [Backup and restore status](BACKUP-RESTORE.md)
 - [Configuration reference](CONFIGURATION.md)
 - [Architecture](ARCHITECTURE.md)

@@ -10,8 +10,10 @@ cargo test --locked
 cargo test --locked --no-default-features --lib
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
+cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
 cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
+cargo build --locked --bin jmodguard-api --no-default-features --features web
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -79,16 +81,20 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   but none compile, **refuse** (error) and leave destination unchanged — never
   DELETE-then-filter. Empty source clears destination (intentional).
   `compile_user_regex` is the single gate for add / copy / cache load / tester.
-- Feature `web` (default): axum + tower-sessions + embedded SPA. Build the bot
-  with `--no-default-features` so it does not link or embed the WebUI.
+- Feature `web` (default with `embed-ui`): axum + tower-sessions. `embed-ui`
+  bakes `frontend/` into the API for local SETUP.md. Bunny API images build
+  `--no-default-features --features web` so containers do not contain the
+  admin UI. Build the bot with `--no-default-features`.
 - Sessions use `MemoryStore` intentionally for a **single** API process; lost on
   restart. Shared session store is a future multi-replica concern.
-- Cross-origin CDN SPA: set `web.cors_origins` / `JMODGUARD_CORS_ORIGINS` and
-  `https` `web.base_url`; frontend uses `credentials: "include"`. Prefer
-  same-origin reverse proxy when possible. `Config::validate_cors` runs in
-  `jmodguard-api` only — invalid CORS must not prevent `jmodguard-bot` from
-  starting. A public bind (`0.0.0.0`) must also pass `validate_public_base_url`
-  (`JMODGUARD_WEB_BASE_URL` https, not localhost).
+- Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
+  from Storage and proxies `/api` `/login` `/oauth` to a private API
+  container (same origin; no CORS). `web.cors_origins` /
+  `JMODGUARD_CORS_ORIGINS` exist only for a split-origin experiment.
+  `https` `web.base_url` is the public CDN hostname. `Config::validate_cors`
+  runs in `jmodguard-api` only. A public bind (`0.0.0.0`) must also pass
+  `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost,
+  not a Magic Container hostname).
 - Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
   credentials must fail startup, not open local SQLite. Unset it only for an
   intentional local-SQLite container run.
@@ -171,8 +177,8 @@ src/state.rs            AppState + config cache + version poll
 src/automod.rs          rule engine + action executor
 src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
-src/web/                axum API + OAuth (embeds frontend/)
-frontend/               SPA assets
+src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
+frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
 migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …

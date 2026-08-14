@@ -411,6 +411,7 @@ async fn api_me(
     })))
 }
 
+#[cfg(feature = "embed-ui")]
 fn static_handler(content: &'static str, content_type: &'static str) -> impl IntoResponse {
     (
         [
@@ -421,6 +422,7 @@ fn static_handler(content: &'static str, content_type: &'static str) -> impl Int
     )
 }
 
+#[cfg(feature = "embed-ui")]
 async fn index() -> impl IntoResponse {
     static_handler(
         include_str!("../../frontend/index.html"),
@@ -431,12 +433,16 @@ async fn index() -> impl IntoResponse {
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
+
+#[cfg(feature = "embed-ui")]
 async fn app_js() -> impl IntoResponse {
     static_handler(
         include_str!("../../frontend/app.js"),
         "application/javascript; charset=utf-8",
     )
 }
+
+#[cfg(feature = "embed-ui")]
 async fn style_css() -> impl IntoResponse {
     static_handler(
         include_str!("../../frontend/style.css"),
@@ -499,10 +505,13 @@ pub fn router(app: Arc<AppState>) -> Router {
         .with_same_site(same_site)
         .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
 
-    let sessioned = Router::new()
+    let sessioned = Router::new();
+    #[cfg(feature = "embed-ui")]
+    let sessioned = sessioned
         .route("/", get(index))
         .route("/app.js", get(app_js))
-        .route("/style.css", get(style_css))
+        .route("/style.css", get(style_css));
+    let sessioned = sessioned
         .route("/login", get(login))
         .route("/logout", axum::routing::post(logout))
         .route("/oauth/callback", get(callback))
@@ -706,6 +715,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "embed-ui")]
     async fn static_pages_serve() {
         let app = test_app();
         for path in ["/", "/app.js", "/style.css"] {

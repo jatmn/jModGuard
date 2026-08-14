@@ -25,8 +25,11 @@ by processes on different hosts.
 
 ## Feature split
 
-- Feature `web` (default): axum, tower-sessions, embedded SPA from `frontend/`.
-- Build the **bot** with `--no-default-features` so it does not link or embed the WebUI.
+- Feature `web` (default with `embed-ui`): axum, tower-sessions. `embed-ui`
+  bakes `frontend/` into the API for local SETUP.md.
+- Bunny API images build `--no-default-features --features web` (JSON + OAuth
+  only). The admin UI is Storage + Pull Zone.
+- Build the **bot** with `--no-default-features`.
 - The **API** binary requires `web` (`required-features = ["web"]`).
 
 ## Config cache invalidation
@@ -92,7 +95,7 @@ src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 src/health.rs              GET /health liveness (bot listener; API axum route)
-frontend/                  SPA (served by API locally; CDN-ready)
+frontend/                  admin SPA (Bunny CDN; local embed-ui)
 migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot
 Dockerfile.api
@@ -102,5 +105,5 @@ Dockerfile.api
 
 - [SETUP.md](SETUP.md) — first install
 - [UPGRADE.md](UPGRADE.md) — moving to a new version
-- [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) — optional Bunny.net deploy shape
+- [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) — Bunny CDN admin UI + private containers
 - [CONFIGURATION.md](CONFIGURATION.md) — config.toml and backups

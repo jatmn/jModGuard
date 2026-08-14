@@ -73,8 +73,8 @@ cargo build --release --locked --bin jmodguard-api
 ```
 
 Or rebuild/push container images from `Dockerfile.bot` / `Dockerfile.api` at
-that tag. If you serve the SPA from a CDN or object storage, publish the
-matching `frontend/` from the **same** tag as the API.
+that tag. On Bunny, also upload matching `frontend/` from the **same** tag to
+the Storage Zone and purge the Pull Zone.
 
 ## 4. Config diff
 
@@ -122,7 +122,7 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 4. Confirm bot logs show `database ready (migrate=true)` and gateway/shards.
 5. **Start the API** — it opens with `migrate=false` and waits for the bot to
    finish the schema/default-data bootstrap.
-6. Confirm API logs show `API/WebUI listening` and OAuth login still works.
+6. Confirm API logs show `API listening` and OAuth login still works.
 7. Sanity check: change a setting in the WebUI; within `config_poll_secs` the
    bot should pick it up (prefix, rules, etc.).
 
@@ -151,9 +151,8 @@ database backup unless a release note says otherwise.
 ## Bunny / dual-container notes
 
 Same order: migrate with the bot app, then roll the API app. Both must keep
-using the same Bunny Database. Update separate CDN/Storage SPA assets, if any,
-from the same release. Generic topology:
-[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+using the same Bunny Database. Upload matching `frontend/` to Storage and purge
+the Pull Zone. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
 ## Related
 

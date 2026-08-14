@@ -121,6 +121,9 @@ owner_id = 123456789012345678               # your Discord user ID
 # Windows: target\release\jmodguard-bot.exe / target\release\jmodguard-api.exe
 ```
 
+This local API serves the admin pages itself. On Bunny the pages live on
+CDN/Storage and the API container is private — see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+
 Run the bot and API in separate terminals (or as the services below): the bot
 is a long-running Discord gateway, so it does not return before the API command.
 
@@ -237,7 +240,7 @@ Work through these in order (each one is logged, so check
 1. **Are the processes running?** Dual-process: check each log for its own
    boot lines.    The bot log should show `database ready (migrate=true)` and
    `starting shards (bot process; no public HTTP API)`. The API log should show
-   `database ready (migrate=false)` and `API/WebUI listening on http://…`.
+   `database ready (migrate=false)` and `API listening on http://…`.
    Looking for `WebUI listening` in the **bot** log is wrong — the bot only
    binds HTTP if `JMODGUARD_HEALTH_BIND` is set (container images: `/health` on
    8080). If a log is empty, that process never started (check the

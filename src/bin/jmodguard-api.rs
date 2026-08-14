@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&web_bind)
         .await
         .with_context(|| format!("failed to bind API on {web_bind}"))?;
-    tracing::info!("API/WebUI listening on http://{web_bind}");
+    tracing::info!("API listening on http://{web_bind}");
     axum::serve(listener, web_app)
         .with_graceful_shutdown(shutdown_signal())
         .await
