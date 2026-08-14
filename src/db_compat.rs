@@ -272,10 +272,14 @@ impl Connection {
                 "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
                 params![receipt],
             )?;
-            transaction.execute(
-                "DELETE FROM mutation_receipts WHERE created_at < unixepoch() - 86400",
-                (),
-            )?;
+            // Amortize receipt retention cleanup; doing a global prune on
+            // every message/event write scales quadratically with traffic.
+            if rand::random::<u16>() & 1023 == 0 {
+                transaction.execute(
+                    "DELETE FROM mutation_receipts WHERE created_at < unixepoch() - 86400",
+                    (),
+                )?;
+            }
         }
         Ok(transaction)
     }
