@@ -187,6 +187,23 @@ async fn main() -> Result<()> {
     }
     {
         let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match app.poll_config_version().await {
+                    Ok(true) => {
+                        tracing::info!("config_version changed; guild config cache invalidated")
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("config_version poll failed: {e:#}"),
+                }
+            }
+        });
+    }
+    {
+        let app = Arc::clone(&app);
         let http = Arc::clone(&http);
         let cache = Arc::clone(&cache);
         tokio::spawn(async move {
@@ -194,19 +211,6 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                // Track whether this tick already cleared the cache so a command
-                // write (bumps both versions) does not invalidate twice.
-                let config_changed = match app.poll_config_version().await {
-                    Ok(true) => {
-                        tracing::info!("config_version changed; guild config cache invalidated");
-                        true
-                    }
-                    Ok(false) => false,
-                    Err(e) => {
-                        tracing::warn!("config_version poll failed: {e:#}");
-                        false
-                    }
-                };
                 // Peek slash registry every tick (not gated on config_version) so a
                 // future slash-only bump cannot be missed. Do not commit the observed
                 // version until Discord re-sync has nothing left to retry — otherwise
@@ -229,7 +233,7 @@ async fn main() -> Result<()> {
                                      commands ({} guild(s))",
                                     guilds.len()
                                 );
-                                if invalidate && !config_changed {
+                                if invalidate {
                                     app.invalidate_configs();
                                 }
                                 let mut failed = std::collections::HashSet::new();
