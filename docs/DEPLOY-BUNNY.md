@@ -67,8 +67,11 @@ volume is not required for the remote database topology.
 
 ## 3. Create the bot app
 
-Create a Magic Container app from the bot image. Start with one instance. Add
-the database credentials from step 1 and these secrets/settings:
+Create a Magic Container app from the bot image. Choose **Single region
+deployment** and exactly one instance; this mode does not autoscale. If you
+use Advanced deployment instead, enable only one region and set both minimum
+and maximum replicas to `1`. Multiple bot replicas are not supported. Add the
+database credentials from step 1 and these secrets/settings:
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
@@ -89,8 +92,11 @@ smoke test; Discord will then reject the later gateway connection as expected.
 
 ## 4. Create the API app
 
-Create a separate Magic Container app from the API image. Attach credentials
-for the same Bunny Database and configure:
+Create a separate Magic Container app from the API image. Use the same
+single-region, exactly-one-instance topology as the bot (or one Advanced
+region with minimum and maximum replicas both `1`); API sessions are
+process-local and do not support multiple replicas. Attach credentials for the
+same Bunny Database and configure:
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
@@ -122,14 +128,16 @@ For the first deployment:
 1. Confirm bot logs show `database ready (migrate=true)` and then shard startup.
 2. Confirm API logs show `database ready (migrate=false)` and
    `API/WebUI listening`.
-3. Request `/`; it must return the embedded jModGuard UI over HTTPS.
-4. Complete Discord OAuth login and open a guild where the user has Manage
+3. In **Regions and Scaling**, confirm each app has one region and exactly one
+   running replica, with no scale-up above `1`.
+4. Request `/`; it must return the embedded jModGuard UI over HTTPS.
+5. Complete Discord OAuth login and open a guild where the user has Manage
    Server permission.
-5. Change a harmless guild prefix in the UI. Confirm the bot eventually
+6. Change a harmless guild prefix in the UI. Confirm the bot eventually
    observes it after polling and any replica convergence, exercise the new
    prefix in Discord, then restore it.
-6. Configure a dry-run moderation rule and verify its audit event.
-7. Restart each app independently and confirm both reconnect to the same data.
+7. Configure a dry-run moderation rule and verify its audit event.
+8. Restart each app independently and confirm both reconnect to the same data.
 
 The repository's CI also runs `tests/remote_database_smoke.rs` against a pinned
 libSQL server. That test proves bot bootstrap, a remote write, API schema-open,
