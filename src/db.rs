@@ -255,7 +255,7 @@ impl Db {
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
-            let defaults = if opts.migrate {
+            if opts.migrate {
                 // A previous successful boot may have left this marker behind.
                 // Clear it before any new migration/default work so an API
                 // restarting concurrently cannot mistake stale readiness for
@@ -272,15 +272,14 @@ impl Db {
                     opts.retention_days,
                     &opts_defaults,
                 )?;
-                opts_defaults.clone()
+                // Idempotent when guild_settings changed; skipped via checksum when not.
+                heal_default_guild_settings_conn(&mut bootstrap, &opts_defaults)?;
             } else {
                 // One primary-routed snapshot is the API readiness barrier.
                 // Replica reads can otherwise see an old completed marker
                 // while a new bot bootstrap is in progress on the primary.
-                read_bootstrap_defaults_primary(&bootstrap)?
-            };
-            // Idempotent when guild_settings changed; skipped via checksum when not.
-            heal_default_guild_settings_conn(&mut bootstrap, &defaults)?;
+                let _ = read_bootstrap_defaults_primary(&bootstrap)?;
+            }
             // Only publish readiness after all migrations, durable defaults,
             // default rows, and the settings heal have completed. Otherwise an
             // API process can serve an incomplete registry during first boot.
@@ -672,20 +671,22 @@ fn write_meta_string_conn(conn: &impl SqlExecutor, key: &str, value: &str) -> Re
     Ok(())
 }
 
-fn write_terminal_defaults_meta(conn: &impl SqlExecutor, defaults: &GuildSettings) -> Result<()> {
+fn write_terminal_defaults_meta(conn: &Connection, defaults: &GuildSettings) -> Result<()> {
+    let tx = conn.transaction_immediate()?;
     let json = serde_json::json!({
         "prefix": defaults.prefix,
         "retention_days": defaults.retention_days,
     });
     let json = json.to_string();
-    let prev = meta_string_conn(conn, META_TERMINAL_DEFAULTS)?;
-    write_meta_string_conn(conn, META_TERMINAL_DEFAULTS, &json)?;
+    let prev = meta_string_conn(&tx, META_TERMINAL_DEFAULTS)?;
+    write_meta_string_conn(&tx, META_TERMINAL_DEFAULTS, &json)?;
     // Bump only when an existing meta value changes (not first seed).
     if let Some(p) = prev
         && p != json
     {
-        bump_config_version_conn(conn)?;
+        bump_config_version_conn(&tx)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -724,17 +725,19 @@ fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
 }
 
 fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
-    let has_meta: i64 = conn.query_row(
+    let tx = conn.transaction_primary_read()?;
+    let has_meta: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
         (),
         |r| Ok(r.get(0)?),
     )?;
     if has_meta != 0 {
-        conn.execute_untracked(
+        tx.execute(
             "DELETE FROM meta WHERE key = ?1",
             params![META_BOOTSTRAP_COMPLETE],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1156,20 +1159,12 @@ fn read_settings_override_conn(
     let Some(json) = raw else {
         return Ok(None);
     };
-    // Corrupt JSON is not a valid override. Clear it immediately so inheritance
-    // resumes without waiting for the next process restart / heal pass.
+    // Corrupt JSON is not a valid override. Runtime reads fail open to
+    // inheritance; bot-owned startup healing performs any durable repair plus
+    // version/checksum changes atomically.
     match parse_settings_override_json(guild_id, &json) {
         Some(ov) => Ok(Some(ov)),
-        None => {
-            write_settings_override_conn(conn, guild_id, &GuildSettingsOverride::default())?;
-            bump_config_version_conn(conn)?;
-            // Autocommit read path (e.g. get_settings): refresh heal checksum so
-            // the next process open does not re-scan when the row is already clean.
-            if conn.is_autocommit() {
-                refresh_settings_heal_checksum_conn(conn)?;
-            }
-            Ok(None)
-        }
+        None => Ok(None),
     }
 }
 
@@ -2431,12 +2426,8 @@ pub async fn mark_edited(db: &Db, message_id: i64, content: &str) -> Result<()> 
 
 pub async fn purge_old_messages(db: &Db) -> Result<usize> {
     db.with_conn(move |conn| {
-        // Retention is destructive: resolve policy and delete from one
-        // primary snapshot so replica lag cannot apply a superseded policy.
-        let tx = conn.transaction_immediate()?;
-        let defaults = terminal_defaults_conn(&tx)?;
         let guild_ids: Vec<i64> = {
-            let mut stmt = tx.prepare("SELECT DISTINCT guild_id FROM messages")?;
+            let mut stmt = conn.prepare("SELECT DISTINCT guild_id FROM messages")?;
             let rows = stmt.query_map((), |r| Ok(r.get::<i64>(0)?))?;
             let mut v = Vec::new();
             for row in rows {
@@ -2447,9 +2438,15 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
 
         let mut total = 0usize;
         for guild_id in guild_ids {
+            // One bounded primary transaction per guild makes policy + delete
+            // atomic without holding the global writer lock across every
+            // guild and hundreds of remote round trips.
+            let tx = conn.transaction_immediate()?;
+            let defaults = terminal_defaults_conn(&tx)?;
             let days = retention_days_for_guild(&tx, guild_id, &defaults)?;
             // 0 = keep forever (UI allows min 0).
             if days == 0 {
+                tx.finish_read()?;
                 continue;
             }
             let Some(duration) = chrono::Duration::try_days(days as i64) else {
@@ -2457,6 +2454,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
                     "skipping invalid retention_days={days} for guild {guild_id}; \
                      set it to at most {MAX_RETENTION_DAYS}"
                 );
+                tx.finish_read()?;
                 continue;
             };
             let cutoff = (Utc::now() - duration).to_rfc3339();
@@ -2465,8 +2463,8 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
                 params![guild_id, cutoff],
             )?;
             total += n;
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(total)
     })
     .await
@@ -3261,6 +3259,16 @@ mod tests {
             "commands present: {}",
             parts.commands.len()
         );
+        let raw: String = db
+            .with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT settings FROM guild_settings WHERE guild_id = 44",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+            })
+            .unwrap();
+        assert_eq!(raw, "{not-json");
         assert_eq!(
             parts.templates.len(),
             crate::types::EVENT_TYPES.len(),
@@ -4658,7 +4666,7 @@ mod tests {
     }
 
     #[test]
-    fn api_open_heals_legacy_guild_settings() {
+    fn api_open_leaves_healing_to_bot_authority() {
         let tmp = tmp_db_path("heal_api_open");
         {
             let db = Db::open(&tmp, 2).unwrap();
@@ -4682,13 +4690,16 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        assert!(
-            tokio_test_block_on(crate::db::get_settings_override(&db, 55))
-                .unwrap()
-                .is_none(),
-            "API migrate=false open must heal corrupt guild_settings rows"
-        );
-        tokio_test_block_on(crate::db::get_settings(&db, 55)).unwrap();
+        let raw: String = db
+            .with_conn_sync(|conn| {
+                conn.query_row(
+                    "SELECT settings FROM guild_settings WHERE guild_id = 55",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+            })
+            .unwrap();
+        assert_eq!(raw, "{not-json");
         cleanup_db(&tmp);
     }
 
@@ -4814,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_read_clears_corrupt_guild_settings_json() {
+    fn runtime_read_ignores_corrupt_settings_and_bot_heals_atomically() {
         let tmp = tmp_db_path("runtime_corrupt_clear");
         let db = Db::open(&tmp, 2).unwrap();
         tokio_test_block_on(db.with_conn(|conn| {
@@ -4825,7 +4836,7 @@ mod tests {
             Ok(())
         }))
         .unwrap();
-        // get_settings must succeed and persist the clear (no restart / heal needed).
+        // Runtime reads inherit safely without performing a multi-commit repair.
         let effective = tokio_test_block_on(crate::db::get_settings(&db, 44)).unwrap();
         assert_eq!(
             effective.prefix,
@@ -4835,24 +4846,24 @@ mod tests {
             tokio_test_block_on(crate::db::get_settings_override(&db, 44))
                 .unwrap()
                 .is_none(),
-            "corrupt row must be deleted on read"
+            "corrupt row must not become an effective override"
         );
-        let v_after_clear = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
+        let v_before_heal = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
         drop(db);
         let db2 = Db::open_with(DbOpenOptions {
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
             pool_size: 2,
-            migrate: false,
+            migrate: true,
             default_prefix: "!".into(),
             retention_days: 7,
         })
         .unwrap();
-        let v_after_reopen = tokio_test_block_on(crate::db::get_config_version(&db2)).unwrap();
-        assert_eq!(
-            v_after_clear, v_after_reopen,
-            "corrupt clear must refresh heal checksum so reopen skips heal"
+        let v_after_heal = tokio_test_block_on(crate::db::get_config_version(&db2)).unwrap();
+        assert!(
+            v_after_heal > v_before_heal,
+            "bot heal must publish its repair"
         );
         cleanup_db(&tmp);
     }

@@ -220,7 +220,10 @@ async fn main() -> Result<()> {
                                 }
                                 let failed_n = failed.len();
                                 if app.finish_slash_resync(remote, failed) {
-                                    app.commit_slash_registry_version(remote);
+                                    tracing::info!(
+                                        remote,
+                                        "slash registry reconciliation committed"
+                                    );
                                 } else {
                                     tracing::warn!(
                                         "slash re-sync incomplete ({failed_n} guild(s) failed); \

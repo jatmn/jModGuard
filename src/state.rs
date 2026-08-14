@@ -155,9 +155,10 @@ impl AppState {
             return Ok(true);
         }
         if remote < prev || remote < self.db.required_config_version() {
+            let suspected_floor = prev.max(self.db.required_config_version());
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
             return Ok(self
-                .reconcile_primary_versions(primary_config, primary_slash)
+                .reconcile_primary_versions(primary_config, primary_slash, suspected_floor)
                 .0);
         }
         Ok(false)
@@ -173,8 +174,10 @@ impl AppState {
         let remote = db::get_slash_registry_version(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
         if remote < prev {
+            let suspected_floor = prev.max(self.db.required_config_version());
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
-            let (_, slash_changed) = self.reconcile_primary_versions(primary_config, primary_slash);
+            let (_, slash_changed) =
+                self.reconcile_primary_versions(primary_config, primary_slash, suspected_floor);
             let current = self.last_slash_registry_version.load(Ordering::SeqCst);
             Ok(
                 (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
@@ -187,29 +190,31 @@ impl AppState {
         }
     }
 
-    fn reconcile_primary_versions(&self, config: u64, slash: u64) -> (bool, bool) {
+    fn reconcile_primary_versions(
+        &self,
+        config: u64,
+        slash: u64,
+        suspected_floor: u64,
+    ) -> (bool, bool) {
         let previous_config = self.last_config_version.load(Ordering::SeqCst);
-        let expected_floor = previous_config.max(self.db.required_config_version());
-        if config < expected_floor {
+        if config < suspected_floor {
             tracing::warn!(
                 previous_config,
-                required_config = expected_floor,
+                required_config = suspected_floor,
                 primary_config = config,
                 "primary database confirmed config version below the local floor; rebaselining"
             );
             self.db
-                .rebaseline_required_config_version(expected_floor, config);
-            self.configs.rebaseline_version(expected_floor, config);
+                .rebaseline_required_config_version(suspected_floor, config);
+            self.configs.rebaseline_version(suspected_floor, config);
         }
         let config_changed = config != previous_config
             && self
                 .last_config_version
                 .compare_exchange(previous_config, config, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
-        if config_changed {
-            if config > previous_config {
-                self.configs.require_version(config);
-            }
+        if config_changed && config > previous_config {
+            self.configs.require_version(config);
         }
 
         let previous_slash = self.last_slash_registry_version.load(Ordering::SeqCst);
@@ -299,8 +304,9 @@ impl AppState {
         SlashResyncPlan::Sync { guilds, invalidate }
     }
 
-    /// Record guilds that failed `set_commands` for `remote`.
-    /// Returns `true` when the caller should [`commit_slash_registry_version`].
+    /// Record guilds that failed `set_commands` for `remote`. A successful
+    /// finish commits the version and clears the force flag while holding the
+    /// progress lock, so a concurrent retry request cannot be erased.
     pub fn finish_slash_resync(&self, remote: u64, failed: HashSet<u64>) -> bool {
         let mut guard = self.slash_sync_progress.lock();
         let Some(progress) = guard.as_mut() else {
@@ -314,6 +320,10 @@ impl AppState {
         }
         if failed.is_empty() {
             *guard = None;
+            self.last_slash_registry_version
+                .store(remote, Ordering::SeqCst);
+            self.force_slash_registry_retry
+                .store(false, Ordering::SeqCst);
             true
         } else {
             progress.remaining = Some(failed);

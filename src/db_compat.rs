@@ -200,7 +200,6 @@ pub trait SqlExecutor {
 
     fn prepare(&self, sql: &str) -> Result<Statement>;
 
-    fn is_autocommit(&self) -> bool;
     fn record_config_version(&self, version: u64);
 }
 
@@ -368,10 +367,6 @@ impl SqlExecutor for Connection {
             inner,
             runtime: self.runtime.clone(),
         })
-    }
-
-    fn is_autocommit(&self) -> bool {
-        self.inner.is_autocommit()
     }
 
     fn record_config_version(&self, version: u64) {
@@ -554,9 +549,10 @@ impl Transaction {
         drop_transaction_without_runtime(transaction.take().expect("transaction active"));
         drop(connection);
         match (query, cleanup) {
-            (Ok(found), Ok(_)) => Ok(found),
+            // Once the primary receipt query answered, the original outcome
+            // is established. Cleanup failure cannot change that snapshot.
+            (Ok(found), _) => Ok(found),
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
         }
     }
 }
@@ -651,10 +647,6 @@ impl SqlExecutor for Transaction {
             inner,
             runtime: self.runtime.clone(),
         })
-    }
-
-    fn is_autocommit(&self) -> bool {
-        self.inner().is_autocommit()
     }
 
     fn record_config_version(&self, version: u64) {
