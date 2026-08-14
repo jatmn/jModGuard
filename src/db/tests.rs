@@ -2098,6 +2098,49 @@ fn nickname_reconcile_exists_before_settings_commit() {
 }
 
 #[test]
+fn nickname_outbox_migration_queues_existing_guild_nicknames() {
+    let tmp = tmp_db_path("nickname_outbox_migration");
+    let legacy = Connection::open(&tmp).unwrap();
+    for (index, sql) in MIGRATIONS[..4].iter().enumerate() {
+        legacy.execute_batch(sql).unwrap();
+        legacy
+            .pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+    }
+    legacy
+        .execute(
+            "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
+            params![42i64, r#"{"bot_name":"Legacy nickname"}"#],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
+            params![43i64, r#"{"bot_name":""}"#],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
+            params![0i64, r#"{"bot_name":"Global nickname"}"#],
+        )
+        .unwrap();
+    drop(legacy);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    let pending = tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|job| (job.guild_id, job.nickname.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(42, "Legacy nickname")],
+        "migration must bridge pre-outbox guild-local nickname configuration"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
     let tmp = tmp_db_path("nickname_outbox_lifecycle");
     let db = Db::open(&tmp, 2).unwrap();
