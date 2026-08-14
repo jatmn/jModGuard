@@ -797,17 +797,9 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
     Ok(load_config_parts_with_version(db, guild_id).await?.1)
 }
 
-async fn load_web_config_snapshot_routed(
-    db: &Db,
-    guild_id: i64,
-    primary: bool,
-) -> Result<WebConfigSnapshot> {
+async fn load_web_config_snapshot_primary(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
     db.with_conn(move |conn| {
-        let tx = if primary {
-            conn.transaction_primary_read()?
-        } else {
-            conn.transaction()?
-        };
+        let tx = conn.transaction_primary_read()?;
         let version = get_config_version_conn(&tx)?;
         let settings = settings_web_bundle_conn(&tx, guild_id)?;
         let nickname_reconcile = if guild_id == GLOBAL_SCOPE {
@@ -858,21 +850,16 @@ async fn load_web_config_snapshot_routed(
     .await
 }
 
-/// Loads one coherent WebUI bundle. Replica reads remain the fast path, but a
-/// stale/before-schema snapshot or any below-floor result is retried against
-/// the primary so a successful mutation cannot be followed by stale UI data.
+/// Loads one coherent, primary-authoritative WebUI bundle. Nickname job state
+/// has its own lifecycle rather than `config_version`, so a replica snapshot
+/// cannot establish freshness for every operator-visible field.
 pub async fn load_web_config_snapshot(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
-    match load_web_config_snapshot_routed(db, guild_id, false).await {
-        Ok(snapshot) if snapshot.version >= db.required_config_version() => Ok(snapshot),
-        Ok(_) | Err(_) => {
-            let snapshot = load_web_config_snapshot_routed(db, guild_id, true).await?;
-            anyhow::ensure!(
-                snapshot.version >= db.required_config_version(),
-                "primary WebUI config snapshot is below the process's committed-version floor"
-            );
-            Ok(snapshot)
-        }
-    }
+    let snapshot = load_web_config_snapshot_primary(db, guild_id).await?;
+    anyhow::ensure!(
+        snapshot.version >= db.required_config_version(),
+        "primary WebUI config snapshot is below the process's committed-version floor"
+    );
+    Ok(snapshot)
 }
 
 async fn load_config_parts_with_version_routed(

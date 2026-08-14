@@ -116,6 +116,8 @@ pub struct Db {
     permits: Arc<tokio::sync::Semaphore>,
     permit_timeout: Option<Duration>,
     required_config_version: Arc<std::sync::atomic::AtomicU64>,
+    config_write_generation: Arc<std::sync::atomic::AtomicU64>,
+    config_floor_lock: Arc<parking_lot::Mutex<()>>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, ConfigParts)>>>,
@@ -326,6 +328,8 @@ impl Db {
             permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
             permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
             required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
             settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
@@ -401,6 +405,8 @@ impl Db {
         .context("database connection limiter closed")?;
         let connections = Arc::clone(&self.connections);
         let required_config_version = Arc::clone(&self.required_config_version);
+        let config_write_generation = Arc::clone(&self.config_write_generation);
+        let config_floor_lock = Arc::clone(&self.config_floor_lock);
         tokio::task::spawn_blocking(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
             // cannot cancel blocking work, so an aborted request must not let
@@ -414,10 +420,17 @@ impl Db {
                     .err()
                     .is_some_and(is_database_commit_indeterminate)
             {
-                required_config_version.fetch_max(
-                    connection.take_config_version(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
+                let committed_version = connection.take_config_version();
+                if committed_version > 0 {
+                    let _floor = config_floor_lock.lock();
+                    // Odd while publishing, even when stable. Rebaseline code
+                    // uses this as a seqlock so reused version numbers after a
+                    // provider rollback cannot hide a concurrent local write.
+                    config_write_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    required_config_version
+                        .fetch_max(committed_version, std::sync::atomic::Ordering::SeqCst);
+                    config_write_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             if connection.pool.remote && result.is_err()
                 || connection.is_tainted()
@@ -458,10 +471,16 @@ impl Db {
                 .err()
                 .is_some_and(is_database_commit_indeterminate)
         {
-            self.required_config_version.fetch_max(
-                connection.take_config_version(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            let committed_version = connection.take_config_version();
+            if committed_version > 0 {
+                let _floor = self.config_floor_lock.lock();
+                self.config_write_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.required_config_version
+                    .fetch_max(committed_version, std::sync::atomic::Ordering::SeqCst);
+                self.config_write_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         if connection.pool.remote && result.is_err()
             || connection.is_tainted()
@@ -480,14 +499,29 @@ impl Db {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn config_write_generation(&self) -> u64 {
+        self.config_write_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn require_config_version(&self, version: u64) {
+        let _floor = self.config_floor_lock.lock();
         self.required_config_version
             .fetch_max(version, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Lowers a process-local read-your-write floor only when it still equals
     /// the value whose loss was confirmed by a primary-routed transaction.
-    pub fn rebaseline_required_config_version(&self, expected: u64, version: u64) {
+    pub fn rebaseline_required_config_version(
+        &self,
+        expected: u64,
+        version: u64,
+        write_generation: u64,
+    ) -> bool {
+        let _floor = self.config_floor_lock.lock();
+        if write_generation & 1 != 0 || self.config_write_generation() != write_generation {
+            return false;
+        }
         let mut current = self.required_config_version();
         while current > version && current <= expected {
             match self.required_config_version.compare_exchange(
@@ -500,6 +534,7 @@ impl Db {
                 Err(actual) => current = actual,
             }
         }
+        true
     }
 }
 

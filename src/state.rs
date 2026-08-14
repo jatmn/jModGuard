@@ -160,9 +160,15 @@ impl AppState {
         }
         if remote < prev || remote < self.db.required_config_version() {
             let suspected_floor = prev.max(self.db.required_config_version());
+            let write_generation = self.db.config_write_generation();
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
             return Ok(self
-                .reconcile_primary_versions(primary_config, primary_slash, suspected_floor)
+                .reconcile_primary_versions(
+                    primary_config,
+                    primary_slash,
+                    suspected_floor,
+                    write_generation,
+                )
                 .0);
         }
         Ok(false)
@@ -182,9 +188,14 @@ impl AppState {
                 .last_config_version
                 .load(Ordering::SeqCst)
                 .max(self.db.required_config_version());
+            let write_generation = self.db.config_write_generation();
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
-            let (_, slash_changed) =
-                self.reconcile_primary_versions(primary_config, primary_slash, suspected_floor);
+            let (_, slash_changed) = self.reconcile_primary_versions(
+                primary_config,
+                primary_slash,
+                suspected_floor,
+                write_generation,
+            );
             let current = self.last_slash_registry_version.load(Ordering::SeqCst);
             Ok(
                 (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
@@ -202,7 +213,17 @@ impl AppState {
         config: u64,
         slash: u64,
         suspected_floor: u64,
+        write_generation: u64,
     ) -> (bool, bool) {
+        if !self
+            .db
+            .rebaseline_required_config_version(suspected_floor, config, write_generation)
+        {
+            tracing::debug!(
+                "discarding primary version snapshot because a local config write committed concurrently"
+            );
+            return (false, false);
+        }
         let previous_config = self.last_config_version.load(Ordering::SeqCst);
         if config < suspected_floor {
             tracing::warn!(
@@ -211,8 +232,6 @@ impl AppState {
                 primary_config = config,
                 "primary database confirmed config version below the local floor; rebaselining"
             );
-            self.db
-                .rebaseline_required_config_version(suspected_floor, config);
             self.configs.rebaseline_version(suspected_floor, config);
         }
         let config_changed = config != previous_config
@@ -912,6 +931,54 @@ mod tests {
             initial_config + 1
         );
         tokio_test_block_on(app.configs.get(&app.db, 1)).expect("cache floor must rebaseline");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn primary_rebaseline_rejects_snapshot_across_concurrent_local_write() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_rebaseline_generation_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        app.db.require_config_version(11);
+        app.configs.require_version(11);
+        app.last_config_version.store(11, Ordering::SeqCst);
+        let before_write = app.db.config_write_generation();
+
+        tokio_test_block_on(db::patch_settings(
+            &app.db,
+            77,
+            Some(Some("reused-version-write".into())),
+            None,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.reconcile_primary_versions(9, 9, 11, before_write),
+            (false, false),
+            "a primary snapshot taken before a concurrent local commit must be discarded"
+        );
+        assert_eq!(app.db.required_config_version(), 11);
+        assert_eq!(app.last_config_version.load(Ordering::SeqCst), 11);
+
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));

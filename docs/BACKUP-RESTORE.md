@@ -59,11 +59,19 @@ value types, schema objects, and migration metadata. Then verify this drill:
    checksum.
 3. Create a separate empty Bunny Database with separate credentials.
 4. Restore the export without pointing either production app at the target.
-5. Compare schema objects and per-table row counts between source and target.
-6. Start the same-version bot against the target, then the API.
-7. Verify a known guild configuration, moderation record, and audit event.
-8. Perform and revert one harmless write through the WebUI.
-9. Record the tool version, source version, checksums, counts, and result.
+5. Compare the exact schema SQL for tables, indexes, and triggers, including
+   `PRAGMA user_version`, the migration/readiness metadata, and
+   `sqlite_sequence` state. Row counts alone are not sufficient.
+6. Produce deterministic per-table logical hashes on both databases. The
+   canonical input must include every column's SQLite `typeof(...)`, a stable
+   primary-key ordering, explicit NULL representation, and the complete value
+   bytes (including JSON/text and blobs). Require every source/target hash to
+   match; also compare row counts as a diagnostic.
+7. Start the same-version bot against the target, then the API.
+8. Verify a known guild configuration, moderation record, and audit event.
+9. Perform and revert one harmless write through the WebUI.
+10. Record the export/restore tool versions, source and target schema hashes,
+    per-table content hashes and counts, export checksum, and drill result.
 
 Do not test restoration by overwriting the source database.
 
