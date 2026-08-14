@@ -100,7 +100,15 @@ async fn main() -> Result<()> {
                 let now = chrono::Utc::now().timestamp();
                 match db::pending_nickname_reconciles(&app.db, now, 25).await {
                     Ok(pending) => {
-                        let me = cache.current_user().id;
+                        let me = match app.bot_user_id().await {
+                            Ok(id) => id,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "nickname reconciliation deferred until Discord identity is available: {error:#}"
+                                );
+                                continue;
+                            }
+                        };
                         for job in pending {
                             let Ok(guild_id_u64) = u64::try_from(job.guild_id) else {
                                 tracing::error!(

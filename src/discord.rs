@@ -21,7 +21,11 @@ pub fn classify_nickname_failure(error: &serenity::Error) -> (NicknameFailureCla
     }
     if matches!(
         error,
-        serenity::Error::Http(serenity::http::HttpError::Request(_))
+        serenity::Error::Http(
+            serenity::http::HttpError::Request(_)
+                | serenity::http::HttpError::RateLimitI64F64
+                | serenity::http::HttpError::RateLimitUtf8
+        )
     ) {
         return (NicknameFailureClass::Transient, "transport".into());
     }
@@ -98,6 +102,13 @@ mod tests {
         );
         assert_eq!(
             classify_nickname_response(503, 0).0,
+            NicknameFailureClass::Transient
+        );
+        assert_eq!(
+            super::classify_nickname_failure(&serenity::Error::Http(
+                serenity::http::HttpError::RateLimitUtf8,
+            ))
+            .0,
             NicknameFailureClass::Transient
         );
     }

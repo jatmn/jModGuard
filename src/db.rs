@@ -490,7 +490,15 @@ fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
 }
 
 fn migrate_conn(conn: &mut Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    // Migration selection must be authoritative. A lagging remote replica can
+    // otherwise report vN-1 after vN committed and make us replay a
+    // non-idempotent CREATE/ALTER migration against the primary.
+    let version: i64 = {
+        let tx = conn.transaction_primary_read()?;
+        let version = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+        tx.finish_read()?;
+        version
+    };
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version < target {

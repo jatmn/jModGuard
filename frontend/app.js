@@ -920,7 +920,9 @@ function tabSettings() {
             bot_name: cfg.settings.bot_name,
             sync_nickname: true,
           });
+          await loadConfig();
           toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success");
+          renderTab();
         } catch (e) {
           toast(e.message || String(e), "error");
         }
