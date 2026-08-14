@@ -411,27 +411,26 @@ impl EventHandler for Handler {
         let id = event.id.get() as i64;
         if let Ok(Some((old_content, _))) =
             db::mark_edited_with_previous(&app.db, id, &new_content).await
+            && old_content != new_content
         {
-            if old_content != new_content {
-                let mut vars = BTreeMap::new();
-                vars.insert("channel".into(), format!("<#{}>", event.channel_id));
-                vars.insert("before".into(), truncate_2000(&old_content));
-                vars.insert("after".into(), truncate_2000(&new_content));
-                if let Some(author) = &event.author {
-                    vars.insert("user".into(), author.name.clone());
-                    vars.insert("mention".into(), format!("<@{}>", author.id));
-                }
-                logging::emit(&app, &ctx, guild_id, "message_edit", vars).await;
-                let _ = db::insert_event(
-                    &app.db,
-                    guild_id.get() as i64,
-                    "message_edit",
-                    event.author.as_ref().map(|a| a.id.get() as i64),
-                    None,
-                    &serde_json::json!({"message_id": id, "before": old_content, "after": new_content, "channel_id": event.channel_id.get()}),
-                )
-                .await;
+            let mut vars = BTreeMap::new();
+            vars.insert("channel".into(), format!("<#{}>", event.channel_id));
+            vars.insert("before".into(), truncate_2000(&old_content));
+            vars.insert("after".into(), truncate_2000(&new_content));
+            if let Some(author) = &event.author {
+                vars.insert("user".into(), author.name.clone());
+                vars.insert("mention".into(), format!("<@{}>", author.id));
             }
+            logging::emit(&app, &ctx, guild_id, "message_edit", vars).await;
+            let _ = db::insert_event(
+                &app.db,
+                guild_id.get() as i64,
+                "message_edit",
+                event.author.as_ref().map(|a| a.id.get() as i64),
+                None,
+                &serde_json::json!({"message_id": id, "before": old_content, "after": new_content, "channel_id": event.channel_id.get()}),
+            )
+            .await;
         }
     }
 
