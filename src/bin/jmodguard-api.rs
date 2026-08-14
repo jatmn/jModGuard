@@ -41,8 +41,9 @@ async fn main() -> Result<()> {
     }
 
     // Bind first so platform GET /health succeeds while the remote database
-    // is still waking or the bot is still migrating. The handler does not
-    // touch SQL; the full router takes over the same socket after open.
+    // is still waking or the bot is still migrating. Only /health and / are
+    // live on this socket until open finishes; other paths return 503. The
+    // full router takes over the same socket after open.
     let web_bind = cfg.web.bind.clone();
     let listener = tokio::net::TcpListener::bind(&web_bind)
         .await

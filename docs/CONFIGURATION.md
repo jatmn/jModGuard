@@ -30,7 +30,7 @@ Environment-only (not in `config.toml`):
 | Variable | Default | Description |
 |---|---|---|
 | `JMODGUARD_REQUIRE_REMOTE_DB` | unset | If `1`/`true`, startup fails unless both a remote URL and token are configured. Container images set this so a missed Bunny secret cannot open a private SQLite file. |
-| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP liveness listener (`GET /health` returns `ok`). Bound before database open. Container bot image sets `0.0.0.0:8080`; bind failure exits the process. Empty = disabled. The API serves the same path on `web.bind` (also before database open). |
+| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP liveness listener (`GET /health` returns `ok`). Bound before database open. Container bot image sets `0.0.0.0:8080`; bind failure exits the process. Empty = disabled. The API serves the same path on `web.bind` before database open; other paths on that bind return `503` until the API is ready. |
 
 ## Database (runtime config)
 

@@ -473,6 +473,11 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     assert!(crate::db::is_api_startup_retryable(&refused, true));
     let auth = anyhow::anyhow!("unauthorized: invalid token");
     assert!(!crate::db::is_api_startup_retryable(&auth, true));
+    let handshake = anyhow::anyhow!("tls handshake: client authentication timed out");
+    assert!(
+        crate::db::is_api_startup_retryable(&handshake, true),
+        "TLS wording that contains 'authentication' must still retry"
+    );
     let schema = anyhow::anyhow!(crate::db::SchemaNotReady("schema is behind".into()));
     assert!(crate::db::is_api_startup_retryable(&schema, false));
     assert!(crate::db::is_api_startup_retryable(&schema, true));

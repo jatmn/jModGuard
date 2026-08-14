@@ -94,7 +94,7 @@ without rolling back durable settings.
 src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
-src/health.rs              GET /health liveness (bot listener; API axum route)
+src/health.rs              GET /health liveness (bot listener; API bind before DB open)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
 migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot

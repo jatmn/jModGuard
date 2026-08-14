@@ -101,7 +101,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   intentional local-SQLite container run.
 - Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET /health`
   are unauthenticated process liveness probes (`ok`, no database). Bind and
-  accept them **before** opening the database. Do not put session middleware
+  accept them **before** opening the database. On the API public bind, only
+  `/health` and `/` return 200 during that window; `/api`, `/login`, and
+  `/oauth` return 503 until axum takes over. Do not put session middleware
   on `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`

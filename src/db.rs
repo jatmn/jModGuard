@@ -95,7 +95,8 @@ fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
         message.contains("unauthorized")
             || message.contains("forbidden")
             || message.contains("invalid token")
-            || message.contains("authentication")
+            || message.contains("authentication failed")
+            || message.contains("authentication error")
             || message.contains("status code: 401")
             || message.contains("status code: 403")
     })
@@ -141,8 +142,9 @@ pub fn is_api_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
 }
 
 /// How long the API (and a remote bot) should keep retrying `open_with`.
-/// The attempt count and delay define a wall-clock retry window; individual
-/// opens must not extend that window.
+/// The attempt count and delay define when new attempts may start. An
+/// in-flight `open_with` is allowed to finish so migrate/bootstrap work is
+/// not abandoned and the last error stays classified.
 pub fn startup_open_retry(opts: &DbOpenOptions) -> (u32, Duration) {
     if opts.url.trim().is_empty() {
         (30, Duration::from_secs(1))
@@ -436,26 +438,20 @@ impl Db {
         let attempts = attempts.max(1);
         // `open_with` owns a synchronous libSQL compatibility boundary. Run
         // each attempt on its own OS thread so callers can continue polling
-        // health and shutdown futures. An unjoined worker is intentional on
-        // cancellation: the process can exit promptly while its in-flight
-        // remote operation is abandoned by the OS.
+        // health and shutdown futures. Do not abort an in-flight open on the
+        // retry deadline: that would drop the real error (including
+        // `SchemaNotReady`) and leave a migrate worker running after the
+        // caller has given up. Shutdown still drops the oneshot receiver;
+        // process exit then abandons the OS thread.
         let deadline = (!delay.is_zero()).then(|| Instant::now() + delay.saturating_mul(attempts));
         let mut last = None;
         for i in 0..attempts {
-            let open = Self::open_with_on_worker(opts.clone());
-            let opened = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match tokio::time::timeout(remaining, open).await {
-                        Ok(result) => result,
-                        Err(_) => break,
-                    }
-                }
-                None => open.await,
-            };
+            if deadline.is_some_and(|deadline| {
+                deadline.saturating_duration_since(Instant::now()).is_zero()
+            }) {
+                break;
+            }
+            let opened = Self::open_with_on_worker(opts.clone()).await;
             match opened {
                 Ok(db) => return Ok(db),
                 Err(err) if is_api_startup_retryable(&err, !opts.url.trim().is_empty()) => {
@@ -481,8 +477,10 @@ impl Db {
                 Err(err) => return Err(err),
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("database schema not ready")))
-            .context("timed out waiting for jmodguard-bot to migrate the database")
+        Err(last.unwrap_or_else(|| {
+            anyhow::Error::new(SchemaNotReady("database schema not ready".into()))
+        }))
+        .context("timed out waiting for jmodguard-bot to migrate the database")
     }
 
     async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {
@@ -490,9 +488,8 @@ impl Db {
         std::thread::Builder::new()
             .name("jmodguard-db-open".into())
             .spawn(move || {
-                // The receiver can be dropped on shutdown or deadline expiry.
-                // In that case the worker just drops its result after the
-                // synchronous libSQL operation returns.
+                // The receiver can be dropped on shutdown. The worker still
+                // finishes the synchronous open; process exit reaps it.
                 let _ = send.send(Self::open_with(opts));
             })
             .context("failed to start database-open worker")?;
