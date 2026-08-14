@@ -157,14 +157,12 @@ impl EventHandler for Handler {
 
         // Backfill member tracking from cache (bounded batch).
         if !guild.members.is_empty() {
-            let members: Vec<(u64, String)> = guild
+            let members: Vec<(i64, String)> = guild
                 .members
                 .values()
-                .map(|m| (m.user.id.get(), m.user.name.clone()))
+                .map(|m| (m.user.id.get() as i64, m.user.name.clone()))
                 .collect();
-            for (uid, name) in members {
-                let _ = db::backfill_member(&app.db, gid.get() as i64, uid as i64, &name).await;
-            }
+            let _ = db::backfill_members(&app.db, gid.get() as i64, members).await;
         }
 
         if is_new.unwrap_or(false) {
@@ -494,17 +492,23 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let n = multiple_deleted_messages_ids.len();
-        for id in &multiple_deleted_messages_ids {
-            let allow_missing = app.message_tracking_pending(id.get());
-            let _ = db::mark_deleted(
-                &app.db,
-                id.get() as i64,
-                guild_id.get() as i64,
-                channel_id.get() as i64,
-                allow_missing,
-            )
-            .await;
-        }
+        let allow_missing_ids = multiple_deleted_messages_ids
+            .iter()
+            .filter(|id| app.message_tracking_pending(id.get()))
+            .map(|id| id.get() as i64)
+            .collect();
+        let message_ids = multiple_deleted_messages_ids
+            .iter()
+            .map(|id| id.get() as i64)
+            .collect();
+        let _ = db::mark_deleted_bulk(
+            &app.db,
+            message_ids,
+            allow_missing_ids,
+            guild_id.get() as i64,
+            channel_id.get() as i64,
+        )
+        .await;
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
         vars.insert("count".into(), n.to_string());

@@ -803,6 +803,53 @@ fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
     }))
     .unwrap();
     assert_eq!(absent, 0, "untracked lifecycle events must not create rows");
+
+    tokio_test_block_on(crate::db::mark_deleted_bulk(
+        &db,
+        vec![104, 105],
+        vec![104],
+        42,
+        7,
+    ))
+    .unwrap();
+    let bulk_rows = tokio_test_block_on(db.with_conn(|conn| {
+        Ok((
+            conn.query_row(
+                "SELECT deleted_at IS NOT NULL FROM messages WHERE message_id = 104",
+                (),
+                |r| Ok(r.get::<bool>(0)?),
+            )?,
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE message_id = 105",
+                (),
+                |r| Ok(r.get::<i64>(0)?),
+            )?,
+        ))
+    }))
+    .unwrap();
+    assert_eq!(bulk_rows, (true, 0));
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn member_backfill_batches_cached_members() {
+    let tmp = tmp_db_path("member_backfill_batch");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(crate::db::backfill_members(
+        &db,
+        42,
+        vec![(1, "one".into()), (2, "two".into())],
+    ))
+    .unwrap();
+    let rows = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*), SUM(currently_in) FROM members WHERE guild_id = 42",
+            (),
+            |r| Ok((r.get::<i64>(0)?, r.get::<i64>(1)?)),
+        )
+    }))
+    .unwrap();
+    assert_eq!(rows, (2, 2));
     cleanup_db(&tmp);
 }
 

@@ -122,18 +122,61 @@ pub async fn search_members(db: &Db, guild_id: i64, q: &str, limit: i64) -> Resu
     .await
 }
 
-pub async fn backfill_member(db: &Db, guild_id: i64, user_id: i64, username: &str) -> Result<()> {
-    let (now, username) = (now_str(), username.to_string());
+pub async fn backfill_members(
+    db: &Db,
+    guild_id: i64,
+    mut members: Vec<(i64, String)>,
+) -> Result<()> {
+    const MAX_BACKFILL_MEMBERS: usize = 10_000;
+    if members.len() > MAX_BACKFILL_MEMBERS {
+        tracing::warn!(
+            guild_id,
+            cached = members.len(),
+            limit = MAX_BACKFILL_MEMBERS,
+            "member cache backfill truncated; later joins/messages fill remaining rows"
+        );
+        members.truncate(MAX_BACKFILL_MEMBERS);
+    }
+    if members.is_empty() {
+        return Ok(());
+    }
+    let now = now_str();
     db.with_conn(move |conn| {
-        conn.execute(
-            "INSERT INTO members (guild_id, user_id, username, first_joined_at, last_joined_at, join_count, currently_in)
-             VALUES (?1, ?2, ?3, ?4, ?4, 1, 1)
-             ON CONFLICT(guild_id, user_id) DO UPDATE SET
-               username = excluded.username, currently_in = 1,
-               first_joined_at = COALESCE(members.first_joined_at, excluded.first_joined_at)",
-            params![guild_id, user_id, username, now],
-        )?;
-        Ok(())
+        let tx = conn.transaction_immediate()?;
+        for chunk in members.chunks(250) {
+            let values = (0..chunk.len())
+                .map(|i| {
+                    let n = i * 4 + 1;
+                    format!(
+                        "(?{n}, ?{}, ?{}, ?{}, ?{}, 1, 1)",
+                        n + 1,
+                        n + 2,
+                        n + 3,
+                        n + 3
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut args = Vec::with_capacity(chunk.len() * 4);
+            for (user_id, username) in chunk {
+                args.push(Value::Integer(guild_id));
+                args.push(Value::Integer(*user_id));
+                args.push(Value::Text(username.clone()));
+                args.push(Value::Text(now.clone()));
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO members
+                       (guild_id, user_id, username, first_joined_at, last_joined_at, join_count, currently_in)
+                     VALUES {values}
+                     ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                       username = excluded.username, currently_in = 1,
+                       first_joined_at = COALESCE(members.first_joined_at, excluded.first_joined_at)"
+                ),
+                params_from_iter(args),
+            )?;
+        }
+        tx.commit()
     })
     .await
 }
@@ -317,31 +360,60 @@ pub async fn mark_deleted_with_previous(
     .await
 }
 
-pub async fn mark_deleted(
+pub async fn mark_deleted_bulk(
     db: &Db,
-    message_id: i64,
+    message_ids: Vec<i64>,
+    allow_missing_ids: Vec<i64>,
     guild_id: i64,
     channel_id: i64,
-    allow_missing: bool,
 ) -> Result<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
     let now = now_str();
     db.with_conn(move |conn| {
-        if allow_missing {
-            conn.execute(
-                "INSERT INTO messages
-                   (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
-                 VALUES (?1, ?2, ?3, 0, '', '', '', ?4)
-                 ON CONFLICT(message_id) DO UPDATE SET
-                   deleted_at = COALESCE(messages.deleted_at, excluded.deleted_at)",
-                params![message_id, guild_id, channel_id, now],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
-                params![now, message_id],
+        let tx = conn.transaction_immediate()?;
+        let placeholders = (2..message_ids.len() + 2)
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute(
+            &format!(
+                "UPDATE messages SET deleted_at = ?1
+                 WHERE deleted_at IS NULL AND message_id IN ({placeholders})"
+            ),
+            params_from_iter(
+                std::iter::once(Value::Text(now.clone()))
+                    .chain(message_ids.into_iter().map(Value::Integer)),
+            ),
+        )?;
+
+        if !allow_missing_ids.is_empty() {
+            let values = (0..allow_missing_ids.len())
+                .map(|i| {
+                    let n = i + 1;
+                    format!("(?{n}, ?{}, ?{}, 0, '', '', '', ?{})", n + allow_missing_ids.len(), n + allow_missing_ids.len() * 2, n + allow_missing_ids.len() * 3)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let count = allow_missing_ids.len();
+            let mut args = Vec::with_capacity(count * 4);
+            args.extend(allow_missing_ids.into_iter().map(Value::Integer));
+            args.extend(std::iter::repeat_n(Value::Integer(guild_id), count));
+            args.extend(std::iter::repeat_n(Value::Integer(channel_id), count));
+            args.extend(std::iter::repeat_n(Value::Text(now), count));
+            tx.execute(
+                &format!(
+                    "INSERT INTO messages
+                       (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
+                     VALUES {values}
+                     ON CONFLICT(message_id) DO UPDATE SET
+                       deleted_at = COALESCE(messages.deleted_at, excluded.deleted_at)"
+                ),
+                params_from_iter(args),
             )?;
         }
-        Ok(())
+        tx.commit()
     })
     .await
 }
