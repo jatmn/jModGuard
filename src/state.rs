@@ -255,9 +255,10 @@ impl AppState {
     /// after a transient startup/guild-join sync failure, when no write may
     /// otherwise advance the durable version to trigger another attempt.
     pub fn retry_slash_registry_version(&self) {
+        let mut progress = self.slash_sync_progress.lock();
         self.force_slash_registry_retry
             .store(true, Ordering::SeqCst);
-        *self.slash_sync_progress.lock() = None;
+        *progress = None;
     }
 
     pub fn acknowledged_slash_registry_version(&self) -> u64 {
