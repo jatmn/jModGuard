@@ -238,6 +238,9 @@ impl Db {
         if remote && opts.token.trim().is_empty() {
             anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
         }
+        if !remote && !opts.token.trim().is_empty() {
+            anyhow::bail!("db.url / JMODGUARD_DB_URL is required when db.token is set");
+        }
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {

@@ -288,6 +288,21 @@ fn config_version_bumps_on_settings_write() {
         err.to_string().contains("JMODGUARD_DB_TOKEN is required"),
         "unexpected: {err:#}"
     );
+    let err = Db::open_with(DbOpenOptions {
+        path: tmp.clone(),
+        url: String::new(),
+        token: "configured-token".into(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    })
+    .err()
+    .expect("remote token without a URL should fail instead of opening local SQLite");
+    assert!(
+        err.to_string().contains("JMODGUARD_DB_URL is required"),
+        "unexpected: {err:#}"
+    );
     cleanup_db(&tmp);
 }
 
