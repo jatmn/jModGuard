@@ -345,11 +345,23 @@ fn bind_is_unspecified(bind: &str) -> bool {
 }
 
 fn host_is_loopback(host: &str) -> bool {
-    let host = host.trim().trim_matches(['[', ']']);
-    host.eq_ignore_ascii_case("localhost")
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host == "0.0.0.0"
+    let host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(address) => address.is_loopback() || address.is_unspecified(),
+        std::net::IpAddr::V6(address) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback() || address.is_unspecified())
+        }
+    }
 }
 
 fn bind_host(bind: &str) -> &str {
@@ -580,6 +592,14 @@ mod tests {
 
         cfg.web.base_url = "https://jmodguard.example.b-cdn.net".into();
         cfg.validate_public_base_url().unwrap();
+
+        for origin in ["https://127.0.0.2", "https://[::]", "https://localhost."] {
+            cfg.web.base_url = origin.into();
+            assert!(
+                cfg.validate_public_base_url().is_err(),
+                "public bind must reject {origin}"
+            );
+        }
 
         cfg.web.bind = "127.0.0.1:8080".into();
         cfg.web.base_url = "http://localhost:8080".into();

@@ -14,9 +14,13 @@
 
 use anyhow::{Context as _, Result};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+const MAX_STARTUP_HEALTH_CONNECTIONS: usize = 16;
 
 /// Binds `addr` and returns the listener. Call this during startup so a
 /// occupied health port fails the process before Discord connects.
@@ -58,16 +62,23 @@ where
     F: Future<Output = T>,
 {
     tokio::pin!(work);
+    let permits = Arc::new(Semaphore::new(MAX_STARTUP_HEALTH_CONNECTIONS));
     loop {
         tokio::select! {
             result = &mut work => return result,
             accept = listener.accept() => match accept {
                 Ok((stream, _)) => {
-                    tokio::spawn(async move {
-                        if let Err(error) = answer_connection(stream).await {
-                            tracing::debug!("health connection ended: {error:#}");
-                        }
-                    });
+                    // Drop excess sockets immediately. Startup must keep
+                    // accepting health checks without allowing idle clients
+                    // to create unbounded tasks or retain file descriptors.
+                    if let Ok(permit) = Arc::clone(&permits).try_acquire_owned() {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(error) = answer_connection(stream).await {
+                                tracing::debug!("health connection ended: {error:#}");
+                            }
+                        });
+                    }
                 }
                 Err(error) => tracing::warn!("health accept failed: {error}"),
             },

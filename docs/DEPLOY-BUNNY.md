@@ -107,7 +107,7 @@ ghcr.io/jatmn/jmodguard-bot:<tag>
 ghcr.io/jatmn/jmodguard-api:<tag>
 ```
 
-Use the short git SHA tag (or `main` after that commit is on the default
+Use the `sha-<short git SHA>` tag (or `main` after that commit is on the default
 branch). `latest` is only applied to version tags (`v*`).
 
 The API image is JSON + OAuth only. It does not embed `frontend/`.
