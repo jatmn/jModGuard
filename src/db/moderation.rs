@@ -246,6 +246,7 @@ pub async fn mark_edited_with_previous(
     guild_id: i64,
     channel_id: i64,
     author_id: Option<i64>,
+    allow_missing: bool,
     content: &str,
 ) -> Result<Option<(String, String)>> {
     let (now, content) = (now_str(), content.to_string());
@@ -263,14 +264,14 @@ pub async fn mark_edited_with_previous(
                 "UPDATE messages SET content = ?1, edited_at = ?2 WHERE message_id = ?3",
                 params![content, now, message_id],
             )?;
-        } else {
+        } else if allow_missing {
             // Gateway lifecycle events can overtake delayed best-effort message
             // tracking. Keep a mergeable tombstone so the later create cannot
             // erase this edit.
             tx.execute(
                 "INSERT INTO messages
                    (message_id, guild_id, channel_id, author_id, content, attachments, created_at, edited_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', '', ?6)",
                 params![message_id, guild_id, channel_id, author_id.unwrap_or(0), content, now],
             )?;
         }
@@ -285,6 +286,7 @@ pub async fn mark_deleted_with_previous(
     message_id: i64,
     guild_id: i64,
     channel_id: i64,
+    allow_missing: bool,
 ) -> Result<Option<(String, String)>> {
     let now = now_str();
     db.with_conn(move |conn| {
@@ -301,11 +303,11 @@ pub async fn mark_deleted_with_previous(
                 "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
                 params![now, message_id],
             )?;
-        } else {
+        } else if allow_missing {
             tx.execute(
                 "INSERT INTO messages
                    (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
-                 VALUES (?1, ?2, ?3, 0, '', '', ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 0, '', '', '', ?4)",
                 params![message_id, guild_id, channel_id, now],
             )?;
         }
@@ -315,17 +317,30 @@ pub async fn mark_deleted_with_previous(
     .await
 }
 
-pub async fn mark_deleted(db: &Db, message_id: i64, guild_id: i64, channel_id: i64) -> Result<()> {
+pub async fn mark_deleted(
+    db: &Db,
+    message_id: i64,
+    guild_id: i64,
+    channel_id: i64,
+    allow_missing: bool,
+) -> Result<()> {
     let now = now_str();
     db.with_conn(move |conn| {
-        conn.execute(
-            "INSERT INTO messages
-               (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
-             VALUES (?1, ?2, ?3, 0, '', '', ?4, ?4)
-             ON CONFLICT(message_id) DO UPDATE SET
-               deleted_at = COALESCE(messages.deleted_at, excluded.deleted_at)",
-            params![message_id, guild_id, channel_id, now],
-        )?;
+        if allow_missing {
+            conn.execute(
+                "INSERT INTO messages
+                   (message_id, guild_id, channel_id, author_id, content, attachments, created_at, deleted_at)
+                 VALUES (?1, ?2, ?3, 0, '', '', '', ?4)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                   deleted_at = COALESCE(messages.deleted_at, excluded.deleted_at)",
+                params![message_id, guild_id, channel_id, now],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE messages SET deleted_at = ?1 WHERE message_id = ?2 AND deleted_at IS NULL",
+                params![now, message_id],
+            )?;
+        }
         Ok(())
     })
     .await
@@ -351,7 +366,17 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
             let tx = conn.transaction_immediate()?;
             let defaults = terminal_defaults_conn(&tx)?;
             let days = retention_days_for_guild(&tx, guild_id, &defaults)?;
-            // 0 = keep forever (UI allows min 0).
+            // Incomplete lifecycle tombstones are only a short race bridge;
+            // they are not retained as message history even when retention is
+            // configured to keep completed messages forever.
+            let tombstone_cutoff = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+            total += tx.execute(
+                "DELETE FROM messages
+                 WHERE guild_id = ?1 AND created_at = ''
+                   AND COALESCE(deleted_at, edited_at) < ?2",
+                params![guild_id, tombstone_cutoff],
+            )?;
+            // 0 = keep completed messages forever (UI allows min 0).
             if days == 0 {
                 tx.finish_read()?;
                 continue;
@@ -735,7 +760,7 @@ pub async fn stats(db: &Db) -> Result<Stats> {
     db.with_conn(|conn| {
         let one = |sql: &str| conn.query_row(sql, (), |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
-            messages: one("SELECT COUNT(*) FROM messages")?,
+            messages: one("SELECT COUNT(*) FROM messages WHERE created_at <> ''")?,
             events: one("SELECT COUNT(*) FROM events")?,
             members: one("SELECT COUNT(*) FROM members")?,
             warns: one("SELECT COUNT(*) FROM warns")?,
@@ -751,7 +776,9 @@ pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| {
         let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
-            messages: one("SELECT COUNT(*) FROM messages WHERE guild_id = ?1")?,
+            messages: one(
+                "SELECT COUNT(*) FROM messages WHERE guild_id = ?1 AND created_at <> ''",
+            )?,
             events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1")?,
             members: one("SELECT COUNT(*) FROM members WHERE guild_id = ?1")?,
             warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,

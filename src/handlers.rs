@@ -285,6 +285,7 @@ impl EventHandler for Handler {
         if msg.author.bot {
             return;
         }
+        let _tracking_guard = app.begin_message_tracking(msg.id.get());
 
         if msg.content.is_empty() {
             warn_empty_content_once();
@@ -409,12 +410,14 @@ impl EventHandler for Handler {
             return;
         };
         let id = event.id.get() as i64;
+        let allow_missing = app.message_tracking_pending(event.id.get());
         if let Ok(Some((old_content, _))) = db::mark_edited_with_previous(
             &app.db,
             id,
             guild_id.get() as i64,
             event.channel_id.get() as i64,
             event.author.as_ref().map(|a| a.id.get() as i64),
+            allow_missing,
             &new_content,
         )
         .await
@@ -451,11 +454,13 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let id = deleted_message_id.get() as i64;
+        let allow_missing = app.message_tracking_pending(deleted_message_id.get());
         let content = db::mark_deleted_with_previous(
             &app.db,
             id,
             guild_id.get() as i64,
             channel_id.get() as i64,
+            allow_missing,
         )
         .await
         .ok()
@@ -490,11 +495,13 @@ impl EventHandler for Handler {
         let Some(guild_id) = guild_id else { return };
         let n = multiple_deleted_messages_ids.len();
         for id in &multiple_deleted_messages_ids {
+            let allow_missing = app.message_tracking_pending(id.get());
             let _ = db::mark_deleted(
                 &app.db,
                 id.get() as i64,
                 guild_id.get() as i64,
                 channel_id.get() as i64,
+                allow_missing,
             )
             .await;
         }

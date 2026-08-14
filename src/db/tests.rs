@@ -740,13 +740,14 @@ fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
             42,
             7,
             Some(9),
+            true,
             "edited first",
         ))
         .unwrap()
         .is_none()
     );
     assert!(
-        tokio_test_block_on(crate::db::mark_deleted_with_previous(&db, 102, 42, 7))
+        tokio_test_block_on(crate::db::mark_deleted_with_previous(&db, 102, 42, 7, true))
             .unwrap()
             .is_none()
     );
@@ -785,6 +786,23 @@ fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
     .unwrap();
     assert_eq!(rows.0, ("edited first".to_string(), true, false));
     assert_eq!(rows.1, ("original delete".to_string(), false, true));
+
+    assert!(
+        tokio_test_block_on(crate::db::mark_deleted_with_previous(
+            &db, 103, 42, 7, false
+        ))
+        .unwrap()
+        .is_none()
+    );
+    let absent = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE message_id = 103",
+            (),
+            |r| Ok(r.get::<i64>(0)?),
+        )
+    }))
+    .unwrap();
+    assert_eq!(absent, 0, "untracked lifecycle events must not create rows");
     cleanup_db(&tmp);
 }
 

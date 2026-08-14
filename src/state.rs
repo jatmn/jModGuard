@@ -46,6 +46,11 @@ pub struct AppState {
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
+    /// Human message-create handlers whose best-effort tracking write has not
+    /// finished yet. Lifecycle handlers use this to distinguish a genuine
+    /// create/edit/delete race from old, bot-authored, or otherwise untracked
+    /// messages that must not manufacture database rows.
+    pending_message_tracking: DashMap<u64, ()>,
     #[allow(dead_code)]
     pub http: reqwest::Client,
     /// Lazy Discord REST client (bot token). Created on first API use
@@ -105,6 +110,7 @@ impl AppState {
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
             cooldowns: DashMap::new(),
+            pending_message_tracking: DashMap::new(),
             oauth,
             http,
             discord_http_cell: std::sync::OnceLock::new(),
@@ -121,6 +127,18 @@ impl AppState {
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
         }))
+    }
+
+    pub fn begin_message_tracking(self: &Arc<Self>, message_id: u64) -> MessageTrackingGuard {
+        self.pending_message_tracking.insert(message_id, ());
+        MessageTrackingGuard {
+            app: Arc::clone(self),
+            message_id,
+        }
+    }
+
+    pub fn message_tracking_pending(&self, message_id: u64) -> bool {
+        self.pending_message_tracking.contains_key(&message_id)
     }
 
     /// Discord REST client for API-side bot-token calls (lazy).
@@ -393,6 +411,17 @@ impl AppState {
             progress.remaining = Some(failed);
             false
         }
+    }
+}
+
+pub struct MessageTrackingGuard {
+    app: Arc<AppState>,
+    message_id: u64,
+}
+
+impl Drop for MessageTrackingGuard {
+    fn drop(&mut self) {
+        self.app.pending_message_tracking.remove(&self.message_id);
     }
 }
 
