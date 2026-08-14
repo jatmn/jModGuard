@@ -70,7 +70,11 @@ floor so it cannot immediately serve an older snapshot.
 
 The remote transport uses the standard libSQL protocol; the portable
 configuration contract is `db.url` / `db.token` or `JMODGUARD_DB_URL` /
-`JMODGUARD_DB_TOKEN`. It is not hard-coded to a Bunny hostname.
+`JMODGUARD_DB_TOKEN`. Environment credentials are selected as an atomic pair:
+if either portable variable is present, both must be non-empty; otherwise the
+same rule applies to Bunny's injected pair. Partial or mixed-provider overrides
+fail startup instead of pairing a URL with an unrelated token. It is not
+hard-coded to a Bunny hostname.
 
 Bunny Database is the first-class launch provider: its injected environment
 names and generic libSQL protocol path have automated tests, and its container

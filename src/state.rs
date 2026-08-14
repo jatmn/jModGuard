@@ -1022,11 +1022,7 @@ mod tests {
         restored.slash_revision = replacement.clone();
 
         assert_eq!(
-            app.reconcile_primary_versions(
-                restored,
-                versions.config,
-                before_write,
-            ),
+            app.reconcile_primary_versions(restored, versions.config, before_write,),
             (false, true)
         );
         assert_eq!(app.slash_registry_revision(), replacement);

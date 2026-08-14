@@ -128,7 +128,7 @@ impl Config {
             Config::default()
         };
 
-        cfg.apply_env();
+        cfg.apply_env()?;
         Ok(cfg)
     }
 
@@ -168,22 +168,45 @@ impl Config {
         }
     }
 
-    fn apply_env(&mut self) {
+    fn apply_env(&mut self) -> Result<()> {
         if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
             self.discord.token = v;
         }
         if let Ok(v) = env::var("JMODGUARD_DB_PATH") {
             self.db.path = PathBuf::from(v);
         }
-        if let Ok(v) = env::var("JMODGUARD_DB_URL") {
-            self.db.url = v;
-        } else if let Ok(v) = env::var("BUNNY_DATABASE_URL") {
-            self.db.url = v;
-        }
-        if let Ok(v) = env::var("JMODGUARD_DB_TOKEN") {
-            self.db.token = v;
-        } else if let Ok(v) = env::var("BUNNY_DATABASE_AUTH_TOKEN") {
-            self.db.token = v;
+        let portable = (
+            env::var("JMODGUARD_DB_URL").ok(),
+            env::var("JMODGUARD_DB_TOKEN").ok(),
+        );
+        let bunny = (
+            env::var("BUNNY_DATABASE_URL").ok(),
+            env::var("BUNNY_DATABASE_AUTH_TOKEN").ok(),
+        );
+        let selected = if portable.0.is_some() || portable.1.is_some() {
+            match portable {
+                (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                    Some((url, token))
+                }
+                _ => anyhow::bail!(
+                    "JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN must be set together and non-empty"
+                ),
+            }
+        } else if bunny.0.is_some() || bunny.1.is_some() {
+            match bunny {
+                (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                    Some((url, token))
+                }
+                _ => anyhow::bail!(
+                    "BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN must be set together and non-empty"
+                ),
+            }
+        } else {
+            None
+        };
+        if let Some((url, token)) = selected {
+            self.db.url = url;
+            self.db.token = token;
         }
         if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
             self.web.bind = v;
@@ -220,6 +243,7 @@ impl Config {
         if let Ok(v) = env::var("JMODGUARD_LOG_DIRECTORY") {
             self.log.directory = PathBuf::from(v);
         }
+        Ok(())
     }
 }
 
@@ -227,6 +251,9 @@ impl Config {
 mod tests {
     use super::Config;
     use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct SavedEnv(Vec<(&'static str, Option<OsString>)>);
 
@@ -262,6 +289,7 @@ mod tests {
 
     #[test]
     fn bunny_database_environment_names_populate_remote_config() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         const NAMES: &[&str] = &[
             "JMODGUARD_DB_URL",
             "JMODGUARD_DB_TOKEN",
@@ -278,9 +306,39 @@ mod tests {
         }
 
         let mut cfg = Config::default();
-        cfg.apply_env();
+        cfg.apply_env().unwrap();
 
         assert_eq!(cfg.db.url, "libsql://example.bunnydb.test");
         assert_eq!(cfg.db.token, "bunny-test-token");
+    }
+
+    #[test]
+    fn database_environment_credentials_are_an_atomic_pair() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var("BUNNY_DATABASE_URL", "libsql://bunny.example");
+            std::env::set_var("BUNNY_DATABASE_AUTH_TOKEN", "bunny-secret");
+            std::env::set_var("JMODGUARD_DB_URL", "libsql://portable.example");
+        }
+
+        let mut cfg = Config::default();
+        assert!(cfg.apply_env().is_err());
+        assert!(cfg.db.url.is_empty());
+        assert!(cfg.db.token.is_empty());
+
+        unsafe { std::env::set_var("JMODGUARD_DB_TOKEN", "portable-secret") };
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.db.url, "libsql://portable.example");
+        assert_eq!(cfg.db.token, "portable-secret");
     }
 }

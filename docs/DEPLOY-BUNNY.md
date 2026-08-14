@@ -40,7 +40,9 @@ BUNNY_DATABASE_AUTH_TOKEN=SECRET
 
 jModGuard reads those names directly. Its portable aliases
 `JMODGUARD_DB_URL` and `JMODGUARD_DB_TOKEN` are also supported and take
-precedence when both forms are present. Never commit an access token.
+precedence when present. URL and token are an atomic pair: setting only one
+portable alias fails startup rather than borrowing a Bunny or TOML credential,
+and the Bunny pair is likewise required in full. Never commit an access token.
 
 ## 2. Build and publish both images
 
