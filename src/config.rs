@@ -185,8 +185,8 @@ impl Config {
         );
         let selected = if portable.0.is_some() || portable.1.is_some() {
             match portable {
-                (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
-                    Some((url, token))
+                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+                    Some((url.trim().to_string(), token))
                 }
                 _ => anyhow::bail!(
                     "JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN must be set together and non-empty"
@@ -194,8 +194,8 @@ impl Config {
             }
         } else if bunny.0.is_some() || bunny.1.is_some() {
             match bunny {
-                (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
-                    Some((url, token))
+                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+                    Some((url.trim().to_string(), token))
                 }
                 _ => anyhow::bail!(
                     "BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN must be set together and non-empty"
@@ -340,5 +340,14 @@ mod tests {
         cfg.apply_env().unwrap();
         assert_eq!(cfg.db.url, "libsql://portable.example");
         assert_eq!(cfg.db.token, "portable-secret");
+
+        unsafe { std::env::set_var("JMODGUARD_DB_URL", "   ") };
+        assert!(cfg.apply_env().is_err());
+
+        unsafe {
+            std::env::set_var("JMODGUARD_DB_URL", "libsql://portable.example");
+            std::env::set_var("JMODGUARD_DB_TOKEN", "   ");
+        }
+        assert!(cfg.apply_env().is_err());
     }
 }
