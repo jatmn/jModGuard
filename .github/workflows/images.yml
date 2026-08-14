@@ -59,21 +59,30 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       # GitHub creates GHCR packages as private. Magic Containers can pull
-      # public ghcr.io images without a registry PAT. The image is already
-      # pushed; a denied visibility API must not fail the workflow.
+      # public ghcr.io images without a registry PAT. PATCH /user/packages
+      # is the Actions token identity (github-actions[bot]), not the package
+      # owner — use /users or /orgs for ghcr.io/<owner>/…. The image is
+      # already pushed; a denied visibility API must not fail the workflow.
       - name: Make package public
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
         run: |
           pkg="jmodguard-${{ matrix.name }}"
+          if [ "${OWNER_TYPE}" = "Organization" ]; then
+            api_path="/orgs/${PACKAGE_OWNER}/packages/container/${pkg}"
+          else
+            api_path="/users/${PACKAGE_OWNER}/packages/container/${pkg}"
+          fi
           for i in 1 2 3 4 5 6; do
-            if gh api --method PATCH "/user/packages/container/${pkg}" \
+            if gh api --method PATCH "${api_path}" \
               -H "Accept: application/vnd.github+json" \
               -f visibility=public; then
               exit 0
             fi
             sleep 5
           done
-          echo "Could not set ${pkg} public. Set visibility on the GitHub package page." >&2
+          echo "Could not set ${pkg} public via ${api_path}. Set visibility on the GitHub package page." >&2
           exit 0

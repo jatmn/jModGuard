@@ -1,15 +1,15 @@
 //! Tiny process-local HTTP health listener.
 //!
 //! The bot binary does not enable the `web` feature, so Magic Containers
-//! health checks cannot use axum. This listener answers `GET /health` (and
-//! `GET /`) with 200 once the process has bound the port, without cookies,
-//! routing, or a database round-trip. The API exposes the same path on its
-//! public bind via axum, and answers probes on that socket while the
-//! database is still opening. Application routes (`/`, `/api`, `/login`,
-//! `/oauth`, …) must not look successful during that window: they get
-//! `503` until axum takes over. `/health` is liveness, not database
-//! readiness: a pooled remote `SELECT 1` can wait tens of seconds and
-//! false-fail a healthy process under load.
+//! health checks cannot use axum. This listener answers `GET /health` and
+//! `GET /health/` with 200 once the process has bound the port, without
+//! cookies, routing, or a database round-trip. `/` is not liveness. The
+//! API exposes the same paths on its public bind via axum, and answers
+//! probes on that socket while the database is still opening. Application
+//! routes (`/`, `/api`, `/login`, `/oauth`, …) must not look successful
+//! during that window: they get `503` until axum takes over. `/health` is
+//! liveness, not database readiness: a pooled remote `SELECT 1` can wait
+//! tens of seconds and false-fail a healthy process under load.
 //!
 //! Bind and accept before opening the database. A closed port during
 //! remote first-boot retries is a failed liveness probe.
@@ -68,11 +68,11 @@ where
     loop {
         tokio::select! {
             result = &mut work => return result,
-            accept = listener.accept() => match accept {
+            // Do not accept when handlers are saturated. Accept-then-drop
+            // RSTs probes; leaving them in the listen backlog applies
+            // backpressure until a slot frees or `work` finishes.
+            accept = listener.accept(), if permits.available_permits() > 0 => match accept {
                 Ok((stream, _)) => {
-                    // Drop excess sockets immediately. Startup must keep
-                    // accepting health checks without allowing idle clients
-                    // to create unbounded tasks or retain file descriptors.
                     if let Ok(permit) = Arc::clone(&permits).try_acquire_owned() {
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -121,7 +121,11 @@ fn is_liveness_request(buf: &[u8]) -> bool {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let path = target.split('?').next().unwrap_or("");
-    matches!(method, "GET" | "HEAD") && (path == "/health" || path == "/health/")
+    matches!(method, "GET" | "HEAD") && is_liveness_path(path)
+}
+
+fn is_liveness_path(path: &str) -> bool {
+    path == "/health" || path == "/health/"
 }
 
 #[cfg(test)]

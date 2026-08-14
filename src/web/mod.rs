@@ -582,6 +582,7 @@ pub fn router(app: Arc<AppState>) -> Router {
 
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/health/", get(health))
         .merge(sessioned)
         .with_state(app.clone());
 
@@ -704,6 +705,23 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn health_trailing_slash_matches_startup_listener() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/")
                     .body(Body::empty())
                     .unwrap(),
             )
