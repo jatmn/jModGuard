@@ -26,6 +26,10 @@ fn remote_options(migrate: bool) -> DbOpenOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a disposable remote libSQL server"]
 async fn bot_bootstrap_and_api_share_remote_database() {
+    // Bootstrap has no mutation-receipt table before its migrations run. A
+    // lost response for its first primary transaction must be verified from a
+    // fresh primary snapshot rather than making the bot exit.
+    test_drop_next_commit_response();
     let bot = Db::open_with(remote_options(true)).expect("bot should bootstrap remote database");
     let before = get_config_version(&bot)
         .await

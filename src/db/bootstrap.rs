@@ -32,7 +32,37 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;
-            tx.commit()?;
+            // Migrations predate `mutation_receipts`, so their primary-routed
+            // transactions cannot use the normal receipt protocol. A lost
+            // COMMIT response is nevertheless recoverable: `user_version`
+            // advances in the same transaction as the migration SQL. Check a
+            // fresh authoritative snapshot before treating that outcome as a
+            // failed bootstrap and taking the bot down.
+            match tx.commit() {
+                Ok(()) => {}
+                Err(error) if is_database_commit_indeterminate(&error) => {
+                    let verify = conn.transaction_primary_read().and_then(|check| {
+                        let applied = check
+                            .query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))?
+                            >= target;
+                        check.finish_read()?;
+                        Ok(applied)
+                    });
+                    match verify {
+                        Ok(true) => tracing::warn!(
+                            migration = target,
+                            "migration commit response was lost; authoritative schema version confirms it applied"
+                        ),
+                        Ok(false) => return Err(error),
+                        Err(verify_error) => {
+                            return Err(error.context(format!(
+                                "migration {target} commit was indeterminate and authoritative verification failed: {verify_error:#}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
             tracing::info!("applied migration {target}");
         } else {
             tx.finish_read()?;
@@ -328,7 +358,36 @@ pub(super) fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
             params![META_BOOTSTRAP_COMPLETE],
         )?;
     }
-    tx.commit()?;
+    match tx.commit() {
+        Ok(()) => {}
+        Err(error) if is_database_commit_indeterminate(&error) => {
+            // This marker deletion is also pre-receipt during an initial
+            // bootstrap. Re-read it through a new primary snapshot: absent
+            // establishes that a lost response did not leave an API-visible
+            // stale-ready marker behind.
+            let verify = conn.transaction_primary_read().and_then(|check| {
+                let cleared = if has_meta == 0 {
+                    true
+                } else {
+                    meta_string_conn(&check, META_BOOTSTRAP_COMPLETE)?.is_none()
+                };
+                check.finish_read()?;
+                Ok(cleared)
+            });
+            match verify {
+                Ok(true) => tracing::warn!(
+                    "bootstrap-marker commit response was lost; authoritative read confirms it cleared"
+                ),
+                Ok(false) => return Err(error),
+                Err(verify_error) => {
+                    return Err(error.context(format!(
+                        "bootstrap-marker commit was indeterminate and authoritative verification failed: {verify_error:#}"
+                    )));
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
