@@ -125,6 +125,6 @@ handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
 frontend/      SPA assets (served by API locally; CDN target when deployed)
-migrations/    0001_init through 0004_nickname_reconcile
+migrations/    0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 ```

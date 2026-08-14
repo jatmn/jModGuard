@@ -183,6 +183,7 @@ impl DbRuntime {
 
 pub struct Connection {
     inner: libsql::Connection,
+    database: Arc<libsql::Database>,
     runtime: DbRuntime,
     tainted: Arc<AtomicBool>,
     config_version: Arc<std::sync::atomic::AtomicU64>,
@@ -208,18 +209,21 @@ impl Connection {
         let runtime = DbRuntime::new()?;
         let path = path.as_ref().to_path_buf();
         let database = runtime.block_on(libsql::Builder::new_local(path).build())?;
+        let database = Arc::new(database);
         let inner = database.connect()?;
         Ok(Self {
             inner,
+            database,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
-    pub fn from_database(database: &libsql::Database, runtime: DbRuntime) -> Result<Self> {
+    pub fn from_database(database: Arc<libsql::Database>, runtime: DbRuntime) -> Result<Self> {
         Ok(Self {
             inner: database.connect()?,
+            database,
             runtime,
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -232,11 +236,19 @@ impl Connection {
         Ok(())
     }
 
+    /// Executes bootstrap SQL without a mutation receipt. This is required
+    /// before the receipt table itself has been migrated into existence.
+    pub fn execute_untracked(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
+        Ok(self
+            .runtime
+            .block_on_database("execute", self.inner.execute(sql, params))? as usize)
+    }
+
     pub fn transaction(&self) -> Result<Transaction> {
         let inner = self
             .runtime
             .block_on_database("begin transaction", self.inner.transaction())?;
-        Ok(self.wrap_transaction(inner))
+        Ok(self.wrap_transaction(inner, None))
     }
 
     /// Starts a write transaction at the primary immediately. Remote libSQL
@@ -248,16 +260,51 @@ impl Connection {
             self.inner
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
         )?;
-        Ok(self.wrap_transaction(inner))
+        let receipt = self.runtime.is_remote().then(|| {
+            format!(
+                "{:032x}{:032x}",
+                rand::random::<u128>(),
+                rand::random::<u128>()
+            )
+        });
+        let transaction = self.wrap_transaction(inner, receipt);
+        if let Some(receipt) = transaction.mutation_receipt.as_deref() {
+            transaction.execute(
+                "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
+                params![receipt],
+            )?;
+            transaction.execute(
+                "DELETE FROM mutation_receipts WHERE created_at < unixepoch() - 86400",
+                (),
+            )?;
+        }
+        Ok(transaction)
     }
 
-    fn wrap_transaction(&self, inner: libsql::Transaction) -> Transaction {
+    /// Starts an IMMEDIATE transaction routed to the primary without creating
+    /// a mutation receipt. Use only for authoritative reads and migrations.
+    pub fn transaction_primary_read(&self) -> Result<Transaction> {
+        let inner = self.runtime.block_on_database(
+            "begin primary read transaction",
+            self.inner
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
+        )?;
+        Ok(self.wrap_transaction(inner, None))
+    }
+
+    fn wrap_transaction(
+        &self,
+        inner: libsql::Transaction,
+        mutation_receipt: Option<String>,
+    ) -> Transaction {
         Transaction {
             inner: Some(inner),
+            database: Arc::clone(&self.database),
             runtime: self.runtime.clone(),
             connection_tainted: Arc::clone(&self.tainted),
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
+            mutation_receipt,
         }
     }
 
@@ -289,6 +336,12 @@ impl Connection {
 
 impl SqlExecutor for Connection {
     fn execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
+        if self.runtime.is_remote() && self.inner.is_autocommit() {
+            let transaction = self.transaction_immediate()?;
+            let changed = transaction.execute(sql, params)?;
+            transaction.commit()?;
+            return Ok(changed);
+        }
         Ok(self
             .runtime
             .block_on_database("execute", self.inner.execute(sql, params))? as usize)
@@ -362,10 +415,12 @@ impl Statement {
 
 pub struct Transaction {
     inner: Option<libsql::Transaction>,
+    database: Arc<libsql::Database>,
     runtime: DbRuntime,
     connection_tainted: Arc<AtomicBool>,
     connection_config_version: Arc<std::sync::atomic::AtomicU64>,
     pending_config_version: std::sync::atomic::AtomicU64,
+    mutation_receipt: Option<String>,
 }
 
 impl Transaction {
@@ -389,9 +444,18 @@ impl Transaction {
     }
 
     pub fn commit(mut self) -> Result<()> {
-        let result = self
+        let mut result = self
             .runtime
             .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
+        #[cfg(debug_assertions)]
+        if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
+            result = Err(database_operation_timed_out(
+                "commit transaction",
+                self.runtime
+                    .operation_timeout
+                    .unwrap_or(Duration::from_secs(1)),
+            ));
+        }
         match result {
             Ok(_) => {
                 self.connection_config_version.fetch_max(
@@ -414,15 +478,88 @@ impl Transaction {
                 );
                 let inner = self.inner.take().expect("transaction already completed");
                 drop_transaction_without_runtime(inner);
-                Err(DatabaseCommitIndeterminate(commit_error).into())
+                let Some(receipt) = self.mutation_receipt.as_deref() else {
+                    return Err(DatabaseCommitIndeterminate(commit_error).into());
+                };
+                match self.reconcile_mutation_receipt(receipt) {
+                    Ok(true) => {
+                        self.connection_config_version.fetch_max(
+                            self.pending_config_version.load(Ordering::Acquire),
+                            Ordering::SeqCst,
+                        );
+                        Ok(())
+                    }
+                    Ok(false) => Err(commit_error),
+                    Err(reconcile_error) => {
+                        self.connection_config_version.fetch_max(
+                            self.pending_config_version.load(Ordering::Acquire),
+                            Ordering::SeqCst,
+                        );
+                        Err(DatabaseCommitIndeterminate(commit_error.context(format!(
+                            "authoritative receipt reconciliation failed: {reconcile_error:#}"
+                        )))
+                        .into())
+                    }
+                }
             }
             Err(error) => Err(error),
         }
     }
 
+    /// Ends a primary-routed read snapshot without using COMMIT semantics.
+    /// A lost response cannot make a read's outcome indeterminate.
+    pub fn finish_read(mut self) -> Result<()> {
+        let result = self.runtime.block_on_database(
+            "finish read transaction",
+            self.inner().execute_batch("ROLLBACK"),
+        );
+        let inner = self.inner.take().expect("transaction already completed");
+        drop_transaction_without_runtime(inner);
+        result.map(|_| ())
+    }
+
     fn inner(&self) -> &libsql::Transaction {
         self.inner.as_ref().expect("transaction already completed")
     }
+
+    fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<bool> {
+        let connection = self.database.connect()?;
+        let transaction = self.runtime.block_on_database(
+            "begin commit reconciliation",
+            connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate),
+        )?;
+        let found = self
+            .runtime
+            .block_on_database("query commit receipt", async {
+                let mut rows = transaction
+                    .query(
+                        "SELECT 1 FROM mutation_receipts WHERE receipt_id = ?1",
+                        libsql::params![receipt],
+                    )
+                    .await?;
+                Ok::<_, libsql::Error>(rows.next().await?.is_some())
+            })?;
+        // The primary snapshot itself establishes the original outcome. Do
+        // not make receipt consumption another mutation whose COMMIT could in
+        // turn be ambiguous; normal writes prune old receipts after 24 hours.
+        let _ = self.runtime.block_on_database(
+            "finish commit reconciliation",
+            transaction.execute_batch("ROLLBACK"),
+        );
+        drop_transaction_without_runtime(transaction);
+        drop(connection);
+        Ok(found)
+    }
+}
+
+#[cfg(debug_assertions)]
+static TEST_DROP_COMMIT_RESPONSE: AtomicBool = AtomicBool::new(false);
+
+/// Debug-build fault injection used by the remote integration test. The next
+/// successful COMMIT is treated as though its response was lost.
+#[cfg(debug_assertions)]
+pub fn test_drop_next_commit_response() {
+    TEST_DROP_COMMIT_RESPONSE.store(true, Ordering::SeqCst);
 }
 
 impl Drop for Transaction {

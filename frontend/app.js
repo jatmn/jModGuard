@@ -839,6 +839,11 @@ function tabSettings() {
   const cards = [
     el("div", { class: "card" },
       el("h3", { text: "This server" }),
+      cfg.nickname_reconcile?.state === "terminal"
+        ? el("p", { class: "error", text: `Discord nickname needs operator action: ${cfg.nickname_reconcile.last_error || cfg.nickname_reconcile.last_error_code || "permanent Discord rejection"}` })
+        : cfg.nickname_reconcile?.state === "dormant"
+          ? el("p", { class: "muted", text: "Discord nickname work is dormant while the bot is absent from this server; it will reactivate on rejoin." })
+          : null,
       el("div", { class: "row" },
         settingsField(
           "Prefix",

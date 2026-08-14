@@ -93,9 +93,10 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
 - Bot nickname: WebUI empty field, `!setname` with no args / `clear` / `-`, and
   `/setname` with the optional `name` omitted all clear the Discord nickname and
   persist `bot_name=""`. Settings and a generation-numbered outbox row commit
-  atomically; only the bot drains that row and mutates Discord. Failures retry
-  without rolling back durable settings, and generation-checked acknowledgement
-  makes the final committed value win across bot/API races. WebUI "Use global"
+  atomically; only the bot drains that row and mutates Discord. Transient failures
+  use persisted bounded backoff, permanent failures become terminal, and a real
+  guild departure makes the row dormant until rejoin. Generation-checked
+  acknowledgement makes the final committed value win across bot/API races. WebUI "Use global"
   sends `bot_name: null` to inherit the parent nickname. `guild_create` queues
   the same reconciliation path, including empty nicknames.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
@@ -155,7 +156,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (embeds frontend/)
 frontend/               SPA assets
-migrations/             0001_init through 0004_nickname_reconcile
+migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

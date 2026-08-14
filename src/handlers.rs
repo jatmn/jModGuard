@@ -7,7 +7,7 @@ use serenity::gateway::ActivityData;
 use serenity::model::channel::Message;
 use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent};
 use serenity::model::gateway::Ready;
-use serenity::model::guild::{Guild, Member};
+use serenity::model::guild::{Guild, Member, UnavailableGuild};
 use serenity::model::id::{GuildId, MessageId};
 use serenity::model::prelude::{ChannelId, User};
 use std::collections::BTreeMap;
@@ -162,6 +162,29 @@ impl EventHandler for Handler {
 
         if is_new.unwrap_or(false) {
             tracing::info!("joined new guild {gid} ({})", guild.name);
+        }
+    }
+
+    async fn guild_delete(
+        &self,
+        _ctx: Context,
+        incomplete: UnavailableGuild,
+        _full: Option<Guild>,
+    ) {
+        // `unavailable=true` is a temporary Discord outage, not a departure.
+        // A real removal remains dormant until guild_create reactivates it.
+        if !incomplete.unavailable
+            && let Err(error) = db::dormancy_nickname_reconcile(
+                &self.app().db,
+                incomplete.id.get() as i64,
+                "bot removed from guild",
+            )
+            .await
+        {
+            tracing::warn!(
+                guild_id = incomplete.id.get(),
+                "failed to mark nickname work dormant: {error:#}"
+            );
         }
     }
 

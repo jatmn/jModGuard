@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+pub use crate::db_compat::test_drop_next_commit_response;
 use crate::db_compat::{
     Connection, DbRuntime, OptionalExtension, Row, SqlExecutor, Value,
     database_operation_timed_out, params, params_from_iter,
@@ -26,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_config_version.sql"),
     include_str!("../migrations/0003_archive_global_log_channels.sql"),
     include_str!("../migrations/0004_nickname_reconcile.sql"),
+    include_str!("../migrations/0005_mutation_receipts_nickname_jobs.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.
@@ -128,8 +131,9 @@ impl ConnectionLease {
         let connection = match connection {
             Some(connection) => connection,
             None => {
-                let connection = Connection::from_database(&pool.database, pool.runtime.clone())
-                    .context("failed to replace discarded database connection")?;
+                let connection =
+                    Connection::from_database(Arc::clone(&pool.database), pool.runtime.clone())
+                        .context("failed to replace discarded database connection")?;
                 configure_connection(&connection, pool.remote)?;
                 connection
             }
@@ -239,7 +243,7 @@ impl Db {
         // Migrate / schema-check on a dedicated connection first, so no other
         // connections are racing the DDL at startup.
         {
-            let mut bootstrap = Connection::from_database(&database, runtime.clone())
+            let mut bootstrap = Connection::from_database(Arc::clone(&database), runtime.clone())
                 .context("failed to connect to database")?;
             if !remote {
                 bootstrap.execute_batch(
@@ -299,7 +303,7 @@ impl Db {
         let pool_size = opts.pool_size.max(2) as usize;
         let mut connections = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            let connection = Connection::from_database(&database, runtime.clone())
+            let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
                 .context("failed to create pooled database connection")?;
             configure_connection(&connection, remote)?;
             connections.push(connection);
@@ -378,7 +382,12 @@ impl Db {
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);
-            if result.is_ok() {
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_database_commit_indeterminate)
+            {
                 required_config_version.fetch_max(
                     connection.take_config_version(),
                     std::sync::atomic::Ordering::SeqCst,
@@ -417,7 +426,12 @@ impl Db {
         let _permit = permit;
         let mut connection = ConnectionLease::checkout(Arc::clone(&self.connections))?;
         let result = f(&mut connection);
-        if result.is_ok() {
+        if result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(is_database_commit_indeterminate)
+        {
             self.required_config_version.fetch_max(
                 connection.take_config_version(),
                 std::sync::atomic::Ordering::SeqCst,
@@ -480,7 +494,7 @@ fn migrate_conn(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         if version < target {
-            let tx = conn.transaction_immediate()?;
+            let tx = conn.transaction_primary_read()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;
@@ -586,10 +600,10 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
 /// authoritative failover rollback from one stale replica observation.
 pub async fn get_primary_versions(db: &Db) -> Result<(u64, u64)> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_immediate()?;
+        let tx = conn.transaction_primary_read()?;
         let config = get_config_version_conn(&tx)?;
         let slash = get_slash_registry_version_conn(&tx)?;
-        tx.commit()?;
+        tx.finish_read()?;
         Ok((config, slash))
     })
     .await
@@ -604,10 +618,10 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 /// the atomically seeded command registry has converged.
 pub fn get_primary_versions_sync(db: &Db) -> Result<(u64, u64)> {
     db.with_conn_sync(|conn| {
-        let tx = conn.transaction_immediate()?;
+        let tx = conn.transaction_primary_read()?;
         let config = get_config_version_conn(&tx)?;
         let slash = get_slash_registry_version_conn(&tx)?;
-        tx.commit()?;
+        tx.finish_read()?;
         Ok((config, slash))
     })
 }
@@ -710,14 +724,14 @@ fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
-fn clear_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
+fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
     let has_meta: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
         (),
         |r| Ok(r.get(0)?),
     )?;
     if has_meta != 0 {
-        conn.execute(
+        conn.execute_untracked(
             "DELETE FROM meta WHERE key = ?1",
             params![META_BOOTSTRAP_COMPLETE],
         )?;
@@ -1261,10 +1275,10 @@ pub async fn get_settings(db: &Db, guild_id: i64) -> Result<GuildSettings> {
 /// reconciliation after independently running bot/API writers.
 pub async fn get_settings_primary(db: &Db, guild_id: i64) -> Result<GuildSettings> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let tx = conn.transaction_primary_read()?;
         let defaults = terminal_defaults_conn(&tx)?;
         let settings = effective_settings_conn(&tx, guild_id, &defaults)?;
-        tx.commit()?;
+        tx.finish_read()?;
         Ok(settings)
     })
     .await
@@ -1272,8 +1286,14 @@ pub async fn get_settings_primary(db: &Db, guild_id: i64) -> Result<GuildSetting
 
 fn enqueue_nickname_reconcile_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO nickname_reconcile (guild_id, generation) VALUES (?1, 1)
-         ON CONFLICT(guild_id) DO UPDATE SET generation = generation + 1",
+        "INSERT INTO nickname_reconcile
+             (guild_id, generation, state, attempt_count, next_attempt_at,
+              last_error_code, last_error, last_error_at)
+         VALUES (?1, 1, 'pending', 0, 0, NULL, NULL, NULL)
+         ON CONFLICT(guild_id) DO UPDATE SET
+             generation = generation + 1,
+             state = 'pending', attempt_count = 0, next_attempt_at = 0,
+             last_error_code = NULL, last_error = NULL, last_error_at = NULL",
         params![guild_id],
     )?;
     Ok(())
@@ -1292,23 +1312,188 @@ pub async fn request_nickname_reconcile(db: &Db, guild_id: i64) -> Result<()> {
     .await
 }
 
-/// Primary-routed durable nickname work. The generation prevents an older
-/// Discord request from acknowledging a newer cross-process settings commit.
-pub async fn pending_nickname_reconciles(db: &Db) -> Result<Vec<(i64, i64, String)>> {
-    db.with_conn(|conn| {
-        let tx = conn.transaction_immediate()?;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NicknameReconcileJob {
+    pub guild_id: i64,
+    pub generation: i64,
+    pub nickname: String,
+    pub attempt_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NicknameReconcileStatus {
+    pub state: String,
+    pub attempt_count: u32,
+    pub next_attempt_at: i64,
+    pub last_error_code: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<i64>,
+}
+
+pub const MAX_NICKNAME_RECONCILE_ATTEMPTS: u32 = 8;
+
+fn validate_discord_nickname(nickname: &str) -> Result<()> {
+    anyhow::ensure!(
+        nickname.chars().count() <= 32,
+        "Discord nickname must be at most 32 characters"
+    );
+    anyhow::ensure!(
+        !nickname.chars().any(char::is_control),
+        "Discord nickname cannot contain control characters"
+    );
+    Ok(())
+}
+
+/// Primary-routed due nickname work. Persisted scheduling prevents a dead row
+/// from consuming Discord calls or delaying later jobs on every poll.
+pub async fn pending_nickname_reconciles(
+    db: &Db,
+    now: i64,
+    limit: u32,
+) -> Result<Vec<NicknameReconcileJob>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
         let defaults = terminal_defaults_conn(&tx)?;
-        let mut stmt =
-            tx.prepare("SELECT guild_id, generation FROM nickname_reconcile ORDER BY guild_id")?;
-        let pending = stmt.query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?)))?;
+        let mut stmt = tx.prepare(
+            "SELECT guild_id, generation, attempt_count
+             FROM nickname_reconcile
+             WHERE state = 'pending' AND next_attempt_at <= ?1
+             ORDER BY next_attempt_at, guild_id LIMIT ?2",
+        )?;
+        let pending = stmt.query_map(params![now, i64::from(limit.max(1))], |row| {
+            Ok((
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<i64>(2)? as u32,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in pending {
-            let (guild_id, generation) = row?;
-            let name = effective_settings_conn(&tx, guild_id, &defaults)?.bot_name;
-            out.push((guild_id, generation, name));
+            let (guild_id, generation, attempt_count) = row?;
+            let nickname = effective_settings_conn(&tx, guild_id, &defaults)?.bot_name;
+            out.push(NicknameReconcileJob {
+                guild_id,
+                generation,
+                nickname,
+                attempt_count,
+            });
         }
-        tx.commit()?;
+        tx.finish_read()?;
         Ok(out)
+    })
+    .await
+}
+
+pub async fn nickname_reconcile_status(
+    db: &Db,
+    guild_id: i64,
+) -> Result<Option<NicknameReconcileStatus>> {
+    db.with_conn(move |conn| {
+        conn.query_row(
+            "SELECT state, attempt_count, next_attempt_at,
+                    last_error_code, last_error, last_error_at
+             FROM nickname_reconcile WHERE guild_id = ?1",
+            params![guild_id],
+            |row| {
+                Ok(NicknameReconcileStatus {
+                    state: row.get(0)?,
+                    attempt_count: row.get::<i64>(1)? as u32,
+                    next_attempt_at: row.get(2)?,
+                    last_error_code: row.get(3)?,
+                    last_error: row.get(4)?,
+                    last_error_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+    })
+    .await
+}
+
+fn nickname_retry_delay_secs(job: &NicknameReconcileJob) -> i64 {
+    let exponent = job.attempt_count.min(9);
+    let base = (5_i64 * (1_i64 << exponent)).min(3600);
+    let jitter_window = (base / 4).max(1);
+    let seed = job.guild_id.unsigned_abs()
+        ^ (job.generation as u64).rotate_left(17)
+        ^ u64::from(job.attempt_count).rotate_left(33);
+    base + (seed % jitter_window as u64) as i64
+}
+
+pub async fn schedule_nickname_reconcile_retry(
+    db: &Db,
+    job: &NicknameReconcileJob,
+    now: i64,
+    code: &str,
+    error: &str,
+) -> Result<bool> {
+    let attempts = job.attempt_count.saturating_add(1);
+    let exhausted = attempts >= MAX_NICKNAME_RECONCILE_ATTEMPTS;
+    let next_attempt_at = now + nickname_retry_delay_secs(job);
+    let (guild_id, generation) = (job.guild_id, job.generation);
+    let (code, error) = (code.to_string(), error.to_string());
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute(
+            "UPDATE nickname_reconcile SET
+                 state = ?1, attempt_count = ?2, next_attempt_at = ?3,
+                 last_error_code = ?4, last_error = ?5, last_error_at = ?6
+             WHERE guild_id = ?7 AND generation = ?8 AND state = 'pending'",
+            params![
+                if exhausted { "terminal" } else { "pending" },
+                i64::from(attempts),
+                next_attempt_at,
+                code,
+                error,
+                now,
+                guild_id,
+                generation
+            ],
+        )?;
+        tx.commit()?;
+        Ok(exhausted)
+    })
+    .await
+}
+
+pub async fn finish_nickname_reconcile(
+    db: &Db,
+    job: &NicknameReconcileJob,
+    state: &str,
+    code: &str,
+    error: &str,
+    now: i64,
+) -> Result<()> {
+    anyhow::ensure!(matches!(state, "terminal" | "dormant"));
+    let (guild_id, generation) = (job.guild_id, job.generation);
+    let (state, code, error) = (state.to_string(), code.to_string(), error.to_string());
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute(
+            "UPDATE nickname_reconcile SET state = ?1, attempt_count = attempt_count + 1,
+                 next_attempt_at = 0, last_error_code = ?2,
+                 last_error = ?3, last_error_at = ?4
+             WHERE guild_id = ?5 AND generation = ?6",
+            params![state, code, error, now, guild_id, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn dormancy_nickname_reconcile(db: &Db, guild_id: i64, reason: &str) -> Result<()> {
+    let reason = reason.to_string();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute(
+            "UPDATE nickname_reconcile SET state = 'dormant', next_attempt_at = 0,
+                 last_error_code = 'guild_departed', last_error = ?1,
+                 last_error_at = unixepoch() WHERE guild_id = ?2",
+            params![reason, guild_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     })
     .await
 }
@@ -1401,6 +1586,9 @@ pub async fn patch_settings(
     bot_name: crate::types::SettingsPatchField<String>,
     retention_days: crate::types::SettingsPatchField<u32>,
 ) -> Result<GuildSettings> {
+    if let Some(Some(nickname)) = &bot_name {
+        validate_discord_nickname(nickname)?;
+    }
     // Trim prefix at the write gate so WebUI / API / !prefix cannot persist
     // leading/trailing whitespace that would break prefix command matching.
     let prefix = match prefix {
@@ -1916,6 +2104,8 @@ pub async fn copy_guild_config(
                 _ => GuildSettingsOverride::default(),
             };
             let to_write = normalize_settings_override_for_scope(dst, to_write);
+            let effective_nickname = to_write.bot_name.as_deref().unwrap_or(&dst_parent.bot_name);
+            validate_discord_nickname(effective_nickname)?;
             write_settings_override_conn(&tx, dst, &to_write)?;
             if dst != GLOBAL_SCOPE {
                 enqueue_nickname_reconcile_conn(&tx, dst)?;
@@ -2850,7 +3040,7 @@ pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u
             log_channels,
             badwords,
         };
-        tx.commit()?;
+        tx.finish_read()?;
         Ok((version, parts))
     })
     .await
@@ -2871,7 +3061,7 @@ pub async fn load_slash_commands_with_version(
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
-        tx.commit()?;
+        tx.finish_read()?;
         Ok((version, commands))
     })
     .await
@@ -3092,6 +3282,7 @@ mod tests {
             )?;
             // Simulate an installation that had reached migration 0002 before
             // the per-guild-only log-channel migration was released.
+            conn.execute_batch("DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts;")?;
             conn.pragma_update(None, "user_version", 2)?;
             migrate_conn(conn)?;
 
@@ -4787,8 +4978,9 @@ mod tests {
             None,
         ))
         .unwrap();
-        let first = tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap();
-        assert_eq!(first, vec![(42, 1, "first".into())]);
+        let first = tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap();
+        assert_eq!(first[0].nickname, "first");
+        assert_eq!((first[0].guild_id, first[0].generation), (42, 1));
 
         tokio_test_block_on(patch_settings(
             &db,
@@ -4799,11 +4991,12 @@ mod tests {
         ))
         .unwrap();
         tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 1)).unwrap();
-        let second = tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap();
-        assert_eq!(second, vec![(42, 2, "second".into())]);
+        let second = tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap();
+        assert_eq!(second[0].nickname, "second");
+        assert_eq!((second[0].guild_id, second[0].generation), (42, 2));
         tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 2)).unwrap();
         assert!(
-            tokio_test_block_on(pending_nickname_reconciles(&db))
+            tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25))
                 .unwrap()
                 .is_empty()
         );
@@ -4816,9 +5009,93 @@ mod tests {
         let db = Db::open(&tmp, 2).unwrap();
         tokio_test_block_on(request_nickname_reconcile(&db, 43)).unwrap();
         assert_eq!(
-            tokio_test_block_on(pending_nickname_reconciles(&db)).unwrap(),
-            vec![(43, 1, String::new())],
+            tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap()[0].nickname,
+            String::new(),
             "a cancelled Discord-first request must retain work for the old authoritative value"
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
+        let tmp = tmp_db_path("nickname_outbox_lifecycle");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(request_nickname_reconcile(&db, 44)).unwrap();
+        let mut job = tokio_test_block_on(pending_nickname_reconciles(&db, 100, 25))
+            .unwrap()
+            .remove(0);
+        assert!(
+            !tokio_test_block_on(schedule_nickname_reconcile_retry(
+                &db,
+                &job,
+                100,
+                "transport",
+                "temporary"
+            ))
+            .unwrap()
+        );
+        assert!(
+            tokio_test_block_on(pending_nickname_reconciles(&db, 104, 25))
+                .unwrap()
+                .is_empty(),
+            "transient work must wait for its persisted schedule"
+        );
+        job = tokio_test_block_on(pending_nickname_reconciles(&db, 10_000, 25))
+            .unwrap()
+            .remove(0);
+        tokio_test_block_on(finish_nickname_reconcile(
+            &db,
+            &job,
+            "terminal",
+            "discord_50013",
+            "missing permissions",
+            10_000,
+        ))
+        .unwrap();
+        assert!(
+            tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+                .unwrap()
+                .is_empty(),
+            "terminal work must not make another API attempt"
+        );
+
+        tokio_test_block_on(request_nickname_reconcile(&db, 45)).unwrap();
+        tokio_test_block_on(dormancy_nickname_reconcile(&db, 45, "departed")).unwrap();
+        assert!(
+            tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+                .unwrap()
+                .is_empty(),
+            "departed guild work must remain dormant"
+        );
+        tokio_test_block_on(request_nickname_reconcile(&db, 45)).unwrap();
+        assert_eq!(
+            tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
+                .unwrap()
+                .len(),
+            1,
+            "guild_create must reactivate dormant work"
+        );
+        cleanup_db(&tmp);
+    }
+
+    #[test]
+    fn nickname_validation_rejects_permanent_discord_failures_before_enqueue() {
+        let tmp = tmp_db_path("nickname_validation");
+        let db = Db::open(&tmp, 2).unwrap();
+        assert!(
+            tokio_test_block_on(patch_settings(
+                &db,
+                46,
+                None,
+                Some(Some("x".repeat(33))),
+                None,
+            ))
+            .is_err()
+        );
+        assert!(
+            tokio_test_block_on(pending_nickname_reconciles(&db, i64::MAX, 25))
+                .unwrap()
+                .is_empty()
         );
         cleanup_db(&tmp);
     }

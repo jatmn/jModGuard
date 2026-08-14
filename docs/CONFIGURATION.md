@@ -28,7 +28,7 @@ database (everything server-related, editable at runtime).
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0004_nickname_reconcile.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0005_mutation_receipts_nickname_jobs.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
 the bot to finish bootstrap or release a transient local SQLite startup lock,
 then exits).
@@ -36,7 +36,8 @@ then exits).
 | Table | Holds |
 |---|---|
 | `meta` | durable keys (`config_version` for cross-process cache invalidation; `slash_registry_version` for Discord slash re-sync) |
-| `nickname_reconcile` | generation-numbered durable work for reconciling Discord nicknames to committed settings across bot/API races |
+| `nickname_reconcile` | generation-numbered nickname jobs with pending/dormant/terminal state, persisted retry schedule, attempt count, and last operator-visible error |
+| `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
 | `guild_settings` | prefix, bot nickname, retention as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
 | `rules` | the 7 automod rules (server + global rows) |
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
@@ -53,13 +54,16 @@ then exits).
 Environment variables override `config.toml` values (see table).
 
 Remote database calls and waits for a pooled connection have a fixed 75-second
-per-request deadline. Transaction rollback cleanup can use one additional
-deadline before the logical operation returns an error. A connection whose operation
-timed out is discarded rather than reused with potentially stale remote stream
-state. jModGuard does not automatically retry a timed-out write because the
-server may have committed it before the response was lost; callers may retry
-reads and naturally recurring polls, while mutating requests report failure
-for operator reconciliation.
+per-wire-attempt deadline. Transaction rollback cleanup and an authoritative
+receipt check after a failed COMMIT can each use an additional deadline before
+the logical operation returns. A connection whose operation timed out is
+discarded rather than reused with potentially stale remote stream state. Each
+remote mutation carries a receipt in its transaction. If a COMMIT
+response is lost, jModGuard checks that receipt in a fresh primary-routed
+transaction and returns the established result rather than inviting a duplicate
+retry. If that authoritative check also fails, the operation remains explicitly
+indeterminate and the process conservatively advances its local configuration
+floor so it cannot immediately serve an older snapshot.
 
 ## Remote providers
 

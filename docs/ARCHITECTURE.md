@@ -54,10 +54,12 @@ transactions so they begin on the primary and serialize with other writers.
 
 Nickname changes commit a generation-numbered durable outbox row in the same
 settings transaction. The bot is the sole Discord nickname writer: it drains
-the outbox through primary-routed reads and acknowledges only the generation it
-applied. This makes the final committed nickname win across bot/API races,
-survives cancelled requests, and retries Discord failures without rolling back
-durable settings.
+due work through primary-routed reads and acknowledges only the generation it
+applied. Transient Discord failures use persisted exponential backoff with
+jitter and a bounded retry budget. Permanent rejections become terminal,
+operator-visible rows; guild departure makes work dormant until `guild_create`
+reactivates it. This makes the final committed nickname win across bot/API
+races and survives cancelled requests without rolling back durable settings.
 
 ## Migrations
 
@@ -85,7 +87,7 @@ src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
 frontend/                  SPA (served by API locally; CDN-ready)
-migrations/                0001_init through 0004_nickname_reconcile
+migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot
 Dockerfile.api
 ```

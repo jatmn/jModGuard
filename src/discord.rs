@@ -1,40 +1,42 @@
 //! Shared Discord REST helpers.
 
-use std::future::Future;
-
 use anyhow::{Result, anyhow};
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 
-/// Retry a Discord REST call a few times with short backoff.
-///
-/// Nickname apply/restore (WebUI and `!setname`) share this so a transient
-/// Discord blip does not leave Discord and SQLite permanently diverged.
-pub async fn with_retries<T, E, F, Fut>(label: &str, guild_id: u64, mut op: F) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    const MAX_ATTEMPTS: u32 = 3;
-    let mut last_err = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if attempt < MAX_ATTEMPTS {
-                    tracing::warn!(
-                        "{label} attempt {attempt}/{MAX_ATTEMPTS} failed \
-                         (guild={guild_id}): {e}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(150 * u64::from(attempt)))
-                        .await;
-                }
-                last_err = Some(e);
-            }
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NicknameFailureClass {
+    Transient,
+    Dormant,
+    Terminal,
+}
+
+/// Classify a Discord nickname failure into the durable outbox lifecycle.
+/// Transport failures, rate limits, and server failures may recover. A guild
+/// the bot cannot currently see is dormant until `guild_create` reactivates
+/// it. Other client rejections require operator action and are terminal.
+pub fn classify_nickname_failure(error: &serenity::Error) -> (NicknameFailureClass, String) {
+    if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error {
+        return classify_nickname_response(response.status_code.as_u16(), response.error.code);
     }
-    Err(last_err.expect("at least one attempt ran"))
+    if matches!(
+        error,
+        serenity::Error::Http(serenity::http::HttpError::Request(_))
+    ) {
+        return (NicknameFailureClass::Transient, "transport".into());
+    }
+    (NicknameFailureClass::Terminal, "client_error".into())
+}
+
+fn classify_nickname_response(status: u16, discord_code: isize) -> (NicknameFailureClass, String) {
+    let code = format!("discord_{discord_code}");
+    if matches!(discord_code, 10004 | 50001) {
+        return (NicknameFailureClass::Dormant, code);
+    }
+    if status == 429 || status >= 500 {
+        return (NicknameFailureClass::Transient, code);
+    }
+    (NicknameFailureClass::Terminal, code)
 }
 
 /// Ensures a configured log destination belongs to the guild whose events it
@@ -65,5 +67,38 @@ pub async fn validate_log_channel_guild(
         ),
         Channel::Private(_) => anyhow::bail!("log channel {channel_id} is not a guild channel"),
         _ => anyhow::bail!("log channel {channel_id} is not a guild channel"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NicknameFailureClass, classify_nickname_response};
+
+    #[test]
+    fn nickname_failure_lifecycle_classification() {
+        assert_eq!(
+            classify_nickname_response(404, 10004).0,
+            NicknameFailureClass::Dormant
+        );
+        assert_eq!(
+            classify_nickname_response(403, 50001).0,
+            NicknameFailureClass::Dormant
+        );
+        assert_eq!(
+            classify_nickname_response(403, 50013).0,
+            NicknameFailureClass::Terminal
+        );
+        assert_eq!(
+            classify_nickname_response(400, 50035).0,
+            NicknameFailureClass::Terminal
+        );
+        assert_eq!(
+            classify_nickname_response(429, 0).0,
+            NicknameFailureClass::Transient
+        );
+        assert_eq!(
+            classify_nickname_response(503, 0).0,
+            NicknameFailureClass::Transient
+        );
     }
 }

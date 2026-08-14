@@ -1,4 +1,7 @@
-use jmodguard::db::{Db, DbOpenOptions, bump_config_version, get_config_version};
+use jmodguard::db::{
+    Db, DbOpenOptions, add_badword, bump_config_version, get_config_version, get_settings_primary,
+    list_badwords, patch_settings, test_drop_next_commit_response,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -54,4 +57,29 @@ async fn bot_bootstrap_and_api_share_remote_database() {
         .expect("next write stalled behind an unrolled-back transaction")
         .expect("next write should succeed after rollback");
     assert_eq!(get_config_version(&bot).await.unwrap(), before + 2);
+
+    // Commit the real remote transaction, then simulate losing its response.
+    // The receipt lookup must establish success on a fresh primary-routed
+    // connection rather than reporting an error that invites a duplicate retry.
+    test_drop_next_commit_response();
+    let committed = patch_settings(&bot, 42, Some(Some("?".into())), None, None)
+        .await
+        .expect("lost COMMIT response should reconcile to the committed outcome");
+    assert_eq!(committed.prefix, "?");
+    assert_eq!(
+        get_settings_primary(&api, 42).await.unwrap().prefix,
+        "?",
+        "the next authoritative read must observe the reconciled mutation"
+    );
+
+    test_drop_next_commit_response();
+    let id = add_badword(&bot, 42, "receipt-sentinel", None)
+        .await
+        .expect("a non-idempotent insert must also reconcile to success");
+    let rows = list_badwords(&api, 42).await.unwrap();
+    assert_eq!(
+        rows.iter().filter(|row| row.id == id).count(),
+        1,
+        "lost COMMIT response must not invite a duplicate insert retry"
+    );
 }

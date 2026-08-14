@@ -46,6 +46,11 @@ pub async fn guild_config(
     let guild = guild_id as i64;
 
     let settings_bundle = db::get_settings_web_bundle(&app.db, guild).await?;
+    let nickname_reconcile = if guild == GLOBAL_SCOPE {
+        None
+    } else {
+        db::nickname_reconcile_status(&app.db, guild).await?
+    };
 
     // rules: effective + scope info
     let g_rules = db::list_rules(&app.db, guild).await?;
@@ -168,6 +173,7 @@ pub async fn guild_config(
         "settings_override": settings_bundle.settings_override,
         "global_settings": settings_bundle.global_settings,
         "global_settings_override": settings_bundle.global_settings_override,
+        "nickname_reconcile": nickname_reconcile,
         "rules": rules,
         "badwords": badwords,
         "commands": commands,
