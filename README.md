@@ -44,7 +44,8 @@ cp config.example.toml config.toml     # add your token + OAuth ids
 ```
 
 Start the bot once before the API so schema creation/migrations and default-data
-bootstrap are complete. The API waits about 30 seconds for that work. Both
+bootstrap are complete. The API waits about 30 seconds locally, or about six
+minutes against a remote database. Both
 processes use the same local SQLite file (`db.path`) or remote libSQL database
 (`db.url` and `db.token`).
 
@@ -58,7 +59,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | Path | Doc |
 |------|-----|
 | Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
-| Bunny Database + two Magic Container apps | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
+| Bunny Database + two Magic Container apps | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) — images `ghcr.io/jatmn/jmodguard-bot` and `ghcr.io/jatmn/jmodguard-api` |
 | Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
 ## Documentation
@@ -128,6 +129,7 @@ templates.rs   {variable} renderer shared by everything
 logging.rs     event → channel router + audit log
 automod.rs     rule engine (sliding windows, escalation) + action executor
 handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
+health.rs      bot GET /health listener (no axum; API serves the same path)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
 frontend/      SPA assets (served by API locally; CDN target when deployed)

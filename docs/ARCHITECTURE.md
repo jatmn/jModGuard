@@ -72,8 +72,9 @@ without rolling back durable settings.
   bootstrap-complete marker.
 - API opens with `migrate=false`. Until the schema, terminal-defaults meta, and
   bootstrap-complete marker exist—or while SQLite is transiently locked by bot
-  startup—it retries for about 30 seconds. Other open failures (remote URL,
-  I/O) fail immediately.
+  startup—it retries for about 30 seconds locally. On a remote database it also
+  retries transient connect/timeout errors for about six minutes. Credential
+  and other non-retryable open failures still fail immediately.
 - Always start (or migrate with) the bot before the API on a new or upgraded DB.
 
 ## WebUI auth (summary)
@@ -90,6 +91,7 @@ without rolling back durable settings.
 src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
+src/health.rs              GET /health (bot listener; API axum route)
 frontend/                  SPA (served by API locally; CDN-ready)
 migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot

@@ -46,24 +46,45 @@ and the Bunny pair is likewise required in full. Never commit an access token.
 
 ## 2. Build and publish both images
 
-Build both images from the same reviewed commit or release tag:
+CI builds `linux/amd64` images and, on `main` and version tags, pushes them to
+GHCR:
+
+```text
+ghcr.io/jatmn/jmodguard-bot:<tag>
+ghcr.io/jatmn/jmodguard-api:<tag>
+```
+
+Use the short git SHA tag (or `main` after that commit is on the default
+branch). Do not deploy a floating `latest` tag; `latest` is only applied to
+version tags (`v*`).
+
+Magic Containers already trusts public GitHub Container Registry. After the
+first successful `images` workflow on `main`, open each package at
+`https://github.com/jatmn/jModGuard/pkgs/container/jmodguard-bot` and
+`.../jmodguard-api` and set visibility to **public** if GitHub created them
+private. If you keep them private, add a GitHub registry in Magic Containers
+with a read-only PAT.
+
+To build locally instead of using GHCR:
 
 ```bash
-docker build --platform linux/amd64 -f Dockerfile.bot -t REGISTRY/jmodguard-bot:TAG .
-docker build --platform linux/amd64 -f Dockerfile.api -t REGISTRY/jmodguard-api:TAG .
-docker push REGISTRY/jmodguard-bot:TAG
-docker push REGISTRY/jmodguard-api:TAG
+docker build --platform linux/amd64 -f Dockerfile.bot -t ghcr.io/jatmn/jmodguard-bot:TAG .
+docker build --platform linux/amd64 -f Dockerfile.api -t ghcr.io/jatmn/jmodguard-api:TAG .
+docker push ghcr.io/jatmn/jmodguard-bot:TAG
+docker push ghcr.io/jatmn/jmodguard-api:TAG
 ```
 
 Magic Containers currently requires `linux/amd64`; keep that platform flag
 when building from ARM hosts such as Apple Silicon.
 
-Record immutable image digests in the private ops repository. Do not deploy
-floating `main` or `latest` tags.
+Record immutable image digests in the private ops repository.
 
-The images default `JMODGUARD_LOG_DIRECTORY` to an empty value so logs go to
-stdout/stderr and appear in the Magic Containers log stream. A persistent
-volume is not required for the remote database topology.
+The images default `JMODGUARD_LOG_DIRECTORY` to empty so logs go to
+stdout/stderr. They also set `JMODGUARD_REQUIRE_REMOTE_DB=1`: if Bunny (or
+portable) database credentials are missing, the process **exits** instead of
+opening a private SQLite file on ephemeral disk. A persistent volume is not
+required for the remote database topology. Unset that variable only when you
+intentionally run the image against local SQLite.
 
 ## 3. Create the bot app
 
@@ -81,10 +102,16 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+The bot image already requires remote DB credentials and binds a process-local
+health listener on container port `8080` (`GET /health`). In **Monitoring**,
+enable HTTP GET health checks on path `/health` port `8080` (startup +
+liveness are enough; the bot has no public endpoint).
+
 The bot is the schema authority. On the first start it creates the schema,
 seeds defaults, and publishes a durable bootstrap marker before connecting to
-Discord. This is initial schema creation on an empty service, not a migration
-of an older deployment.
+Discord. Remote connect/bootstrap failures retry for about six minutes so a
+slow first database wake does not immediately crash-loop. This is initial
+schema creation on an empty service, not a migration of an older deployment.
 
 Wait for logs containing `database ready (migrate=true)` before starting the
 API app. A fake or invalid Discord token can still be used for a database-only
@@ -111,7 +138,10 @@ JMODGUARD_LOG_DIRECTORY=
 ```
 
 The API also needs the Discord bot token because WebUI unban uses Discord's
-REST API. Add a public HTTPS endpoint for container port `8080`. In the Discord
+REST API. `JMODGUARD_WEB_BASE_URL` is required: the image binds `0.0.0.0:8080`,
+and the process refuses to start if that public bind still has the localhost
+OAuth default. Add a public HTTPS endpoint for container port `8080`. Enable
+HTTP GET health checks on path `/health` port `8080`. In the Discord
 Developer Portal, set the OAuth redirect URI to this exact value:
 
 ```text
@@ -119,7 +149,8 @@ https://YOUR-API-HOSTNAME/oauth/callback
 ```
 
 The API never applies migrations. It verifies the schema and bot bootstrap
-marker, retrying briefly if it starts while the bot is still bootstrapping.
+marker, retrying incomplete schema and transient remote connect errors for
+about six minutes on a remote database (about 30 seconds for local SQLite).
 
 ## 5. Acceptance test
 
@@ -130,7 +161,8 @@ For the first deployment:
    `API/WebUI listening`.
 3. In **Regions and Scaling**, confirm each app has one region and exactly one
    running replica, with no scale-up above `1`.
-4. Request `/`; it must return the embedded jModGuard UI over HTTPS.
+4. Request `/health`; it must return `ok` over HTTPS. Request `/`; it must
+   return the embedded jModGuard UI.
 5. Complete Discord OAuth login and open a guild where the user has Manage
    Server permission.
 6. Change a harmless guild prefix in the UI. Confirm the bot eventually
@@ -155,7 +187,11 @@ the bot/API process contract against local SQLite.
 - Run one bot app instance unless Discord sharding and singleton work have been
   deliberately redesigned and tested.
 - API sessions use an in-memory store. Restarting the API logs users out, and
-  multiple API replicas do not share sessions.
+  multiple API replicas do not share sessions. SIGTERM from Magic Containers
+  stops the Discord gateway and the API listener cleanly.
+- Container images refuse to start without a complete remote database URL/token
+  pair (`JMODGUARD_REQUIRE_REMOTE_DB=1`). Missing Bunny secrets must not fall
+  through to an ephemeral local SQLite file.
 - Both processes poll durable `config_version` plus its revision token;
   command changes additionally update `slash_registry_version` and its token
   for Discord slash-command resync. Tokens distinguish counters reused after

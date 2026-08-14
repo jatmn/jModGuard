@@ -462,6 +462,31 @@ fn api_open_until_ready_times_out_without_bot() {
 }
 
 #[test]
+fn startup_retries_transient_remote_errors_but_not_auth() {
+    let timeout = anyhow::anyhow!("remote database connect timed out after 75s");
+    assert!(crate::db::is_api_startup_retryable(&timeout, true));
+    assert!(
+        !crate::db::is_api_startup_retryable(&timeout, false),
+        "local SQLite must not treat transport timeouts as a migrate race"
+    );
+    let refused = anyhow::anyhow!("tcp connect error: connection refused");
+    assert!(crate::db::is_api_startup_retryable(&refused, true));
+    let auth = anyhow::anyhow!("unauthorized: invalid token");
+    assert!(!crate::db::is_api_startup_retryable(&auth, true));
+    let schema = anyhow::anyhow!(crate::db::SchemaNotReady("schema is behind".into()));
+    assert!(crate::db::is_api_startup_retryable(&schema, false));
+    assert!(crate::db::is_api_startup_retryable(&schema, true));
+}
+
+#[test]
+fn healthcheck_succeeds_on_open_database() {
+    let tmp = tmp_db_path("healthcheck");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.healthcheck()).expect("healthcheck");
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn delete_badword_rejects_other_guild_idor() {
     let tmp = tmp_db_path("badword_idor");
     let db = Db::open(&tmp, 2).unwrap();
@@ -885,7 +910,13 @@ fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
         ))
     }))
     .unwrap();
-    assert_eq!(persisted_bulk_rows, (("created after bulk tombstone".to_string(), true), ("created too".to_string(), true)));
+    assert_eq!(
+        persisted_bulk_rows,
+        (
+            ("created after bulk tombstone".to_string(), true),
+            ("created too".to_string(), true)
+        )
+    );
     cleanup_db(&tmp);
 }
 

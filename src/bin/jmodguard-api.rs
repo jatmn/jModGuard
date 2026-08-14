@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
 use jmodguard::state::AppState;
-use jmodguard::{init_tracing, web};
+use jmodguard::{init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use std::time::Duration;
 async fn main() -> Result<()> {
     let cfg = Config::load()?;
     cfg.validate_cors()?;
+    cfg.validate_public_base_url()?;
 
     if cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty() {
         anyhow::bail!(
@@ -42,7 +43,8 @@ async fn main() -> Result<()> {
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.
     let opts = cfg.db_open_options(false);
-    let db = Db::open_with_until_ready(opts, 30, Duration::from_secs(1))
+    let (attempts, delay) = jmodguard::db::startup_open_retry(&opts);
+    let db = Db::open_with_until_ready(opts, attempts, delay)
         .await
         .with_context(|| {
         format!(
@@ -92,7 +94,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind API on {web_bind}"))?;
     tracing::info!("API/WebUI listening on http://{web_bind}");
     axum::serve(listener, web_app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("web server error")?;
+    tracing::info!("API process stopped");
     Ok(())
 }

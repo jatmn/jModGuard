@@ -12,6 +12,7 @@ mod db_compat;
 pub mod defaults;
 pub mod discord;
 pub mod handlers;
+pub mod health;
 pub mod ids;
 pub mod logging;
 pub mod normalize;
@@ -22,6 +23,43 @@ pub mod types;
 pub mod web;
 
 use crate::config::Config;
+
+/// Completes when the process should stop (Ctrl+C or SIGTERM).
+///
+/// Magic Containers sends SIGTERM on restart/redeploy. Without this, the
+/// Discord gateway is hard-killed and in-flight work is abandoned.
+pub async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::error!(
+                        "failed to install SIGTERM handler: {error}; waiting for Ctrl+C"
+                    );
+                    if let Err(error) = ctrl_c.await {
+                        tracing::error!("ctrl_c handler failed: {error}");
+                    }
+                    return;
+                }
+            };
+        tokio::select! {
+            result = ctrl_c => {
+                if let Err(error) = result {
+                    tracing::error!("ctrl_c handler failed: {error}");
+                }
+            }
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = ctrl_c.await {
+        tracing::error!("ctrl_c handler failed: {error}");
+    }
+    tracing::info!("shutdown signal received");
+}
 
 /// Initializes tracing from config (console or rolling files under `log.directory`).
 ///

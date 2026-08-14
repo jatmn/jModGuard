@@ -3,7 +3,7 @@
 #
 # Dual-process local run:
 #   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway
-#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (waits ~30s for bot migrate)
+#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (waits ~30s locally for bot migrate)
 
 [discord]
 # Bot token from https://discord.com/developers/applications

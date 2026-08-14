@@ -27,7 +27,8 @@ This release **removes that entrypoint**. You must run two binaries:
 5. Fill in Discord OAuth client id/secret. The API process **refuses to start**
    without them; the old monolith could still run Discord without WebUI login.
 6. Start the bot first (it migrates and completes default-data bootstrap). The
-   API waits about 30 seconds for that work, then exits if the bot never completes it.
+   API waits about 30 seconds locally (about six minutes against a remote
+   database) for that work, then exits if the bot never completes it.
 
 Then continue with backup / rollout below as for any later upgrade.
 

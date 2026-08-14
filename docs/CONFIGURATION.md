@@ -25,13 +25,20 @@ database (everything server-related, editable at runtime).
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
 
+Environment-only (not in `config.toml`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `JMODGUARD_REQUIRE_REMOTE_DB` | unset | If `1`/`true`, startup fails when no remote URL/token pair is configured. Container images set this so a missed Bunny secret cannot open a private SQLite file. |
+| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP health listener (`GET /health`). Container bot image sets `0.0.0.0:8080`. Empty = disabled. The API serves `/health` on `web.bind`. |
+
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0005_mutation_receipts_nickname_jobs.sql`) and is applied by
-`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
-the bot to finish bootstrap or release a transient local SQLite startup lock,
-then exits).
+`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
+locally, or about six minutes on a remote database, for the bot to finish
+bootstrap or for a transient connect/lock to clear, then exits).
 
 | Table | Holds |
 |---|---|

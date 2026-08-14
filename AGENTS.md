@@ -19,7 +19,7 @@ Local dual-process:
 
 ```bash
 cargo run --bin jmodguard-bot --no-default-features   # migrates DB; Discord gateway
-cargo run --bin jmodguard-api                         # waits ~30s for bot migrate, then serves HTTP
+cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m remote for bot migrate, then serves HTTP
 ```
 
 ## Version pins (verified)
@@ -87,7 +87,13 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   `https` `web.base_url`; frontend uses `credentials: "include"`. Prefer
   same-origin reverse proxy when possible. `Config::validate_cors` runs in
   `jmodguard-api` only — invalid CORS must not prevent `jmodguard-bot` from
-  starting.
+  starting. A public bind (`0.0.0.0`) must also pass `validate_public_base_url`
+  (`JMODGUARD_WEB_BASE_URL` https, not localhost).
+- Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
+  credentials must fail startup, not open local SQLite. Unset it only for an
+  intentional local-SQLite container run.
+- Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET /health`
+  are unauthenticated liveness probes. Do not put session middleware on `/health`.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /
@@ -157,7 +163,7 @@ src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/moderation.rs    members/messages/retention/audit/warns/bans
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
-src/discord.rs          Discord REST helpers (nickname retries)
+src/health.rs          process-local GET /health listener (bot; no axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
 src/state.rs            AppState + config cache + version poll

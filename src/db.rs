@@ -89,8 +89,64 @@ fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_api_startup_retryable(err: &anyhow::Error) -> bool {
-    is_schema_not_ready(err) || is_sqlite_startup_lock(err)
+fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
+    err.chain().any(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("unauthorized")
+            || message.contains("forbidden")
+            || message.contains("invalid token")
+            || message.contains("authentication")
+            || message.contains("status code: 401")
+            || message.contains("status code: 403")
+    })
+}
+
+fn is_transient_remote_open(err: &anyhow::Error) -> bool {
+    if is_database_operation_timeout(err) {
+        return true;
+    }
+    err.chain().any(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        const NEEDLES: &[&str] = &[
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "try again",
+            "network is unreachable",
+            "no route to host",
+            "failed to lookup",
+            "dns error",
+            "name or service not known",
+            "tls handshake",
+            "handshake timed",
+            "server is unavailable",
+            "goaway",
+            "stream closed",
+        ];
+        NEEDLES.iter().any(|needle| message.contains(needle))
+    })
+}
+
+/// API (and remote bot) startup retries incomplete schema, SQLite locks, and
+/// transient remote transport errors. Auth failures still fail immediately.
+pub fn is_api_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
+    if is_schema_not_ready(err) || is_sqlite_startup_lock(err) {
+        return true;
+    }
+    remote && !is_rejected_remote_auth(err) && is_transient_remote_open(err)
+}
+
+/// How long the API (and a remote bot) should keep retrying `open_with`.
+pub fn startup_open_retry(opts: &DbOpenOptions) -> (u32, Duration) {
+    if opts.url.trim().is_empty() {
+        (30, Duration::from_secs(1))
+    } else {
+        (180, Duration::from_secs(2))
+    }
 }
 
 /// Options for opening either local SQLite or a remote libSQL database.
@@ -358,12 +414,13 @@ impl Db {
             .take()
     }
 
-    /// Retries `open_with` while the bot is still applying schema.
+    /// Retries `open_with` while the bot is still applying schema, and while a
+    /// remote database is still waking up.
     ///
     /// systemd `After=jmodguard-bot.service` only waits for the bot *process*
     /// to exist, not for migrate to finish. Fail-fast plus `Restart=on-failure`
-    /// turns that into a crash loop. Other errors (remote URL, I/O) still fail
-    /// immediately.
+    /// turns that into a crash loop. Auth failures and other non-retryable
+    /// errors still fail immediately.
     pub async fn open_with_until_ready(
         opts: DbOpenOptions,
         attempts: u32,
@@ -374,7 +431,7 @@ impl Db {
         for i in 0..attempts {
             match Self::open_with(opts.clone()) {
                 Ok(db) => return Ok(db),
-                Err(err) if is_api_startup_retryable(&err) => {
+                Err(err) if is_api_startup_retryable(&err, !opts.url.trim().is_empty()) => {
                     tracing::info!(
                         "database not ready for API (attempt {}/{attempts}); waiting for jmodguard-bot: {err:#}",
                         i + 1
@@ -448,6 +505,17 @@ impl Db {
         })
         .await
         .context("db task panicked")?
+    }
+
+    /// Cheap liveness probe for `/health`. Uses one pooled connection.
+    pub async fn healthcheck(&self) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT 1", (), |row| Ok(row.get::<i64>(0)?))?;
+            Ok(())
+        })
+        .await
+        .context("database health check failed")?;
+        Ok(())
     }
 
     /// Runs a closure synchronously (tests only).

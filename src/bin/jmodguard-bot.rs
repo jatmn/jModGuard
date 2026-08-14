@@ -1,11 +1,11 @@
-//! jModGuard Discord bot process (gateway only — no HTTP bind).
+//! jModGuard Discord bot process (gateway only — health listener optional).
 
 use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
 use jmodguard::handlers::Handler;
 use jmodguard::state::AppState;
-use jmodguard::{db, init_tracing};
+use jmodguard::{db, init_tracing, shutdown_signal};
 use serenity::builder::EditMember;
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
@@ -166,16 +166,21 @@ async fn main() -> Result<()> {
     init_tracing(&cfg, "bot");
 
     let opts = cfg.db_open_options(true);
-    let db = Db::open_with(opts).with_context(|| {
-        format!(
-            "failed to open database {}",
-            if cfg.db.url.is_empty() {
-                cfg.db.path.display().to_string()
-            } else {
-                cfg.db.url.clone()
-            }
-        )
-    })?;
+    let remote = cfg.is_remote_db();
+    let db = if remote {
+        let (attempts, delay) = db::startup_open_retry(&opts);
+        Db::open_with_until_ready(opts, attempts, delay)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open remote database {} after waiting for a transient connect/bootstrap",
+                    cfg.db.url
+                )
+            })?
+    } else {
+        Db::open_with(opts)
+            .with_context(|| format!("failed to open database {}", cfg.db.path.display()))?
+    };
     tracing::info!(
         "database ready (migrate=true) at {}",
         if cfg.db.url.is_empty() {
@@ -334,7 +339,25 @@ async fn main() -> Result<()> {
         });
     }
 
-    tracing::info!("starting shards (bot process; no HTTP bind)");
-    client.start().await.context("discord client error")?;
+    tracing::info!("starting shards (bot process; no public HTTP API)");
+    if let Some(bind) = cfg.health_bind() {
+        let health_db = app.db.clone();
+        tokio::spawn(async move {
+            if let Err(error) = jmodguard::health::serve(&bind, health_db).await {
+                tracing::error!("health listener exited: {error:#}");
+            }
+        });
+    }
+
+    let shard_manager = client.shard_manager.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("stopping Discord shards");
+        shard_manager.shutdown_all().await;
+    });
+    if let Err(error) = client.start().await {
+        anyhow::bail!("discord client error: {error:#}");
+    }
+    tracing::info!("bot process stopped");
     Ok(())
 }

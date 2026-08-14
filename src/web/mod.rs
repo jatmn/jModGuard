@@ -427,6 +427,18 @@ async fn index() -> impl IntoResponse {
         "text/html; charset=utf-8",
     )
 }
+
+async fn health(
+    axum::extract::State(app): axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match app.db.healthcheck().await {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(error) => {
+            tracing::warn!("health check failed: {error:#}");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
+        }
+    }
+}
 async fn app_js() -> impl IntoResponse {
     static_handler(
         include_str!("../../frontend/app.js"),
@@ -495,7 +507,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .with_same_site(same_site)
         .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
 
-    let mut router = Router::new()
+    let sessioned = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
@@ -565,7 +577,11 @@ pub fn router(app: Arc<AppState>) -> Router {
             axum::routing::post(api::unban),
         )
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
-        .layer(session_layer)
+        .layer(session_layer);
+
+    let mut router = Router::new()
+        .route("/health", get(health))
+        .merge(sessioned)
         .with_state(app.clone());
 
     if cross_origin {

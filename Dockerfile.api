@@ -19,5 +19,7 @@ ENV JMODGUARD_DB_PATH=/data/jmodguard.db
 ENV JMODGUARD_CONFIG=/data/config.toml
 ENV JMODGUARD_WEB_BIND=0.0.0.0:8080
 ENV JMODGUARD_LOG_DIRECTORY=""
+# Fail closed unless Bunny/portable remote credentials are present.
+ENV JMODGUARD_REQUIRE_REMOTE_DB=1
 EXPOSE 8080
 ENTRYPOINT ["jmodguard-api"]
