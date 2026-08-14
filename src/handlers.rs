@@ -408,7 +408,7 @@ impl EventHandler for Handler {
             return;
         };
         let id = event.id.get() as i64;
-        let allow_missing = app.message_tracking_pending(event.id.get());
+        let allow_missing = true;
         if let Ok(Some((old_content, _))) = db::mark_edited_with_previous(
             &app.db,
             id,
@@ -452,7 +452,7 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
         let id = deleted_message_id.get() as i64;
-        let allow_missing = app.message_tracking_pending(deleted_message_id.get());
+        let allow_missing = true;
         let content = db::mark_deleted_with_previous(
             &app.db,
             id,
@@ -494,7 +494,6 @@ impl EventHandler for Handler {
         let n = multiple_deleted_messages_ids.len();
         let allow_missing_ids = multiple_deleted_messages_ids
             .iter()
-            .filter(|id| app.message_tracking_pending(id.get()))
             .map(|id| id.get() as i64)
             .collect();
         let message_ids = multiple_deleted_messages_ids

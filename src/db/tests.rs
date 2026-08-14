@@ -843,6 +843,97 @@ fn delayed_message_tracking_preserves_earlier_lifecycle_events() {
     }))
     .unwrap();
     assert_eq!(bulk_rows, (true, 0));
+
+    // Edit/delete lifecycle events can be observed before a message is fully
+    // ingested as a tracked create. Persist them regardless of in-memory
+    // tracking state so we never overwrite later with a stale "live" message.
+    tokio_test_block_on(crate::db::mark_deleted_bulk(
+        &db,
+        vec![106, 107],
+        vec![106, 107],
+        42,
+        7,
+    ))
+    .unwrap();
+    for (message_id, original) in [(106, "created after bulk tombstone"), (107, "created too")] {
+        tokio_test_block_on(crate::db::record_message_activity(
+            &db,
+            message_id,
+            42,
+            7,
+            9,
+            "user",
+            None,
+            original,
+            "[]",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    }
+    let persisted_bulk_rows = tokio_test_block_on(db.with_conn(|conn| {
+        Ok((
+            conn.query_row(
+                "SELECT content, deleted_at IS NOT NULL FROM messages WHERE message_id = 106",
+                (),
+                |r| Ok((r.get::<String>(0)?, r.get::<bool>(1)?)),
+            )?,
+            conn.query_row(
+                "SELECT content, deleted_at IS NOT NULL FROM messages WHERE message_id = 107",
+                (),
+                |r| Ok((r.get::<String>(0)?, r.get::<bool>(1)?)),
+            )?,
+        ))
+    }))
+    .unwrap();
+    assert_eq!(persisted_bulk_rows, (("created after bulk tombstone".to_string(), true), ("created too".to_string(), true)));
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn delayed_message_edit_before_create_remains_edited() {
+    let tmp = tmp_db_path("message_edit_reordering");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    assert!(
+        tokio_test_block_on(crate::db::mark_edited_with_previous(
+            &db,
+            108,
+            42,
+            7,
+            Some(9),
+            true,
+            "edit first",
+        ))
+        .unwrap()
+        .is_none()
+    );
+
+    tokio_test_block_on(crate::db::record_message_activity(
+        &db,
+        108,
+        42,
+        7,
+        9,
+        "user",
+        None,
+        "created after edit",
+        "[]",
+        "2026-01-01T00:00:00Z",
+    ))
+    .unwrap();
+
+    let row = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT content, edited_at IS NOT NULL, deleted_at IS NOT NULL
+             FROM messages WHERE message_id = 108",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<bool>(1)?, r.get::<bool>(2)?)),
+        )
+    }))
+    .unwrap();
+    assert_eq!(row.0, "edit first".to_string());
+    assert!(row.1);
+    assert!(!row.2);
     cleanup_db(&tmp);
 }
 
