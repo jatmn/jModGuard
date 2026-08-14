@@ -231,27 +231,23 @@ impl Config {
             self.db.path = PathBuf::from(v.trim());
         }
         let portable = (
-            env::var("JMODGUARD_DB_URL").ok(),
-            env::var("JMODGUARD_DB_TOKEN").ok(),
+            nonempty_env("JMODGUARD_DB_URL"),
+            nonempty_env("JMODGUARD_DB_TOKEN"),
         );
         let bunny = (
-            env::var("BUNNY_DATABASE_URL").ok(),
-            env::var("BUNNY_DATABASE_AUTH_TOKEN").ok(),
+            nonempty_env("BUNNY_DATABASE_URL"),
+            nonempty_env("BUNNY_DATABASE_AUTH_TOKEN"),
         );
         let selected = if portable.0.is_some() || portable.1.is_some() {
             match portable {
-                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-                    Some((url.trim().to_string(), token.trim().to_string()))
-                }
+                (Some(url), Some(token)) => Some((url, token)),
                 _ => anyhow::bail!(
                     "JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN must be set together and non-empty"
                 ),
             }
         } else if bunny.0.is_some() || bunny.1.is_some() {
             match bunny {
-                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-                    Some((url.trim().to_string(), token.trim().to_string()))
-                }
+                (Some(url), Some(token)) => Some((url, token)),
                 _ => anyhow::bail!(
                     "BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN must be set together and non-empty"
                 ),
@@ -263,9 +259,11 @@ impl Config {
             self.db.url = url;
             self.db.token = token;
         }
-        if env_flag("JMODGUARD_REQUIRE_REMOTE_DB") && self.db.url.trim().is_empty() {
+        if env_flag("JMODGUARD_REQUIRE_REMOTE_DB")
+            && (self.db.url.trim().is_empty() || self.db.token.trim().is_empty())
+        {
             anyhow::bail!(
-                "JMODGUARD_REQUIRE_REMOTE_DB is set but no remote database credentials were found. \
+                "JMODGUARD_REQUIRE_REMOTE_DB is set but no complete remote database URL/token pair was found. \
                  Set BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN \
                  (or JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN). \
                  Unset JMODGUARD_REQUIRE_REMOTE_DB only for a local SQLite run."
@@ -314,6 +312,17 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
 }
 
 fn env_flag(name: &str) -> bool {
@@ -501,6 +510,57 @@ mod tests {
             "unexpected: {err:#}"
         );
         assert!(cfg.db.url.is_empty());
+    }
+
+    #[test]
+    fn blank_portable_env_does_not_block_bunny_credentials() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var("JMODGUARD_DB_URL", "   ");
+            std::env::set_var("JMODGUARD_DB_TOKEN", "");
+            std::env::set_var("BUNNY_DATABASE_URL", "libsql://bunny.example");
+            std::env::set_var("BUNNY_DATABASE_AUTH_TOKEN", "bunny-secret");
+        }
+
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.db.url, "libsql://bunny.example");
+        assert_eq!(cfg.db.token, "bunny-secret");
+    }
+
+    #[test]
+    fn require_remote_db_fails_closed_with_url_but_no_token() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+            "JMODGUARD_REQUIRE_REMOTE_DB",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe { std::env::set_var("JMODGUARD_REQUIRE_REMOTE_DB", "1") };
+
+        let mut cfg = Config::default();
+        cfg.db.url = "libsql://example.bunnydb.test".into();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("complete remote database URL/token pair"),
+            "unexpected: {err:#}"
+        );
     }
 
     #[test]

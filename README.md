@@ -129,7 +129,7 @@ templates.rs   {variable} renderer shared by everything
 logging.rs     event → channel router + audit log
 automod.rs     rule engine (sliding windows, escalation) + action executor
 handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
-health.rs      bot GET /health listener (no axum; API serves the same path)
+health.rs      bot GET /health liveness listener (no axum; API serves the same path)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum WebUI: OAuth login, JSON API (feature web; embeds frontend/)
 frontend/      SPA assets (served by API locally; CDN target when deployed)

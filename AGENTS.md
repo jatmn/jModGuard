@@ -93,7 +93,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   credentials must fail startup, not open local SQLite. Unset it only for an
   intentional local-SQLite container run.
 - Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET /health`
-  are unauthenticated liveness probes. Do not put session middleware on `/health`.
+  are unauthenticated process liveness probes (`ok`, no database). Do not put
+  session middleware on `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /

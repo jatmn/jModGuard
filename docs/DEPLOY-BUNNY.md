@@ -40,9 +40,11 @@ BUNNY_DATABASE_AUTH_TOKEN=SECRET
 
 jModGuard reads those names directly. Its portable aliases
 `JMODGUARD_DB_URL` and `JMODGUARD_DB_TOKEN` are also supported and take
-precedence when present. URL and token are an atomic pair: setting only one
-portable alias fails startup rather than borrowing a Bunny or TOML credential,
-and the Bunny pair is likewise required in full. Never commit an access token.
+precedence when both are non-empty. URL and token are an atomic pair: setting
+only one non-empty portable alias fails startup rather than borrowing a Bunny
+or TOML credential, and the Bunny pair is likewise required in full. Blank or
+whitespace-only values count as unset, so an empty portable alias does not
+block Bunny credentials. Never commit an access token.
 
 ## 2. Build and publish both images
 
@@ -58,12 +60,12 @@ Use the short git SHA tag (or `main` after that commit is on the default
 branch). Do not deploy a floating `latest` tag; `latest` is only applied to
 version tags (`v*`).
 
-Magic Containers already trusts public GitHub Container Registry. After the
-first successful `images` workflow on `main`, open each package at
+Magic Containers already trusts public GitHub Container Registry. The `images`
+workflow tries to mark `jmodguard-bot` and `jmodguard-api` **public** after the
+first push. If that API call is denied, open each package at
 `https://github.com/jatmn/jModGuard/pkgs/container/jmodguard-bot` and
-`.../jmodguard-api` and set visibility to **public** if GitHub created them
-private. If you keep them private, add a GitHub registry in Magic Containers
-with a read-only PAT.
+`.../jmodguard-api` and set visibility to public. If you keep them private, add
+a GitHub registry in Magic Containers with a read-only PAT.
 
 To build locally instead of using GHCR:
 
@@ -103,9 +105,11 @@ JMODGUARD_LOG_DIRECTORY=
 ```
 
 The bot image already requires remote DB credentials and binds a process-local
-health listener on container port `8080` (`GET /health`). In **Monitoring**,
-enable HTTP GET health checks on path `/health` port `8080` (startup +
-liveness are enough; the bot has no public endpoint).
+health listener on container port `8080` (`GET /health`). Bind failure is fatal
+so Magic Containers cannot see a running bot with no probe port. `/health`
+returns `ok` as soon as the process is listening; it does not wait on the
+database. In **Monitoring**, enable HTTP GET health checks on path `/health`
+port `8080` (startup + liveness are enough; the bot has no public endpoint).
 
 The bot is the schema authority. On the first start it creates the schema,
 seeds defaults, and publishes a durable bootstrap marker before connecting to

@@ -340,10 +340,14 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("starting shards (bot process; no public HTTP API)");
-    if let Some(bind) = cfg.health_bind() {
-        let health_db = app.db.clone();
+    let health_listener = if let Some(bind) = cfg.health_bind() {
+        Some(jmodguard::health::bind(&bind).await?)
+    } else {
+        None
+    };
+    if let Some(listener) = health_listener {
         tokio::spawn(async move {
-            if let Err(error) = jmodguard::health::serve(&bind, health_db).await {
+            if let Err(error) = jmodguard::health::serve_listener(listener).await {
                 tracing::error!("health listener exited: {error:#}");
             }
         });

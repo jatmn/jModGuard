@@ -2,48 +2,56 @@
 //!
 //! The bot binary does not enable the `web` feature, so Magic Containers
 //! health checks cannot use axum. This listener answers `GET /health` (and
-//! `GET /`) with 200 after the database is reachable, without cookies or
-//! routing. The API exposes the same path on its public bind via axum.
+//! `GET /`) with 200 once the process has bound the port, without cookies,
+//! routing, or a database round-trip. The API exposes the same path on its
+//! public bind via axum. `/health` is liveness, not database readiness: a
+//! pooled remote `SELECT 1` can wait tens of seconds and false-fail a
+//! healthy process under load.
 
 use anyhow::{Context as _, Result};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::db::Db;
-
-/// Binds `addr` and serves `/health` until the process exits.
-pub async fn serve(addr: &str, db: Db) -> Result<()> {
-    let listener = TcpListener::bind(addr)
+/// Binds `addr` and returns the listener. Call this during startup so a
+/// occupied health port fails the process before Discord connects.
+pub async fn bind(addr: &str) -> Result<TcpListener> {
+    TcpListener::bind(addr)
         .await
-        .with_context(|| format!("failed to bind health listener on {addr}"))?;
-    tracing::info!("health listener on http://{addr}/health");
+        .with_context(|| format!("failed to bind health listener on {addr}"))
+}
+
+/// Serves `/health` on an already-bound listener until the process exits.
+pub async fn serve_listener(listener: TcpListener) -> Result<()> {
+    tracing::info!(
+        "health listener on http://{}/health",
+        listener.local_addr()?
+    );
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let db = db.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = answer(stream, db).await {
-                        tracing::debug!("health connection ended: {error:#}");
-                    }
-                });
+                // Handle one probe at a time. Health is tiny; unbounded
+                // spawn would let a connection flood create tasks.
+                if let Err(error) = answer(stream).await {
+                    tracing::debug!("health connection ended: {error:#}");
+                }
             }
             Err(error) => tracing::warn!("health accept failed: {error}"),
         }
     }
 }
 
-async fn answer(mut stream: TcpStream, db: Db) -> Result<()> {
+/// Binds `addr` and serves `/health` until the process exits.
+pub async fn serve(addr: &str) -> Result<()> {
+    serve_listener(bind(addr).await?).await
+}
+
+async fn answer(mut stream: TcpStream) -> Result<()> {
     let mut buf = [0u8; 2048];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-    let ok = db.healthcheck().await.is_ok();
-    let (status, body) = if ok {
-        ("200 OK", "ok")
-    } else {
-        ("503 Service Unavailable", "database unavailable")
-    };
+    let body = "ok";
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -54,28 +62,17 @@ async fn answer(mut stream: TcpStream, db: Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::serve;
-    use crate::db::Db;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     #[tokio::test]
-    async fn health_listener_returns_ok_for_open_database() {
-        let tmp = std::env::temp_dir().join(format!(
-            "jmodguard_health_{}_{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = Db::open(&tmp, 2).expect("temp db");
+    async fn health_listener_returns_ok() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let bind = addr.to_string();
-        let server_db = db.clone();
-        let server = tokio::spawn(async move { serve(&bind, server_db).await });
+        let server = tokio::spawn(async move { serve(&bind).await });
         let mut last_err = None;
         let mut stream = None;
         for _ in 0..50 {
@@ -106,8 +103,5 @@ mod tests {
         assert!(text.contains("\r\n\r\nok"), "unexpected: {text}");
 
         server.abort();
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
     }
 }

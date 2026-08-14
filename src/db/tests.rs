@@ -479,14 +479,6 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
 }
 
 #[test]
-fn healthcheck_succeeds_on_open_database() {
-    let tmp = tmp_db_path("healthcheck");
-    let db = Db::open(&tmp, 2).unwrap();
-    tokio_test_block_on(db.healthcheck()).expect("healthcheck");
-    cleanup_db(&tmp);
-}
-
-#[test]
 fn delete_badword_rejects_other_guild_idor() {
     let tmp = tmp_db_path("badword_idor");
     let db = Db::open(&tmp, 2).unwrap();

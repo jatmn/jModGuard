@@ -428,16 +428,8 @@ async fn index() -> impl IntoResponse {
     )
 }
 
-async fn health(
-    axum::extract::State(app): axum::extract::State<Arc<AppState>>,
-) -> impl IntoResponse {
-    match app.db.healthcheck().await {
-        Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(error) => {
-            tracing::warn!("health check failed: {error:#}");
-            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
-        }
-    }
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 async fn app_js() -> impl IntoResponse {
     static_handler(
@@ -694,6 +686,23 @@ mod tests {
         let app = crate::state::AppState::new(Default::default(), db).unwrap();
         std::fs::remove_file(&tmp).ok();
         router(app)
+    }
+
+    #[tokio::test]
+    async fn health_is_unauthenticated_liveness() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     #[tokio::test]

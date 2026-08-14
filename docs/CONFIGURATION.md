@@ -29,8 +29,8 @@ Environment-only (not in `config.toml`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `JMODGUARD_REQUIRE_REMOTE_DB` | unset | If `1`/`true`, startup fails when no remote URL/token pair is configured. Container images set this so a missed Bunny secret cannot open a private SQLite file. |
-| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP health listener (`GET /health`). Container bot image sets `0.0.0.0:8080`. Empty = disabled. The API serves `/health` on `web.bind`. |
+| `JMODGUARD_REQUIRE_REMOTE_DB` | unset | If `1`/`true`, startup fails unless both a remote URL and token are configured. Container images set this so a missed Bunny secret cannot open a private SQLite file. |
+| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP liveness listener (`GET /health` returns `ok`). Container bot image sets `0.0.0.0:8080`; bind failure exits the process. Empty = disabled. The API serves the same path on `web.bind`. |
 
 ## Database (runtime config)
 
@@ -78,10 +78,10 @@ floor so it cannot immediately serve an older snapshot.
 The remote transport uses the standard libSQL protocol; the portable
 configuration contract is `db.url` / `db.token` or `JMODGUARD_DB_URL` /
 `JMODGUARD_DB_TOKEN`. Environment credentials are selected as an atomic pair:
-if either portable variable is present, both must be non-empty; otherwise the
-same rule applies to Bunny's injected pair. Partial or mixed-provider overrides
-fail startup instead of pairing a URL with an unrelated token. It is not
-hard-coded to a Bunny hostname.
+if either portable variable is non-empty, both must be non-empty; otherwise the
+same rule applies to Bunny's injected pair. Blank or whitespace-only values are
+treated as unset. Partial or mixed-provider overrides fail startup instead of
+pairing a URL with an unrelated token. It is not hard-coded to a Bunny hostname.
 
 Bunny Database is the first-class launch provider: its injected environment
 names and generic libSQL protocol path have automated tests, and its container

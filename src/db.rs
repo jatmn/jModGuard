@@ -354,9 +354,20 @@ impl Db {
                 // while a new bot bootstrap is in progress on the primary.
                 let _ = read_bootstrap_defaults_primary(&bootstrap)?;
             }
-            // Only publish readiness after all migrations, durable defaults,
-            // default rows, and the settings heal have completed. Otherwise an
-            // API process can serve an incomplete registry during first boot.
+
+            let pool_size = opts.pool_size.max(2) as usize;
+            let mut connections = Vec::with_capacity(pool_size);
+            for _ in 0..pool_size {
+                let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
+                    .context("failed to create pooled database connection")?;
+                configure_connection(&connection, remote)?;
+                connections.push(connection);
+            }
+
+            // Publish readiness only after the pool exists. A retry of
+            // `open_with_until_ready` (remote first-boot) would otherwise
+            // clear this marker after a later pool-connect failure, while an
+            // API that already passed the gate is serving.
             if opts.migrate {
                 write_meta_string_conn(
                     &bootstrap,
@@ -364,35 +375,26 @@ impl Db {
                     &MIGRATIONS.len().to_string(),
                 )?;
             }
-        }
 
-        let pool_size = opts.pool_size.max(2) as usize;
-        let mut connections = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
-                .context("failed to create pooled database connection")?;
-            configure_connection(&connection, remote)?;
-            connections.push(connection);
-        }
-
-        Ok(Self {
-            _database: Arc::clone(&database),
-            runtime: runtime.clone(),
-            connections: Arc::new(ConnectionPool {
-                idle: Mutex::new(connections),
-                database,
+            Ok(Self {
+                _database: Arc::clone(&database),
                 runtime: runtime.clone(),
-                remote,
-            }),
-            permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
-            permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
-            required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
-            settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(debug_assertions)]
-            test_config_snapshot: Arc::new(Mutex::new(None)),
-        })
+                connections: Arc::new(ConnectionPool {
+                    idle: Mutex::new(connections),
+                    database,
+                    runtime: runtime.clone(),
+                    remote,
+                }),
+                permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
+                required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
+                settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(debug_assertions)]
+                test_config_snapshot: Arc::new(Mutex::new(None)),
+            })
+        }
     }
 
     /// Fault injection for remote replica-lag regression coverage. The next
@@ -505,17 +507,6 @@ impl Db {
         })
         .await
         .context("db task panicked")?
-    }
-
-    /// Cheap liveness probe for `/health`. Uses one pooled connection.
-    pub async fn healthcheck(&self) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.query_row("SELECT 1", (), |row| Ok(row.get::<i64>(0)?))?;
-            Ok(())
-        })
-        .await
-        .context("database health check failed")?;
-        Ok(())
     }
 
     /// Runs a closure synchronously (tests only).
