@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
 use jmodguard::state::AppState;
-use jmodguard::{init_tracing, shutdown_signal, web};
+use jmodguard::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,13 +40,29 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Bind first so platform GET /health succeeds while the remote database
+    // is still waking or the bot is still migrating. The handler does not
+    // touch SQL; the full router takes over the same socket after open.
+    let web_bind = cfg.web.bind.clone();
+    let listener = tokio::net::TcpListener::bind(&web_bind)
+        .await
+        .with_context(|| format!("failed to bind API on {web_bind}"))?;
+    tracing::info!("API liveness on http://{web_bind}/health");
+
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.
     let opts = cfg.db_open_options(false);
     let (attempts, delay) = jmodguard::db::startup_open_retry(&opts);
-    let db = Db::open_with_until_ready(opts, attempts, delay)
-        .await
-        .with_context(|| {
+    let db = health::serve_while(&listener, async {
+        tokio::select! {
+            db = Db::open_with_until_ready(opts, attempts, delay) => db,
+            _ = shutdown_signal() => {
+                Err(anyhow::anyhow!("shutdown during database open"))
+            }
+        }
+    })
+    .await
+    .with_context(|| {
         format!(
             "failed to open database {} (API opens with migrate=false — start jmodguard-bot once first, or apply migrations)",
             if cfg.db.url.is_empty() {
@@ -88,10 +104,6 @@ async fn main() -> Result<()> {
     }
 
     let web_app = web::router(Arc::clone(&app));
-    let web_bind = app.cfg.web.bind.clone();
-    let listener = tokio::net::TcpListener::bind(&web_bind)
-        .await
-        .with_context(|| format!("failed to bind API on {web_bind}"))?;
     tracing::info!("API listening on http://{web_bind}");
     axum::serve(listener, web_app)
         .with_graceful_shutdown(shutdown_signal())

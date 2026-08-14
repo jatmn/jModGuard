@@ -333,6 +333,25 @@ pub(super) fn read_terminal_defaults_meta(
     }))
 }
 
+/// True when a migrate-open must hide `bootstrap_complete` from the API.
+///
+/// An already-bootstrapped reconnect must not clear the marker: a later
+/// retryable pool failure would otherwise block API start for the whole
+/// remote retry window. Transport errors propagate so the retry loop can
+/// run without deleting a valid marker.
+pub(super) fn migrate_open_needs_api_fence(conn: &impl SqlExecutor) -> Result<bool> {
+    match ensure_schema_current(conn) {
+        Ok(()) => {}
+        Err(error) if is_schema_not_ready(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    match ensure_bootstrap_complete(conn) {
+        Ok(()) => Ok(false),
+        Err(error) if is_schema_not_ready(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
     let expected = MIGRATIONS.len().to_string();
     if meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref() != Some(expected.as_str()) {

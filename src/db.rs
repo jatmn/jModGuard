@@ -300,7 +300,8 @@ impl Db {
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
-            runtime.block_on(
+            runtime.block_on_database(
+                "connect",
                 libsql::Builder::new_remote(opts.url.clone(), opts.token.clone()).build(),
             )?
         } else {
@@ -330,11 +331,13 @@ impl Db {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
             if opts.migrate {
-                // A previous successful boot may have left this marker behind.
-                // Clear it before any new migration/default work so an API
-                // restarting concurrently cannot mistake stale readiness for
-                // completion of this bootstrap.
-                clear_bootstrap_complete(&bootstrap)?;
+                // Hide readiness only when this open will actually rebuild
+                // schema/defaults. Clearing on every reconnect made a
+                // retryable pool failure look like an incomplete first boot
+                // and blocked the API for the whole remote retry window.
+                if migrate_open_needs_api_fence(&bootstrap)? {
+                    clear_bootstrap_complete(&bootstrap)?;
+                }
                 migrate_conn(&mut bootstrap)?;
                 // Bot is authority for terminal defaults: sync from config every
                 // migrate-open so both processes resolve empty global fields from

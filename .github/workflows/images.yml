@@ -59,7 +59,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       # GitHub creates GHCR packages as private. Magic Containers can pull
-      # public ghcr.io images without a registry PAT.
+      # public ghcr.io images without a registry PAT. The image is already
+      # pushed; a denied visibility API must not fail the workflow.
       - name: Make package public
         if: github.event_name != 'pull_request'
         env:
@@ -75,4 +76,4 @@ jobs:
             sleep 5
           done
           echo "Could not set ${pkg} public. Set visibility on the GitHub package page." >&2
-          exit 1
+          exit 0

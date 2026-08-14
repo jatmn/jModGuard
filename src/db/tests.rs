@@ -479,6 +479,70 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
 }
 
 #[test]
+fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
+    let tmp = tmp_db_path("migrate_fence");
+    let empty = Connection::open(&tmp).unwrap();
+    assert!(
+        migrate_open_needs_api_fence(&empty).unwrap(),
+        "an empty database must fence the API until the bot finishes bootstrap"
+    );
+    drop(empty);
+
+    let bot = Db::open_with(DbOpenOptions {
+        path: tmp.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    })
+    .expect("bot migrate-open");
+    bot.with_conn_sync(|conn| {
+        assert!(
+            !migrate_open_needs_api_fence(conn)?,
+            "a finished bootstrap must not hide readiness on reconnect"
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    Db::open_with(DbOpenOptions {
+        path: tmp.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    })
+    .expect("API must open while the bot reconnects a ready database");
+
+    bot.with_conn_sync(|conn| {
+        clear_bootstrap_complete(conn)?;
+        assert!(
+            migrate_open_needs_api_fence(conn)?,
+            "a missing marker must fence the API during a real bootstrap"
+        );
+        Ok(())
+    })
+    .unwrap();
+    let err = Db::open_with(DbOpenOptions {
+        path: tmp.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    })
+    .err()
+    .expect("API must wait while bootstrap is incomplete");
+    assert!(crate::db::is_schema_not_ready(&err), "unexpected: {err:#}");
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn delete_badword_rejects_other_guild_idor() {
     let tmp = tmp_db_path("badword_idor");
     let db = Db::open(&tmp, 2).unwrap();

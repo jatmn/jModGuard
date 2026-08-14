@@ -236,7 +236,8 @@ schema-open against a local libSQL server, not Bunny TLS.
 - Bunny Database is Public Preview. Internal snapshots are not an
   operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
 - One bot replica. One API replica (in-memory sessions).
-- SIGTERM stops the Discord gateway and the API listener cleanly.
+- SIGTERM stops the Discord gateway and the API listener cleanly, including
+  during remote database retry.
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
 - Keep bot image, API image, and Storage `frontend/` on the same git

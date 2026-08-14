@@ -154,12 +154,15 @@ impl Config {
         }
     }
 
-    /// Reject a public HTTP bind that still uses a localhost OAuth origin.
+    /// Reject a public HTTP bind that still uses a localhost or non-HTTPS
+    /// OAuth origin.
     ///
     /// Call this from `jmodguard-api` only. Local `127.0.0.1` binds keep the
     /// SETUP.md default `http://localhost:8080`. Container images bind
     /// `0.0.0.0:8080`, so they must set `JMODGUARD_WEB_BASE_URL` to the public
-    /// HTTPS hostname.
+    /// HTTPS origin browsers open (the CDN hostname on Bunny). Magic Container
+    /// hostnames are not a stable, detectable class — this check enforces
+    /// HTTPS + non-loopback, not a particular DNS suffix.
     pub fn validate_public_base_url(&self) -> Result<()> {
         if !bind_is_unspecified(&self.web.bind) {
             return Ok(());

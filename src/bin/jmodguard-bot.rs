@@ -165,18 +165,32 @@ async fn main() -> Result<()> {
 
     init_tracing(&cfg, "bot");
 
+    // Liveness must accept before remote DB retry. Platform probes hit this
+    // port while `open_with_until_ready` waits on a waking database.
+    if let Some(bind) = cfg.health_bind() {
+        let listener = jmodguard::health::bind(&bind).await?;
+        tokio::spawn(async move {
+            if let Err(error) = jmodguard::health::serve_listener(listener).await {
+                tracing::error!("health listener exited: {error:#}");
+            }
+        });
+    }
+
     let opts = cfg.db_open_options(true);
     let remote = cfg.is_remote_db();
     let db = if remote {
         let (attempts, delay) = db::startup_open_retry(&opts);
-        Db::open_with_until_ready(opts, attempts, delay)
-            .await
-            .with_context(|| {
+        tokio::select! {
+            db = Db::open_with_until_ready(opts, attempts, delay) => db.with_context(|| {
                 format!(
                     "failed to open remote database {} after waiting for a transient connect/bootstrap",
                     cfg.db.url
                 )
-            })?
+            })?,
+            _ = shutdown_signal() => {
+                anyhow::bail!("shutdown during remote database open");
+            }
+        }
     } else {
         Db::open_with(opts)
             .with_context(|| format!("failed to open database {}", cfg.db.path.display()))?
@@ -340,19 +354,6 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("starting shards (bot process; no public HTTP API)");
-    let health_listener = if let Some(bind) = cfg.health_bind() {
-        Some(jmodguard::health::bind(&bind).await?)
-    } else {
-        None
-    };
-    if let Some(listener) = health_listener {
-        tokio::spawn(async move {
-            if let Err(error) = jmodguard::health::serve_listener(listener).await {
-                tracing::error!("health listener exited: {error:#}");
-            }
-        });
-    }
-
     let shard_manager = client.shard_manager.clone();
     tokio::spawn(async move {
         shutdown_signal().await;

@@ -93,14 +93,16 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `JMODGUARD_CORS_ORIGINS` exist only for a split-origin experiment.
   `https` `web.base_url` is the public CDN hostname. `Config::validate_cors`
   runs in `jmodguard-api` only. A public bind (`0.0.0.0`) must also pass
-  `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost,
-  not a Magic Container hostname).
+  `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost).
+  Operators must set the CDN origin themselves; Magic Container hostnames
+  are not a stable class this check can reject.
 - Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
   credentials must fail startup, not open local SQLite. Unset it only for an
   intentional local-SQLite container run.
 - Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET /health`
-  are unauthenticated process liveness probes (`ok`, no database). Do not put
-  session middleware on `/health`. If the env var is set, bind failure is fatal.
+  are unauthenticated process liveness probes (`ok`, no database). Bind and
+  accept them **before** opening the database. Do not put session middleware
+  on `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /
