@@ -72,7 +72,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
 | [docs/AUTOMOD.md](docs/AUTOMOD.md) | the 7 rules, escalation, whitelists, dry-run, evidence |
 | [docs/TEMPLATES.md](docs/TEMPLATES.md) | event templates + variable reference |
-| [docs/WEBUI.md](docs/WEBUI.md) | WebUI tabs, global vs per-server config, REST API |
+| [docs/WEBUI.md](docs/WEBUI.md) | admin UI files, how to host them, tabs, REST API |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | config.toml reference, database layout, backups |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | version-specific findings (serenity 0.12.5 etc.) |
 

@@ -9,6 +9,52 @@ API; the API (and the bot) open the database.
 Start `jmodguard-bot` once first so the database is migrated, then start
 `jmodguard-api`. Both use the same local SQLite file or remote libSQL database.
 
+## Getting and hosting the files
+
+The website is three files in this repository, in the `frontend/` folder:
+
+| File | What it is |
+|---|---|
+| `frontend/index.html` | the page |
+| `frontend/app.js` | the app |
+| `frontend/style.css` | the look |
+
+Use the **same git tag or commit** as the bot and API you are running. Do
+not mix an old website with a new API.
+
+**Self-host (one machine, [SETUP.md](SETUP.md)).** You do not copy these
+files anywhere. A normal `jmodguard-api` build already includes them and
+serves them at `http://localhost:8080`.
+
+**Bunny (first-class cloud path, [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md)).**
+
+1. Create a Bunny **Storage Zone**.
+2. Put the three files in the **root** of that zone so they are `/index.html`
+   (or `/`), `/app.js`, and `/style.css`.
+3. Create a **Pull Zone** whose origin is that Storage Zone. That hostname
+   (or a custom domain on it) is the public admin site.
+4. Point `/api`, `/login`, `/logout`, and `/oauth/callback` on that Pull
+   Zone at the private API container (see DEPLOY-BUNNY.md). Leave
+   `window.JMODGUARD_API_BASE` unset.
+
+You can upload by hand in the Bunny dashboard (**Browse Files**), or
+repeat it with GitHub Actions. The script
+[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
+and the example workflow
+[docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
+are for a **private** ops repo so Bunny Storage passwords are not stored
+in this public project. A private repo is not required to try it once;
+it is the intended way to publish updates.
+
+**Another host or CDN.** Copy the same three files from that git tag to
+the site root. If the API is on a **different** hostname than the pages,
+set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads,
+and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Bunny’s
+designed shape does not need that split: the Pull Zone is one hostname
+for both the files and `/api`.
+
+Never put a database URL or token in these files.
+
 ## Access
 
 `http://localhost:8080` → **Login with Discord** → pick a server. Only servers

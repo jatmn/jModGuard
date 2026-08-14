@@ -61,14 +61,24 @@ access token.
 
 ## 2. Publish the admin UI to Storage + CDN
 
+The files are `frontend/index.html`, `frontend/app.js`, and
+`frontend/style.css` in this repository. How to get them and where they
+go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
+
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
 The Pull Zone hostname (or a custom domain on it) is what operators open.
 
-`frontend/` in this public repo is the source of those files. **Publishing
-them is done by GitHub Actions in your private ops repo**, using
+**First time (manual).** In the Storage Zone, **Browse Files**, and upload
+those three files to the **root** so they are `/` (or `/index.html`),
+`/app.js`, and `/style.css`. Use the same git tag as the container images.
+
+**Later updates.** Publishing is meant to be GitHub Actions in your
+**private** ops repo (Bunny Storage passwords do not belong in this public
+project), using
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
 and [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh).
-Copy the workflow into the private repo. Store these secrets there:
+A private repo is not required for a one-off upload. Copy the workflow
+into the private repo when you want repeats. Store these secrets there:
 
 | Secret | What it is |
 |---|---|
