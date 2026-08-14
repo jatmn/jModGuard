@@ -283,10 +283,10 @@ impl AppState {
             Some(rem) => {
                 let pending: Vec<u64> =
                     cached.iter().copied().filter(|g| rem.contains(g)).collect();
-                if pending.is_empty() {
-                    // A guild can disappear from Serenity's cache while it is
-                    // unavailable or reconnecting. Keep its failed sync owned
-                    // by this durable version until it reappears and succeeds.
+                if pending.len() != rem.len() {
+                    // Do not partially consume the failure set: otherwise a
+                    // successful present guild could acknowledge the version
+                    // while another failed guild remains absent from cache.
                     return SlashResyncPlan::Defer;
                 }
                 pending
@@ -934,6 +934,13 @@ mod tests {
         assert_eq!(
             app.plan_slash_resync(remote, &[10, 30]),
             SlashResyncPlan::Defer
+        );
+        assert_eq!(
+            app.plan_slash_resync(remote, &[10, 20, 30]),
+            SlashResyncPlan::Sync {
+                guilds: vec![20],
+                invalidate: false,
+            }
         );
         match app.plan_slash_resync(remote, &[10, 20, 30]) {
             SlashResyncPlan::Sync { guilds, invalidate } => {
