@@ -354,7 +354,8 @@ pub async fn sync_slash_commands_versioned_http(
     guild_id: GuildId,
     target_version: u64,
 ) -> bool {
-    let (loaded_version, commands) =
+    let expected_revision = app.slash_registry_revision();
+    let (mut loaded_version, mut loaded_revision, mut commands) =
         match db::load_slash_commands_with_version(&app.db, guild_id.get() as i64).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -364,9 +365,24 @@ pub async fn sync_slash_commands_versioned_http(
                 return false;
             }
         };
-    if loaded_version != target_version {
+    if loaded_version != target_version || loaded_revision != expected_revision {
+        match db::load_slash_commands_with_version_primary(&app.db, guild_id.get() as i64).await {
+            Ok((version, revision, primary_commands)) => {
+                loaded_version = version;
+                loaded_revision = revision;
+                commands = primary_commands;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "slash sync: primary registry load failed for {guild_id}: {error:#}"
+                );
+                return false;
+            }
+        }
+    }
+    if loaded_version != target_version || loaded_revision != expected_revision {
         tracing::warn!(
-            "slash sync: replica returned registry version {loaded_version} for {guild_id}, expected {target_version}; will retry"
+            "slash sync: registry snapshot {loaded_version}/{loaded_revision} for {guild_id} did not match expected {target_version}/{expected_revision}; will retry"
         );
         return false;
     }

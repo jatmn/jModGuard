@@ -154,7 +154,7 @@ pub struct VersionState {
     pub slash_revision: String,
 }
 
-fn get_version_state_conn(conn: &impl SqlExecutor) -> Result<VersionState> {
+pub(super) fn get_version_state_conn(conn: &impl SqlExecutor) -> Result<VersionState> {
     let config = get_config_version_conn(conn)?;
     let slash = get_slash_registry_version_conn(conn)?;
     let config_revision =

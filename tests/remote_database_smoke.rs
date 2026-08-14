@@ -92,7 +92,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     let stale = load_config_parts_with_version(&bot, guild_id as i64)
         .await
         .expect("capture pre-write config snapshot");
-    let cache = ConfigCache::new(stale.0);
+    let cache = ConfigCache::new(stale.0, stale.1.clone());
     patch_settings(
         &bot,
         guild_id as i64,

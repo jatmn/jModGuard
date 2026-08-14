@@ -843,7 +843,7 @@ fn slash_registry_version_bumps_only_on_command_writes() {
         tokio_test_block_on(crate::db::get_config_version(&db)).unwrap() >= 2,
         "command upsert still bumps config_version"
     );
-    let (loaded_version, loaded_commands) =
+    let (loaded_version, _loaded_revision, loaded_commands) =
         tokio_test_block_on(crate::db::load_slash_commands_with_version(&db, 1)).unwrap();
     assert_eq!(loaded_version, s0 + 1);
     assert_eq!(

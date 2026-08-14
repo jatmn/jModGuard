@@ -98,7 +98,7 @@ impl AppState {
         Ok(Arc::new(Self {
             db,
             cfg: Arc::new(cfg),
-            configs: ConfigCache::new(primed.config),
+            configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
             cooldowns: DashMap::new(),
             oauth,
@@ -249,11 +249,12 @@ impl AppState {
         if config_changed {
             self.last_config_version
                 .store(primary.config, Ordering::SeqCst);
-            if config_revision_changed && primary.config <= previous_config {
-                // A rollback/reused counter cannot distinguish pre- and
-                // post-failover replica snapshots numerically. Every guild
-                // loaded in this cache generation must use the primary.
-                self.configs.require_primary_revision(primary.config);
+            if config_revision_changed {
+                // Snapshot acceptance carries the revision identity, so a
+                // higher pre-failover replica counter cannot bypass rollback
+                // recovery and later invalidations cannot forget lineage.
+                self.configs
+                    .require_primary_revision(primary.config, primary.config_revision.clone());
             } else if primary.config >= previous_config {
                 self.configs.require_version(primary.config);
             } else {
@@ -314,6 +315,10 @@ impl AppState {
 
     pub fn acknowledged_slash_registry_version(&self) -> u64 {
         self.last_slash_registry_version.load(Ordering::SeqCst)
+    }
+
+    pub fn slash_registry_revision(&self) -> String {
+        self.last_slash_registry_revision.lock().clone()
     }
 
     /// Decide which guilds to `set_commands` for pending registry `remote`.
@@ -677,24 +682,24 @@ pub struct ConfigCache {
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
-    primary_generation: Arc<AtomicU64>,
+    accepted_revision: Arc<parking_lot::Mutex<String>>,
 }
 
 impl Default for ConfigCache {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(0, "legacy:0".into())
     }
 }
 
 impl ConfigCache {
-    pub fn new(durable_floor: u64) -> Self {
+    pub fn new(durable_floor: u64, revision: String) -> Self {
         Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
-            primary_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            accepted_revision: Arc::new(parking_lot::Mutex::new(revision)),
         }
     }
 
@@ -709,11 +714,11 @@ impl ConfigCache {
         self.invalidate();
     }
 
-    fn require_primary_revision(&self, version: u64) {
+    fn require_primary_revision(&self, version: u64, revision: String) {
         let _publication = self.publication_lock.lock();
         self.durable_floor.store(version, Ordering::SeqCst);
-        let generation = self.version.fetch_add(1, Ordering::Relaxed) + 1;
-        self.primary_generation.store(generation, Ordering::SeqCst);
+        *self.accepted_revision.lock() = revision;
+        self.version.fetch_add(1, Ordering::Relaxed);
         self.map.clear();
     }
 
@@ -745,13 +750,12 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
-        let mut primary =
-            self.primary_generation.load(Ordering::SeqCst) == self.version.load(Ordering::Relaxed);
+        let mut primary = false;
         let mut last_observed = 0;
         let mut last_required = required;
         for _ in 0..3 {
             let version = self.version.load(Ordering::Relaxed);
-            let (durable_version, parts) = if primary {
+            let (durable_version, revision, parts) = if primary {
                 db::load_config_parts_with_version_primary(db, guild_id as i64).await?
             } else {
                 db::load_config_parts_with_version(db, guild_id as i64).await?
@@ -762,8 +766,13 @@ impl ConfigCache {
                 .max(db.required_config_version());
             last_observed = durable_version;
             last_required = required_after;
+            let accepted_revision = self.accepted_revision.lock().clone();
 
-            if durable_version < required_after {
+            if primary && revision != accepted_revision {
+                self.require_primary_revision(durable_version, revision);
+                continue;
+            }
+            if durable_version < required_after || revision != accepted_revision {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
@@ -784,9 +793,12 @@ impl ConfigCache {
                     .durable_floor
                     .load(Ordering::SeqCst)
                     .max(db.required_config_version());
-                if self.version.load(Ordering::Relaxed) != version || durable_version < required_now
+                let accepted_revision = self.accepted_revision.lock().clone();
+                if self.version.load(Ordering::Relaxed) != version
+                    || durable_version < required_now
+                    || revision != accepted_revision
                 {
-                    primary |= durable_version < required_now;
+                    primary = true;
                     continue;
                 }
                 self.map.insert(guild_id as i64, Arc::clone(&cfg));
@@ -976,6 +988,49 @@ mod tests {
                 .prefix,
             "aba-visible"
         );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn slash_revision_forces_sync_when_counter_is_reused() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_slash_revision_aba_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = AppState::new(Config::default(), db).unwrap();
+        let versions = db::get_primary_versions_sync(&app.db).unwrap();
+        let before_write = app.db.config_write_generation();
+        let replacement = "replacement-slash-revision".to_string();
+        let mut restored = versions.clone();
+        restored.slash_revision = replacement.clone();
+
+        assert_eq!(
+            app.reconcile_primary_versions(
+                restored,
+                versions.config,
+                before_write,
+            ),
+            (false, true)
+        );
+        assert_eq!(app.slash_registry_revision(), replacement);
+        assert!(app.force_slash_registry_retry.load(Ordering::SeqCst));
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));

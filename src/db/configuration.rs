@@ -794,7 +794,7 @@ fn rows_map_plain<T: PlainValue + Send + 'static>(
 }
 
 pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
-    Ok(load_config_parts_with_version(db, guild_id).await?.1)
+    Ok(load_config_parts_with_version(db, guild_id).await?.2)
 }
 
 async fn load_web_config_snapshot_primary(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
@@ -866,14 +866,14 @@ async fn load_config_parts_with_version_routed(
     db: &Db,
     guild_id: i64,
     primary: bool,
-) -> Result<(u64, ConfigParts)> {
+) -> Result<(u64, String, ConfigParts)> {
     db.with_conn(move |conn| {
         let tx = if primary {
             conn.transaction_primary_read()?
         } else {
             conn.transaction()?
         };
-        let version = get_config_version_conn(&tx)?;
+        let versions = get_version_state_conn(&tx)?;
         let conn = &tx;
         let defaults = terminal_defaults_conn(conn)?;
         // settings (effective: field-level guild → global → config terminal defaults)
@@ -965,12 +965,15 @@ async fn load_config_parts_with_version_routed(
             badwords,
         };
         tx.finish_read()?;
-        Ok((version, parts))
+        Ok((versions.config, versions.config_revision, parts))
     })
     .await
 }
 
-pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u64, ConfigParts)> {
+pub async fn load_config_parts_with_version(
+    db: &Db,
+    guild_id: i64,
+) -> Result<(u64, String, ConfigParts)> {
     #[cfg(debug_assertions)]
     if let Some(snapshot) = db.take_test_config_snapshot() {
         return Ok(snapshot);
@@ -984,7 +987,7 @@ pub async fn load_config_parts_with_version(db: &Db, guild_id: i64) -> Result<(u
 pub async fn load_config_parts_with_version_primary(
     db: &Db,
     guild_id: i64,
-) -> Result<(u64, ConfigParts)> {
+) -> Result<(u64, String, ConfigParts)> {
     load_config_parts_with_version_routed(db, guild_id, true).await
 }
 
@@ -994,17 +997,35 @@ pub async fn load_config_parts_with_version_primary(
 pub async fn load_slash_commands_with_version(
     db: &Db,
     guild_id: i64,
-) -> Result<(u64, std::collections::HashMap<String, CommandDef>)> {
+) -> Result<(u64, String, std::collections::HashMap<String, CommandDef>)> {
     db.with_conn(move |conn| {
         let tx = conn.transaction()?;
-        let version = get_slash_registry_version_conn(&tx)?;
+        let versions = get_version_state_conn(&tx)?;
         let guild: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", guild_id)?;
         let mut commands: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
         commands.extend(guild);
         tx.finish_read()?;
-        Ok((version, commands))
+        Ok((versions.slash, versions.slash_revision, commands))
+    })
+    .await
+}
+
+pub async fn load_slash_commands_with_version_primary(
+    db: &Db,
+    guild_id: i64,
+) -> Result<(u64, String, std::collections::HashMap<String, CommandDef>)> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let versions = get_version_state_conn(&tx)?;
+        let guild: std::collections::HashMap<String, CommandDef> =
+            rows_map_json(&tx, "commands", "name", "data", guild_id)?;
+        let mut commands: std::collections::HashMap<String, CommandDef> =
+            rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
+        commands.extend(guild);
+        tx.finish_read()?;
+        Ok((versions.slash, versions.slash_revision, commands))
     })
     .await
 }

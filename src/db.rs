@@ -120,7 +120,7 @@ pub struct Db {
     config_floor_lock: Arc<parking_lot::Mutex<()>>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(debug_assertions)]
-    test_config_snapshot: Arc<Mutex<Option<(u64, ConfigParts)>>>,
+    test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
 
 struct ConnectionPool {
@@ -340,7 +340,7 @@ impl Db {
     /// ordinary config read returns this previously captured snapshot; a
     /// primary-routed fallback must still satisfy the process's durable floor.
     #[cfg(debug_assertions)]
-    pub fn test_inject_next_config_snapshot(&self, snapshot: (u64, ConfigParts)) {
+    pub fn test_inject_next_config_snapshot(&self, snapshot: (u64, String, ConfigParts)) {
         *self
             .test_config_snapshot
             .lock()
@@ -348,7 +348,7 @@ impl Db {
     }
 
     #[cfg(debug_assertions)]
-    pub(super) fn take_test_config_snapshot(&self) -> Option<(u64, ConfigParts)> {
+    pub(super) fn take_test_config_snapshot(&self) -> Option<(u64, String, ConfigParts)> {
         self.test_config_snapshot
             .lock()
             .expect("test config snapshot lock poisoned")
