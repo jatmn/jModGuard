@@ -255,7 +255,7 @@ impl Db {
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
-            if opts.migrate {
+            let defaults = if opts.migrate {
                 // A previous successful boot may have left this marker behind.
                 // Clear it before any new migration/default work so an API
                 // restarting concurrently cannot mistake stale readiness for
@@ -272,20 +272,13 @@ impl Db {
                     opts.retention_days,
                     &opts_defaults,
                 )?;
+                opts_defaults.clone()
             } else {
-                ensure_schema_current(&bootstrap)?;
-                ensure_bootstrap_complete(&bootstrap)?;
-            }
-            // API must never seed terminal defaults — that poisoned meta when API
-            // opened before the bot with a different config.toml.
-            let defaults =
-                read_terminal_defaults_meta_with_retry(&bootstrap, remote)?.ok_or_else(|| {
-                    SchemaNotReady(
-                        "database is missing meta.settings_terminal_defaults. \
-                     Start jmodguard-bot once first, then start jmodguard-api."
-                            .into(),
-                    )
-                })?;
+                // One primary-routed snapshot is the API readiness barrier.
+                // Replica reads can otherwise see an old completed marker
+                // while a new bot bootstrap is in progress on the primary.
+                read_bootstrap_defaults_primary(&bootstrap)?
+            };
             // Idempotent when guild_settings changed; skipped via checksum when not.
             heal_default_guild_settings_conn(&mut bootstrap, &defaults)?;
             // Only publish readiness after all migrations, durable defaults,
@@ -513,7 +506,7 @@ fn migrate_conn(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_schema_current(conn: &Connection) -> Result<()> {
+fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let required = MIGRATIONS.len() as i64;
     if version < required {
@@ -538,6 +531,20 @@ fn ensure_schema_current(conn: &Connection) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<GuildSettings> {
+    let tx = conn.transaction_primary_read()?;
+    ensure_schema_current(&tx)?;
+    ensure_bootstrap_complete(&tx)?;
+    let defaults = read_terminal_defaults_meta(&tx)?.ok_or_else(|| {
+        SchemaNotReady(
+            "database is missing meta.settings_terminal_defaults. Start jmodguard-bot once first, then start jmodguard-api."
+                .into(),
+        )
+    })?;
+    tx.finish_read()?;
+    Ok(defaults)
 }
 
 /// Bumps durable `config_version` on an open connection (config writers only).
@@ -702,22 +709,6 @@ fn read_terminal_defaults_meta(conn: &impl SqlExecutor) -> Result<Option<GuildSe
             .map(|r| r as u32)
             .unwrap_or(GuildSettings::default().retention_days),
     }))
-}
-
-fn read_terminal_defaults_meta_with_retry(
-    conn: &impl SqlExecutor,
-    remote: bool,
-) -> Result<Option<GuildSettings>> {
-    let attempts = if remote { 10 } else { 1 };
-    for attempt in 0..attempts {
-        if let Some(defaults) = read_terminal_defaults_meta(conn)? {
-            return Ok(Some(defaults));
-        }
-        if attempt + 1 < attempts {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-    Ok(None)
 }
 
 fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
@@ -1568,8 +1559,8 @@ pub(crate) async fn upsert_settings(
 ) -> Result<()> {
     let override_ = GuildSettingsOverride::from_complete(settings);
     db.with_conn(move |conn| {
-        let defaults = terminal_defaults_conn(conn)?;
         let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
         let ov = normalize_settings_override_against_parent(&override_, &parent);
         write_settings_override_conn(&tx, guild_id, &ov)?;
@@ -1622,8 +1613,8 @@ pub async fn patch_settings(
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
-        let defaults = terminal_defaults_conn(conn)?;
         let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
         let mut ov = read_settings_override_conn(&tx, guild_id)?.unwrap_or_default();
 
@@ -2088,11 +2079,10 @@ pub async fn copy_guild_config(
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
-        let defaults = terminal_defaults_conn(conn)?;
-        // Always re-validate inside the write path (closes preflight TOCTOU).
-        preflight_copy_guild_config_conn(conn, src, dst, &sections)?;
-
         let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
+        // Always re-validate in the same primary snapshot as the write.
+        preflight_copy_guild_config_conn(&tx, src, dst, &sections)?;
         let mut result = CopyResult::default();
         let wants = |name: &str| section_wanted(&sections, name);
         let copied_settings = wants("settings");
@@ -2441,9 +2431,12 @@ pub async fn mark_edited(db: &Db, message_id: i64, content: &str) -> Result<()> 
 
 pub async fn purge_old_messages(db: &Db) -> Result<usize> {
     db.with_conn(move |conn| {
-        let defaults = terminal_defaults_conn(conn)?;
+        // Retention is destructive: resolve policy and delete from one
+        // primary snapshot so replica lag cannot apply a superseded policy.
+        let tx = conn.transaction_immediate()?;
+        let defaults = terminal_defaults_conn(&tx)?;
         let guild_ids: Vec<i64> = {
-            let mut stmt = conn.prepare("SELECT DISTINCT guild_id FROM messages")?;
+            let mut stmt = tx.prepare("SELECT DISTINCT guild_id FROM messages")?;
             let rows = stmt.query_map((), |r| Ok(r.get::<i64>(0)?))?;
             let mut v = Vec::new();
             for row in rows {
@@ -2454,7 +2447,7 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
 
         let mut total = 0usize;
         for guild_id in guild_ids {
-            let days = retention_days_for_guild(conn, guild_id, &defaults)?;
+            let days = retention_days_for_guild(&tx, guild_id, &defaults)?;
             // 0 = keep forever (UI allows min 0).
             if days == 0 {
                 continue;
@@ -2467,12 +2460,13 @@ pub async fn purge_old_messages(db: &Db) -> Result<usize> {
                 continue;
             };
             let cutoff = (Utc::now() - duration).to_rfc3339();
-            let n = conn.execute(
+            let n = tx.execute(
                 "DELETE FROM messages WHERE guild_id = ?1 AND created_at < ?2",
                 params![guild_id, cutoff],
             )?;
             total += n;
         }
+        tx.commit()?;
         Ok(total)
     })
     .await

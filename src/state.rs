@@ -154,7 +154,7 @@ impl AppState {
             self.configs.require_version(remote);
             return Ok(true);
         }
-        if remote < prev {
+        if remote < prev || remote < self.db.required_config_version() {
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
             return Ok(self
                 .reconcile_primary_versions(primary_config, primary_slash)
@@ -172,9 +172,7 @@ impl AppState {
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
         let remote = db::get_slash_registry_version(&self.db).await?;
         let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        if self.force_slash_registry_retry.load(Ordering::SeqCst) || remote > prev {
-            Ok(Some(remote.max(prev)))
-        } else if remote < prev {
+        if remote < prev {
             let (primary_config, primary_slash) = db::get_primary_versions(&self.db).await?;
             let (_, slash_changed) = self.reconcile_primary_versions(primary_config, primary_slash);
             let current = self.last_slash_registry_version.load(Ordering::SeqCst);
@@ -182,6 +180,8 @@ impl AppState {
                 (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
                     .then_some(current),
             )
+        } else if self.force_slash_registry_retry.load(Ordering::SeqCst) || remote > prev {
+            Ok(Some(remote.max(prev)))
         } else {
             Ok(None)
         }
@@ -189,22 +189,25 @@ impl AppState {
 
     fn reconcile_primary_versions(&self, config: u64, slash: u64) -> (bool, bool) {
         let previous_config = self.last_config_version.load(Ordering::SeqCst);
+        let expected_floor = previous_config.max(self.db.required_config_version());
+        if config < expected_floor {
+            tracing::warn!(
+                previous_config,
+                required_config = expected_floor,
+                primary_config = config,
+                "primary database confirmed config version below the local floor; rebaselining"
+            );
+            self.db
+                .rebaseline_required_config_version(expected_floor, config);
+            self.configs.rebaseline_version(expected_floor, config);
+        }
         let config_changed = config != previous_config
             && self
                 .last_config_version
                 .compare_exchange(previous_config, config, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
         if config_changed {
-            if config < previous_config {
-                tracing::warn!(
-                    previous_config,
-                    primary_config = config,
-                    "primary database confirmed config version rollback; rebaselining after provider failover"
-                );
-                self.db
-                    .rebaseline_required_config_version(previous_config, config);
-                self.configs.rebaseline_version(previous_config, config);
-            } else {
+            if config > previous_config {
                 self.configs.require_version(config);
             }
         }
@@ -301,7 +304,10 @@ impl AppState {
     pub fn finish_slash_resync(&self, remote: u64, failed: HashSet<u64>) -> bool {
         let mut guard = self.slash_sync_progress.lock();
         let Some(progress) = guard.as_mut() else {
-            return failed.is_empty();
+            // A concurrent guild-create/startup failure clears progress to
+            // request a fresh attempt. Never let an older in-flight poll
+            // acknowledge and erase that newer retry request.
+            return false;
         };
         if progress.target != remote {
             return false;
@@ -903,6 +909,15 @@ mod tests {
                 assert!(!invalidate);
             }
             other => panic!("expected Sync, got {other:?}"),
+        }
+
+        // A concurrent guild-create failure requests a fresh pass while this
+        // one is in flight. The older successful pass must not erase it.
+        app.retry_slash_registry_version();
+        assert!(!app.finish_slash_resync(remote, HashSet::new()));
+        match app.plan_slash_resync(remote, &[10, 20, 30, 40]) {
+            SlashResyncPlan::Sync { guilds, .. } => assert_eq!(guilds, vec![10, 20, 30, 40]),
+            other => panic!("expected fresh retry plan, got {other:?}"),
         }
 
         assert!(!app.finish_slash_resync(remote, [20u64].into_iter().collect()));

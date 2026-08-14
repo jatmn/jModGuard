@@ -524,31 +524,40 @@ impl Transaction {
 
     fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<bool> {
         let connection = self.database.connect()?;
-        let transaction = self.runtime.block_on_database(
+        let mut transaction = Some(self.runtime.block_on_database(
             "begin commit reconciliation",
             connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate),
-        )?;
-        let found = self
+        )?);
+        let query = self
             .runtime
             .block_on_database("query commit receipt", async {
                 let mut rows = transaction
+                    .as_ref()
+                    .expect("transaction active")
                     .query(
                         "SELECT 1 FROM mutation_receipts WHERE receipt_id = ?1",
                         libsql::params![receipt],
                     )
                     .await?;
                 Ok::<_, libsql::Error>(rows.next().await?.is_some())
-            })?;
+            });
         // The primary snapshot itself establishes the original outcome. Do
         // not make receipt consumption another mutation whose COMMIT could in
         // turn be ambiguous; normal writes prune old receipts after 24 hours.
-        let _ = self.runtime.block_on_database(
+        let cleanup = self.runtime.block_on_database(
             "finish commit reconciliation",
-            transaction.execute_batch("ROLLBACK"),
+            transaction
+                .as_ref()
+                .expect("transaction active")
+                .execute_batch("ROLLBACK"),
         );
-        drop_transaction_without_runtime(transaction);
+        drop_transaction_without_runtime(transaction.take().expect("transaction active"));
         drop(connection);
-        Ok(found)
+        match (query, cleanup) {
+            (Ok(found), Ok(_)) => Ok(found),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
