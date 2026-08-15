@@ -165,7 +165,9 @@ The API still listens on container port `8080` so Bunny can origin-pull
 it and so platform health checks can hit `GET`/`HEAD /health`. Until
 axum takes over (database open, AppState primary-version prime, router
 build), only `/health` returns `200`; `/`, `/api`, `/login`, and
-`/oauth` return `503`. Enable sticky sessions on that origin:
+`/oauth` return `503` with JSON `{"error":"not ready"}` and `Retry-After`.
+The admin page retries `/api/me` through that window instead of showing a
+hard load error. Enable sticky sessions on that origin:
 sessions live in that one process.
 
 ```dotenv
@@ -240,7 +242,7 @@ schema-open against a local libSQL server, not Bunny TLS.
   operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
 - One bot replica. One API replica (in-memory sessions).
 - SIGTERM stops the Discord gateway and the API listener cleanly, including
-  during remote database retry.
+  during remote database retry (startup then exits 0 instead of failing).
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
 - Keep bot image, API image, and Storage `frontend/` on the same git

@@ -38,7 +38,8 @@ All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0005_mutation_receipts_nickname_jobs.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
-bootstrap or for a transient connect/lock to clear, then exits).
+bootstrap or for a transient connect/lock to clear, then serves HTTP; it
+exits if that wait expires).
 
 | Table | Holds |
 |---|---|

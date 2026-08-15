@@ -24,6 +24,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 const MAX_HEALTH_CONNECTIONS: usize = 16;
+const LIVENESS_BODY: &str = "ok";
+/// Same JSON error shape as axum `ApiError`, so the CDN SPA can retry warmup
+/// instead of treating a plain-text 503 as a fatal load failure.
+const NOT_READY_BODY: &str = r#"{"error":"not ready"}"#;
 
 /// Binds `addr` and returns the listener. Call this during startup so a
 /// occupied health port fails the process before Discord connects.
@@ -100,20 +104,28 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
         .and_then(Result::ok)
         .unwrap_or(0);
     let probe = parse_probe(&buf[..n]);
-    let (status, body) = if probe.liveness {
-        ("200 OK", "ok")
-    } else {
-        ("503 Service Unavailable", "not ready")
-    };
-    // HEAD must advertise the GET body length and omit the body.
-    let body_out = if probe.head { "" } else { body };
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body_out}",
-        body.len()
-    );
+    let response = probe_response(probe);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+fn probe_response(probe: Probe) -> String {
+    let (status, content_type, extra, body) = if probe.liveness {
+        ("200 OK", "text/plain; charset=utf-8", "", LIVENESS_BODY)
+    } else {
+        (
+            "503 Service Unavailable",
+            "application/json",
+            "retry-after: 1\r\n",
+            NOT_READY_BODY,
+        )
+    };
+    let body_out = if probe.head { "" } else { body };
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n{extra}content-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body_out}",
+        body.len()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +170,7 @@ fn is_liveness_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_probe, request_target_path, serve, Probe};
+    use super::{Probe, parse_probe, request_target_path, serve};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -324,7 +336,14 @@ mod tests {
                 text.starts_with("HTTP/1.1 503 Service Unavailable"),
                 "unexpected: {text}"
             );
-            assert!(text.contains("\r\n\r\nnot ready"), "unexpected: {text}");
+            assert!(
+                text.contains("retry-after: 1"),
+                "warmup must advertise Retry-After: {text}"
+            );
+            assert!(
+                text.contains(r#"{"error":"not ready"}"#),
+                "warmup must use the API JSON error shape: {text}"
+            );
         };
         super::serve_while(&listener, work).await;
     }

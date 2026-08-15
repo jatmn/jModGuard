@@ -191,7 +191,9 @@ async fn main() -> Result<()> {
             }
         })?,
         _ = shutdown_signal() => {
-            anyhow::bail!("shutdown during database open");
+            tracing::info!("shutdown during database open");
+            tracing::info!("bot process stopped");
+            return Ok(());
         }
     };
     tracing::info!(

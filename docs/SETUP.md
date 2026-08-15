@@ -135,7 +135,8 @@ First boot (bot):
 The API process serves the WebUI on `127.0.0.1:8080`. It **requires** Discord
 OAuth client id/secret (it exits immediately if they are empty). If the bot is
 still migrating, the API waits about 30 seconds locally (about six minutes
-against a remote database), then exits.
+against a remote database), then serves HTTP. If that wait expires, the API
+exits.
 
 ### Windows (run as a service)
 

@@ -104,14 +104,20 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
-                Ok(web_app)
+                Ok::<_, anyhow::Error>(Some(web_app))
             } => result,
             _ = shutdown_signal() => {
-                Err(anyhow::anyhow!("shutdown during API startup"))
+                tracing::info!("shutdown during API startup");
+                Ok(None)
             }
         }
     })
     .await?;
+
+    let Some(web_app) = web_app else {
+        tracing::info!("API process stopped");
+        return Ok(());
+    };
 
     tracing::info!("API listening on http://{web_bind}");
     axum::serve(listener, web_app)

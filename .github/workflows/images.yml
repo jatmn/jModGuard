@@ -84,5 +84,5 @@ jobs:
             fi
             sleep 5
           done
-          echo "Could not set ${pkg} public via ${api_path}. Set visibility on the GitHub package page." >&2
+          echo "::warning::Could not set ${pkg} public via ${api_path}. Set visibility on the GitHub package page."
           exit 0

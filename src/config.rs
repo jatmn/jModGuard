@@ -574,7 +574,8 @@ mod tests {
         cfg.db.url = "libsql://example.bunnydb.test".into();
         let err = cfg.apply_env().unwrap_err();
         assert!(
-            err.to_string().contains("complete remote database URL/token pair"),
+            err.to_string()
+                .contains("complete remote database URL/token pair"),
             "unexpected: {err:#}"
         );
     }

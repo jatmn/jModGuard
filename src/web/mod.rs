@@ -786,9 +786,7 @@ mod tests {
         // Same composition as jmodguard-api: raw /health on the public bind
         // until open finishes, then axum takes that socket. Application
         // routes must flip from startup 503 to the real router.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -798,7 +796,8 @@ mod tests {
                     Ok(mut stream) => {
                         stream
                             .write_all(
-                                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(),
+                                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                                    .as_bytes(),
                             )
                             .await
                             .unwrap();

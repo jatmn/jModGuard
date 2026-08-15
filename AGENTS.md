@@ -175,6 +175,7 @@ src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/moderation.rs    members/messages/retention/audit/warns/bans
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
+src/discord.rs          Discord REST helpers (nickname retries)
 src/health.rs          process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)

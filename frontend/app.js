@@ -46,6 +46,42 @@ function authUrl(path) {
   return `${base}${path}?return_to=${encodeURIComponent(window.location.origin)}`;
 }
 
+function apiError(message, status, retryAfterMs) {
+  const err = new Error(message);
+  err.status = status;
+  err.retryAfterMs = retryAfterMs;
+  return err;
+}
+
+function parseRetryAfterMs(header) {
+  if (!header) return 0;
+  const seconds = Number(header);
+  if (!Number.isFinite(seconds) || seconds < 0) return 0;
+  return Math.min(seconds, 30) * 1000;
+}
+
+function isUnauthenticated(err) {
+  const msg = String(err && err.message);
+  return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
+}
+
+/** Pre-axum API bind returns 503 JSON `{error:"not ready"}` until the router is live. */
+function isApiWarmup(err) {
+  const msg = String(err && err.message);
+  return err.status === 503 || msg === "not ready";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function showView(id) {
+  ["startup-view", "login-view", "main-view"].forEach((name) => {
+    const node = $("#" + name);
+    if (node) node.classList.toggle("hidden", name !== id);
+  });
+}
+
 async function api(path, method = "GET", body = null) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include" };
@@ -56,9 +92,29 @@ async function api(path, method = "GET", body = null) {
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
   if (!res.ok) {
     const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
   }
   return data;
+}
+
+/** CDN Storage can serve this page while the API is still opening the database. */
+async function waitForApiMe() {
+  const deadline = Date.now() + 6 * 60 * 1000;
+  let delay = 500;
+  let sawWarmup = false;
+  while (true) {
+    try {
+      return await api("/api/me");
+    } catch (e) {
+      if (!isApiWarmup(e) || Date.now() >= deadline) throw e;
+      if (!sawWarmup) {
+        sawWarmup = true;
+        showView("startup-view");
+      }
+      await sleep(Math.max(e.retryAfterMs || 0, delay));
+      delay = Math.min(Math.floor(delay * 1.5), 2000);
+    }
+  }
 }
 
 function toast(msg, kind = "info") {
@@ -75,11 +131,10 @@ function esc(s) {
 
 async function init() {
   try {
-    const me = await api("/api/me");
+    const me = await waitForApiMe();
     state.me = me;
     state.guilds = me.guilds;
-    $("#login-view").classList.add("hidden");
-    $("#main-view").classList.remove("hidden");
+    showView("main-view");
     $("#user-chip").textContent = `${me.user.username} (${me.user.global_name || ""})`.trim();
     const sel = $("#guild-select");
     sel.innerHTML = "";
@@ -103,8 +158,11 @@ async function init() {
     await loadConfig();
     renderTab();
   } catch (e) {
-    if (String(e.message).includes("not authenticated") || String(e.message).includes("401")) {
-      $("#login-view").classList.remove("hidden");
+    if (isUnauthenticated(e)) {
+      showView("login-view");
+    } else if (isApiWarmup(e)) {
+      showView("startup-view");
+      toast("API is still starting. Reload this page in a minute.", "error");
     } else {
       toast("Failed to load: " + e.message, "error");
     }
