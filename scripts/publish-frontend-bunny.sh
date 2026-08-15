@@ -51,9 +51,17 @@ restore_existing() {
 
 rollback() {
   echo "upload failed; restoring previous frontend/ files" >&2
-  restore_existing app.js || true
-  restore_existing style.css || true
-  restore_existing index.html || true
+  local file dest
+  for file in "$@"; do
+    dest="$backup_dir/$file"
+    if [[ -f "$dest" ]]; then
+      restore_existing "$file" || true
+    else
+      echo "removing newly uploaded ${file} (no previous copy)"
+      curl -fsS -X DELETE "$(storage_url "$file")" \
+        -H "AccessKey: ${password}" || true
+    fi
+  done
 }
 
 upload() {
@@ -71,17 +79,25 @@ download_existing app.js
 download_existing style.css
 
 # Assets first, HTML last, so a failed later PUT cannot pair new HTML with
-# old JS/CSS. On any upload failure, restore the previous Storage copies.
-if ! upload app.js "application/javascript; charset=utf-8"; then
-  rollback
+# old JS/CSS. On any upload failure, restore previous copies or delete
+# files that did not exist before this run.
+uploaded=()
+if upload app.js "application/javascript; charset=utf-8"; then
+  uploaded+=("app.js")
+else
+  rollback "${uploaded[@]}"
   exit 1
 fi
-if ! upload style.css "text/css; charset=utf-8"; then
-  rollback
+if upload style.css "text/css; charset=utf-8"; then
+  uploaded+=("style.css")
+else
+  rollback "${uploaded[@]}"
   exit 1
 fi
-if ! upload index.html "text/html; charset=utf-8"; then
-  rollback
+if upload index.html "text/html; charset=utf-8"; then
+  uploaded+=("index.html")
+else
+  rollback "${uploaded[@]}"
   exit 1
 fi
 
