@@ -65,9 +65,16 @@ function isUnauthenticated(err) {
   return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
 }
 
-/** Only the pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
+/** Pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
 function isApiWarmup(err) {
   return err.status === 503 && String(err && err.message) === "not ready";
+}
+
+/** Origin has not handed off to axum yet: warmup JSON, Bunny 502/504, or fetch failure. */
+function isOriginStarting(err) {
+  if (isApiWarmup(err)) return true;
+  if (!err || !err.status) return true;
+  return err.status === 502 || err.status === 503 || err.status === 504;
 }
 
 function sleep(ms) {
@@ -79,6 +86,11 @@ function showView(id) {
     const node = $("#" + name);
     if (node) node.classList.toggle("hidden", name !== id);
   });
+}
+
+function setStartupStatus(text) {
+  const node = $("#startup-status");
+  if (node) node.textContent = text;
 }
 
 async function api(path, method = "GET", body = null) {
@@ -96,22 +108,22 @@ async function api(path, method = "GET", body = null) {
   return data;
 }
 
-/** CDN Storage can serve this page while the API is still opening the database.
- *  Keep retrying while the origin advertises the warmup contract. The API
- *  process either keeps returning 503 `not ready`, hands off to axum, or
- *  exits — a parallel client deadline would give up while the origin is
- *  still legitimately starting. */
+/** CDN Storage can serve this page while the API origin is still binding or
+ *  opening the database. Keep retrying until axum answers `/api/me` — a
+ *  parallel client deadline would give up while Bunny is still origin-pulling
+ *  a starting container. */
 async function waitForApiMe() {
   let delay = 500;
-  let sawWarmup = false;
+  let sawStartup = false;
   while (true) {
     try {
       return await api("/api/me");
     } catch (e) {
-      if (!isApiWarmup(e)) throw e;
-      if (!sawWarmup) {
-        sawWarmup = true;
+      if (!isOriginStarting(e)) throw e;
+      if (!sawStartup) {
+        sawStartup = true;
         showView("startup-view");
+        setStartupStatus("Waiting for the API to finish starting…");
       }
       await sleep(Math.max(e.retryAfterMs || 0, delay));
       delay = Math.min(Math.floor(delay * 1.5), 2000);
@@ -163,6 +175,8 @@ async function init() {
     if (isUnauthenticated(e)) {
       showView("login-view");
     } else {
+      showView("startup-view");
+      setStartupStatus("Failed to load: " + (e.message || String(e)));
       toast("Failed to load: " + e.message, "error");
     }
   }

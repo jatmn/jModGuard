@@ -3,12 +3,14 @@
 pub mod api;
 
 use axum::extract::Query;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use std::sync::Arc;
 use tower_sessions::cookie::time::Duration as CookieDuration;
+use tower_sessions::cookie::{Cookie, SameSite};
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 
 use crate::state::{AppState, DiscordGuild, DiscordUser};
@@ -16,8 +18,12 @@ use crate::state::{AppState, DiscordGuild, DiscordUser};
 const SESSION_USER: &str = "discord_user_id";
 const SESSION_TOKEN: &str = "access_token";
 const SESSION_REFRESH: &str = "refresh_token";
-const SESSION_STATE: &str = "oauth_state";
-const SESSION_RETURN_TO: &str = "return_to";
+/// Browser-held CSRF secret for Discord OAuth. MemoryStore sessions die on
+/// API restart; this cookie survives so `/oauth/callback` after a deploy
+/// still matches the `state` Discord echoes back.
+const COOKIE_OAUTH_STATE: &str = "jmodguard_oauth_state";
+const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
+const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
 
 // ---------------------------------------------------------------------------
 // errors
@@ -261,16 +267,20 @@ fn return_to_or_root(cfg: &crate::config::Config, requested: Option<&str>) -> St
 }
 
 async fn login(
-    session: Session,
     state: axum::extract::State<Arc<AppState>>,
     Query(query): Query<ReturnToQuery>,
 ) -> Response {
     let state_token = random_oauth_state();
-    let _ = session.insert(SESSION_STATE, &state_token).await;
     let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
-    let _ = session.insert(SESSION_RETURN_TO, &return_to).await;
     let url = state.oauth.authorize_url(&state_token);
-    axum::response::Redirect::to(&url).into_response()
+    let (secure, same_site) = public_cookie_policy(&state.cfg);
+    append_oauth_cookies(
+        axum::response::Redirect::to(&url).into_response(),
+        &state_token,
+        &return_to,
+        secure,
+        same_site,
+    )
 }
 
 async fn logout(
@@ -316,36 +326,139 @@ fn random_oauth_state() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn public_cookie_policy(cfg: &crate::config::Config) -> (bool, SameSite) {
+    let secure = cfg
+        .web
+        .base_url
+        .to_ascii_lowercase()
+        .starts_with("https://");
+    let cross_origin = cfg.web.cors_origins.iter().any(|origin| {
+        let origin = origin.trim();
+        origin != "*" && HeaderValue::from_str(origin).is_ok()
+    });
+    (secure, session_same_site(cross_origin, secure))
+}
+
+fn oauth_cookie<'a>(
+    name: &'a str,
+    value: &'a str,
+    secure: bool,
+    same_site: SameSite,
+    max_age: CookieDuration,
+) -> Cookie<'a> {
+    Cookie::build((name, value))
+        .http_only(true)
+        .secure(secure)
+        .same_site(same_site)
+        .path("/")
+        .max_age(max_age)
+        .build()
+}
+
+fn append_set_cookie(response: &mut Response, cookie: Cookie<'_>) {
+    if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+}
+
+fn append_oauth_cookies(
+    mut response: Response,
+    state_token: &str,
+    return_to: &str,
+    secure: bool,
+    same_site: SameSite,
+) -> Response {
+    append_set_cookie(
+        &mut response,
+        oauth_cookie(
+            COOKIE_OAUTH_STATE,
+            state_token,
+            secure,
+            same_site,
+            OAUTH_COOKIE_MAX_AGE,
+        ),
+    );
+    append_set_cookie(
+        &mut response,
+        oauth_cookie(
+            COOKIE_OAUTH_RETURN_TO,
+            return_to,
+            secure,
+            same_site,
+            OAUTH_COOKIE_MAX_AGE,
+        ),
+    );
+    response
+}
+
+fn clear_oauth_cookies(mut response: Response, secure: bool, same_site: SameSite) -> Response {
+    append_set_cookie(
+        &mut response,
+        oauth_cookie(
+            COOKIE_OAUTH_STATE,
+            "",
+            secure,
+            same_site,
+            CookieDuration::ZERO,
+        ),
+    );
+    append_set_cookie(
+        &mut response,
+        oauth_cookie(
+            COOKIE_OAUTH_RETURN_TO,
+            "",
+            secure,
+            same_site,
+            CookieDuration::ZERO,
+        ),
+    );
+    response
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(COOKIE)?.to_str().ok()?;
+    Cookie::split_parse(raw)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_string())
+}
+
+/// CSRF is the browser cookie Discord cannot set, compared to the `state`
+/// query Discord echoes. Empty or missing cookies must reject.
+fn oauth_csrf_ok(headers: &HeaderMap, query_state: Option<&str>) -> bool {
+    let expected = cookie_value(headers, COOKIE_OAUTH_STATE).unwrap_or_default();
+    !expected.is_empty() && Some(expected.as_str()) == query_state
+}
+
 async fn callback(
     session: Session,
     state: axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
-    let expected = session
-        .get::<String>(SESSION_STATE)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    // Reject missing/empty session state — skipping the check enables CSRF.
-    if expected.is_empty() || Some(expected.as_str()) != query.state.as_deref() {
+    // Reject missing/empty CSRF cookie — skipping the check enables CSRF.
+    // The secret lives on the client so an API restart between /login and
+    // Discord's redirect does not invent a state mismatch.
+    if !oauth_csrf_ok(&headers, query.state.as_deref()) {
         return error_page("OAuth state mismatch");
     }
+    let (secure, same_site) = public_cookie_policy(&state.cfg);
+    let finish = |response: Response| clear_oauth_cookies(response, secure, same_site);
     let Some(code) = &query.code else {
-        return error_page("missing authorization code");
+        return finish(error_page("missing authorization code"));
     };
     let tok = match state.oauth.exchange_code(code).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("oauth callback: token exchange failed: {e:#}");
-            return error_page(&format!("token exchange failed: {e:#}"));
+            return finish(error_page(&format!("token exchange failed: {e:#}")));
         }
     };
     let user = match state.oauth.me(&tok.access_token).await {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("oauth callback: me request failed: {e:#}");
-            return error_page(&format!("failed to fetch user: {e:#}"));
+            return finish(error_page(&format!("failed to fetch user: {e:#}")));
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
@@ -354,11 +467,9 @@ async fn callback(
     if let Some(r) = &tok.refresh_token {
         let _ = session.insert(SESSION_REFRESH, r).await;
     }
-    let _: Option<String> = session.remove(SESSION_STATE).await.ok().flatten();
-    let requested_return_to: Option<String> =
-        session.remove(SESSION_RETURN_TO).await.ok().flatten();
+    let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
     let return_to = return_to_or_root(&state.cfg, requested_return_to.as_deref());
-    axum::response::Redirect::to(&return_to).into_response()
+    finish(axum::response::Redirect::to(&return_to).into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -918,7 +1029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_redirects_to_discord() {
+    async fn login_sets_oauth_csrf_cookie() {
         let app = test_app();
         let res = app
             .oneshot(
@@ -931,12 +1042,28 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
         let location = res.headers().get("location").unwrap().to_str().unwrap();
-        assert!(location.starts_with("https://discord.com/oauth2/authorize"));
+        let state = location
+            .split("state=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("authorize URL must include state");
+        let cookies: Vec<_> = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.contains(&format!("{COOKIE_OAUTH_STATE}={state}"))),
+            "login must put CSRF state on the client, not only in MemoryStore: {cookies:?}"
+        );
     }
 
     #[tokio::test]
-    async fn oauth_callback_rejects_missing_session_state() {
-        // No prior /login → empty session state → CSRF reject (must not skip check).
+    async fn oauth_callback_rejects_missing_csrf_cookie() {
+        // No prior /login cookie → CSRF reject (must not skip check).
         let app = test_app();
         let res = app
             .oneshot(
@@ -956,6 +1083,19 @@ mod tests {
             text.contains("OAuth state mismatch"),
             "expected CSRF reject page, got: {text}"
         );
+    }
+
+    #[test]
+    fn oauth_csrf_compares_cookie_to_query_state() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("jmodguard_oauth_state=deadbeef; other=1"),
+        );
+        assert!(oauth_csrf_ok(&headers, Some("deadbeef")));
+        assert!(!oauth_csrf_ok(&headers, Some("attacker")));
+        assert!(!oauth_csrf_ok(&HeaderMap::new(), Some("deadbeef")));
+        assert!(!oauth_csrf_ok(&headers, None));
     }
 
     fn auth_user(discord_id: u64) -> AuthCtx {

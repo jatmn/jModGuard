@@ -15,6 +15,7 @@ cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
 cargo build --locked --bin jmodguard-api --no-default-features --features web
 node --test scripts/frontend-warmup-test.mjs
+node --test scripts/publish-frontend-test.mjs
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -87,7 +88,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `--no-default-features --features web` so containers do not contain the
   admin UI. Build the bot with `--no-default-features`.
 - Sessions use `MemoryStore` intentionally for a **single** API process; lost on
-  restart. Shared session store is a future multi-replica concern.
+  restart. Shared session store is a future multi-replica concern. Discord
+  OAuth CSRF (`state`) and `return_to` are browser cookies so a restart
+  between `/login` and `/oauth/callback` does not fail the handshake.
 - Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
   from Storage and proxies `/api` `/login` `/oauth` to a private API
   container (same origin; no CORS). `web.cors_origins` /

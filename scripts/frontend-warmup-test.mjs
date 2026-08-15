@@ -38,17 +38,52 @@ function loadFrontend(fetchImpl) {
     console,
   });
   return vm.runInContext(
-    `${src}\n({ isApiWarmup, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError })`,
+    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError })`,
     context,
   );
 }
 
-test("isApiWarmup matches only the JSON not-ready contract", () => {
-  const { isApiWarmup, apiError } = loadFrontend(async () => {});
-  assert.equal(isApiWarmup(apiError("not ready", 503, 1000)), true);
-  assert.equal(isApiWarmup(apiError("HTTP 503", 503, 0)), false);
-  assert.equal(isApiWarmup(apiError("not ready", 500, 0)), false);
-  assert.equal(isApiWarmup(apiError("not authenticated", 400, 0)), false);
+test("isOriginStarting retries proxy and network failures until axum answers", () => {
+  const { isOriginStarting, isApiWarmup, apiError } = loadFrontend(async () => {});
+  assert.equal(isApiWarmup(apiError("not ready", 503, 0)), true);
+  assert.equal(isOriginStarting(apiError("not ready", 503, 0)), true);
+  assert.equal(isOriginStarting(apiError("HTTP 502", 502, 0)), true);
+  assert.equal(isOriginStarting(apiError("HTTP 504", 504, 0)), true);
+  assert.equal(isOriginStarting(apiError("Failed to fetch")), true);
+  assert.equal(isOriginStarting(apiError("not authenticated", 400, 0)), false);
+});
+
+test("waitForApiMe keeps retrying origin-start failures until axum answers", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 502,
+        headers: { get: () => null },
+        text: async () => "Bad Gateway",
+      };
+    }
+    if (calls === 2) {
+      return {
+        ok: false,
+        status: 503,
+        headers: { get: (name) => (name === "retry-after" ? "0" : null) },
+        text: async () => JSON.stringify({ error: "not ready" }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
+    };
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl);
+  const me = await waitForApiMe();
+  assert.equal(calls, 3);
+  assert.equal(me.user.username, "ok");
 });
 
 test("waitForApiMe keeps retrying warmup until axum answers", async () => {

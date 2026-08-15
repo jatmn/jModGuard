@@ -6,9 +6,11 @@ on Storage/CDN; the API container stays private and only answers `/api`,
 login, and OAuth. The pages never open SQL from the browser. They call the
 API; the API (and the bot) open the database. If the CDN page loads while
 the API is still starting, `/api/me` returns `503` `{error:"not ready"}`
-and the UI keeps waiting until the API is ready (or the origin goes away)
-instead of treating that as a failed login. `/login` and `/oauth/callback`
-return an HTML wait page that reloads until axum can redirect.
+(or the CDN origin is still a `502`/`504` while the container binds) and
+the UI keeps waiting until axum answers `/api/me`. `/login` and
+`/oauth/callback` return an HTML wait page that reloads until axum can
+redirect. OAuth CSRF lives in a cookie, so an API restart between Login
+and Discord's return still completes the handshake.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
 `jmodguard-api`. Both use the same local SQLite file or remote libSQL database.

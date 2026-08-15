@@ -10,7 +10,7 @@ endpoint="${BUNNY_STORAGE_ENDPOINT:-storage.bunnycdn.com}"
 endpoint="${endpoint#https://}"
 endpoint="${endpoint%/}"
 
-root="$(cd "$(dirname "$0")/.." && pwd)/frontend"
+root="${JMODGUARD_FRONTEND_ROOT:-$(cd "$(dirname "$0")/.." && pwd)/frontend}"
 if [[ ! -f "$root/index.html" || ! -f "$root/app.js" || ! -f "$root/style.css" ]]; then
   echo "frontend/ is missing index.html, app.js, or style.css under $root" >&2
   exit 1
@@ -24,6 +24,8 @@ storage_url() {
 }
 
 # Retry a Storage mutating call. Failures here are the rollback/upload surface.
+retry_sleep="${JMODGUARD_PUBLISH_RETRY_SLEEP:-1}"
+
 storage_put() {
   local file="$1"
   local src="$2"
@@ -37,7 +39,7 @@ storage_put() {
     if curl "${args[@]}"; then
       return 0
     fi
-    sleep 1
+    sleep "$retry_sleep"
   done
   return 1
 }
@@ -50,7 +52,7 @@ storage_delete() {
       -H "AccessKey: ${password}"; then
       return 0
     fi
-    sleep 1
+    sleep "$retry_sleep"
   done
   return 1
 }
@@ -78,7 +80,7 @@ download_existing() {
   exit 1
 }
 
-rollback() {
+rollback_once() {
   echo "restoring previous frontend/ files on Storage" >&2
   local file dest status=0
   for file in "$@"; do
@@ -101,6 +103,19 @@ rollback() {
     fi
   done
   return "$status"
+}
+
+# Restore is a set: retry until every uploaded file is restored or confirmed
+# deleted. A single pass that continues after a failed PUT leaves mixed origin.
+rollback() {
+  local attempt
+  for attempt in 1 2 3 4 5 6; do
+    if rollback_once "$@"; then
+      return 0
+    fi
+    sleep "$retry_sleep"
+  done
+  return 1
 }
 
 abort_upload() {
@@ -156,7 +171,7 @@ if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
       purged=1
       break
     fi
-    sleep 2
+    sleep "$retry_sleep"
   done
   if [[ "$purged" -ne 1 ]]; then
     echo "Storage already has the new frontend/. Pull Zone purge failed; CDN may keep stale or mixed cached files until you purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard. Do not re-upload until that purge succeeds." >&2

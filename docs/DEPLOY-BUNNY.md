@@ -174,9 +174,10 @@ build), only `/health` returns `200`. `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
-`/api/me` for as long as that JSON warmup is advertised. Enable sticky
-sessions on that origin:
-sessions live in that one process.
+`/api/me` while the origin is still starting (`not ready`, `502`/`504`,
+or a dropped origin pull). OAuth CSRF is a cookie, so a restart between
+`/login` and Discord's return still completes. Enable sticky sessions
+on that origin: login sessions live in that one process.
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
