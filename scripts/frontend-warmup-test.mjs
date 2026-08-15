@@ -49,8 +49,29 @@ test("isOriginStarting retries proxy and network failures until axum answers", (
   assert.equal(isOriginStarting(apiError("not ready", 503, 0)), true);
   assert.equal(isOriginStarting(apiError("HTTP 502", 502, 0)), true);
   assert.equal(isOriginStarting(apiError("HTTP 504", 504, 0)), true);
+  assert.equal(isOriginStarting(apiError("HTTP 503", 503, 0)), true);
   assert.equal(isOriginStarting(apiError("Failed to fetch")), true);
   assert.equal(isOriginStarting(apiError("not authenticated", 400, 0)), false);
+  assert.equal(isOriginStarting(apiError("rate limited", 503, 0)), false);
+});
+
+test("waitForApiMe does not retry application JSON 503", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 503,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ error: "rate limited" }),
+    };
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl);
+  await assert.rejects(waitForApiMe, (err) => {
+    assert.equal(calls, 1);
+    assert.equal(err.message, "rate limited");
+    return true;
+  });
 });
 
 test("waitForApiMe keeps retrying origin-start failures until axum answers", async () => {

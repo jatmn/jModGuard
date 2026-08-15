@@ -70,11 +70,15 @@ function isApiWarmup(err) {
   return err.status === 503 && String(err && err.message) === "not ready";
 }
 
-/** Origin has not handed off to axum yet: warmup JSON, Bunny 502/504, or fetch failure. */
+/** Origin has not handed off to axum yet.
+ *  Warmup JSON, Bunny 502/504, a dropped fetch, or a proxy HTML 503
+ *  (`api()` reports those as "HTTP 503"). A JSON 503 with a different
+ *  `error` field is an application response and must not spin. */
 function isOriginStarting(err) {
   if (isApiWarmup(err)) return true;
   if (!err || !err.status) return true;
-  return err.status === 502 || err.status === 503 || err.status === 504;
+  if (err.status === 502 || err.status === 504) return true;
+  return err.status === 503 && String(err && err.message) === "HTTP 503";
 }
 
 function sleep(ms) {

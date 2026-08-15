@@ -91,6 +91,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   restart. Shared session store is a future multi-replica concern. Discord
   OAuth CSRF (`state`) and `return_to` are browser cookies so a restart
   between `/login` and `/oauth/callback` does not fail the handshake.
+  Those cookies are host-only on `web.base_url`; a split-origin SPA still
+  sends the user through that hostname for login and callback.
 - Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
   from Storage and proxies `/api` `/login` `/oauth` to a private API
   container (same origin; no CORS). `web.cors_origins` /

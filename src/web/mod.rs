@@ -436,14 +436,17 @@ async fn callback(
     headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
+    // Handshake cookies are single-use. Clear them on every callback
+    // outcome, including CSRF reject, so a failed attempt cannot leave
+    // a live secret for the next request.
+    let (secure, same_site) = public_cookie_policy(&state.cfg);
+    let finish = |response: Response| clear_oauth_cookies(response, secure, same_site);
     // Reject missing/empty CSRF cookie — skipping the check enables CSRF.
     // The secret lives on the client so an API restart between /login and
     // Discord's redirect does not invent a state mismatch.
     if !oauth_csrf_ok(&headers, query.state.as_deref()) {
-        return error_page("OAuth state mismatch");
+        return finish(error_page("OAuth state mismatch"));
     }
-    let (secure, same_site) = public_cookie_policy(&state.cfg);
-    let finish = |response: Response| clear_oauth_cookies(response, secure, same_site);
     let Some(code) = &query.code else {
         return finish(error_page("missing authorization code"));
     };
@@ -1075,6 +1078,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let cookies: Vec<String> = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect();
         let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await
             .unwrap();
@@ -1082,6 +1091,52 @@ mod tests {
         assert!(
             text.contains("OAuth state mismatch"),
             "expected CSRF reject page, got: {text}"
+        );
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.contains(COOKIE_OAUTH_STATE) && cookie.contains("Max-Age=0")
+            }),
+            "CSRF reject must expire the handshake cookies: {cookies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_matching_cookie_passes_csrf() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/callback?code=fake&state=deadbeef")
+                    .header(COOKIE, format!("{COOKIE_OAUTH_STATE}=deadbeef"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let cookies: Vec<String> = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect();
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("OAuth state mismatch"),
+            "matching cookie+state must leave CSRF: {text}"
+        );
+        assert!(
+            text.contains("token exchange failed"),
+            "must reach Discord exchange after CSRF: {text}"
+        );
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.contains(COOKIE_OAUTH_STATE) && cookie.contains("Max-Age=0")
+            }),
+            "successful CSRF path must still expire handshake cookies: {cookies:?}"
         );
     }
 

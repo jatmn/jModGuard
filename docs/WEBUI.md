@@ -55,9 +55,11 @@ it is the intended way to publish updates.
 **Another host or CDN.** Copy the same three files from that git tag to
 the site root. If the API is on a **different** hostname than the pages,
 set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads,
-and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Bunny’s
-designed shape does not need that split: the Pull Zone is one hostname
-for both the files and `/api`.
+and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
+OAuth still happens on `web.base_url`: `/login` and `/oauth/callback`
+must be that same hostname so the CSRF cookies Discord cannot set are
+sent back on the redirect. Bunny’s designed shape does not need that
+split: the Pull Zone is one hostname for both the files and `/api`.
 
 Never put a database URL or token in these files.
 
