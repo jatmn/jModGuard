@@ -65,10 +65,9 @@ function isUnauthenticated(err) {
   return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
 }
 
-/** Pre-axum API bind returns 503 JSON `{error:"not ready"}` until the router is live. */
+/** Only the pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
 function isApiWarmup(err) {
-  const msg = String(err && err.message);
-  return err.status === 503 || msg === "not ready";
+  return err.status === 503 && String(err && err.message) === "not ready";
 }
 
 function sleep(ms) {
