@@ -14,6 +14,7 @@ cargo clippy --locked --bin jmodguard-api --no-default-features --features web -
 cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
 cargo build --locked --bin jmodguard-api --no-default-features --features web
+node --test scripts/frontend-warmup-test.mjs
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -103,8 +104,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `/health` are unauthenticated process liveness probes (`ok`, no database).
   Bind and accept them **before** opening the database. On the API public
   bind, only `/health` returns 200 until axum takes over (database open,
-  AppState primary-version prime, router build); `/`, `/api`, `/login`, and
-  `/oauth` return 503 in that window. Do not put session middleware on
+  AppState primary-version prime, router build); `/api` returns JSON 503
+  `{"error":"not ready"}` and `Retry-After`, and `/login` / `/oauth` return
+  HTML 503 that refreshes in place. Do not put session middleware on
   `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`

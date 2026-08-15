@@ -854,6 +854,23 @@ mod tests {
                 api.starts_with("HTTP/1.1 503 Service Unavailable"),
                 "startup must fence app routes: {api}"
             );
+            assert!(
+                api.contains("retry-after: 1"),
+                "startup 503 must advertise Retry-After: {api}"
+            );
+            assert!(
+                api.contains(r#"{"error":"not ready"}"#),
+                "startup /api must use the JSON warmup contract: {api}"
+            );
+            let login = http_get(addr, "/login").await;
+            assert!(
+                login.contains("content-type: text/html; charset=utf-8"),
+                "startup /login must be HTML so OAuth navigations can retry: {login}"
+            );
+            assert!(
+                login.contains("Waiting for the API to finish starting"),
+                "startup /login must refresh in place: {login}"
+            );
         };
         let (web_app, _) = tokio::join!(serving, probes);
         tokio::spawn(async move {

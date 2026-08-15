@@ -38,30 +38,38 @@ download_existing() {
   echo "no existing ${file} to restore (HTTP ${code})"
 }
 
-restore_existing() {
-  local file="$1"
-  local dest="$backup_dir/$file"
-  if [[ -f "$dest" ]]; then
-    echo "restoring previous ${file}"
-    curl -fsS -X PUT "$(storage_url "$file")" \
-      -H "AccessKey: ${password}" \
-      --upload-file "$dest"
-  fi
-}
-
 rollback() {
-  echo "upload failed; restoring previous frontend/ files" >&2
-  local file dest
+  echo "restoring previous frontend/ files on Storage" >&2
+  local file dest status=0
   for file in "$@"; do
     dest="$backup_dir/$file"
     if [[ -f "$dest" ]]; then
-      restore_existing "$file" || true
+      echo "restoring previous ${file}" >&2
+      if ! curl -fsS -X PUT "$(storage_url "$file")" \
+        -H "AccessKey: ${password}" \
+        --upload-file "$dest"; then
+        echo "failed to restore ${file}" >&2
+        status=1
+      fi
     else
-      echo "removing newly uploaded ${file} (no previous copy)"
-      curl -fsS -X DELETE "$(storage_url "$file")" \
-        -H "AccessKey: ${password}" || true
+      echo "removing newly uploaded ${file} (no previous copy)" >&2
+      if ! curl -fsS -X DELETE "$(storage_url "$file")" \
+        -H "AccessKey: ${password}"; then
+        echo "failed to delete ${file}; Storage may be inconsistent" >&2
+        status=1
+      fi
     fi
   done
+  return "$status"
+}
+
+abort_publish() {
+  local reason="$1"
+  echo "${reason}" >&2
+  if ! rollback "${uploaded[@]}"; then
+    echo "rollback did not fully restore Storage; the zone may mix revisions" >&2
+  fi
+  exit 1
 }
 
 upload() {
@@ -79,26 +87,25 @@ download_existing app.js
 download_existing style.css
 
 # Assets first, HTML last, so a failed later PUT cannot pair new HTML with
-# old JS/CSS. On any upload failure, restore previous copies or delete
-# files that did not exist before this run.
+# old JS/CSS. On any upload or purge failure, restore previous copies or
+# delete files that did not exist before this run. A configured Pull Zone
+# purge is part of the same publish: same-named assets are not live until
+# the CDN cache is invalidated.
 uploaded=()
 if upload app.js "application/javascript; charset=utf-8"; then
   uploaded+=("app.js")
 else
-  rollback "${uploaded[@]}"
-  exit 1
+  abort_publish "upload failed"
 fi
 if upload style.css "text/css; charset=utf-8"; then
   uploaded+=("style.css")
 else
-  rollback "${uploaded[@]}"
-  exit 1
+  abort_publish "upload failed"
 fi
 if upload index.html "text/html; charset=utf-8"; then
   uploaded+=("index.html")
 else
-  rollback "${uploaded[@]}"
-  exit 1
+  abort_publish "upload failed"
 fi
 
 if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
@@ -116,8 +123,7 @@ if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
     sleep 2
   done
   if [[ "$purged" -ne 1 ]]; then
-    echo "Storage upload succeeded but Pull Zone purge failed. Purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard or CDN will keep stale assets." >&2
-    exit 1
+    abort_publish "Storage upload succeeded but Pull Zone purge failed. Rolled Storage back so origin matches the still-cached CDN revision. Purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard, then rerun publish."
   fi
 fi
 

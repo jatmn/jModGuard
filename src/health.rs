@@ -6,11 +6,13 @@
 //! without cookies, routing, or a database round-trip. `/` is not liveness.
 //! The API exposes the same paths on its public bind via axum, and answers
 //! probes on that socket until axum takes over (database open, AppState
-//! primary-version prime, router build). Application routes (`/`, `/api`,
-//! `/login`, `/oauth`, …) must not look successful during that window: they
-//! get `503`. `/health` is liveness, not database readiness: a pooled
-//! remote `SELECT 1` can wait tens of seconds and false-fail a healthy
-//! process under load.
+//! primary-version prime, router build). Application routes must not look
+//! successful during that window: they get `503`. `/api` uses the JSON
+//! `{"error":"not ready"}` shape so the SPA can retry. Browser navigations
+//! (`/login`, `/oauth/callback`, …) get HTML that refreshes in place so an
+//! OAuth redirect is not replaced by a JSON error page. `/health` is
+//! liveness, not database readiness: a pooled remote `SELECT 1` can wait
+//! tens of seconds and false-fail a healthy process under load.
 //!
 //! Bind and accept before opening the database. A closed port during
 //! remote first-boot retries is a failed liveness probe.
@@ -27,7 +29,18 @@ const MAX_HEALTH_CONNECTIONS: usize = 16;
 const LIVENESS_BODY: &str = "ok";
 /// Same JSON error shape as axum `ApiError`, so the CDN SPA can retry warmup
 /// instead of treating a plain-text 503 as a fatal load failure.
-const NOT_READY_BODY: &str = r#"{"error":"not ready"}"#;
+const NOT_READY_JSON: &str = r#"{"error":"not ready"}"#;
+/// Same waiting copy as `frontend/index.html`. `Refresh` / meta-refresh
+/// reloads the current URL (including OAuth query strings) without
+/// reflecting the request-target into HTML.
+const NOT_READY_HTML: &str = concat!(
+    "<!DOCTYPE html><html lang=\"en\"><head>",
+    "<meta charset=\"utf-8\">",
+    "<meta http-equiv=\"refresh\" content=\"1\">",
+    "<title>jModGuard</title></head><body>",
+    "<p>Waiting for the API to finish starting…</p>",
+    "</body></html>"
+);
 
 /// Binds `addr` and returns the listener. Call this during startup so a
 /// occupied health port fails the process before Discord connects.
@@ -92,10 +105,11 @@ where
 }
 
 /// Answers one HTTP connection. `GET`/`HEAD` `/health` return `200 ok`
-/// (process liveness). Every other path returns `503` so a shared API
-/// bind cannot fake success for `/`, OAuth, or `/api` during database
-/// open. `/` is not liveness: Bunny serves the admin UI from Storage,
-/// and the API image has no `/` route after axum takes over.
+/// (process liveness). `/api` returns JSON `503` so `fetch` can retry.
+/// Other `GET`/`HEAD` paths return HTML `503` so a browser sitting on
+/// `/login` or `/oauth/callback` retries the same URL. `/` is not
+/// liveness: Bunny serves the admin UI from Storage, and the API image
+/// has no `/` route after axum takes over.
 pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
     let mut buf = [0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
@@ -113,12 +127,19 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
 fn probe_response(probe: Probe) -> String {
     let (status, content_type, extra, body) = if probe.liveness {
         ("200 OK", "text/plain; charset=utf-8", "", LIVENESS_BODY)
-    } else {
+    } else if probe.json_error {
         (
             "503 Service Unavailable",
             "application/json",
             "retry-after: 1\r\n",
-            NOT_READY_BODY,
+            NOT_READY_JSON,
+        )
+    } else {
+        (
+            "503 Service Unavailable",
+            "text/html; charset=utf-8",
+            "retry-after: 1\r\nrefresh: 1\r\n",
+            NOT_READY_HTML,
         )
     };
     let body_out = if probe.head { "" } else { body };
@@ -131,6 +152,8 @@ fn probe_response(probe: Probe) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     liveness: bool,
+    /// `/api` and non-GET/HEAD methods: machine clients (SPA `fetch`).
+    json_error: bool,
     head: bool,
 }
 
@@ -142,8 +165,10 @@ fn parse_probe(buf: &[u8]) -> Probe {
     let target = parts.next().unwrap_or("");
     let path = request_target_path(target);
     let head = method == "HEAD";
+    let get_or_head = matches!(method, "GET" | "HEAD");
     Probe {
-        liveness: matches!(method, "GET" | "HEAD") && is_liveness_path(path),
+        liveness: get_or_head && is_liveness_path(path),
+        json_error: is_api_path(path) || !get_or_head,
         head,
     }
 }
@@ -168,9 +193,13 @@ fn is_liveness_path(path: &str) -> bool {
     path == "/health" || path == "/health/"
 }
 
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Probe, parse_probe, request_target_path, serve};
+    use super::{Probe, parse_probe, request_target_path, serve, NOT_READY_HTML, NOT_READY_JSON};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -222,6 +251,7 @@ mod tests {
             parse_probe(b"GET /health HTTP/1.1"),
             Probe {
                 liveness: true,
+                json_error: false,
                 head: false
             }
         );
@@ -229,6 +259,7 @@ mod tests {
             parse_probe(b"HEAD /health HTTP/1.1"),
             Probe {
                 liveness: true,
+                json_error: false,
                 head: true
             }
         );
@@ -236,6 +267,7 @@ mod tests {
             parse_probe(b"GET http://127.0.0.1:8080/health HTTP/1.1"),
             Probe {
                 liveness: true,
+                json_error: false,
                 head: false
             }
         );
@@ -243,6 +275,23 @@ mod tests {
             parse_probe(b"GET / HTTP/1.1"),
             Probe {
                 liveness: false,
+                json_error: false,
+                head: false
+            }
+        );
+        assert_eq!(
+            parse_probe(b"GET /api/me HTTP/1.1"),
+            Probe {
+                liveness: false,
+                json_error: true,
+                head: false
+            }
+        );
+        assert_eq!(
+            parse_probe(b"GET /login HTTP/1.1"),
+            Probe {
+                liveness: false,
+                json_error: false,
                 head: false
             }
         );
@@ -250,6 +299,7 @@ mod tests {
             parse_probe(b"POST /health HTTP/1.1"),
             Probe {
                 liveness: false,
+                json_error: true,
                 head: false
             }
         );
@@ -341,9 +391,52 @@ mod tests {
                 "warmup must advertise Retry-After: {text}"
             );
             assert!(
-                text.contains(r#"{"error":"not ready"}"#),
+                text.contains(NOT_READY_JSON),
                 "warmup must use the API JSON error shape: {text}"
             );
+            assert!(
+                text.contains("content-type: application/json"),
+                "API warmup must be JSON: {text}"
+            );
+        };
+        super::serve_while(&listener, work).await;
+    }
+
+    #[tokio::test]
+    async fn serve_while_retries_browser_oauth_navigations_as_html() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            for request in [
+                &b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"[..],
+                &b"GET /oauth/callback?code=x&state=y HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"[..],
+            ] {
+                let text = exchange(addr, request).await;
+                assert!(
+                    text.starts_with("HTTP/1.1 503 Service Unavailable"),
+                    "unexpected: {text}"
+                );
+                assert!(
+                    text.contains("retry-after: 1"),
+                    "warmup must advertise Retry-After: {text}"
+                );
+                assert!(
+                    text.contains("refresh: 1"),
+                    "browser warmup must refresh in place: {text}"
+                );
+                assert!(
+                    text.contains("content-type: text/html; charset=utf-8"),
+                    "browser warmup must be HTML: {text}"
+                );
+                assert!(
+                    text.contains(NOT_READY_HTML),
+                    "browser warmup must reload without reflecting the target: {text}"
+                );
+                assert!(
+                    !text.contains("code=x"),
+                    "must not echo OAuth query into HTML: {text}"
+                );
+            }
         };
         super::serve_while(&listener, work).await;
     }
@@ -357,6 +450,10 @@ mod tests {
             assert!(
                 text.starts_with("HTTP/1.1 503 Service Unavailable"),
                 "unexpected: {text}"
+            );
+            assert!(
+                text.contains("content-type: text/html; charset=utf-8"),
+                "document requests must not get JSON: {text}"
             );
         };
         super::serve_while(&listener, work).await;

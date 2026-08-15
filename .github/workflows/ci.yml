@@ -57,6 +57,9 @@ jobs:
       - name: cargo clippy API without embedded UI
         run: cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
 
+      - name: frontend warmup contract
+        run: node --test scripts/frontend-warmup-test.mjs
+
       - name: dual-process smoke (no Discord)
         run: cargo test --locked --test dual_process_smoke -- --nocapture
 

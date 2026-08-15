@@ -96,16 +96,19 @@ async function api(path, method = "GET", body = null) {
   return data;
 }
 
-/** CDN Storage can serve this page while the API is still opening the database. */
+/** CDN Storage can serve this page while the API is still opening the database.
+ *  Keep retrying while the origin advertises the warmup contract. The API
+ *  process either keeps returning 503 `not ready`, hands off to axum, or
+ *  exits — a parallel client deadline would give up while the origin is
+ *  still legitimately starting. */
 async function waitForApiMe() {
-  const deadline = Date.now() + 6 * 60 * 1000;
   let delay = 500;
   let sawWarmup = false;
   while (true) {
     try {
       return await api("/api/me");
     } catch (e) {
-      if (!isApiWarmup(e) || Date.now() >= deadline) throw e;
+      if (!isApiWarmup(e)) throw e;
       if (!sawWarmup) {
         sawWarmup = true;
         showView("startup-view");
@@ -159,9 +162,6 @@ async function init() {
   } catch (e) {
     if (isUnauthenticated(e)) {
       showView("login-view");
-    } else if (isApiWarmup(e)) {
-      showView("startup-view");
-      toast("API is still starting. Reload this page in a minute.", "error");
     } else {
       toast("Failed to load: " + e.message, "error");
     }
@@ -193,10 +193,12 @@ function renderTab() {
   content.append(fn());
 }
 
-document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
-  state.tab = b.dataset.tab;
-  renderTab();
-}));
+function bindTabButtons() {
+  document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
+    state.tab = b.dataset.tab;
+    renderTab();
+  }));
+}
 
 function tabDashboard() {
   const g = selectedGuild();
@@ -1063,16 +1065,24 @@ function closeOverlay() {
   if (m) m.remove();
 }
 
-const loginLink = $("#login-link");
-if (loginLink) loginLink.href = authUrl("/login");
-$("#logout-btn").addEventListener("click", async () => {
-  try {
-    const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
-    const data = await res.json();
-    window.location = data.return_to || "/";
-  } catch (_) {
-    // The session delete may have succeeded even if navigation failed.
-    window.location = "/";
-  }
-});
-init().catch((e) => { toast("Init failed: " + e.message, "error"); });
+function bootUi() {
+  bindTabButtons();
+  const loginLink = $("#login-link");
+  if (loginLink) loginLink.href = authUrl("/login");
+  const logoutBtn = $("#logout-btn");
+  if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+    try {
+      const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
+      const data = await res.json();
+      window.location = data.return_to || "/";
+    } catch (_) {
+      // The session delete may have succeeded even if navigation failed.
+      window.location = "/";
+    }
+  });
+  init().catch((e) => { toast("Init failed: " + e.message, "error"); });
+}
+
+if (typeof document !== "undefined" && document.getElementById?.("app")) {
+  bootUi();
+}

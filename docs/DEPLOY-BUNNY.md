@@ -91,6 +91,9 @@ into the private repo when you want repeats. Store these secrets there:
 Dispatch the workflow with the same jModGuard git tag as the container
 images. The runner checks out that tag and uploads `index.html`, `app.js`,
 and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
+If a later file fails to upload, or a configured Pull Zone purge fails,
+the script restores the previous Storage files (or deletes first-publish
+objects) so origin does not sit on a mixed or unpurged revision.
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 6),
@@ -164,10 +167,12 @@ hostname. The Pull Zone from step 2 is the public URL.
 The API still listens on container port `8080` so Bunny can origin-pull
 it and so platform health checks can hit `GET`/`HEAD /health`. Until
 axum takes over (database open, AppState primary-version prime, router
-build), only `/health` returns `200`; `/`, `/api`, `/login`, and
-`/oauth` return `503` with JSON `{"error":"not ready"}` and `Retry-After`.
-The admin page retries `/api/me` through that window instead of showing a
-hard load error. Enable sticky sessions on that origin:
+build), only `/health` returns `200`. `/api` returns `503` with JSON
+`{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
+return HTML `503` that refreshes the same URL (so an in-flight Discord
+redirect is not replaced by a JSON error page). The admin page retries
+`/api/me` for as long as that JSON warmup is advertised. Enable sticky
+sessions on that origin:
 sessions live in that one process.
 
 ```dotenv
