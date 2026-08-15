@@ -719,6 +719,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_head_matches_get_without_body() {
+        // axum `get` already accepts HEAD and strips the body. Lock that so a
+        // later method-router change cannot make HEAD 405 after the startup
+        // listener (which answers HEAD) hands the socket over.
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
+        assert!(body.is_empty(), "HEAD must omit the GET body");
+    }
+
+    #[tokio::test]
     async fn health_trailing_slash_matches_startup_listener() {
         let app = test_app();
         let res = app
@@ -758,6 +779,97 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn startup_listener_handoff_to_axum_keeps_liveness() {
+        // Same composition as jmodguard-api: raw /health on the public bind
+        // until open finishes, then axum takes that socket. Application
+        // routes must flip from startup 503 to the real router.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut last_err = None;
+            for _ in 0..50 {
+                match tokio::net::TcpStream::connect(addr).await {
+                    Ok(mut stream) => {
+                        stream
+                            .write_all(
+                                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let mut buf = vec![0u8; 1024];
+                        let n = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            stream.read(&mut buf),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        return String::from_utf8_lossy(&buf[..n]).into_owned();
+                    }
+                    Err(error) => {
+                        last_err = Some(error);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+            panic!("never connected to {addr}: {last_err:?}");
+        }
+        // Same composition as jmodguard-api: each synchronous startup step on
+        // spawn_blocking so the accept loop can keep answering /health.
+        let serving = crate::health::serve_while(&listener, async {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            })
+            .await
+            .unwrap();
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                test_app()
+            })
+            .await
+            .unwrap()
+        });
+        let probes = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(350);
+            while tokio::time::Instant::now() < deadline {
+                let health = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    http_get(addr, "/health"),
+                )
+                .await
+                .expect("health must answer during AppState prime and router build");
+                assert!(
+                    health.starts_with("HTTP/1.1 200 OK"),
+                    "startup liveness: {health}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let api = http_get(addr, "/api/me").await;
+            assert!(
+                api.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "startup must fence app routes: {api}"
+            );
+        };
+        let (web_app, _) = tokio::join!(serving, probes);
+        tokio::spawn(async move {
+            axum::serve(listener, web_app).await.ok();
+        });
+        let health = http_get(addr, "/health").await;
+        assert!(
+            health.starts_with("HTTP/1.1 200 OK"),
+            "axum liveness after handoff: {health}"
+        );
+        let api = http_get(addr, "/api/me").await;
+        assert!(
+            api.starts_with("HTTP/1.1 400"),
+            "app routes must leave the startup 503 after handoff: {api}"
+        );
     }
 
     #[tokio::test]

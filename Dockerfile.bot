@@ -22,7 +22,7 @@ ENV JMODGUARD_CONFIG=/data/config.toml
 ENV JMODGUARD_LOG_DIRECTORY=""
 # Fail closed unless Bunny/portable remote credentials are present.
 ENV JMODGUARD_REQUIRE_REMOTE_DB=1
-# Process-local liveness for Magic Containers HTTP GET /health.
+# Process-local liveness for Magic Containers HTTP GET/HEAD /health.
 ENV JMODGUARD_HEALTH_BIND=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["jmodguard-bot"]

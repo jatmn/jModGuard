@@ -143,9 +143,10 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
     })
 }
 
-/// API (and remote bot) startup retries incomplete schema, SQLite locks, and
-/// transient remote transport errors. Auth failures still fail immediately.
-pub fn is_api_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
+/// Startup retries incomplete schema, SQLite locks, and transient remote
+/// transport errors. Auth failures still fail immediately. Shared by the
+/// API (`migrate=false`) and the bot (`migrate=true`).
+pub fn is_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
     if is_schema_not_ready(err) || is_sqlite_startup_lock(err) {
         return true;
     }
@@ -434,13 +435,14 @@ impl Db {
             .take()
     }
 
-    /// Retries `open_with` while the bot is still applying schema, and while a
-    /// remote database is still waking up.
+    /// Retries `open_with` for both processes: incomplete schema, a local
+    /// SQLite lock, or a remote database that is still waking.
     ///
     /// systemd `After=jmodguard-bot.service` only waits for the bot *process*
     /// to exist, not for migrate to finish. Fail-fast plus `Restart=on-failure`
     /// turns that into a crash loop. Auth failures and other non-retryable
-    /// errors still fail immediately.
+    /// errors still fail immediately. Exhaustion wraps the last classified
+    /// error; callers add process-specific context (API vs bot).
     pub async fn open_with_until_ready(
         opts: DbOpenOptions,
         attempts: u32,
@@ -465,9 +467,9 @@ impl Db {
             let opened = Self::open_with_on_worker(opts.clone()).await;
             match opened {
                 Ok(db) => return Ok(db),
-                Err(err) if is_api_startup_retryable(&err, !opts.url.trim().is_empty()) => {
+                Err(err) if is_startup_retryable(&err, !opts.url.trim().is_empty()) => {
                     tracing::info!(
-                        "database not ready for API (attempt {}/{attempts}); waiting for jmodguard-bot: {err:#}",
+                        "database not ready (attempt {}/{attempts}); retrying: {err:#}",
                         i + 1
                     );
                     last = Some(err);
@@ -491,7 +493,7 @@ impl Db {
         Err(last.unwrap_or_else(|| {
             anyhow::Error::new(SchemaNotReady("database schema not ready".into()))
         }))
-        .context("timed out waiting for jmodguard-bot to migrate the database")
+        .context("timed out retrying database open")
     }
 
     async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {

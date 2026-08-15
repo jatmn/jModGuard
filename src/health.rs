@@ -1,15 +1,16 @@
 //! Tiny process-local HTTP health listener.
 //!
 //! The bot binary does not enable the `web` feature, so Magic Containers
-//! health checks cannot use axum. This listener answers `GET /health` and
-//! `GET /health/` with 200 once the process has bound the port, without
-//! cookies, routing, or a database round-trip. `/` is not liveness. The
-//! API exposes the same paths on its public bind via axum, and answers
-//! probes on that socket while the database is still opening. Application
-//! routes (`/`, `/api`, `/login`, `/oauth`, …) must not look successful
-//! during that window: they get `503` until axum takes over. `/health` is
-//! liveness, not database readiness: a pooled remote `SELECT 1` can wait
-//! tens of seconds and false-fail a healthy process under load.
+//! health checks cannot use axum. This listener answers `GET`/`HEAD`
+//! `/health` and `/health/` with 200 once the process has bound the port,
+//! without cookies, routing, or a database round-trip. `/` is not liveness.
+//! The API exposes the same paths on its public bind via axum, and answers
+//! probes on that socket until axum takes over (database open, AppState
+//! primary-version prime, router build). Application routes (`/`, `/api`,
+//! `/login`, `/oauth`, …) must not look successful during that window: they
+//! get `503`. `/health` is liveness, not database readiness: a pooled
+//! remote `SELECT 1` can wait tens of seconds and false-fail a healthy
+//! process under load.
 //!
 //! Bind and accept before opening the database. A closed port during
 //! remote first-boot retries is a failed liveness probe.
@@ -22,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-const MAX_STARTUP_HEALTH_CONNECTIONS: usize = 16;
+const MAX_HEALTH_CONNECTIONS: usize = 16;
 
 /// Binds `addr` and returns the listener. Call this during startup so a
 /// occupied health port fails the process before Discord connects.
@@ -33,23 +34,16 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 }
 
 /// Serves `/health` on an already-bound listener until the process exits.
+///
+/// Concurrency is the same bounded-accept loop as API startup (`serve_while`):
+/// a slow probe must not stall the next one, and excess sockets stay in the
+/// listen backlog instead of being accepted and dropped.
 pub async fn serve_listener(listener: TcpListener) -> Result<()> {
     tracing::info!(
         "health listener on http://{}/health",
         listener.local_addr()?
     );
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                // Handle one probe at a time. Health is tiny; unbounded
-                // spawn would let a connection flood create tasks.
-                if let Err(error) = answer_connection(stream).await {
-                    tracing::debug!("health connection ended: {error:#}");
-                }
-            }
-            Err(error) => tracing::warn!("health accept failed: {error}"),
-        }
-    }
+    serve_while(&listener, std::future::pending::<Result<()>>()).await
 }
 
 /// Binds `addr` and serves `/health` until the process exits.
@@ -64,18 +58,22 @@ where
     F: Future<Output = T>,
 {
     tokio::pin!(work);
-    let permits = Arc::new(Semaphore::new(MAX_STARTUP_HEALTH_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(MAX_HEALTH_CONNECTIONS));
     loop {
+        // Acquire is the wait primitive. `available_permits() > 0` as a
+        // `select!` guard never wakes when a handler finishes, so a full
+        // set of in-flight probes would freeze accept until `work` ended.
+        let permit = tokio::select! {
+            result = &mut work => return result,
+            permit = Arc::clone(&permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return (&mut work).await,
+            },
+        };
         tokio::select! {
             result = &mut work => return result,
-            // Do not accept when handlers are saturated. Accept-then-drop
-            // RSTs probes; leaving them in the listen backlog applies
-            // backpressure until a slot frees or `work` finishes.
-            accept = listener.accept(), if permits.available_permits() > 0 => match accept {
+            accept = listener.accept() => match accept {
                 Ok((stream, _)) => {
-                    let permit = Arc::clone(&permits)
-                        .try_acquire_owned()
-                        .expect("accept is gated on an available health permit");
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(error) = answer_connection(stream).await {
@@ -101,13 +99,16 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
         .ok()
         .and_then(Result::ok)
         .unwrap_or(0);
-    let (status, body) = if is_liveness_request(&buf[..n]) {
+    let probe = parse_probe(&buf[..n]);
+    let (status, body) = if probe.liveness {
         ("200 OK", "ok")
     } else {
         ("503 Service Unavailable", "not ready")
     };
+    // HEAD must advertise the GET body length and omit the body.
+    let body_out = if probe.head { "" } else { body };
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body_out}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
@@ -115,14 +116,40 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn is_liveness_request(buf: &[u8]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Probe {
+    liveness: bool,
+    head: bool,
+}
+
+fn parse_probe(buf: &[u8]) -> Probe {
     let text = std::str::from_utf8(buf).unwrap_or("");
     let line = text.split(['\r', '\n']).next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
-    let path = target.split('?').next().unwrap_or("");
-    matches!(method, "GET" | "HEAD") && is_liveness_path(path)
+    let path = request_target_path(target);
+    let head = method == "HEAD";
+    Probe {
+        liveness: matches!(method, "GET" | "HEAD") && is_liveness_path(path),
+        head,
+    }
+}
+
+/// Path of an HTTP/1.1 request-target (origin-form or absolute-form).
+fn request_target_path(target: &str) -> &str {
+    let target = target.split(['?', '#']).next().unwrap_or("");
+    if target.starts_with('/') {
+        return target;
+    }
+    if let Some(scheme) = target.find("://") {
+        let after_authority = &target[scheme + 3..];
+        return after_authority
+            .find('/')
+            .map(|i| &after_authority[i..])
+            .unwrap_or("/");
+    }
+    target
 }
 
 fn is_liveness_path(path: &str) -> bool {
@@ -131,10 +158,90 @@ fn is_liveness_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::serve;
+    use super::{parse_probe, request_target_path, serve, Probe};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    async fn connect(addr: std::net::SocketAddr) -> TcpStream {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(connected) => return connected,
+                Err(error) => {
+                    last_err = Some(error);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("health listener never accepted: {last_err:?}");
+    }
+
+    async fn exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut stream = connect(addr).await;
+        stream.write_all(request).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[test]
+    fn request_target_path_origin_and_absolute_form() {
+        assert_eq!(request_target_path("/health"), "/health");
+        assert_eq!(request_target_path("/health?x=1"), "/health");
+        assert_eq!(request_target_path("/health/"), "/health/");
+        assert_eq!(
+            request_target_path("http://127.0.0.1:8080/health"),
+            "/health"
+        );
+        assert_eq!(
+            request_target_path("https://probe.example/health/?q=1"),
+            "/health/"
+        );
+        assert_eq!(request_target_path("http://127.0.0.1:8080"), "/");
+    }
+
+    #[test]
+    fn parse_probe_matches_get_and_head_liveness() {
+        assert_eq!(
+            parse_probe(b"GET /health HTTP/1.1"),
+            Probe {
+                liveness: true,
+                head: false
+            }
+        );
+        assert_eq!(
+            parse_probe(b"HEAD /health HTTP/1.1"),
+            Probe {
+                liveness: true,
+                head: true
+            }
+        );
+        assert_eq!(
+            parse_probe(b"GET http://127.0.0.1:8080/health HTTP/1.1"),
+            Probe {
+                liveness: true,
+                head: false
+            }
+        );
+        assert_eq!(
+            parse_probe(b"GET / HTTP/1.1"),
+            Probe {
+                liveness: false,
+                head: false
+            }
+        );
+        assert_eq!(
+            parse_probe(b"POST /health HTTP/1.1"),
+            Probe {
+                liveness: false,
+                head: false
+            }
+        );
+    }
 
     #[tokio::test]
     async fn health_listener_returns_ok() {
@@ -143,35 +250,54 @@ mod tests {
         drop(listener);
         let bind = addr.to_string();
         let server = tokio::spawn(async move { serve(&bind).await });
-        let mut last_err = None;
-        let mut stream = None;
-        for _ in 0..50 {
-            match TcpStream::connect(addr).await {
-                Ok(connected) => {
-                    stream = Some(connected);
-                    break;
-                }
-                Err(error) => {
-                    last_err = Some(error);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            }
-        }
-        let mut stream =
-            stream.unwrap_or_else(|| panic!("health listener never accepted: {last_err:?}"));
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 512];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let text = String::from_utf8_lossy(&buf[..n]);
+        let text = exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
         assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         assert!(text.contains("\r\n\r\nok"), "unexpected: {text}");
+        server.abort();
+    }
 
+    #[tokio::test]
+    async fn health_listener_resumes_accept_after_saturated_handlers_finish() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let bind = addr.to_string();
+        let server = tokio::spawn(async move { serve(&bind).await });
+        let mut held = Vec::new();
+        for _ in 0..super::MAX_HEALTH_CONNECTIONS {
+            held.push(connect(addr).await);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Closing the silent peers frees permits. `select!` must wake on
+        // that release — not only when `work` completes.
+        drop(held);
+        let text = tokio::time::timeout(
+            Duration::from_millis(500),
+            exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+        )
+        .await
+        .expect("permit release must resume accept");
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_listener_answers_while_another_client_is_slow() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let bind = addr.to_string();
+        let server = tokio::spawn(async move { serve(&bind).await });
+        // Hold a connection open without sending. Sequential accept would
+        // wait the 2s read timeout before the next probe can complete.
+        let _slow = connect(addr).await;
+        let text = tokio::time::timeout(
+            Duration::from_millis(500),
+            exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+        )
+        .await
+        .expect("slow peer must not serialize liveness probes");
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         server.abort();
     }
 
@@ -180,32 +306,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let work = async {
-            let mut stream = None;
-            let mut last_err = None;
-            for _ in 0..50 {
-                match TcpStream::connect(addr).await {
-                    Ok(connected) => {
-                        stream = Some(connected);
-                        break;
-                    }
-                    Err(error) => {
-                        last_err = Some(error);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                }
-            }
-            let mut stream =
-                stream.unwrap_or_else(|| panic!("health listener never accepted: {last_err:?}"));
-            stream
-                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = vec![0u8; 512];
-            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let text = exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
             assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
             7u8
         };
@@ -218,25 +319,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let work = async {
-            let mut stream = None;
-            for _ in 0..50 {
-                if let Ok(connected) = TcpStream::connect(addr).await {
-                    stream = Some(connected);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let mut stream = stream.expect("health listener never accepted");
-            stream
-                .write_all(b"GET /api/me HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = vec![0u8; 512];
-            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let text = exchange(addr, b"GET /api/me HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
             assert!(
                 text.starts_with("HTTP/1.1 503 Service Unavailable"),
                 "unexpected: {text}"
@@ -251,25 +334,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let work = async {
-            let mut stream = None;
-            for _ in 0..50 {
-                if let Ok(connected) = TcpStream::connect(addr).await {
-                    stream = Some(connected);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let mut stream = stream.expect("health listener never accepted");
-            stream
-                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = vec![0u8; 512];
-            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let text = exchange(addr, b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
             assert!(
                 text.starts_with("HTTP/1.1 503 Service Unavailable"),
                 "unexpected: {text}"
@@ -283,25 +348,41 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let work = async {
-            let mut stream = None;
-            for _ in 0..50 {
-                if let Ok(connected) = TcpStream::connect(addr).await {
-                    stream = Some(connected);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            let mut stream = stream.expect("health listener never accepted");
-            stream
-                .write_all(b"GET /health/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = vec![0u8; 512];
-            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let text = exchange(addr, b"GET /health/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
+        };
+        super::serve_while(&listener, work).await;
+    }
+
+    #[tokio::test]
+    async fn health_head_has_no_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let text = exchange(addr, b"HEAD /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
+            assert!(
+                text.contains("content-length: 2"),
+                "HEAD must advertise GET body length: {text}"
+            );
+            assert!(
+                text.ends_with("\r\n\r\n"),
+                "HEAD must omit the body: {text:?}"
+            );
+        };
+        super::serve_while(&listener, work).await;
+    }
+
+    #[tokio::test]
+    async fn health_absolute_form_is_liveness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let text = exchange(
+                addr,
+                b"GET http://127.0.0.1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .await;
             assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         };
         super::serve_while(&listener, work).await;

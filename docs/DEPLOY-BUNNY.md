@@ -162,9 +162,10 @@ Do **not** attach a custom domain or a browseable Magic Containers CDN
 hostname. The Pull Zone from step 2 is the public URL.
 
 The API still listens on container port `8080` so Bunny can origin-pull
-it and so platform health checks can hit `GET /health`. Until the
-database is open, only `/health` returns `200`; `/`, `/api`, `/login`,
-and `/oauth` return `503`. Enable sticky sessions on that origin:
+it and so platform health checks can hit `GET`/`HEAD /health`. Until
+axum takes over (database open, AppState primary-version prime, router
+build), only `/health` returns `200`; `/`, `/api`, `/login`, and
+`/oauth` return `503`. Enable sticky sessions on that origin:
 sessions live in that one process.
 
 ```dotenv

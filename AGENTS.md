@@ -99,12 +99,13 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 - Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
   credentials must fail startup, not open local SQLite. Unset it only for an
   intentional local-SQLite container run.
-- Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET /health`
-  are unauthenticated process liveness probes (`ok`, no database). Bind and
-  accept them **before** opening the database. On the API public bind, only
-  `/health` returns 200 during that window; `/`, `/api`, `/login`, and
-  `/oauth` return 503 until axum takes over. Do not put session middleware
-  on `/health`. If the env var is set, bind failure is fatal.
+- Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET`/`HEAD`
+  `/health` are unauthenticated process liveness probes (`ok`, no database).
+  Bind and accept them **before** opening the database. On the API public
+  bind, only `/health` returns 200 until axum takes over (database open,
+  AppState primary-version prime, router build); `/`, `/api`, `/login`, and
+  `/oauth` return 503 in that window. Do not put session middleware on
+  `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /
@@ -174,7 +175,7 @@ src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/moderation.rs    members/messages/retention/audit/warns/bans
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
-src/health.rs          process-local GET /health listener (bot; no axum)
+src/health.rs          process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
 src/state.rs            AppState + config cache + version poll

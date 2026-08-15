@@ -451,7 +451,7 @@ fn api_open_until_ready_times_out_without_bot() {
     .expect("must not succeed without bot migrate");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("timed out waiting for jmodguard-bot"),
+        msg.contains("timed out retrying database open"),
         "unexpected error: {msg}"
     );
     assert!(
@@ -462,33 +462,82 @@ fn api_open_until_ready_times_out_without_bot() {
 }
 
 #[test]
+fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
+    let tmp = tmp_db_path("migrate_retry_timeout");
+    let lock_path = tmp.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = Connection::open(lock_path).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::park();
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    locked_rx.recv().unwrap();
+    struct UnparkOnDrop(std::thread::Thread);
+    impl Drop for UnparkOnDrop {
+        fn drop(&mut self) {
+            self.0.unpark();
+        }
+    }
+    let _unpark = UnparkOnDrop(holder.thread().clone());
+    let err = tokio_test_block_on(Db::open_with_until_ready(
+        DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        },
+        2,
+        std::time::Duration::from_millis(1),
+    ))
+    .err()
+    .expect("exclusive lock must exhaust the retry budget");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("timed out retrying database open"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !msg.contains("waiting for jmodguard-bot"),
+        "bot migrate-open must not report an API wait: {msg}"
+    );
+    drop(_unpark);
+    let _ = holder.join();
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn startup_retries_transient_remote_errors_but_not_auth() {
     let timeout = anyhow::anyhow!("remote database connect timed out after 75s");
-    assert!(crate::db::is_api_startup_retryable(&timeout, true));
+    assert!(crate::db::is_startup_retryable(&timeout, true));
     assert!(
-        !crate::db::is_api_startup_retryable(&timeout, false),
+        !crate::db::is_startup_retryable(&timeout, false),
         "local SQLite must not treat transport timeouts as a migrate race"
     );
     let refused = anyhow::anyhow!("tcp connect error: connection refused");
-    assert!(crate::db::is_api_startup_retryable(&refused, true));
+    assert!(crate::db::is_startup_retryable(&refused, true));
     // libSQL Hrana: `HranaError::Api("status={}, body={}")` — not reqwest's
     // `status code: N`. 502/503 are Bunny wake; 401/403 are credentials.
     let waking = anyhow::anyhow!("Hrana: `api error: `status=503 Service Unavailable, body=``");
-    assert!(crate::db::is_api_startup_retryable(&waking, true));
+    assert!(crate::db::is_startup_retryable(&waking, true));
     let gateway = anyhow::anyhow!("Hrana: `api error: `status=502 Bad Gateway, body=``");
-    assert!(crate::db::is_api_startup_retryable(&gateway, true));
+    assert!(crate::db::is_startup_retryable(&gateway, true));
     let auth = anyhow::anyhow!("Hrana: `api error: `status=401 Unauthorized, body=``");
-    assert!(!crate::db::is_api_startup_retryable(&auth, true));
+    assert!(!crate::db::is_startup_retryable(&auth, true));
     let forbidden = anyhow::anyhow!("Hrana: `api error: `status=403 Forbidden, body=``");
-    assert!(!crate::db::is_api_startup_retryable(&forbidden, true));
+    assert!(!crate::db::is_startup_retryable(&forbidden, true));
     let handshake = anyhow::anyhow!("tls handshake: client authentication timed out");
     assert!(
-        crate::db::is_api_startup_retryable(&handshake, true),
+        crate::db::is_startup_retryable(&handshake, true),
         "TLS wording that contains 'authentication' must still retry"
     );
     let schema = anyhow::anyhow!(crate::db::SchemaNotReady("schema is behind".into()));
-    assert!(crate::db::is_api_startup_retryable(&schema, false));
-    assert!(crate::db::is_api_startup_retryable(&schema, true));
+    assert!(crate::db::is_startup_retryable(&schema, false));
+    assert!(crate::db::is_startup_retryable(&schema, true));
 }
 
 #[test]
