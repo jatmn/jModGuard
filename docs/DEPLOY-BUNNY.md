@@ -88,8 +88,9 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
 
-Dispatch the workflow with the same jModGuard git tag as the container
-images. The runner checks out that tag and uploads `index.html`, `app.js`,
+Dispatch the workflow with the same jModGuard release tag you used for
+the container images (`v1.2.3`, not `main` or a random SHA). The runner
+checks out that tag and uploads `index.html`, `app.js`,
 and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
@@ -105,16 +106,22 @@ these files.
 
 ## 3. Build and publish both images
 
-CI builds `linux/amd64` images and, on `main` and version tags, pushes
-them to GHCR as packages of this public repo:
+GHCR is **release-only**. Everyday pushes to `main` do not publish a new
+image. When you want new containers, publish a GitHub Release (for example
+tag `v1.2.3`) on this repo, or run the `images` workflow by hand. That
+builds `linux/amd64` images and pushes:
 
 ```text
-ghcr.io/jatmn/jmodguard-bot:<tag>
-ghcr.io/jatmn/jmodguard-api:<tag>
+ghcr.io/jatmn/jmodguard-bot:latest
+ghcr.io/jatmn/jmodguard-api:latest
 ```
 
-Use the `sha-<short git SHA>` tag (or `main` after that commit is on the default
-branch). `latest` is only applied to version tags (`v*`).
+The same digest is also tagged with the release name (for example `v1.2.3`).
+The workflow then deletes older GHCR versions so only the current release
+image is stored.
+
+Point Magic Containers at `:latest`. After each release, redeploy or
+restart the apps so they pull the new image.
 
 The API image is JSON + OAuth only. It does not embed `frontend/`.
 
