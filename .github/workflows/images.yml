@@ -1,13 +1,24 @@
 name: images
 
+# Publish GHCR images only when you cut a GitHub Release (or click
+# "Run workflow"). Everyday CI on main/PRs does not push a new image.
+# Each publish retags :latest and deletes older package versions so GHCR
+# only keeps the current release image (version tag + latest, same digest).
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
   pull_request:
+    paths:
+      - "Dockerfile.bot"
+      - "Dockerfile.api"
+      - ".github/workflows/images.yml"
 
-# GHCR packages are created on the first push to main. Magic Containers can
-# pull public GitHub Container Registry images without extra registry auth.
+concurrency:
+  group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Magic Containers can pull public GHCR images without extra registry auth.
 permissions:
   contents: read
   packages: write
@@ -22,9 +33,11 @@ jobs:
           - name: bot
             file: Dockerfile.bot
             image: ghcr.io/jatmn/jmodguard-bot
+            package: jmodguard-bot
           - name: api
             file: Dockerfile.api
             image: ghcr.io/jatmn/jmodguard-api
+            package: jmodguard-api
     steps:
       - uses: actions/checkout@v5
 
@@ -42,10 +55,8 @@ jobs:
         with:
           images: ${{ matrix.image }}
           tags: |
-            type=raw,value=main,enable={{is_default_branch}}
-            type=sha,format=short
+            type=raw,value=latest
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -58,23 +69,20 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-      # GitHub creates GHCR packages as private. Magic Containers can pull
-      # public ghcr.io images without a registry PAT. PATCH /user/packages
-      # is the Actions token identity (github-actions[bot]), not the package
-      # owner — use /users or /orgs for ghcr.io/<owner>/…. The image is
-      # already pushed; a denied visibility API must not fail the workflow.
+      # GitHub creates GHCR packages as private. PATCH /user/packages is the
+      # Actions token identity, not the package owner — use /users or /orgs.
       - name: Make package public
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGE_OWNER: ${{ github.repository_owner }}
           OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE: ${{ matrix.package }}
         run: |
-          pkg="jmodguard-${{ matrix.name }}"
           if [ "${OWNER_TYPE}" = "Organization" ]; then
-            api_path="/orgs/${PACKAGE_OWNER}/packages/container/${pkg}"
+            api_path="/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE}"
           else
-            api_path="/users/${PACKAGE_OWNER}/packages/container/${pkg}"
+            api_path="/users/${PACKAGE_OWNER}/packages/container/${PACKAGE}"
           fi
           for i in 1 2 3 4 5 6; do
             if gh api --method PATCH "${api_path}" \
@@ -84,5 +92,71 @@ jobs:
             fi
             sleep 5
           done
-          echo "::warning::Could not set ${pkg} public via ${api_path}. Set visibility on the GitHub package page."
+          echo "::warning::Could not set ${PACKAGE} public via ${api_path}. Set visibility on the GitHub package page."
           exit 0
+
+      - name: Keep only the current image
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -eu
+          if [ "${OWNER_TYPE}" = "Organization" ]; then
+            list_path="/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE}/versions"
+          else
+            list_path="/users/${PACKAGE_OWNER}/packages/container/${PACKAGE}/versions"
+          fi
+
+          versions="$(gh api --paginate "${list_path}" -H "Accept: application/vnd.github+json")"
+          keep_id="$(printf '%s' "${versions}" | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          if not isinstance(data, list):
+              data = [data]
+          keep = None
+          for v in data:
+              tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
+              if "latest" in tags:
+                  keep = v["id"]
+                  break
+          if keep is None and data:
+              keep = data[0]["id"]
+          print(keep or "")
+          ')"
+
+          if [ -z "${keep_id}" ]; then
+            echo "::warning::No GHCR versions found for ${PACKAGE}; skip prune."
+            exit 0
+          fi
+
+          printf '%s' "${versions}" | KEEP_ID="${keep_id}" LIST_PATH="${list_path}" python3 -c '
+          import json, os, subprocess, sys
+          data = json.load(sys.stdin)
+          if not isinstance(data, list):
+              data = [data]
+          keep = int(os.environ["KEEP_ID"])
+          list_path = os.environ["LIST_PATH"]
+          deleted = 0
+          for v in data:
+              vid = v["id"]
+              if vid == keep:
+                  tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
+                  print(f"keeping {vid} tags={tags}")
+                  continue
+              tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
+              path = f"{list_path}/{vid}"
+              r = subprocess.run(
+                  ["gh", "api", "--method", "DELETE", path, "-H", "Accept: application/vnd.github+json"],
+                  capture_output=True,
+                  text=True,
+              )
+              if r.returncode == 0:
+                  deleted += 1
+                  print(f"deleted {vid} tags={tags}")
+              else:
+                  print(f"::warning::Could not delete {vid} tags={tags}: {r.stderr.strip() or r.stdout.strip()}")
+          print(f"deleted {deleted} older version(s); kept {keep}")
+          '
