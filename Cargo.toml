@@ -8,9 +8,13 @@ autobins = false
 rust-version = "1.96"
 
 [features]
-default = ["web"]
-# WebUI/API (axum + sessions + embedded SPA). Bot builds with --no-default-features.
+default = ["web", "embed-ui"]
+# JSON API + OAuth (axum + sessions). Bot builds with --no-default-features.
+# The API container image uses this without `embed-ui`: Bunny serves `frontend/`
+# from Storage/CDN, and Magic Containers stay private.
 web = ["dep:axum", "dep:tower-sessions", "dep:tower-http"]
+# Bake `frontend/` into the API binary for local SETUP.md. Not used on Bunny.
+embed-ui = ["web"]
 
 [[bin]]
 name = "jmodguard-bot"

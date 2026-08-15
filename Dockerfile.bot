@@ -20,4 +20,9 @@ ENV JMODGUARD_CONFIG=/data/config.toml
 # Container platforms collect stdout/stderr. An empty directory disables
 # rolling files; override this if persistent file logs are desired.
 ENV JMODGUARD_LOG_DIRECTORY=""
+# Fail closed unless Bunny/portable remote credentials are present.
+ENV JMODGUARD_REQUIRE_REMOTE_DB=1
+# Process-local liveness for Magic Containers HTTP GET/HEAD /health.
+ENV JMODGUARD_HEALTH_BIND=0.0.0.0:8080
+EXPOSE 8080
 ENTRYPOINT ["jmodguard-bot"]

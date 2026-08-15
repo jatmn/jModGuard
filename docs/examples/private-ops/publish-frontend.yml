@@ -1,0 +1,35 @@
+# Copy this workflow into *your* private ops repository.
+# Do not enable it on the public jModGuard repo: it needs Bunny Storage
+# credentials that must not live there.
+#
+# The runner checks out a jModGuard tag from GitHub and uploads frontend/
+# to Bunny Storage (then purges the Pull Zone). That is the designed
+# publisher for the admin UI.
+
+name: Publish jModGuard admin UI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: jModGuard git tag or commit SHA to publish
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out jModGuard source
+        uses: actions/checkout@v5
+        with:
+          repository: jatmn/jModGuard
+          ref: ${{ inputs.ref }}
+
+      - name: Upload frontend/ to Bunny Storage
+        env:
+          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+          BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+        run: bash scripts/publish-frontend-bunny.sh

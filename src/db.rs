@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(debug_assertions)]
 pub use crate::db_compat::test_drop_next_commit_response;
@@ -89,8 +89,80 @@ fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_api_startup_retryable(err: &anyhow::Error) -> bool {
-    is_schema_not_ready(err) || is_sqlite_startup_lock(err)
+/// True when `message` reports this HTTP status. libSQL Hrana formats
+/// `status=503 Service Unavailable`; reqwest-style errors use `status code: 503`.
+fn http_status_in(message: &str, code: u16) -> bool {
+    let code = code.to_string();
+    message.contains(&format!("status={code}")) || message.contains(&format!("status code: {code}"))
+}
+
+fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
+    err.chain().any(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("unauthorized")
+            || message.contains("forbidden")
+            || message.contains("invalid token")
+            || message.contains("authentication failed")
+            || message.contains("authentication error")
+            || http_status_in(&message, 401)
+            || http_status_in(&message, 403)
+    })
+}
+
+fn is_transient_remote_open(err: &anyhow::Error) -> bool {
+    if is_database_operation_timeout(err) {
+        return true;
+    }
+    err.chain().any(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        const NEEDLES: &[&str] = &[
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "try again",
+            "network is unreachable",
+            "no route to host",
+            "failed to lookup",
+            "dns error",
+            "name or service not known",
+            "tls handshake",
+            "handshake timed",
+            "server is unavailable",
+            "bad gateway",
+            "goaway",
+            "stream closed",
+        ];
+        NEEDLES.iter().any(|needle| message.contains(needle))
+            || http_status_in(&message, 502)
+            || http_status_in(&message, 503)
+    })
+}
+
+/// Startup retries incomplete schema, SQLite locks, and transient remote
+/// transport errors. Auth failures still fail immediately. Shared by the
+/// API (`migrate=false`) and the bot (`migrate=true`).
+pub fn is_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
+    if is_schema_not_ready(err) || is_sqlite_startup_lock(err) {
+        return true;
+    }
+    remote && !is_rejected_remote_auth(err) && is_transient_remote_open(err)
+}
+
+/// How long the API (and a remote bot) should keep retrying `open_with`.
+/// The attempt count and delay define when new attempts may start. An
+/// in-flight `open_with` is allowed to finish so migrate/bootstrap work is
+/// not abandoned and the last error stays classified.
+pub fn startup_open_retry(opts: &DbOpenOptions) -> (u32, Duration) {
+    if opts.url.trim().is_empty() {
+        (30, Duration::from_secs(1))
+    } else {
+        (180, Duration::from_secs(2))
+    }
 }
 
 /// Options for opening either local SQLite or a remote libSQL database.
@@ -244,7 +316,8 @@ impl Db {
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
-            runtime.block_on(
+            runtime.block_on_database(
+                "connect",
                 libsql::Builder::new_remote(opts.url.clone(), opts.token.clone()).build(),
             )?
         } else {
@@ -274,11 +347,13 @@ impl Db {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
             if opts.migrate {
-                // A previous successful boot may have left this marker behind.
-                // Clear it before any new migration/default work so an API
-                // restarting concurrently cannot mistake stale readiness for
-                // completion of this bootstrap.
-                clear_bootstrap_complete(&bootstrap)?;
+                // Hide readiness only when this open will actually rebuild
+                // schema/defaults. Clearing on every reconnect made a
+                // retryable pool failure look like an incomplete first boot
+                // and blocked the API for the whole remote retry window.
+                if migrate_open_needs_api_fence(&bootstrap)? {
+                    clear_bootstrap_complete(&bootstrap)?;
+                }
                 migrate_conn(&mut bootstrap)?;
                 // Bot is authority for terminal defaults: sync from config every
                 // migrate-open so both processes resolve empty global fields from
@@ -298,9 +373,20 @@ impl Db {
                 // while a new bot bootstrap is in progress on the primary.
                 let _ = read_bootstrap_defaults_primary(&bootstrap)?;
             }
-            // Only publish readiness after all migrations, durable defaults,
-            // default rows, and the settings heal have completed. Otherwise an
-            // API process can serve an incomplete registry during first boot.
+
+            let pool_size = opts.pool_size.max(2) as usize;
+            let mut connections = Vec::with_capacity(pool_size);
+            for _ in 0..pool_size {
+                let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
+                    .context("failed to create pooled database connection")?;
+                configure_connection(&connection, remote)?;
+                connections.push(connection);
+            }
+
+            // Publish readiness only after the pool exists. A retry of
+            // `open_with_until_ready` (remote first-boot) would otherwise
+            // clear this marker after a later pool-connect failure, while an
+            // API that already passed the gate is serving.
             if opts.migrate {
                 write_meta_string_conn(
                     &bootstrap,
@@ -308,35 +394,26 @@ impl Db {
                     &MIGRATIONS.len().to_string(),
                 )?;
             }
-        }
 
-        let pool_size = opts.pool_size.max(2) as usize;
-        let mut connections = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
-                .context("failed to create pooled database connection")?;
-            configure_connection(&connection, remote)?;
-            connections.push(connection);
-        }
-
-        Ok(Self {
-            _database: Arc::clone(&database),
-            runtime: runtime.clone(),
-            connections: Arc::new(ConnectionPool {
-                idle: Mutex::new(connections),
-                database,
+            Ok(Self {
+                _database: Arc::clone(&database),
                 runtime: runtime.clone(),
-                remote,
-            }),
-            permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
-            permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
-            required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
-            settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(debug_assertions)]
-            test_config_snapshot: Arc::new(Mutex::new(None)),
-        })
+                connections: Arc::new(ConnectionPool {
+                    idle: Mutex::new(connections),
+                    database,
+                    runtime: runtime.clone(),
+                    remote,
+                }),
+                permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
+                required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
+                settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(debug_assertions)]
+                test_config_snapshot: Arc::new(Mutex::new(None)),
+            })
+        }
     }
 
     /// Fault injection for remote replica-lag regression coverage. The next
@@ -358,37 +435,80 @@ impl Db {
             .take()
     }
 
-    /// Retries `open_with` while the bot is still applying schema.
+    /// Retries `open_with` for both processes: incomplete schema, a local
+    /// SQLite lock, or a remote database that is still waking.
     ///
     /// systemd `After=jmodguard-bot.service` only waits for the bot *process*
     /// to exist, not for migrate to finish. Fail-fast plus `Restart=on-failure`
-    /// turns that into a crash loop. Other errors (remote URL, I/O) still fail
-    /// immediately.
+    /// turns that into a crash loop. Auth failures and other non-retryable
+    /// errors still fail immediately. Exhaustion wraps the last classified
+    /// error; callers add process-specific context (API vs bot).
     pub async fn open_with_until_ready(
         opts: DbOpenOptions,
         attempts: u32,
         delay: Duration,
     ) -> Result<Self> {
         let attempts = attempts.max(1);
+        // `open_with` owns a synchronous libSQL compatibility boundary. Run
+        // each attempt on its own OS thread so callers can continue polling
+        // health and shutdown futures. Do not abort an in-flight open on the
+        // retry deadline: that would drop the real error (including
+        // `SchemaNotReady`) and leave a migrate worker running after the
+        // caller has given up. Shutdown still drops the oneshot receiver;
+        // process exit then abandons the OS thread.
+        let deadline = (!delay.is_zero()).then(|| Instant::now() + delay.saturating_mul(attempts));
         let mut last = None;
         for i in 0..attempts {
-            match Self::open_with(opts.clone()) {
+            if deadline.is_some_and(|deadline| {
+                deadline.saturating_duration_since(Instant::now()).is_zero()
+            }) {
+                break;
+            }
+            let opened = Self::open_with_on_worker(opts.clone()).await;
+            match opened {
                 Ok(db) => return Ok(db),
-                Err(err) if is_api_startup_retryable(&err) => {
+                Err(err) if is_startup_retryable(&err, !opts.url.trim().is_empty()) => {
                     tracing::info!(
-                        "database not ready for API (attempt {}/{attempts}); waiting for jmodguard-bot: {err:#}",
+                        "database not ready (attempt {}/{attempts}); retrying: {err:#}",
                         i + 1
                     );
                     last = Some(err);
                     if i + 1 < attempts {
-                        tokio::time::sleep(delay).await;
+                        let sleep_for = deadline
+                            .map(|deadline| {
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(delay)
+                            })
+                            .unwrap_or(delay);
+                        if sleep_for.is_zero() {
+                            break;
+                        }
+                        tokio::time::sleep(sleep_for).await;
                     }
                 }
                 Err(err) => return Err(err),
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("database schema not ready")))
-            .context("timed out waiting for jmodguard-bot to migrate the database")
+        Err(last.unwrap_or_else(|| {
+            anyhow::Error::new(SchemaNotReady("database schema not ready".into()))
+        }))
+        .context("timed out retrying database open")
+    }
+
+    async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("jmodguard-db-open".into())
+            .spawn(move || {
+                // The receiver can be dropped on shutdown. The worker still
+                // finishes the synchronous open; process exit reaps it.
+                let _ = send.send(Self::open_with(opts));
+            })
+            .context("failed to start database-open worker")?;
+        receive
+            .await
+            .context("database-open worker stopped before returning a result")?
     }
 
     /// Runs a blocking compatibility closure on a libSQL connection off the

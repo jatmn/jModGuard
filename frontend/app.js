@@ -46,6 +46,57 @@ function authUrl(path) {
   return `${base}${path}?return_to=${encodeURIComponent(window.location.origin)}`;
 }
 
+function apiError(message, status, retryAfterMs) {
+  const err = new Error(message);
+  err.status = status;
+  err.retryAfterMs = retryAfterMs;
+  return err;
+}
+
+function parseRetryAfterMs(header) {
+  if (!header) return 0;
+  const seconds = Number(header);
+  if (!Number.isFinite(seconds) || seconds < 0) return 0;
+  return Math.min(seconds, 30) * 1000;
+}
+
+function isUnauthenticated(err) {
+  const msg = String(err && err.message);
+  return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
+}
+
+/** Pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
+function isApiWarmup(err) {
+  return err.status === 503 && String(err && err.message) === "not ready";
+}
+
+/** Origin has not handed off to axum yet.
+ *  Warmup JSON, Bunny 502/504, a dropped fetch, or a proxy HTML 503
+ *  (`api()` reports those as "HTTP 503"). A JSON 503 with a different
+ *  `error` field is an application response and must not spin. */
+function isOriginStarting(err) {
+  if (isApiWarmup(err)) return true;
+  if (!err || !err.status) return true;
+  if (err.status === 502 || err.status === 504) return true;
+  return err.status === 503 && String(err && err.message) === "HTTP 503";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function showView(id) {
+  ["startup-view", "login-view", "main-view"].forEach((name) => {
+    const node = $("#" + name);
+    if (node) node.classList.toggle("hidden", name !== id);
+  });
+}
+
+function setStartupStatus(text) {
+  const node = $("#startup-status");
+  if (node) node.textContent = text;
+}
+
 async function api(path, method = "GET", body = null) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include" };
@@ -56,9 +107,32 @@ async function api(path, method = "GET", body = null) {
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
   if (!res.ok) {
     const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
   }
   return data;
+}
+
+/** CDN Storage can serve this page while the API origin is still binding or
+ *  opening the database. Keep retrying until axum answers `/api/me` — a
+ *  parallel client deadline would give up while Bunny is still origin-pulling
+ *  a starting container. */
+async function waitForApiMe() {
+  let delay = 500;
+  let sawStartup = false;
+  while (true) {
+    try {
+      return await api("/api/me");
+    } catch (e) {
+      if (!isOriginStarting(e)) throw e;
+      if (!sawStartup) {
+        sawStartup = true;
+        showView("startup-view");
+        setStartupStatus("Waiting for the API to finish starting…");
+      }
+      await sleep(Math.max(e.retryAfterMs || 0, delay));
+      delay = Math.min(Math.floor(delay * 1.5), 2000);
+    }
+  }
 }
 
 function toast(msg, kind = "info") {
@@ -75,11 +149,10 @@ function esc(s) {
 
 async function init() {
   try {
-    const me = await api("/api/me");
+    const me = await waitForApiMe();
     state.me = me;
     state.guilds = me.guilds;
-    $("#login-view").classList.add("hidden");
-    $("#main-view").classList.remove("hidden");
+    showView("main-view");
     $("#user-chip").textContent = `${me.user.username} (${me.user.global_name || ""})`.trim();
     const sel = $("#guild-select");
     sel.innerHTML = "";
@@ -103,9 +176,11 @@ async function init() {
     await loadConfig();
     renderTab();
   } catch (e) {
-    if (String(e.message).includes("not authenticated") || String(e.message).includes("401")) {
-      $("#login-view").classList.remove("hidden");
+    if (isUnauthenticated(e)) {
+      showView("login-view");
     } else {
+      showView("startup-view");
+      setStartupStatus("Failed to load: " + (e.message || String(e)));
       toast("Failed to load: " + e.message, "error");
     }
   }
@@ -136,10 +211,12 @@ function renderTab() {
   content.append(fn());
 }
 
-document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
-  state.tab = b.dataset.tab;
-  renderTab();
-}));
+function bindTabButtons() {
+  document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
+    state.tab = b.dataset.tab;
+    renderTab();
+  }));
+}
 
 function tabDashboard() {
   const g = selectedGuild();
@@ -1006,16 +1083,24 @@ function closeOverlay() {
   if (m) m.remove();
 }
 
-const loginLink = $("#login-link");
-if (loginLink) loginLink.href = authUrl("/login");
-$("#logout-btn").addEventListener("click", async () => {
-  try {
-    const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
-    const data = await res.json();
-    window.location = data.return_to || "/";
-  } catch (_) {
-    // The session delete may have succeeded even if navigation failed.
-    window.location = "/";
-  }
-});
-init().catch((e) => { toast("Init failed: " + e.message, "error"); });
+function bootUi() {
+  bindTabButtons();
+  const loginLink = $("#login-link");
+  if (loginLink) loginLink.href = authUrl("/login");
+  const logoutBtn = $("#logout-btn");
+  if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+    try {
+      const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
+      const data = await res.json();
+      window.location = data.return_to || "/";
+    } catch (_) {
+      // The session delete may have succeeded even if navigation failed.
+      window.location = "/";
+    }
+  });
+  init().catch((e) => { toast("Init failed: " + e.message, "error"); });
+}
+
+if (typeof document !== "undefined" && document.getElementById?.("app")) {
+  bootUi();
+}

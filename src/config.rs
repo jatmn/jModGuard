@@ -132,6 +132,65 @@ impl Config {
         Ok(cfg)
     }
 
+    /// True when this process is configured for a remote libSQL database.
+    pub fn is_remote_db(&self) -> bool {
+        !self.db.url.trim().is_empty()
+    }
+
+    /// Optional process-local health bind (`JMODGUARD_HEALTH_BIND`).
+    /// Empty / unset disables the bot health listener. Container images set
+    /// `0.0.0.0:8080` so Magic Containers HTTP GET `/health` has a port.
+    pub fn health_bind(&self) -> Option<String> {
+        match env::var("JMODGUARD_HEALTH_BIND") {
+            Ok(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Reject a public HTTP bind that still uses a localhost or non-HTTPS
+    /// OAuth origin.
+    ///
+    /// Call this from `jmodguard-api` only. Local `127.0.0.1` binds keep the
+    /// SETUP.md default `http://localhost:8080`. Container images bind
+    /// `0.0.0.0:8080`, so they must set `JMODGUARD_WEB_BASE_URL` to the public
+    /// HTTPS origin browsers open (the CDN hostname on Bunny). Magic Container
+    /// hostnames are not a stable, detectable class — this check enforces
+    /// HTTPS + non-loopback, not a particular DNS suffix.
+    pub fn validate_public_base_url(&self) -> Result<()> {
+        if !bind_is_unspecified(&self.web.bind) {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(&self.web.base_url)
+            .with_context(|| format!("invalid web.base_url `{}`", self.web.base_url))?;
+        let host = url.host_str().unwrap_or("");
+        if host_is_loopback(host) {
+            anyhow::bail!(
+                "jmodguard-api is bound on `{}` but web.base_url is `{}`. \
+                 Set JMODGUARD_WEB_BASE_URL to the public HTTPS origin \
+                 (the CDN hostname browsers open, not a Magic Container). \
+                 It must match the Discord OAuth redirect.",
+                self.web.bind,
+                self.web.base_url
+            );
+        }
+        if url.scheme() != "https" {
+            anyhow::bail!(
+                "jmodguard-api is bound on `{}` so web.base_url must be https \
+                 (got `{}`). Discord OAuth and Secure session cookies require it.",
+                self.web.bind,
+                self.web.base_url
+            );
+        }
+        Ok(())
+    }
+
     /// Reject CORS values which would otherwise make tower-http panic while
     /// building a credentialed `AllowOrigin::list` layer.
     ///
@@ -170,33 +229,29 @@ impl Config {
 
     fn apply_env(&mut self) -> Result<()> {
         if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
-            self.discord.token = v;
+            self.discord.token = v.trim().to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_DB_PATH") {
-            self.db.path = PathBuf::from(v);
+            self.db.path = PathBuf::from(v.trim());
         }
         let portable = (
-            env::var("JMODGUARD_DB_URL").ok(),
-            env::var("JMODGUARD_DB_TOKEN").ok(),
+            nonempty_env("JMODGUARD_DB_URL"),
+            nonempty_env("JMODGUARD_DB_TOKEN"),
         );
         let bunny = (
-            env::var("BUNNY_DATABASE_URL").ok(),
-            env::var("BUNNY_DATABASE_AUTH_TOKEN").ok(),
+            nonempty_env("BUNNY_DATABASE_URL"),
+            nonempty_env("BUNNY_DATABASE_AUTH_TOKEN"),
         );
         let selected = if portable.0.is_some() || portable.1.is_some() {
             match portable {
-                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-                    Some((url.trim().to_string(), token))
-                }
+                (Some(url), Some(token)) => Some((url, token)),
                 _ => anyhow::bail!(
                     "JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN must be set together and non-empty"
                 ),
             }
         } else if bunny.0.is_some() || bunny.1.is_some() {
             match bunny {
-                (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-                    Some((url.trim().to_string(), token))
-                }
+                (Some(url), Some(token)) => Some((url, token)),
                 _ => anyhow::bail!(
                     "BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN must be set together and non-empty"
                 ),
@@ -208,17 +263,27 @@ impl Config {
             self.db.url = url;
             self.db.token = token;
         }
+        if env_flag("JMODGUARD_REQUIRE_REMOTE_DB")
+            && (self.db.url.trim().is_empty() || self.db.token.trim().is_empty())
+        {
+            anyhow::bail!(
+                "JMODGUARD_REQUIRE_REMOTE_DB is set but no complete remote database URL/token pair was found. \
+                 Set BUNNY_DATABASE_URL and BUNNY_DATABASE_AUTH_TOKEN \
+                 (or JMODGUARD_DB_URL and JMODGUARD_DB_TOKEN). \
+                 Unset JMODGUARD_REQUIRE_REMOTE_DB only for a local SQLite run."
+            );
+        }
         if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
-            self.web.bind = v;
+            self.web.bind = v.trim().to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_WEB_BASE_URL") {
-            self.web.base_url = v;
+            self.web.base_url = v.trim().trim_end_matches('/').to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_ID") {
-            self.web.oauth_client_id = v;
+            self.web.oauth_client_id = v.trim().to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_SECRET") {
-            self.web.oauth_client_secret = v;
+            self.web.oauth_client_secret = v.trim().to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_CORS_ORIGINS") {
             self.web.cors_origins = v
@@ -227,24 +292,86 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        if let Ok(v) = env::var("JMODGUARD_OWNER_ID")
-            && let Ok(id) = v.parse()
-        {
-            self.bot.owner_id = id;
+        if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.owner_id = v.parse().with_context(|| {
+                    format!("JMODGUARD_OWNER_ID must be a Discord snowflake, got `{v}`")
+                })?;
+            }
         }
-        if let Ok(v) = env::var("JMODGUARD_CONFIG_POLL_SECS")
-            && let Ok(secs) = v.parse()
-        {
-            self.bot.config_poll_secs = secs;
+        if let Ok(v) = env::var("JMODGUARD_CONFIG_POLL_SECS") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.config_poll_secs = v.parse().with_context(|| {
+                    format!("JMODGUARD_CONFIG_POLL_SECS must be a positive integer, got `{v}`")
+                })?;
+            }
         }
         if let Ok(v) = env::var("JMODGUARD_LOG_LEVEL") {
-            self.log.level = v;
+            self.log.level = v.trim().to_string();
         }
         if let Ok(v) = env::var("JMODGUARD_LOG_DIRECTORY") {
-            self.log.directory = PathBuf::from(v);
+            self.log.directory = PathBuf::from(v.trim());
         }
         Ok(())
     }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn bind_is_unspecified(bind: &str) -> bool {
+    let host = bind_host(bind);
+    host == "0.0.0.0" || host == "::" || host == "[::]"
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(address) => address.is_loopback() || address.is_unspecified(),
+        std::net::IpAddr::V6(address) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback() || address.is_unspecified())
+        }
+    }
+}
+
+fn bind_host(bind: &str) -> &str {
+    let bind = bind.trim();
+    if let Some(rest) = bind.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once("]:")
+    {
+        return host;
+    }
+    bind.rsplit_once(':').map(|(host, _)| host).unwrap_or(bind)
 }
 
 #[cfg(test)]
@@ -349,5 +476,148 @@ mod tests {
             std::env::set_var("JMODGUARD_DB_TOKEN", "   ");
         }
         assert!(cfg.apply_env().is_err());
+    }
+
+    #[test]
+    fn remote_tokens_are_trimmed() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+            "JMODGUARD_REQUIRE_REMOTE_DB",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var("BUNNY_DATABASE_URL", "  libsql://example.bunnydb.test\n");
+            std::env::set_var("BUNNY_DATABASE_AUTH_TOKEN", " bunny-test-token\n");
+        }
+
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.db.url, "libsql://example.bunnydb.test");
+        assert_eq!(cfg.db.token, "bunny-test-token");
+    }
+
+    #[test]
+    fn require_remote_db_fails_closed_without_credentials() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+            "JMODGUARD_REQUIRE_REMOTE_DB",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe { std::env::set_var("JMODGUARD_REQUIRE_REMOTE_DB", "1") };
+
+        let mut cfg = Config::default();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("JMODGUARD_REQUIRE_REMOTE_DB"),
+            "unexpected: {err:#}"
+        );
+        assert!(cfg.db.url.is_empty());
+    }
+
+    #[test]
+    fn blank_portable_env_does_not_block_bunny_credentials() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var("JMODGUARD_DB_URL", "   ");
+            std::env::set_var("JMODGUARD_DB_TOKEN", "");
+            std::env::set_var("BUNNY_DATABASE_URL", "libsql://bunny.example");
+            std::env::set_var("BUNNY_DATABASE_AUTH_TOKEN", "bunny-secret");
+        }
+
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.db.url, "libsql://bunny.example");
+        assert_eq!(cfg.db.token, "bunny-secret");
+    }
+
+    #[test]
+    fn require_remote_db_fails_closed_with_url_but_no_token() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_URL",
+            "JMODGUARD_DB_TOKEN",
+            "BUNNY_DATABASE_URL",
+            "BUNNY_DATABASE_AUTH_TOKEN",
+            "JMODGUARD_REQUIRE_REMOTE_DB",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe { std::env::set_var("JMODGUARD_REQUIRE_REMOTE_DB", "1") };
+
+        let mut cfg = Config::default();
+        cfg.db.url = "libsql://example.bunnydb.test".into();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("complete remote database URL/token pair"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn public_bind_rejects_localhost_oauth_origin() {
+        let mut cfg = Config::default();
+        cfg.web.bind = "0.0.0.0:8080".into();
+        cfg.web.base_url = "http://localhost:8080".into();
+        let err = cfg.validate_public_base_url().unwrap_err();
+        assert!(
+            err.to_string().contains("JMODGUARD_WEB_BASE_URL"),
+            "unexpected: {err:#}"
+        );
+
+        cfg.web.base_url = "https://jmodguard.example.b-cdn.net".into();
+        cfg.validate_public_base_url().unwrap();
+
+        for origin in ["https://127.0.0.2", "https://[::]", "https://localhost."] {
+            cfg.web.base_url = origin.into();
+            assert!(
+                cfg.validate_public_base_url().is_err(),
+                "public bind must reject {origin}"
+            );
+        }
+
+        cfg.web.bind = "127.0.0.1:8080".into();
+        cfg.web.base_url = "http://localhost:8080".into();
+        cfg.validate_public_base_url().unwrap();
+    }
+
+    #[test]
+    fn invalid_owner_id_env_fails_closed() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &["JMODGUARD_OWNER_ID"];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe { std::env::set_var("JMODGUARD_OWNER_ID", "not-a-snowflake") };
+        let mut cfg = Config::default();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("JMODGUARD_OWNER_ID"),
+            "unexpected: {err:#}"
+        );
     }
 }

@@ -10,8 +10,12 @@ cargo test --locked
 cargo test --locked --no-default-features --lib
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
+cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
 cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
+cargo build --locked --bin jmodguard-api --no-default-features --features web
+node --test scripts/frontend-warmup-test.mjs
+node --test scripts/publish-frontend-test.mjs
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -19,7 +23,7 @@ Local dual-process:
 
 ```bash
 cargo run --bin jmodguard-bot --no-default-features   # migrates DB; Discord gateway
-cargo run --bin jmodguard-api                         # waits ~30s for bot migrate, then serves HTTP
+cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m remote for bot migrate, then serves HTTP
 ```
 
 ## Version pins (verified)
@@ -79,15 +83,36 @@ cargo run --bin jmodguard-api                         # waits ~30s for bot migra
   but none compile, **refuse** (error) and leave destination unchanged — never
   DELETE-then-filter. Empty source clears destination (intentional).
   `compile_user_regex` is the single gate for add / copy / cache load / tester.
-- Feature `web` (default): axum + tower-sessions + embedded SPA. Build the bot
-  with `--no-default-features` so it does not link or embed the WebUI.
+- Feature `web` (default with `embed-ui`): axum + tower-sessions. `embed-ui`
+  bakes `frontend/` into the API for local SETUP.md. Bunny API images build
+  `--no-default-features --features web` so containers do not contain the
+  admin UI. Build the bot with `--no-default-features`.
 - Sessions use `MemoryStore` intentionally for a **single** API process; lost on
-  restart. Shared session store is a future multi-replica concern.
-- Cross-origin CDN SPA: set `web.cors_origins` / `JMODGUARD_CORS_ORIGINS` and
-  `https` `web.base_url`; frontend uses `credentials: "include"`. Prefer
-  same-origin reverse proxy when possible. `Config::validate_cors` runs in
-  `jmodguard-api` only — invalid CORS must not prevent `jmodguard-bot` from
-  starting.
+  restart. Shared session store is a future multi-replica concern. Discord
+  OAuth CSRF (`state`) and `return_to` are browser cookies so a restart
+  between `/login` and `/oauth/callback` does not fail the handshake.
+  Those cookies are host-only on `web.base_url`; a split-origin SPA still
+  sends the user through that hostname for login and callback.
+- Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
+  from Storage and proxies `/api` `/login` `/oauth` to a private API
+  container (same origin; no CORS). `web.cors_origins` /
+  `JMODGUARD_CORS_ORIGINS` exist only for a split-origin experiment.
+  `https` `web.base_url` is the public CDN hostname. `Config::validate_cors`
+  runs in `jmodguard-api` only. A public bind (`0.0.0.0`) must also pass
+  `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost).
+  Operators must set the CDN origin themselves; Magic Container hostnames
+  are not a stable class this check can reject.
+- Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
+  credentials must fail startup, not open local SQLite. Unset it only for an
+  intentional local-SQLite container run.
+- Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET`/`HEAD`
+  `/health` are unauthenticated process liveness probes (`ok`, no database).
+  Bind and accept them **before** opening the database. On the API public
+  bind, only `/health` returns 200 until axum takes over (database open,
+  AppState primary-version prime, router build); `/api` returns JSON 503
+  `{"error":"not ready"}` and `Retry-After`, and `/login` / `/oauth` return
+  HTML 503 that refreshes in place. Do not put session middleware on
+  `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
   at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /
@@ -158,14 +183,15 @@ src/db/moderation.rs    members/messages/retention/audit/warns/bans
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/discord.rs          Discord REST helpers (nickname retries)
+src/health.rs          process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
 src/state.rs            AppState + config cache + version poll
 src/automod.rs          rule engine + action executor
 src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
-src/web/                axum API + OAuth (embeds frontend/)
-frontend/               SPA assets
+src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
+frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
 migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …

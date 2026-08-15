@@ -1,11 +1,67 @@
 # WebUI
 
-The WebUI is a single-page app served by **`jmodguard-api`** (not the Discord
-bot process). It manages everything the bot does — no config file editing
-needed beyond the token / OAuth credentials and `bot.owner_id`.
+The WebUI is a single-page admin app. On a laptop it is served by
+**`jmodguard-api`** (feature `embed-ui`). On Bunny it is files in `frontend/`
+on Storage/CDN; the API container stays private and only answers `/api`,
+login, and OAuth. The pages never open SQL from the browser. They call the
+API; the API (and the bot) open the database. If the CDN page loads while
+the API is still starting, `/api/me` returns `503` `{error:"not ready"}`
+(or the CDN origin is still a `502`/`504` while the container binds) and
+the UI keeps waiting until axum answers `/api/me`. `/login` and
+`/oauth/callback` return an HTML wait page that reloads until axum can
+redirect. OAuth CSRF lives in a cookie, so an API restart between Login
+and Discord's return still completes the handshake.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
 `jmodguard-api`. Both use the same local SQLite file or remote libSQL database.
+
+## Getting and hosting the files
+
+The website is three files in this repository, in the `frontend/` folder:
+
+| File | What it is |
+|---|---|
+| `frontend/index.html` | the page |
+| `frontend/app.js` | the app |
+| `frontend/style.css` | the look |
+
+Use the **same git tag or commit** as the bot and API you are running. Do
+not mix an old website with a new API.
+
+**Self-host (one machine, [SETUP.md](SETUP.md)).** You do not copy these
+files anywhere. A normal `jmodguard-api` build already includes them and
+serves them at `http://localhost:8080`.
+
+**Bunny (first-class cloud path, [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md)).**
+
+1. Create a Bunny **Storage Zone**.
+2. Put the three files in the **root** of that zone so they are `/index.html`
+   (or `/`), `/app.js`, and `/style.css`.
+3. Create a **Pull Zone** whose origin is that Storage Zone. That hostname
+   (or a custom domain on it) is the public admin site.
+4. Point `/api`, `/login`, `/logout`, and `/oauth/callback` on that Pull
+   Zone at the private API container (see DEPLOY-BUNNY.md). Leave
+   `window.JMODGUARD_API_BASE` unset.
+
+You can upload by hand in the Bunny dashboard (**Browse Files**), or
+repeat it with GitHub Actions. The script
+[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
+and the example workflow
+[docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
+are for a **private** ops repo so Bunny Storage passwords are not stored
+in this public project. A private repo is not required to try it once;
+it is the intended way to publish updates.
+
+**Another host or CDN.** Copy the same three files from that git tag to
+the site root. If the API is on a **different** hostname than the pages,
+set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads,
+and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
+OAuth still happens on `web.base_url`: `/login` and `/oauth/callback`
+must be that same hostname so the CSRF cookies Discord cannot set are
+sent back on the redirect. Bunny’s designed shape does not need that
+split: the Pull Zone is one hostname for both the files and `/api`.
+
+Never put a database URL or token in these files.
 
 ## Access
 

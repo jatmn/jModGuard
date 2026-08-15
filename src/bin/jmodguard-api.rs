@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
 use jmodguard::state::AppState;
-use jmodguard::{init_tracing, web};
+use jmodguard::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use std::time::Duration;
 async fn main() -> Result<()> {
     let cfg = Config::load()?;
     cfg.validate_cors()?;
+    cfg.validate_public_base_url()?;
 
     if cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty() {
         anyhow::bail!(
@@ -39,60 +40,90 @@ async fn main() -> Result<()> {
         );
     }
 
-    // API expects the bot (or a one-shot migrate) to have applied schema already.
-    // Wait briefly so systemd/container start order can race the bot's first migrate.
-    let opts = cfg.db_open_options(false);
-    let db = Db::open_with_until_ready(opts, 30, Duration::from_secs(1))
-        .await
-        .with_context(|| {
-        format!(
-            "failed to open database {} (API opens with migrate=false — start jmodguard-bot once first, or apply migrations)",
-            if cfg.db.url.is_empty() {
-                cfg.db.path.display().to_string()
-            } else {
-                cfg.db.url.clone()
-            }
-        )
-    })?;
-    tracing::info!(
-        "database ready (migrate=false) at {}",
-        if cfg.db.url.is_empty() {
-            cfg.db.path.display().to_string()
-        } else {
-            cfg.db.url.clone()
-        }
-    );
-
-    let app = AppState::new(cfg.clone(), db)?;
-
-    // Cross-process cache invalidation (bot ↔ API config writes).
-    let poll_secs = cfg.bot.config_poll_secs.max(1);
-    {
-        let app = Arc::clone(&app);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                match app.poll_config_version().await {
-                    Ok(true) => {
-                        tracing::info!("config_version changed; guild config cache invalidated")
-                    }
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!("config_version poll failed: {e:#}"),
-                }
-            }
-        });
-    }
-
-    let web_app = web::router(Arc::clone(&app));
-    let web_bind = app.cfg.web.bind.clone();
+    // Bind first so platform GET/HEAD /health succeeds while the remote
+    // database is still waking, the bot is still migrating, or AppState
+    // primes primary version baselines (a blocking remote read). Only
+    // /health is live on this socket until axum takes over; other paths
+    // return 503. `serve_while` owns every pre-axum step so the bind is
+    // never idle between open and `axum::serve`.
+    let web_bind = cfg.web.bind.clone();
     let listener = tokio::net::TcpListener::bind(&web_bind)
         .await
         .with_context(|| format!("failed to bind API on {web_bind}"))?;
-    tracing::info!("API/WebUI listening on http://{web_bind}");
+    tracing::info!("API liveness on http://{web_bind}/health");
+
+    // API expects the bot (or a one-shot migrate) to have applied schema already.
+    // Wait briefly so systemd/container start order can race the bot's first migrate.
+    let opts = cfg.db_open_options(false);
+    let (attempts, delay) = jmodguard::db::startup_open_retry(&opts);
+    let cfg_for_state = cfg.clone();
+    let db_label = if cfg.db.url.is_empty() {
+        cfg.db.path.display().to_string()
+    } else {
+        cfg.db.url.clone()
+    };
+    let web_app = health::serve_while(&listener, async {
+        tokio::select! {
+            result = async {
+                let db = Db::open_with_until_ready(opts, attempts, delay)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to open database {db_label} (API opens with migrate=false — start jmodguard-bot once first, or apply migrations)"
+                        )
+                    })?;
+                tracing::info!("database ready (migrate=false) at {db_label}");
+                // `AppState::new` and `web::router` are synchronous. Run both
+                // off the task that drives `serve_while` or `/health` stalls
+                // for the same remote round-trip / router build this listener
+                // exists to cover.
+                let app = tokio::task::spawn_blocking(move || AppState::new(cfg_for_state, db))
+                    .await
+                    .context("app state worker stopped before returning")??;
+                let router_app = Arc::clone(&app);
+                let web_app = tokio::task::spawn_blocking(move || web::router(router_app))
+                    .await
+                    .context("router worker stopped before returning")?;
+                // Runtime work starts only after the serving artifact exists.
+                // Starting the poller before `web::router` succeeded would leave
+                // a background task on a process that then failed to listen.
+                let poll_secs = app.cfg.bot.config_poll_secs.max(1);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        match app.poll_config_version().await {
+                            Ok(true) => {
+                                tracing::info!(
+                                    "config_version changed; guild config cache invalidated"
+                                )
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!("config_version poll failed: {e:#}"),
+                        }
+                    }
+                });
+                Ok::<_, anyhow::Error>(Some(web_app))
+            } => result,
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown during API startup");
+                Ok(None)
+            }
+        }
+    })
+    .await?;
+
+    let Some(web_app) = web_app else {
+        tracing::info!("API process stopped");
+        return Ok(());
+    };
+
+    tracing::info!("API listening on http://{web_bind}");
     axum::serve(listener, web_app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("web server error")?;
+    tracing::info!("API process stopped");
     Ok(())
 }

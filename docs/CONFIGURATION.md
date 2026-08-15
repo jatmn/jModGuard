@@ -16,7 +16,7 @@ database (everything server-related, editable at runtime).
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
 | `web.oauth_client_secret` | — | Discord OAuth client secret (env: `JMODGUARD_OAUTH_CLIENT_SECRET`) |
-| `web.cors_origins` | `[]` | Extra SPA origins for credentialed CORS (env: `JMODGUARD_CORS_ORIGINS`, comma-separated). Empty = same-origin only |
+| `web.cors_origins` | `[]` | Extra SPA origins only for a split-origin UI (env: `JMODGUARD_CORS_ORIGINS`). Empty = same-origin. Bunny CDN proxies `/api` onto the UI hostname, so this stays empty. |
 | `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) |
 | `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
 | `bot.retention_days` | `7` | seeded into the global settings row on first boot; synced to the same meta terminal-defaults row (WebUI / config cache / purge share it; `0` = keep forever) |
@@ -25,13 +25,21 @@ database (everything server-related, editable at runtime).
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
 
+Environment-only (not in `config.toml`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `JMODGUARD_REQUIRE_REMOTE_DB` | unset | If `1`/`true`, startup fails unless both a remote URL and token are configured. Container images set this so a missed Bunny secret cannot open a private SQLite file. |
+| `JMODGUARD_HEALTH_BIND` | unset | Bot-only HTTP liveness listener (`GET`/`HEAD /health` returns `ok`). Bound before database open. Container bot image sets `0.0.0.0:8080`; bind failure exits the process. Empty = disabled. The API serves the same path on `web.bind` until axum takes over; other paths on that bind return `503` until then. |
+
 ## Database (runtime config)
 
 All of this is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0005_mutation_receipts_nickname_jobs.sql`) and is applied by
-`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s for
-the bot to finish bootstrap or release a transient local SQLite startup lock,
-then exits).
+`jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
+locally, or about six minutes on a remote database, for the bot to finish
+bootstrap or for a transient connect/lock to clear, then serves HTTP; it
+exits if that wait expires).
 
 | Table | Holds |
 |---|---|
@@ -71,10 +79,10 @@ floor so it cannot immediately serve an older snapshot.
 The remote transport uses the standard libSQL protocol; the portable
 configuration contract is `db.url` / `db.token` or `JMODGUARD_DB_URL` /
 `JMODGUARD_DB_TOKEN`. Environment credentials are selected as an atomic pair:
-if either portable variable is present, both must be non-empty; otherwise the
-same rule applies to Bunny's injected pair. Partial or mixed-provider overrides
-fail startup instead of pairing a URL with an unrelated token. It is not
-hard-coded to a Bunny hostname.
+if either portable variable is non-empty, both must be non-empty; otherwise the
+same rule applies to Bunny's injected pair. Blank or whitespace-only values are
+treated as unset. Partial or mixed-provider overrides fail startup instead of
+pairing a URL with an unrelated token. It is not hard-coded to a Bunny hostname.
 
 Bunny Database is the first-class launch provider: its injected environment
 names and generic libSQL protocol path have automated tests, and its container

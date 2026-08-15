@@ -121,6 +121,9 @@ owner_id = 123456789012345678               # your Discord user ID
 # Windows: target\release\jmodguard-bot.exe / target\release\jmodguard-api.exe
 ```
 
+This local API serves the admin pages itself. On Bunny the pages live on
+CDN/Storage and the API container is private — see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+
 Run the bot and API in separate terminals (or as the services below): the bot
 is a long-running Discord gateway, so it does not return before the API command.
 
@@ -131,7 +134,9 @@ First boot (bot):
 
 The API process serves the WebUI on `127.0.0.1:8080`. It **requires** Discord
 OAuth client id/secret (it exits immediately if they are empty). If the bot is
-still migrating, the API waits about 30 seconds, then exits.
+still migrating, the API waits about 30 seconds locally (about six minutes
+against a remote database), then serves HTTP. If that wait expires, the API
+exits.
 
 ### Windows (run as a service)
 
@@ -183,8 +188,10 @@ WantedBy=multi-user.target
 ```
 
 `After=jmodguard-bot.service` only waits for the bot **process** to exist, not
-for bootstrap to finish. The API retries incomplete-bootstrap and transient
-SQLite-lock states for about 30 seconds so a first-boot race does not crash-loop.
+for bootstrap to finish. The API retries incomplete-bootstrap, transient
+SQLite-lock, and (on remote databases) connect/timeout errors so a first-boot
+race does not crash-loop. Local SQLite waits about 30 seconds; remote waits
+about six minutes.
 
 ```bash
 sudo systemctl daemon-reload
@@ -232,11 +239,12 @@ Work through these in order (each one is logged, so check
 `logs/jmodguard-bot.log.YYYY-MM-DD` / `logs/jmodguard-api.log.YYYY-MM-DD` first):
 
 1. **Are the processes running?** Dual-process: check each log for its own
-   boot lines. The bot log should show `database ready (migrate=true)` and
-   `starting shards (bot process; no HTTP bind)`. The API log should show
-   `database ready (migrate=false)` and `API/WebUI listening on http://…`.
-   Looking for `WebUI listening` in the **bot** log is wrong — the bot never
-   binds HTTP. If a log is empty, that process never started (check the
+   boot lines.    The bot log should show `database ready (migrate=true)` and
+   `starting shards (bot process; no public HTTP API)`. The API log should show
+   `database ready (migrate=false)` and `API listening on http://…`.
+   Looking for `WebUI listening` in the **bot** log is wrong — the bot only
+   binds HTTP if `JMODGUARD_HEALTH_BIND` is set (container images: `/health` on
+   8080). If a log is empty, that process never started (check the
    service/working directory — each process creates `logs/` and uses
    `jmodguard.db` relative to its *current working directory*).
 2. **Privileged intents.** If you see `received messages with empty content...`

@@ -1,12 +1,12 @@
 # Multi-stage build for jmodguard-api.
-# Pins Rust 1.96 (lockfile MSRV; edition 2024). Requires the `web` feature (default).
+# Pins Rust 1.96 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
+# embed frontend/ (Bunny serves that from Storage/CDN).
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-COPY frontend ./frontend
-RUN cargo build --locked --release --bin jmodguard-api --features web
+RUN cargo build --locked --release --bin jmodguard-api --no-default-features --features web
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -19,5 +19,7 @@ ENV JMODGUARD_DB_PATH=/data/jmodguard.db
 ENV JMODGUARD_CONFIG=/data/config.toml
 ENV JMODGUARD_WEB_BIND=0.0.0.0:8080
 ENV JMODGUARD_LOG_DIRECTORY=""
+# Fail closed unless Bunny/portable remote credentials are present.
+ENV JMODGUARD_REQUIRE_REMOTE_DB=1
 EXPOSE 8080
 ENTRYPOINT ["jmodguard-api"]
