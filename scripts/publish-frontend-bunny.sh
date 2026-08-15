@@ -23,6 +23,40 @@ storage_url() {
   printf 'https://%s/%s/%s' "$endpoint" "$zone" "$1"
 }
 
+# Retry a Storage mutating call. Failures here are the rollback/upload surface.
+storage_put() {
+  local file="$1"
+  local src="$2"
+  local mime="${3:-}"
+  local args=(-fsS -X PUT "$(storage_url "$file")" -H "AccessKey: ${password}" --upload-file "$src")
+  if [[ -n "$mime" ]]; then
+    args+=(-H "Content-Type: ${mime}")
+  fi
+  local i
+  for i in 1 2 3; do
+    if curl "${args[@]}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+storage_delete() {
+  local file="$1"
+  local i
+  for i in 1 2 3; do
+    if curl -fsS -X DELETE "$(storage_url "$file")" \
+      -H "AccessKey: ${password}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Classify existing objects before any PUT. Non-200/404 is not "missing":
+# a failed backup must not later DELETE a live object.
 download_existing() {
   local file="$1"
   local dest="$backup_dir/$file"
@@ -35,7 +69,13 @@ download_existing() {
     return 0
   fi
   rm -f "$dest"
-  echo "no existing ${file} to restore (HTTP ${code})"
+  if [[ "$code" == "404" ]]; then
+    : >"$backup_dir/${file}.absent"
+    echo "no existing ${file} to restore (HTTP 404)"
+    return 0
+  fi
+  echo "cannot determine existing ${file} (HTTP ${code}); refusing to publish without a restore plan" >&2
+  exit 1
 }
 
 rollback() {
@@ -45,27 +85,26 @@ rollback() {
     dest="$backup_dir/$file"
     if [[ -f "$dest" ]]; then
       echo "restoring previous ${file}" >&2
-      if ! curl -fsS -X PUT "$(storage_url "$file")" \
-        -H "AccessKey: ${password}" \
-        --upload-file "$dest"; then
+      if ! storage_put "$file" "$dest"; then
         echo "failed to restore ${file}" >&2
         status=1
       fi
-    else
-      echo "removing newly uploaded ${file} (no previous copy)" >&2
-      if ! curl -fsS -X DELETE "$(storage_url "$file")" \
-        -H "AccessKey: ${password}"; then
+    elif [[ -f "$backup_dir/${file}.absent" ]]; then
+      echo "removing newly uploaded ${file} (confirmed missing before publish)" >&2
+      if ! storage_delete "$file"; then
         echo "failed to delete ${file}; Storage may be inconsistent" >&2
         status=1
       fi
+    else
+      echo "no restore plan for ${file}; leaving Storage object unchanged" >&2
+      status=1
     fi
   done
   return "$status"
 }
 
-abort_publish() {
-  local reason="$1"
-  echo "${reason}" >&2
+abort_upload() {
+  echo "upload failed" >&2
   if ! rollback "${uploaded[@]}"; then
     echo "rollback did not fully restore Storage; the zone may mix revisions" >&2
   fi
@@ -76,10 +115,7 @@ upload() {
   local file="$1"
   local mime="$2"
   echo "PUT ${file} -> ${endpoint}/${zone}/${file}"
-  curl -fsS -X PUT "$(storage_url "$file")" \
-    -H "AccessKey: ${password}" \
-    -H "Content-Type: ${mime}" \
-    --upload-file "${root}/${file}"
+  storage_put "$file" "${root}/${file}" "$mime"
 }
 
 download_existing index.html
@@ -87,25 +123,25 @@ download_existing app.js
 download_existing style.css
 
 # Assets first, HTML last, so a failed later PUT cannot pair new HTML with
-# old JS/CSS. On any upload or purge failure, restore previous copies or
-# delete files that did not exist before this run. A configured Pull Zone
-# purge is part of the same publish: same-named assets are not live until
-# the CDN cache is invalidated.
+# old JS/CSS. On upload failure, restore confirmed previous copies or delete
+# objects that were confirmed absent. A failed Pull Zone purge does not
+# roll Storage back: the new files are the intended origin, and reverting
+# them cannot un-fetch edges that already missed cache.
 uploaded=()
 if upload app.js "application/javascript; charset=utf-8"; then
   uploaded+=("app.js")
 else
-  abort_publish "upload failed"
+  abort_upload
 fi
 if upload style.css "text/css; charset=utf-8"; then
   uploaded+=("style.css")
 else
-  abort_publish "upload failed"
+  abort_upload
 fi
 if upload index.html "text/html; charset=utf-8"; then
   uploaded+=("index.html")
 else
-  abort_publish "upload failed"
+  abort_upload
 fi
 
 if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
@@ -123,7 +159,8 @@ if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
     sleep 2
   done
   if [[ "$purged" -ne 1 ]]; then
-    abort_publish "Storage upload succeeded but Pull Zone purge failed. Rolled Storage back so origin matches the still-cached CDN revision. Purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard, then rerun publish."
+    echo "Storage already has the new frontend/. Pull Zone purge failed; CDN may keep stale or mixed cached files until you purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard. Do not re-upload until that purge succeeds." >&2
+    exit 1
   fi
 fi
 

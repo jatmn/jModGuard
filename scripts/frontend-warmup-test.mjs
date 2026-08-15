@@ -95,6 +95,11 @@ test("waitForApiMe does not treat unauthenticated as warmup", async () => {
   });
 });
 
+test("waitForApiMe has no parallel client deadline", () => {
+  assert.equal(src.includes("6 * 60 * 1000"), false);
+  assert.equal(src.includes("Date.now() +"), false);
+});
+
 test("parseRetryAfterMs caps advertised delay", () => {
   const { parseRetryAfterMs } = loadFrontend(async () => {});
   assert.equal(parseRetryAfterMs("1"), 1000);

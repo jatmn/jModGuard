@@ -30,9 +30,10 @@ const LIVENESS_BODY: &str = "ok";
 /// Same JSON error shape as axum `ApiError`, so the CDN SPA can retry warmup
 /// instead of treating a plain-text 503 as a fatal load failure.
 const NOT_READY_JSON: &str = r#"{"error":"not ready"}"#;
-/// Same waiting copy as `frontend/index.html`. `Refresh` / meta-refresh
-/// reloads the current URL (including OAuth query strings) without
-/// reflecting the request-target into HTML.
+/// Waiting copy shared with `frontend/index.html` startup-view. `Refresh` /
+/// meta-refresh reloads the current URL (including OAuth query strings)
+/// without reflecting the request-target into HTML. This is a document
+/// retry page, not the styled SPA shell.
 const NOT_READY_HTML: &str = concat!(
     "<!DOCTYPE html><html lang=\"en\"><head>",
     "<meta charset=\"utf-8\">",
