@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
 
-function loadFrontend(fetchImpl) {
+function loadFrontend(fetchImpl, clock) {
   const document = {
     querySelector() {
       return {
@@ -23,11 +23,12 @@ function loadFrontend(fetchImpl) {
       return [];
     },
   };
+  const now = clock || { ms: 0 };
   const context = vm.createContext({
     fetch: fetchImpl,
     document,
     window: { JMODGUARD_API_BASE: "" },
-    Date,
+    Date: { now: () => now.ms },
     Number,
     String,
     Math,
@@ -38,7 +39,7 @@ function loadFrontend(fetchImpl) {
     console,
   });
   return vm.runInContext(
-    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError })`,
+    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage })`,
     context,
   );
 }
@@ -151,9 +152,32 @@ test("waitForApiMe does not treat unauthenticated as warmup", async () => {
   });
 });
 
-test("waitForApiMe has no parallel client deadline", () => {
-  assert.equal(src.includes("6 * 60 * 1000"), false);
-  assert.equal(src.includes("Date.now() +"), false);
+test("waitForApiMe gives up on persistent origin failures", async () => {
+  const clock = { ms: 0 };
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    clock.ms = 90 * 1000;
+    return {
+      ok: false,
+      status: 502,
+      headers: { get: () => null },
+      text: async () => "Bad Gateway",
+    };
+  };
+  const { waitForApiMe, originGaveUpMessage, apiError } = loadFrontend(fetchImpl, clock);
+  await assert.rejects(waitForApiMe, (err) => {
+    assert.equal(calls, 1);
+    assert.equal(err.message, originGaveUpMessage(apiError("HTTP 502", 502, 0)));
+    return true;
+  });
+});
+
+test("waitForApiMe warmup budget is longer than origin reachability", () => {
+  const { API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS } = loadFrontend(async () => {});
+  assert.equal(API_WARMUP_BUDGET_MS, 8 * 60 * 1000);
+  assert.equal(ORIGIN_REACHABILITY_BUDGET_MS, 90 * 1000);
+  assert.ok(API_WARMUP_BUDGET_MS > ORIGIN_REACHABILITY_BUDGET_MS);
 });
 
 test("parseRetryAfterMs caps advertised delay", () => {

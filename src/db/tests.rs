@@ -530,6 +530,11 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     assert!(!crate::db::is_startup_retryable(&auth, true));
     let forbidden = anyhow::anyhow!("Hrana: `api error: `status=403 Forbidden, body=``");
     assert!(!crate::db::is_startup_retryable(&forbidden, true));
+    let readonly = anyhow::anyhow!("attempt to write a readonly database");
+    assert!(
+        !crate::db::is_startup_retryable(&readonly, true),
+        "read-only tokens must fail immediately, not burn the remote retry window"
+    );
     let handshake = anyhow::anyhow!("tls handshake: client authentication timed out");
     assert!(
         crate::db::is_startup_retryable(&handshake, true),

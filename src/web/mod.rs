@@ -3,7 +3,7 @@
 pub mod api;
 
 use axum::extract::Query;
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -23,7 +23,9 @@ const SESSION_REFRESH: &str = "refresh_token";
 /// still matches the `state` Discord echoes back.
 const COOKIE_OAUTH_STATE: &str = "jmodguard_oauth_state";
 const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
+const SESSION_COOKIE_NAME: &str = "jmodguard_session";
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
+const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 
 // ---------------------------------------------------------------------------
 // errors
@@ -465,6 +467,9 @@ async fn callback(
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
+    if let Err(error) = session.cycle_id().await {
+        tracing::warn!("oauth callback: failed to rotate session id: {error}");
+    }
     let _ = session.insert(SESSION_USER, uid).await;
     let _ = session.insert(SESSION_TOKEN, &tok.access_token).await;
     if let Some(r) = &tok.refresh_token {
@@ -545,7 +550,11 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (
+        axum::http::StatusCode::OK,
+        [(CACHE_CONTROL, NO_STORE)],
+        "ok",
+    )
 }
 
 #[cfg(feature = "embed-ui")]
@@ -615,6 +624,7 @@ pub fn router(app: Arc<AppState>) -> Router {
     let cross_origin = !cors_origins.is_empty();
     let same_site = session_same_site(cross_origin, secure);
     let session_layer = SessionManagerLayer::new(session_store)
+        .with_name(SESSION_COOKIE_NAME)
         .with_secure(secure)
         .with_same_site(same_site)
         .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
@@ -692,7 +702,11 @@ pub fn router(app: Arc<AppState>) -> Router {
             axum::routing::post(api::unban),
         )
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
-        .layer(session_layer);
+        .layer(session_layer)
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            NO_STORE,
+        ));
 
     // CORS is a browser credential policy for the SPA/API. Process liveness
     // (`/health`) must not depend on Origin — platform probes are not a
@@ -828,8 +842,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(NO_STORE.as_bytes())
+        );
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn api_me_sets_no_store_cache_control() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(NO_STORE.as_bytes()),
+            "credentialed API JSON must not be CDN-cacheable"
+        );
     }
 
     #[tokio::test]

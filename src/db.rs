@@ -104,6 +104,9 @@ fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
             || message.contains("invalid token")
             || message.contains("authentication failed")
             || message.contains("authentication error")
+            || message.contains("readonly")
+            || message.contains("read-only")
+            || message.contains("read only")
             || http_status_in(&message, 401)
             || http_status_in(&message, 403)
     })
@@ -375,6 +378,10 @@ impl Db {
                 // Replica reads can otherwise see an old completed marker
                 // while a new bot bootstrap is in progress on the primary.
                 let _ = read_bootstrap_defaults_primary(&bootstrap)?;
+                // Bunny issues read-only tokens alongside full-access. The API
+                // only SELECTs during open, so a read-only token would pass
+                // bootstrap and fail later on the first WebUI write.
+                ensure_api_writes_allowed(&bootstrap)?;
             }
 
             let pool_size = opts.pool_size.max(2) as usize;

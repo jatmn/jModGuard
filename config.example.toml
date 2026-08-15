@@ -26,6 +26,8 @@ url = ""
 token = ""
 # Number of reusable database connections and maximum concurrent database
 # operations in this process. Both the bot and API apply this independently.
+# Env: JMODGUARD_DB_POOL_SIZE (minimum 2). Container deploys usually have no
+# config.toml, so set the env var when you need something other than 8.
 pool_size = 8
 # Remote database calls and waits for a pooled connection have a fixed
 # 75-second per-request deadline (longer than Bunny's documented failover

@@ -361,6 +361,37 @@ pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
     }
 }
 
+/// Prove the API token can mutate. Read-only Bunny tokens otherwise survive
+/// schema-open and fail on the first WebUI `PUT`.
+pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
+    let tx = conn
+        .transaction_immediate()
+        .map_err(annotate_readonly_token)?;
+    tx.execute(
+        "UPDATE meta SET value = value WHERE key = ?1",
+        params![META_BOOTSTRAP_COMPLETE],
+    )
+    .map_err(annotate_readonly_token)?;
+    tx.commit().map_err(annotate_readonly_token)?;
+    Ok(())
+}
+
+fn annotate_readonly_token(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("readonly")
+        || message.contains("read-only")
+        || message.contains("read only")
+        || message.contains("not authorized")
+        || message.contains("permission denied")
+    {
+        return anyhow::anyhow!(
+            "remote database token cannot write. The API needs a full-access token \
+             (Bunny Database Access → full access, not read-only). Original error: {error:#}"
+        );
+    }
+    error
+}
+
 pub(super) fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
     let expected = MIGRATIONS.len().to_string();
     if meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref() != Some(expected.as_str()) {

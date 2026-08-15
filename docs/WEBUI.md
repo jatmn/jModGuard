@@ -6,8 +6,9 @@ on Storage/CDN; the API container stays private and only answers `/api`,
 login, and OAuth. The pages never open SQL from the browser. They call the
 API; the API (and the bot) open the database. If the CDN page loads while
 the API is still starting, `/api/me` returns `503` `{error:"not ready"}`
-(or the CDN origin is still a `502`/`504` while the container binds) and
-the UI keeps waiting until axum answers `/api/me`. `/login` and
+and the UI keeps waiting (up to eight minutes). A lasting `502`/`504` or
+failed fetch stops after 90 seconds so a bad origin rule is not an
+infinite spinner. `/login` and
 `/oauth/callback` return an HTML wait page that reloads until axum can
 redirect. OAuth CSRF lives in a cookie, so an API restart between Login
 and Discord's return still completes the handshake.
@@ -39,9 +40,10 @@ serves them at `http://localhost:8080`.
    (or `/`), `/app.js`, and `/style.css`.
 3. Create a **Pull Zone** whose origin is that Storage Zone. That hostname
    (or a custom domain on it) is the public admin site.
-4. Point `/api`, `/login`, `/logout`, and `/oauth/callback` on that Pull
-   Zone at the private API container (see DEPLOY-BUNNY.md). Leave
-   `window.JMODGUARD_API_BASE` unset.
+4. Point `/api`, `/login`, `/logout`, `/oauth`, and `/health` on that Pull
+   Zone at the API container with **Override Origin: Magic Containers**
+   (you must create a CDN endpoint on the API app first; see
+   DEPLOY-BUNNY.md). Leave `window.JMODGUARD_API_BASE` unset.
 
 You can upload by hand in the Bunny dashboard (**Browse Files**), or
 repeat it with GitHub Actions. The script
@@ -150,10 +152,12 @@ bot owner).
 ## Auth & sessions
 
 - Discord OAuth2 (scopes `identify guilds`), sessions last 7 days of
-  inactivity. Sessions use an **in-memory store on the single API process**:
-  re-login after an API restart. A shared session store is required only if
-  you run multiple API replicas.
-- The login state parameter is checked against the session to prevent CSRF
-  (empty or mismatched state is rejected).
+  inactivity. Sessions use an **in-memory store on the single API process**
+  (`jmodguard_session` cookie): re-login after an API restart. A shared
+  session store is required only if you run multiple API replicas.
+- OAuth CSRF is a host-only cookie compared to Discord's echoed `state`
+  (empty or mismatched state is rejected). Successful login rotates the
+  session id.
 - Session cookies use the `Secure` flag when `web.base_url` starts with
-  `https://`. Expose publicly only behind HTTPS (see SETUP.md §8).
+  `https://`. API JSON sets `Cache-Control: private, no-store`. Expose
+  publicly only behind HTTPS (see SETUP.md §8).

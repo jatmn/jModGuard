@@ -300,6 +300,35 @@ impl Config {
                 })?;
             }
         }
+        if let Ok(v) = env::var("JMODGUARD_DB_POOL_SIZE") {
+            let v = v.trim();
+            if !v.is_empty() {
+                let parsed: u32 = v.parse().with_context(|| {
+                    format!("JMODGUARD_DB_POOL_SIZE must be an integer, got `{v}`")
+                })?;
+                if parsed < 2 {
+                    anyhow::bail!("JMODGUARD_DB_POOL_SIZE must be at least 2, got `{parsed}`");
+                }
+                self.db.pool_size = parsed;
+            }
+        }
+        if let Ok(v) = env::var("JMODGUARD_DEFAULT_PREFIX") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.default_prefix = v.to_string();
+            }
+        }
+        if let Ok(v) = env::var("JMODGUARD_RETENTION_DAYS") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.retention_days = v.parse().with_context(|| {
+                    format!("JMODGUARD_RETENTION_DAYS must be an integer, got `{v}`")
+                })?;
+            }
+        }
+        if let Ok(v) = env::var("JMODGUARD_BOT_STATUS") {
+            self.bot.status = v.trim().to_string();
+        }
         if let Ok(v) = env::var("JMODGUARD_CONFIG_POLL_SECS") {
             let v = v.trim();
             if !v.is_empty() {
@@ -617,6 +646,47 @@ mod tests {
         let err = cfg.apply_env().unwrap_err();
         assert!(
             err.to_string().contains("JMODGUARD_OWNER_ID"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn pool_size_and_bot_env_override_config_file_defaults() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_DB_POOL_SIZE",
+            "JMODGUARD_DEFAULT_PREFIX",
+            "JMODGUARD_RETENTION_DAYS",
+            "JMODGUARD_BOT_STATUS",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        for name in NAMES {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe {
+            std::env::set_var("JMODGUARD_DB_POOL_SIZE", "4");
+            std::env::set_var("JMODGUARD_DEFAULT_PREFIX", "?");
+            std::env::set_var("JMODGUARD_RETENTION_DAYS", "14");
+            std::env::set_var("JMODGUARD_BOT_STATUS", "watching");
+        }
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.db.pool_size, 4);
+        assert_eq!(cfg.bot.default_prefix, "?");
+        assert_eq!(cfg.bot.retention_days, 14);
+        assert_eq!(cfg.bot.status, "watching");
+    }
+
+    #[test]
+    fn pool_size_env_rejects_below_minimum() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &["JMODGUARD_DB_POOL_SIZE"];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe { std::env::set_var("JMODGUARD_DB_POOL_SIZE", "1") };
+        let mut cfg = Config::default();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("JMODGUARD_DB_POOL_SIZE"),
             "unexpected: {err:#}"
         );
     }

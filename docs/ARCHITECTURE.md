@@ -82,7 +82,8 @@ without rolling back durable settings.
 
 ## WebUI auth (summary)
 
-- Discord OAuth2; sessions in `MemoryStore` (single API process; lost on API restart).
+- Discord OAuth2; sessions in `MemoryStore` (single API process; cookie
+  `jmodguard_session`; lost on API restart).
 - Guild admins need Discord `MANAGE_GUILD`.
 - Global edits (`guild_id=0` or body `scope: "global"`) require `bot.owner_id`.
 - Guild-scoped authorization always re-fetches Discord guild membership

@@ -81,6 +81,22 @@ function isOriginStarting(err) {
   return err.status === 503 && String(err && err.message) === "HTTP 503";
 }
 
+/** Keep retrying API `not ready` longer than the remote open window (~6 min). */
+const API_WARMUP_BUDGET_MS = 8 * 60 * 1000;
+/** Misrouted / dead origin should not look like warmup forever. */
+const ORIGIN_REACHABILITY_BUDGET_MS = 90 * 1000;
+
+function originRetryBudgetMs(err) {
+  return isApiWarmup(err) ? API_WARMUP_BUDGET_MS : ORIGIN_REACHABILITY_BUDGET_MS;
+}
+
+function originGaveUpMessage(err) {
+  if (isApiWarmup(err)) {
+    return "API did not become ready in time. Start the bot first and wait for database ready (migrate=true).";
+  }
+  return "Cannot reach the API. Check that the API container is running and that the Pull Zone OriginMagicContainers rules send /api to it.";
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -113,10 +129,11 @@ async function api(path, method = "GET", body = null) {
 }
 
 /** CDN Storage can serve this page while the API origin is still binding or
- *  opening the database. Keep retrying until axum answers `/api/me` — a
- *  parallel client deadline would give up while Bunny is still origin-pulling
- *  a starting container. */
+ *  opening the database. Keep retrying `not ready` through the remote open
+ *  window. 502/network failures stop after ORIGIN_REACHABILITY_BUDGET_MS so a
+ *  bad Pull Zone rule is not an infinite spinner. */
 async function waitForApiMe() {
+  const started = Date.now();
   let delay = 500;
   let sawStartup = false;
   while (true) {
@@ -124,6 +141,9 @@ async function waitForApiMe() {
       return await api("/api/me");
     } catch (e) {
       if (!isOriginStarting(e)) throw e;
+      if (Date.now() - started >= originRetryBudgetMs(e)) {
+        throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+      }
       if (!sawStartup) {
         sawStartup = true;
         showView("startup-view");
