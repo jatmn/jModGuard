@@ -580,13 +580,10 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
         .layer(session_layer);
 
-    let mut router = Router::new()
-        .route("/health", get(health))
-        .route("/health/", get(health))
-        .merge(sessioned)
-        .with_state(app.clone());
-
-    if cross_origin {
+    // CORS is a browser credential policy for the SPA/API. Process liveness
+    // (`/health`) must not depend on Origin — platform probes are not a
+    // credentialed CORS client.
+    let sessioned = if cross_origin {
         use axum::http::Method;
         use tower_http::cors::{AllowOrigin, CorsLayer};
         let cors = CorsLayer::new()
@@ -604,10 +601,16 @@ pub fn router(app: Arc<AppState>) -> Router {
                 axum::http::header::COOKIE,
             ])
             .allow_credentials(true);
-        router = router.layer(cors);
-    }
+        sessioned.layer(cors)
+    } else {
+        sessioned
+    };
 
-    router
+    Router::new()
+        .route("/health", get(health))
+        .route("/health/", get(health))
+        .merge(sessioned)
+        .with_state(app.clone())
 }
 
 /// Authorize Discord MANAGE_GUILD for a real guild id with a **fresh** guild list.
@@ -722,6 +725,31 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn health_ignores_cors_origin() {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tmp =
+            std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
+        let db = crate::db::Db::open(&tmp, 2).unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.web.cors_origins = vec!["https://admin.example.com".into()];
+        let app = router(crate::state::AppState::new(cfg, db).unwrap());
+        std::fs::remove_file(&tmp).ok();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("origin", "https://attacker.example.com")
                     .body(Body::empty())
                     .unwrap(),
             )

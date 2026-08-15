@@ -73,14 +73,15 @@ where
             // backpressure until a slot frees or `work` finishes.
             accept = listener.accept(), if permits.available_permits() > 0 => match accept {
                 Ok((stream, _)) => {
-                    if let Ok(permit) = Arc::clone(&permits).try_acquire_owned() {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(error) = answer_connection(stream).await {
-                                tracing::debug!("health connection ended: {error:#}");
-                            }
-                        });
-                    }
+                    let permit = Arc::clone(&permits)
+                        .try_acquire_owned()
+                        .expect("accept is gated on an available health permit");
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = answer_connection(stream).await {
+                            tracing::debug!("health connection ended: {error:#}");
+                        }
+                    });
                 }
                 Err(error) => tracing::warn!("health accept failed: {error}"),
             },

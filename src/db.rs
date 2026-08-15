@@ -89,6 +89,13 @@ fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True when `message` reports this HTTP status. libSQL Hrana formats
+/// `status=503 Service Unavailable`; reqwest-style errors use `status code: 503`.
+fn http_status_in(message: &str, code: u16) -> bool {
+    let code = code.to_string();
+    message.contains(&format!("status={code}")) || message.contains(&format!("status code: {code}"))
+}
+
 fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
     err.chain().any(|error| {
         let message = error.to_string().to_ascii_lowercase();
@@ -97,8 +104,8 @@ fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
             || message.contains("invalid token")
             || message.contains("authentication failed")
             || message.contains("authentication error")
-            || message.contains("status code: 401")
-            || message.contains("status code: 403")
+            || http_status_in(&message, 401)
+            || http_status_in(&message, 403)
     })
 }
 
@@ -116,6 +123,7 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
             "timed out",
             "timeout",
             "temporarily unavailable",
+            "service unavailable",
             "try again",
             "network is unreachable",
             "no route to host",
@@ -126,12 +134,12 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
             "handshake timed",
             "server is unavailable",
             "bad gateway",
-            "status code: 502",
-            "status code: 503",
             "goaway",
             "stream closed",
         ];
         NEEDLES.iter().any(|needle| message.contains(needle))
+            || http_status_in(&message, 502)
+            || http_status_in(&message, 503)
     })
 }
 

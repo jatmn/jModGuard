@@ -165,8 +165,9 @@ async fn main() -> Result<()> {
 
     init_tracing(&cfg, "bot");
 
-    // Liveness must accept before remote DB retry. Platform probes hit this
-    // port while `open_with_until_ready` waits on a waking database.
+    // Liveness must accept before database retry. Platform probes hit this
+    // port while `open_with_until_ready` waits on a waking database or a
+    // local SQLite lock.
     if let Some(bind) = cfg.health_bind() {
         let listener = jmodguard::health::bind(&bind).await?;
         tokio::spawn(async move {
@@ -177,23 +178,21 @@ async fn main() -> Result<()> {
     }
 
     let opts = cfg.db_open_options(true);
-    let remote = cfg.is_remote_db();
-    let db = if remote {
-        let (attempts, delay) = db::startup_open_retry(&opts);
-        tokio::select! {
-            db = Db::open_with_until_ready(opts, attempts, delay) => db.with_context(|| {
+    let (attempts, delay) = db::startup_open_retry(&opts);
+    let db = tokio::select! {
+        db = Db::open_with_until_ready(opts, attempts, delay) => db.with_context(|| {
+            if cfg.is_remote_db() {
                 format!(
                     "failed to open remote database {} after waiting for a transient connect/bootstrap",
                     cfg.db.url
                 )
-            })?,
-            _ = shutdown_signal() => {
-                anyhow::bail!("shutdown during remote database open");
+            } else {
+                format!("failed to open database {}", cfg.db.path.display())
             }
+        })?,
+        _ = shutdown_signal() => {
+            anyhow::bail!("shutdown during database open");
         }
-    } else {
-        Db::open_with(opts)
-            .with_context(|| format!("failed to open database {}", cfg.db.path.display()))?
     };
     tracing::info!(
         "database ready (migrate=true) at {}",
