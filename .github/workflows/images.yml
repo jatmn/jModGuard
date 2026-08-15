@@ -14,6 +14,10 @@ on:
       - "Dockerfile.api"
       - ".github/workflows/images.yml"
 
+concurrency:
+  group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # Magic Containers can pull public GHCR images without extra registry auth.
 permissions:
   contents: read
