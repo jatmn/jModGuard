@@ -21,7 +21,7 @@ This release **removes that entrypoint**. You must run two binaries:
 2. Build both new binaries (`jmodguard-bot` with `--no-default-features`,
    `jmodguard-api` with the default `web` feature). See [SETUP.md](SETUP.md).
 3. Keep the same working directory and `config.toml` / `jmodguard.db`.
-4. Replace the one unit/task with **two** (`jmodguard-bot` then `jmodguard-api`).
+4. Replace the one systemd unit with **two** (`jmodguard-bot` then `jmodguard-api`).
    Logs are now `logs/jmodguard-bot.log.*` and `logs/jmodguard-api.log.*`
    instead of a single `jmodguard.log`.
 5. Fill in Discord OAuth client id/secret. The API process **refuses to start**
