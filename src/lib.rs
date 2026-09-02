@@ -16,6 +16,7 @@ pub mod health;
 pub mod ids;
 pub mod logging;
 pub mod normalize;
+mod remote_https;
 pub mod state;
 pub mod templates;
 pub mod types;

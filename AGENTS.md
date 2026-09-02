@@ -34,7 +34,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).
-- libsql 0.9.30 (`core`, `remote`, `tls`), axum 0.8, tower-sessions 0.14,
+- libsql 0.9.30 (`core`, `remote`; remote HTTPS uses in-tree rustls 0.23, not
+  libsql's `tls`/`hyper-rustls 0.25` stack), axum 0.8, tower-sessions 0.14,
   reqwest 0.13, edition 2024.
 
 ## Invariants to respect
@@ -182,6 +183,7 @@ src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/moderation.rs    members/messages/retention/audit/warns/bans
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
+src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)
 src/discord.rs          Discord REST helpers (nickname retries)
 src/health.rs          process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates

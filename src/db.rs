@@ -316,9 +316,13 @@ impl Db {
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
+            let connector = crate::remote_https::https_connector()
+                .context("failed to configure rustls for the remote database")?;
             runtime.block_on_database(
                 "connect",
-                libsql::Builder::new_remote(opts.url.clone(), opts.token.clone()).build(),
+                libsql::Builder::new_remote(opts.url.clone(), opts.token.clone())
+                    .connector(connector)
+                    .build(),
             )?
         } else {
             runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?

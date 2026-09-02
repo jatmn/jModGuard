@@ -32,14 +32,19 @@ chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 parking_lot = "0.12"
 percent-encoding = "2"
-libsql = { version = "0.9.30", default-features = false, features = ["core", "remote", "tls"] }
+hyper = { version = "0.14", default-features = false, features = ["client", "http1", "tcp", "runtime"] }
+libsql = { version = "0.9.30", default-features = false, features = ["core", "remote"] }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "form"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "cache", "model", "builder", "http", "utils", "chrono", "rustls_backend"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "process"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1"
 thiserror = "2"
 tower-http = { version = "0.6", optional = true, features = ["cors"] }
@@ -50,4 +55,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
 tower = "0.5.3"
+
+[patch.crates-io]
+tokio-tungstenite = { path = "vendor/tokio-tungstenite" }

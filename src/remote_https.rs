@@ -1,0 +1,199 @@
+//! rustls 0.23 HTTPS connector for libsql's hyper 0.14 remote client.
+//!
+//! libsql 0.9.30's `tls` feature pulls `hyper-rustls 0.25` → `rustls 0.22` →
+//! `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8). Building the connector here
+//! lets that feature stay off while remote HTTPS still uses rustls.
+
+use anyhow::{Context as _, Result, bail};
+use hyper::Uri;
+use hyper::client::HttpConnector;
+use hyper::client::connect::{Connected, Connection};
+use hyper::service::Service;
+use rustls::ClientConfig;
+use rustls_pki_types::ServerName;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+
+pub(crate) fn https_connector() -> Result<HttpsConnector<HttpConnector>> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    Ok(HttpsConnector {
+        http,
+        tls: TlsConnector::from(Arc::new(client_config()?)),
+    })
+}
+
+fn client_config() -> Result<ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        let detail = if native.errors.is_empty() {
+            "no valid native root CA certificates found".to_string()
+        } else {
+            format!(
+                "no valid native root CA certificates found ({})",
+                native
+                    .errors
+                    .iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        bail!("{detail}");
+    }
+
+    Ok(
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .context("invalid rustls protocol versions")?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+#[derive(Clone)]
+pub(crate) struct HttpsConnector<T> {
+    http: T,
+    tls: TlsConnector,
+}
+
+pub(crate) enum MaybeHttpsStream<T> {
+    Http(T),
+    Https(Box<TlsStream<T>>),
+}
+
+impl<T> Connection for MaybeHttpsStream<T>
+where
+    T: AsyncRead + AsyncWrite + Connection + Unpin,
+{
+    fn connected(&self) -> Connected {
+        match self {
+            Self::Http(stream) => stream.connected(),
+            Self::Https(stream) => {
+                let (tcp, tls) = stream.get_ref();
+                if tls.alpn_protocol() == Some(b"h2") {
+                    tcp.connected().negotiated_h2()
+                } else {
+                    tcp.connected()
+                }
+            }
+        }
+    }
+}
+
+impl<T> AsyncRead for MaybeHttpsStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Https(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<T> AsyncWrite for MaybeHttpsStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Https(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Https(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Https(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<T> Service<Uri> for HttpsConnector<T>
+where
+    T: Service<Uri>,
+    T::Response: Connection + AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    T::Future: Send + 'static,
+    T::Error: Into<BoxError>,
+{
+    type Response = MaybeHttpsStream<T::Response>;
+    type Error = BoxError;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.http.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        match dst.scheme_str() {
+            Some("http") => {
+                let future = self.http.call(dst);
+                return Box::pin(async move {
+                    Ok(MaybeHttpsStream::Http(future.await.map_err(Into::into)?))
+                });
+            }
+            Some("https") => {}
+            Some(scheme) => {
+                let message = format!("unsupported scheme {scheme}");
+                return Box::pin(async move { Err(io::Error::other(message).into()) });
+            }
+            None => {
+                return Box::pin(async move { Err(io::Error::other("missing scheme").into()) });
+            }
+        }
+
+        let mut hostname = dst.host().unwrap_or_default();
+        if let Some(trimmed) = hostname
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        {
+            hostname = trimmed;
+        }
+        let hostname = match ServerName::try_from(hostname) {
+            Ok(name) => name.to_owned(),
+            Err(_) => {
+                return Box::pin(async move { Err(io::Error::other("invalid dnsname").into()) });
+            }
+        };
+
+        let connecting = self.http.call(dst);
+        let tls = self.tls.clone();
+        Box::pin(async move {
+            let tcp = connecting.await.map_err(Into::into)?;
+            let tls_stream = tls.connect(hostname, tcp).await.map_err(io::Error::other)?;
+            Ok(MaybeHttpsStream::Https(Box::new(tls_stream)))
+        })
+    }
+}
