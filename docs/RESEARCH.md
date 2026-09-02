@@ -53,6 +53,10 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
   (`src/remote_https.rs`); local installs use `Builder::new_local`.
   Do not enable libsql's `tls` feature: it pulls `hyper-rustls 0.25` /
   `rustls 0.22` / `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8).
+- `remote` still pulls `libsql-sqlite3-parser` 0.13.x. crates.io never
+  published a fix for GHSA-8m95-fffc-h4c5 (CVE-2025-47736: Debug panic on
+  invalid UTF-8). Path-patch it to `vendor/libsql-sqlite3-parser` 0.13.1
+  (0.13.0 sources + lemon-rs `from_utf8_lossy`).
 - The libSQL API is async. `src/db_compat.rs` supplies a narrow synchronous
   facade so the existing SQL paths can run unchanged inside `with_conn`'s
   blocking closures.

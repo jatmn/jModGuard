@@ -55,8 +55,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+fallible-iterator = "0.3"
+libsql-sqlite3-parser = "0.13"
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
 tower = "0.5.3"
 
 [patch.crates-io]
+libsql-sqlite3-parser = { path = "vendor/libsql-sqlite3-parser" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite" }
