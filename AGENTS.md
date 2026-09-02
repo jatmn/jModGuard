@@ -28,9 +28,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 
 ## Version pins (verified)
 
-- Rust **1.96.0** — `rust-toolchain.toml`, CI (`dtolnay/rust-toolchain@1.96.0`),
-  and `Dockerfile.{bot,api}` (`rust:1.96-bookworm`) must stay aligned.
-  `Cargo.toml` `rust-version = "1.96"`. Do not float CI on `@stable`.
+- Rust **1.96.0** — `rust-toolchain.toml`, CI (`dtolnay/rust-toolchain` pinned to
+  the 1.96.0 commit SHA), and `Dockerfile.{bot,api}` (`rust:1.96-bookworm`) must
+  stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float CI on `@stable`.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).
