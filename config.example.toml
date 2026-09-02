@@ -65,7 +65,8 @@ default_prefix = "!"
 # Discord, right-click your avatar -> Copy User ID.
 owner_id = 0
 # Terminal retention fallback when neither guild nor global overrides it. The
-# bot refreshes it at startup (0 = keep forever).
+# bot refreshes it at startup (0 = keep forever). Values above 100000 are
+# rejected, matching WebUI writes and the purge maximum.
 retention_days = 7
 # Presence status text shown under the bot's name.
 status = "moderating"

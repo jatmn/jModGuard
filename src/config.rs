@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
 
-use crate::db::DbOpenOptions;
+use crate::db::{DbOpenOptions, MAX_RETENTION_DAYS};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -130,6 +130,13 @@ impl Config {
 
         cfg.apply_env()?;
         Ok(cfg)
+    }
+
+    fn retention_days_in_range(days: u32, source: &str) -> Result<u32> {
+        if days > MAX_RETENTION_DAYS {
+            anyhow::bail!("{source} must be between 0 and {MAX_RETENTION_DAYS} (got {days})");
+        }
+        Ok(days)
     }
 
     /// True when this process is configured for a remote libSQL database.
@@ -321,9 +328,11 @@ impl Config {
         if let Ok(v) = env::var("JMODGUARD_RETENTION_DAYS") {
             let v = v.trim();
             if !v.is_empty() {
-                self.bot.retention_days = v.parse().with_context(|| {
+                let parsed: u32 = v.parse().with_context(|| {
                     format!("JMODGUARD_RETENTION_DAYS must be an integer, got `{v}`")
                 })?;
+                self.bot.retention_days =
+                    Self::retention_days_in_range(parsed, "JMODGUARD_RETENTION_DAYS")?;
             }
         }
         if let Ok(v) = env::var("JMODGUARD_BOT_STATUS") {
@@ -346,6 +355,9 @@ impl Config {
         if let Ok(v) = env::var("JMODGUARD_LOG_DIRECTORY") {
             self.log.directory = PathBuf::from(v.trim());
         }
+        // File and env both feed bot migrate-open terminal defaults; WebUI
+        // writes already reject above MAX_RETENTION_DAYS or purge skips.
+        Self::retention_days_in_range(self.bot.retention_days, "bot.retention_days")?;
         Ok(())
     }
 }
@@ -701,6 +713,39 @@ mod tests {
         let err = cfg.apply_env().unwrap_err();
         assert!(
             err.to_string().contains("JMODGUARD_DB_POOL_SIZE"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn retention_days_env_rejects_above_purge_maximum() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &["JMODGUARD_RETENTION_DAYS"];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe { std::env::set_var("JMODGUARD_RETENTION_DAYS", "100001") };
+        let mut cfg = Config::default();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("JMODGUARD_RETENTION_DAYS"),
+            "unexpected: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("100000") || err.to_string().contains("100_000"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn retention_days_file_value_rejects_above_purge_maximum() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &["JMODGUARD_RETENTION_DAYS"];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe { std::env::remove_var("JMODGUARD_RETENTION_DAYS") };
+        let mut cfg = Config::default();
+        cfg.bot.retention_days = crate::db::MAX_RETENTION_DAYS + 1;
+        let err = cfg.apply_env().unwrap_err();
+        assert!(
+            err.to_string().contains("bot.retention_days"),
             "unexpected: {err:#}"
         );
     }

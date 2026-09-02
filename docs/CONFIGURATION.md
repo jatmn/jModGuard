@@ -19,7 +19,7 @@ database (everything server-related, editable at runtime).
 | `web.cors_origins` | `[]` | Extra SPA origins only for a split-origin UI (env: `JMODGUARD_CORS_ORIGINS`). Empty = same-origin. Bunny CDN proxies `/api` onto the UI hostname, so this stays empty. |
 | `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) (env: `JMODGUARD_DEFAULT_PREFIX`) |
 | `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
-| `bot.retention_days` | `7` | seeded into the global settings row on first boot; synced to the same meta terminal-defaults row (WebUI / config cache / purge share it; `0` = keep forever) (env: `JMODGUARD_RETENTION_DAYS`) |
+| `bot.retention_days` | `7` | seeded into the global settings row on first boot; synced to the same meta terminal-defaults row (WebUI / config cache / purge share it; `0` = keep forever; maximum 100000, same bound as WebUI writes) (env: `JMODGUARD_RETENTION_DAYS`) |
 | `bot.status` | `moderating` | presence text (env: `JMODGUARD_BOT_STATUS`) |
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |

@@ -133,20 +133,15 @@ async function api(path, method = "GET", body = null, signal) {
   return data;
 }
 
-/** Cap one in-flight `/api/me` so a black-holed origin cannot stall the 90s clock. */
-function originAttemptTimeoutMs(now, reachabilityStarted) {
-  if (reachabilityStarted === null) return ORIGIN_REACHABILITY_BUDGET_MS;
-  return Math.max(1, ORIGIN_REACHABILITY_BUDGET_MS - (now - reachabilityStarted));
-}
-
 /** CDN Storage can serve this page while the API origin is still binding or
  *  opening the database. Keep retrying `not ready` through the remote open
  *  window. Consecutive 502/network failures stop after
  *  ORIGIN_REACHABILITY_BUDGET_MS so a bad Pull Zone rule is not an infinite
  *  spinner. Each class has its own clock: a late gateway blip must not spend
  *  warmup elapsed time, and one `not ready` must not inherit eight minutes
- *  for a dead origin. Each attempt is aborted after the remaining
- *  reachability budget so a pending origin pull cannot stall Date.now(). */
+ *  for a dead origin. Each attempt is aborted after ORIGIN_REACHABILITY_BUDGET_MS
+ *  (not leftover consecutive time) so a pending origin pull cannot stall
+ *  Date.now(), while a slow warmup 503 after 502s can still be classified. */
 async function waitForApiMe() {
   let warmupStarted = null;
   let reachabilityStarted = null;
@@ -157,7 +152,7 @@ async function waitForApiMe() {
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
-      originAttemptTimeoutMs(attemptStarted, reachabilityStarted),
+      ORIGIN_REACHABILITY_BUDGET_MS,
     );
     try {
       const me = await api("/api/me", "GET", null, controller.signal);

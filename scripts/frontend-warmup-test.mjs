@@ -40,7 +40,7 @@ function loadFrontend(fetchImpl, clock, timers) {
     console,
   });
   return vm.runInContext(
-    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage, originAttemptTimeoutMs })`,
+    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage })`,
     context,
   );
 }
@@ -225,11 +225,69 @@ test("parseRetryAfterMs caps advertised delay", () => {
   assert.equal(parseRetryAfterMs("nope"), 0);
 });
 
-test("originAttemptTimeoutMs uses remaining reachability budget", () => {
-  const { originAttemptTimeoutMs, ORIGIN_REACHABILITY_BUDGET_MS } = loadFrontend(async () => {});
-  assert.equal(originAttemptTimeoutMs(0, null), ORIGIN_REACHABILITY_BUDGET_MS);
-  assert.equal(originAttemptTimeoutMs(60 * 1000, 0), 30 * 1000);
-  assert.equal(originAttemptTimeoutMs(90 * 1000, 0), 1);
+test("waitForApiMe does not shrink abort to leftover reachability before class is known", async () => {
+  const clock = { ms: 0 };
+  let calls = 0;
+  let jumpedToDeadline = false;
+  const pending = [];
+  const fetchImpl = async (_url, opts) => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 502,
+        headers: { get: () => null },
+        text: async () => "Bad Gateway",
+      };
+    }
+    if (calls === 2) {
+      const abortTimer = pending.find((t) => t.ms === 90 * 1000);
+      assert.ok(
+        abortTimer,
+        "attempt abort must stay the full 90s budget after prior 502s, not leftover consecutive time",
+      );
+      assert.ok(opts && opts.signal && !opts.signal.aborted);
+      return {
+        ok: false,
+        status: 503,
+        headers: { get: (name) => (name === "retry-after" ? "0" : null) },
+        text: async () => JSON.stringify({ error: "not ready" }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
+    };
+  };
+  const timers = {
+    setTimeout(fn, ms) {
+      // Retry sleeps are short. Abort uses the full 90s budget.
+      if (ms < 90 * 1000) {
+        queueMicrotask(() => {
+          if (!jumpedToDeadline) {
+            jumpedToDeadline = true;
+            clock.ms = 89 * 1000;
+          }
+          fn();
+        });
+        return 0;
+      }
+      const id = pending.length + 1;
+      pending.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout(id) {
+      const i = pending.findIndex((t) => t.id === id);
+      if (i >= 0) pending.splice(i, 1);
+    },
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl, clock, timers);
+  const me = await waitForApiMe();
+  assert.equal(calls, 3);
+  assert.equal(me.user.username, "ok");
+  assert.equal(clock.ms, 89 * 1000);
 });
 
 test("waitForApiMe aborts a fetch that never settles after the reachability budget", async () => {
