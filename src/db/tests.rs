@@ -466,21 +466,18 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
     let tmp = tmp_db_path("migrate_retry_timeout");
     let lock_path = tmp.clone();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    // `thread::park()` can return spuriously; a COMMIT then lets migrate-open
+    // succeed and this assertion fails. Hold the exclusive lock until the
+    // timeout path has been observed (sender drop unblocks `recv`).
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
         let conn = Connection::open(lock_path).unwrap();
         conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
         locked_tx.send(()).unwrap();
-        std::thread::park();
+        let _ = release_rx.recv();
         conn.execute_batch("COMMIT").unwrap();
     });
     locked_rx.recv().unwrap();
-    struct UnparkOnDrop(std::thread::Thread);
-    impl Drop for UnparkOnDrop {
-        fn drop(&mut self) {
-            self.0.unpark();
-        }
-    }
-    let _unpark = UnparkOnDrop(holder.thread().clone());
     let err = tokio_test_block_on(Db::open_with_until_ready(
         DbOpenOptions {
             path: tmp.clone(),
@@ -501,11 +498,16 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
         msg.contains("timed out retrying database open"),
         "unexpected error: {msg}"
     );
+    let lower = msg.to_ascii_lowercase();
+    assert!(
+        lower.contains("database is locked") || lower.contains("database is busy"),
+        "timeout must chain the exclusive-lock failure, not skip open: {msg}"
+    );
     assert!(
         !msg.contains("waiting for jmodguard-bot"),
         "bot migrate-open must not report an API wait: {msg}"
     );
-    drop(_unpark);
+    drop(release_tx);
     let _ = holder.join();
     cleanup_db(&tmp);
 }
