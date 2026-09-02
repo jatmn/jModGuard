@@ -24,6 +24,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: Check Windows builds
         run: |
           cargo check --locked --bin jmodguard-bot --no-default-features
