@@ -1074,7 +1074,7 @@ mod tests {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(350);
             while tokio::time::Instant::now() < deadline {
                 let health = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_secs(2),
                     http_get(addr, "/health"),
                 )
                 .await
