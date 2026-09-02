@@ -377,17 +377,8 @@ pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
 }
 
 fn annotate_readonly_token(error: anyhow::Error) -> anyhow::Error {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("readonly")
-        || message.contains("read-only")
-        || message.contains("read only")
-        || message.contains("not authorized")
-        || message.contains("permission denied")
-    {
-        return anyhow::anyhow!(
-            "remote database token cannot write. The API needs a full-access token \
-             (Bunny Database Access → full access, not read-only). Original error: {error:#}"
-        );
+    if super::is_rejected_remote_auth(&error) {
+        return anyhow::Error::new(RemoteTokenCannotWrite(format!("{error:#}")));
     }
     error
 }
