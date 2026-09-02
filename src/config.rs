@@ -327,7 +327,10 @@ impl Config {
             }
         }
         if let Ok(v) = env::var("JMODGUARD_BOT_STATUS") {
-            self.bot.status = v.trim().to_string();
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.status = v.to_string();
+            }
         }
         if let Ok(v) = env::var("JMODGUARD_CONFIG_POLL_SECS") {
             let v = v.trim();
@@ -675,6 +678,17 @@ mod tests {
         assert_eq!(cfg.bot.default_prefix, "?");
         assert_eq!(cfg.bot.retention_days, 14);
         assert_eq!(cfg.bot.status, "watching");
+    }
+
+    #[test]
+    fn empty_bot_status_env_does_not_clear_default() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &["JMODGUARD_BOT_STATUS"];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe { std::env::set_var("JMODGUARD_BOT_STATUS", "  ") };
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.bot.status, "moderating");
     }
 
     #[test]

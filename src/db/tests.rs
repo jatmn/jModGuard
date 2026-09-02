@@ -546,6 +546,27 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
 }
 
 #[test]
+fn ensure_api_writes_allowed_fails_closed_on_query_only() {
+    let tmp = tmp_db_path("api_write_probe_query_only");
+    let _bot = Db::open(&tmp, 2).expect("bot migrate-open");
+    let conn = Connection::open(&tmp).unwrap();
+    conn.execute_batch("PRAGMA query_only=ON;").unwrap();
+    let err = ensure_api_writes_allowed(&conn)
+        .err()
+        .expect("query_only connection must fail the API write probe");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot write") || msg.to_ascii_lowercase().contains("readonly"),
+        "unexpected: {msg}"
+    );
+    assert!(
+        !crate::db::is_startup_retryable(&err, true),
+        "write-probe denial must not burn the remote retry window"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     let tmp = tmp_db_path("migrate_fence");
     let empty = Connection::open(&tmp).unwrap();
