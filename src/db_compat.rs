@@ -693,7 +693,7 @@ mod tests {
         });
 
         let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_millis(100))).unwrap();
-        let connector = crate::remote_https::https_connector().expect("test rustls connector");
+        let connector = crate::remote_https::https_connector();
         let database = runtime
             .block_on(
                 libsql::Builder::new_remote(format!("http://{address}"), "test-token".into())
