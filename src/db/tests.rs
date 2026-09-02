@@ -343,9 +343,10 @@ fn api_open_retries_until_bot_migrates() {
         migrate: true,
         ..api_opts.clone()
     };
-    // Prove the retry path is required, then start migrate without a wall-clock
-    // delay. `sleep` before bot-open was a race: a slow scheduler could exhaust
-    // the API budget before migrate ran.
+    // Prove unreadiness, then retry on a worker while this thread migrates.
+    // Putting migrate on a background thread (with or without `sleep`) lets
+    // cargo's parallel scheduler starve it until the API budget expires — that
+    // failed PR CI after the park() fixture fix.
     let before = Db::open_with(api_opts.clone())
         .err()
         .expect("API must not open before bot migrate");
@@ -353,16 +354,17 @@ fn api_open_retries_until_bot_migrates() {
         is_schema_not_ready(&before),
         "unexpected error before migrate: {before:#}"
     );
-    let handle = std::thread::spawn(move || {
-        Db::open_with(bot_opts).expect("bot migrate must succeed");
+    let api = std::thread::spawn(move || {
+        tokio_test_block_on(Db::open_with_until_ready(
+            api_opts,
+            80,
+            std::time::Duration::from_millis(50),
+        ))
     });
-    tokio_test_block_on(Db::open_with_until_ready(
-        api_opts,
-        80,
-        std::time::Duration::from_millis(50),
-    ))
-    .expect("API must succeed once bot migrations finish");
-    handle.join().expect("bot migrate thread panicked");
+    Db::open_with(bot_opts).expect("bot migrate must succeed");
+    api.join()
+        .expect("API retry thread panicked")
+        .expect("API must succeed once bot migrations finish");
     cleanup_db(&tmp);
 }
 
