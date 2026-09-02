@@ -110,8 +110,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 - Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
   credentials must fail startup, not open local SQLite. Unset it only for an
   intentional local-SQLite container run. Runtime user is UID 10001. Env
-  `JMODGUARD_DB_POOL_SIZE` (minimum 2) overrides `db.pool_size` when there
-  is no mounted `config.toml`.
+  `JMODGUARD_DB_POOL_SIZE` (minimum 2) overrides `db.pool_size` when set
+  (environment wins over `config.toml`, same as other `JMODGUARD_*` keys).
+  Container deploys typically have no toml, so set the env var there.
 - Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET`/`HEAD`
   `/health` are unauthenticated process liveness probes (`ok`, no database).
   Bind and accept them **before** opening the database. On the API public

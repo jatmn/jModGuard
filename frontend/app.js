@@ -86,10 +86,6 @@ const API_WARMUP_BUDGET_MS = 8 * 60 * 1000;
 /** Misrouted / dead origin should not look like warmup forever. */
 const ORIGIN_REACHABILITY_BUDGET_MS = 90 * 1000;
 
-function originRetryBudgetMs(err) {
-  return isApiWarmup(err) ? API_WARMUP_BUDGET_MS : ORIGIN_REACHABILITY_BUDGET_MS;
-}
-
 function originGaveUpMessage(err) {
   if (isApiWarmup(err)) {
     return "API did not become ready in time. Start the bot first and wait for database ready (migrate=true).";
@@ -130,10 +126,14 @@ async function api(path, method = "GET", body = null) {
 
 /** CDN Storage can serve this page while the API origin is still binding or
  *  opening the database. Keep retrying `not ready` through the remote open
- *  window. 502/network failures stop after ORIGIN_REACHABILITY_BUDGET_MS so a
- *  bad Pull Zone rule is not an infinite spinner. */
+ *  window. Consecutive 502/network failures stop after
+ *  ORIGIN_REACHABILITY_BUDGET_MS so a bad Pull Zone rule is not an infinite
+ *  spinner. Each class has its own clock: a late gateway blip must not spend
+ *  warmup elapsed time, and one `not ready` must not inherit eight minutes
+ *  for a dead origin. */
 async function waitForApiMe() {
-  const started = Date.now();
+  let warmupStarted = null;
+  let reachabilityStarted = null;
   let delay = 500;
   let sawStartup = false;
   while (true) {
@@ -141,8 +141,18 @@ async function waitForApiMe() {
       return await api("/api/me");
     } catch (e) {
       if (!isOriginStarting(e)) throw e;
-      if (Date.now() - started >= originRetryBudgetMs(e)) {
-        throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+      const now = Date.now();
+      if (isApiWarmup(e)) {
+        reachabilityStarted = null;
+        if (warmupStarted === null) warmupStarted = now;
+        if (now - warmupStarted >= API_WARMUP_BUDGET_MS) {
+          throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+        }
+      } else {
+        if (reachabilityStarted === null) reachabilityStarted = now;
+        if (now - reachabilityStarted >= ORIGIN_REACHABILITY_BUDGET_MS) {
+          throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+        }
       }
       if (!sawStartup) {
         sawStartup = true;

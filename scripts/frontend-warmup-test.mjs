@@ -157,7 +157,7 @@ test("waitForApiMe gives up on persistent origin failures", async () => {
   let calls = 0;
   const fetchImpl = async () => {
     calls += 1;
-    clock.ms = 90 * 1000;
+    if (calls > 1) clock.ms = 90 * 1000;
     return {
       ok: false,
       status: 502,
@@ -167,10 +167,47 @@ test("waitForApiMe gives up on persistent origin failures", async () => {
   };
   const { waitForApiMe, originGaveUpMessage, apiError } = loadFrontend(fetchImpl, clock);
   await assert.rejects(waitForApiMe, (err) => {
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     assert.equal(err.message, originGaveUpMessage(apiError("HTTP 502", 502, 0)));
     return true;
   });
+});
+
+test("waitForApiMe does not spend warmup time on a late 502", async () => {
+  const clock = { ms: 0 };
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls <= 2) {
+      clock.ms = calls === 1 ? 0 : 91 * 1000;
+      return {
+        ok: false,
+        status: 503,
+        headers: { get: (name) => (name === "retry-after" ? "0" : null) },
+        text: async () => JSON.stringify({ error: "not ready" }),
+      };
+    }
+    if (calls === 3) {
+      clock.ms = 92 * 1000;
+      return {
+        ok: false,
+        status: 502,
+        headers: { get: () => null },
+        text: async () => "Bad Gateway",
+      };
+    }
+    clock.ms = 93 * 1000;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
+    };
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl, clock);
+  const me = await waitForApiMe();
+  assert.equal(calls, 4);
+  assert.equal(me.user.username, "ok");
 });
 
 test("waitForApiMe warmup budget is longer than origin reachability", () => {

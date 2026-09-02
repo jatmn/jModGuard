@@ -467,17 +467,49 @@ async fn callback(
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
-    if let Err(error) = session.cycle_id().await {
-        tracing::warn!("oauth callback: failed to rotate session id: {error}");
-    }
-    let _ = session.insert(SESSION_USER, uid).await;
-    let _ = session.insert(SESSION_TOKEN, &tok.access_token).await;
-    if let Some(r) = &tok.refresh_token {
-        let _ = session.insert(SESSION_REFRESH, r).await;
+    if let Err(error) = store_login_session(
+        &session,
+        uid,
+        &tok.access_token,
+        tok.refresh_token.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("oauth callback: {error}");
+        return finish(error_page("failed to rotate session"));
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
     let return_to = return_to_or_root(&state.cfg, requested_return_to.as_deref());
     finish(axum::response::Redirect::to(&return_to).into_response())
+}
+
+/// Rotate the session id, then persist OAuth credentials. Fail closed: a
+/// rotation or store error must not leave tokens on the pre-login session id.
+async fn store_login_session(
+    session: &Session,
+    uid: u64,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    session
+        .cycle_id()
+        .await
+        .map_err(|error| format!("failed to rotate session id: {error}"))?;
+    session
+        .insert(SESSION_USER, uid)
+        .await
+        .map_err(|error| format!("failed to persist login session: {error}"))?;
+    session
+        .insert(SESSION_TOKEN, access_token)
+        .await
+        .map_err(|error| format!("failed to persist login session: {error}"))?;
+    if let Some(refresh) = refresh_token {
+        session
+            .insert(SESSION_REFRESH, refresh)
+            .await
+            .map_err(|error| format!("failed to persist login session: {error}"))?;
+    }
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -827,6 +859,59 @@ mod tests {
         let app = crate::state::AppState::new(Default::default(), db).unwrap();
         std::fs::remove_file(&tmp).ok();
         router(app)
+    }
+
+    #[tokio::test]
+    async fn store_login_session_fails_closed_when_rotation_fails() {
+        #[derive(Debug, Clone, Default)]
+        struct FailingDeleteStore;
+
+        #[serenity::async_trait]
+        impl tower_sessions::SessionStore for FailingDeleteStore {
+            async fn create(
+                &self,
+                _record: &mut tower_sessions::session::Record,
+            ) -> tower_sessions::session_store::Result<()> {
+                Ok(())
+            }
+
+            async fn save(
+                &self,
+                _record: &tower_sessions::session::Record,
+            ) -> tower_sessions::session_store::Result<()> {
+                Ok(())
+            }
+
+            async fn load(
+                &self,
+                _session_id: &tower_sessions::session::Id,
+            ) -> tower_sessions::session_store::Result<Option<tower_sessions::session::Record>>
+            {
+                Ok(None)
+            }
+
+            async fn delete(
+                &self,
+                _session_id: &tower_sessions::session::Id,
+            ) -> tower_sessions::session_store::Result<()> {
+                Err(tower_sessions::session_store::Error::Backend(
+                    "delete failed".into(),
+                ))
+            }
+        }
+
+        let session = Session::new(None, Arc::new(FailingDeleteStore), None);
+        let err = store_login_session(&session, 1, "token", None)
+            .await
+            .expect_err("rotation failure must not persist credentials");
+        assert!(
+            err.contains("failed to rotate session id"),
+            "unexpected: {err}"
+        );
+        assert!(
+            session.get::<u64>(SESSION_USER).await.unwrap().is_none(),
+            "pre-login session must not receive the Discord user id"
+        );
     }
 
     #[tokio::test]

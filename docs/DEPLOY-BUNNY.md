@@ -162,6 +162,12 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+Optional when you have no `config.toml` on the bot container (typical):
+`JMODGUARD_DB_POOL_SIZE` (this process's pool), `JMODGUARD_DEFAULT_PREFIX`,
+`JMODGUARD_RETENTION_DAYS`, and `JMODGUARD_BOT_STATUS`. Prefix and retention
+are written on migrate-open into durable `meta.settings_terminal_defaults`.
+Status is the Discord presence text.
+
 Plus the database pair from step 1.
 
 The bot is the schema authority. Wait for logs containing
@@ -193,8 +199,8 @@ build), only `/health` returns `200`. `/api` returns `503` with JSON
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
 `/api/me` while the origin is still starting (`not ready` for up to eight
-minutes). Persistent `502`/`504` or a dropped origin pull stop after 90
-seconds with an error instead of spinning forever. OAuth CSRF is a cookie, so a restart between
+minutes). Consecutive `502`/`504` or dropped origin pulls stop after 90
+seconds of those failures with an error instead of spinning forever. OAuth CSRF is a cookie, so a restart between
 `/login` and Discord's return still completes. Login sessions live in
 that one process (`jmodguard_session`).
 
@@ -210,9 +216,9 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
-Optional when you have no `config.toml` on the container (typical):
-`JMODGUARD_DB_POOL_SIZE`, `JMODGUARD_DEFAULT_PREFIX`,
-`JMODGUARD_RETENTION_DAYS`, `JMODGUARD_BOT_STATUS`.
+Optional when you have no `config.toml` on the API container (typical):
+`JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix,
+retention, and bot status are bot-owned — set those on the bot app.
 
 `JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators open, not a
 container hostname. Discord OAuth redirect URI:
