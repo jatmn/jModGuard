@@ -36,7 +36,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `CommandInteraction` rename, `GuildId::set_commands`).
 - libsql 0.9.30 (`core`, `remote`; remote HTTPS uses in-tree rustls 0.23, not
   libsql's `tls`/`hyper-rustls 0.25` stack; `libsql-sqlite3-parser` is
-  git-patched to `vendor/libsql-sqlite3-parser-0.13.1` for GHSA-8m95-fffc-h4c5),
+  git-patched from branch `vendor/libsql-sqlite3-parser-0.13.1` (rev
+  `f2391d6`) for GHSA-8m95-fffc-h4c5),
   axum 0.8, tower-sessions 0.14, reqwest 0.13, edition 2024.
 
 ## Invariants to respect
