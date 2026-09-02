@@ -6,6 +6,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY vendor ./vendor
 RUN cargo build --locked --release --bin jmodguard-bot --no-default-features
 
 FROM debian:bookworm-slim

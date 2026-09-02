@@ -1,0 +1,67 @@
+[package]
+name = "tokio-tungstenite"
+description = "Tokio binding for Tungstenite, the Lightweight stream-based WebSocket implementation"
+version = "0.21.0"
+edition = "2018"
+rust-version = "1.63"
+license = "MIT"
+repository = "https://github.com/snapview/tokio-tungstenite"
+publish = false
+
+# Version is labeled 0.21.0 so Cargo [patch] replaces serenity 0.12.5's
+# tokio-tungstenite 0.21.0 pin. The sources are 0.24.0 (rustls 0.23) to drop
+# rustls-webpki 0.102.8 (GHSA-82j2-j2ch-gfr8).
+
+[features]
+default = ["connect", "handshake", "url"]
+connect = ["stream", "tokio/net", "handshake"]
+handshake = ["tungstenite/handshake"]
+native-tls = ["native-tls-crate", "tokio-native-tls", "stream", "tungstenite/native-tls", "handshake"]
+native-tls-vendored = ["native-tls", "native-tls-crate/vendored", "tungstenite/native-tls-vendored"]
+rustls-tls-native-roots = ["__rustls-tls", "rustls-native-certs"]
+rustls-tls-webpki-roots = ["__rustls-tls", "webpki-roots", "url"]
+__rustls-tls = ["rustls", "rustls-pki-types", "tokio-rustls", "stream", "tungstenite/__rustls-tls", "handshake"]
+stream = []
+url = ["tungstenite/url"]
+
+[dependencies]
+log = "0.4.17"
+futures-util = { version = "0.3.28", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1.0.0", default-features = false, features = ["io-util"] }
+
+[dependencies.tungstenite]
+version = "0.24.0"
+default-features = false
+
+[dependencies.native-tls-crate]
+optional = true
+package = "native-tls"
+version = "0.2.11"
+
+[dependencies.rustls]
+optional = true
+version = "0.23.0"
+default-features = false
+features = ["ring", "std", "tls12"]
+
+[dependencies.rustls-pki-types]
+optional = true
+version = "1.0"
+
+[dependencies.rustls-native-certs]
+optional = true
+version = "0.8.0"
+
+[dependencies.tokio-native-tls]
+optional = true
+version = "0.3.1"
+
+[dependencies.tokio-rustls]
+optional = true
+version = "0.26.0"
+default-features = false
+features = ["ring", "tls12"]
+
+[dependencies.webpki-roots]
+optional = true
+version = "0.26.0"

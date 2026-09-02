@@ -49,7 +49,10 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 ## libsql 0.9.30
 
 - Bunny Database uses the remote libSQL protocol. Build it with
-  `Builder::new_remote(url, token)`; local installs use `Builder::new_local`.
+  `Builder::new_remote(url, token)` plus the in-tree rustls 0.23 connector
+  (`src/remote_https.rs`); local installs use `Builder::new_local`.
+  Do not enable libsql's `tls` feature: it pulls `hyper-rustls 0.25` /
+  `rustls 0.22` / `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8).
 - The libSQL API is async. `src/db_compat.rs` supplies a narrow synchronous
   facade so the existing SQL paths can run unchanged inside `with_conn`'s
   blocking closures.
