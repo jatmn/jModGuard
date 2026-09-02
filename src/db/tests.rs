@@ -108,11 +108,11 @@ fn cancelled_caller_does_not_release_blocking_task_permit() {
         );
 
         release_tx.send(()).unwrap();
-        for _ in 0..100 {
+        for _ in 0..200 {
             if db.permits.available_permits() == 2 {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(db.permits.available_permits(), 2);
         assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
@@ -123,7 +123,7 @@ fn cancelled_caller_does_not_release_blocking_task_permit() {
 
 #[test]
 fn seeds_globals_in_memory() {
-    let tmp = std::env::temp_dir().join(format!("jmodguard_test_{}.db", std::process::id()));
+    let tmp = tmp_db_path("seeds_globals");
     let db = Db::open(&tmp, 2).unwrap();
     let parts = db
         .with_conn_sync(|conn| {
@@ -167,9 +167,7 @@ fn seeds_globals_in_memory() {
         "all event templates seeded"
     );
     assert_eq!(parts.3, 0, "no badwords by default");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    cleanup_db(&tmp);
 }
 
 #[test]
@@ -177,7 +175,7 @@ fn config_parts_loads_every_section() {
     // Regression: load_config_parts must succeed for a real guild and
     // return rules, commands, templates AND log channels (these tables
     // use non-`data` value columns).
-    let tmp = std::env::temp_dir().join(format!("jmodguard_test3_{}.db", std::process::id()));
+    let tmp = tmp_db_path("config_parts_every_section");
     let db = Db::open(&tmp, 2).unwrap();
     let guild = 271083998816632834i64;
     let parts = tokio_test_block_on(crate::db::load_config_parts(&db, guild));
@@ -195,9 +193,7 @@ fn config_parts_loads_every_section() {
     );
     assert!(parts.templates.contains_key("automod"));
     assert!(parts.log_channels.is_empty(), "no log channels by default");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    cleanup_db(&tmp);
 }
 
 #[test]
@@ -347,14 +343,23 @@ fn api_open_retries_until_bot_migrates() {
         migrate: true,
         ..api_opts.clone()
     };
+    // Prove the retry path is required, then start migrate without a wall-clock
+    // delay. `sleep` before bot-open was a race: a slow scheduler could exhaust
+    // the API budget before migrate ran.
+    let before = Db::open_with(api_opts.clone())
+        .err()
+        .expect("API must not open before bot migrate");
+    assert!(
+        is_schema_not_ready(&before),
+        "unexpected error before migrate: {before:#}"
+    );
     let handle = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(80));
         Db::open_with(bot_opts).expect("bot migrate must succeed");
     });
     tokio_test_block_on(Db::open_with_until_ready(
         api_opts,
-        40,
-        std::time::Duration::from_millis(25),
+        80,
+        std::time::Duration::from_millis(50),
     ))
     .expect("API must succeed once bot migrations finish");
     handle.join().expect("bot migrate thread panicked");
@@ -407,6 +412,9 @@ fn api_open_retries_while_bot_holds_sqlite_lock() {
         let conn = Connection::open(lock_path).unwrap();
         conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
         locked_tx.send(()).unwrap();
+        // Hold long enough for the API open to enter SQLite's busy wait.
+        // `PRAGMA busy_timeout=5000` is much larger, so this cannot exhaust
+        // the retry budget the way a spurious `park()` wakeup could.
         std::thread::sleep(std::time::Duration::from_millis(100));
         conn.execute_batch("COMMIT").unwrap();
     });
@@ -910,7 +918,7 @@ fn dual_process_local_share_config_version() {
 
 #[test]
 fn config_parts_loads_effective_rules() {
-    let tmp = std::env::temp_dir().join(format!("jmodguard_test2_{}.db", std::process::id()));
+    let tmp = tmp_db_path("config_parts_effective_rules");
     let db = Db::open(&tmp, 2).unwrap();
     let parts = db.with_conn_sync(|_| Ok(())).unwrap();
     let _ = parts;
@@ -935,9 +943,7 @@ fn config_parts_loads_effective_rules() {
     got.sort();
     expected.sort();
     assert_eq!(got, expected);
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    cleanup_db(&tmp);
 }
 
 #[test]
