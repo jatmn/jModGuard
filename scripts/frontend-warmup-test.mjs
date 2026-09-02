@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const src = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
 
-function loadFrontend(fetchImpl, clock) {
+function loadFrontend(fetchImpl, clock, timers) {
   const document = {
     querySelector() {
       return {
@@ -34,12 +34,13 @@ function loadFrontend(fetchImpl, clock) {
     Math,
     JSON,
     Error,
-    setTimeout,
-    clearTimeout,
+    AbortController,
+    setTimeout: timers?.setTimeout || setTimeout,
+    clearTimeout: timers?.clearTimeout || clearTimeout,
     console,
   });
   return vm.runInContext(
-    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage })`,
+    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage, originAttemptTimeoutMs })`,
     context,
   );
 }
@@ -222,4 +223,51 @@ test("parseRetryAfterMs caps advertised delay", () => {
   assert.equal(parseRetryAfterMs("1"), 1000);
   assert.equal(parseRetryAfterMs("99"), 30000);
   assert.equal(parseRetryAfterMs("nope"), 0);
+});
+
+test("originAttemptTimeoutMs uses remaining reachability budget", () => {
+  const { originAttemptTimeoutMs, ORIGIN_REACHABILITY_BUDGET_MS } = loadFrontend(async () => {});
+  assert.equal(originAttemptTimeoutMs(0, null), ORIGIN_REACHABILITY_BUDGET_MS);
+  assert.equal(originAttemptTimeoutMs(60 * 1000, 0), 30 * 1000);
+  assert.equal(originAttemptTimeoutMs(90 * 1000, 0), 1);
+});
+
+test("waitForApiMe aborts a fetch that never settles after the reachability budget", async () => {
+  const clock = { ms: 0 };
+  let calls = 0;
+  const fetchImpl = (_url, opts) => new Promise((_, reject) => {
+    calls += 1;
+    assert.ok(opts && opts.signal, "waitForApiMe must pass an AbortSignal");
+    const abort = () => {
+      const err = new Error("The operation was aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    if (opts.signal.aborted) abort();
+    else opts.signal.addEventListener("abort", abort);
+  });
+  const pending = [];
+  const timers = {
+    setTimeout(fn, ms) {
+      const id = pending.length + 1;
+      pending.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout(id) {
+      const i = pending.findIndex((t) => t.id === id);
+      if (i >= 0) pending.splice(i, 1);
+    },
+  };
+  const { waitForApiMe, originGaveUpMessage, apiError, ORIGIN_REACHABILITY_BUDGET_MS } =
+    loadFrontend(fetchImpl, clock, timers);
+  const done = waitForApiMe();
+  const abortTimer = pending.find((t) => t.ms === ORIGIN_REACHABILITY_BUDGET_MS);
+  assert.ok(abortTimer, "waitForApiMe must schedule an abort for a pending origin pull");
+  clock.ms = ORIGIN_REACHABILITY_BUDGET_MS;
+  abortTimer.fn();
+  await assert.rejects(done, (err) => {
+    assert.equal(calls, 1);
+    assert.equal(err.message, originGaveUpMessage(apiError("Failed to fetch")));
+    return true;
+  });
 });

@@ -6,9 +6,9 @@ on Storage/CDN; the API container stays private and only answers `/api`,
 login, and OAuth. The pages never open SQL from the browser. They call the
 API; the API (and the bot) open the database. If the CDN page loads while
 the API is still starting, `/api/me` returns `503` `{error:"not ready"}`
-and the UI keeps waiting (up to eight minutes). Consecutive `502`/`504` or
-failed fetches stop after 90 seconds of those failures so a bad origin
-rule is not an infinite spinner. `/login` and
+and the UI keeps waiting (up to eight minutes). Consecutive `502`/`504`,
+failed fetches, or origin pulls that never complete stop after 90 seconds
+of those failures so a bad origin rule is not an infinite spinner. `/login` and
 `/oauth/callback` return an HTML wait page that reloads until axum can
 redirect. OAuth CSRF lives in a cookie, so an API restart between Login
 and Discord's return still completes the handshake.

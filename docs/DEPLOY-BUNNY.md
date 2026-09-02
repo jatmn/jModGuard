@@ -199,8 +199,9 @@ build), only `/health` returns `200`. `/api` returns `503` with JSON
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
 `/api/me` while the origin is still starting (`not ready` for up to eight
-minutes). Consecutive `502`/`504` or dropped origin pulls stop after 90
-seconds of those failures with an error instead of spinning forever. OAuth CSRF is a cookie, so a restart between
+minutes). Consecutive `502`/`504`, dropped origin pulls, or origin pulls
+that never complete stop after 90 seconds of those failures with an error
+instead of spinning forever. OAuth CSRF is a cookie, so a restart between
 `/login` and Discord's return still completes. Login sessions live in
 that one process (`jmodguard_session`).
 

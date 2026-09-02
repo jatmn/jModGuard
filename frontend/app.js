@@ -109,11 +109,20 @@ function setStartupStatus(text) {
   if (node) node.textContent = text;
 }
 
-async function api(path, method = "GET", body = null) {
+async function api(path, method = "GET", body = null, signal) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include" };
+  if (signal) opts.signal = signal;
   if (body !== null) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
-  const res = await fetch(apiUrl(path), opts);
+  let res;
+  try {
+    res = await fetch(apiUrl(path), opts);
+  } catch (e) {
+    if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
+      throw apiError("Failed to fetch");
+    }
+    throw e;
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
@@ -124,32 +133,46 @@ async function api(path, method = "GET", body = null) {
   return data;
 }
 
+/** Cap one in-flight `/api/me` so a black-holed origin cannot stall the 90s clock. */
+function originAttemptTimeoutMs(now, reachabilityStarted) {
+  if (reachabilityStarted === null) return ORIGIN_REACHABILITY_BUDGET_MS;
+  return Math.max(1, ORIGIN_REACHABILITY_BUDGET_MS - (now - reachabilityStarted));
+}
+
 /** CDN Storage can serve this page while the API origin is still binding or
  *  opening the database. Keep retrying `not ready` through the remote open
  *  window. Consecutive 502/network failures stop after
  *  ORIGIN_REACHABILITY_BUDGET_MS so a bad Pull Zone rule is not an infinite
  *  spinner. Each class has its own clock: a late gateway blip must not spend
  *  warmup elapsed time, and one `not ready` must not inherit eight minutes
- *  for a dead origin. */
+ *  for a dead origin. Each attempt is aborted after the remaining
+ *  reachability budget so a pending origin pull cannot stall Date.now(). */
 async function waitForApiMe() {
   let warmupStarted = null;
   let reachabilityStarted = null;
   let delay = 500;
   let sawStartup = false;
   while (true) {
+    const attemptStarted = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      originAttemptTimeoutMs(attemptStarted, reachabilityStarted),
+    );
     try {
-      return await api("/api/me");
+      const me = await api("/api/me", "GET", null, controller.signal);
+      return me;
     } catch (e) {
       if (!isOriginStarting(e)) throw e;
       const now = Date.now();
       if (isApiWarmup(e)) {
         reachabilityStarted = null;
-        if (warmupStarted === null) warmupStarted = now;
+        if (warmupStarted === null) warmupStarted = attemptStarted;
         if (now - warmupStarted >= API_WARMUP_BUDGET_MS) {
           throw apiError(originGaveUpMessage(e), e.status || 0, 0);
         }
       } else {
-        if (reachabilityStarted === null) reachabilityStarted = now;
+        if (reachabilityStarted === null) reachabilityStarted = attemptStarted;
         if (now - reachabilityStarted >= ORIGIN_REACHABILITY_BUDGET_MS) {
           throw apiError(originGaveUpMessage(e), e.status || 0, 0);
         }
@@ -161,6 +184,8 @@ async function waitForApiMe() {
       }
       await sleep(Math.max(e.retryAfterMs || 0, delay));
       delay = Math.min(Math.floor(delay * 1.5), 2000);
+    } finally {
+      clearTimeout(timer);
     }
   }
 }
