@@ -61,5 +61,5 @@ rustls-webpki = { version = "0.103.13", default-features = false, features = ["r
 tower = "0.5.3"
 
 [patch.crates-io]
-libsql-sqlite3-parser = { path = "vendor/libsql-sqlite3-parser" }
+libsql-sqlite3-parser = { git = "https://github.com/jatmn/jModGuard", rev = "f2391d613c4bb8018873964e779341f50ce05447" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite" }

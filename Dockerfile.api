@@ -7,6 +7,9 @@ COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY vendor ./vendor
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo build --locked --release --bin jmodguard-api --no-default-features --features web
 
 FROM debian:bookworm-slim
