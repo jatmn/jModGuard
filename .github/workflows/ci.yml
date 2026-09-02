@@ -16,22 +16,6 @@ env:
   TMPDIR: ${{ github.workspace }}/.tmp
 
 jobs:
-  windows-build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check Windows builds
-        run: |
-          cargo check --locked --bin jmodguard-bot --no-default-features
-          cargo check --locked --bin jmodguard-api
-
   test:
     runs-on: ubuntu-latest
     steps:

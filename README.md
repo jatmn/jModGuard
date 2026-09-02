@@ -25,7 +25,7 @@ from a private GitHub Actions repo. You do not need Bunny to run it
 - **Logging**: every event type (joins, leaves, bans, edits, deletes, automod
   hits, mod actions) routes to its own channel with editable templates.
 - **Member tracking**: join/leave history, join counts, message counts.
-- **Prefix + slash commands**, multi-server, Windows/Linux binary (SQLite and
+- **Prefix + slash commands**, multi-server, Linux binary (SQLite and
   TLS are bundled — zero system dependencies).
 
 ## Quick start
@@ -47,8 +47,8 @@ minutes against a remote database. Both
 processes use the same local SQLite file (`db.path`) or remote libSQL database
 (`db.url` and `db.token`).
 
-Full walkthrough (Discord developer portal, intents, invite URL, systemd /
-Task Scheduler): **[docs/SETUP.md](docs/SETUP.md)**.
+Full walkthrough (Discord developer portal, intents, invite URL, systemd):
+**[docs/SETUP.md](docs/SETUP.md)**.
 
 Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 
@@ -64,7 +64,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 
 | Doc | Contents |
 |---|---|
-| [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Windows & Linux |
+| [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Linux |
 | [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
 | [docs/BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) | local recovery procedure and Bunny production blocker |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |

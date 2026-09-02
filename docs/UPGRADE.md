@@ -9,8 +9,8 @@ your operator runbook for promote and rollout.
 
 ## 0. Upgrading from the single `jmodguard` binary
 
-Older builds shipped one process: `target/release/jmodguard` (or `jmodguard.exe`)
-and typically one service unit (`jmodguard.service` / one Task Scheduler task).
+Older builds shipped one process: `target/release/jmodguard`
+and typically one systemd unit (`jmodguard.service`).
 This release **removes that entrypoint**. You must run two binaries:
 
 | Old | New |
