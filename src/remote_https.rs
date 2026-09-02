@@ -13,6 +13,7 @@ use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -53,13 +54,29 @@ fn client_config() -> Result<ClientConfig> {
         bail!("{detail}");
     }
 
-    Ok(
+    let mut config =
         ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
             .with_safe_default_protocol_versions()
             .context("invalid rustls protocol versions")?
             .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+            .with_no_client_auth();
+    // hyper is compiled with HTTP/1.1 only; advertise that ALPN so HTTPS
+    // libSQL endpoints do not negotiate HTTP/2.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+fn server_name_from_uri_host(host: &str) -> Result<ServerName<'static>, io::Error> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::from(ip));
+    }
+    ServerName::try_from(host)
+        .map(|name| name.to_owned())
+        .map_err(|_| io::Error::other("invalid dnsname"))
 }
 
 #[derive(Clone)]
@@ -174,17 +191,10 @@ where
             }
         }
 
-        let mut hostname = dst.host().unwrap_or_default();
-        if let Some(trimmed) = hostname
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-        {
-            hostname = trimmed;
-        }
-        let hostname = match ServerName::try_from(hostname) {
-            Ok(name) => name.to_owned(),
-            Err(_) => {
-                return Box::pin(async move { Err(io::Error::other("invalid dnsname").into()) });
+        let hostname = match server_name_from_uri_host(dst.host().unwrap_or_default()) {
+            Ok(name) => name,
+            Err(error) => {
+                return Box::pin(async move { Err(error.into()) });
             }
         };
 
@@ -195,5 +205,43 @@ where
             let tls_stream = tls.connect(hostname, tcp).await.map_err(io::Error::other)?;
             Ok(MaybeHttpsStream::Https(Box::new(tls_stream)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_host_ipv4_literal_is_an_ip_server_name() {
+        let name = server_name_from_uri_host("127.0.0.1").expect("ipv4");
+        assert_eq!(
+            name,
+            ServerName::from("127.0.0.1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn uri_host_bracketed_ipv6_literal_is_an_ip_server_name() {
+        let name = server_name_from_uri_host("[::1]").expect("ipv6");
+        assert_eq!(name, ServerName::from("::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn uri_host_dns_name_is_preserved() {
+        let name = server_name_from_uri_host("example.lite.bunnydb.net").expect("dns");
+        assert!(matches!(name, ServerName::DnsName(_)));
+    }
+
+    #[test]
+    fn uri_host_empty_is_invalid() {
+        let error = server_name_from_uri_host("").expect_err("empty host");
+        assert_eq!(error.to_string(), "invalid dnsname");
+    }
+
+    #[test]
+    fn https_client_config_advertises_http11_alpn() {
+        let config = client_config().expect("native roots");
+        assert_eq!(config.alpn_protocols, [b"http/1.1".to_vec()]);
     }
 }
