@@ -47,7 +47,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1"
 thiserror = "2"
-tower-http = { version = "0.6", optional = true, features = ["cors"] }
+tower-http = { version = "0.6", optional = true, features = ["cors", "set-header"] }
 tower-sessions = { version = "0.14", optional = true, features = ["memory-store"] }
 tracing = "0.1"
 tracing-appender = "0.2"

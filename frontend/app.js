@@ -81,6 +81,18 @@ function isOriginStarting(err) {
   return err.status === 503 && String(err && err.message) === "HTTP 503";
 }
 
+/** Keep retrying API `not ready` longer than the remote open window (~6 min). */
+const API_WARMUP_BUDGET_MS = 8 * 60 * 1000;
+/** Misrouted / dead origin should not look like warmup forever. */
+const ORIGIN_REACHABILITY_BUDGET_MS = 90 * 1000;
+
+function originGaveUpMessage(err) {
+  if (isApiWarmup(err)) {
+    return "API did not become ready in time. Start the bot first and wait for database ready (migrate=true).";
+  }
+  return "Cannot reach the API. Check that the API container is running and that the Pull Zone OriginMagicContainers rules send /api to it.";
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -97,11 +109,20 @@ function setStartupStatus(text) {
   if (node) node.textContent = text;
 }
 
-async function api(path, method = "GET", body = null) {
+async function api(path, method = "GET", body = null, signal) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include" };
+  if (signal) opts.signal = signal;
   if (body !== null) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
-  const res = await fetch(apiUrl(path), opts);
+  let res;
+  try {
+    res = await fetch(apiUrl(path), opts);
+  } catch (e) {
+    if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
+      throw apiError("Failed to fetch");
+    }
+    throw e;
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
@@ -113,17 +134,44 @@ async function api(path, method = "GET", body = null) {
 }
 
 /** CDN Storage can serve this page while the API origin is still binding or
- *  opening the database. Keep retrying until axum answers `/api/me` — a
- *  parallel client deadline would give up while Bunny is still origin-pulling
- *  a starting container. */
+ *  opening the database. Keep retrying `not ready` through the remote open
+ *  window. Consecutive 502/network failures stop after
+ *  ORIGIN_REACHABILITY_BUDGET_MS so a bad Pull Zone rule is not an infinite
+ *  spinner. Each class has its own clock: a late gateway blip must not spend
+ *  warmup elapsed time, and one `not ready` must not inherit eight minutes
+ *  for a dead origin. Each attempt is aborted after ORIGIN_REACHABILITY_BUDGET_MS
+ *  (not leftover consecutive time) so a pending origin pull cannot stall
+ *  Date.now(), while a slow warmup 503 after 502s can still be classified. */
 async function waitForApiMe() {
+  let warmupStarted = null;
+  let reachabilityStarted = null;
   let delay = 500;
   let sawStartup = false;
   while (true) {
+    const attemptStarted = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      ORIGIN_REACHABILITY_BUDGET_MS,
+    );
     try {
-      return await api("/api/me");
+      const me = await api("/api/me", "GET", null, controller.signal);
+      return me;
     } catch (e) {
       if (!isOriginStarting(e)) throw e;
+      const now = Date.now();
+      if (isApiWarmup(e)) {
+        reachabilityStarted = null;
+        if (warmupStarted === null) warmupStarted = attemptStarted;
+        if (now - warmupStarted >= API_WARMUP_BUDGET_MS) {
+          throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+        }
+      } else {
+        if (reachabilityStarted === null) reachabilityStarted = attemptStarted;
+        if (now - reachabilityStarted >= ORIGIN_REACHABILITY_BUDGET_MS) {
+          throw apiError(originGaveUpMessage(e), e.status || 0, 0);
+        }
+      }
       if (!sawStartup) {
         sawStartup = true;
         showView("startup-view");
@@ -131,6 +179,8 @@ async function waitForApiMe() {
       }
       await sleep(Math.max(e.retryAfterMs || 0, delay));
       delay = Math.min(Math.floor(delay * 1.5), 2000);
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

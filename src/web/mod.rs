@@ -3,7 +3,7 @@
 pub mod api;
 
 use axum::extract::Query;
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -23,7 +23,9 @@ const SESSION_REFRESH: &str = "refresh_token";
 /// still matches the `state` Discord echoes back.
 const COOKIE_OAUTH_STATE: &str = "jmodguard_oauth_state";
 const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
+const SESSION_COOKIE_NAME: &str = "jmodguard_session";
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
+const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 
 // ---------------------------------------------------------------------------
 // errors
@@ -465,14 +467,49 @@ async fn callback(
         }
     };
     let uid = user.id.parse::<u64>().unwrap_or(0);
-    let _ = session.insert(SESSION_USER, uid).await;
-    let _ = session.insert(SESSION_TOKEN, &tok.access_token).await;
-    if let Some(r) = &tok.refresh_token {
-        let _ = session.insert(SESSION_REFRESH, r).await;
+    if let Err(error) = store_login_session(
+        &session,
+        uid,
+        &tok.access_token,
+        tok.refresh_token.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("oauth callback: {error}");
+        return finish(error_page("failed to rotate session"));
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
     let return_to = return_to_or_root(&state.cfg, requested_return_to.as_deref());
     finish(axum::response::Redirect::to(&return_to).into_response())
+}
+
+/// Rotate the session id, then persist OAuth credentials. Fail closed: a
+/// rotation or store error must not leave tokens on the pre-login session id.
+async fn store_login_session(
+    session: &Session,
+    uid: u64,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    session
+        .cycle_id()
+        .await
+        .map_err(|error| format!("failed to rotate session id: {error}"))?;
+    session
+        .insert(SESSION_USER, uid)
+        .await
+        .map_err(|error| format!("failed to persist login session: {error}"))?;
+    session
+        .insert(SESSION_TOKEN, access_token)
+        .await
+        .map_err(|error| format!("failed to persist login session: {error}"))?;
+    if let Some(refresh) = refresh_token {
+        session
+            .insert(SESSION_REFRESH, refresh)
+            .await
+            .map_err(|error| format!("failed to persist login session: {error}"))?;
+    }
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -545,7 +582,11 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (
+        axum::http::StatusCode::OK,
+        [(CACHE_CONTROL, NO_STORE)],
+        "ok",
+    )
 }
 
 #[cfg(feature = "embed-ui")]
@@ -615,6 +656,7 @@ pub fn router(app: Arc<AppState>) -> Router {
     let cross_origin = !cors_origins.is_empty();
     let same_site = session_same_site(cross_origin, secure);
     let session_layer = SessionManagerLayer::new(session_store)
+        .with_name(SESSION_COOKIE_NAME)
         .with_secure(secure)
         .with_same_site(same_site)
         .with_expiry(Expiry::OnInactivity(CookieDuration::days(7)));
@@ -692,7 +734,11 @@ pub fn router(app: Arc<AppState>) -> Router {
             axum::routing::post(api::unban),
         )
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
-        .layer(session_layer);
+        .layer(session_layer)
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            NO_STORE,
+        ));
 
     // CORS is a browser credential policy for the SPA/API. Process liveness
     // (`/health`) must not depend on Origin — platform probes are not a
@@ -816,6 +862,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_login_session_fails_closed_when_rotation_fails() {
+        #[derive(Debug, Clone, Default)]
+        struct FailingDeleteStore;
+
+        #[serenity::async_trait]
+        impl tower_sessions::SessionStore for FailingDeleteStore {
+            async fn create(
+                &self,
+                _record: &mut tower_sessions::session::Record,
+            ) -> tower_sessions::session_store::Result<()> {
+                Ok(())
+            }
+
+            async fn save(
+                &self,
+                _record: &tower_sessions::session::Record,
+            ) -> tower_sessions::session_store::Result<()> {
+                Ok(())
+            }
+
+            async fn load(
+                &self,
+                _session_id: &tower_sessions::session::Id,
+            ) -> tower_sessions::session_store::Result<Option<tower_sessions::session::Record>>
+            {
+                Ok(None)
+            }
+
+            async fn delete(
+                &self,
+                _session_id: &tower_sessions::session::Id,
+            ) -> tower_sessions::session_store::Result<()> {
+                Err(tower_sessions::session_store::Error::Backend(
+                    "delete failed".into(),
+                ))
+            }
+        }
+
+        let session = Session::new(None, Arc::new(FailingDeleteStore), None);
+        let err = store_login_session(&session, 1, "token", None)
+            .await
+            .expect_err("rotation failure must not persist credentials");
+        assert!(
+            err.contains("failed to rotate session id"),
+            "unexpected: {err}"
+        );
+        assert!(
+            session.get::<u64>(SESSION_USER).await.unwrap().is_none(),
+            "pre-login session must not receive the Discord user id"
+        );
+    }
+
+    #[tokio::test]
     async fn health_is_unauthenticated_liveness() {
         let app = test_app();
         let res = app
@@ -828,8 +927,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(NO_STORE.as_bytes())
+        );
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn api_me_sets_no_store_cache_control() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(NO_STORE.as_bytes()),
+            "credentialed API JSON must not be CDN-cacheable"
+        );
     }
 
     #[tokio::test]

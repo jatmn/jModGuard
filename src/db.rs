@@ -51,6 +51,25 @@ const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(75);
 /// duration range and is also enforced at the WebUI/database write boundary.
 pub const MAX_RETENTION_DAYS: u32 = 100_000;
 
+/// API-open failure: the remote token can read schema but cannot write.
+/// Distinct from `SchemaNotReady` so startup does not retry a permanent
+/// permission failure for the whole remote window.
+#[derive(Debug)]
+pub struct RemoteTokenCannotWrite(String);
+
+impl std::fmt::Display for RemoteTokenCannotWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "remote database token cannot write. The API needs a full-access token \
+             (Bunny Database Access → full access, not read-only). Original error: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RemoteTokenCannotWrite {}
+
 /// API-open failure that is expected until the bot finishes migrations.
 #[derive(Debug)]
 pub struct SchemaNotReady(pub String);
@@ -96,14 +115,25 @@ fn http_status_in(message: &str, code: u16) -> bool {
     message.contains(&format!("status={code}")) || message.contains(&format!("status code: {code}"))
 }
 
-fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
+pub(super) fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<RemoteTokenCannotWrite>().is_some() {
+        return true;
+    }
     err.chain().any(|error| {
+        if error.downcast_ref::<RemoteTokenCannotWrite>().is_some() {
+            return true;
+        }
         let message = error.to_string().to_ascii_lowercase();
         message.contains("unauthorized")
+            || message.contains("not authorized")
             || message.contains("forbidden")
             || message.contains("invalid token")
             || message.contains("authentication failed")
             || message.contains("authentication error")
+            || message.contains("permission denied")
+            || message.contains("readonly")
+            || message.contains("read-only")
+            || message.contains("read only")
             || http_status_in(&message, 401)
             || http_status_in(&message, 403)
     })
@@ -375,6 +405,10 @@ impl Db {
                 // Replica reads can otherwise see an old completed marker
                 // while a new bot bootstrap is in progress on the primary.
                 let _ = read_bootstrap_defaults_primary(&bootstrap)?;
+                // Bunny issues read-only tokens alongside full-access. The API
+                // only SELECTs during open, so a read-only token would pass
+                // bootstrap and fail later on the first WebUI write.
+                ensure_api_writes_allowed(&bootstrap)?;
             }
 
             let pool_size = opts.pool_size.max(2) as usize;

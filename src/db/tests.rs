@@ -530,6 +530,33 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     assert!(!crate::db::is_startup_retryable(&auth, true));
     let forbidden = anyhow::anyhow!("Hrana: `api error: `status=403 Forbidden, body=``");
     assert!(!crate::db::is_startup_retryable(&forbidden, true));
+    let readonly = anyhow::anyhow!("attempt to write a readonly database");
+    assert!(
+        !crate::db::is_startup_retryable(&readonly, true),
+        "read-only tokens must fail immediately, not burn the remote retry window"
+    );
+    let not_authorized = anyhow::anyhow!("Hrana: not authorized");
+    assert!(
+        !crate::db::is_startup_retryable(&not_authorized, true),
+        "libSQL 'not authorized' is a permanent token failure, not a 401 Unauthorized substring"
+    );
+    let not_authorized_try_again = anyhow::anyhow!("not authorized, try again");
+    assert!(
+        !crate::db::is_startup_retryable(&not_authorized_try_again, true),
+        "authz wording must win over a transient 'try again' needle"
+    );
+    let permission_reset = anyhow::anyhow!("permission denied: connection reset");
+    assert!(
+        !crate::db::is_startup_retryable(&permission_reset, true),
+        "permission denied must not burn the remote retry window as a transport reset"
+    );
+    let annotated = anyhow::Error::new(crate::db::RemoteTokenCannotWrite(
+        "not authorized, try again".into(),
+    ));
+    assert!(
+        !crate::db::is_startup_retryable(&annotated, true),
+        "write-probe annotation must stay fail-closed even when the cause looks transient"
+    );
     let handshake = anyhow::anyhow!("tls handshake: client authentication timed out");
     assert!(
         crate::db::is_startup_retryable(&handshake, true),
@@ -538,6 +565,31 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     let schema = anyhow::anyhow!(crate::db::SchemaNotReady("schema is behind".into()));
     assert!(crate::db::is_startup_retryable(&schema, false));
     assert!(crate::db::is_startup_retryable(&schema, true));
+}
+
+#[test]
+fn ensure_api_writes_allowed_fails_closed_on_query_only() {
+    let tmp = tmp_db_path("api_write_probe_query_only");
+    let _bot = Db::open(&tmp, 2).expect("bot migrate-open");
+    let conn = Connection::open(&tmp).unwrap();
+    conn.execute_batch("PRAGMA query_only=ON;").unwrap();
+    let err = ensure_api_writes_allowed(&conn)
+        .err()
+        .expect("query_only connection must fail the API write probe");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot write"),
+        "unexpected: {msg}"
+    );
+    assert!(
+        err.downcast_ref::<crate::db::RemoteTokenCannotWrite>().is_some(),
+        "write-probe denial must keep a typed non-retryable error, not only help text: {msg}"
+    );
+    assert!(
+        !crate::db::is_startup_retryable(&err, true),
+        "write-probe denial must not burn the remote retry window"
+    );
+    cleanup_db(&tmp);
 }
 
 #[test]

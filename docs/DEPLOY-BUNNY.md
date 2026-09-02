@@ -162,17 +162,34 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+Optional when you have no `config.toml` on the bot container (typical):
+`JMODGUARD_DB_POOL_SIZE` (this process's pool), `JMODGUARD_DEFAULT_PREFIX`,
+`JMODGUARD_RETENTION_DAYS`, and `JMODGUARD_BOT_STATUS`. Prefix and retention
+are written on migrate-open into durable `meta.settings_terminal_defaults`.
+Status is the Discord presence text.
+
 Plus the database pair from step 1.
 
 The bot is the schema authority. Wait for logs containing
 `database ready (migrate=true)` before expecting the API to open.
 
+Create the Discord application **before** the containers (intents, OAuth
+redirect, invite). Those steps are in this file under [Discord](#discord-application-required-for-bunny)
+so you do not have to bounce to SETUP.md.
+
 ## 5. Create the API app (origin only, no public website)
 
 Create a second Magic Container app from the API image. Same
 single-region, exactly-one-instance topology (sessions are in-memory).
-Do **not** attach a custom domain or a browseable Magic Containers CDN
-hostname. The Pull Zone from step 2 is the public URL.
+Do **not** attach a custom domain to this app. The Pull Zone from step 2 is
+the public URL.
+
+Bunny can only origin-pull a Magic Container through an **Endpoint**. On
+this API app, **Endpoints → Add CDN endpoint**, container port `8080`.
+Enable sticky sessions on that endpoint and use cookie name
+`jmodguard_session` (the API session cookie). Do not give operators this
+endpoint hostname; it exists so the Storage Pull Zone can target
+`MagicContainersAppId` + `MagicContainersEndpointId`.
 
 The API still listens on container port `8080` so Bunny can origin-pull
 it and so platform health checks can hit `GET`/`HEAD /health`. Until
@@ -181,10 +198,12 @@ build), only `/health` returns `200`. `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
-`/api/me` while the origin is still starting (`not ready`, `502`/`504`,
-or a dropped origin pull). OAuth CSRF is a cookie, so a restart between
-`/login` and Discord's return still completes. Enable sticky sessions
-on that origin: login sessions live in that one process.
+`/api/me` while the origin is still starting (`not ready` for up to eight
+minutes). Consecutive `502`/`504`, dropped origin pulls, or origin pulls
+that never complete stop after 90 seconds of those failures with an error
+instead of spinning forever. OAuth CSRF is a cookie, so a restart between
+`/login` and Discord's return still completes. Login sessions live in
+that one process (`jmodguard_session`).
 
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
@@ -198,6 +217,10 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+Optional when you have no `config.toml` on the API container (typical):
+`JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix,
+retention, and bot status are bot-owned — set those on the bot app.
+
 `JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators open, not a
 container hostname. Discord OAuth redirect URI:
 
@@ -209,29 +232,53 @@ Leave `JMODGUARD_CORS_ORIGINS` unset. Same-origin via the Pull Zone does
 not need CORS. The API still needs the Discord bot token for OAuth, the
 guild list, and WebUI unban.
 
+Both containers need **full-access** database tokens. A read-only Bunny
+token will fail API startup (the API probes a no-op write after schema
+open).
+
 The API never applies migrations. It waits for the bot bootstrap marker
-(about six minutes on a remote database).
+(about six minutes on a remote database), then exits if that wait
+expires — start the bot first and wait for `database ready (migrate=true)`.
 
 ## 6. Point API paths on the Pull Zone at the API container
 
 On the Pull Zone from step 2 (Storage origin for the files):
 
-1. Add the API Magic Container as an alternate origin (Magic Containers
-   origin / endpoint for container port `8080`).
-2. Add edge rules so these paths go to that origin and are **not**
-   cached:
+1. Add an edge rule whose action is **Override Origin: Magic Containers**
+   (`OriginMagicContainers`). Pick the API app and the CDN endpoint from
+   step 5 (those two IDs are required; “Change Origin URL” to a public
+   Magic Container hostname is the wrong tool).
+2. Trigger on request URL for these paths, and **bypass cache /
+   Perma-Cache** on them. The API also sends `Cache-Control: private,
+   no-store`, but a cached `/api/me` would still leak sessions if you
+   skip the bypass:
    - `/api*`
    - `/login*`
    - `/logout*`
    - `/oauth*`
    - `/health*`
 3. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
-4. Disable caching / bypass Perma-Cache on the API paths. Cached
-   `/api/me` would leak sessions.
 
 After this, a browser on the CDN hostname loads the admin UI from
 Storage and calls `/api/...` on the same host; Bunny forwards those
-requests to the private API container.
+requests to the API container. The Magic Container endpoint hostname is
+not the product URL.
+
+## Discord application (required for Bunny)
+
+Do this in the [Discord developer portal](https://discord.com/developers/applications)
+in addition to the container env vars. SETUP.md has the same list for
+self-host.
+
+1. **Bot → Privileged Gateway Intents:** enable **Server Members** and
+   **Message Content**. Presence is unused.
+2. **OAuth2 → Redirects:** add exactly
+   `https://YOUR-CDN-HOSTNAME/oauth/callback` (must match
+   `JMODGUARD_WEB_BASE_URL`).
+3. **Invite** with scopes `bot` and `applications.commands`, and at least
+   Kick Members, Ban Members, Moderate Members, Manage Messages, Read
+   Message History, View Channels, Send Messages, Manage Nicknames
+   (Manage Roles only if you use role plan steps).
 
 ## 7. Acceptance test
 
@@ -256,7 +303,8 @@ schema-open against a local libSQL server, not Bunny TLS.
 
 - Bunny Database is Public Preview. Internal snapshots are not an
   operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
-- One bot replica. One API replica (in-memory sessions).
+- One bot replica. One API replica (in-memory sessions). Sticky session
+  cookie on the API Magic Container endpoint: `jmodguard_session`.
 - SIGTERM stops the Discord gateway and the API listener cleanly, including
   during remote database retry (startup then exits 0 instead of failing).
 - Missing Bunny DB secrets must not fall through to local SQLite

@@ -89,11 +89,15 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `--no-default-features --features web` so containers do not contain the
   admin UI. Build the bot with `--no-default-features`.
 - Sessions use `MemoryStore` intentionally for a **single** API process; lost on
-  restart. Shared session store is a future multi-replica concern. Discord
+  restart. Cookie name is `jmodguard_session` (Magic Container sticky
+  sessions must use that name). Shared session store is a future
+  multi-replica concern. Discord
   OAuth CSRF (`state`) and `return_to` are browser cookies so a restart
   between `/login` and `/oauth/callback` does not fail the handshake.
   Those cookies are host-only on `web.base_url`; a split-origin SPA still
   sends the user through that hostname for login and callback.
+  Successful `/oauth/callback` rotates the session id. API JSON responses
+  set `Cache-Control: private, no-store`.
 - Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
   from Storage and proxies `/api` `/login` `/oauth` to a private API
   container (same origin; no CORS). `web.cors_origins` /
@@ -105,7 +109,10 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   are not a stable class this check can reject.
 - Container images set `JMODGUARD_REQUIRE_REMOTE_DB=1`. Missing remote DB
   credentials must fail startup, not open local SQLite. Unset it only for an
-  intentional local-SQLite container run.
+  intentional local-SQLite container run. Runtime user is UID 10001. Env
+  `JMODGUARD_DB_POOL_SIZE` (minimum 2) overrides `db.pool_size` when set
+  (environment wins over `config.toml`, same as other `JMODGUARD_*` keys).
+  Container deploys typically have no toml, so set the env var there.
 - Bot `JMODGUARD_HEALTH_BIND` (images: `0.0.0.0:8080`) and API `GET`/`HEAD`
   `/health` are unauthenticated process liveness probes (`ok`, no database).
   Bind and accept them **before** opening the database. On the API public

@@ -200,7 +200,7 @@ fn is_api_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Probe, parse_probe, request_target_path, serve, NOT_READY_HTML, NOT_READY_JSON};
+    use super::{NOT_READY_HTML, NOT_READY_JSON, Probe, parse_probe, request_target_path, serve};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;

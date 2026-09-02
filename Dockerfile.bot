@@ -3,7 +3,7 @@
 # Discord binary does not embed the SPA or link axum/tower-sessions.
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY vendor ./vendor
