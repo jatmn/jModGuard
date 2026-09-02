@@ -1,18 +1,15 @@
 name: images
 
 # Publish GHCR images only when you cut a GitHub Release (or click
-# "Run workflow"). Everyday CI on main/PRs does not push a new image.
-# Each publish retags :latest and deletes older package versions so GHCR
-# only keeps the current release image (version tag + latest, same digest).
+# "Run workflow"). PRs and everyday main pushes do not build or push
+# images: each matrix image is a full Rust docker compile (~10 min) and
+# path-filtered PR builds were still the minutes leak after release-only
+# publish. Each publish retags :latest and deletes older package versions
+# so GHCR only keeps the current release image (version tag + latest).
 on:
   release:
     types: [published]
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "Dockerfile.bot"
-      - "Dockerfile.api"
-      - ".github/workflows/images.yml"
 
 concurrency:
   group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

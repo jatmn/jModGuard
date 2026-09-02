@@ -3,8 +3,9 @@
 A data-driven Discord moderation bot: automod against spam bots, per-server
 config with global fallback, editable commands/events/templates, and a WebUI.
 
-This guide covers everything from zero to a running bot on **Windows** or
-**Linux**.
+This guide covers everything from zero to a running bot on **Linux**
+(self-host / VPS). For Bunny.net Magic Containers, use
+[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) instead.
 
 ---
 
@@ -15,8 +16,8 @@ This guide covers everything from zero to a running bot on **Windows** or
   Docker builder images). `rustup` will select that pin automatically in this
   directory.
 - A Discord account (the bot owner).
-- Somewhere to run it: any Windows/Linux machine that stays online (VPS,
-  home server, Raspberry Pi class box is fine).
+- Somewhere to run it: a Linux machine that stays online (VPS, home
+  server, Raspberry Pi class box is fine).
 
 ## 2. Create the Discord application
 
@@ -118,7 +119,6 @@ owner_id = 123456789012345678               # your Discord user ID
 ```bash
 ./target/release/jmodguard-bot        # Discord gateway; migrates DB
 ./target/release/jmodguard-api        # WebUI/API on 127.0.0.1:8080
-# Windows: target\release\jmodguard-bot.exe / target\release\jmodguard-api.exe
 ```
 
 This local API serves the admin pages itself. On Bunny the pages live on
@@ -137,17 +137,6 @@ OAuth client id/secret (it exits immediately if they are empty). If the bot is
 still migrating, the API waits about 30 seconds locally (about six minutes
 against a remote database), then serves HTTP. If that wait expires, the API
 exits.
-
-### Windows (run as a service)
-
-1. **Task Scheduler**: Create Basic Tasks for both binaries → Program: path to
-   `target\release\jmodguard-bot.exe` / `target\release\jmodguard-api.exe`, trigger: *At startup*.
-   Set the working directory to the folder that contains `config.toml` and the database.
-2. Or use **NSSM** for proper services:
-   `nssm install jModGuardBot C:\path\to\target\release\jmodguard-bot.exe` and
-   `nssm install jModGuardApi C:\path\to\target\release\jmodguard-api.exe`.
-   Set `AppDirectory` on **both** to that same folder (`nssm set … AppDirectory C:\path\to\jmodguard`)
-   so they share `jmodguard.db` and `config.toml`.
 
 ### Linux (systemd)
 
