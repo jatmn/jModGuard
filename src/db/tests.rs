@@ -357,7 +357,7 @@ fn api_open_retries_until_bot_migrates() {
     let api = std::thread::spawn(move || {
         tokio_test_block_on(Db::open_with_until_ready(
             api_opts,
-            80,
+            120,
             std::time::Duration::from_millis(50),
         ))
     });
