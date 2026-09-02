@@ -11,10 +11,14 @@ RUN cargo build --locked --release --bin jmodguard-bot --no-default-features
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /data --shell /usr/sbin/nologin jmodguard \
+    && mkdir -p /data \
+    && chown jmodguard:jmodguard /data
 COPY --from=builder /app/target/release/jmodguard-bot /usr/local/bin/jmodguard-bot
 WORKDIR /data
 VOLUME ["/data"]
+USER 10001
 ENV JMODGUARD_DB_PATH=/data/jmodguard.db
 ENV JMODGUARD_CONFIG=/data/config.toml
 # Container platforms collect stdout/stderr. An empty directory disables
