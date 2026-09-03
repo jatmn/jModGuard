@@ -14,6 +14,9 @@ env:
   # Keep artifacts off /tmp when runners are constrained.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   TMPDIR: ${{ github.workspace }}/.tmp
+  # libsql-sqlite3-parser is git-patched from this private repo; libgit2
+  # cannot use GITHUB_TOKEN, so Cargo must invoke git(1).
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   test:
@@ -32,6 +35,11 @@ jobs:
 
       - name: Create temp dir
         run: mkdir -p "$TMPDIR"
+
+      - name: Authorize Cargo git fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: cargo test --locked
         run: cargo test --locked
@@ -76,6 +84,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       JMODGUARD_REMOTE_TEST_URL: http://127.0.0.1:8080
       JMODGUARD_REMOTE_TEST_TOKEN: local-ci-token
     steps:
@@ -86,6 +95,11 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Authorize Cargo git fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: remote libSQL bot/API smoke
         run: cargo test --locked --test remote_database_smoke -- --ignored --nocapture

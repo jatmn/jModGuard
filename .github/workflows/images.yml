@@ -65,6 +65,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          # Builder cargo must clone the private libsql-sqlite3-parser git pin.
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
 
       # GitHub creates GHCR packages as private. PATCH /user/packages is the
       # Actions token identity, not the package owner — use /users or /orgs.
