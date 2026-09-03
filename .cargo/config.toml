@@ -1,0 +1,4 @@
+[net]
+# libsql-sqlite3-parser is git-patched from this private GitHub repo.
+# libgit2 cannot use the same credentials as git(1).
+git-fetch-with-cli = true

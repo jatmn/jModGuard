@@ -3,5 +3,5 @@
 jmodguard.db
 jmodguard.db-*
 logs/
-config.toml
+/config.toml
 jmodguard.secret

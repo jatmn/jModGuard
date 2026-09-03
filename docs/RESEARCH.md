@@ -61,6 +61,7 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
   `GITHUB_TOKEN` (`CARGO_NET_GIT_FETCH_WITH_CLI`; Docker BuildKit secret
   `github_token`). Local images:
   `docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.bot .`
+  Local `cargo` uses git(1) via `.cargo/config.toml` so clone credentials work.
 - The libSQL API is async. `src/db_compat.rs` supplies a narrow synchronous
   facade so the existing SQL paths can run unchanged inside `with_conn`'s
   blocking closures.
