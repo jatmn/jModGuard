@@ -53,6 +53,16 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
   (`src/remote_https.rs`); local installs use `Builder::new_local`.
   Do not enable libsql's `tls` feature: it pulls `hyper-rustls 0.25` /
   `rustls 0.22` / `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8).
+- `remote` still pulls `libsql-sqlite3-parser` 0.13.x. crates.io never
+  published a fix for GHSA-8m95-fffc-h4c5 (CVE-2025-47736: Debug panic on
+  invalid UTF-8). Git-patch it to branch `vendor/libsql-sqlite3-parser-0.13.1`
+  (0.13.0 sources + lemon-rs `from_utf8_lossy`, commit `f2391d6`).
+  CI and Docker fetch that pin with `GITHUB_TOKEN` only for `cargo fetch`
+  (`CARGO_NET_GIT_FETCH_WITH_CLI`; Docker BuildKit secret `github_token`).
+  Compile/test/image `cargo build` runs after fetch, without the token in
+  gitconfig, env, or the secret mount. Local images:
+  `docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.bot .`
+  Local `cargo` uses git(1) via `.cargo/config.toml` so clone credentials work.
 - The libSQL API is async. `src/db_compat.rs` supplies a narrow synchronous
   facade so the existing SQL paths can run unchanged inside `with_conn`'s
   blocking closures.

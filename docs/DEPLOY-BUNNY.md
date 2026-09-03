@@ -132,11 +132,11 @@ visibility on
 `.../jmodguard-api`. If you keep them private, add a GitHub registry PAT
 in Magic Containers.
 
-To build locally:
+To build locally (`GITHUB_TOKEN` must be set; BuildKit secret is required):
 
 ```bash
-docker build --platform linux/amd64 -f Dockerfile.bot -t ghcr.io/jatmn/jmodguard-bot:TAG .
-docker build --platform linux/amd64 -f Dockerfile.api -t ghcr.io/jatmn/jmodguard-api:TAG .
+docker build --platform linux/amd64 --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.bot -t ghcr.io/jatmn/jmodguard-bot:TAG .
+docker build --platform linux/amd64 --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.api -t ghcr.io/jatmn/jmodguard-api:TAG .
 docker push ghcr.io/jatmn/jmodguard-bot:TAG
 docker push ghcr.io/jatmn/jmodguard-api:TAG
 ```

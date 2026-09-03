@@ -1,13 +1,25 @@
+# syntax=docker/dockerfile:1
 # Multi-stage build for jmodguard-bot.
 # Pins Rust 1.96 (lockfile MSRV; edition 2024). Builds without the `web` feature so the
 # Discord binary does not embed the SPA or link axum/tower-sessions.
+# Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.bot .
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY vendor ./vendor
-RUN cargo build --locked --release --bin jmodguard-bot --no-default-features
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=secret,id=github_token,required=true \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=credential.helper \
+    GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo password=$(cat /run/secrets/github_token); }; f' \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    cargo fetch --locked
+RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    cargo build --locked --release --bin jmodguard-bot --no-default-features
 
 FROM debian:bookworm-slim
 RUN apt-get update \
