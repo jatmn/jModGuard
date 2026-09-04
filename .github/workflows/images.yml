@@ -1,7 +1,7 @@
 name: images
 
 # Publish GHCR images only when you cut a GitHub Release (or click
-# "Run workflow"). PRs and everyday main pushes do not build or push
+# "Run workflow" and set source_ref to the tag or SHA to compile). PRs and everyday main pushes do not build or push
 # images: each matrix image is a full Rust docker compile (~10 min) and
 # path-filtered PR builds were still the minutes leak after release-only
 # publish. Each publish retags :latest and deletes older package versions
@@ -10,6 +10,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git tag or full commit SHA to build (must exist in this repo)
+        required: true
+        type: string
 
 concurrency:
   group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -42,6 +47,12 @@ jobs:
             package: jmodguard-api
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          # Release events build the tag. Manual runs build inputs.source_ref
+          # (a tag or SHA). github.ref on workflow_dispatch is only the branch
+          # that contains this workflow file, not the revision to compile.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
@@ -59,6 +70,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=ref,event=tag
+            type=raw,value=${{ inputs.source_ref }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:

@@ -114,9 +114,12 @@ these files.
 GHCR is **release-only**. Everyday pushes to `main` and pull requests do
 not build or publish a new image. There is nothing for Magic Containers to
 pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
-repo, or run the `images` workflow by hand **on that same tag or SHA**.
-Do not publish frontend from one revision and images from another. That
-builds `linux/amd64` images and pushes:
+repo, or run the `images` workflow by hand from a branch that contains the
+workflow file (usually `main`) and set the `source_ref` input to that same
+tag or full commit SHA. GitHub's workflow-dispatch branch selector is **not**
+the revision to compile; a SHA that is not a branch or tag cannot be chosen
+there. Do not publish frontend from one revision and images from another.
+That builds `linux/amd64` images and pushes:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:latest
