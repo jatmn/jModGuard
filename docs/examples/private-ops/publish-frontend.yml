@@ -6,9 +6,11 @@
 # That is the designed publisher for the admin UI.
 #
 # `ref` must equal the 40-character Source SHA recorded in this ops repo
-# (docs/BUNNY.md below). That SHA must match the running bot and API images.
-# Do not dispatch a branch, a tag, or any other revision: the workflow
-# rejects a mismatch before it checks out jModGuard.
+# (`| Source SHA |` in docs/BUNNY.md). Do not grep the first hex in the
+# file: blob URLs in that file also contain 40-character SHAs. That SHA
+# must match the running bot and API images. Do not dispatch a branch, a
+# tag, or any other revision: the workflow rejects a mismatch before it
+# checks out jModGuard.
 
 name: Publish jModGuard admin UI
 
@@ -35,7 +37,7 @@ jobs:
           REQUESTED_REF: ${{ inputs.ref }}
         run: |
           set -eu
-          pin="$(grep -m1 -oE '[0-9a-f]{40}' ops/docs/BUNNY.md)"
+          pin="$(grep -E '^\| Source SHA \|' ops/docs/BUNNY.md | grep -oE '[0-9a-f]{40}' | head -1)"
           test -n "$pin"
           requested="$(printf '%s' "$REQUESTED_REF" | tr '[:upper:]' '[:lower:]')"
           if [ "$requested" != "$pin" ]; then
