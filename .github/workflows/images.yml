@@ -33,13 +33,15 @@ jobs:
     uses: ./.github/workflows/pick-runner.yml
     secrets: inherit
 
-  # Reject moving refs (main, other branches, short SHAs) before checkout.
-  # GitHub's commits API resolves those; a later run with the same source_ref
-  # would compile different source and overwrite :latest.
+  # Reject moving refs before checkout. GitHub's commits API resolves
+  # branches and short SHAs; tags can move between jobs. Validate that
+  # source_ref is an existing tag or identity-checked full SHA, peel tags
+  # (including annotated tags) to a commit, and check out only that SHA.
   validate-source-ref:
     runs-on: ubuntu-latest
     outputs:
       checkout_ref: ${{ steps.validate.outputs.checkout_ref }}
+      docker_tag: ${{ steps.validate.outputs.docker_tag }}
     steps:
       - name: Require tag or full commit SHA
         id: validate
@@ -59,6 +61,9 @@ jobs:
           import sys
           from urllib.parse import quote
 
+          SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+          DOCKER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
           def fail(message):
               print(f"::error::{message}")
               sys.exit(1)
@@ -71,15 +76,68 @@ jobs:
               )
               return result.returncode, result.stdout
 
-          def write_checkout_ref(value):
+          def write_outputs(checkout_ref, docker_tag):
+              if not SHA_RE.fullmatch(checkout_ref):
+                  fail("internal error: checkout ref is not a full commit SHA.")
               output_path = os.environ["GITHUB_OUTPUT"]
               with open(output_path, "a", encoding="utf-8") as handle:
-                  handle.write(f"checkout_ref={value}\n")
-              print(f"checkout_ref={value}")
+                  handle.write(f"checkout_ref={checkout_ref}\n")
+                  handle.write(f"docker_tag={docker_tag}\n")
+              print(f"checkout_ref={checkout_ref}")
+              print(f"docker_tag={docker_tag}")
+
+          def docker_tag_from_label(label):
+              safe = label.replace("/", "-")
+              if not DOCKER_TAG_RE.fullmatch(safe):
+                  fail(
+                      "source_ref is not a Docker tag after replacing '/' with '-'."
+                  )
+              return safe
+
+          def peel_tag_to_commit(repo, tag_name):
+              code, stdout = gh_api(
+                  f"repos/{repo}/git/ref/tags/{quote(tag_name, safe='/')}"
+              )
+              if code != 0:
+                  fail(
+                      "source_ref must be an existing Git tag or a full 40-character "
+                      "commit SHA. Branch names such as main are rejected because they move."
+                  )
+              payload = json.loads(stdout)
+              resolved = payload.get("ref") or ""
+              expected = f"refs/tags/{tag_name}"
+              if resolved != expected:
+                  fail("source_ref did not resolve to that exact Git tag.")
+              obj = payload.get("object") or {}
+              obj_type = obj.get("type") or ""
+              obj_sha = (obj.get("sha") or "").lower()
+              if obj_type == "commit":
+                  if not SHA_RE.fullmatch(obj_sha):
+                      fail("tag did not resolve to a commit SHA.")
+                  return obj_sha
+              if obj_type == "tag":
+                  # Annotated tag: object.sha is the tag object, not the commit.
+                  code, stdout = gh_api(f"repos/{repo}/git/tags/{obj_sha}")
+                  if code != 0:
+                      fail("could not peel annotated tag to a commit.")
+                  peeled = json.loads(stdout).get("object") or {}
+                  if peeled.get("type") != "commit":
+                      fail("annotated tag does not point at a commit.")
+                  commit = (peeled.get("sha") or "").lower()
+                  if not SHA_RE.fullmatch(commit):
+                      fail("annotated tag did not resolve to a commit SHA.")
+                  return commit
+              fail(f"tag object type {obj_type!r} is not a commit.")
 
           event_name = os.environ["EVENT_NAME"]
+          repo = os.environ["REPO"]
+
           if event_name != "workflow_dispatch":
-              write_checkout_ref(os.environ["EVENT_REF"])
+              event_ref = os.environ["EVENT_REF"]
+              if not event_ref.startswith("refs/tags/"):
+                  fail("release checkout must be a tag, not a branch.")
+              tag_name = event_ref[len("refs/tags/") :]
+              write_outputs(peel_tag_to_commit(repo, tag_name), "unused")
               sys.exit(0)
 
           ref = (os.environ.get("SOURCE_REF") or "").strip()
@@ -93,7 +151,6 @@ jobs:
           if ref.startswith("refs/tags/"):
               ref = ref[len("refs/tags/") :]
 
-          repo = os.environ["REPO"]
           if re.fullmatch(r"[0-9a-fA-F]{40}", ref):
               code, stdout = gh_api(f"repos/{repo}/commits/{ref}")
               if code != 0:
@@ -105,22 +162,11 @@ jobs:
                       "source_ref must be the full 40-character commit SHA. "
                       "Branch names and abbreviated SHAs are rejected because they move."
                   )
-              write_checkout_ref(got)
+              write_outputs(got, docker_tag_from_label(got))
               sys.exit(0)
 
-          code, stdout = gh_api(
-              f"repos/{repo}/git/ref/tags/{quote(ref, safe='/')}"
-          )
-          if code != 0:
-              fail(
-                  "source_ref must be an existing Git tag or a full 40-character "
-                  "commit SHA. Branch names such as main are rejected because they move."
-              )
-          resolved = json.loads(stdout).get("ref") or ""
-          expected = f"refs/tags/{ref}"
-          if resolved != expected:
-              fail("source_ref did not resolve to that exact Git tag.")
-          write_checkout_ref(expected)
+          sha = peel_tag_to_commit(repo, ref)
+          write_outputs(sha, docker_tag_from_label(ref))
           PY
 
   build:
@@ -141,27 +187,22 @@ jobs:
             image: ghcr.io/jatmn/jmodguard-api
             package: jmodguard-api
     steps:
-      - name: Refuse empty or branch checkout
+      - name: Refuse empty or non-SHA checkout
         env:
           CHECKOUT_REF: ${{ needs.validate-source-ref.outputs.checkout_ref }}
         run: |
           set -eu
-          if [ -z "${CHECKOUT_REF}" ]; then
-            echo "::error::validated checkout ref is empty; refusing to default to the dispatch branch."
+          if ! printf '%s' "${CHECKOUT_REF}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::validated checkout ref must be a full commit SHA; refusing to default to the dispatch branch or follow a moving tag."
             exit 1
           fi
-          case "${CHECKOUT_REF}" in
-            refs/heads/*)
-              echo "::error::validated checkout ref must not be a branch."
-              exit 1
-              ;;
-          esac
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-          # Validated tag (refs/tags/...) or full SHA. Never github.ref on
-          # workflow_dispatch: that is the branch that contains this file.
+          # Peeled commit SHA from validate-source-ref. Never github.ref on
+          # workflow_dispatch (that is the branch that contains this file),
+          # and never a tag name (tags can move between validate and checkout).
           ref: ${{ needs.validate-source-ref.outputs.checkout_ref }}
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -173,30 +214,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker-safe extra tag
-        id: extra_tag
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SOURCE_REF: ${{ needs.validate-source-ref.outputs.checkout_ref }}
-        run: |
-          set -eu
-          if [ "${EVENT_NAME}" != "workflow_dispatch" ]; then
-            echo "enable=false" >> "$GITHUB_OUTPUT"
-            echo "value=unused" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          raw="${SOURCE_REF}"
-          raw="${raw#refs/tags/}"
-          raw="${raw#refs/heads/}"
-          # Git tags may contain /; Docker tags may not.
-          safe="${raw//\//-}"
-          if ! printf '%s' "${safe}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
-            echo "::error::source_ref is not a Docker tag after replacing '/' with '-'."
-            exit 1
-          fi
-          echo "enable=true" >> "$GITHUB_OUTPUT"
-          echo "value=${safe}" >> "$GITHUB_OUTPUT"
-
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
@@ -204,7 +221,8 @@ jobs:
           tags: |
             type=raw,value=latest
             type=ref,event=tag
-            type=raw,value=${{ steps.extra_tag.outputs.value }},enable=${{ steps.extra_tag.outputs.enable }}
+            type=raw,value=${{ needs.validate-source-ref.outputs.checkout_ref }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.validate-source-ref.outputs.docker_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:

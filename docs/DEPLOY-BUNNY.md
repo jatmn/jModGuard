@@ -89,14 +89,12 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-Dispatch the workflow with the **same** jModGuard git tag or commit SHA
-you used for the container images (`v1.2.3` or a full SHA). Do not use
-floating `main` unless that commit is the revision you recorded and
-deployed. The runner checks out that ref and uploads `index.html`,
-`app.js`, and `style.css` to the Storage Zone root (`/`, `/app.js`,
-`/style.css`). After you copy the example into an ops repo, reject any
-dispatch `ref` that is not your recorded pin so Storage cannot drift
-from the running images.
+Dispatch the workflow with the **same** 40-character jModGuard SHA recorded
+in the ops pin file (`docs/BUNNY.md` in the example). The copied workflow
+checks out that pin file first and **rejects** any other `ref` (including
+`main` and tags) before it clones this repository, so Storage cannot drift
+from the running images. The runner then uploads `index.html`, `app.js`,
+and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
 It refuses to start if it cannot read the current objects. A failed Pull
@@ -133,8 +131,10 @@ ghcr.io/jatmn/jmodguard-api:latest
 ```
 
 The same digest is also tagged with the release name (for example `v1.2.3`).
-A manual run tags the digest with `source_ref` as well; `/` in a Git tag
-becomes `-` so the Docker tag stays valid (`release/2025` → `release-2025`).
+A manual run tags the digest with the peeled commit SHA and, if
+`source_ref` was a Git tag, that tag with `/` replaced by `-`
+(`release/2025` → `release-2025`). Tags are resolved to a commit SHA
+before checkout so a force-moved tag cannot change what gets compiled.
 The workflow then deletes older GHCR versions so only the current release
 image is stored.
 
