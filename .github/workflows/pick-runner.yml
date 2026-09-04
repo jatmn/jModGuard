@@ -1,0 +1,73 @@
+name: pick-runner
+
+on:
+  workflow_call:
+    outputs:
+      runner:
+        description: JSON-encoded runs-on value for fromJSON
+        value: ${{ jobs.pick-runner.outputs.runner }}
+    secrets:
+      RUNNER_READ_TOKEN:
+        description: Token that can list repository self-hosted runners
+        required: false
+
+jobs:
+  pick-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - name: Pick self-hosted runner if online
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_READ_TOKEN || github.token }}
+        run: |
+          set -eu
+          fallback='"ubuntu-latest"'
+          preferred='["self-hosted","linux","proxmox"]'
+          echo "runner=${fallback}" >> "${GITHUB_OUTPUT}"
+
+          tmp="$(mktemp)"
+          err="$(mktemp)"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/runners" >"${tmp}" 2>"${err}"; then
+            echo "::warning::Runners API failed; falling back to ubuntu-latest"
+            exit 0
+          fi
+
+          selected="$(python3 - "${tmp}" <<'PY' || true
+          import json
+          import sys
+
+          wanted = {"self-hosted", "linux", "proxmox"}
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  data = json.load(handle)
+          except Exception:
+              print('"ubuntu-latest"')
+              raise SystemExit(0)
+
+          runners = data.get("runners") if isinstance(data, dict) else data
+          if not isinstance(runners, list):
+              print('"ubuntu-latest"')
+              raise SystemExit(0)
+
+          for runner in runners:
+              if str(runner.get("status") or "").lower() != "online":
+                  continue
+              labels = {
+                  str(label.get("name") or "").lower()
+                  for label in (runner.get("labels") or [])
+              }
+              if wanted <= labels:
+                  print('["self-hosted","linux","proxmox"]')
+                  raise SystemExit(0)
+
+          print('"ubuntu-latest"')
+          PY
+          )"
+          selected="$(printf '%s' "${selected}" | tr -d '\n')"
+          if [ -z "${selected}" ]; then
+            selected="${fallback}"
+          fi
+          echo "runner=${selected}" >> "${GITHUB_OUTPUT}"
+          echo "Selected runs-on: ${selected}"
