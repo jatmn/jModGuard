@@ -1,9 +1,8 @@
-name: ci
+# Automatic CI is Buildkite. This workflow is GitHub-hosted failover when Proxmox agents are down.
+name: CI failover
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -19,13 +18,8 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
-  pick-runner:
-    uses: ./.github/workflows/pick-runner.yml
-    secrets: inherit
-
   test:
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
@@ -107,8 +101,7 @@ jobs:
         run: cargo build --locked --bin jmodguard-api --no-default-features --features web
 
   remote-database:
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
+    runs-on: ubuntu-latest
     services:
       libsql:
         image: ghcr.io/tursodatabase/libsql-server@sha256:1bc51611928ccc51229bdc40ca0defcb915907f8f9f6a664b43529de0ca45fab
