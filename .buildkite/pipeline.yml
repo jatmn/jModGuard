@@ -4,6 +4,8 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Optional GITHUB_TOKEN secret covers private HTTPS git deps.
+  GITHUB_TOKEN: "$$GITHUB_TOKEN"
 
 steps:
   - label: "test"
@@ -12,6 +14,11 @@ steps:
       set -eu
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      if [ -n "$${GITHUB_TOKEN:-}" ]; then
+        git config --local url."https://x-access-token:$${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+      fi
+      git config --local url.git@github.com:.insteadOf https://github.com/
+      cargo fetch --locked
       cargo test --locked
       cargo test --locked --no-default-features --lib
       cargo clippy --locked --bins -- -D warnings
@@ -27,17 +34,29 @@ steps:
   - label: "remote-database"
     timeout_in_minutes: 30
     command: |
-      set -eu
+      set -euo pipefail
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
-      docker rm -f libsql-ci >/dev/null 2>&1 || true
-      docker run -d --name libsql-ci -p 8080:8080 \
+      if [ -n "$${GITHUB_TOKEN:-}" ]; then
+        git config --local url."https://x-access-token:$${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+      fi
+      git config --local url.git@github.com:.insteadOf https://github.com/
+      cargo fetch --locked
+      NAME="libsql-ci-$${BUILDKITE_JOB_ID}"
+      trap 'docker rm -f "$$NAME"' EXIT
+      docker run -d --name "$$NAME" -p 127.0.0.1::8080 \
         ghcr.io/tursodatabase/libsql-server@sha256:1bc51611928ccc51229bdc40ca0defcb915907f8f9f6a664b43529de0ca45fab
-      trap 'docker rm -f libsql-ci' EXIT
+      HOST_PORT=$$(docker port "$$NAME" 8080/tcp | tail -1 | cut -d: -f2)
+      if [ -z "$$HOST_PORT" ]; then
+        echo "failed to resolve host port for $$NAME" >&2
+        exit 1
+      fi
+      export JMODGUARD_REMOTE_TEST_URL=http://127.0.0.1:$${HOST_PORT}
+      export JMODGUARD_REMOTE_TEST_TOKEN=local-ci-token
       ready=0
       i=0
       while [ "$i" -lt 30 ]; do
-        if curl -sS -o /dev/null --connect-timeout 1 http://127.0.0.1:8080; then
+        if curl -sS -o /dev/null --connect-timeout 1 "$$JMODGUARD_REMOTE_TEST_URL"; then
           ready=1
           break
         fi
@@ -45,9 +64,7 @@ steps:
         sleep 1
       done
       if [ "$ready" -ne 1 ]; then
-        echo "libsql-ci did not become ready within 30s" >&2
+        echo "$$NAME did not become ready within 30s" >&2
         exit 1
       fi
-      export JMODGUARD_REMOTE_TEST_URL=http://127.0.0.1:8080
-      export JMODGUARD_REMOTE_TEST_TOKEN=local-ci-token
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
