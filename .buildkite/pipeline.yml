@@ -4,8 +4,6 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Optional GITHUB_TOKEN is inherited from the agent or pipeline environment.
-  # Do not map GITHUB_TOKEN: "$$GITHUB_TOKEN" — that stores the literal string.
 
 steps:
   - label: "test"
@@ -14,9 +12,15 @@ steps:
       set -eu
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      # Cargo clones git deps into ~/.cargo/git, so `git config --local` on this
+      # checkout never applies. GIT_CONFIG_* env vars do, for every git subprocess.
+      # Prefer an inherited GITHUB_TOKEN (do not map $$GITHUB_TOKEN in env — that
+      # stores the literal string). Otherwise rewrite HTTPS to SSH for the deploy key.
       case "$${GITHUB_TOKEN:-}" in
         ''|'$$GITHUB_TOKEN')
-          git config --local url.git@github.com:.insteadOf https://github.com/
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
           ;;
         *)
           export GIT_CONFIG_COUNT=1
@@ -45,7 +49,9 @@ steps:
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
       case "$${GITHUB_TOKEN:-}" in
         ''|'$$GITHUB_TOKEN')
-          git config --local url.git@github.com:.insteadOf https://github.com/
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
           ;;
         *)
           export GIT_CONFIG_COUNT=1
