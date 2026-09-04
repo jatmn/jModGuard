@@ -21,26 +21,52 @@ jobs:
         id: pick
         env:
           GH_TOKEN: ${{ secrets.RUNNER_READ_TOKEN || github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -eu
           fallback='"ubuntu-latest"'
           preferred='["self-hosted","linux","proxmox"]'
           echo "runner=${fallback}" >> "${GITHUB_OUTPUT}"
 
-          event="${GITHUB_EVENT_NAME:-}"
-          ref="${GITHUB_REF:-}"
+          event="${EVENT_NAME:-}"
+          ref="${EVENT_REF:-}"
+          repo="${REPO:-}"
+          owner="${OWNER:-}"
+          actor="${ACTOR:-}"
+          pr_head_repo="${PR_HEAD_REPO:-}"
           trusted=0
+          case_matched=""
+
           if [ "${event}" = "push" ] && [ "${ref}" = "refs/heads/main" ]; then
             trusted=1
-          elif [ "${event}" = "release" ] || [ "${event}" = "workflow_dispatch" ]; then
+            case_matched="push to refs/heads/main"
+          elif [ "${event}" = "release" ]; then
             trusted=1
+            case_matched="release"
+          elif [ "${event}" = "workflow_dispatch" ]; then
+            trusted=1
+            case_matched="workflow_dispatch"
+          elif [ "${event}" = "pull_request" ] && [ -n "${actor}" ] && [ -n "${owner}" ] && [ "${actor}" = "${owner}" ] && [ -n "${pr_head_repo}" ] && [ -n "${repo}" ] && [ "${pr_head_repo}" = "${repo}" ]; then
+            trusted=1
+            case_matched="owner same-repo pull_request (actor=${actor} owner=${owner} head=${pr_head_repo} repo=${repo})"
+          elif [ "${event}" = "pull_request" ]; then
+            case_matched="untrusted pull_request (actor=${actor} owner=${owner} head=${pr_head_repo} repo=${repo})"
+          elif [ "${event}" = "pull_request_target" ]; then
+            case_matched="untrusted pull_request_target"
+          else
+            case_matched="untrusted event (${event:-empty})"
           fi
 
           if [ "${trusted}" -eq 0 ]; then
-            echo "Untrusted event; using GitHub-hosted runner"
+            echo "Untrusted: ${case_matched}; using GitHub-hosted runner"
             exit 0
           fi
-          echo "Trusted event; preferring Proxmox if online"
+          echo "Trusted: ${case_matched}; preferring Proxmox if online"
 
           tmp="$(mktemp)"
           err="$(mktemp)"
