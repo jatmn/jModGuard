@@ -26,6 +26,7 @@ jobs:
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           ACTOR: ${{ github.actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -eu
@@ -38,6 +39,7 @@ jobs:
           repo="${REPO:-}"
           owner="${OWNER:-}"
           actor="${ACTOR:-}"
+          pr_author="${PR_AUTHOR:-}"
           pr_head_repo="${PR_HEAD_REPO:-}"
           trusted=0
           case_matched=""
@@ -51,11 +53,11 @@ jobs:
           elif [ "${event}" = "workflow_dispatch" ]; then
             trusted=1
             case_matched="workflow_dispatch"
-          elif [ "${event}" = "pull_request" ] && [ -n "${actor}" ] && [ -n "${owner}" ] && [ "${actor}" = "${owner}" ] && [ -n "${pr_head_repo}" ] && [ -n "${repo}" ] && [ "${pr_head_repo}" = "${repo}" ]; then
+          elif [ "${event}" = "pull_request" ] && [ -n "${pr_author}" ] && [ -n "${owner}" ] && [ "${pr_author}" = "${owner}" ] && [ -n "${pr_head_repo}" ] && [ -n "${repo}" ] && [ "${pr_head_repo}" = "${repo}" ]; then
             trusted=1
-            case_matched="owner same-repo pull_request (actor=${actor} owner=${owner} head=${pr_head_repo} repo=${repo})"
+            case_matched="owner same-repo pull_request (pr_author=${pr_author} owner=${owner} head=${pr_head_repo} repo=${repo})"
           elif [ "${event}" = "pull_request" ]; then
-            case_matched="untrusted pull_request (actor=${actor} owner=${owner} head=${pr_head_repo} repo=${repo})"
+            case_matched="untrusted pull_request (pr_author=${pr_author} actor=${actor} owner=${owner} head=${pr_head_repo} repo=${repo})"
           elif [ "${event}" = "pull_request_target" ]; then
             case_matched="untrusted pull_request_target"
           else
