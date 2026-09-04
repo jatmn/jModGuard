@@ -14,9 +14,20 @@ steps:
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
       # Cargo clones git deps into ~/.cargo/git, so `git config --local` on this
       # checkout never applies. GIT_CONFIG_* env vars do, for every git subprocess.
-      export GIT_CONFIG_COUNT=1
-      export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
-      export GIT_CONFIG_VALUE_0="https://github.com/"
+      # Prefer an inherited GITHUB_TOKEN (do not map $$GITHUB_TOKEN in env — that
+      # stores the literal string). Otherwise rewrite HTTPS to SSH for the deploy key.
+      case "$${GITHUB_TOKEN:-}" in
+        ''|'$$GITHUB_TOKEN')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          ;;
+        *)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          export GIT_CONFIG_VALUE_0="!f() { echo username=x-access-token; echo password=$${GITHUB_TOKEN}; }; f"
+          ;;
+      esac
       cargo fetch --locked
       cargo test --locked
       cargo test --locked --no-default-features --lib
@@ -36,9 +47,18 @@ steps:
       set -euo pipefail
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
-      export GIT_CONFIG_COUNT=1
-      export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
-      export GIT_CONFIG_VALUE_0="https://github.com/"
+      case "$${GITHUB_TOKEN:-}" in
+        ''|'$$GITHUB_TOKEN')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          ;;
+        *)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          export GIT_CONFIG_VALUE_0="!f() { echo username=x-access-token; echo password=$${GITHUB_TOKEN}; }; f"
+          ;;
+      esac
       cargo fetch --locked
       NAME="libsql-ci-$${BUILDKITE_JOB_ID}"
       trap 'docker rm -f "$$NAME"' EXIT
