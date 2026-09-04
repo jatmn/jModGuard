@@ -27,9 +27,24 @@ jobs:
           preferred='["self-hosted","linux","proxmox"]'
           echo "runner=${fallback}" >> "${GITHUB_OUTPUT}"
 
+          event="${GITHUB_EVENT_NAME:-}"
+          ref="${GITHUB_REF:-}"
+          trusted=0
+          if [ "${event}" = "push" ] && [ "${ref}" = "refs/heads/main" ]; then
+            trusted=1
+          elif [ "${event}" = "release" ] || [ "${event}" = "workflow_dispatch" ]; then
+            trusted=1
+          fi
+
+          if [ "${trusted}" -eq 0 ]; then
+            echo "Untrusted event; using GitHub-hosted runner"
+            exit 0
+          fi
+          echo "Trusted event; preferring Proxmox if online"
+
           tmp="$(mktemp)"
           err="$(mktemp)"
-          if ! gh api "repos/${GITHUB_REPOSITORY}/actions/runners" >"${tmp}" 2>"${err}"; then
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runners" --jq '.runners[]' >"${tmp}" 2>"${err}"; then
             echo "::warning::Runners API failed; falling back to ubuntu-latest"
             exit 0
           fi
@@ -39,19 +54,49 @@ jobs:
           import sys
 
           wanted = {"self-hosted", "linux", "proxmox"}
+
+          def fail_open():
+              print('"ubuntu-latest"')
+              raise SystemExit(0)
+
           try:
               with open(sys.argv[1], encoding="utf-8") as handle:
-                  data = json.load(handle)
+                  raw = handle.read()
           except Exception:
-              print('"ubuntu-latest"')
-              raise SystemExit(0)
+              fail_open()
 
-          runners = data.get("runners") if isinstance(data, dict) else data
-          if not isinstance(runners, list):
-              print('"ubuntu-latest"')
-              raise SystemExit(0)
+          def collect_runners(text):
+              runners = []
+              decoder = json.JSONDecoder()
+              idx = 0
+              length = len(text)
+              while idx < length:
+                  while idx < length and text[idx].isspace():
+                      idx += 1
+                  if idx >= length:
+                      break
+                  obj, end = decoder.raw_decode(text, idx)
+                  idx = end
+                  if isinstance(obj, dict):
+                      page = obj.get("runners")
+                      if isinstance(page, list):
+                          runners.extend(page)
+                      else:
+                          runners.append(obj)
+                  elif isinstance(obj, list):
+                      runners.extend(obj)
+                  else:
+                      raise ValueError("unexpected JSON value")
+              return runners
+
+          try:
+              runners = collect_runners(raw)
+          except Exception:
+              fail_open()
 
           for runner in runners:
+              if not isinstance(runner, dict):
+                  continue
               if str(runner.get("status") or "").lower() != "online":
                   continue
               labels = {
