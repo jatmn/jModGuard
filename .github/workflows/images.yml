@@ -17,8 +17,11 @@ on:
         type: string
 
 concurrency:
-  group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Every publish retags :latest and prunes older GHCR versions. One group
+  # for all releases and manual source_refs so a second dispatch queues
+  # instead of cancelling an unrelated SHA, and two source_refs cannot race.
+  group: images-publish
+  cancel-in-progress: false
 
 # Magic Containers can pull public GHCR images without extra registry auth.
 permissions:
@@ -63,6 +66,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Docker-safe extra tag
+        id: extra_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -eu
+          if [ "${EVENT_NAME}" != "workflow_dispatch" ]; then
+            echo "enable=false" >> "$GITHUB_OUTPUT"
+            echo "value=unused" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          raw="${SOURCE_REF}"
+          raw="${raw#refs/tags/}"
+          raw="${raw#refs/heads/}"
+          # Git tags may contain /; Docker tags may not.
+          safe="${raw//\//-}"
+          if ! printf '%s' "${safe}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::source_ref is not a Docker tag after replacing '/' with '-'."
+            exit 1
+          fi
+          echo "enable=true" >> "$GITHUB_OUTPUT"
+          echo "value=${safe}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
@@ -70,7 +97,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=ref,event=tag
-            type=raw,value=${{ inputs.source_ref }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ steps.extra_tag.outputs.value }},enable=${{ steps.extra_tag.outputs.enable }}
 
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:

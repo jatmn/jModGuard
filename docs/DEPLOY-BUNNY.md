@@ -118,7 +118,10 @@ repo, or run the `images` workflow by hand from a branch that contains the
 workflow file (usually `main`) and set the `source_ref` input to that same
 tag or full commit SHA. GitHub's workflow-dispatch branch selector is **not**
 the revision to compile; a SHA that is not a branch or tag cannot be chosen
-there. Do not publish frontend from one revision and images from another.
+there. Only one `images` publish runs at a time: a second dispatch waits
+rather than cancelling the first, because each run retags `:latest` and
+deletes older GHCR versions. Do not publish frontend from one revision and
+images from another.
 That builds `linux/amd64` images and pushes:
 
 ```text
@@ -127,6 +130,8 @@ ghcr.io/jatmn/jmodguard-api:latest
 ```
 
 The same digest is also tagged with the release name (for example `v1.2.3`).
+A manual run tags the digest with `source_ref` as well; `/` in a Git tag
+becomes `-` so the Docker tag stays valid (`release/2025` → `release-2025`).
 The workflow then deletes older GHCR versions so only the current release
 image is stored.
 
