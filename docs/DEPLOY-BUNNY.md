@@ -116,7 +116,10 @@ not build or publish a new image. There is nothing for Magic Containers to
 pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
 repo, or run the `images` workflow by hand from a branch that contains the
 workflow file (usually `main`) and set the `source_ref` input to that same
-tag or full commit SHA. GitHub's workflow-dispatch branch selector is **not**
+tag or full 40-character commit SHA. The workflow rejects branch names
+(`main`, `refs/heads/…`) and abbreviated SHAs: GitHub would otherwise
+resolve them to whatever that name points at on the day of the run, then
+overwrite `:latest`. GitHub's workflow-dispatch branch selector is **not**
 the revision to compile; a SHA that is not a branch or tag cannot be chosen
 there. Only one `images` publish runs at a time: a second dispatch waits
 rather than cancelling the first, because each run retags `:latest` and
