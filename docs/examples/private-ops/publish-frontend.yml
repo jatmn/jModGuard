@@ -20,10 +20,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out jModGuard source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: jatmn/jModGuard
           ref: ${{ inputs.ref }}
+          persist-credentials: false
+          # While jModGuard is private, set ops secret JMODGUARD_CHECKOUT_TOKEN
+          # to a PAT with contents:read and uncomment the next line. Once the
+          # source repo is public, the default token is enough.
+          # token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN }}
 
       - name: Upload frontend/ to Bunny Storage
         env:

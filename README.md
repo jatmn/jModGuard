@@ -31,10 +31,12 @@ from a private GitHub Actions repo. You do not need Bunny to run it
 ## Quick start
 
 ```bash
+git clone https://github.com/jatmn/jModGuard.git
+cd jModGuard
 # Bot without the `web` feature (no axum / sessions / SPA embed).
-cargo build --release --bin jmodguard-bot --no-default-features
+cargo build --locked --release --bin jmodguard-bot --no-default-features
 # API with the default `web` feature.
-cargo build --release --bin jmodguard-api
+cargo build --locked --release --bin jmodguard-api
 cp config.example.toml config.toml     # add your token + OAuth ids
 ./target/release/jmodguard-bot         # Discord gateway (migrates DB)
 ./target/release/jmodguard-api         # WebUI/API on http://localhost:8080

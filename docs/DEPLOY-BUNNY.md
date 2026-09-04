@@ -107,9 +107,10 @@ these files.
 ## 3. Build and publish both images
 
 GHCR is **release-only**. Everyday pushes to `main` and pull requests do
-not build or publish a new image. When you want new containers, publish a
-GitHub Release (for example tag `v1.2.3`) on this repo, or run the
-`images` workflow by hand. That builds `linux/amd64` images and pushes:
+not build or publish a new image. There is nothing for Magic Containers to
+pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
+repo, or run the `images` workflow by hand. That builds `linux/amd64`
+images and pushes:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:latest

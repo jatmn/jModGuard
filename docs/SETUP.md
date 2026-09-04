@@ -69,13 +69,20 @@ Discord OAuth2 → **General** → scroll to **Redirects**:
 ## 5. Build
 
 ```bash
-git clone <your-repo-url> jModGuard
+git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
+# rust-toolchain.toml selects Rust 1.96.0 via rustup.
 # Bot without the `web` feature (no axum / sessions / SPA embed).
-cargo build --release --bin jmodguard-bot --no-default-features
+cargo build --locked --release --bin jmodguard-bot --no-default-features
 # API with the default `web` feature.
-cargo build --release --bin jmodguard-api
+cargo build --locked --release --bin jmodguard-api
 ```
+
+`Cargo.toml` patches `libsql-sqlite3-parser` by cloning a revision of this
+same GitHub repository. `.cargo/config.toml` already forces Cargo to use
+`git(1)` for that fetch. While the repository is private, Git must be able
+to authenticate (`gh auth login`, SSH, or a PAT). Once the repository is
+public, a normal clone is enough.
 
 Binaries:
 - `target/release/jmodguard-bot` — Discord gateway (applies migrations)
@@ -215,8 +222,8 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
 
 ```bash
 git pull
-cargo build --release --bin jmodguard-bot --no-default-features
-cargo build --release --bin jmodguard-api
+cargo build --locked --release --bin jmodguard-bot --no-default-features
+cargo build --locked --release --bin jmodguard-api
 # restart both services; the database and config persist
 ```
 
