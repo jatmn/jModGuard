@@ -18,6 +18,9 @@ This guide covers everything from zero to a running bot on **Linux**
 - A Discord account (the bot owner).
 - Somewhere to run it: a Linux machine that stays online (VPS, home
   server, Raspberry Pi class box is fine).
+- While this repository is private: GitHub HTTPS credentials that can read it
+  (`gh auth login` + `gh auth setup-git`, or a PAT). An SSH key is not
+  enough for the Cargo git patch (see [Build](#5-build)).
 
 ## 2. Create the Discord application
 
@@ -68,14 +71,33 @@ Discord OAuth2 → **General** → scroll to **Redirects**:
 
 ## 5. Build
 
+`Cargo.toml` patches `libsql-sqlite3-parser` by cloning a revision of this
+same GitHub repository over **HTTPS**
+(`https://github.com/jatmn/jModGuard`). `.cargo/config.toml` only tells Cargo
+to use `git(1)` for that fetch; it does **not** rewrite HTTPS to SSH. While
+the repository is private, authenticate HTTPS **before** `git clone` and
+`cargo build`. An SSH key or `git clone git@github.com:...` does not
+authenticate the HTTPS patch fetch unless you also rewrite GitHub HTTPS URLs
+to SSH.
+
 ```bash
-git clone <your-repo-url> jModGuard
+# HTTPS credentials (covers clone and cargo fetch):
+gh auth login
+gh auth setup-git
+# SSH-only alternative (rewrite HTTPS GitHub URLs to SSH):
+# git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
+# rust-toolchain.toml selects Rust 1.96.0 via rustup.
 # Bot without the `web` feature (no axum / sessions / SPA embed).
-cargo build --release --bin jmodguard-bot --no-default-features
+cargo build --locked --release --bin jmodguard-bot --no-default-features
 # API with the default `web` feature.
-cargo build --release --bin jmodguard-api
+cargo build --locked --release --bin jmodguard-api
 ```
+
+Once the repository is public, skip the authentication commands; a normal
+HTTPS clone is enough.
 
 Binaries:
 - `target/release/jmodguard-bot` — Discord gateway (applies migrations)
@@ -215,8 +237,8 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
 
 ```bash
 git pull
-cargo build --release --bin jmodguard-bot --no-default-features
-cargo build --release --bin jmodguard-api
+cargo build --locked --release --bin jmodguard-bot --no-default-features
+cargo build --locked --release --bin jmodguard-api
 # restart both services; the database and config persist
 ```
 

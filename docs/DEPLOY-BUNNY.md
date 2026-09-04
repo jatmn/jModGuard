@@ -87,10 +87,13 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_STORAGE_ENDPOINT` | Regional host, default `storage.bunnycdn.com` |
 | `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
+| `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-Dispatch the workflow with the same jModGuard release tag you used for
-the container images (`v1.2.3`, not `main` or a random SHA). The runner
-checks out that tag and uploads `index.html`, `app.js`,
+Dispatch the workflow with the **same** 40-character jModGuard SHA recorded
+in the ops pin file (`docs/BUNNY.md` in the example). The copied workflow
+checks out that pin file first and **rejects** any other `ref` (including
+`main` and tags) before it clones this repository, so Storage cannot drift
+from the running images. The runner then uploads `index.html`, `app.js`,
 and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
@@ -107,9 +110,20 @@ these files.
 ## 3. Build and publish both images
 
 GHCR is **release-only**. Everyday pushes to `main` and pull requests do
-not build or publish a new image. When you want new containers, publish a
-GitHub Release (for example tag `v1.2.3`) on this repo, or run the
-`images` workflow by hand. That builds `linux/amd64` images and pushes:
+not build or publish a new image. There is nothing for Magic Containers to
+pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
+repo, or run the `images` workflow by hand from a branch that contains the
+workflow file (usually `main`) and set the `source_ref` input to that same
+tag or full 40-character commit SHA. The workflow rejects branch names
+(`main`, `refs/heads/…`) and abbreviated SHAs: GitHub would otherwise
+resolve them to whatever that name points at on the day of the run, then
+overwrite `:latest`. GitHub's workflow-dispatch branch selector is **not**
+the revision to compile; a SHA that is not a branch or tag cannot be chosen
+there. Only one `images` publish runs at a time: a second dispatch waits
+rather than cancelling the first, because each run retags `:latest` and
+deletes older GHCR versions. Do not publish frontend from one revision and
+images from another.
+That builds `linux/amd64` images and pushes:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:latest
@@ -117,6 +131,10 @@ ghcr.io/jatmn/jmodguard-api:latest
 ```
 
 The same digest is also tagged with the release name (for example `v1.2.3`).
+A manual run tags the digest with the peeled commit SHA and, if
+`source_ref` was a Git tag, that tag with `/` replaced by `-`
+(`release/2025` → `release-2025`). Tags are resolved to a commit SHA
+before checkout so a force-moved tag cannot change what gets compiled.
 The workflow then deletes older GHCR versions so only the current release
 image is stored.
 

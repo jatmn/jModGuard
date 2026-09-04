@@ -13,15 +13,16 @@ env:
   # Keep artifacts off /tmp when runners are constrained.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   TMPDIR: ${{ github.workspace }}/.tmp
-  # libsql-sqlite3-parser is git-patched from this private repo; libgit2
-  # cannot use GITHUB_TOKEN, so Cargo must invoke git(1).
+  # libsql-sqlite3-parser is git-patched from this repository; libgit2
+  # cannot use GITHUB_TOKEN, so Cargo must invoke git(1). While the repo
+  # is private, that fetch needs GitHub credentials.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
@@ -114,7 +115,7 @@ jobs:
       JMODGUARD_REMOTE_TEST_URL: http://127.0.0.1:8080
       JMODGUARD_REMOTE_TEST_TOKEN: local-ci-token
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 

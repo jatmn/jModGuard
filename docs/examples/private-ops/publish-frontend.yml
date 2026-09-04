@@ -2,9 +2,13 @@
 # Do not enable it on the public jModGuard repo: it needs Bunny Storage
 # credentials that must not live there.
 #
-# The runner checks out a jModGuard tag from GitHub and uploads frontend/
-# to Bunny Storage (then purges the Pull Zone). That is the designed
-# publisher for the admin UI.
+# The runner uploads frontend/ to Bunny Storage (then purges the Pull Zone).
+# That is the designed publisher for the admin UI.
+#
+# `ref` must equal the 40-character Source SHA recorded in this ops repo
+# (docs/BUNNY.md below). That SHA must match the running bot and API images.
+# Do not dispatch a branch, a tag, or any other revision: the workflow
+# rejects a mismatch before it checks out jModGuard.
 
 name: Publish jModGuard admin UI
 
@@ -12,24 +16,55 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: jModGuard git tag or commit SHA to publish
+        description: Must equal the Source SHA in docs/BUNNY.md
         required: true
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Check out ops pin
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: ops
+
+      - name: Require dispatch ref to match docs/BUNNY.md
+        id: pin
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          pin="$(grep -m1 -oE '[0-9a-f]{40}' ops/docs/BUNNY.md)"
+          test -n "$pin"
+          requested="$(printf '%s' "$REQUESTED_REF" | tr '[:upper:]' '[:lower:]')"
+          if [ "$requested" != "$pin" ]; then
+            echo "ref '${REQUESTED_REF}' does not match docs/BUNNY.md Source SHA '${pin}'. Update the pin and rebuild images from that SHA before publishing." >&2
+            exit 1
+          fi
+          echo "pin=${pin}" >> "${GITHUB_OUTPUT}"
+
       - name: Check out jModGuard source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: jatmn/jModGuard
-          ref: ${{ inputs.ref }}
+          ref: ${{ steps.pin.outputs.pin }}
+          persist-credentials: false
+          # Cross-repo checkout of private jModGuard needs a PAT
+          # (contents:read). Once this source repo is public, github.token
+          # from the ops runner is enough.
+          token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN || github.token }}
+          path: source
 
       - name: Upload frontend/ to Bunny Storage
+        working-directory: source
         env:
           BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
           BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
           BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
           BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
           BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
-        run: bash scripts/publish-frontend-bunny.sh
+        run: |
+          set -eu
+          test -f scripts/publish-frontend-bunny.sh
+          bash scripts/publish-frontend-bunny.sh
