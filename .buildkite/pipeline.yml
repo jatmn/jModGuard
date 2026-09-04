@@ -4,8 +4,6 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Optional GITHUB_TOKEN is inherited from the agent or pipeline environment.
-  # Do not map GITHUB_TOKEN: "$$GITHUB_TOKEN" — that stores the literal string.
 
 steps:
   - label: "test"
@@ -14,16 +12,11 @@ steps:
       set -eu
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
-      case "$${GITHUB_TOKEN:-}" in
-        ''|'$$GITHUB_TOKEN')
-          git config --local url.git@github.com:.insteadOf https://github.com/
-          ;;
-        *)
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0=credential.helper
-          export GIT_CONFIG_VALUE_0="!f() { echo username=x-access-token; echo password=$${GITHUB_TOKEN}; }; f"
-          ;;
-      esac
+      # Cargo clones git deps into ~/.cargo/git, so `git config --local` on this
+      # checkout never applies. GIT_CONFIG_* env vars do, for every git subprocess.
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+      export GIT_CONFIG_VALUE_0="https://github.com/"
       cargo fetch --locked
       cargo test --locked
       cargo test --locked --no-default-features --lib
@@ -43,16 +36,9 @@ steps:
       set -euo pipefail
       mkdir -p .tmp
       export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
-      case "$${GITHUB_TOKEN:-}" in
-        ''|'$$GITHUB_TOKEN')
-          git config --local url.git@github.com:.insteadOf https://github.com/
-          ;;
-        *)
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0=credential.helper
-          export GIT_CONFIG_VALUE_0="!f() { echo username=x-access-token; echo password=$${GITHUB_TOKEN}; }; f"
-          ;;
-      esac
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0="url.git@github.com:.insteadof"
+      export GIT_CONFIG_VALUE_0="https://github.com/"
       cargo fetch --locked
       NAME="libsql-ci-$${BUILDKITE_JOB_ID}"
       trap 'docker rm -f "$$NAME"' EXIT
