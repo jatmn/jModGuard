@@ -19,8 +19,13 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  pick-runner:
+    uses: ./.github/workflows/pick-runner.yml
+    secrets: inherit
+
   test:
-    runs-on: ubuntu-latest
+    needs: pick-runner
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -102,7 +107,8 @@ jobs:
         run: cargo build --locked --bin jmodguard-api --no-default-features --features web
 
   remote-database:
-    runs-on: ubuntu-latest
+    needs: pick-runner
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
     services:
       libsql:
         image: ghcr.io/tursodatabase/libsql-server@sha256:1bc51611928ccc51229bdc40ca0defcb915907f8f9f6a664b43529de0ca45fab
