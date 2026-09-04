@@ -30,6 +30,12 @@ from a private GitHub Actions repo. You do not need Bunny to run it
 
 ## Quick start
 
+While this repository is private, authenticate **HTTPS** GitHub access
+**before** cloning (`gh auth login` then `gh auth setup-git`). That covers
+both the clone and Cargo's later git fetch of this same repo. An SSH key or
+`git@github.com:` clone is not enough by itself — see
+[docs/SETUP.md](docs/SETUP.md). Once the repository is public, skip that.
+
 ```bash
 git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
