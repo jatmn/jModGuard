@@ -2,9 +2,14 @@
 # Do not enable it on the public jModGuard repo: it needs Bunny Storage
 # credentials that must not live there.
 #
-# The runner checks out a jModGuard tag from GitHub and uploads frontend/
-# to Bunny Storage (then purges the Pull Zone). That is the designed
-# publisher for the admin UI.
+# The runner checks out a jModGuard tag or SHA from GitHub and uploads
+# frontend/ to Bunny Storage (then purges the Pull Zone). That is the
+# designed publisher for the admin UI.
+#
+# `ref` must be the same git tag or commit SHA as the bot and API images
+# you are running. Do not dispatch floating `main`. After copying into
+# ops, add a check that rejects any ref other than your recorded pin
+# (see jmodguard-ops: compare inputs.ref to docs/BUNNY.md).
 
 name: Publish jModGuard admin UI
 
@@ -12,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: jModGuard git tag or commit SHA to publish
+        description: Git tag or commit SHA; must match the running bot/API images (not floating main)
         required: true
 
 jobs:
@@ -37,4 +42,8 @@ jobs:
           BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
           BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
           BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
-        run: bash scripts/publish-frontend-bunny.sh
+        run: |
+          set -eu
+          # Workspace is the jModGuard checkout from the previous step.
+          test -f scripts/publish-frontend-bunny.sh
+          bash scripts/publish-frontend-bunny.sh

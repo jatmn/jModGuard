@@ -89,10 +89,14 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-Dispatch the workflow with the same jModGuard release tag you used for
-the container images (`v1.2.3`, not `main` or a random SHA). The runner
-checks out that tag and uploads `index.html`, `app.js`,
-and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
+Dispatch the workflow with the **same** jModGuard git tag or commit SHA
+you used for the container images (`v1.2.3` or a full SHA). Do not use
+floating `main` unless that commit is the revision you recorded and
+deployed. The runner checks out that ref and uploads `index.html`,
+`app.js`, and `style.css` to the Storage Zone root (`/`, `/app.js`,
+`/style.css`). After you copy the example into an ops repo, reject any
+dispatch `ref` that is not your recorded pin so Storage cannot drift
+from the running images.
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
 It refuses to start if it cannot read the current objects. A failed Pull
@@ -110,8 +114,9 @@ these files.
 GHCR is **release-only**. Everyday pushes to `main` and pull requests do
 not build or publish a new image. There is nothing for Magic Containers to
 pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
-repo, or run the `images` workflow by hand. That builds `linux/amd64`
-images and pushes:
+repo, or run the `images` workflow by hand **on that same tag or SHA**.
+Do not publish frontend from one revision and images from another. That
+builds `linux/amd64` images and pushes:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:latest
