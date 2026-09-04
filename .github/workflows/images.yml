@@ -46,7 +46,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_REF: ${{ inputs.source_ref }}
-          GITHUB_REF: ${{ github.ref }}
+          EVENT_REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -79,7 +79,7 @@ jobs:
 
           event_name = os.environ["EVENT_NAME"]
           if event_name != "workflow_dispatch":
-              write_checkout_ref(os.environ["GITHUB_REF"])
+              write_checkout_ref(os.environ["EVENT_REF"])
               sys.exit(0)
 
           ref = (os.environ.get("SOURCE_REF") or "").strip()
@@ -141,6 +141,22 @@ jobs:
             image: ghcr.io/jatmn/jmodguard-api
             package: jmodguard-api
     steps:
+      - name: Refuse empty or branch checkout
+        env:
+          CHECKOUT_REF: ${{ needs.validate-source-ref.outputs.checkout_ref }}
+        run: |
+          set -eu
+          if [ -z "${CHECKOUT_REF}" ]; then
+            echo "::error::validated checkout ref is empty; refusing to default to the dispatch branch."
+            exit 1
+          fi
+          case "${CHECKOUT_REF}" in
+            refs/heads/*)
+              echo "::error::validated checkout ref must not be a branch."
+              exit 1
+              ;;
+          esac
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
