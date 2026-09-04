@@ -154,6 +154,11 @@ Same order: migrate with the bot app, then roll the API app. Both must keep
 using the same Bunny Database. Upload matching `frontend/` to Storage and purge
 the Pull Zone. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
+Before publishing new GHCR images, confirm previous bot/API digests still
+pull (or re-run `images` for the previous `source_ref`). Each `images`
+publish retags `:latest` and may delete older package versions. Point
+Magic Containers at recorded digests, not `:latest`.
+
 ## Related
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — dual-process and `config_version`

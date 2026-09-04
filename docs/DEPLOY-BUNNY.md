@@ -90,11 +90,13 @@ into the private repo when you want repeats. Store these secrets there:
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
 Dispatch the workflow with the **same** 40-character jModGuard SHA recorded
-in the ops pin file (`docs/BUNNY.md` in the example). The copied workflow
-checks out that pin file first and **rejects** any other `ref` (including
-`main` and tags) before it clones this repository, so Storage cannot drift
-from the running images. The runner then uploads `index.html`, `app.js`,
-and `style.css` to the Storage Zone root (`/`, `/app.js`, `/style.css`).
+in the ops pin file (`| Source SHA |` in `docs/BUNNY.md` in the example —
+not the first hex in that file, which may be a blob URL). The copied
+workflow checks out that pin file first and **rejects** any other `ref`
+(including `main` and tags) before it clones this repository, so Storage
+cannot drift from the running images. The runner then uploads `index.html`,
+`app.js`, and `style.css` to the Storage Zone root (`/`, `/app.js`,
+`/style.css`).
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
 It refuses to start if it cannot read the current objects. A failed Pull
@@ -136,10 +138,14 @@ A manual run tags the digest with the peeled commit SHA and, if
 (`release/2025` → `release-2025`). Tags are resolved to a commit SHA
 before checkout so a force-moved tag cannot change what gets compiled.
 The workflow then deletes older GHCR versions so only the current release
-image is stored.
+image is stored. A digest recorded from a previous publish may stop
+pulling after the next run unless GHCR retention keeps it or you re-run
+`images` with that earlier `source_ref`. Record bot and API digests
+before the next publish if you may need to roll back.
 
-Point Magic Containers at `:latest`. After each release, redeploy or
-restart the apps so they pull the new image.
+Point Magic Containers at those recorded **digests**, not floating
+`:latest`. After each publish, redeploy or restart the apps so they pull
+the intended image.
 
 The API image is JSON + OAuth only. It does not embed `frontend/`.
 
@@ -328,8 +334,11 @@ schema-open against a local libSQL server, not Bunny TLS.
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
 - Keep bot image, API image, and Storage `frontend/` on the same git
-  tag. Pin image digests in the private ops repo if you want an
-  immutable rollout record.
+  tag or commit SHA. Pin image **digests** in the private ops repo and
+  point Magic Containers at those digests. A later `images` publish
+  retags `:latest` and may prune older GHCR versions, so a recorded
+  digest may stop pulling unless you re-run `images` for that earlier
+  `source_ref` or configure GHCR retention.
 - Do not add public Magic Container endpoints for the bot. Do not use a
   Magic Container hostname as the product URL.
 
