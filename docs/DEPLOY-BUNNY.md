@@ -87,6 +87,7 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_STORAGE_ENDPOINT` | Regional host, default `storage.bunnycdn.com` |
 | `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
+| `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
 Dispatch the workflow with the same jModGuard release tag you used for
 the container images (`v1.2.3`, not `main` or a random SHA). The runner

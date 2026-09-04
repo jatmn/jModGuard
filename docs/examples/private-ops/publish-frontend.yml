@@ -25,10 +25,10 @@ jobs:
           repository: jatmn/jModGuard
           ref: ${{ inputs.ref }}
           persist-credentials: false
-          # While jModGuard is private, set ops secret JMODGUARD_CHECKOUT_TOKEN
-          # to a PAT with contents:read and uncomment the next line. Once the
-          # source repo is public, the default token is enough.
-          # token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN }}
+          # Cross-repo checkout of private jModGuard needs a PAT
+          # (contents:read). Once this source repo is public, github.token
+          # from the ops runner is enough.
+          token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN || github.token }}
 
       - name: Upload frontend/ to Bunny Storage
         env:
