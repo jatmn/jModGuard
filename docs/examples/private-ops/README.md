@@ -12,7 +12,8 @@ Short version:
   Do not use OriginMagicContainers on a Storage-origin Pull Zone.
 - At most five URL patterns per edge-rule trigger. Disable Cookies must be
   off. Do not paste Magic Container GET/PATCH JSON (it dumps env).
-- The API image does not serve `/`. Probe `/health`.
+- The Bunny API image does not serve `/` (a default local build may).
+  Probe `/health`.
 - `JMODGUARD_WEB_BASE_URL` and the Discord redirect must be the hostname
   people type (Force SSL on a custom hostname).
 

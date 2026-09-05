@@ -167,7 +167,8 @@ resolves `:latest` to the index digest when attestations are attached and
 then fails to pull. After each publish, redeploy or restart the apps so
 they pull the intended image.
 
-The API image is JSON + OAuth only. It does not embed `frontend/`.
+The Bunny API image is JSON + OAuth only. It does not embed `frontend/`.
+A default local API build still can (`embed-ui`).
 
 Magic Containers trusts public GHCR. The `images` workflow tries to mark
 those packages public after the first push. If that is denied, set
@@ -240,7 +241,8 @@ exists so the Storage Pull Zone can origin-pull the API. GET/PATCH of a
 Magic Container via the Bunny API returns every env var — never paste
 those responses.
 
-The API image does not serve `/` (no embedded UI). Do not treat `/` on
+The Bunny API image does not embed or serve the UI at `/`; a default
+local API build (`embed-ui`) may serve `/`. Do not treat `/` on
 the container or its endpoint hostname as a ready check. Platform and
 Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. Until axum
 takes over (database open, AppState primary-version prime, router
@@ -347,8 +349,8 @@ self-host.
 3. Each app: one region, one replica.
 4. Open the **CDN** hostname that matches `JMODGUARD_WEB_BASE_URL`. The
    admin UI loads from Storage. Login with Discord. OAuth returns to that
-   origin. Probe `/health` (200 `ok`); do not use `/` on the API origin as
-   a ready check.
+   origin. Probe `/health` (200 `ok`); do not use `/` on the Bunny API
+   origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure a dry-run rule and check the audit event.
