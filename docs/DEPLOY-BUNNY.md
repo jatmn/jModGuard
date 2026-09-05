@@ -111,20 +111,21 @@ these files.
 
 ## 3. Build and publish both images
 
-GHCR is **release-only**. Everyday pushes to `main` and pull requests do
-not build or publish a new image. There is nothing for Magic Containers to
-pull until you publish a GitHub Release (for example tag `v1.2.3`) on this
-repo, or run the `images` workflow by hand from a branch that contains the
-workflow file (usually `main`) and set the `source_ref` input to that same
-tag or full 40-character commit SHA. The workflow rejects branch names
-(`main`, `refs/heads/…`) and abbreviated SHAs: GitHub would otherwise
-resolve them to whatever that name points at on the day of the run, then
-overwrite `:latest`. GitHub's workflow-dispatch branch selector is **not**
-the revision to compile; a SHA that is not a branch or tag cannot be chosen
-there. Only one `images` publish runs at a time: a second dispatch waits
-rather than cancelling the first, because each run retags `:latest` and
-deletes older GHCR versions. Do not publish frontend from one revision and
-images from another.
+GHCR has two publish styles:
+
+- **`images` workflow** (a GitHub Release, or Run workflow with a tag or
+  full SHA): builds **both** images. It still rejects branch names.
+- **Path-filtered workflows on `main`**: `Publish bot image`, `Publish
+  database image` (bot image, because the bot applies SQL), and `Publish
+  API image`. These run only on push to `main` (no manual dispatch, so a
+  feature branch cannot retag `:latest`). A CSS-only change does not
+  build either container. Manual publishes still use the `images`
+  workflow with a tag or full SHA.
+
+There is nothing for Magic Containers to pull until one of those publishes.
+Each run retags `:latest` for **that** package and may delete older versions
+of that package only. Do not mix a new website with an old API when the page
+needs new endpoints.
 That builds **single-manifest** `linux/amd64` images (no Buildx
 provenance/SBOM index) and pushes:
 

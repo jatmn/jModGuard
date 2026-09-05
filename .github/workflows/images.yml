@@ -1,11 +1,10 @@
 name: images
 
-# Publish GHCR images only when you cut a GitHub Release (or click
-# "Run workflow" and set source_ref to the tag or SHA to compile). PRs and everyday main pushes do not build or push
-# images: each matrix image is a full Rust docker compile (~10 min) and
-# path-filtered PR builds were still the minutes leak after release-only
-# publish. Each publish retags :latest and deletes older package versions
-# so GHCR only keeps the current release image (version tag + latest).
+# Publish both GHCR images from a GitHub Release or a manual source_ref
+# (tag or full SHA, not a branch). Everyday pushes do not run this
+# workflow. Path-filtered Publish bot/API/database image workflows on main
+# build one image at a time. Each publish retags :latest for that package
+# and deletes older versions of that package only.
 on:
   release:
     types: [published]
@@ -94,6 +93,19 @@ jobs:
                   )
               return safe
 
+          def extra_docker_tag_from_git_tag(label):
+              # Release Git tags may include characters Docker rejects (e.g. +).
+              # Skip the extra image tag rather than failing the publish; latest
+              # and the commit SHA are still applied in publish-image.yml.
+              safe = label.replace("/", "-").replace("+", "-")
+              if DOCKER_TAG_RE.fullmatch(safe):
+                  return safe
+              print(
+                  f"::warning::Git tag {label!r} is not a Docker tag; "
+                  "publishing latest and the commit SHA only."
+              )
+              return ""
+
           def peel_tag_to_commit(repo, tag_name):
               code, stdout = gh_api(
                   f"repos/{repo}/git/ref/tags/{quote(tag_name, safe='/')}"
@@ -137,7 +149,7 @@ jobs:
               if not event_ref.startswith("refs/tags/"):
                   fail("release checkout must be a tag, not a branch.")
               tag_name = event_ref[len("refs/tags/") :]
-              write_outputs(peel_tag_to_commit(repo, tag_name), "unused")
+              write_outputs(peel_tag_to_commit(repo, tag_name), extra_docker_tag_from_git_tag(tag_name))
               sys.exit(0)
 
           ref = (os.environ.get("SOURCE_REF") or "").strip()
@@ -169,167 +181,26 @@ jobs:
           write_outputs(sha, docker_tag_from_label(ref))
           PY
 
-  build:
+  publish-bot:
     needs:
       - pick-runner
       - validate-source-ref
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: bot
-            file: Dockerfile.bot
-            image: ghcr.io/jatmn/jmodguard-bot
-            package: jmodguard-bot
-          - name: api
-            file: Dockerfile.api
-            image: ghcr.io/jatmn/jmodguard-api
-            package: jmodguard-api
-    steps:
-      - name: Refuse empty or non-SHA checkout
-        env:
-          CHECKOUT_REF: ${{ needs.validate-source-ref.outputs.checkout_ref }}
-        run: |
-          set -eu
-          if ! printf '%s' "${CHECKOUT_REF}" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::validated checkout ref must be a full commit SHA; refusing to default to the dispatch branch or follow a moving tag."
-            exit 1
-          fi
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      component: bot
+      checkout_ref: ${{ needs.validate-source-ref.outputs.checkout_ref }}
+      runner: ${{ needs.pick-runner.outputs.runner }}
+      extra_tag: ${{ needs.validate-source-ref.outputs.docker_tag }}
+    secrets: inherit
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          # Peeled commit SHA from validate-source-ref. Never github.ref on
-          # workflow_dispatch (that is the branch that contains this file),
-          # and never a tag name (tags can move between validate and checkout).
-          ref: ${{ needs.validate-source-ref.outputs.checkout_ref }}
-
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        if: github.event_name != 'pull_request'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        id: meta
-        with:
-          images: ${{ matrix.image }}
-          tags: |
-            type=raw,value=latest
-            type=ref,event=tag
-            type=raw,value=${{ needs.validate-source-ref.outputs.checkout_ref }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=${{ needs.validate-source-ref.outputs.docker_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: ${{ matrix.file }}
-          platforms: linux/amd64
-          # Magic Containers cannot pull Buildx OCI indexes (attestation
-          # sibling). A single linux/amd64 image manifest is the digest we pin.
-          provenance: false
-          sbom: false
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-          # Builder cargo must clone the private libsql-sqlite3-parser git pin.
-          secrets: |
-            github_token=${{ secrets.GITHUB_TOKEN }}
-
-      # GitHub creates GHCR packages as private. PATCH /user/packages is the
-      # Actions token identity, not the package owner — use /users or /orgs.
-      - name: Make package public
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGE_OWNER: ${{ github.repository_owner }}
-          OWNER_TYPE: ${{ github.event.repository.owner.type }}
-          PACKAGE: ${{ matrix.package }}
-        run: |
-          if [ "${OWNER_TYPE}" = "Organization" ]; then
-            api_path="/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE}"
-          else
-            api_path="/users/${PACKAGE_OWNER}/packages/container/${PACKAGE}"
-          fi
-          for i in 1 2 3 4 5 6; do
-            if gh api --method PATCH "${api_path}" \
-              -H "Accept: application/vnd.github+json" \
-              -f visibility=public; then
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::warning::Could not set ${PACKAGE} public via ${api_path}. Set visibility on the GitHub package page."
-          exit 0
-
-      - name: Keep only the current image
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGE_OWNER: ${{ github.repository_owner }}
-          OWNER_TYPE: ${{ github.event.repository.owner.type }}
-          PACKAGE: ${{ matrix.package }}
-        run: |
-          set -eu
-          if [ "${OWNER_TYPE}" = "Organization" ]; then
-            list_path="/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE}/versions"
-          else
-            list_path="/users/${PACKAGE_OWNER}/packages/container/${PACKAGE}/versions"
-          fi
-
-          versions="$(gh api --paginate "${list_path}" -H "Accept: application/vnd.github+json")"
-          keep_id="$(printf '%s' "${versions}" | python3 -c '
-          import json, sys
-          data = json.load(sys.stdin)
-          if not isinstance(data, list):
-              data = [data]
-          keep = None
-          for v in data:
-              tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
-              if "latest" in tags:
-                  keep = v["id"]
-                  break
-          if keep is None and data:
-              keep = data[0]["id"]
-          print(keep or "")
-          ')"
-
-          if [ -z "${keep_id}" ]; then
-            echo "::warning::No GHCR versions found for ${PACKAGE}; skip prune."
-            exit 0
-          fi
-
-          printf '%s' "${versions}" | KEEP_ID="${keep_id}" LIST_PATH="${list_path}" python3 -c '
-          import json, os, subprocess, sys
-          data = json.load(sys.stdin)
-          if not isinstance(data, list):
-              data = [data]
-          keep = int(os.environ["KEEP_ID"])
-          list_path = os.environ["LIST_PATH"]
-          deleted = 0
-          for v in data:
-              vid = v["id"]
-              if vid == keep:
-                  tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
-                  print(f"keeping {vid} tags={tags}")
-                  continue
-              tags = (v.get("metadata") or {}).get("container", {}).get("tags") or []
-              path = f"{list_path}/{vid}"
-              r = subprocess.run(
-                  ["gh", "api", "--method", "DELETE", path, "-H", "Accept: application/vnd.github+json"],
-                  capture_output=True,
-                  text=True,
-              )
-              if r.returncode == 0:
-                  deleted += 1
-                  print(f"deleted {vid} tags={tags}")
-              else:
-                  print(f"::warning::Could not delete {vid} tags={tags}: {r.stderr.strip() or r.stdout.strip()}")
-          print(f"deleted {deleted} older version(s); kept {keep}")
-          '
+  publish-api:
+    needs:
+      - pick-runner
+      - validate-source-ref
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      component: api
+      checkout_ref: ${{ needs.validate-source-ref.outputs.checkout_ref }}
+      runner: ${{ needs.pick-runner.outputs.runner }}
+      extra_tag: ${{ needs.validate-source-ref.outputs.docker_tag }}
+    secrets: inherit

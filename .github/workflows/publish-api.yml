@@ -1,0 +1,50 @@
+# Rebuild only the API image on push to main. No workflow_dispatch:
+# a feature branch must not retag :latest. Manual publishes use images.yml.
+
+name: Publish API image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.api
+      - src/bin/jmodguard-api.rs
+      - src/web/**
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - vendor/**
+      - src/lib.rs
+      - src/config.rs
+      - src/db.rs
+      - src/db/**
+      - src/db_compat.rs
+      - src/defaults.rs
+      - src/health.rs
+      - src/ids.rs
+      - src/logging.rs
+      - src/normalize.rs
+      - src/remote_https.rs
+      - src/state.rs
+      - src/templates.rs
+      - src/types.rs
+      - .github/workflows/publish-api.yml
+      - .github/workflows/publish-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pick-runner:
+    uses: ./.github/workflows/pick-runner.yml
+    secrets: inherit
+
+  publish:
+    needs: pick-runner
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      component: api
+      checkout_ref: ${{ github.sha }}
+      runner: ${{ needs.pick-runner.outputs.runner }}
+    secrets: inherit
