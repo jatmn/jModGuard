@@ -17,3 +17,5 @@ Short version:
   people type (Force SSL on a custom hostname).
 
 [publish-frontend.yml](publish-frontend.yml) is the Storage/CDN publisher.
+If a bad UI is live, run it with a known-good `ref` and confirm the purge.
+Disabling the workflow does not roll Storage back.

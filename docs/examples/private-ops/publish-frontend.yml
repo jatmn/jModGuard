@@ -6,7 +6,9 @@
 # to main is picked up by cron on the ops default branch (GitHub only
 # runs schedule from that branch). Run workflow with ref left as main
 # publishes immediately. CSS-only updates do not need a new container
-# image; rebuild the API when the page needs new endpoints.
+# image; rebuild the API when the page needs new endpoints. A bad publish
+# stays on Storage until you rerun with a known-good ref and the purge
+# succeeds; disabling this workflow does not roll the files back.
 
 name: Publish jModGuard admin UI
 

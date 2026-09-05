@@ -105,6 +105,11 @@ receive a webhook from jModGuard. A CSS-only change does not need a new
 container image. Do not mix a new `app.js` with an old API when the page
 needs new endpoints.
 
+If a published UI is wrong or breaks login, **Run workflow** with `ref`
+set to a known-good tag or SHA, then confirm the Pull Zone purge
+succeeded. Turning the workflow off only stops later publishes; Storage
+and CDN keep the last uploaded files until you replace them and purge.
+
 The runner uploads `index.html`, `app.js`, and `style.css` to the Storage
 Zone root (`/`, `/app.js`, `/style.css`).
 If a later file fails to upload, the script restores files it successfully
