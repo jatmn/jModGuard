@@ -1,0 +1,54 @@
+# Rebuild only the Discord bot image. Does not publish the API or the admin UI.
+# Schema files are publish-database.yml (still a bot image; that is who migrates).
+
+name: Publish bot image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.bot
+      - src/bin/jmodguard-bot.rs
+      - src/handlers.rs
+      - src/automod.rs
+      - src/commands/**
+      - src/discord.rs
+      - Cargo.lock
+      - Cargo.toml
+      - rust-toolchain.toml
+      - vendor/**
+      - src/lib.rs
+      - src/config.rs
+      - src/db.rs
+      - src/db/**
+      - src/db_compat.rs
+      - src/defaults.rs
+      - src/health.rs
+      - src/ids.rs
+      - src/logging.rs
+      - src/normalize.rs
+      - src/remote_https.rs
+      - src/state.rs
+      - src/templates.rs
+      - src/types.rs
+      - .github/workflows/publish-bot.yml
+      - .github/workflows/publish-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pick-runner:
+    uses: ./.github/workflows/pick-runner.yml
+    secrets: inherit
+
+  publish:
+    needs: pick-runner
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      component: bot
+      checkout_ref: ${{ github.sha }}
+      runner: ${{ needs.pick-runner.outputs.runner }}
+    secrets: inherit

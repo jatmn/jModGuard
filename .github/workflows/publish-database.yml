@@ -1,0 +1,30 @@
+# Rebuild the bot image because the bot is what applies SQL migrations.
+# Does not publish the API image or the admin UI.
+
+name: Publish database image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - migrations/**
+      - .github/workflows/publish-database.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pick-runner:
+    uses: ./.github/workflows/pick-runner.yml
+    secrets: inherit
+
+  publish:
+    needs: pick-runner
+    uses: ./.github/workflows/publish-image.yml
+    with:
+      component: bot
+      checkout_ref: ${{ github.sha }}
+      runner: ${{ needs.pick-runner.outputs.runner }}
+    secrets: inherit
