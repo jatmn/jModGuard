@@ -13,10 +13,12 @@ contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
 The UI files are published by **GitHub Actions in your private ops repo**
-(not by this public repository). That private runner checks out a jModGuard
-tag and uploads `frontend/` to Storage. Bunny credentials stay in that
-private repo’s secrets. This public repo is the source; it is not the
-place those keys live.
+(not by this public repository). That private runner polls this repository
+(usually `main`) and uploads `frontend/` to Storage. Match the running
+container revision only when the page needs new API endpoints;
+CSS/layout-only revisions can publish independently. Bunny credentials
+stay in that private repo’s secrets. This public repo is the source; it
+is not the place those keys live.
 
 ```text
 Browser  →  Bunny CDN (Pull Zone)
@@ -75,7 +77,10 @@ must be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual).** In the Storage Zone, **Browse Files**, and upload
 those three files to the **root** so they are `/` (or `/index.html`),
-`/app.js`, and `/style.css`. Use the same git tag as the container images.
+`/app.js`, and `/style.css`. Start from the same git tag as the container
+images so the first login works. After that, CSS/layout-only revisions can
+publish without a new image; match the container revision again only when
+the page needs new API endpoints.
 
 **Later updates.** Publishing is meant to be GitHub Actions in your
 **private** ops repo (Bunny Storage passwords do not belong in this public
@@ -128,8 +133,9 @@ overwrite `:latest`. GitHub's workflow-dispatch branch selector is **not**
 the revision to compile; a SHA that is not a branch or tag cannot be chosen
 there. Only one `images` publish runs at a time: a second dispatch waits
 rather than cancelling the first, because each run retags `:latest` and
-deletes older GHCR versions. Do not publish frontend from one revision and
-images from another.
+deletes older GHCR versions. Match frontend to the running API when the
+page needs new endpoints. CSS/layout-only frontend revisions can publish
+without a new image.
 That builds **single-manifest** `linux/amd64` images (no Buildx
 provenance/SBOM index) and pushes:
 

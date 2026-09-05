@@ -73,8 +73,9 @@ cargo build --release --locked --bin jmodguard-api
 ```
 
 Or rebuild/push container images from `Dockerfile.bot` / `Dockerfile.api` at
-that tag. On Bunny, also upload matching `frontend/` from the **same** tag to
-the Storage Zone and purge the Pull Zone.
+that tag. On Bunny, upload `frontend/` from the **same** tag when the page
+needs the new API; CSS/layout-only files can publish independently. Purge
+the Pull Zone after the upload.
 
 ## 4. Config diff
 
