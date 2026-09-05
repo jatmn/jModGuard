@@ -117,7 +117,10 @@ GHCR has two publish styles:
   full SHA): builds **both** images. It still rejects branch names.
 - **Path-filtered workflows on `main`**: `Publish bot image`, `Publish
   database image` (bot image, because the bot applies SQL), and `Publish
-  API image`. A CSS-only change does not build either container.
+  API image`. These run only on push to `main` (no manual dispatch, so a
+  feature branch cannot retag `:latest`). A CSS-only change does not
+  build either container. Manual publishes still use the `images`
+  workflow with a tag or full SHA.
 
 There is nothing for Magic Containers to pull until one of those publishes.
 Each run retags `:latest` for **that** package and may delete older versions

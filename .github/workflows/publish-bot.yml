@@ -1,5 +1,5 @@
-# Rebuild only the Discord bot image. Does not publish the API or the admin UI.
-# Schema files are publish-database.yml (still a bot image; that is who migrates).
+# Rebuild only the Discord bot image on push to main. No workflow_dispatch:
+# a feature branch must not retag :latest. Manual publishes use images.yml.
 
 name: Publish bot image
 
@@ -33,7 +33,6 @@ on:
       - src/types.rs
       - .github/workflows/publish-bot.yml
       - .github/workflows/publish-image.yml
-  workflow_dispatch:
 
 permissions:
   contents: read

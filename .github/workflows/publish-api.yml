@@ -1,4 +1,5 @@
-# Rebuild only the API image. Does not publish the bot or the admin UI.
+# Rebuild only the API image on push to main. No workflow_dispatch:
+# a feature branch must not retag :latest. Manual publishes use images.yml.
 
 name: Publish API image
 
@@ -29,7 +30,6 @@ on:
       - src/types.rs
       - .github/workflows/publish-api.yml
       - .github/workflows/publish-image.yml
-  workflow_dispatch:
 
 permissions:
   contents: read

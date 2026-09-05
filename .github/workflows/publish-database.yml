@@ -1,5 +1,5 @@
-# Rebuild the bot image because the bot is what applies SQL migrations.
-# Does not publish the API image or the admin UI.
+# Rebuild the bot image on push of migrations/ to main (the bot applies SQL).
+# No workflow_dispatch: a feature branch must not retag :latest.
 
 name: Publish database image
 
@@ -9,7 +9,6 @@ on:
     paths:
       - migrations/**
       - .github/workflows/publish-database.yml
-  workflow_dispatch:
 
 permissions:
   contents: read

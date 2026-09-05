@@ -93,6 +93,19 @@ jobs:
                   )
               return safe
 
+          def extra_docker_tag_from_git_tag(label):
+              # Release Git tags may include characters Docker rejects (e.g. +).
+              # Skip the extra image tag rather than failing the publish; latest
+              # and the commit SHA are still applied in publish-image.yml.
+              safe = label.replace("/", "-").replace("+", "-")
+              if DOCKER_TAG_RE.fullmatch(safe):
+                  return safe
+              print(
+                  f"::warning::Git tag {label!r} is not a Docker tag; "
+                  "publishing latest and the commit SHA only."
+              )
+              return ""
+
           def peel_tag_to_commit(repo, tag_name):
               code, stdout = gh_api(
                   f"repos/{repo}/git/ref/tags/{quote(tag_name, safe='/')}"
@@ -136,7 +149,7 @@ jobs:
               if not event_ref.startswith("refs/tags/"):
                   fail("release checkout must be a tag, not a branch.")
               tag_name = event_ref[len("refs/tags/") :]
-              write_outputs(peel_tag_to_commit(repo, tag_name), docker_tag_from_label(tag_name))
+              write_outputs(peel_tag_to_commit(repo, tag_name), extra_docker_tag_from_git_tag(tag_name))
               sys.exit(0)
 
           ref = (os.environ.get("SOURCE_REF") or "").strip()
