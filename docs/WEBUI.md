@@ -187,3 +187,7 @@ bot owner).
 - Session cookies use the `Secure` flag when `web.base_url` starts with
   `https://`. API JSON sets `Cache-Control: private, no-store`. Expose
   publicly only behind HTTPS (see SETUP.md §8).
+
+### Appearance
+
+Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page.

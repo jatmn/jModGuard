@@ -3,15 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#122d35">
+<meta name="theme-color" content="#e0eeff">
 <meta name="description" content="Your Discord moderation workspace. Configure protection, manage commands, and keep your community in view.">
 <title>jModGuard · Moderation workspace</title>
+<script>
+// Apply the saved appearance before CSS paints, including on the sign-in screen.
+try {
+  const theme = localStorage.getItem("jmodguard.theme");
+  document.documentElement.dataset.theme = theme === "dark" ||
+    (theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+} catch (_) {
+  document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <a class="skip-link" href="#content">Skip to workspace</a>
 <div id="app">
   <div id="startup-view" class="hidden welcome-view">
+    <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     <div class="login-card">
       <span class="brand-mark" aria-hidden="true">jG</span>
       <p class="eyebrow">YOUR COMMUNITY, IN GOOD HANDS</p>
@@ -20,6 +31,7 @@
     </div>
   </div>
   <div id="login-view" class="hidden welcome-view">
+    <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     <div class="login-card">
       <span class="brand-mark" aria-hidden="true">jG</span>
       <p class="eyebrow">JMODGUARD / MODERATION WORKSPACE</p>
@@ -33,6 +45,7 @@
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>MODERATION WORKSPACE</small></span></div>
       <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select"></select></div>
+      <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
       <nav id="tabs" aria-label="Workspace navigation">
         <span class="nav-label">WORKSPACE</span>
         <button data-tab="dashboard" class="active"><span aria-hidden="true">◈</span> Dashboard</button>

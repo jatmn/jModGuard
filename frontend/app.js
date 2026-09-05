@@ -1325,7 +1325,28 @@ function closeOverlay() {
   if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
 }
 
+function initTheme() {
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  let preference = "system";
+  try { preference = window.localStorage.getItem("jmodguard.theme") || "system"; } catch (_) { /* Keep an in-memory preference when storage is blocked. */ }
+  if (!["light", "dark", "system"].includes(preference)) preference = "system";
+  const apply = () => {
+    const theme = preference === "system" ? (media.matches ? "dark" : "light") : preference;
+    document.documentElement.dataset.theme = theme;
+    document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#101e33" : "#e0eeff";
+    document.querySelectorAll(".theme-select").forEach((select) => { select.value = preference; });
+  };
+  document.querySelectorAll(".theme-select").forEach((select) => select.addEventListener("change", () => {
+    preference = select.value;
+    try { window.localStorage.setItem("jmodguard.theme", preference); } catch (_) { /* Appearance still changes for this session. */ }
+    apply();
+  }));
+  media.addEventListener("change", apply);
+  apply();
+}
+
 function bootUi() {
+  initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
     if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) markDirty();
