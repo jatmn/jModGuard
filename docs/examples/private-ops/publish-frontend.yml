@@ -2,15 +2,11 @@
 # Do not enable it on the public jModGuard repo: it needs Bunny Storage
 # credentials that must not live there.
 #
-# The runner uploads frontend/ to Bunny Storage (then purges the Pull Zone).
-# That is the designed publisher for the admin UI.
-#
-# `ref` must equal the 40-character Source SHA recorded in this ops repo
-# (`| Source SHA |` in docs/BUNNY.md). Do not grep the first hex in the
-# file: blob URLs in that file also contain 40-character SHAs. That SHA
-# must match the running bot and API images. Do not dispatch a branch, a
-# tag, or any other revision: the workflow rejects a mismatch before it
-# checks out jModGuard.
+# Ops polls jModGuard. It does not receive a webhook. A push of frontend/
+# to main is picked up by cron on the ops default branch (GitHub only
+# runs schedule from that branch). Run workflow with ref left as main
+# publishes immediately. CSS-only updates do not need a new container
+# image; rebuild the API when the page needs new endpoints.
 
 name: Publish jModGuard admin UI
 
@@ -18,39 +14,45 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Must equal the Source SHA in docs/BUNNY.md
-        required: true
+        description: jModGuard branch, tag, or SHA (leave as main)
+        required: false
+        default: main
+        type: string
+  schedule:
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: publish-frontend
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out ops pin
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          path: ops
-
-      - name: Require dispatch ref to match docs/BUNNY.md
-        id: pin
+      - name: Resolve source ref
+        id: src
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REQUESTED_REF: ${{ inputs.ref }}
         run: |
           set -eu
-          pin="$(grep -E '^\| Source SHA \|' ops/docs/BUNNY.md | grep -oE '[0-9a-f]{40}' | head -1)"
-          test -n "$pin"
-          requested="$(printf '%s' "$REQUESTED_REF" | tr '[:upper:]' '[:lower:]')"
-          if [ "$requested" != "$pin" ]; then
-            echo "ref '${REQUESTED_REF}' does not match docs/BUNNY.md Source SHA '${pin}'. Update the pin and rebuild images from that SHA before publishing." >&2
-            exit 1
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${REQUESTED_REF:-}" ]; then
+            ref="$REQUESTED_REF"
+          else
+            ref="main"
           fi
-          echo "pin=${pin}" >> "${GITHUB_OUTPUT}"
+          ref="$(printf '%s' "$ref" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          if printf '%s' "$ref" | grep -qiE '^[0-9a-f]{40}$'; then
+            ref="$(printf '%s' "$ref" | tr '[:upper:]' '[:lower:]')"
+          fi
+          test -n "$ref"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Check out jModGuard source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: jatmn/jModGuard
-          ref: ${{ steps.pin.outputs.pin }}
+          ref: ${{ steps.src.outputs.ref }}
           persist-credentials: false
           # Cross-repo checkout of private jModGuard needs a PAT
           # (contents:read). Once this source repo is public, github.token
@@ -58,7 +60,23 @@ jobs:
           token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN || github.token }}
           path: source
 
+      - name: Frontend tree
+        id: tree
+        run: |
+          set -eu
+          tree="$(git -C source rev-parse HEAD:frontend)"
+          echo "tree=${tree}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip unchanged frontend on schedule
+        id: skip
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: /tmp/jmodguard-frontend-tree
+          key: jmodguard-frontend-tree-${{ steps.tree.outputs.tree }}
+
       - name: Upload frontend/ to Bunny Storage
+        if: github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true'
         working-directory: source
         env:
           BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
@@ -70,3 +88,14 @@ jobs:
           set -eu
           test -f scripts/publish-frontend-bunny.sh
           bash scripts/publish-frontend-bunny.sh
+
+      - name: Write frontend tree marker
+        if: success() && (github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true')
+        run: printf '%s\n' '${{ steps.tree.outputs.tree }}' > /tmp/jmodguard-frontend-tree
+
+      - name: Remember published frontend tree
+        if: success() && (github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true')
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: /tmp/jmodguard-frontend-tree
+          key: jmodguard-frontend-tree-${{ steps.tree.outputs.tree }}

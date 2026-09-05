@@ -26,8 +26,8 @@ The website is three files in this repository, in the `frontend/` folder:
 | `frontend/app.js` | the app |
 | `frontend/style.css` | the look |
 
-Use the **same git tag or commit** as the bot and API you are running. Do
-not mix an old website with a new API.
+Use the **same git tag or commit** as the bot and API when the page needs
+new endpoints. CSS-only updates can ship without a new image.
 
 **Self-host (one machine, [SETUP.md](SETUP.md)).** You do not copy these
 files anywhere. A normal `jmodguard-api` build already includes them and
@@ -41,9 +41,11 @@ serves them at `http://localhost:8080`.
 3. Create a **Pull Zone** whose origin is that Storage Zone. That hostname
    (or a custom domain on it) is the public admin site.
 4. Point `/api`, `/login`, `/logout`, `/oauth`, and `/health` on that Pull
-   Zone at the API container with **Override Origin: Magic Containers**
-   (you must create a CDN endpoint on the API app first; see
-   DEPLOY-BUNNY.md). Leave `window.JMODGUARD_API_BASE` unset.
+   Zone at the API container with **Change Origin URL** (`OriginUrl`) to
+   the API endpoint Pull Zone host (you must create a CDN endpoint on the
+   API app first; see DEPLOY-BUNNY.md). Do not use Override Origin: Magic
+   Containers on a Storage Pull Zone. Leave `window.JMODGUARD_API_BASE`
+   unset. Disable Cookies must be off.
 
 You can upload by hand in the Bunny dashboard (**Browse Files**), or
 repeat it with GitHub Actions. The script

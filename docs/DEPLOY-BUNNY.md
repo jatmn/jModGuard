@@ -67,6 +67,11 @@ go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
 The Pull Zone hostname (or a custom domain on it) is what operators open.
+If you add a custom hostname, enable Force SSL on it, set
+`JMODGUARD_WEB_BASE_URL` and the Discord OAuth redirect to **that** host,
+and do not log in on the system `*.b-cdn.net` hostname afterward (OAuth
+CSRF cookies are host-only). On the admin Pull Zone, **Disable Cookies**
+must be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual).** In the Storage Zone, **Browse Files**, and upload
 those three files to the **root** so they are `/` (or `/index.html`),
@@ -89,14 +94,14 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_API_KEY` | Account API key, used only for the purge |
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-Dispatch the workflow with the **same** 40-character jModGuard SHA recorded
-in the ops pin file (`| Source SHA |` in `docs/BUNNY.md` in the example —
-not the first hex in that file, which may be a blob URL). The copied
-workflow checks out that pin file first and **rejects** any other `ref`
-(including `main` and tags) before it clones this repository, so Storage
-cannot drift from the running images. The runner then uploads `index.html`,
-`app.js`, and `style.css` to the Storage Zone root (`/`, `/app.js`,
-`/style.css`).
+The example workflow **polls** this repository (cron on the ops default
+branch, or **Run workflow** with `ref` left as `main`). Ops does not
+receive a webhook from jModGuard. A CSS-only change does not need a new
+container image. Do not mix a new `app.js` with an old API when the page
+needs new endpoints.
+
+The runner uploads `index.html`, `app.js`, and `style.css` to the Storage
+Zone root (`/`, `/app.js`, `/style.css`).
 If a later file fails to upload, the script restores files it successfully
 backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
 It refuses to start if it cannot read the current objects. A failed Pull
@@ -177,7 +182,9 @@ secrets exit instead of opening SQLite on ephemeral disk.
 ## 4. Create the bot app (no public endpoint)
 
 Create a Magic Container app from the bot image. **Single region**,
-exactly one instance. Do **not** add a CDN or Anycast endpoint. The bot
+exactly one instance. If the dashboard refuses min/max 1 (some trial
+accounts cap Deploy UI at a higher minimum), create the app with
+`POST /mc/apps` instead. Do **not** add a CDN or Anycast endpoint. The bot
 is not a website. Platform health checks (Monitoring → HTTP GET `/health`
 on port `8080`) stay inside Bunny; they are not a public URL.
 
@@ -213,14 +220,18 @@ the public URL.
 
 Bunny can only origin-pull a Magic Container through an **Endpoint**. On
 this API app, **Endpoints → Add CDN endpoint**, container port `8080`.
-Enable sticky sessions on that endpoint and use cookie name
-`jmodguard_session` (the API session cookie). Do not give operators this
-endpoint hostname; it exists so the Storage Pull Zone can target
-`MagicContainersAppId` + `MagicContainersEndpointId`.
+Enable sticky sessions on that endpoint. Prefer cookie name
+`jmodguard_session` (the API session cookie). If the dashboard cookie
+field is read-only (`BUNNYNET_MC_SESSIONID` on some trial UIs), one
+replica is still fine. Do not give operators this endpoint hostname; it
+exists so the Storage Pull Zone can origin-pull the API. GET/PATCH of a
+Magic Container via the Bunny API returns every env var — never paste
+those responses.
 
-The API still listens on container port `8080` so Bunny can origin-pull
-it and so platform health checks can hit `GET`/`HEAD /health`. Until
-axum takes over (database open, AppState primary-version prime, router
+The API image does not serve `/` (no embedded UI). Do not treat `/` on
+the container or its endpoint hostname as a ready check. Platform and
+Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. Until axum
+takes over (database open, AppState primary-version prime, router
 build), only `/health` returns `200`. `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
@@ -248,8 +259,10 @@ Optional when you have no `config.toml` on the API container (typical):
 `JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix,
 retention, and bot status are bot-owned — set those on the bot app.
 
-`JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators open, not a
-container hostname. Discord OAuth redirect URI:
+`JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators type into the
+browser (custom hostname if you added one), not a container hostname and
+not a leftover `*.b-cdn.net` system host after you cut over. Discord
+OAuth redirect URI:
 
 ```text
 https://YOUR-CDN-HOSTNAME/oauth/callback
@@ -271,20 +284,26 @@ expires — start the bot first and wait for `database ready (migrate=true)`.
 
 On the Pull Zone from step 2 (Storage origin for the files):
 
-1. Add an edge rule whose action is **Override Origin: Magic Containers**
-   (`OriginMagicContainers`). Pick the API app and the CDN endpoint from
-   step 5 (those two IDs are required; “Change Origin URL” to a public
-   Magic Container hostname is the wrong tool).
-2. Trigger on request URL for these paths, and **bypass cache /
-   Perma-Cache** on them. The API also sends `Cache-Control: private,
-   no-store`, but a cached `/api/me` would still leak sessions if you
-   skip the bypass:
-   - `/api*`
-   - `/login*`
-   - `/logout*`
-   - `/oauth*`
-   - `/health*`
-3. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
+1. Add an edge rule whose action is **Change Origin URL** (`OriginUrl`,
+   ActionType 2). The origin host is the API **endpoint Pull Zone**
+   `*.b-cdn.net` hostname from step 5 (Bunny creates that PZ when you add
+   the CDN endpoint). Do **not** give operators that hostname. Do **not**
+   use **Override Origin: Magic Containers** (`OriginMagicContainers`,
+   ActionType 22) on a Storage-origin Pull Zone: that rule can match and
+   still serve Bunny’s “We’re deploying your app” splash while the API is
+   already live.
+2. Bypass Perma-Cache on the API paths (ExtraAction BypassPermaCache).
+   The API also sends `Cache-Control: private, no-store`, but a cached
+   `/api/me` would still leak sessions if you skip the bypass.
+3. Trigger on request URL for `/api*`, `/login*`, `/logout*`, `/oauth*`,
+   and `/health*`. Bunny allows **at most five** PatternMatches per
+   trigger. Matching both a custom hostname and the system `*.b-cdn.net`
+   host means **two** triggers (five path patterns each), MatchAny.
+4. Set **Disable Cookies** to off on this Pull Zone (`DisableCookies` must
+   be **false**) so login cookies are not stripped. If you update the zone
+   via the Bunny API, send only the fields you are changing — posting the
+   full GET body back fails (`model.invalid` on `id`).
+5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
 
 After this, a browser on the CDN hostname loads the admin UI from
 Storage and calls `/api/...` on the same host; Bunny forwards those
@@ -314,13 +333,15 @@ self-host.
 2. API logs: `database ready (migrate=false)` and listening. No public
    website hostname on the container.
 3. Each app: one region, one replica.
-4. Open the **CDN** hostname. The admin UI loads from Storage. Login
-   with Discord. OAuth returns to the CDN origin.
+4. Open the **CDN** hostname that matches `JMODGUARD_WEB_BASE_URL`. The
+   admin UI loads from Storage. Login with Discord. OAuth returns to that
+   origin. Probe `/health` (200 `ok`); do not use `/` on the API origin as
+   a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure a dry-run rule and check the audit event.
-7. Restart each container. Both reconnect to the same database. The UI
-   still comes from CDN.
+7. Restart the **API** app only: bot stays connected; users log in again.
+8. Restart the **bot** app only: API stays up; bot returns online.
 
 CI’s `tests/remote_database_smoke.rs` proves bot bootstrap and API
 schema-open against a local libSQL server, not Bunny TLS.
@@ -331,17 +352,24 @@ schema-open against a local libSQL server, not Bunny TLS.
 - Bunny Database is Public Preview. Internal snapshots are not an
   operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
 - One bot replica. One API replica (in-memory sessions). Sticky session
-  cookie on the API Magic Container endpoint: `jmodguard_session`.
+  cookie on the API Magic Container endpoint: `jmodguard_session` when
+  the dashboard allows it; a locked `BUNNYNET_MC_SESSIONID` is acceptable
+  at one replica.
+- On the Storage Pull Zone, origin-pull the API with **OriginUrl**, not
+  OriginMagicContainers. Disable Cookies must be off. Five PatternMatches
+  per trigger maximum.
+- Never paste Magic Container GET/PATCH JSON (it includes every secret).
 - SIGTERM stops the Discord gateway and the API listener cleanly, including
   during remote database retry (startup then exits 0 instead of failing).
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
-- Keep bot image, API image, and Storage `frontend/` on the same git
-  tag or commit SHA. Pin image **digests** in the private ops repo and
-  point Magic Containers at those digests. A later `images` publish
-  retags `:latest` and may prune older GHCR versions, so a recorded
-  digest may stop pulling unless you re-run `images` for that earlier
-  `source_ref` or configure GHCR retention.
+- Pin bot and API image **digests** in the private ops repo and point
+  Magic Containers at those digests, not floating `:latest`. Storage
+  `frontend/` can move independently for CSS/layout; do not mix a new
+  website with an old API when the page needs new endpoints. A later
+  `images` publish retags `:latest` and may prune older GHCR versions, so
+  a recorded digest may stop pulling unless you re-run `images` for that
+  earlier `source_ref` or configure GHCR retention.
 - Do not add public Magic Container endpoints for the bot. Do not use a
   Magic Container hostname as the product URL.
 

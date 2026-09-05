@@ -90,7 +90,7 @@ function originGaveUpMessage(err) {
   if (isApiWarmup(err)) {
     return "API did not become ready in time. Start the bot first and wait for database ready (migrate=true).";
   }
-  return "Cannot reach the API. Check that the API container is running and that the Pull Zone OriginMagicContainers rules send /api to it.";
+  return "Cannot reach the API. Check that the API container is running and that the Pull Zone OriginUrl rules send /api to it.";
 }
 
 function sleep(ms) {

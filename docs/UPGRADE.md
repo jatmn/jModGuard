@@ -152,7 +152,9 @@ database backup unless a release note says otherwise.
 
 Same order: migrate with the bot app, then roll the API app. Both must keep
 using the same Bunny Database. Upload matching `frontend/` to Storage and purge
-the Pull Zone. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+the Pull Zone when the page needs the new API. CSS-only UI updates do not
+require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
+the API with **OriginUrl**, not OriginMagicContainers.
 
 Before publishing new GHCR images, confirm previous bot/API digests still
 pull (or re-run `images` for the previous `source_ref`). Each `images`
