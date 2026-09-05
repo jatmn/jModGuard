@@ -74,6 +74,25 @@ Never put a database URL or token in these files.
 where your account has **Manage Server** permission are shown, so one WebUI
 instance manages all your servers.
 
+## Workspace and saved changes
+
+The sidebar keeps your server and all moderation sections within reach. On
+small screens, navigation becomes a horizontally scrollable bar. Tables scroll
+within the workspace, and editors support keyboard navigation.
+
+The selected server and section are remembered in this browser for each signed-in
+account and API origin. Restored server IDs are checked against your current
+manageable-server list. If a server is no longer available, the first accessible
+server is selected. Browser storage is optional; if blocked, the app still works,
+but selection will not survive a reload. Settings themselves always come from the
+API and are never restored from browser storage.
+
+Use **Save** in an editor to apply changes. While an action is running, controls
+are disabled to prevent duplicate saves or switching its target server. If a
+configuration refresh fails, the workspace shows **Retry** instead of stale
+settings. Server loads ignore out-of-order responses. Navigation warns before
+discarding unsaved edits; a successful save reloads the authoritative snapshot.
+
 ## Tabs
 
 | Tab | What it does |

@@ -75,6 +75,9 @@ jobs:
           GITHUB_TOKEN: ""
         run: cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
 
+      - name: frontend workspace state
+        run: node --test scripts/frontend-state-test.mjs
+
       - name: frontend warmup contract
         run: node --test scripts/frontend-warmup-test.mjs
 

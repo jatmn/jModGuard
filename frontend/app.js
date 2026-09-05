@@ -7,17 +7,75 @@ const el = (tag, attrs, ...children) => {
   if (attrs) Object.entries(attrs).forEach(([k, v]) => {
     if (k === "class") n.className = v;
     else if (k === "text") n.textContent = v;
-    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
-    else if (k === "checked" || k === "selected") n[k] = Boolean(v);
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), (event) => handleEvent(n, v, event));
+    else if (k === "checked" || k === "selected" || k === "hidden" || k === "disabled") n[k] = Boolean(v);
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   });
-  children.forEach((c) => {
+  children.flat(Infinity).forEach((c) => {
     if (c !== null && c !== undefined) n.append(c.nodeType ? c : document.createTextNode(c));
   });
   return n;
 };
 
-let state = { me: null, guilds: [], guildId: null, config: null, tab: "dashboard" };
+let state = { me: null, guilds: [], guildId: null, config: null, tab: "dashboard", loading: false, error: null };
+let configRequest = 0;
+let busy = false;
+let dirty = false;
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "members", "events", "bans", "settings"];
+
+function workspaceKey() {
+  return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
+}
+function restoreWorkspace() {
+  let saved = {};
+  try { saved = JSON.parse(window.localStorage.getItem(workspaceKey())) || {}; } catch (_) { /* Storage may be unavailable. */ }
+  state.guildId = state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
+  state.tab = tabs.includes(saved.tab) ? saved.tab : "dashboard";
+}
+function persistWorkspace() {
+  try { window.localStorage.setItem(workspaceKey(), JSON.stringify({ guildId: state.guildId, tab: state.tab })); } catch (_) { /* Session still works without storage. */ }
+}
+function canLeave() {
+  return !busy && (!dirty || confirm("Discard unsaved changes?"));
+}
+function setBusy(value) {
+  busy = value;
+  document.querySelectorAll("#main-view button, #main-view input, #main-view select, #main-view textarea").forEach((node) => {
+    if (value) { node.dataset.wasDisabled = String(node.disabled); node.disabled = true; }
+    else if (node.dataset.wasDisabled !== undefined) { node.disabled = node.dataset.wasDisabled === "true"; delete node.dataset.wasDisabled; }
+  });
+  const status = $("#workspace-status");
+  if (status) status.textContent = value ? "Working…" : "Changes saved with each action";
+}
+async function handleEvent(node, handler, event) {
+  if (busy) return;
+  const guildId = state.guildId, tab = state.tab;
+  const form = node.closest?.(".card, .modal-box");
+  const drafts = form ? [...$("#content").querySelectorAll("input, select, textarea")]
+    .filter((input) => !form.contains(input) && input._initialValue !== undefined && input.value !== input._initialValue)
+    .map((input) => ({ key: input.dataset.inputKey, value: input.value })) : [];
+  try {
+    const result = handler(event);
+    if (result && typeof result.then === "function") {
+      setBusy(true);
+      await result;
+      if (!node.isConnected && guildId === state.guildId && tab === state.tab) {
+        for (const draft of drafts) {
+          const input = $("#content").querySelector(`[data-input-key="${draft.key}"]`);
+          if (input) { input.value = draft.value; dirty = true; }
+        }
+      }
+    }
+  } catch (e) { toast(e.message || String(e), "error"); }
+  finally { if (busy) setBusy(false); }
+}
+function navigate(tab) {
+  if (!canLeave()) return;
+  state.tab = tabs.includes(tab) ? tab : "dashboard";
+  persistWorkspace();
+  renderTab();
+}
+
 
 function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
@@ -111,26 +169,27 @@ function setStartupStatus(text) {
 
 async function api(path, method = "GET", body = null, signal) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
-  const opts = { method, headers: {}, credentials: "include" };
-  if (signal) opts.signal = signal;
-  if (body !== null) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
-  let res;
+  const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
+  const controller = signal ? null : new AbortController();
+  const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
+  opts.signal = signal || controller.signal;
   try {
-    res = await fetch(apiUrl(path), opts);
+    if (body !== null) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
+    const res = await fetch(apiUrl(path), opts);
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+    if (!res.ok) {
+      const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+      throw apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
+    }
+    return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
-      throw apiError("Failed to fetch");
+      throw apiError(signal ? "Failed to fetch" : "Request timed out. Refresh to verify saved state before trying again.");
     }
     throw e;
-  }
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
-  if (!res.ok) {
-    const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
-    throw apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
-  }
-  return data;
+  } finally { if (timeout !== null) clearTimeout(timeout); }
 }
 
 /** CDN Storage can serve this page while the API origin is still binding or
@@ -209,21 +268,19 @@ async function init() {
     me.guilds.forEach((g) => {
       sel.append(el("option", { value: g.id, text: g.name }));
     });
-    if (me.guilds.length === 0) {
-      sel.append(el("option", { value: "", text: "No manageable servers — invite the bot" }));
-      return;
-    }
-    if (me.guilds.length > 1) {
-      sel.append(el("option", { value: "", text: "Select a server…" }));
-    }
+    restoreWorkspace();
     sel.value = state.guildId || "";
-    if (!state.guildId) { sel.value = me.guilds[0].id; }
-    state.guildId = sel.value;
+    if (!state.guildId) sel.append(el("option", { value: "", text: "No manageable servers" }));
     sel.addEventListener("change", async () => {
+      if (!canLeave()) { sel.value = state.guildId || ""; return; }
       state.guildId = sel.value;
-      if (state.guildId) { await loadConfig(); renderTab(); }
+      state.config = null;
+      dirty = false;
+      persistWorkspace();
+      if (!await loadConfig()) return;
+      renderTab();
     });
-    await loadConfig();
+    if (!await loadConfig()) return;
     renderTab();
   } catch (e) {
     if (isUnauthenticated(e)) {
@@ -237,7 +294,28 @@ async function init() {
 }
 
 async function loadConfig() {
-  state.config = await api(`/api/guilds/${state.guildId}/config`);
+  const guildId = state.guildId;
+  const request = ++configRequest;
+  if (!guildId) { renderTab(); return; }
+  state.loading = true;
+  state.error = null;
+  if (!state.config) renderTab();
+  try {
+    const config = await api(`/api/guilds/${guildId}/config`);
+    if (request !== configRequest || guildId !== state.guildId) return;
+    state.config = config;
+    return true;
+  } catch (e) {
+    if (request !== configRequest || guildId !== state.guildId) return;
+    state.config = null;
+    state.error = e.message || String(e);
+    toast("Could not refresh configuration: " + state.error, "error");
+  } finally {
+    if (request === configRequest) {
+      state.loading = false;
+      if (state.error) renderTab();
+    }
+  }
 }
 
 function selectedGuild() {
@@ -254,17 +332,46 @@ function renderTab() {
     templates: tabTemplates, logchannels: tabLogChannels, members: tabMembers,
     events: tabEvents, bans: tabBans, settings: tabSettings,
   };
-  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.tab));
+  document.querySelectorAll("#tabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === state.tab);
+    if (b.dataset.tab === state.tab) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
   const fn = map[state.tab] || tabDashboard;
   const content = $("#content");
   content.innerHTML = "";
-  content.append(fn());
+  dirty = false;
+  const guild = selectedGuild();
+  const name = $("#workspace-name");
+  if (name) name.textContent = guild?.name || "Your servers";
+  if (!state.guildId) {
+    content.append(el("div", { class: "empty-state" }, el("h2", { text: "No servers to manage yet" }), el("p", { text: "Sign in with an account that has Manage Server permission in a server using jModGuard." })));
+  } else if (!state.config) {
+    content.append(el("div", { class: "empty-state", role: "status" },
+      el("h2", { text: state.loading ? "Loading your workspace…" : "Configuration unavailable" }),
+      el("p", { text: state.error || "Fetching saved settings for this server." }),
+      !state.loading ? el("button", { class: "btn primary", text: "Retry", onclick: async () => { if (!await loadConfig()) return; renderTab(); } }) : null));
+  } else {
+    content.append(fn());
+    content.querySelectorAll("table").forEach((table) => {
+      const wrap = el("div", { class: "table-scroll", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
+      table.replaceWith(wrap); wrap.append(table);
+    });
+    content.querySelectorAll("input, select, textarea").forEach((input, i) => {
+      input.dataset.inputKey = String(i);
+      input._initialValue = input.value;
+    });
+    content.querySelectorAll(".field").forEach((field, i) => {
+      const label = field.querySelector("label");
+      const input = field.querySelector("input, select, textarea");
+      if (label && input) { input.id ||= `field-${i}`; label.htmlFor = input.id; }
+    });
+  }
 }
 
 function bindTabButtons() {
   document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
-    state.tab = b.dataset.tab;
-    renderTab();
+    navigate(b.dataset.tab);
   }));
 }
 
@@ -276,21 +383,28 @@ function tabDashboard() {
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
   return el("div", {},
-    el("h2", { text: `Dashboard — ${g ? g.name : ""}` }),
+    el("section", { class: "hero" },
+      el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
+      el("h2", { text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
+      el("p", { text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", text: "Review protection →", onclick: () => navigate("rules") }),
+        el("button", { class: "btn", text: "View audit log", onclick: () => navigate("events") }))),
     el("div", { class: "stat-grid" },
-      stat("Prefix", `\`${cfg.settings.prefix}\``),
+      stat("Prefix", cfg.settings.prefix),
       stat("Bot name", cfg.settings.bot_name || "default"),
       stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
       stat("Rules in dry-run", rulesDry),
       stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
       stat("Log channels", chans),
+      stat("Badword patterns", cfg.badwords.length),
       stat("Retention", Number(cfg.settings.retention_days) === 0 ? "forever" : `${cfg.settings.retention_days}d`),
     ),
     el("div", { class: "card", style: "margin-top:16px" },
       el("h3", { text: "Getting started" }),
       el("p", { class: "muted", text: isBotOwner()
-        ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Changes are saved immediately; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
-        : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Changes are saved immediately; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }),
+        ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
+        : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }),
     ),
   );
 }
@@ -399,21 +513,21 @@ function editRule(r) {
         const scope = scopeSel.value;
         await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope, data: rule });
         if (scope === "global") {
-          await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" }).catch(() => {});
+          await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
         }
-        await loadConfig();
+        if (!await loadConfig()) return;
         toast("Rule saved", "success");
         closeOverlay();
         renderTab();
       } }),
       el("button", { class: "btn danger", text: "Reset to global", onclick: async () => {
         await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
-        await loadConfig();
+        if (!await loadConfig()) return;
         toast("Rule reset", "success");
         closeOverlay();
         renderTab();
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: closeOverlay }),
+      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   );
   modal.append(box);
@@ -452,7 +566,7 @@ function tabBadwords() {
           if (!pattern.value.trim()) return toast("Enter a pattern", "error");
           await api(`/api/guilds/${state.guildId}/badwords`, "POST", { scope: scope.value, pattern: pattern.value.trim(), note: note.value || null });
           pattern.value = ""; note.value = "";
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast("Badword added", "success");
           renderTab();
         } })),
@@ -487,7 +601,7 @@ function tabBadwords() {
               : el("span", { class: "tag on", text: "active" })),
             el("td", {}, canDelete ? el("button", { class: "btn small danger", text: "✕", onclick: async () => {
               await api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE");
-              await loadConfig();
+              if (!await loadConfig()) return;
               toast("Removed", "success");
               renderTab();
             } }) : el("span", { class: "muted", text: "owner only" })),
@@ -704,7 +818,7 @@ function editCommand(c) {
         } else {
           await api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "PUT", { scope: scopeSel.value, data });
         }
-        await loadConfig();
+        if (!await loadConfig()) return;
         toast("Command saved", "success");
         closeOverlay();
         renderTab();
@@ -717,12 +831,12 @@ function editCommand(c) {
           ? "guild"
           : (c.scope === "global" && isBotOwner()) ? "global" : "guild";
         await api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "DELETE", { scope: delScope });
-        await loadConfig();
+        if (!await loadConfig()) return;
         toast(c.guild_override ? "Override cleared" : "Deleted", "success");
         closeOverlay();
         renderTab();
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: closeOverlay }),
+      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   ));
 }
@@ -764,13 +878,13 @@ function templateCard(t) {
         scopeSel,
         el("button", { class: "btn primary small", text: "Save", onclick: async () => {
           await api(`/api/guilds/${state.guildId}/templates/${t.event}`, "PUT", { scope: scopeSel.value, template: text.value });
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast("Template saved", "success");
           renderTab();
         } }),
         el("button", { class: "btn small", text: "Reset to global", onclick: async () => {
           await api(`/api/guilds/${state.guildId}/templates/${t.event}`, "DELETE", { scope: "guild" });
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast("Reset", "success");
           renderTab();
         } }),
@@ -793,20 +907,20 @@ function tabLogChannels() {
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
       const scopeSel = scopeSelect("This server", "Global", false);
-      return el("div", { class: "row", style: "margin-bottom:8px" },
+      return el("div", { class: "card row", style: "margin-bottom:8px" },
         el("label", { style: "width:180px", text: lc.event }),
         input, scopeSel,
         el("button", { class: "btn small primary", text: "Set", onclick: async () => {
           const v = input.value.trim().replace(/[<#>]/g, "");
           if (!v) return toast("Enter a channel id", "error");
           await api(`/api/guilds/${state.guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast("Log channel set", "success");
           renderTab();
         } }),
         el("button", { class: "btn small", text: "Clear", onclick: async () => {
           await api(`/api/guilds/${state.guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast("Cleared", "success");
           renderTab();
         } }),
@@ -821,20 +935,31 @@ function tabLogChannels() {
 
 function tabMembers() {
   const q = el("input", { type: "text", placeholder: "search name or id" });
-  const table = el("table", {}, el("tbody", {}));
+  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Member", "User ID", "Status", "Joins", "Messages", "First joined", "Last left"].map((text) => el("th", { text })))), el("tbody", {}));
+  const guildId = state.guildId;
+  let request = 0;
   const tbody = () => table.querySelector("tbody");
   const run = async () => {
-    const rows = await api(`/api/guilds/${state.guildId}/members?q=${encodeURIComponent(q.value || "")}&limit=100`);
-    tbody().innerHTML = "";
-    rows.forEach((r) => tbody().append(el("tr", {},
-      el("td", { text: r.username || String(r.user_id) }),
-      el("td", { class: "mono", text: r.user_id }),
-      el("td", { text: r.currently_in ? "in server" : "left" }),
-      el("td", { text: `joined ${r.join_count}x` }),
-      el("td", { text: `${r.message_count} msgs` }),
-      el("td", { class: "muted", text: r.first_joined_at ? new Date(r.first_joined_at).toLocaleString() : "-" }),
-      el("td", { class: "muted", text: r.last_left_at ? new Date(r.last_left_at).toLocaleString() : "-" }),
-    )));
+    const current = ++request;
+    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, text: "Loading…" })));
+    try {
+      const rows = await api(`/api/guilds/${guildId}/members?q=${encodeURIComponent(q.value || "")}&limit=100`);
+      if (current !== request) return;
+      tbody().innerHTML = "";
+      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 7, class: "muted", text: "No matching records." })));
+      rows.forEach((r) => tbody().append(el("tr", {},
+        el("td", { text: r.username || String(r.user_id) }),
+        el("td", { class: "mono", text: r.user_id }),
+        el("td", { text: r.currently_in ? "in server" : "left" }),
+        el("td", { text: `joined ${r.join_count}x` }),
+        el("td", { text: `${r.message_count} msgs` }),
+        el("td", { class: "muted", text: r.first_joined_at ? new Date(r.first_joined_at).toLocaleString() : "-" }),
+        el("td", { class: "muted", text: r.last_left_at ? new Date(r.last_left_at).toLocaleString() : "-" }),
+      )));
+    } catch (e) {
+      if (current !== request) return;
+      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
+    }
   };
   q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
   run().catch((e) => toast(e.message, "error"));
@@ -849,25 +974,36 @@ function tabEvents() {
   const typeSel = el("select", {}, el("option", { value: "", text: "all types" }),
     ...state.config.event_types.map((t) => el("option", { value: t, text: t })));
   const userIn = el("input", { type: "text", placeholder: "user id" });
-  const table = el("table", {}, el("tbody", {}));
+  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Time", "Event", "User ID", "Actor ID", "Details"].map((text) => el("th", { text })))), el("tbody", {}));
+  const guildId = state.guildId;
+  let request = 0;
   const tbody = () => table.querySelector("tbody");
   const run = async () => {
-    const user = userIn.value.trim();
-    const rows = await api(`/api/guilds/${state.guildId}/events?limit=100` +
-      (typeSel.value ? `&event=${encodeURIComponent(typeSel.value)}` : "") +
-      (user ? `&user=${encodeURIComponent(user)}` : ""));
-    tbody().innerHTML = "";
-    rows.forEach((r) => {
-      let data = "";
-      try { data = JSON.stringify(JSON.parse(r.data || "{}"), null, 1); } catch (_) { data = r.data || ""; }
-      tbody().append(el("tr", {},
-        el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
-        el("td", { text: r.event_type }),
-        el("td", { class: "mono", text: r.user_id || "-" }),
-        el("td", { class: "mono", text: r.actor_id || "-" }),
-        el("td", { class: "mono", style: "font-size:11px", text: data }),
-      ));
-    });
+    const current = ++request;
+    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
+    try {
+      const user = userIn.value.trim();
+      const rows = await api(`/api/guilds/${guildId}/events?limit=100` +
+        (typeSel.value ? `&event=${encodeURIComponent(typeSel.value)}` : "") +
+        (user ? `&user=${encodeURIComponent(user)}` : ""));
+      if (current !== request) return;
+      tbody().innerHTML = "";
+      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No matching records." })));
+      rows.forEach((r) => {
+        let data = "";
+        try { data = JSON.stringify(JSON.parse(r.data || "{}"), null, 1); } catch (_) { data = r.data || ""; }
+        tbody().append(el("tr", {},
+          el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
+          el("td", { text: r.event_type }),
+          el("td", { class: "mono", text: r.user_id || "-" }),
+          el("td", { class: "mono", text: r.actor_id || "-" }),
+          el("td", { class: "mono", style: "font-size:11px", text: data }),
+        ));
+      });
+    } catch (e) {
+      if (current !== request) return;
+      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
+    }
   };
   typeSel.onchange = run;
   userIn.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
@@ -880,27 +1016,38 @@ function tabEvents() {
 }
 
 function tabBans() {
-  const table = el("table", {}, el("tbody", {}));
+  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["User ID", "Status", "Reason", "Time", "Actions"].map((text) => el("th", { text })))), el("tbody", {}));
+  const guildId = state.guildId;
+  let request = 0;
   const tbody = () => table.querySelector("tbody");
   const run = async () => {
-    const rows = await api(`/api/guilds/${state.guildId}/bans?limit=200`);
-    tbody().innerHTML = "";
-    rows.forEach((r) => tbody().append(el("tr", {},
-      el("td", { class: "mono", text: r.user_id }),
-      el("td", { text: r.active ? "banned" : "unbanned" }),
-      el("td", { text: r.reason || "" }),
-      el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
-      el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
-        if (!confirm(`Unban ${r.user_id}?`)) return;
-        try {
-          await api(`/api/guilds/${state.guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
-          toast("Unbanned", "success");
-          run();
-        } catch (e) {
-          toast(e.message || String(e), "error");
-        }
-      } }) : null),
-    )));
+    const current = ++request;
+    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
+    try {
+      const rows = await api(`/api/guilds/${guildId}/bans?limit=200`);
+      if (current !== request) return;
+      tbody().innerHTML = "";
+      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No matching records." })));
+      rows.forEach((r) => tbody().append(el("tr", {},
+        el("td", { class: "mono", text: r.user_id }),
+        el("td", { text: r.active ? "banned" : "unbanned" }),
+        el("td", { text: r.reason || "" }),
+        el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
+        el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
+          if (!confirm(`Unban ${r.user_id}?`)) return;
+          try {
+            await api(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
+            toast("Unbanned", "success");
+            run();
+          } catch (e) {
+            toast(e.message || String(e), "error");
+          }
+        } }) : null),
+      )));
+    } catch (e) {
+      if (current !== request) return;
+      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
+    }
   };
   run().catch((e) => toast(e.message, "error"));
   return el("div", {},
@@ -937,7 +1084,7 @@ function tabSettings() {
   async function inheritField(field) {
     try {
       await api(`/api/guilds/${state.guildId}/settings`, "PUT", { [field]: null });
-      await loadConfig();
+      if (!await loadConfig()) return;
       toast(`Using global ${field.replaceAll("_", " ")}`, "success");
       renderTab();
     } catch (e) {
@@ -1022,8 +1169,8 @@ function tabSettings() {
           }
         } else {
           const days = Number(rawDays);
-          if (!Number.isFinite(days) || days < 0) {
-            toast("Retention must be a non-negative number (0 = keep forever)", "error");
+          if (!Number.isSafeInteger(days) || days < 0) {
+            toast("Retention must be a non-negative whole number (0 = keep forever)", "error");
             return;
           }
           if (days !== cfg.settings.retention_days) body.retention_days = days;
@@ -1034,7 +1181,7 @@ function tabSettings() {
         }
         try {
           const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", body);
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success");
           renderTab();
         } catch (e) {
@@ -1046,7 +1193,7 @@ function tabSettings() {
           const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", {
             sync_nickname: true,
           });
-          await loadConfig();
+          if (!await loadConfig()) return;
           toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success");
           renderTab();
         } catch (e) {
@@ -1071,7 +1218,7 @@ function tabSettings() {
           }
           try {
             await api(`/api/guilds/0/settings`, "PUT", { prefix: raw });
-            await loadConfig();
+            if (!await loadConfig()) return;
             toast("Global prefix saved", "success");
             renderTab();
           } catch (e) {
@@ -1095,7 +1242,7 @@ function tabSettings() {
             let res = await api(`/api/guilds/${state.guildId}/copy`, "POST", {
               from_guild_id: String(srcSel.value), sections: [sectionSel.value],
             });
-            await loadConfig();
+            if (!await loadConfig()) return;
             let msg = `Copied: ${(res.copied || []).join(", ") || "(nothing)"}`;
             if (res.skipped_badwords > 0) {
               msg += ` (${res.skipped_badwords} invalid badword(s) skipped — not enforced)`;
@@ -1124,21 +1271,40 @@ function tabSettings() {
 // ---------------------------------------------------------------------------
 
 function overlay() {
-  const modal = el("div", { class: "modal-overlay", onclick: (e) => { if (e.target === modal) closeOverlay(); } });
+  const modal = el("div", { class: "modal-overlay", role: "dialog", "aria-modal": "true", "aria-label": "Configuration editor", tabindex: "-1", onclick: (e) => { if (e.target === modal && canLeave()) closeOverlay(); } });
+  modal._returnFocus = document.activeElement;
+  modal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && canLeave()) closeOverlay();
+    if (event.key === "Tab") {
+      const controls = [...modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")];
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === modal)) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || document.activeElement === modal)) { event.preventDefault(); first?.focus(); }
+    }
+  });
   $("#content").append(modal);
+  modal.focus();
   return modal;
 }
 function closeOverlay() {
   const m = $(".modal-overlay");
-  if (m) m.remove();
+  if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; }
 }
 
 function bootUi() {
   bindTabButtons();
+  $("#content").addEventListener("input", (event) => {
+    if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) dirty = true;
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }
+  });
   const loginLink = $("#login-link");
   if (loginLink) loginLink.href = authUrl("/login");
   const logoutBtn = $("#logout-btn");
   if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+    if (!canLeave()) return;
+    dirty = false;
     try {
       const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
       const data = await res.json();

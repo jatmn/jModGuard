@@ -14,6 +14,7 @@ cargo clippy --locked --bin jmodguard-api --no-default-features --features web -
 cargo build --locked --bin jmodguard-bot --no-default-features
 cargo build --locked --bin jmodguard-api
 cargo build --locked --bin jmodguard-api --no-default-features --features web
+node --test scripts/frontend-state-test.mjs
 node --test scripts/frontend-warmup-test.mjs
 node --test scripts/publish-frontend-test.mjs
 # or: ./scripts/smoke-dual-process.sh
