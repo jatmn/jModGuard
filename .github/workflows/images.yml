@@ -229,6 +229,10 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           platforms: linux/amd64
+          # Magic Containers cannot pull Buildx OCI indexes (attestation
+          # sibling). A single linux/amd64 image manifest is the digest we pin.
+          provenance: false
+          sbom: false
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -125,7 +125,8 @@ there. Only one `images` publish runs at a time: a second dispatch waits
 rather than cancelling the first, because each run retags `:latest` and
 deletes older GHCR versions. Do not publish frontend from one revision and
 images from another.
-That builds `linux/amd64` images and pushes:
+That builds **single-manifest** `linux/amd64` images (no Buildx
+provenance/SBOM index) and pushes:
 
 ```text
 ghcr.io/jatmn/jmodguard-bot:latest
@@ -144,8 +145,10 @@ pulling after the next run unless GHCR retention keeps it or you re-run
 before the next publish if you may need to roll back.
 
 Point Magic Containers at those recorded **digests**, not floating
-`:latest`. After each publish, redeploy or restart the apps so they pull
-the intended image.
+`:latest`. The digest must be the image manifest, not an OCI index — Bunny
+resolves `:latest` to the index digest when attestations are attached and
+then fails to pull. After each publish, redeploy or restart the apps so
+they pull the intended image.
 
 The API image is JSON + OAuth only. It does not embed `frontend/`.
 
