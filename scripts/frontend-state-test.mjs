@@ -12,6 +12,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
   const node = (tag) => ({
     tag, nodeType: 1, children: [], attrs: {}, dataset: {}, listeners: {}, disabled: false,
     classList: { toggle() {} },
+    focus() {},
     append(...children) { this.children.push(...children); },
     setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
     removeAttribute(k) { delete this.attrs[k]; },
@@ -29,7 +30,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
   });
-  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabSettings, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -175,3 +176,63 @@ test('fractional retention is rejected before a save request', async () => {
   await save.listeners.click({});
   assert.equal(calls.length, 0);
 });
+
+
+test('partial settings actions preserve dirty sibling fields in the same card', () => {
+  const { app, nodes } = harness();
+  const prefix = { value: '?', _initialValue: '!', dataset: { inputKey: '0' } };
+  const nickname = { value: 'Draft nickname', _initialValue: 'Guard', dataset: { inputKey: '1' } };
+  nodes.get('#content').querySelectorAll = () => [prefix, nickname];
+  const form = { contains: () => true };
+  const resetPrefix = { closest: () => form, _savedInputs: [prefix] };
+  const resync = { closest: () => form, _savedInputs: [] };
+  assert.deepEqual(JSON.parse(JSON.stringify(app.captureDrafts(resetPrefix))), [{ key: '1', value: 'Draft nickname' }]);
+  assert.equal(app.captureDrafts(resync).length, 2);
+  assert.equal(app.captureDrafts({ closest: () => form }).length, 0);
+});
+
+test('unrelated drafts survive the unavailable screen and restore after Retry', () => {
+  const { app, nodes } = harness();
+  const input = { value: 'Saved text', dataset: { inputKey: '0' } };
+  app.state.config = null;
+  app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Unsaved text' }]);
+  assert.equal(app.isDirty(), true);
+  app.restoreDrafts(); // Loading/error screen still has no input.
+  app.state.config = {};
+  nodes.get('#content').querySelector = () => input;
+  app.restoreDrafts();
+  assert.equal(input.value, 'Unsaved text');
+  assert.equal(nodes.get('#workspace-status').textContent, 'Unsaved changes');
+});
+
+test('confirmed navigation clears pending drafts and prevents later replay', () => {
+  const { app, nodes } = harness();
+  const originalTab = app.state.tab;
+  app.state.config = null;
+  app.retainDrafts(app.state.guildId, originalTab, [{ key: '0', value: 'Old draft' }]);
+  app.navigate('settings');
+  app.state.tab = originalTab;
+  app.state.config = {};
+  const input = { value: 'Server value' };
+  nodes.get('#content').querySelector = () => input;
+  app.restoreDrafts();
+  assert.equal(input.value, 'Server value');
+  assert.equal(app.isDirty(), false);
+});
+
+for (const kind of ['rule', 'command']) {
+  for (const action of ['add', 'remove']) {
+    test(`${kind} structural ${action} marks the editor dirty`, async () => {
+      const { app, elements } = harness();
+      if (kind === 'rule') app.editRule({ name: 'Flood', rule_id: 'flood', effective: { params: {}, actions: [{ at: 1, action: 'warn' }] } });
+      else app.editCommand(null);
+      assert.equal(app.isDirty(), false, 'opening the editor does not modify it');
+      const button = action === 'add'
+        ? elements.find(n => n.tag === 'button' && (n.textContent === '+ add step' || n.children.some(c => c.textContent === '+ add action')))
+        : elements.find(n => n.tag === 'button' && (n.textContent === '✕' || n.children.some(c => c.textContent === '✕')));
+      assert.ok(button);
+      await button.listeners.click({});
+      assert.equal(app.isDirty(), true);
+    });
+  }
+}

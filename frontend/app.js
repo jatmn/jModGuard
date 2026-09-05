@@ -7,6 +7,7 @@ const el = (tag, attrs, ...children) => {
   if (attrs) Object.entries(attrs).forEach(([k, v]) => {
     if (k === "class") n.className = v;
     else if (k === "text") n.textContent = v;
+    else if (k === "savedInputs") n._savedInputs = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), (event) => handleEvent(n, v, event));
     else if (k === "checked" || k === "selected" || k === "hidden" || k === "disabled") n[k] = Boolean(v);
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
@@ -21,6 +22,7 @@ let state = { me: null, guilds: [], guildId: null, config: null, tab: "dashboard
 let configRequest = 0;
 let busy = false;
 let dirty = false;
+let pendingDrafts = null;
 const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "members", "events", "bans", "settings"];
 
 function workspaceKey() {
@@ -38,39 +40,66 @@ function persistWorkspace() {
 function canLeave() {
   return !busy && (!dirty || confirm("Discard unsaved changes?"));
 }
+function updateWorkspaceStatus() {
+  const status = $("#workspace-status");
+  if (status) status.textContent = busy ? "Working…" : dirty ? "Unsaved changes" : "Changes saved with each action";
+}
+function markDirty() {
+  dirty = true;
+  updateWorkspaceStatus();
+}
+function captureDrafts(node) {
+  const form = node.closest?.(".card, .modal-box");
+  if (!form) return [];
+  return [...$("#content").querySelectorAll("input, select, textarea")]
+    .filter((input) => !(node._savedInputs ? node._savedInputs.includes(input) : form.contains(input)) &&
+      input._initialValue !== undefined && input.value !== input._initialValue)
+    .map((input) => ({ key: input.dataset.inputKey, value: input.value }));
+}
+function retainDrafts(guildId, tab, drafts) {
+  if (!drafts.length || guildId !== state.guildId || tab !== state.tab) return;
+  pendingDrafts = { guildId, tab, drafts };
+  restoreDrafts();
+}
+function restoreDrafts() {
+  if (!pendingDrafts || pendingDrafts.guildId !== state.guildId || pendingDrafts.tab !== state.tab) return;
+  markDirty();
+  // The unavailable/loading screen has no inputs. Keep the draft until Retry succeeds.
+  if (!state.config) return;
+  for (const draft of pendingDrafts.drafts) {
+    const input = $("#content").querySelector(`[data-input-key="${draft.key}"]`);
+    if (input) {
+      input.value = draft.value;
+      input.dispatchEvent?.(new Event("input", { bubbles: true }));
+    }
+  }
+  pendingDrafts = null;
+}
 function setBusy(value) {
   busy = value;
   document.querySelectorAll("#main-view button, #main-view input, #main-view select, #main-view textarea").forEach((node) => {
     if (value) { node.dataset.wasDisabled = String(node.disabled); node.disabled = true; }
     else if (node.dataset.wasDisabled !== undefined) { node.disabled = node.dataset.wasDisabled === "true"; delete node.dataset.wasDisabled; }
   });
-  const status = $("#workspace-status");
-  if (status) status.textContent = value ? "Working…" : "Changes saved with each action";
+  updateWorkspaceStatus();
 }
 async function handleEvent(node, handler, event) {
   if (busy) return;
   const guildId = state.guildId, tab = state.tab;
-  const form = node.closest?.(".card, .modal-box");
-  const drafts = form ? [...$("#content").querySelectorAll("input, select, textarea")]
-    .filter((input) => !form.contains(input) && input._initialValue !== undefined && input.value !== input._initialValue)
-    .map((input) => ({ key: input.dataset.inputKey, value: input.value })) : [];
+  const drafts = captureDrafts(node);
   try {
     const result = handler(event);
     if (result && typeof result.then === "function") {
       setBusy(true);
       await result;
-      if (!node.isConnected && guildId === state.guildId && tab === state.tab) {
-        for (const draft of drafts) {
-          const input = $("#content").querySelector(`[data-input-key="${draft.key}"]`);
-          if (input) { input.value = draft.value; dirty = true; }
-        }
-      }
+      if (!node.isConnected) retainDrafts(guildId, tab, drafts);
     }
   } catch (e) { toast(e.message || String(e), "error"); }
   finally { if (busy) setBusy(false); }
 }
 function navigate(tab) {
   if (!canLeave()) return;
+  pendingDrafts = null;
   state.tab = tabs.includes(tab) ? tab : "dashboard";
   persistWorkspace();
   renderTab();
@@ -273,6 +302,7 @@ async function init() {
     if (!state.guildId) sel.append(el("option", { value: "", text: "No manageable servers" }));
     sel.addEventListener("change", async () => {
       if (!canLeave()) { sel.value = state.guildId || ""; return; }
+      pendingDrafts = null;
       state.guildId = sel.value;
       state.config = null;
       dirty = false;
@@ -367,6 +397,8 @@ function renderTab() {
       if (label && input) { input.id ||= `field-${i}`; label.htmlFor = input.id; }
     });
   }
+  restoreDrafts();
+  updateWorkspaceStatus();
 }
 
 function bindTabButtons() {
@@ -470,7 +502,7 @@ function editRule(r) {
       const reason = el("input", { type: "text", value: a.reason || "", style: "flex:1", placeholder: "reason template" });
       actionsRows.append(el("div", { class: "row", style: "margin-bottom:6px" },
         el("span", { class: "muted", text: "at " }), at, action, dur, dd, reason,
-        el("button", { class: "btn small danger", onclick: () => { rule.actions.splice(i, 1); renderActions(); } }, "✕"),
+        el("button", { class: "btn small danger", onclick: () => { rule.actions.splice(i, 1); markDirty(); renderActions(); } }, "✕"),
       ));
       at.onchange = () => (rule.actions[i].at = Math.max(1, parseInt(at.value) || 1));
       action.onchange = () => { rule.actions[i].action = action.value; renderActions(); };
@@ -494,7 +526,7 @@ function editRule(r) {
     ),
     el("div", { class: "field" },
       el("label", { text: "Action escalation" }), actionsRows,
-      el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); renderActions(); } }, "+ add action"),
+      el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
     el("div", { class: "row" },
       el("div", { class: "field" }, el("label", { text: "Whitelist roles (ids, comma)" }), whitelistText),
@@ -726,7 +758,7 @@ function editCommand(c) {
       };
       stepsBox.append(el("div", { class: "step-card" },
         el("div", { class: "row" }, type, field,
-          el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); syncPlanJson(); renderSteps(); } })),
+          el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); markDirty(); syncPlanJson(); renderSteps(); } })),
       ));
     });
   };
@@ -768,6 +800,7 @@ function editCommand(c) {
       el("label", { text: "Action plan steps" }), stepsBox,
       el("button", { class: "btn small", text: "+ add step", onclick: () => {
         data.behavior.params.steps.push({ type: "reply", template: "" });
+        markDirty();
         syncPlanJson();
         renderSteps();
       } })) : null,
@@ -1103,6 +1136,7 @@ function tabSettings() {
             class: "btn small",
             type: "button",
             text: "Use global",
+            savedInputs: [input],
             style: "margin-top:6px",
             onclick: () => inheritField(overrideKey),
           })
@@ -1188,7 +1222,7 @@ function tabSettings() {
           toast(e.message || String(e), "error");
         }
       } }),
-      el("button", { class: "btn", text: "Re-sync Discord nickname", onclick: async () => {
+      el("button", { class: "btn", text: "Re-sync Discord nickname", savedInputs: [], onclick: async () => {
         try {
           const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", {
             sync_nickname: true,
@@ -1288,13 +1322,13 @@ function overlay() {
 }
 function closeOverlay() {
   const m = $(".modal-overlay");
-  if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; }
+  if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
 }
 
 function bootUi() {
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) dirty = true;
+    if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }
