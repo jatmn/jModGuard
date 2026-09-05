@@ -73,8 +73,9 @@ cargo build --release --locked --bin jmodguard-api
 ```
 
 Or rebuild/push container images from `Dockerfile.bot` / `Dockerfile.api` at
-that tag. On Bunny, also upload matching `frontend/` from the **same** tag to
-the Storage Zone and purge the Pull Zone.
+that tag. On Bunny, upload `frontend/` from the **same** tag when the page
+needs the new API; CSS/layout-only files can publish independently. Purge
+the Pull Zone after the upload.
 
 ## 4. Config diff
 
@@ -152,7 +153,9 @@ database backup unless a release note says otherwise.
 
 Same order: migrate with the bot app, then roll the API app. Both must keep
 using the same Bunny Database. Upload matching `frontend/` to Storage and purge
-the Pull Zone. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+the Pull Zone when the page needs the new API. CSS-only UI updates do not
+require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
+the API with **OriginUrl**, not OriginMagicContainers.
 
 Before publishing new GHCR images, confirm previous bot/API digests still
 pull (or re-run `images` for the previous `source_ref`). Each `images`
