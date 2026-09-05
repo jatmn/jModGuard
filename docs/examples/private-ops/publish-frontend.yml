@@ -5,10 +5,16 @@
 # Ops polls jModGuard. It does not receive a webhook. A push of frontend/
 # to main is picked up by cron on the ops default branch (GitHub only
 # runs schedule from that branch). Run workflow with ref left as main
-# publishes immediately. CSS-only updates do not need a new container
-# image; rebuild the API when the page needs new endpoints. A bad publish
-# stays on Storage until you rerun with a known-good ref and the purge
-# succeeds; disabling this workflow does not roll the files back.
+# always uploads (it does not use the skip cache). Use that path when
+# Storage was changed by hand, files were deleted, or a bad publish is
+# live. CSS-only updates do not need a new container image; rebuild the
+# API when the page needs new endpoints. A bad publish stays on Storage
+# until you rerun with a known-good ref and the purge succeeds; disabling
+# this workflow does not roll the files back.
+#
+# Cron skip is only "this git tree was published before". On a cache hit
+# the job still GETs Storage and compares the three files; a miss or
+# mismatch republishes. Run workflow always uploads.
 
 name: Publish jModGuard admin UI
 
@@ -77,8 +83,43 @@ jobs:
           path: /tmp/jmodguard-frontend-tree
           key: jmodguard-frontend-tree-${{ steps.tree.outputs.tree }}
 
+      - name: Confirm Storage still matches this tree
+        id: storage
+        if: github.event_name == 'schedule' && steps.skip.outputs.cache-hit == 'true'
+        env:
+          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          zone="${BUNNY_STORAGE_ZONE:?set BUNNY_STORAGE_ZONE}"
+          password="${BUNNY_STORAGE_PASSWORD:?set BUNNY_STORAGE_PASSWORD}"
+          endpoint="${BUNNY_STORAGE_ENDPOINT:-storage.bunnycdn.com}"
+          endpoint="${endpoint#https://}"
+          endpoint="${endpoint%/}"
+          mismatch=0
+          for file in index.html app.js style.css; do
+            dest="$(mktemp)"
+            code="$(curl -sS -o "$dest" -w '%{http_code}' \
+              -H "AccessKey: ${password}" \
+              "https://${endpoint}/${zone}/${file}" || true)"
+            if [ "$code" != "200" ] || ! cmp -s "$dest" "source/frontend/${file}"; then
+              echo "Storage ${file} does not match this tree (HTTP ${code}); will republish."
+              mismatch=1
+            fi
+            rm -f "$dest"
+          done
+          if [ "$mismatch" -eq 1 ]; then
+            echo "force=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "force=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload frontend/ to Bunny Storage
-        if: github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true'
+        if: >-
+          github.event_name != 'schedule'
+          || steps.skip.outputs.cache-hit != 'true'
+          || steps.storage.outputs.force == 'true'
         working-directory: source
         env:
           BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
@@ -92,11 +133,19 @@ jobs:
           bash scripts/publish-frontend-bunny.sh
 
       - name: Write frontend tree marker
-        if: success() && (github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true')
+        if: >-
+          success()
+          && (github.event_name != 'schedule'
+              || steps.skip.outputs.cache-hit != 'true'
+              || steps.storage.outputs.force == 'true')
         run: printf '%s\n' '${{ steps.tree.outputs.tree }}' > /tmp/jmodguard-frontend-tree
 
       - name: Remember published frontend tree
-        if: success() && (github.event_name != 'schedule' || steps.skip.outputs.cache-hit != 'true')
+        if: >-
+          success()
+          && (github.event_name != 'schedule'
+              || steps.skip.outputs.cache-hit != 'true'
+              || steps.storage.outputs.force == 'true')
         uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: /tmp/jmodguard-frontend-tree

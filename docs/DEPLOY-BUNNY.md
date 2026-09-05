@@ -103,7 +103,9 @@ The example workflow **polls** this repository (cron on the ops default
 branch, or **Run workflow** with `ref` left as `main`). Ops does not
 receive a webhook from jModGuard. A CSS-only change does not need a new
 container image. Do not mix a new `app.js` with an old API when the page
-needs new endpoints.
+needs new endpoints. Cron skips an upload only when that git tree was
+already published **and** Storage still matches those three files. **Run
+workflow** always uploads (Storage drift, hand deletes, or a bad UI).
 
 If a published UI is wrong or breaks login, **Run workflow** with `ref`
 set to a known-good tag or SHA, then confirm the Pull Zone purge

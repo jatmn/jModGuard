@@ -4,7 +4,9 @@ Copy these into a **private** operations repository. Bunny Storage passwords
 and account API keys must not live in this public project.
 
 Live-test learnings that belong in every Bunny install (not one
-environment’s hostnames or IDs) are in [DEPLOY-BUNNY.md](../../DEPLOY-BUNNY.md).
+environment’s hostnames or IDs) are in
+[DEPLOY-BUNNY.md](https://github.com/jatmn/jModGuard/blob/main/docs/DEPLOY-BUNNY.md)
+(that URL still works after you copy this folder into a private ops repo).
 Short version:
 
 - Ops **polls** jModGuard. A push to the ops repo does not deploy.
@@ -18,5 +20,8 @@ Short version:
   people type (Force SSL on a custom hostname).
 
 [publish-frontend.yml](publish-frontend.yml) is the Storage/CDN publisher.
-If a bad UI is live, run it with a known-good `ref` and confirm the purge.
-Disabling the workflow does not roll Storage back.
+Cron skips an upload only when this git tree was already published **and**
+Storage still matches those three files. **Run workflow** always uploads: use
+it after a hand edit or delete on Storage, or when a bad UI is live (set
+`ref` to a known-good tag or SHA and confirm the purge). Disabling the
+workflow does not roll Storage back.
