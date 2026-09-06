@@ -13,7 +13,9 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     tag, nodeType: 1, children: [], attrs: {}, dataset: {}, listeners: {}, disabled: false,
     classList: { toggle() {} },
     focus() {},
-    append(...children) { this.children.push(...children); },
+    append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
+    set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
     setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
     removeAttribute(k) { delete this.attrs[k]; },
     addEventListener(k, v) { this.listeners[k] = v; },
@@ -25,7 +27,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
-      querySelector: (key) => nodes.get(key), querySelectorAll: () => [],
+      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
@@ -37,6 +39,19 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
   return { app, elements, nodes, storage };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
+
+function findNode(root, predicate) {
+  if (predicate(root)) return root;
+  for (const child of root.children || []) {
+    const found = findNode(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function textOf(root) {
+  return (root.textContent || '') + (root.children || []).map(textOf).join('');
+}
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
   const first = harness();
@@ -236,3 +251,149 @@ for (const kind of ['rule', 'command']) {
     });
   }
 }
+
+function ruleSaveHarness({ scope = 'global', override = false } = {}) {
+  const calls = [];
+  const failures = { put: false, delete: false, refresh: false };
+  let globalRule = { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] };
+  let guildRule = override ? structuredClone(globalRule) : null;
+  const snapshot = () => ({ rules: [{
+    rule_id: 'mention_spam', name: 'Mention spam', global: globalRule,
+    guild_override: guildRule, effective: guildRule || globalRule,
+  }] });
+  const h = harness(async (url, options) => {
+    const body = options.body && JSON.parse(options.body);
+    calls.push({ url, method: options.method, body });
+    if (options.method === 'PUT') {
+      if (failures.put) throw new Error('write refused');
+      if (body.scope === 'global') globalRule = body.data;
+      else guildRule = body.data;
+    } else if (options.method === 'DELETE') {
+      if (failures.delete) throw new Error('cleanup unavailable');
+      guildRule = null;
+    } else {
+      if (failures.refresh) throw new Error('refresh unavailable');
+      return response(snapshot());
+    }
+    return response({ ok: true });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = structuredClone(snapshot());
+  h.app.navigate('rules');
+  h.app.editRule(h.app.state.config.rules[0]);
+  const content = h.nodes.get('#content');
+  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const scopeInput = findNode(modal, (n) => n.tag === 'select' && n.children.some((c) => c.attrs?.value === 'global'));
+  scopeInput.value = scope;
+  const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
+  const save = findNode(modal, (n) => n.textContent === 'Save');
+  const cancel = findNode(modal, (n) => n.textContent === 'Cancel');
+  return { ...h, calls, failures, content, modal, enabled, save, cancel, snapshot };
+}
+
+test('global rule partial success reconciles the committed value before navigation', async () => {
+  const h = ruleSaveHarness();
+  h.failures.delete = true;
+  await h.enabled.listeners.change({ target: { checked: false } });
+  await h.save.listeners.click({});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.equal(h.snapshot().rules[0].effective.enabled, false);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
+  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
+  assert.match(h.nodes.get('#toast').className, /error/);
+  await h.cancel.listeners.click({});
+  h.app.navigate('rules');
+  assert.match(textOf(h.content), /disabled/);
+  assert.equal(h.app.isBusy(), false);
+});
+
+test('global rule partial success with failed reconciliation stays unavailable through Retry', async () => {
+  const h = ruleSaveHarness();
+  h.failures.delete = h.failures.refresh = true;
+  await h.enabled.listeners.change({ target: { checked: false } });
+  await h.save.listeners.click({});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.equal(h.app.state.config, null);
+  assert.match(textOf(h.content), /Configuration unavailable/);
+  assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
+  assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
+  assert.match(h.nodes.get('#toast').textContent, /Retry/);
+  assert.equal(h.app.isBusy(), false);
+  h.app.navigate('rules');
+  assert.match(textOf(h.content), /Configuration unavailable/);
+  h.failures.refresh = false;
+  const retry = findNode(h.content, (n) => n.textContent === 'Retry');
+  await retry.listeners.click({});
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.match(textOf(h.content), /disabled/);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET', 'GET']);
+});
+
+test('a refused rule PUT retains the checkbox draft and never deletes an override', async () => {
+  const h = ruleSaveHarness();
+  h.failures.put = true;
+  await h.enabled.listeners.change({ target: { checked: false } });
+  await h.save.listeners.click({});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
+  assert.equal(findNode(h.content, (n) => n === h.modal), h.modal);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, true);
+  assert.equal(h.app.isBusy(), false);
+  h.failures.put = false;
+  await h.save.listeners.click({});
+  assert.equal(h.calls.filter((c) => c.method === 'PUT')[1].body.data.enabled, false);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+});
+
+test('a successful global rule save clears the guild override and refreshes', async () => {
+  const h = ruleSaveHarness({ override: true });
+  await h.enabled.listeners.change({ target: { checked: false } });
+  await h.save.listeners.click({});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.equal(h.calls[0].body.scope, 'global');
+  assert.equal(h.calls[1].body.scope, 'guild');
+  assert.equal(h.app.state.config.rules[0].guild_override, null);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.equal(findNode(h.content, (n) => n === h.modal), null);
+  assert.equal(h.nodes.get('#toast').textContent, 'Rule saved');
+});
+
+test('a guild-only rule save does not run global override cleanup', async () => {
+  const h = ruleSaveHarness({ scope: 'guild' });
+  await h.enabled.listeners.change({ target: { checked: false } });
+  await h.save.listeners.click({});
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'GET']);
+  assert.equal(h.calls[0].body.scope, 'guild');
+  assert.equal(h.app.state.config.rules[0].global.enabled, true);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+});
+
+test('a refused command save retains its checkbox value for the next save', async () => {
+  const calls = [];
+  let refuse = true;
+  const h = harness(async (url, options) => {
+    if (options.method === 'GET') return response({ commands: [] });
+    calls.push(JSON.parse(options.body));
+    if (refuse) throw new Error('write refused');
+    return response({ ok: true });
+  });
+  h.app.state.config = { commands: [] };
+  h.app.navigate('commands');
+  h.app.editCommand(null);
+  const content = h.nodes.get('#content');
+  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const name = findNode(modal, (n) => n.attrs?.placeholder === 'command name');
+  name.value = 'hello';
+  const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
+  const save = findNode(modal, (n) => n.textContent === 'Save');
+  await enabled.listeners.change({ target: { checked: false } });
+  await save.listeners.click({});
+  assert.equal(findNode(content, (n) => n === modal), modal);
+  assert.equal(h.app.isBusy(), false);
+  refuse = false;
+  await save.listeners.click({});
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].data.enabled, false);
+  assert.equal(calls[1].data.enabled, false);
+  assert.equal(findNode(content, (n) => n === modal), null);
+});

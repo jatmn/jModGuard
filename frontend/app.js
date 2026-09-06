@@ -545,7 +545,17 @@ function editRule(r) {
         const scope = scopeSel.value;
         await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope, data: rule });
         if (scope === "global") {
-          await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
+          try {
+            await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
+          } catch (e) {
+            // The global write already committed. A failed second request must
+            // not leave the pre-save snapshot visible as current configuration.
+            const refreshed = await loadConfig();
+            if (refreshed) { closeOverlay(); renderTab(); }
+            toast(`Global rule saved, but clearing this server's override could not be confirmed: ${e.message || String(e)}` +
+              (refreshed ? "" : " Configuration refresh also failed. Use Retry to load the saved state."), "error");
+            return;
+          }
         }
         if (!await loadConfig()) return;
         toast("Rule saved", "success");
