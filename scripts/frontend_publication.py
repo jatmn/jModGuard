@@ -44,6 +44,11 @@ def parse(raw: bytes, zone: str) -> dict | None:
         files = data.get("files")
         if not isinstance(files, dict):
             return None
+        # Legacy pending receipts cannot prove a retry was CSS-only.
+        requires_api = data.get("requires_api", not data["complete"])
+        if type(requires_api) is not bool:
+            return None
+        data["requires_api"] = requires_api
         if not files and not data["complete"]:
             return data
         if set(files) != set(FILES) or not all(
@@ -56,15 +61,35 @@ def parse(raw: bytes, zone: str) -> dict | None:
         return None
 
 
+def make_receipt(mode: str, root: str, previous: str, zone: str) -> dict:
+    old = parse(Path(previous).read_bytes(), zone) if Path(previous).exists() else None
+    desired = asset_hashes(root)
+    complete = mode == "complete"
+    requires_api = False
+    if not complete:
+        requires_api = old is None or (not old["complete"] and old["requires_api"])
+        for name in ("index.html", "app.js"):
+            # previous lives beside the actual pre-upload Storage backups.
+            # Those bytes can differ even when the last completed hashes match
+            # the selected source (repair or an interrupted A -> B -> A).
+            backup = Path(previous).parent / name
+            requires_api |= (
+                not old or old["files"].get(name) != desired[name]
+                or not backup.is_file()
+                or hashlib.sha256(backup.read_bytes()).hexdigest() != desired[name]
+            )
+    return {"version": 1, "complete": complete, "pull_zone_id": zone,
+            "files": desired if complete else (old["files"] if old else {}),
+            "requires_api": bool(requires_api)}
+
+
 def main() -> None:
     zone = configured_zone()
     if sys.argv[1:] == ["zone"]:
         print(zone)
         return
     mode, root, previous = sys.argv[1:]
-    old = parse(Path(previous).read_bytes(), zone) if Path(previous).exists() else None
-    files = asset_hashes(root) if mode == "complete" else (old["files"] if old else {})
-    print(json.dumps({"version": 1, "complete": mode == "complete", "pull_zone_id": zone, "files": files}, sort_keys=True))
+    print(json.dumps(make_receipt(mode, root, previous, zone), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -192,3 +192,22 @@ test("returning to a previous revision cannot hide a failed purge", () => {
   assert.equal(receipt().complete, true);
   assert.equal(receipt().pull_zone_id, "123");
 });
+
+test("JS repair keeps API retry intent after purge or completion receipt failure", () => {
+  for (const failure of [{ MOCK_FAIL_PURGE: "1" }, { MOCK_FAIL_PUT: ".jmodguard-publication.json:1:3" }]) {
+    const ctx = setup();
+    assert.equal(publish(ctx).status, 0);
+    const receipt = () => JSON.parse(fs.readFileSync(path.join(ctx.store, ".jmodguard-publication.json"), "utf8"));
+    const completedHashes = receipt().files;
+    fs.writeFileSync(path.join(ctx.store, "app.js"), "UNCOMPLETED-JS");
+    assert.notEqual(publish(ctx, failure).status, 0);
+    assert.equal(fs.readFileSync(path.join(ctx.store, "app.js"), "utf8"), "NEW-JS");
+    assert.deepEqual(receipt().files, completedHashes);
+    assert.equal(receipt().complete, false);
+    assert.equal(receipt().requires_api, true);
+    assert.notEqual(publish(ctx, { MOCK_FAIL_PURGE: "1" }).status, 0);
+    assert.equal(receipt().requires_api, true);
+    assert.equal(publish(ctx).status, 0);
+    assert.equal(receipt().requires_api, false);
+  }
+});

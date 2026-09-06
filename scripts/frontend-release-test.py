@@ -92,6 +92,52 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(self.check())
         self.assertTrue(any('api.bunny.net' in url for url in self.calls))
 
+    def test_matching_pending_js_repair_rechecks_digest_and_readiness(self):
+        self.receipt.update(complete=False, requires_api=True)
+        self.digest = 'sha256:' + 'c' * 64
+        with self.assertRaises(ValueError):
+            self.check()
+        self.digest = self.approved['api_digest']
+        self.ready = (503, b'{"error":"not ready"}')
+        with self.assertRaises(ValueError):
+            self.check()
+        self.ready = (400, b'{"error":"not authenticated"}')
+        self.assertTrue(self.check())
+
+    def test_legacy_pending_is_conservative_but_known_css_retry_is_independent(self):
+        self.receipt['complete'] = False
+        self.digest = 'sha256:' + 'c' * 64
+        with self.assertRaises(ValueError):
+            self.check()
+        self.receipt['requires_api'] = False
+        self.calls.clear()
+        self.assertTrue(self.check())
+        self.assertFalse(any('api.bunny.net' in url for url in self.calls))
+
+    def test_receipt_carries_actual_js_repair_intent_until_completion(self):
+        backups = self.root / 'backups'
+        backups.mkdir()
+        for name in gate.publication.FILES:
+            (backups / name).write_bytes(self.stored[name])
+        previous = backups / gate.publication.RECEIPT
+        previous.write_text(json.dumps(self.receipt))
+        root = str(self.root / 'frontend')
+        (self.root / 'frontend/style.css').write_text('new CSS')
+        pending = gate.publication.make_receipt('pending', root, str(previous), '123')
+        self.assertFalse(pending['requires_api'])
+        # JS drift repair has the same target/last-completed hashes.
+        (backups / 'app.js').write_text('uncompleted JS')
+        pending = gate.publication.make_receipt('pending', root, str(previous), '123')
+        self.assertTrue(pending['requires_api'])
+        self.assertEqual(pending['files']['app.js'], self.receipt['files']['app.js'])
+        previous.write_text(json.dumps(pending))
+        (backups / 'app.js').write_bytes(self.stored['app.js'])
+        retry = gate.publication.make_receipt('pending', root, str(previous), '123')
+        self.assertTrue(retry['requires_api'])
+        completed = gate.publication.make_receipt('complete', root, str(previous), '123')
+        self.assertTrue(completed['complete'])
+        self.assertFalse(completed['requires_api'])
+
     def test_invalid_zone_and_storage_errors_fail_closed(self):
         with patch.dict(os.environ, {'BUNNY_PULL_ZONE_ID': ''}):
             with self.assertRaises(ValueError):

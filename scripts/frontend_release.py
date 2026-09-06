@@ -70,7 +70,8 @@ def should_publish(source, approved, scheduled):
     previous = receipt['files'] if receipt else {}
     changed.update(name for name in publication.FILES if previous.get(name) != desired[name])
     complete = bool(receipt and receipt['complete'] and not changed)
-    if not changed.intersection({'index.html', 'app.js'}):
+    pending_api = bool(receipt and not receipt['complete'] and receipt['requires_api'])
+    if not pending_api and not changed.intersection({'index.html', 'app.js'}):
         return not complete or not scheduled
     app_id = urllib.parse.quote(os.environ['JMODGUARD_API_APP_ID'], safe='')
     code, body = read(f'https://api.bunny.net/mc/apps/{app_id}', {'AccessKey': key})

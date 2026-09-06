@@ -61,6 +61,10 @@ all potentially modified assets on upload failure, and completes its receipt
 only after a successful purge. This is not an atomic CDN rollout: readers may
 observe mixed files during changes, and a failed upload rollback cannot evict
 already-cached attempted assets. A pending receipt keeps the next retry active.
+It also retains whether JS/HTML was involved, including repair of drifted files,
+so retries repeat API checks even after origin bytes match the selected source.
+Older pending receipts without that evidence also require API checks; known
+CSS-only retries remain independent. Successful completion clears that intent.
 
 To pause, set `enabled: false`, disable the workflow and wait for in-flight runs
 before manual intervention. Disabling future runs does not undo a running job
