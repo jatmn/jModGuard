@@ -10,6 +10,8 @@ on:
       - Dockerfile.api
       - src/bin/jmodguard-api.rs
       - src/web/**
+      - src/discord.rs
+      - src/automod.rs
       - Cargo.lock
       - Cargo.toml
       - rust-toolchain.toml

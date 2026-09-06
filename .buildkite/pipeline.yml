@@ -36,6 +36,7 @@ steps:
       cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
       node --test scripts/frontend-warmup-test.mjs
       node --test scripts/publish-frontend-test.mjs
+      python3 scripts/frontend-release-test.py
       cargo test --locked --test dual_process_smoke -- --nocapture
       cargo build --locked --bin jmodguard-bot --no-default-features
       cargo build --locked --bin jmodguard-api

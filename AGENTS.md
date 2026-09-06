@@ -16,6 +16,7 @@ cargo build --locked --bin jmodguard-api
 cargo build --locked --bin jmodguard-api --no-default-features --features web
 node --test scripts/frontend-warmup-test.mjs
 node --test scripts/publish-frontend-test.mjs
+python3 scripts/frontend-release-test.py
 # or: ./scripts/smoke-dual-process.sh
 ```
 

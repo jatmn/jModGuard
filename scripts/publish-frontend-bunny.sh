@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Upload frontend/ to a Bunny Storage Zone and optionally purge a Pull Zone.
-# Designed to run on GitHub Actions in a *private* ops repo (Bunny credentials
-# never belong in the public jModGuard repository).
+# Upload frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
+#
+# Copy this and frontend_publication.py into the private ops repository.
+# Run that reviewed ops-owned copy with Bunny secrets, and point
+# JMODGUARD_FRONTEND_ROOT at the approved source frontend/ directory.
 set -euo pipefail
+
+pull_zone="$(python3 "$(dirname "$0")/frontend_publication.py" zone)"
+key="${BUNNY_API_KEY:?set BUNNY_API_KEY to purge the Pull Zone}"
 
 zone="${BUNNY_STORAGE_ZONE:?set BUNNY_STORAGE_ZONE}"
 password="${BUNNY_STORAGE_PASSWORD:?set BUNNY_STORAGE_PASSWORD}"
@@ -63,9 +68,12 @@ download_existing() {
   local file="$1"
   local dest="$backup_dir/$file"
   local code
-  code="$(curl -sS -o "$dest" -w '%{http_code}' \
+  if ! code="$(curl -sS -o "$dest" -w '%{http_code}' \
     -H "AccessKey: ${password}" \
-    "$(storage_url "$file")" || true)"
+    "$(storage_url "$file")")"; then
+    echo "backup transfer failed for ${file}; refusing to publish" >&2
+    exit 1
+  fi
   if [[ "$code" == "200" ]]; then
     echo "backed up existing ${file}"
     return 0
@@ -120,7 +128,11 @@ rollback() {
 
 abort_upload() {
   echo "upload failed" >&2
-  if ! rollback "${uploaded[@]}"; then
+  # Restore every frontend object we backed up, not only files curl reported
+  # as uploaded. A PUT can be accepted by Storage and still look like a
+  # client failure (lost response, retry timeout). Those objects would
+  # otherwise stay on the new revision and mix with restored files.
+  if ! rollback app.js style.css index.html; then
     echo "rollback did not fully restore Storage; the zone may mix revisions" >&2
   fi
   exit 1
@@ -136,47 +148,54 @@ upload() {
 download_existing index.html
 download_existing app.js
 download_existing style.css
+receipt=".jmodguard-publication.json"
+download_existing "$receipt"
+# Invalidate the one mutable receipt before any PUT, even on A -> B -> A.
+# Keep the last completed asset hashes so a CSS-only retry stays independent.
+python3 "$(dirname "$0")/frontend_publication.py" pending "$root" "$backup_dir/$receipt" >"$backup_dir/pending.json"
+python3 "$(dirname "$0")/frontend_publication.py" complete "$root" "$backup_dir/$receipt" >"$backup_dir/complete.json"
+if ! storage_put "$receipt" "$backup_dir/pending.json" "application/json"; then
+  echo "cannot mark publication pending; refusing to upload assets" >&2
+  exit 1
+fi
 
 # Assets first, HTML last, so a failed later PUT cannot pair new HTML with
-# old JS/CSS. On upload failure, restore confirmed previous copies or delete
-# objects that were confirmed absent. A failed Pull Zone purge does not
-# roll Storage back: the new files are the intended origin, and reverting
-# them cannot un-fetch edges that already missed cache.
-uploaded=()
-if upload app.js "application/javascript; charset=utf-8"; then
-  uploaded+=("app.js")
-else
+# old JS/CSS. On upload failure, restore all three backed-up objects (or
+# delete ones confirmed absent), including the file whose PUT may have
+# succeeded remotely after curl reported an error. A failed Pull Zone purge
+# does not roll Storage back: the new files are the intended origin, and
+# reverting them cannot un-fetch edges that already missed cache.
+if ! upload app.js "application/javascript; charset=utf-8"; then
   abort_upload
 fi
-if upload style.css "text/css; charset=utf-8"; then
-  uploaded+=("style.css")
-else
+if ! upload style.css "text/css; charset=utf-8"; then
   abort_upload
 fi
-if upload index.html "text/html; charset=utf-8"; then
-  uploaded+=("index.html")
-else
+if ! upload index.html "text/html; charset=utf-8"; then
   abort_upload
 fi
 
-if [[ -n "${BUNNY_PULL_ZONE_ID:-}" ]]; then
-  key="${BUNNY_API_KEY:?set BUNNY_API_KEY to purge the Pull Zone}"
-  echo "Purging Pull Zone ${BUNNY_PULL_ZONE_ID}"
-  purged=0
-  for _ in 1 2 3 4 5 6; do
-    if curl -fsS -X POST "https://api.bunny.net/pullzone/${BUNNY_PULL_ZONE_ID}/purgeCache" \
-      -H "AccessKey: ${key}" \
-      -H "Content-Type: application/json" \
-      -d '{}'; then
-      purged=1
-      break
-    fi
-    sleep "$retry_sleep"
-  done
-  if [[ "$purged" -ne 1 ]]; then
-    echo "Storage already has the new frontend/. Pull Zone purge failed; CDN may keep stale or mixed cached files until you purge zone ${BUNNY_PULL_ZONE_ID} in the Bunny dashboard. Do not re-upload until that purge succeeds." >&2
-    exit 1
+echo "Purging Pull Zone ${pull_zone}"
+purged=0
+for _ in 1 2 3 4 5 6; do
+  if curl -fsS -X POST "https://api.bunny.net/pullzone/${pull_zone}/purgeCache" \
+    -H "AccessKey: ${key}" \
+    -H "Content-Type: application/json" \
+    -d '{}'; then
+    purged=1
+    break
   fi
+  sleep "$retry_sleep"
+done
+if [[ "$purged" -ne 1 ]]; then
+  echo "Storage already has the new frontend/. Pull Zone purge failed; CDN may keep stale or mixed cached files until a retry or dashboard purge succeeds. Publication remains pending for the next run." >&2
+  exit 1
+fi
+
+# A failed/lost response here leaves a safe retry (or an already valid receipt).
+if ! storage_put "$receipt" "$backup_dir/complete.json" "application/json"; then
+  echo "publication receipt failed; next run will reconcile and retry" >&2
+  exit 1
 fi
 
 echo "frontend/ published"

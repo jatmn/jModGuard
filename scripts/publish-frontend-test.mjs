@@ -35,13 +35,13 @@ for (let i = 0; i < args.length; i++) {
 }
 const file = decodeURIComponent(new URL(url).pathname.split("/").filter(Boolean).pop() || "");
 fs.appendFileSync(log, method + " " + file + "\\n");
-if (url.includes("/purgeCache")) process.exit(0);
+if (url.includes("/purgeCache")) process.exit(process.env.MOCK_FAIL_PURGE ? 22 : 0);
 if (method === "GET") {
   const p = path.join(store, file);
   if (fs.existsSync(p)) {
-    if (outfile) fs.copyFileSync(p, outfile);
+    if (outfile) fs.writeFileSync(outfile, process.env.MOCK_PARTIAL_GET ? fs.readFileSync(p).subarray(0, 3) : fs.readFileSync(p));
     if (writeFmt.includes("http_code")) process.stdout.write("200");
-    process.exit(0);
+    process.exit(process.env.MOCK_PARTIAL_GET ? 18 : 0);
   }
   if (process.env.MOCK_GET_CODE) {
     if (writeFmt.includes("http_code")) process.stdout.write(process.env.MOCK_GET_CODE);
@@ -56,7 +56,10 @@ if (method === "PUT") {
     const countPath = path.join(store, ".failcount-" + file);
     const n = (fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, "utf8")) : 0) + 1;
     fs.writeFileSync(countPath, String(n));
-    if (n > rule.skip && n <= rule.skip + rule.times) process.exit(22);
+    if (n > rule.skip && n <= rule.skip + rule.times) {
+      if (process.env.MOCK_WRITE_THEN_FAIL) fs.copyFileSync(upload, path.join(store, file));
+      process.exit(22);
+    }
   }
   fs.copyFileSync(upload, path.join(store, file));
   process.exit(0);
@@ -90,6 +93,8 @@ function publish(ctx, extra = {}) {
       ...process.env,
       PATH: `${path.join(ctx.dir, "bin")}:${process.env.PATH}`,
       BUNNY_STORAGE_ZONE: "zone",
+      BUNNY_PULL_ZONE_ID: "123",
+      BUNNY_API_KEY: "fake",
       BUNNY_STORAGE_PASSWORD: "pw",
       BUNNY_STORAGE_ENDPOINT: "storage.test",
       JMODGUARD_FRONTEND_ROOT: ctx.frontend,
@@ -147,4 +152,43 @@ test("successful publish writes all three files", () => {
   assert.equal(fs.readFileSync(path.join(ctx.store, "app.js"), "utf8"), "NEW-JS");
   assert.equal(fs.readFileSync(path.join(ctx.store, "style.css"), "utf8"), "NEW-CSS");
   assert.equal(fs.readFileSync(path.join(ctx.store, "index.html"), "utf8"), "NEW-HTML");
+});
+
+
+test("uncertain PUT restores the file even when curl reports failure", () => {
+  const ctx = setup();
+  for (const file of ["app.js", "style.css", "index.html"]) fs.writeFileSync(path.join(ctx.store, file), "OLD");
+  const result = publish(ctx, { MOCK_FAIL_PUT: "style.css:0:3", MOCK_WRITE_THEN_FAIL: "1" });
+  assert.notEqual(result.status, 0);
+  for (const file of ["app.js", "style.css", "index.html"]) assert.equal(fs.readFileSync(path.join(ctx.store, file), "utf8"), "OLD");
+});
+
+test("partial HTTP 200 backup refuses all mutations", () => {
+  const ctx = setup();
+  fs.writeFileSync(path.join(ctx.store, "index.html"), "ORIGINAL");
+  const result = publish(ctx, { MOCK_PARTIAL_GET: "1" });
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(fs.readFileSync(ctx.log, "utf8"), /PUT/);
+});
+
+test("invalid purge configuration fails before touching Storage", () => {
+  for (const extra of [{ BUNNY_PULL_ZONE_ID: "" }, { BUNNY_PULL_ZONE_ID: "12/34" }, { BUNNY_API_KEY: "" }]) {
+    const ctx = setup();
+    assert.notEqual(publish(ctx, extra).status, 0);
+    assert.equal(fs.existsSync(ctx.log), false);
+  }
+});
+
+test("returning to a previous revision cannot hide a failed purge", () => {
+  const ctx = setup();
+  assert.equal(publish(ctx).status, 0);
+  fs.writeFileSync(path.join(ctx.frontend, "app.js"), "OTHER-JS");
+  assert.equal(publish(ctx).status, 0);
+  fs.writeFileSync(path.join(ctx.frontend, "app.js"), "NEW-JS");
+  assert.notEqual(publish(ctx, { MOCK_FAIL_PURGE: "1" }).status, 0);
+  const receipt = () => JSON.parse(fs.readFileSync(path.join(ctx.store, ".jmodguard-publication.json"), "utf8"));
+  assert.equal(receipt().complete, false);
+  assert.equal(publish(ctx).status, 0);
+  assert.equal(receipt().complete, true);
+  assert.equal(receipt().pull_zone_id, "123");
 });

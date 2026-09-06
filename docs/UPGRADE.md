@@ -55,8 +55,8 @@ Both `jmodguard-bot` and `jmodguard-api` can hold the shared DB open.
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` — do not file-copy
 the `.db` while either process is writing. See [CONFIGURATION.md](CONFIGURATION.md).
 
-For Bunny Database, the local file-copy procedure does not apply. A complete
-operator-controlled backup path is not yet available; `bsql .dump` alone is
+For Bunny Database, the local file-copy procedure does not apply. An
+operator-controlled recovery method must pass a live drill; `bsql .dump` alone is
 insufficient for the jModGuard schema. Do not perform a production upgrade
 until the acceptance drill in [BACKUP-RESTORE.md](BACKUP-RESTORE.md) passes.
 
@@ -157,10 +157,23 @@ the Pull Zone when the page needs the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **OriginUrl**, not OriginMagicContainers.
 
-Before publishing new GHCR images, confirm previous bot/API digests still
-pull (or re-run `images` for the previous `source_ref`). Each `images`
-publish retags `:latest` and may delete older package versions. Point
-Magic Containers at recorded digests, not `:latest`.
+Select production from a reviewed ops release: full source SHA, exact bot/API
+digests and matching recovery evidence. Source publication creates artifacts;
+it does not authorize deployment. Scheduled/manual reconciliation must retry the
+approved selection, including after a failed rollout. The frontend example and
+its installation requirements are in [private ops](examples/private-ops/README.md).
+
+Retain current and rollback images before publishing a candidate. Source image
+workflows retain older versions; manual registry cleanup must protect those
+inventories. Verify approved digests remain pullable. Rebuilding an old source
+SHA can produce a different digest; approve that replacement explicitly rather
+than silently substituting it. Tags, including SHA tags, can be retagged.
+
+Pause reconciliation and wait for in-flight runs before incident changes. For
+remote data recovery, restore into a separate database, verify it, and switch
+configuration under the incident plan. Do not overwrite production to test a
+restore. Start the matching bot then API and restore matching frontend assets
+with a successful CDN purge. Reverting an ops release does not reverse migrations.
 
 ## Related
 

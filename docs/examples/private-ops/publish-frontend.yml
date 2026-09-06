@@ -1,152 +1,68 @@
-# Copy this workflow into *your* private ops repository.
-# Do not enable it on the public jModGuard repo: it needs Bunny Storage
-# credentials that must not live there.
-#
-# Ops polls jModGuard. It does not receive a webhook. A push of frontend/
-# to main is picked up by cron on the ops default branch (GitHub only
-# runs schedule from that branch). Run workflow with ref left as main
-# always uploads (it does not use the skip cache). Use that path when
-# Storage was changed by hand, files were deleted, or a bad publish is
-# live. CSS-only updates do not need a new container image; rebuild the
-# API when the page needs new endpoints. A bad publish stays on Storage
-# until you rerun with a known-good ref and the purge succeeds; disabling
-# this workflow does not roll the files back.
-#
-# Cron skip is only "this git tree was published before". On a cache hit
-# the job still GETs Storage and compares the three files; a miss or
-# mismatch republishes. Run workflow always uploads.
-
+# Copy to .github/workflows/ in your private ops repo; see the sibling README.
+# Ops main selects a release. Source pushes do not select production.
 name: Publish jModGuard admin UI
 
 on:
+  push:
+    branches: [main]
+    paths: [frontend-release.json]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: jModGuard branch, tag, or SHA (leave as main)
-        required: false
-        default: main
-        type: string
   schedule:
     - cron: '*/5 * * * *'
 
+permissions:
+  contents: read
+
 concurrency:
-  group: publish-frontend
+  # API deployment workflows in this ops repo must use this same group.
+  group: deploy-api-${{ vars.JMODGUARD_API_APP_ID }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve source ref
-        id: src
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REQUESTED_REF: ${{ inputs.ref }}
-        run: |
-          set -eu
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${REQUESTED_REF:-}" ]; then
-            ref="$REQUESTED_REF"
-          else
-            ref="main"
-          fi
-          ref="$(printf '%s' "$ref" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-          if printf '%s' "$ref" | grep -qiE '^[0-9a-f]{40}$'; then
-            ref="$(printf '%s' "$ref" | tr '[:upper:]' '[:lower:]')"
-          fi
-          test -n "$ref"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+      - name: Check out current approved ops configuration
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          path: ops
+          persist-credentials: false
 
-      - name: Check out jModGuard source
+      - name: Resolve approved source
+        id: release
+        run: python3 ops/scripts/frontend_release.py resolve ops/frontend-release.json >> "$GITHUB_OUTPUT"
+
+      - name: Check out approved assets
+        if: steps.release.outputs.enabled == 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: jatmn/jModGuard
-          ref: ${{ steps.src.outputs.ref }}
-          persist-credentials: false
-          # Cross-repo checkout of private jModGuard needs a PAT
-          # (contents:read). Once this source repo is public, github.token
-          # from the ops runner is enough.
-          token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN || github.token }}
+          ref: ${{ steps.release.outputs.source_sha }}
           path: source
+          persist-credentials: false
+          token: ${{ secrets.JMODGUARD_CHECKOUT_TOKEN || github.token }}
 
-      - name: Frontend tree
-        id: tree
-        run: |
-          set -eu
-          tree="$(git -C source rev-parse HEAD:frontend)"
-          echo "tree=${tree}" >> "$GITHUB_OUTPUT"
-
-      - name: Skip unchanged frontend on schedule
-        id: skip
-        if: github.event_name == 'schedule'
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-        with:
-          path: /tmp/jmodguard-frontend-tree
-          key: jmodguard-frontend-tree-${{ steps.tree.outputs.tree }}
-
-      - name: Confirm Storage still matches this tree
-        id: storage
-        if: github.event_name == 'schedule' && steps.skip.outputs.cache-hit == 'true'
-        env:
-          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
-          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
-          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          zone="${BUNNY_STORAGE_ZONE:?set BUNNY_STORAGE_ZONE}"
-          password="${BUNNY_STORAGE_PASSWORD:?set BUNNY_STORAGE_PASSWORD}"
-          endpoint="${BUNNY_STORAGE_ENDPOINT:-storage.bunnycdn.com}"
-          endpoint="${endpoint#https://}"
-          endpoint="${endpoint%/}"
-          mismatch=0
-          for file in index.html app.js style.css; do
-            dest="$(mktemp)"
-            code="$(curl -sS -o "$dest" -w '%{http_code}' \
-              -H "AccessKey: ${password}" \
-              "https://${endpoint}/${zone}/${file}" || true)"
-            if [ "$code" != "200" ] || ! cmp -s "$dest" "source/frontend/${file}"; then
-              echo "Storage ${file} does not match this tree (HTTP ${code}); will republish."
-              mismatch=1
-            fi
-            rm -f "$dest"
-          done
-          if [ "$mismatch" -eq 1 ]; then
-            echo "force=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "force=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload frontend/ to Bunny Storage
-        if: >-
-          github.event_name != 'schedule'
-          || steps.skip.outputs.cache-hit != 'true'
-          || steps.storage.outputs.force == 'true'
-        working-directory: source
+      - name: Verify live publication and approved API
+        if: steps.release.outputs.enabled == 'true'
+        id: gate
         env:
           BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
           BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
           BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
           BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
           BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
-        run: |
-          set -eu
-          test -f scripts/publish-frontend-bunny.sh
-          bash scripts/publish-frontend-bunny.sh
+          JMODGUARD_API_APP_ID: ${{ vars.JMODGUARD_API_APP_ID }}
+          JMODGUARD_READINESS_URL: ${{ vars.JMODGUARD_READINESS_URL }}
+        run: python3 ops/scripts/frontend_release.py check ops/frontend-release.json source >> "$GITHUB_OUTPUT"
 
-      - name: Write frontend tree marker
-        if: >-
-          success()
-          && (github.event_name != 'schedule'
-              || steps.skip.outputs.cache-hit != 'true'
-              || steps.storage.outputs.force == 'true')
-        run: printf '%s\n' '${{ steps.tree.outputs.tree }}' > /tmp/jmodguard-frontend-tree
-
-      - name: Remember published frontend tree
-        if: >-
-          success()
-          && (github.event_name != 'schedule'
-              || steps.skip.outputs.cache-hit != 'true'
-              || steps.storage.outputs.force == 'true')
-        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-        with:
-          path: /tmp/jmodguard-frontend-tree
-          key: jmodguard-frontend-tree-${{ steps.tree.outputs.tree }}
+      - name: Publish with reviewed ops-owned tooling
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+          BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+          JMODGUARD_FRONTEND_ROOT: ${{ github.workspace }}/source/frontend
+        run: bash ops/scripts/publish-frontend-bunny.sh

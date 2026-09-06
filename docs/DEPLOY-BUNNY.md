@@ -12,13 +12,12 @@ workers: they talk to Bunny Database and (outbound) to Discord. They do not
 contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
-The UI files are published by **GitHub Actions in your private ops repo**
-(not by this public repository). That private runner polls this repository
-(usually `main`) and uploads `frontend/` to Storage. Match the running
-container revision only when the page needs new API endpoints;
-CSS/layout-only revisions can publish independently. Bunny credentials
-stay in that private repo’s secrets. This public repo is the source; it
-is not the place those keys live.
+The UI files are published by **GitHub Actions in your private ops repo**.
+Source pushes build artifacts; production changes require a reviewed ops release
+selecting the source SHA and exact compatible bot/API image digests. Scheduled
+and manual ops runs reconcile that selection. CSS-only assets can move without
+an API rollout, but still require release approval. Keep Bunny credentials,
+resource IDs and recovery evidence in ops.
 
 ```text
 Browser  →  Bunny CDN (Pull Zone)
@@ -86,7 +85,7 @@ the page needs new API endpoints.
 **private** ops repo (Bunny Storage passwords do not belong in this public
 project), using
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
-and [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh).
+and its [private ops installation instructions](examples/private-ops/README.md).
 A private repo is not required for a one-off upload. Copy the workflow
 into the private repo when you want repeats. Store these secrets there:
 
@@ -96,30 +95,33 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
 | `BUNNY_STORAGE_ENDPOINT` | Regional host, default `storage.bunnycdn.com` |
 | `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
-| `BUNNY_API_KEY` | Account API key, used only for the purge |
+| `BUNNY_API_KEY` | Account API key for API state inspection and CDN purge |
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-The example workflow **polls** this repository (cron on the ops default
-branch, or **Run workflow** with `ref` left as `main`). Ops does not
-receive a webhook from jModGuard. A CSS-only change does not need a new
-container image. Do not mix a new `app.js` with an old API when the page
-needs new endpoints. Cron skips an upload only when that git tree was
-already published **and** Storage still matches those three files. **Run
-workflow** always uploads (Storage drift, hand deletes, or a bad UI).
+Install all files and variables listed in the
+[private ops README](examples/private-ops/README.md), including its disabled
+`frontend-release.json` and ops-owned Python helpers. The example publishes only
+an approved full source SHA from ops `main`. It is a frontend publisher; use your
+container runbook to deploy compatible bot/API digests and apply migrations.
 
-If a published UI is wrong or breaks login, **Run workflow** with `ref`
-set to a known-good tag or SHA, then confirm the Pull Zone purge
-succeeded. Turning the workflow off only stops later publishes; Storage
-and CDN keep the last uploaded files until you replace them and purge.
+Release review must establish API compatibility and completed recovery evidence.
+The frontend checker verifies live Storage contents, publication completion and,
+for changed JS/HTML, the approved active API digest plus `/api/me` readiness.
+CSS-only changes can publish independently of an API rollout. API deployment
+workflows must share the example's concurrency group. `/health` alone cannot
+prove application readiness because it responds before database bootstrap.
 
-The runner uploads `index.html`, `app.js`, and `style.css` to the Storage
-Zone root (`/`, `/app.js`, `/style.css`).
-If a later file fails to upload, the script restores files it successfully
-backed up (HTTP 200) or deletes files it confirmed were missing (HTTP 404).
-It refuses to start if it cannot read the current objects. A failed Pull
-Zone purge leaves the new files on Storage and exits non-zero so you can
-purge the zone; rolling Storage back cannot un-cache edges that already
-fetched the new files.
+Publication requires both a valid Pull Zone id and purge credentials before any
+Storage access. All backup downloads must complete. On an upload error, restore
+all potentially modified assets, including a PUT accepted remotely despite a
+lost response. A mutable receipt records completion only after CDN purge; an old
+Actions cache entry or matching origin files cannot prove that purge finished.
+A failed purge leaves the new origin files and a pending receipt for retry.
+Uploads and rollback are not atomic at the CDN; verify the public site afterward.
+
+For a bad UI, commit an approved known-good release in ops and confirm its
+publication and purge. Disable publication and wait for in-flight runs before
+manual repairs; disabling a workflow does not undo an existing upload.
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 6),
@@ -140,8 +142,8 @@ GHCR has two publish styles:
   workflow with a tag or full SHA.
 
 There is nothing for Magic Containers to pull until one of those publishes.
-Each run retags `:latest` for **that** package and may delete older versions
-of that package only. Match frontend to the running API when the page
+Each run retags `:latest` for **that** package and retains older versions.
+Match frontend to the running API when the page
 needs new endpoints. CSS/layout-only frontend revisions can publish
 without a new image.
 That builds **single-manifest** `linux/amd64` images (no Buildx
@@ -157,17 +159,18 @@ A manual run tags the digest with the peeled commit SHA and, if
 `source_ref` was a Git tag, that tag with `/` replaced by `-`
 (`release/2025` → `release-2025`). Tags are resolved to a commit SHA
 before checkout so a force-moved tag cannot change what gets compiled.
-The workflow then deletes older GHCR versions so only the current release
-image is stored. A digest recorded from a previous publish may stop
-pulling after the next run unless GHCR retention keeps it or you re-run
-`images` with that earlier `source_ref`. Record bot and API digests
-before the next publish if you may need to roll back.
+Publishing does not prune older GHCR versions. Retain the currently approved
+and rollback digests before building a candidate. Any later manual cleanup must
+consult deployment inventories; the public source cannot know which private
+installations still use an image. Rebuilding the same source SHA may produce a
+different digest and is a new artifact requiring approval, not recovery of the
+original image bytes.
 
 Point Magic Containers at those recorded **digests**, not floating
 `:latest`. The digest must be the image manifest, not an OCI index — Bunny
 resolves `:latest` to the index digest when attestations are attached and
-then fails to pull. After each publish, redeploy or restart the apps so
-they pull the intended image.
+then fails to pull. After ops approves the release, deploy its exact digests
+and verify rollout.
 
 The Bunny API image is JSON + OAuth only. It does not embed `frontend/`.
 A default local API build still can (`embed-ui`).
@@ -383,9 +386,9 @@ schema-open against a local libSQL server, not Bunny TLS.
   Magic Containers at those digests, not floating `:latest`. Storage
   `frontend/` can move independently for CSS/layout; do not mix a new
   website with an old API when the page needs new endpoints. A later
-  `images` publish retags `:latest` and may prune older GHCR versions, so
-  a recorded digest may stop pulling unless you re-run `images` for that
-  earlier `source_ref` or configure GHCR retention.
+  `images` publish retags `:latest` but retains old versions. Review any manual
+  pruning against deployed and rollback image inventories; a recorded digest
+  alone is not a retained artifact.
 - Do not add public Magic Container endpoints for the bot. Do not use a
   Magic Container hostname as the product URL.
 
