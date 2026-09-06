@@ -74,6 +74,34 @@ Never put a database URL or token in these files.
 where your account has **Manage Server** permission are shown, so one WebUI
 instance manages all your servers.
 
+## Workspace and saved changes
+
+The sidebar keeps your server and all moderation sections within reach. On
+small screens, navigation becomes a horizontally scrollable bar. Tables scroll
+within the workspace, and editors support keyboard navigation.
+
+The selected server and section are remembered in this browser for each signed-in
+account and API origin. Restored server IDs are checked against your current
+manageable-server list. If a server is no longer available, the first accessible
+server is selected. Browser storage is optional; if blocked, the app still works,
+but selection will not survive a reload. Settings themselves always come from the
+API and are never restored from browser storage.
+
+Use **Save** in an editor to apply changes. While an action is running, controls
+are disabled to prevent duplicate saves or switching its target server. If a
+configuration refresh fails, the workspace shows **Retry** instead of stale
+settings. Server loads ignore out-of-order responses. Navigation warns before
+discarding unsaved edits, including action/step additions and removals. A successful
+save reloads the authoritative snapshot. Other edited fields stay marked
+**Unsaved changes**, including when a field-specific settings action runs or a
+failed refresh needs Retry. Drafts remain in memory only and are discarded when
+you confirm leaving the workspace.
+
+A Global rule save writes the global rule before clearing the current server's
+override. If that second request fails, the workspace refreshes the saved state
+and reports the partial result; if the refresh also fails, use **Retry**. Closing
+the editor does not undo an acknowledged global write.
+
 ## Tabs
 
 | Tab | What it does |
@@ -164,3 +192,7 @@ bot owner).
 - Session cookies use the `Secure` flag when `web.base_url` starts with
   `https://`. API JSON sets `Cache-Control: private, no-store`. Expose
   publicly only behind HTTPS (see SETUP.md §8).
+
+### Appearance
+
+Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page.

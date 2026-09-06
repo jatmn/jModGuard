@@ -3,53 +3,73 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>jModGuard</title>
+<meta name="theme-color" content="#e0eeff">
+<meta name="description" content="Your Discord moderation workspace. Configure protection, manage commands, and keep your community in view.">
+<title>jModGuard · Moderation workspace</title>
+<script>
+// Apply the saved appearance before CSS paints, including on the sign-in screen.
+try {
+  const theme = localStorage.getItem("jmodguard.theme");
+  document.documentElement.dataset.theme = theme === "dark" ||
+    (theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+} catch (_) {
+  document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to workspace</a>
 <div id="app">
-  <div id="startup-view" class="hidden">
+  <div id="startup-view" class="hidden welcome-view">
+    <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     <div class="login-card">
-      <h1>jModGuard</h1>
-      <p id="startup-status">Waiting for the API to finish starting…</p>
+      <span class="brand-mark" aria-hidden="true">jG</span>
+      <p class="eyebrow">YOUR COMMUNITY, IN GOOD HANDS</p>
+      <h1>Getting things ready.</h1>
+      <p id="startup-status" role="status">Waiting for the API to finish starting…</p>
     </div>
   </div>
-
-  <div id="login-view" class="hidden">
+  <div id="login-view" class="hidden welcome-view">
+    <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     <div class="login-card">
-      <h1>jModGuard</h1>
-      <p>Discord moderation bot control panel</p>
-      <a id="login-link" class="btn primary" href="/login">Login with Discord</a>
+      <span class="brand-mark" aria-hidden="true">jG</span>
+      <p class="eyebrow">JMODGUARD / MODERATION WORKSPACE</p>
+      <h1>A calmer place<br>to keep order.</h1>
+      <p>Thoughtful protection for your Discord community.<br>Manage your rules, people, and settings in one place.</p>
+      <a id="login-link" class="btn primary" href="/login">Continue with Discord <span aria-hidden="true">↗</span></a>
+      <small>For server managers and community builders.</small>
     </div>
   </div>
-
   <div id="main-view" class="hidden">
-    <header>
-      <div class="brand"><span class="logo">&#128737;</span> jModGuard</div>
-      <div class="header-right">
-        <select id="guild-select" title="Select server"></select>
-        <span id="user-chip"></span>
-        <button id="logout-btn" class="btn small">Logout</button>
-      </div>
-    </header>
-
-    <nav id="tabs">
-      <button data-tab="dashboard" class="active">Dashboard</button>
-      <button data-tab="rules">Automod Rules</button>
-      <button data-tab="badwords">Badwords</button>
-      <button data-tab="commands">Commands</button>
-      <button data-tab="templates">Templates</button>
-      <button data-tab="logchannels">Log Channels</button>
-      <button data-tab="members">Members</button>
-      <button data-tab="events">Audit Log</button>
-      <button data-tab="bans">Bans</button>
-      <button data-tab="settings">Settings</button>
-    </nav>
-
-    <main id="content"></main>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>MODERATION WORKSPACE</small></span></div>
+      <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select"></select></div>
+      <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <nav id="tabs" aria-label="Workspace navigation">
+        <span class="nav-label">WORKSPACE</span>
+        <button data-tab="dashboard" class="active"><span aria-hidden="true">◈</span> Dashboard</button>
+        <button data-tab="rules"><span aria-hidden="true">◇</span> Automod Rules</button>
+        <button data-tab="badwords"><span aria-hidden="true">⊘</span> Badwords</button>
+        <button data-tab="commands"><span aria-hidden="true">⌘</span> Commands</button>
+        <button data-tab="templates"><span aria-hidden="true">≡</span> Templates</button>
+        <button data-tab="logchannels"><span aria-hidden="true">#</span> Log Channels</button>
+        <span class="nav-label">COMMUNITY</span>
+        <button data-tab="members"><span aria-hidden="true">◎</span> Members</button>
+        <button data-tab="events"><span aria-hidden="true">≋</span> Audit Log</button>
+        <button data-tab="bans"><span aria-hidden="true">⊖</span> Bans</button>
+        <button data-tab="settings"><span aria-hidden="true">⚙</span> Settings</button>
+      </nav>
+      <div class="sidebar-footer"><span id="user-chip"></span><button id="logout-btn" class="btn small">Sign out</button></div>
+    </aside>
+    <div class="workspace">
+      <header class="workspace-header"><div><span class="eyebrow">SERVER WORKSPACE</span><strong id="workspace-name">Your servers</strong></div><span id="workspace-status">Changes saved with each action</span></header>
+      <main id="content" tabindex="-1"></main>
+      <footer class="workspace-footer">jModGuard <span>Built for better communities.</span></footer>
+    </div>
   </div>
 </div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <script src="/app.js"></script>
 </body>
 </html>
