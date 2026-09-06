@@ -1,27 +1,74 @@
 # Private ops examples
 
-Copy these into a **private** operations repository. Bunny Storage passwords
-and account API keys must not live in this public project.
+Production releases are selected in your **private ops repository**, not by
+tracking source `main`. Source publishes artifacts; an operator reviews the
+source, compatible bot/API image digests, migrations and recovery evidence before
+promoting a release. Keep production IDs, secrets and actual approval records in
+ops. [DEPLOY-BUNNY.md](https://github.com/jatmn/jModGuard/blob/main/docs/DEPLOY-BUNNY.md)
+contains the generic topology.
 
-Live-test learnings that belong in every Bunny install (not one
-environment’s hostnames or IDs) are in
-[DEPLOY-BUNNY.md](https://github.com/jatmn/jModGuard/blob/main/docs/DEPLOY-BUNNY.md)
-(that URL still works after you copy this folder into a private ops repo).
-Short version:
+## Install this frontend example
 
-- Ops **polls** jModGuard. A push to the ops repo does not deploy.
-- Origin-pull `/api` with **OriginUrl** to the API endpoint Pull Zone host.
-  Do not use OriginMagicContainers on a Storage-origin Pull Zone.
-- At most five URL patterns per edge-rule trigger. Disable Cookies must be
-  off. Do not paste Magic Container GET/PATCH JSON (it dumps env).
-- The Bunny API image does not serve `/` (a default local build may).
-  Probe `/health`.
-- `JMODGUARD_WEB_BASE_URL` and the Discord redirect must be the hostname
-  people type (Force SSL on a custom hostname).
+1. Copy `publish-frontend.yml` into your ops `.github/workflows/` and
+   `frontend-release.json` into its root. It starts disabled.
+2. Copy these three files from this source revision into ops `scripts/`:
+   `publish-frontend-bunny.sh`, `frontend_publication.py`, and
+   `frontend_release.py`. Review tooling updates as ops changes. Never execute
+   scripts from a newly selected source checkout with production credentials.
+3. Configure the Storage/purge secrets listed in DEPLOY-BUNNY and, while source
+   is private, `JMODGUARD_CHECKOUT_TOKEN` with source `contents:read` access.
+4. Set repository variables `JMODGUARD_API_APP_ID` and
+   `JMODGUARD_READINESS_URL` (`https://YOUR-CDN-HOSTNAME/api/me`). The API container
+   template image name must be `jmodguard-api`. Use the same concurrency group
+   `deploy-api-<app-id>` for API deployment workflows in this ops repo. Manual
+   provider changes and workflows in other repositories cannot share that lock;
+   pause publication before such changes.
+5. Protect ops `main` with your release-review policy. Before enabling, complete
+   the [recovery drill](https://github.com/jatmn/jModGuard/blob/main/docs/BACKUP-RESTORE.md),
+   retain the backup and running/rollback images, and record actual evidence in
+   your private runbook. The example does not perform or certify that drill.
+6. Review and commit `frontend-release.json` on ops `main` with `enabled: true`,
+   `source_sha` equal to the full lowercase source commit, and `api_digest` equal
+   to the compatible API's exact `sha256:<64 lowercase hex>` manifest digest.
+   The release review must establish compatibility from complete API inputs or
+   tested API behavior; a SHA/tag alone is not proof. Deploy the required bot
+   migrations and API first through your container runbook.
 
-[publish-frontend.yml](publish-frontend.yml) is the Storage/CDN publisher.
-Cron skips an upload only when this git tree was already published **and**
-Storage still matches those three files. **Run workflow** always uploads: use
-it after a hand edit or delete on Storage, or when a bad UI is live (set
-`ref` to a known-good tag or SHA and confirm the purge). Disabling the
-workflow does not roll Storage back.
+This is a **frontend** example, not a bot/database deployment orchestrator or a
+full production-release/recovery attestation system. Your ops system should bind
+bot and API digests and recovery evidence to the same approved source revision.
+It may adapt this example to read that single release record instead of keeping
+a separate frontend selection.
+
+## Reconcile and recover
+
+A push changing the release file on ops `main` triggers publication. Scheduled
+and manual runs retry the currently committed selection; neither follows source
+`main` nor accepts a source override. Dispatch from ops `main`.
+
+The checker compares live Storage bytes and a mutable publication receipt.
+Changed JS/HTML also requires the selected API digest, active container status,
+and the anonymous `/api/me` readiness response. `/health` is only liveness.
+CSS-only changes can publish without an API rollout once previous JS/HTML
+publication is established. Unavailable or unready APIs fail the run; a later
+run can retry. The check verifies the approved image is configured and the API
+is responding, not per-request backend image identity during a rolling update;
+wait for rollout completion before approving publication.
+
+The publisher requires a valid Pull Zone and purge key before touching Storage.
+It backs up all objects before upload, rejects incomplete downloads, restores
+all potentially modified assets on upload failure, and completes its receipt
+only after a successful purge. This is not an atomic CDN rollout: readers may
+observe mixed files during changes, and a failed upload rollback cannot evict
+already-cached attempted assets. A pending receipt keeps the next retry active.
+It also retains whether JS/HTML was involved, including repair of drifted files,
+so retries repeat API checks even after origin bytes match the selected source.
+Older pending receipts without that evidence also require API checks; known
+CSS-only retries remain independent. Successful completion clears that intent.
+
+To pause, set `enabled: false`, disable the workflow and wait for in-flight runs
+before manual intervention. Disabling future runs does not undo a running job
+or restore old assets. To roll back, review and commit the known-good source SHA
+and compatible API digest, then publish and confirm purge. Restoring frontend
+files does not reverse database migrations. Manual runs re-upload even matching
+assets; schedules skip only when bytes and the completed receipt match.

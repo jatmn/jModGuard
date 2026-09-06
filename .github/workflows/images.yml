@@ -4,7 +4,7 @@ name: images
 # (tag or full SHA, not a branch). Everyday pushes do not run this
 # workflow. Path-filtered Publish bot/API/database image workflows on main
 # build one image at a time. Each publish retags :latest for that package
-# and deletes older versions of that package only.
+# and retains earlier versions for approved releases and rollback.
 on:
   release:
     types: [published]
@@ -16,7 +16,7 @@ on:
         type: string
 
 concurrency:
-  # Every publish retags :latest and prunes older GHCR versions. One group
+  # Every publish retags :latest. One group
   # for all releases and manual source_refs so a second dispatch queues
   # instead of cancelling an unrelated SHA, and two source_refs cannot race.
   group: images-publish

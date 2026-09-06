@@ -50,6 +50,9 @@ jobs:
           export GIT_CONFIG_VALUE_0="!f() { echo username=x-access-token; echo password=${GITHUB_TOKEN}; }; f"
           cargo fetch --locked
 
+      - name: Frontend release checks
+        run: python3 scripts/frontend-release-test.py
+
       - name: cargo test --locked
         env:
           GITHUB_TOKEN: ""

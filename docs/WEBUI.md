@@ -54,7 +54,12 @@ and the example workflow
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
 are for a **private** ops repo so Bunny Storage passwords are not stored
 in this public project. A private repo is not required to try it once;
-it is the intended way to publish updates.
+follow the [private ops installation instructions](examples/private-ops/README.md)
+to copy the reviewed publisher and Python helpers. Production updates select a
+full source SHA and compatible API digest in a reviewed ops release. Source
+pushes do not promote production. The example verifies changed JS/HTML against
+the approved active API and application readiness, and records completion only
+after CDN purge. CSS-only updates still need approval but not an API rollout.
 
 **Another host or CDN.** Copy the same three files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
