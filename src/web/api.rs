@@ -37,6 +37,16 @@ async fn real_guild_scope(
 // config bundle
 // ---------------------------------------------------------------------------
 
+// The old internal schema still has this field during the staged overhaul.
+// It is not a supported chat-history control or part of the API contract.
+fn settings_wire(settings: &impl serde::Serialize) -> serde_json::Value {
+    let mut value = serde_json::json!(settings);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("retention_days");
+    }
+    value
+}
+
 pub async fn guild_config(
     State(app): State<Arc<AppState>>,
     session: Session,
@@ -146,10 +156,10 @@ pub async fn guild_config(
     }
 
     Ok(Json(serde_json::json!({
-        "settings": snapshot.settings.settings,
-        "settings_override": snapshot.settings.settings_override,
-        "global_settings": snapshot.settings.global_settings,
-        "global_settings_override": snapshot.settings.global_settings_override,
+        "settings": settings_wire(&snapshot.settings.settings),
+        "settings_override": settings_wire(&snapshot.settings.settings_override),
+        "global_settings": settings_wire(&snapshot.settings.global_settings),
+        "global_settings_override": settings_wire(&snapshot.settings.global_settings_override),
         "nickname_reconcile": snapshot.nickname_reconcile,
         "rules": rules,
         "badwords": badwords,
@@ -166,13 +176,12 @@ pub async fn guild_config(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SettingsBody {
     #[serde(default, deserialize_with = "crate::types::de_settings_patch_field")]
     prefix: crate::types::SettingsPatchField<String>,
     #[serde(default, deserialize_with = "crate::types::de_settings_patch_field")]
     bot_name: crate::types::SettingsPatchField<String>,
-    #[serde(default, deserialize_with = "crate::types::de_settings_patch_field")]
-    retention_days: crate::types::SettingsPatchField<u32>,
     /// Explicit repair action for Discord↔SQLite nickname drift. Kept separate
     /// from ordinary saves so a stale form never re-applies a nickname.
     #[serde(default)]
@@ -201,7 +210,7 @@ pub async fn update_settings(
         guild_id as i64,
         body.prefix,
         body.bot_name,
-        body.retention_days,
+        None,
         body.sync_nickname,
     )
     .await?;
@@ -209,7 +218,7 @@ pub async fn update_settings(
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "settings": settings,
+        "settings": settings_wire(&settings),
         "nickname_applied": null,
         "nickname_queued": nickname_queued,
         "nickname_error": null,
@@ -740,21 +749,7 @@ pub async fn test_regex(
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
-    q: Option<String>,
     limit: Option<i64>,
-}
-
-pub async fn members(
-    State(app): State<Arc<AppState>>,
-    session: Session,
-    Path(guild_id): Path<u64>,
-    Query(query): Query<SearchQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = real_guild_scope(&app, &session, guild_id).await?;
-    let q = query.q.unwrap_or_default();
-    let limit = query.limit.unwrap_or(50);
-    let rows = db::search_members(&app.db, guild_id as i64, &q, limit).await?;
-    Ok(Json(serde_json::json!(rows)))
 }
 
 #[derive(Deserialize)]
@@ -871,23 +866,37 @@ mod tests {
     }
 
     #[test]
+    fn chat_history_retention_is_not_an_api_setting() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<SettingsBody>(serde_json::json!({"retention_days":value}))
+                    .is_err()
+            );
+        }
+        let value = super::settings_wire(&crate::types::GuildSettings::default());
+        assert!(value.get("retention_days").is_none());
+        assert!(value.get("prefix").is_some());
+        assert!(super::settings_wire(&None::<crate::types::GuildSettingsOverride>).is_null());
+    }
+
+    #[test]
     fn settings_body_null_means_clear_override() {
         let body: SettingsBody =
-            serde_json::from_str(r#"{"prefix":null,"bot_name":null,"retention_days":null}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"prefix":null,"bot_name":null}"#).unwrap();
         assert_eq!(body.prefix, Some(None));
         assert_eq!(body.bot_name, Some(None));
-        assert_eq!(body.retention_days, Some(None));
 
         let omit: SettingsBody = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(omit.prefix, None);
         assert_eq!(omit.bot_name, None);
-        assert_eq!(omit.retention_days, None);
 
         let set: SettingsBody =
-            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot","retention_days":0}"#).unwrap();
+            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot"}"#).unwrap();
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
-        assert_eq!(set.retention_days, Some(Some(0)));
     }
 }

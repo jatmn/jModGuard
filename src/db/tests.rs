@@ -853,24 +853,25 @@ fn guild_stats_are_scoped_not_global() {
     let db = Db::open(&tmp, 2).unwrap();
     let g1 = 111i64;
     let g2 = 222i64;
-    tokio_test_block_on(crate::db::bump_message(&db, g1, 1, "a")).unwrap();
-    tokio_test_block_on(crate::db::bump_message(&db, g1, 2, "b")).unwrap();
-    tokio_test_block_on(crate::db::bump_message(&db, g2, 3, "c")).unwrap();
     tokio_test_block_on(crate::db::add_warn(&db, g1, 1, 9, "spam")).unwrap();
     tokio_test_block_on(crate::db::add_warn(&db, g2, 3, 9, "spam")).unwrap();
+    tokio_test_block_on(crate::db::add_warn(&db, g2, 4, 9, "spam")).unwrap();
+    tokio_test_block_on(crate::db::record_ban(&db, g2, 4, Some(9), "spam")).unwrap();
+    // No historical member/message tables are needed for guild stats.
+    db.with_conn_sync(|conn| {
+        conn.execute_batch("DROP TABLE messages; DROP TABLE members;")?;
+        Ok(())
+    })
+    .unwrap();
     let s1 = tokio_test_block_on(crate::db::guild_stats(&db, g1)).unwrap();
     let s2 = tokio_test_block_on(crate::db::guild_stats(&db, g2)).unwrap();
-    assert_eq!(s1.members, 2);
-    assert_eq!(s2.members, 1);
     assert_eq!(s1.warns, 1);
-    assert_eq!(s2.warns, 1);
-    assert_eq!(s1.guilds, 1);
-    let global = tokio_test_block_on(crate::db::stats(&db)).unwrap();
-    assert_eq!(global.members, 3);
-    assert_eq!(global.warns, 2);
-    // Discord !stats / WebUI must use guild_stats — prove g1 never sees g2 totals.
-    assert_ne!(s1.members, global.members);
-    assert_ne!(s1.warns, global.warns);
+    assert_eq!(s2.warns, 2);
+    assert_eq!(s1.bans, 0);
+    assert_eq!(s2.bans, 1);
+    let wire = serde_json::to_value(s1).unwrap();
+    assert!(wire.get("messages").is_none());
+    assert!(wire.get("members").is_none());
     cleanup_db(&tmp);
 }
 

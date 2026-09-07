@@ -28,7 +28,8 @@ from a private GitHub Actions repo. You do not need Bunny to run it
   entire configuration from one server to another.
 - **Logging**: every event type (joins, leaves, bans, edits, deletes, automod
   hits, mod actions) routes to its own channel with editable templates.
-- **Member tracking**: join/leave history, join counts, message counts.
+- **Minimal routine storage**: basic Discord-channel reports without SQL message/member
+  history. Selected moderation records remain durable; see [logging/data](docs/LOGGING-DATA.md).
 - **Prefix + slash commands**, multi-server, Linux binary (SQLite and
   TLS are bundled — zero system dependencies).
 
@@ -132,7 +133,7 @@ db/bootstrap.rs        migrations, startup fencing, versions, settings healing
 db/configuration.rs    rules, commands, templates, badwords, config snapshots
 db/settings.rs         inherited settings reads/writes
 db/nickname_jobs.rs    durable Discord nickname reconciliation jobs
-db/moderation.rs       members, messages, retention, audit, warns, and bans
+db/moderation.rs       moderation records and transitional historical data helpers
 db_compat.rs   synchronous libSQL transaction/deadline/outcome facade
 defaults.rs    seeded rules / commands / templates
 types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)

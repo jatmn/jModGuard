@@ -1,4 +1,4 @@
-//! Discord gateway event handlers: member lifecycle, message tracking,
+//! Discord gateway event handlers: basic member/message reports,
 //! automod pipeline, and command dispatch.
 
 use serenity::async_trait;
@@ -27,25 +27,6 @@ pub struct Handler {
 impl Handler {
     fn app(&self) -> &Arc<AppState> {
         &self.app
-    }
-}
-
-fn attachments_json(msg: &Message) -> String {
-    serde_json::to_string(
-        &msg.attachments
-            .iter()
-            .map(|a| serde_json::json!({"filename": a.filename, "url": a.url, "size": a.size, "content_type": a.content_type}))
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| "[]".into())
-}
-
-fn truncate_2000(s: &str) -> String {
-    let t: String = s.chars().take(1900).collect();
-    if t.chars().count() >= 1900 {
-        format!("{t}…")
-    } else {
-        t
     }
 }
 
@@ -111,22 +92,17 @@ impl EventHandler for Handler {
                     if !commands::sync_slash_commands(&app, &ctx, gid).await {
                         failed = true;
                     }
-                    let _ = db::insert_event(
-                        &app.db,
-                        gid.get() as i64,
-                        "system",
-                        None,
-                        None,
-                        &serde_json::json!({
-                            "content": format!("Bot started (v{})", env!("CARGO_PKG_VERSION"))
-                        }),
-                    )
-                    .await;
+                    let mut vars = BTreeMap::new();
+                    vars.insert(
+                        "content".into(),
+                        format!("Bot started (v{})", env!("CARGO_PKG_VERSION")),
+                    );
+                    logging::emit(&app, &ctx, gid, "system", vars).await;
                 }
                 if failed {
                     app.retry_slash_registry_version();
                 }
-                tracing::info!("startup slash sync + backfill complete");
+                tracing::info!("startup slash sync complete");
             });
         }
     }
@@ -153,16 +129,6 @@ impl EventHandler for Handler {
                 guild_id = gid.get(),
                 "failed to queue nickname reconciliation on guild_create: {error:#}"
             );
-        }
-
-        // Backfill member tracking from cache (bounded batch).
-        if !guild.members.is_empty() {
-            let members: Vec<(i64, String)> = guild
-                .members
-                .values()
-                .map(|m| (m.user.id.get() as i64, m.user.name.clone()))
-                .collect();
-            let _ = db::backfill_members(&app.db, gid.get() as i64, members).await;
         }
 
         if is_new.unwrap_or(false) {
@@ -198,21 +164,6 @@ impl EventHandler for Handler {
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
         app.automod.member_joined(guild_id.get(), uid);
-        let _ = db::member_joined(
-            &app.db,
-            guild_id.get() as i64,
-            uid as i64,
-            &new_member.user.name,
-        )
-        .await;
-        let _ = db::upsert_user(
-            &app.db,
-            uid as i64,
-            &new_member.user.name,
-            new_member.user.global_name.as_deref(),
-            None,
-        )
-        .await;
         logging::emit_member_event(
             &app,
             &ctx,
@@ -229,20 +180,17 @@ impl EventHandler for Handler {
         ctx: Context,
         guild_id: GuildId,
         user: User,
-        _member_data: Option<Member>,
+        member_data: Option<Member>,
     ) {
         let app = Arc::clone(self.app());
-        let _ = db::member_left(&app.db, guild_id.get() as i64, user.id.get() as i64).await;
         let mut extra = BTreeMap::new();
-        if let Ok(Some(row)) =
-            db::member_row(&app.db, guild_id.get() as i64, user.id.get() as i64).await
-            && let (Some(first), Some(last)) = (&row.first_joined_at, &row.last_joined_at)
-        {
-            extra.insert(
-                "duration".into(),
-                format!("{first} → {last} ({} joins)", row.join_count),
-            );
-        }
+        extra.insert(
+            "duration".into(),
+            member_data
+                .and_then(|m| m.joined_at)
+                .map(|joined| format!("joined at {joined}"))
+                .unwrap_or_else(|| "unavailable".into()),
+        );
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra).await;
     }
 
@@ -283,7 +231,6 @@ impl EventHandler for Handler {
         if msg.author.bot {
             return;
         }
-        let _tracking_guard = app.begin_message_tracking(msg.id.get());
 
         if msg.content.is_empty() {
             warn_empty_content_once();
@@ -370,75 +317,17 @@ impl EventHandler for Handler {
             let cfg_arc = Arc::clone(&cfg);
             let _ = commands::handle_prefix(&app, &ctx, cfg_arc, &msg).await;
         }
-
-        // Best-effort tracking runs after moderation and command dispatch, and
-        // uses one transaction/deadline rather than three sequential remote
-        // mutations. A database outage must not hold the enforcement path.
-        let _ = db::record_message_activity(
-            &app.db,
-            msg.id.get() as i64,
-            guild_id.get() as i64,
-            msg.channel_id.get() as i64,
-            msg.author.id.get() as i64,
-            &msg.author.name,
-            msg.author.global_name.as_deref(),
-            &msg.content,
-            &attachments_json(&msg),
-            &msg.timestamp.to_string(),
-        )
-        .await;
     }
 
     async fn message_update(
         &self,
         ctx: Context,
         _old: Option<Message>,
-        new: Option<Message>,
+        _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
-        let app = Arc::clone(self.app());
-        let Some(guild_id) = event.guild_id else {
-            return;
-        };
-        let Some(new_content) = new
-            .as_ref()
-            .map(|m| m.content.clone())
-            .or_else(|| event.content.clone())
-        else {
-            return;
-        };
-        let id = event.id.get() as i64;
-        let allow_missing = true;
-        if let Ok(Some((old_content, _))) = db::mark_edited_with_previous(
-            &app.db,
-            id,
-            guild_id.get() as i64,
-            event.channel_id.get() as i64,
-            event.author.as_ref().map(|a| a.id.get() as i64),
-            allow_missing,
-            &new_content,
-        )
-        .await
-            && old_content != new_content
-        {
-            let mut vars = BTreeMap::new();
-            vars.insert("channel".into(), format!("<#{}>", event.channel_id));
-            vars.insert("before".into(), truncate_2000(&old_content));
-            vars.insert("after".into(), truncate_2000(&new_content));
-            if let Some(author) = &event.author {
-                vars.insert("user".into(), author.name.clone());
-                vars.insert("mention".into(), format!("<@{}>", author.id));
-            }
-            logging::emit(&app, &ctx, guild_id, "message_edit", vars).await;
-            let _ = db::insert_event(
-                &app.db,
-                guild_id.get() as i64,
-                "message_edit",
-                event.author.as_ref().map(|a| a.id.get() as i64),
-                None,
-                &serde_json::json!({"message_id": id, "before": old_content, "after": new_content, "channel_id": event.channel_id.get()}),
-            )
-            .await;
+        if let Some(report) = logging::message_update_report(&event) {
+            logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }
 
@@ -449,37 +338,9 @@ impl EventHandler for Handler {
         deleted_message_id: MessageId,
         guild_id: Option<GuildId>,
     ) {
-        let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
-        let id = deleted_message_id.get() as i64;
-        let allow_missing = true;
-        let content = db::mark_deleted_with_previous(
-            &app.db,
-            id,
-            guild_id.get() as i64,
-            channel_id.get() as i64,
-            allow_missing,
-        )
-        .await
-        .ok()
-        .flatten()
-        .map(|(c, _)| c);
-        let mut vars = BTreeMap::new();
-        vars.insert("channel".into(), format!("<#{}>", channel_id));
-        vars.insert(
-            "content".into(),
-            truncate_2000(content.as_deref().unwrap_or("*unknown*")),
-        );
-        logging::emit(&app, &ctx, guild_id, "message_delete", vars).await;
-        let _ = db::insert_event(
-            &app.db,
-            guild_id.get() as i64,
-            "message_delete",
-            None,
-            None,
-            &serde_json::json!({"message_id": id, "channel_id": channel_id.get(), "content": content}),
-        )
-        .await;
+        let report = logging::message_delete_report(guild_id, channel_id, deleted_message_id);
+        logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
     }
 
     async fn message_delete_bulk(
@@ -489,38 +350,14 @@ impl EventHandler for Handler {
         multiple_deleted_messages_ids: Vec<MessageId>,
         guild_id: Option<GuildId>,
     ) {
-        let app = Arc::clone(self.app());
         let Some(guild_id) = guild_id else { return };
-        let n = multiple_deleted_messages_ids.len();
-        let allow_missing_ids = multiple_deleted_messages_ids
-            .iter()
-            .map(|id| id.get() as i64)
-            .collect();
-        let message_ids = multiple_deleted_messages_ids
-            .iter()
-            .map(|id| id.get() as i64)
-            .collect();
-        let _ = db::mark_deleted_bulk(
-            &app.db,
-            message_ids,
-            allow_missing_ids,
-            guild_id.get() as i64,
-            channel_id.get() as i64,
-        )
-        .await;
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
-        vars.insert("count".into(), n.to_string());
-        logging::emit(&app, &ctx, guild_id, "message_bulk_delete", vars).await;
-        let _ = db::insert_event(
-            &app.db,
-            guild_id.get() as i64,
-            "message_bulk_delete",
-            None,
-            None,
-            &serde_json::json!({"channel_id": channel_id.get(), "count": n}),
-        )
-        .await;
+        vars.insert(
+            "count".into(),
+            multiple_deleted_messages_ids.len().to_string(),
+        );
+        logging::emit(&self.app, &ctx, guild_id, "message_bulk_delete", vars).await;
     }
 
     async fn guild_member_update(

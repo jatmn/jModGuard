@@ -19,7 +19,6 @@ database (everything server-related, editable at runtime).
 | `web.cors_origins` | `[]` | Extra SPA origins only for a split-origin UI (env: `JMODGUARD_CORS_ORIGINS`). Empty = same-origin. Bunny CDN proxies `/api` onto the UI hostname, so this stays empty. |
 | `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) (env: `JMODGUARD_DEFAULT_PREFIX`) |
 | `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
-| `bot.retention_days` | `7` | seeded into the global settings row on first boot; synced to the same meta terminal-defaults row (WebUI / config cache / purge share it; `0` = keep forever; maximum 100000, same bound as WebUI writes) (env: `JMODGUARD_RETENTION_DAYS`) |
 | `bot.status` | `moderating` | presence text (env: `JMODGUARD_BOT_STATUS`) |
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
@@ -46,18 +45,18 @@ exits if that wait expires).
 | `meta` | durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
 | `nickname_reconcile` | generation-numbered nickname jobs with pending/dormant/terminal state, persisted retry schedule, attempt count, and last operator-visible error |
 | `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
-| `guild_settings` | prefix, bot nickname, retention as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
+| `guild_settings` | prefix and bot nickname as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
 | `rules` | the 7 automod rules (server + global rows) |
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
 | `log_channels` | event type → channel mapping (per server only) |
 | `legacy_global_log_channels` | global mappings retired by migration 0003; inspect them while recreating per-server mappings |
 | `badwords` | regex patterns (server + global) |
-| `members` | join/leave history, join count, message count, last seen |
-| `messages` | recent message content + attachments (retention-limited) |
-| `events` | append-only audit log |
+| `members` | retired schema scaffolding; no live collection or WebUI member history |
+| `messages` | retired schema scaffolding; no live collection |
+| `events` | transitional retained moderation records; routine channel reports do not append here |
 | `warns` / `bans` | warnings and ban history |
-| `users` | username/avatar cache |
+| `users` | retired schema scaffolding; no live collection |
 
 Environment variables override `config.toml` values (see table).
 
@@ -118,3 +117,18 @@ Bunny's internal snapshots are not an operator-controlled backup. The current
 `bsql .dump` output also omits schema objects required by jModGuard, so it is
 not a complete recovery path. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for
 the exact limitation and the restore drill required before production.
+
+### Discord log delivery
+
+`log.discord_concurrency` (default 8, environment `JMODGUARD_LOG_DISCORD_CONCURRENCY`)
+and `log.discord_timeout_secs` (default 10, environment `JMODGUARD_LOG_DISCORD_TIMEOUT_SECS`)
+are positive bot bootstrap controls. Admission never waits; the deadline includes config
+lookup and delivery. Saturated/failed reports are dropped without a persistent queue or
+replay. A cumulative counter produces sparse process warnings without raw report content.
+Operator UI controls and per-guild fairness remain pending. These defaults are tunable,
+not measured throughput budgets. See [logging/data status](LOGGING-DATA.md).
+
+The internal settings/schema still contain the retired `retention_days` field during
+this staged refactor. It has no live message-retention effect and is absent from API
+responses; settings requests containing it are rejected. New tenant schema work will
+remove the old helpers/tables. No existing deployment data is migrated or cleaned here.

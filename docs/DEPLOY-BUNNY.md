@@ -216,9 +216,11 @@ JMODGUARD_LOG_DIRECTORY=
 
 Optional when you have no `config.toml` on the bot container (typical):
 `JMODGUARD_DB_POOL_SIZE` (this process's pool), `JMODGUARD_DEFAULT_PREFIX`,
-`JMODGUARD_RETENTION_DAYS`, and `JMODGUARD_BOT_STATUS`. Prefix and retention
-are written on migrate-open into durable `meta.settings_terminal_defaults`.
-Status is the Discord presence text.
+and `JMODGUARD_BOT_STATUS`. Prefix is written on migrate-open into durable
+`meta.settings_terminal_defaults`. Status is the Discord presence text.
+`JMODGUARD_LOG_DISCORD_CONCURRENCY` (default 8) and `JMODGUARD_LOG_DISCORD_TIMEOUT_SECS`
+(default 10) bound best-effort Discord log delivery. Routine chat/member history is no
+longer collected; the historical retention field has no active collection effect.
 
 Plus the database pair from step 1.
 
@@ -275,8 +277,8 @@ JMODGUARD_LOG_DIRECTORY=
 ```
 
 Optional when you have no `config.toml` on the API container (typical):
-`JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix,
-retention, and bot status are bot-owned — set those on the bot app.
+`JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix
+and bot status are bot-owned — set those on the bot app.
 
 `JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators type into the
 browser (custom hostname if you added one), not a container hostname and

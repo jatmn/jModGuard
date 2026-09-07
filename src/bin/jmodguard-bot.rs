@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
         | GatewayIntents::GUILD_MODERATION;
 
     let mut cache_settings = CacheSettings::default();
-    cache_settings.max_messages = 0; // we track messages in SQLite, not RAM
+    cache_settings.max_messages = 0; // no general message history in RAM or SQL
     cache_settings.cache_guilds = true;
     cache_settings.cache_channels = true;
     cache_settings.cache_users = true;
@@ -339,17 +339,6 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 app.automod.prune();
-                if let Err(e) = db::purge_old_messages(&app.db).await {
-                    tracing::warn!("message retention cleanup failed: {e:#}");
-                }
-                if let Ok(stats) = db::stats(&app.db).await {
-                    tracing::debug!(
-                        "housekeeping: {} messages, {} events, {} members tracked",
-                        stats.messages,
-                        stats.events,
-                        stats.members
-                    );
-                }
             }
         });
     }

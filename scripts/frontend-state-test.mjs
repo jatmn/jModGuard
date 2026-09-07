@@ -89,6 +89,15 @@ test('blocked browser storage does not block navigation or restoration', () => {
   assert.equal(app.state.guildId, app.state.guilds[0].id);
 });
 
+test('saved Members tab falls back to the dashboard after history removal', () => {
+  const { app, storage } = harness();
+  const guildId = app.state.guilds[1].id;
+  storage.set(app.workspaceKey(), JSON.stringify({ guildId, tab: 'members' }));
+  app.restoreWorkspace();
+  assert.equal(app.state.guildId, guildId);
+  assert.equal(app.state.tab, 'dashboard');
+});
+
 test('dropdown option arrays become real nodes and boolean false stays false', () => {
   const { app } = harness();
   const options = ['log', 'warn', 'ban'].map((value) => app.el('option', { value, selected: value === 'ban' }));
@@ -176,22 +185,19 @@ test('settings patches send only changed fields to the selected server', async (
   assert.equal(calls[1].method, 'GET');
 });
 
-test('settings keep clear-to-inherit, empty nickname, and zero retention distinct', async () => {
+test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
   inputs[1].value = '';
-  inputs[2].value = '0';
   await save.listeners.click({});
-  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '', retention_days: 0 });
+  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '' });
 });
 
-test('fractional retention is rejected before a save request', async () => {
-  const { calls, inputs, save } = settingsHarness();
-  inputs[2].value = '1.5';
-  await save.listeners.click({});
-  assert.equal(calls.length, 0);
+test('settings do not expose historical chat-retention controls', () => {
+  const { elements, inputs } = settingsHarness();
+  assert.equal(inputs.filter(n => n.attrs.type === 'number').length, 0);
+  assert.ok(!elements.some(n => /retention|keep forever/i.test(n.textContent || '')));
 });
-
 
 test('partial settings actions preserve dirty sibling fields in the same card', () => {
   const { app, nodes } = harness();

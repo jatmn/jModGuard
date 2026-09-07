@@ -63,6 +63,8 @@ pub struct BotConfig {
 pub struct LogConfig {
     pub level: String,
     pub directory: PathBuf,
+    pub discord_concurrency: usize,
+    pub discord_timeout_secs: u64,
 }
 
 impl Default for DbConfig {
@@ -105,6 +107,8 @@ impl Default for LogConfig {
         Self {
             level: "info".into(),
             directory: PathBuf::from("logs"),
+            discord_concurrency: 8,
+            discord_timeout_secs: 10,
         }
     }
 }
@@ -348,6 +352,18 @@ impl Config {
                     format!("JMODGUARD_CONFIG_POLL_SECS must be a positive integer, got `{v}`")
                 })?;
             }
+        }
+        if let Ok(v) = env::var("JMODGUARD_LOG_DISCORD_CONCURRENCY") {
+            self.log.discord_concurrency = v
+                .trim()
+                .parse()
+                .context("JMODGUARD_LOG_DISCORD_CONCURRENCY must be a positive integer")?;
+        }
+        if let Ok(v) = env::var("JMODGUARD_LOG_DISCORD_TIMEOUT_SECS") {
+            self.log.discord_timeout_secs = v
+                .trim()
+                .parse()
+                .context("JMODGUARD_LOG_DISCORD_TIMEOUT_SECS must be a positive integer")?;
         }
         if let Ok(v) = env::var("JMODGUARD_LOG_LEVEL") {
             self.log.level = v.trim().to_string();

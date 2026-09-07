@@ -23,7 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "members", "events", "bans", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "settings"];
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -359,7 +359,7 @@ function selectedGuild() {
 function renderTab() {
   const map = {
     dashboard: tabDashboard, rules: tabRules, badwords: tabBadwords, commands: tabCommands,
-    templates: tabTemplates, logchannels: tabLogChannels, members: tabMembers,
+    templates: tabTemplates, logchannels: tabLogChannels,
     events: tabEvents, bans: tabBans, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
@@ -430,7 +430,7 @@ function tabDashboard() {
       stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
       stat("Log channels", chans),
       stat("Badword patterns", cfg.badwords.length),
-      stat("Retention", Number(cfg.settings.retention_days) === 0 ? "forever" : `${cfg.settings.retention_days}d`),
+      stat("Chat history", "Not stored"),
     ),
     el("div", { class: "card", style: "margin-top:16px" },
       el("h3", { text: "Getting started" }),
@@ -973,45 +973,8 @@ function tabLogChannels() {
 }
 
 // ---------------------------------------------------------------------------
-// members / events / bans
+// events / bans
 // ---------------------------------------------------------------------------
-
-function tabMembers() {
-  const q = el("input", { type: "text", placeholder: "search name or id" });
-  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Member", "User ID", "Status", "Joins", "Messages", "First joined", "Last left"].map((text) => el("th", { text })))), el("tbody", {}));
-  const guildId = state.guildId;
-  let request = 0;
-  const tbody = () => table.querySelector("tbody");
-  const run = async () => {
-    const current = ++request;
-    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, text: "Loading…" })));
-    try {
-      const rows = await api(`/api/guilds/${guildId}/members?q=${encodeURIComponent(q.value || "")}&limit=100`);
-      if (current !== request) return;
-      tbody().innerHTML = "";
-      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 7, class: "muted", text: "No matching records." })));
-      rows.forEach((r) => tbody().append(el("tr", {},
-        el("td", { text: r.username || String(r.user_id) }),
-        el("td", { class: "mono", text: r.user_id }),
-        el("td", { text: r.currently_in ? "in server" : "left" }),
-        el("td", { text: `joined ${r.join_count}x` }),
-        el("td", { text: `${r.message_count} msgs` }),
-        el("td", { class: "muted", text: r.first_joined_at ? new Date(r.first_joined_at).toLocaleString() : "-" }),
-        el("td", { class: "muted", text: r.last_left_at ? new Date(r.last_left_at).toLocaleString() : "-" }),
-      )));
-    } catch (e) {
-      if (current !== request) return;
-      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
-    }
-  };
-  q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
-  run().catch((e) => toast(e.message, "error"));
-  return el("div", {},
-    el("h2", { text: "Members" }),
-    el("div", { class: "row", style: "margin-bottom:12px" }, q, el("button", { class: "btn", text: "Search", onclick: run })),
-    table,
-  );
-}
 
 function tabEvents() {
   const typeSel = el("select", {}, el("option", { value: "", text: "all types" }),
@@ -1109,7 +1072,6 @@ function tabSettings() {
   const ov = cfg.settings_override || {};
   const prefix = el("input", { type: "text", value: cfg.settings.prefix });
   const botName = el("input", { type: "text", value: cfg.settings.bot_name });
-  const retention = el("input", { type: "number", min: 0, value: cfg.settings.retention_days });
 
   const srcSel = el("select", {},
     ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => el("option", { value: g.id, text: g.name })),
@@ -1176,12 +1138,6 @@ function tabSettings() {
           "Empty clears the Discord nickname. Nicknames are configured per server.",
           false,
         ),
-        settingsField(
-          "Message retention (days)",
-          retention,
-          "retention_days",
-          "0 = keep forever. Empty + Save clears a server override (inherit global).",
-        ),
       ),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         // Tri-state body: omit unchanged, null clears override, value sets.
@@ -1202,24 +1158,7 @@ function tabSettings() {
         if (botName.value !== cfg.settings.bot_name) {
           body.bot_name = botName.value;
         }
-        const rawDays = String(retention.value ?? "").trim();
-        if (rawDays === "") {
-          // Empty means "clear override / inherit" — never "forever" (that is 0).
-          // Without an override, blank is invalid (same fail-closed rule as prefix).
-          if (ov.retention_days != null) body.retention_days = null;
-          else {
-            toast("Enter retention days (0 = forever). Empty only clears a server override.", "error");
-            return;
-          }
-        } else {
-          const days = Number(rawDays);
-          if (!Number.isSafeInteger(days) || days < 0) {
-            toast("Retention must be a non-negative whole number (0 = keep forever)", "error");
-            return;
-          }
-          if (days !== cfg.settings.retention_days) body.retention_days = days;
-        }
-        if (body.prefix === undefined && body.bot_name === undefined && body.retention_days === undefined) {
+        if (body.prefix === undefined && body.bot_name === undefined) {
           toast("No settings changes", "success");
           return;
         }
@@ -1359,7 +1298,7 @@ function bootUi() {
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) markDirty();
+    if (event.target.matches("input, textarea, select") && !["events", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }

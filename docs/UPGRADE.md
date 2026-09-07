@@ -114,7 +114,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    inheritance. Runtime reads ignore corrupt rows so inheritance remains
    available, but only a bot migrate-open durably heals them. The bot also writes durable
    `meta.settings_terminal_defaults` from `bot.default_prefix` /
-   `bot.retention_days` on every migrate-open; both processes read that meta
+   the transitional `bot.retention_days` field on every migrate-open (routine chat
+   collection/purge and its UI control are retired); both processes read that meta
    row on each settings resolve (not cached at open). The API **refuses to
    open** if that meta row is missing — start the bot first (do not let the API
    seed terminal defaults from its own config). Legacy settings heal is skipped

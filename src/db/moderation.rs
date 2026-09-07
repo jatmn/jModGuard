@@ -818,44 +818,19 @@ pub async fn get_user(db: &Db, user_id: i64) -> Result<Option<(String, Option<St
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
-    pub messages: i64,
     pub events: i64,
-    pub members: i64,
     pub warns: i64,
     pub bans: i64,
-    pub guilds: i64,
 }
 
-/// Process-wide aggregates for bot housekeeping logs only.
-/// Do **not** expose this to Discord commands or the WebUI — use [`guild_stats`].
-pub async fn stats(db: &Db) -> Result<Stats> {
-    db.with_conn(|conn| {
-        let one = |sql: &str| conn.query_row(sql, (), |r| Ok(r.get::<i64>(0)?));
-        Ok(Stats {
-            messages: one("SELECT COUNT(*) FROM messages WHERE created_at <> ''")?,
-            events: one("SELECT COUNT(*) FROM events")?,
-            members: one("SELECT COUNT(*) FROM members")?,
-            warns: one("SELECT COUNT(*) FROM warns")?,
-            bans: one("SELECT COUNT(*) FROM bans")?,
-            guilds: one("SELECT COUNT(DISTINCT guild_id) FROM members")?,
-        })
-    })
-    .await
-}
-
-/// Per-guild aggregates for the WebUI (avoids leaking other servers' data).
+/// Per-guild retained moderation aggregates; ordinary activity is not collected.
 pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| {
         let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
-            messages: one(
-                "SELECT COUNT(*) FROM messages WHERE guild_id = ?1 AND created_at <> ''",
-            )?,
             events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1")?,
-            members: one("SELECT COUNT(*) FROM members WHERE guild_id = ?1")?,
             warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,
             bans: one("SELECT COUNT(*) FROM bans WHERE guild_id = ?1")?,
-            guilds: 1,
         })
     })
     .await
