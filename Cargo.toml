@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = [".", "crates/runtime", "crates/conductor"]
-default-members = [".", "crates/runtime", "crates/conductor"]
+# Preserve existing root build commands; the optional conductor is selected with -p.
+default-members = ["."]
 
 [workspace.package]
 version = "0.1.0"

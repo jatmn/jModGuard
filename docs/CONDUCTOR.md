@@ -1,7 +1,7 @@
 # Conductor development
 
-The conductor is the independent installation-control process being built on the
-`overhaul` branch. Current code supplies process startup and status only. Updates,
+The conductor is an optional independent installation-control process under development.
+Current code supplies process startup and status only. Updates,
 backups, recovery, owner authentication and provider operations are not available yet.
 Do not route production administration traffic to this development service.
 

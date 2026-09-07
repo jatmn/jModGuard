@@ -3,9 +3,9 @@
 Contributor-oriented build and design invariants for the public jModGuard repo.
 Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Upgrades: `docs/UPGRADE.md`.
 
-## Overhaul branch
+## Incremental overhaul
 
-Source implementation is active. See `docs/OVERHAUL.md` for completed and pending slices.
+The first compatible foundation is integrated here. See `docs/OVERHAUL.md` for scope.
 The workspace adds `crates/runtime` (shared process primitives) and `crates/conductor`
 (independent control process). Do not import the broad `jmodguard` application crate,
 Serenity or bot/API state into those crates. The existing bot/API feature/state/config
@@ -15,6 +15,8 @@ slice is implemented, with corresponding regression coverage.
 The conductor currently reports liveness/version but readiness remains 503. Do not
 expose operational routes until owner authorization and durable control state exist.
 No live provider testing or deployment is part of the current local implementation.
+This foundation preserves existing database migrations and bot/API configuration.
+Fresh-database enforcement and other incompatible cutovers belong in separate changes.
 
 ## Commands
 

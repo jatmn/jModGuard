@@ -1,13 +1,28 @@
 # Overhaul implementation status
 
-The `overhaul` branch develops a fresh deployment baseline. It is not ready for a
-production installation. Existing deployment instructions describe the previous
-bot/API system until their replacements are implemented and tested.
+The overhaul lands in independently reviewed changes. This first wave adds the Cargo
+workspace, shared process utilities and an optional conductor development foundation.
+Existing bot/API installation and upgrade instructions continue to apply.
+
+## Compatibility of this wave
+
+- Existing database migrations, bootstrap, configuration and WebUI contracts are unchanged.
+  There is no database reset, schema-family gate or data conversion in this change.
+- Bot/API binary names, Cargo feature flags and health/shutdown module paths remain
+  available. Existing container definitions include the new workspace directories.
+  Bare Cargo commands still select the application; conductor builds use an explicit
+  package selection, and CI uses `--workspace` to include all tests.
+- Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
+  deployment approval flow remain in place; the conductor is not auto-published or
+  required for startup.
+- The conductor has no operational API and must not be deployed as an update/recovery
+  service. Its addition does not establish production tenant isolation or resource usage.
 
 The target has three Rust services (Discord bot, guild API and installation conductor)
 and a static WebUI. Generic setup, releases and recovery tooling will live in this
-repository; private installation credentials stay with the operator. The new baseline
-will not import the previous system's databases or adopt its deployment resources.
+repository; private installation credentials stay with the operator. A later, explicitly
+incompatible fresh-installation baseline will be reviewed separately. That future
+baseline will not import old databases; it is not activated by this foundation.
 
 ## Implemented: service foundation
 
