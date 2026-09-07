@@ -85,7 +85,8 @@ steps:
       ready=0
       i=0
       while [ "$$i" -lt 30 ]; do
-        if curl -sS -o /dev/null --connect-timeout 1 "$$JMODGUARD_REMOTE_TEST_URL"; then
+        # GET / is a WebSocket upgrade route (404 for curl), not the health route.
+        if curl -fsS -o /dev/null --connect-timeout 1 --max-time 1 "$$JMODGUARD_REMOTE_TEST_URL/health"; then
           ready=1
           break
         fi
@@ -93,7 +94,7 @@ steps:
         sleep 1
       done
       if [ "$$ready" -ne 1 ]; then
-        echo "$$NAME did not become ready within 30s" >&2
+        echo "$$NAME did not become healthy after 30 attempts" >&2
         exit 1
       fi
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
