@@ -8,7 +8,8 @@ use crate::db::{DbOpenOptions, MAX_RETENTION_DAYS};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
-pub struct Config {
+// Private loader adapter; runtime constructors accept only a process configuration.
+struct Config {
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub web: WebConfig,
@@ -113,27 +114,141 @@ impl Default for LogConfig {
     }
 }
 
-impl Config {
-    /// Loads config from `config.toml` (path from `--config <path>` or env
-    /// `JMODGUARD_CONFIG`, else default in CWD). Environment variables
-    /// (JMODGUARD_DISCORD_TOKEN, JMODGUARD_WEB_BASE_URL, ...) override values.
+/// Configuration retained by the Discord worker. It cannot hold OAuth credentials.
+/// ```compile_fail
+/// fn oauth_access(cfg: &jmodguard::config::BotProcessConfig) {
+///     let _ = &cfg.web;
+/// }
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BotProcessConfig {
+    pub discord: DiscordConfig,
+    pub db: DbConfig,
+    pub bot: BotConfig,
+    pub log: LogConfig,
+}
+
+/// API process configuration. The bot token remains required for direct REST actions;
+/// remove it only when those operations have a complete replacement.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ApiProcessConfig {
+    pub discord: DiscordConfig,
+    pub db: DbConfig,
+    pub web: WebConfig,
+    pub bot: BotConfig,
+    pub log: LogConfig,
+}
+
+impl From<Config> for BotProcessConfig {
+    fn from(c: Config) -> Self {
+        Self {
+            discord: c.discord,
+            db: c.db,
+            bot: c.bot,
+            log: c.log,
+        }
+    }
+}
+impl From<Config> for ApiProcessConfig {
+    fn from(c: Config) -> Self {
+        Self {
+            discord: c.discord,
+            db: c.db,
+            web: c.web,
+            bot: c.bot,
+            log: c.log,
+        }
+    }
+}
+impl From<BotProcessConfig> for Config {
+    fn from(c: BotProcessConfig) -> Self {
+        Self {
+            discord: c.discord,
+            db: c.db,
+            web: WebConfig::default(),
+            bot: c.bot,
+            log: c.log,
+        }
+    }
+}
+impl From<ApiProcessConfig> for Config {
+    fn from(c: ApiProcessConfig) -> Self {
+        Self {
+            discord: c.discord,
+            db: c.db,
+            web: c.web,
+            bot: c.bot,
+            log: c.log,
+        }
+    }
+}
+impl BotProcessConfig {
+    pub fn is_remote_db(&self) -> bool {
+        !self.db.url.trim().is_empty()
+    }
     pub fn load() -> Result<Self> {
+        Config::load_for(false).map(Into::into)
+    }
+    pub fn db_open_options(&self) -> DbOpenOptions {
+        self.db.open_options(&self.bot, true)
+    }
+    pub fn health_bind(&self) -> Option<String> {
+        health_bind_from_env()
+    }
+}
+impl ApiProcessConfig {
+    pub fn load() -> Result<Self> {
+        let cfg = Config::load_for(true)?;
+        cfg.validate_cors()?;
+        cfg.validate_public_base_url()?;
+        Ok(cfg.into())
+    }
+    pub fn db_open_options(&self) -> DbOpenOptions {
+        self.db.open_options(&self.bot, false)
+    }
+}
+impl DbConfig {
+    fn open_options(&self, bot: &BotConfig, migrate: bool) -> DbOpenOptions {
+        DbOpenOptions {
+            path: self.path.clone(),
+            url: self.url.clone(),
+            token: self.token.clone(),
+            pool_size: self.pool_size,
+            migrate,
+            default_prefix: bot.default_prefix.clone(),
+            retention_days: bot.retention_days,
+        }
+    }
+}
+
+impl Config {
+    /// Load the requested process shape from JMODGUARD_CONFIG or config.toml.
+    /// File sections belonging only to the other process are ignored by serde.
+    fn load_for(api: bool) -> Result<Self> {
         let path = env::var("JMODGUARD_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("config.toml"));
-
-        let mut cfg: Config = if path.exists() {
+        let mut cfg = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
-            toml::from_str(&raw)
+            Self::parse_file(&raw, api)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?
         } else {
             tracing::warn!("config.toml not found; using defaults. See config.example.toml.");
-            Config::default()
+            Self::default()
         };
-
-        cfg.apply_env()?;
+        cfg.apply_env_for(api)?;
         Ok(cfg)
+    }
+
+    fn parse_file(raw: &str, api: bool) -> Result<Self> {
+        if api {
+            Ok(toml::from_str::<ApiProcessConfig>(raw)?.into())
+        } else {
+            Ok(toml::from_str::<BotProcessConfig>(raw)?.into())
+        }
     }
 
     fn retention_days_in_range(days: u32, source: &str) -> Result<u32> {
@@ -141,28 +256,6 @@ impl Config {
             anyhow::bail!("{source} must be between 0 and {MAX_RETENTION_DAYS} (got {days})");
         }
         Ok(days)
-    }
-
-    /// True when this process is configured for a remote libSQL database.
-    pub fn is_remote_db(&self) -> bool {
-        !self.db.url.trim().is_empty()
-    }
-
-    /// Optional process-local health bind (`JMODGUARD_HEALTH_BIND`).
-    /// Empty / unset disables the bot health listener. Container images set
-    /// `0.0.0.0:8080` so Magic Containers HTTP GET `/health` has a port.
-    pub fn health_bind(&self) -> Option<String> {
-        match env::var("JMODGUARD_HEALTH_BIND") {
-            Ok(value) => {
-                let value = value.trim();
-                if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }
-            Err(_) => None,
-        }
     }
 
     /// Reject a public HTTP bind that still uses a localhost or non-HTTPS
@@ -225,20 +318,12 @@ impl Config {
         Ok(())
     }
 
-    /// Builds DB open options for this process (`migrate=true` for bot, `false` for API).
-    pub fn db_open_options(&self, migrate: bool) -> DbOpenOptions {
-        DbOpenOptions {
-            path: self.db.path.clone(),
-            url: self.db.url.clone(),
-            token: self.db.token.clone(),
-            pool_size: self.db.pool_size,
-            migrate,
-            default_prefix: self.bot.default_prefix.clone(),
-            retention_days: self.bot.retention_days,
-        }
+    #[cfg(test)]
+    fn apply_env(&mut self) -> Result<()> {
+        self.apply_env_for(false)
     }
 
-    fn apply_env(&mut self) -> Result<()> {
+    fn apply_env_for(&mut self, api: bool) -> Result<()> {
         if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
             self.discord.token = v.trim().to_string();
         }
@@ -284,24 +369,26 @@ impl Config {
                  Unset JMODGUARD_REQUIRE_REMOTE_DB only for a local SQLite run."
             );
         }
-        if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
-            self.web.bind = v.trim().to_string();
-        }
-        if let Ok(v) = env::var("JMODGUARD_WEB_BASE_URL") {
-            self.web.base_url = v.trim().trim_end_matches('/').to_string();
-        }
-        if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_ID") {
-            self.web.oauth_client_id = v.trim().to_string();
-        }
-        if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_SECRET") {
-            self.web.oauth_client_secret = v.trim().to_string();
-        }
-        if let Ok(v) = env::var("JMODGUARD_CORS_ORIGINS") {
-            self.web.cors_origins = v
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+        if api {
+            if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
+                self.web.bind = v.trim().to_string();
+            }
+            if let Ok(v) = env::var("JMODGUARD_WEB_BASE_URL") {
+                self.web.base_url = v.trim().trim_end_matches('/').to_string();
+            }
+            if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_ID") {
+                self.web.oauth_client_id = v.trim().to_string();
+            }
+            if let Ok(v) = env::var("JMODGUARD_OAUTH_CLIENT_SECRET") {
+                self.web.oauth_client_secret = v.trim().to_string();
+            }
+            if let Ok(v) = env::var("JMODGUARD_CORS_ORIGINS") {
+                self.web.cors_origins = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
         }
         if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
             let v = v.trim();
@@ -375,6 +462,20 @@ impl Config {
         // writes already reject above MAX_RETENTION_DAYS or purge skips.
         Self::retention_days_in_range(self.bot.retention_days, "bot.retention_days")?;
         Ok(())
+    }
+}
+
+fn health_bind_from_env() -> Option<String> {
+    match env::var("JMODGUARD_HEALTH_BIND") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -464,6 +565,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bot_file_ignores_dashboard_fields_but_api_validates_them() {
+        let raw = "[discord]\ntoken='bot-token'\n[web]\noauth_client_secret=123\nbind=[]\n";
+        let bot = Config::parse_file(raw, false).unwrap();
+        assert_eq!(bot.discord.token, "bot-token");
+        assert!(bot.web.oauth_client_secret.is_empty());
+        assert!(Config::parse_file(raw, true).is_err());
+        // TOML syntax still has to be valid, even in an ignored section.
+        assert!(Config::parse_file("[web]\nbind=[", false).is_err());
+        assert!(Config::parse_file("[discord]\ntoken=123", false).is_err());
+        assert!(Config::parse_file("[discord]\ntoken=123", true).is_err());
+    }
+
+    #[test]
+    fn process_options_fix_migration_role_and_keep_shared_settings() {
+        let raw = "[db]\npath='custom.db'\npool_size=3\n[bot]\ndefault_prefix='?'\nowner_id=42\nconfig_poll_secs=2\n[log]\ndiscord_concurrency=4\ndiscord_timeout_secs=6\n";
+        let bot: super::BotProcessConfig = Config::parse_file(raw, false).unwrap().into();
+        let api: super::ApiProcessConfig = Config::parse_file(raw, true).unwrap().into();
+        let bot_db = bot.db_open_options();
+        let api_db = api.db_open_options();
+        assert!(bot_db.migrate);
+        assert!(!api_db.migrate);
+        assert_eq!(bot_db.path, api_db.path);
+        assert_eq!(api_db.pool_size, 3);
+        assert_eq!(bot_db.default_prefix, "?");
+        assert_eq!(api.bot.owner_id, 42);
+        assert_eq!(api.bot.config_poll_secs, 2);
+        assert_eq!(bot.log.discord_concurrency, 4);
+        assert_eq!(bot.log.discord_timeout_secs, 6);
+    }
+
+    #[test]
+    fn process_environment_loads_oauth_only_for_api_and_bot_token_for_both() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        const NAMES: &[&str] = &[
+            "JMODGUARD_OAUTH_CLIENT_ID",
+            "JMODGUARD_OAUTH_CLIENT_SECRET",
+            "JMODGUARD_WEB_BASE_URL",
+            "JMODGUARD_DISCORD_TOKEN",
+        ];
+        let _saved = SavedEnv::capture(NAMES);
+        unsafe {
+            std::env::set_var("JMODGUARD_OAUTH_CLIENT_ID", "oauth-id");
+            std::env::set_var("JMODGUARD_OAUTH_CLIENT_SECRET", "oauth-secret");
+            std::env::set_var("JMODGUARD_WEB_BASE_URL", "https://dashboard.invalid/");
+            std::env::set_var("JMODGUARD_DISCORD_TOKEN", " bot-secret ");
+        }
+        let mut bot = Config::default();
+        bot.apply_env_for(false).unwrap();
+        let mut api = Config::default();
+        api.apply_env_for(true).unwrap();
+        assert!(bot.web.oauth_client_id.is_empty());
+        assert!(bot.web.oauth_client_secret.is_empty());
+        assert_eq!(api.web.oauth_client_id, "oauth-id");
+        assert_eq!(api.web.oauth_client_secret, "oauth-secret");
+        assert_eq!(api.web.base_url, "https://dashboard.invalid");
+        assert_eq!(bot.discord.token, "bot-secret");
+        assert_eq!(api.discord.token, "bot-secret");
     }
 
     #[test]

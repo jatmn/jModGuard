@@ -23,16 +23,16 @@ pub mod types;
 #[cfg(feature = "web")]
 pub mod web;
 
-use crate::config::Config;
+use crate::config::LogConfig;
 pub use jmodguard_runtime::shutdown_signal;
 
 /// Initializes tracing from config (console or rolling files under `log.directory`).
 ///
 /// `process` selects a per-binary log file stem (`jmodguard-bot` / `jmodguard-api`)
 /// so dual-process deploys do not contend on one shared appender.
-pub fn init_tracing(cfg: &Config, process: &str) {
-    let level = cfg.log.level.clone();
-    let dir = cfg.log.directory.clone();
+pub fn init_tracing(cfg: &LogConfig, process: &str) {
+    let level = cfg.level.clone();
+    let dir = cfg.directory.clone();
     // Our crate logs per-message diagnostics at debug; everything else at the
     // configured level. This keeps the log file useful without drowning in
     // serenity internals.

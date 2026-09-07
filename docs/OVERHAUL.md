@@ -78,15 +78,28 @@ state. The bot no longer allocates an OAuth HTTP client or dashboard display cac
 OAuth code is compiled with `web`. API configuration reads remain direct database reads,
 with primary-confirmed version observation and protection against concurrent local writes.
 
-The shared configuration shape and package still exist. The API still requires a bot
+The shared package still exists. The API still requires a bot
 token for direct unban and log-channel validation; the bot uses its Gateway/REST token
 as before. This slice adds no queue, changes no schema or wire contract, and does not
 claim credential/dependency isolation or measured memory savings. The optional conductor
 remains inactive. See [runtime state ownership](ARCHITECTURE.md#runtime-state-ownership).
 
+## Implemented: typed process configuration
+
+Runtime constructors now require `BotProcessConfig` or `ApiProcessConfig`. The bot has
+no dashboard configuration field and ignores dashboard TOML values/environment overrides;
+the API still loads and validates them. Common settings and environment/DB credential
+precedence remain unchanged. DB-open options encode each process's existing migration
+role; tracing consumes only logging settings.
+
+The API retains its bot token for current direct Discord actions. The private common
+loader adapter and shared bot/log settings remain implementation scaffolding. This adds
+no queue, schema or dependency change, and does not isolate OS environment/filesystem
+secrets or database privileges. See [process configuration](ARCHITECTURE.md#process-configuration).
+
 ## Next implementation slices
 
-1. Separate process configuration and credentials. Replace API bot-token operations with typed,
+1. Complete credential separation. Replace API bot-token operations with typed,
    durable bot actions, preserving current guild permission checks and explicit outcomes.
    Complete bot/API crate boundaries without pulling gateway/cache state into the API.
 2. Implement the fresh data model and tenant routing: shared/dedicated guild placement,

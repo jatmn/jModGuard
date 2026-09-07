@@ -47,11 +47,30 @@ The processes have separate state types in the current shared application crate:
   moderation engine, cooldown maps, log-delivery semaphore or slash-sync state.
 
 Existing unban and log-channel validation still use a lazy bot-token REST client owned
-by `ApiState`. Both processes still load the common `Config` shape and both require the
-bot token under the existing startup contract. State separation does not yet isolate
-credentials or remove Serenity from the API dependency graph. The durable action queue,
-process-specific configuration and independent bot/API packages are separate work.
-No additional dependency is introduced by this split; resource savings are not measured.
+by `ApiState`. Both processes still require the bot token under the existing startup
+contract. The durable action queue, API bot-token removal and independent bot/API
+packages remain separate work. No dependency is added; resource savings are not measured.
+
+## Process configuration
+
+`BotState` accepts `BotProcessConfig`; `ApiState` accepts `ApiProcessConfig`. The bot
+configuration has no `web` field. Its loader ignores dashboard fields in TOML and does
+not apply web/OAuth environment overrides. Malformed dashboard field values therefore
+cannot block the bot, although the shared file must still have valid TOML syntax.
+The API loader continues to parse and validate dashboard configuration, including
+credentialed CORS and public HTTPS origin checks, before opening its listener.
+
+The file path (`JMODGUARD_CONFIG` or `config.toml`), environment names, environment-over-file
+precedence, atomic remote DB credential selection and common bot/log settings remain.
+API configuration still includes its required bot token. This narrows retained typed
+configuration; it is not an OS secret boundary. A process can still read environment
+variables or the raw contents of a shared file made available to it. Assign OAuth
+secrets only to the API in a deployment that needs process-level secret separation.
+
+The process config builds DB options without a caller-supplied migration flag: bot
+options initialize the database, API options wait for completed initialization. This
+encodes startup ownership, not DB privilege isolation. The `jmodguard-core-1` schema,
+shared database access and existing bootstrap/defaults behavior are unchanged.
 
 ## Config cache invalidation
 

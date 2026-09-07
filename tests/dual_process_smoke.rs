@@ -7,7 +7,7 @@
 //! 2. API-side write bumps `config_version`; bot poll invalidates cache ≤ poll window.
 //! 3. Bot-side write (simulated `!prefix`) is visible via API DB reads.
 
-use jmodguard::config::Config;
+use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
 use jmodguard::db::{self, Db, DbOpenOptions};
 use jmodguard::state::BotState;
 use jmodguard::web::state::ApiState;
@@ -60,10 +60,10 @@ async fn smoke_dual_process_config_sync() {
     {
         let (bot_db, api_db) = open_dual(&tmp);
 
-        let mut cfg = Config::default();
+        let mut cfg = BotProcessConfig::default();
         cfg.bot.config_poll_secs = 1;
-        let bot = BotState::new(cfg.clone(), bot_db).expect("BotState");
-        let api = ApiState::new(cfg, api_db).expect("ApiState");
+        let bot = BotState::new(cfg, bot_db).expect("BotState");
+        let api = ApiState::new(ApiProcessConfig::default(), api_db).expect("ApiState");
 
         let guild_id: u64 = 55_555;
 

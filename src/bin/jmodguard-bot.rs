@@ -1,7 +1,7 @@
 //! jModGuard Discord bot process (gateway only — health listener optional).
 
 use anyhow::{Context as _, Result};
-use jmodguard::config::Config;
+use jmodguard::config::BotProcessConfig;
 use jmodguard::db::Db;
 use jmodguard::handlers::Handler;
 use jmodguard::state::BotState;
@@ -172,7 +172,7 @@ async fn drain_nickname_reconciles(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = Config::load()?;
+    let cfg = BotProcessConfig::load()?;
 
     if cfg.discord.token.is_empty() {
         anyhow::bail!(
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    init_tracing(&cfg, "bot");
+    init_tracing(&cfg.log, "bot");
 
     // Liveness must accept before database retry. Platform probes hit this
     // port while `open_with_until_ready` waits on a waking database or a
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    let opts = cfg.db_open_options(true);
+    let opts = cfg.db_open_options();
     let (attempts, delay) = db::startup_open_retry(&opts);
     let db = tokio::select! {
         db = Db::open_with_until_ready(opts, attempts, delay) => db.with_context(|| {

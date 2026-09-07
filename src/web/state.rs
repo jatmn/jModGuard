@@ -1,7 +1,7 @@
 //! API-owned dashboard state without moderation or compiled guild caches.
 //! Bot-token REST remains here until the durable action queue replaces direct calls.
 use super::oauth::{DiscordGuild, DiscordUser, OAuthClient};
-use crate::config::Config;
+use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// ```
 pub struct ApiState {
     pub db: Db,
-    pub cfg: Arc<Config>,
+    pub cfg: Arc<ApiProcessConfig>,
     pub oauth: OAuthClient,
     /// Transitional lazy bot-token REST client for existing API actions.
     discord_http_cell: std::sync::OnceLock<Arc<serenity::http::Http>>,
@@ -27,7 +27,7 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    pub fn new(cfg: Config, db: Db) -> Result<Arc<Self>> {
+    pub fn new(cfg: ApiProcessConfig, db: Db) -> Result<Arc<Self>> {
         let http = reqwest::Client::builder()
             .user_agent("jModGuard (Discord dashboard)")
             .timeout(Duration::from_secs(15))
@@ -116,10 +116,10 @@ mod tests {
                 rand::random::<u128>()
             ));
             let writer = Db::open(&path, 2).unwrap();
-            let mut cfg = Config::default();
+            let mut cfg = ApiProcessConfig::default();
             cfg.db.path = path.clone();
             cfg.db.pool_size = 2;
-            let db = Db::open_with(cfg.db_open_options(false)).unwrap();
+            let db = Db::open_with(cfg.db_open_options()).unwrap();
             let api = ApiState::new(cfg, db).unwrap();
             Self { writer, api, path }
         }

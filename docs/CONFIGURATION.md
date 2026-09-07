@@ -3,6 +3,12 @@
 There are two layers: the static `config.toml` (tokens, bindings) and the
 database (everything server-related, editable at runtime).
 
+The bot and API load `BotProcessConfig` and `ApiProcessConfig` respectively. Existing
+file/env names remain valid. The bot ignores `[web]` fields and web/OAuth env overrides;
+the API continues to validate them. The shared file must have valid TOML syntax. Both
+processes still need their bot token for existing Discord operations; this change does
+not activate the action queue. See [process configuration](ARCHITECTURE.md#process-configuration).
+
 ## config.toml
 
 | Key | Default | Description |
