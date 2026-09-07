@@ -3,10 +3,25 @@
 Contributor-oriented build and design invariants for the public jModGuard repo.
 Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Upgrades: `docs/UPGRADE.md`.
 
+## Incremental overhaul
+
+The first compatible foundation is integrated here. See `docs/OVERHAUL.md` for scope.
+The workspace adds `crates/runtime` (shared process primitives) and `crates/conductor`
+(independent control process). Do not import the broad `jmodguard` application crate,
+Serenity or bot/API state into those crates. The existing bot/API feature/state/config
+invariants below describe current code; replace them deliberately as their overhaul
+slice is implemented, with corresponding regression coverage.
+
+The conductor currently reports liveness/version but readiness remains 503. Do not
+expose operational routes until owner authorization and durable control state exist.
+No live provider testing or deployment is part of the current local implementation.
+This foundation preserves existing database migrations and bot/API configuration.
+Fresh-database enforcement and other incompatible cutovers belong in separate changes.
+
 ## Commands
 
 ```bash
-cargo test --locked
+cargo test --locked --workspace
 cargo test --locked --no-default-features --lib
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
@@ -18,6 +33,9 @@ node --test scripts/frontend-state-test.mjs
 node --test scripts/frontend-warmup-test.mjs
 node --test scripts/publish-frontend-test.mjs
 python3 scripts/frontend-release-test.py
+cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
+cargo build --locked -p jmodguard-conductor
+python3 scripts/check-service-boundaries.py
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -31,7 +49,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 ## Version pins (verified)
 
 - Rust **1.96.0** — `rust-toolchain.toml`, CI (`dtolnay/rust-toolchain` pinned to
-  the 1.96.0 commit SHA), and `Dockerfile.{bot,api}` (`rust:1.96-bookworm`) must
+  the 1.96.0 commit SHA), and `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm`) must
   stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float CI on `@stable`.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
@@ -197,7 +215,7 @@ src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)
 src/discord.rs          Discord REST helpers (nickname retries)
-src/health.rs          process-local GET/HEAD /health listener (bot; API bind until axum)
+crates/runtime/src/health.rs process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
 src/state.rs            AppState + config cache + version poll
@@ -207,6 +225,6 @@ src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
 migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
-Dockerfile.bot / Dockerfile.api
+Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

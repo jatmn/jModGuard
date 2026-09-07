@@ -11,7 +11,7 @@ export TMPDIR="${TMPDIR:-$ROOT/.tmp}"
 mkdir -p "$TMPDIR"
 
 echo "==> cargo test --locked"
-cargo test --locked
+cargo test --locked --workspace
 
 echo "==> cargo test --locked --no-default-features --lib"
 cargo test --locked --no-default-features --lib
@@ -30,5 +30,9 @@ cargo build --locked --bin jmodguard-bot --no-default-features
 
 echo "==> api builds with web feature"
 cargo build --locked --bin jmodguard-api
+
+cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
+cargo build --locked -p jmodguard-conductor
+python3 scripts/check-service-boundaries.py
 
 echo "==> CI checks complete (no Discord network required)"

@@ -1,0 +1,17 @@
+[package]
+name = "jmodguard-conductor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Independent jModGuard installation control service"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+jmodguard-runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

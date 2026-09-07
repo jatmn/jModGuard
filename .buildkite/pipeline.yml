@@ -4,6 +4,12 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Bound compiler memory on self-hosted runners. CI checks need assertions,
+  # not full debugger symbols or incremental state discarded by git clean.
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 steps:
   - label: "test"
@@ -11,7 +17,7 @@ steps:
     command: |
       set -eu
       mkdir -p .tmp
-      export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      export TMPDIR="$$PWD/.tmp" CARGO_TARGET_DIR="$$PWD/target"
       # Cargo clones git deps into ~/.cargo/git, so `git config --local` on this
       # checkout never applies. GIT_CONFIG_* env vars do, for every git subprocess.
       # Prefer an inherited GITHUB_TOKEN (do not map $$GITHUB_TOKEN in env — that
@@ -29,11 +35,14 @@ steps:
           ;;
       esac
       cargo fetch --locked
-      cargo test --locked
+      cargo test --locked --workspace
       cargo test --locked --no-default-features --lib
       cargo clippy --locked --bins -- -D warnings
       cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
       cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
+      cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
+      cargo build --locked -p jmodguard-conductor
+      python3 scripts/check-service-boundaries.py
       node --test scripts/frontend-state-test.mjs
       node --test scripts/frontend-warmup-test.mjs
       node --test scripts/publish-frontend-test.mjs
@@ -48,7 +57,7 @@ steps:
     command: |
       set -euo pipefail
       mkdir -p .tmp
-      export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      export TMPDIR="$$PWD/.tmp" CARGO_TARGET_DIR="$$PWD/target"
       case "$${GITHUB_TOKEN:-}" in
         ''|'$$GITHUB_TOKEN')
           export GIT_CONFIG_COUNT=1
@@ -75,16 +84,17 @@ steps:
       export JMODGUARD_REMOTE_TEST_TOKEN=local-ci-token
       ready=0
       i=0
-      while [ "$i" -lt 30 ]; do
-        if curl -sS -o /dev/null --connect-timeout 1 "$$JMODGUARD_REMOTE_TEST_URL"; then
+      while [ "$$i" -lt 30 ]; do
+        # GET / is a WebSocket upgrade route (404 for curl), not the health route.
+        if curl -fsS -o /dev/null --connect-timeout 1 --max-time 1 "$$JMODGUARD_REMOTE_TEST_URL/health"; then
           ready=1
           break
         fi
         i=$((i + 1))
         sleep 1
       done
-      if [ "$ready" -ne 1 ]; then
-        echo "$$NAME did not become ready within 30s" >&2
+      if [ "$$ready" -ne 1 ]; then
+        echo "$$NAME did not become healthy after 30 attempts" >&2
         exit 1
       fi
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture

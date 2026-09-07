@@ -1117,6 +1117,7 @@ dependencies = [
  "dashmap 6.2.1",
  "fallible-iterator",
  "hyper 0.14.32",
+ "jmodguard-runtime",
  "libsql",
  "libsql-sqlite3-parser",
  "parking_lot",
@@ -1142,6 +1143,28 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-normalization",
+]
+
+[[package]]
+name = "jmodguard-conductor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "jmodguard-runtime",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "jmodguard-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

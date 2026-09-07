@@ -23,7 +23,7 @@ on:
       - src/db/**
       - src/db_compat.rs
       - src/defaults.rs
-      - src/health.rs
+      - crates/runtime/**
       - src/ids.rs
       - src/logging.rs
       - src/normalize.rs
