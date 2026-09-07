@@ -11,7 +11,7 @@ steps:
     command: |
       set -eu
       mkdir -p .tmp
-      export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      export TMPDIR="$$PWD/.tmp" CARGO_TARGET_DIR="$$PWD/target"
       # Cargo clones git deps into ~/.cargo/git, so `git config --local` on this
       # checkout never applies. GIT_CONFIG_* env vars do, for every git subprocess.
       # Prefer an inherited GITHUB_TOKEN (do not map $$GITHUB_TOKEN in env — that
@@ -51,7 +51,7 @@ steps:
     command: |
       set -euo pipefail
       mkdir -p .tmp
-      export TMPDIR="$PWD/.tmp" CARGO_TARGET_DIR="$PWD/target"
+      export TMPDIR="$$PWD/.tmp" CARGO_TARGET_DIR="$$PWD/target"
       case "$${GITHUB_TOKEN:-}" in
         ''|'$$GITHUB_TOKEN')
           export GIT_CONFIG_COUNT=1
@@ -78,7 +78,7 @@ steps:
       export JMODGUARD_REMOTE_TEST_TOKEN=local-ci-token
       ready=0
       i=0
-      while [ "$i" -lt 30 ]; do
+      while [ "$$i" -lt 30 ]; do
         if curl -sS -o /dev/null --connect-timeout 1 "$$JMODGUARD_REMOTE_TEST_URL"; then
           ready=1
           break
@@ -86,7 +86,7 @@ steps:
         i=$((i + 1))
         sleep 1
       done
-      if [ "$ready" -ne 1 ]; then
+      if [ "$$ready" -ne 1 ]; then
         echo "$$NAME did not become ready within 30s" >&2
         exit 1
       fi
