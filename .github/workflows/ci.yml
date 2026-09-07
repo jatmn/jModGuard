@@ -56,7 +56,7 @@ jobs:
       - name: cargo test --locked
         env:
           GITHUB_TOKEN: ""
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: cargo test --locked --no-default-features --lib
         env:
@@ -77,6 +77,12 @@ jobs:
         env:
           GITHUB_TOKEN: ""
         run: cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
+
+      - name: conductor and shared runtime
+        run: |
+          cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
+          cargo build --locked -p jmodguard-conductor
+          python3 scripts/check-service-boundaries.py
 
       - name: frontend workspace state
         run: node --test scripts/frontend-state-test.mjs

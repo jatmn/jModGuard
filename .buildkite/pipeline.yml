@@ -29,11 +29,14 @@ steps:
           ;;
       esac
       cargo fetch --locked
-      cargo test --locked
+      cargo test --locked --workspace
       cargo test --locked --no-default-features --lib
       cargo clippy --locked --bins -- -D warnings
       cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
       cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
+      cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
+      cargo build --locked -p jmodguard-conductor
+      python3 scripts/check-service-boundaries.py
       node --test scripts/frontend-state-test.mjs
       node --test scripts/frontend-warmup-test.mjs
       node --test scripts/publish-frontend-test.mjs

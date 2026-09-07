@@ -1,3 +1,14 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/runtime", "crates/conductor"]
+default-members = [".", "crates/runtime", "crates/conductor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+
 [package]
 name = "jmodguard"
 version = "0.1.0"
@@ -26,6 +37,7 @@ path = "src/bin/jmodguard-api.rs"
 required-features = ["web"]
 
 [dependencies]
+jmodguard-runtime = { path = "crates/runtime" }
 anyhow = "1"
 axum = { version = "0.8", optional = true, features = ["json", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }

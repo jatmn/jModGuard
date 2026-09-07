@@ -589,12 +589,10 @@ fn ensure_api_writes_allowed_fails_closed_on_query_only() {
         .err()
         .expect("query_only connection must fail the API write probe");
     let msg = err.to_string();
+    assert!(msg.contains("cannot write"), "unexpected: {msg}");
     assert!(
-        msg.contains("cannot write"),
-        "unexpected: {msg}"
-    );
-    assert!(
-        err.downcast_ref::<crate::db::RemoteTokenCannotWrite>().is_some(),
+        err.downcast_ref::<crate::db::RemoteTokenCannotWrite>()
+            .is_some(),
         "write-probe denial must keep a typed non-retryable error, not only help text: {msg}"
     );
     assert!(

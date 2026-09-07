@@ -1,5 +1,10 @@
 # jModGuard
 
+**Overhaul branch:** source implementation has started. The independent conductor
+foundation is available for local development; operational updates/backups are still
+pending. See [implementation status](docs/OVERHAUL.md). The instructions below describe
+the existing bot/API system until the new deployment baseline is complete.
+
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
 (bot + API/WebUI), libSQL-backed, multi-server.
 
