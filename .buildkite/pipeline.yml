@@ -4,6 +4,12 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Bound compiler memory on self-hosted runners. CI checks need assertions,
+  # not full debugger symbols or incremental state discarded by git clean.
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 steps:
   - label: "test"
