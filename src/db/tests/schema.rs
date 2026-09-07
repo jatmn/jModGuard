@@ -199,3 +199,41 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
         cleanup_db(&path);
     }
 }
+
+#[test]
+fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
+    let path = tmp_db_path("queue_upgrade");
+    let conn = Connection::open(&path).unwrap();
+    for (index, sql) in MIGRATIONS[..5].iter().enumerate() {
+        let tx = conn.transaction_primary_read().unwrap();
+        tx.execute_batch(sql).unwrap();
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute_batch("INSERT INTO log_channels(guild_id,event_type,channel_id) VALUES(42,'member_join',123);
+        INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,100,200,'keep audit','2026-09-07');").unwrap();
+    drop(conn);
+    assert!(is_schema_not_ready(
+        &Db::open_with(options(&path, false)).err().unwrap()
+    ));
+    drop(Db::open_with(options(&path, true)).unwrap());
+    let api = Db::open_with(options(&path, false)).unwrap();
+    assert_eq!(
+        tokio_test_block_on(list_log_channels(&api, 42)).unwrap()[0].1,
+        123
+    );
+    assert_eq!(
+        tokio_test_block_on(list_warns(&api, 42, 100)).unwrap()[0]
+            .reason
+            .as_deref(),
+        Some("keep audit")
+    );
+    assert!(
+        tokio_test_block_on(recent_bot_actions(&api, 42))
+            .unwrap()
+            .is_empty()
+    );
+    drop(api);
+    cleanup_db(&path);
+}

@@ -41,9 +41,19 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0005. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0006. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
-Keep a backup with the binaries/images that support its family and version. An old
-backup requires its matching old release; it cannot be restored into this baseline as
+Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
+lineage requires its matching release; it cannot be restored into this baseline as
 an upgrade. This is a schema boundary, not an automatic backup or restore implementation.
+
+## Action storage extension
+
+Migration 0006 adds an initially empty durable action queue and replay-floor metadata
+within `jmodguard-core-1`. Bot startup can extend version 5 while retaining configuration
+and moderation records; the API waits for the updated bootstrap marker. Deploy matched
+bot/API builds. Older binaries that support only version 5 reject version 6 on startup;
+rollback requires the matching pre-upgrade database backup, not a version-marker edit.
+This does not add a production backup implementation or an old-lineage migration.
+The queue is [inactive storage groundwork](BOT-ACTIONS.md), not an enabled service.

@@ -207,7 +207,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch("DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts;")?;
+        conn.execute_batch("DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DELETE FROM meta WHERE key='action_request_floor';")?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -2533,3 +2533,6 @@ fn patch_settings_noop_does_not_bump_config_version() {
 }
 
 mod schema;
+
+mod action_history;
+mod action_queue;
