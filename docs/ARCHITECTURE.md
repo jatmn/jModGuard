@@ -32,6 +32,27 @@ by processes on different hosts.
 - Build the **bot** with `--no-default-features`.
 - The **API** binary requires `web` (`required-features = ["web"]`).
 
+## Runtime state ownership
+
+The processes have separate state types in the current shared application crate:
+
+- `BotState` owns compiled guild configuration, automod working state, command cooldowns,
+  Discord log-delivery limits and slash-command synchronization. It does not construct
+  dashboard OAuth clients or user/guild display caches. Nickname reconciliation reuses
+  the Gateway client's REST handle and caches bot identity in its worker; it does not
+  allocate a second REST client or fetch identity when no nickname jobs are pending.
+- `ApiState` owns the OAuth client, dashboard identity/display caches and a serialized
+  database-version observation. Configuration endpoints already read the database
+  directly; the API no longer constructs the bot's compiled configuration cache,
+  moderation engine, cooldown maps, log-delivery semaphore or slash-sync state.
+
+Existing unban and log-channel validation still use a lazy bot-token REST client owned
+by `ApiState`. Both processes still load the common `Config` shape and both require the
+bot token under the existing startup contract. State separation does not yet isolate
+credentials or remove Serenity from the API dependency graph. The durable action queue,
+process-specific configuration and independent bot/API packages are separate work.
+No additional dependency is introduced by this split; resource savings are not measured.
+
 ## Config cache invalidation
 
 Config writers bump a durable `meta.config_version` row and replace its
@@ -39,12 +60,15 @@ Config writers bump a durable `meta.config_version` row and replace its
 (same transaction as the write). Runtime moderation writers (events,
 warns, bans) do **not** bump it.
 
-Both processes poll `bot.config_poll_secs` (default 5) and invalidate their
-in-memory guild config cache when the version changes. Command registry writers
+Both processes poll `bot.config_poll_secs` (default 5). The bot invalidates its compiled
+guild cache; the API updates its database read observation without a compiled cache.
+Local config writes continue to advance the DB read floor immediately. Command registry writers
 also bump `meta.slash_registry_version` and replace its revision token; the bot polls that independently each
 tick and re-syncs Discord slash commands only when it advances (not on every
-settings/rules/template write). `AppState::new` primes both baselines from the
-DB so the first poll has no unobserved window.
+settings/rules/template write). `BotState::new` primes both baselines and
+`ApiState::new` primes its config observation from the primary. Neither skips its first
+observation. API primary reconciliation checks the local write generation so an older
+snapshot cannot replace the read floor after a concurrent API mutation.
 
 Expect up to one poll interval of lag locally after a cross-process config
 write; remote deployments can additionally wait for provider replica convergence.
@@ -69,6 +93,9 @@ committed nickname win across bot/API races and survives cancelled requests
 without rolling back durable settings.
 
 ## Migrations
+
+The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
+migrations 0001–0005. The runtime-state split changes no schema or stored data.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
   versions, heals settings, then publishes a
@@ -95,6 +122,9 @@ without rolling back durable settings.
 src/lib.rs                 shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
+src/state.rs               BotState, compiled config cache and slash-version polling
+src/web/state.rs           ApiState and config-version observation
+src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
 migrations/                0001_init through 0005_mutation_receipts_nickname_jobs

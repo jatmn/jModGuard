@@ -141,7 +141,9 @@ db/moderation.rs       moderation records and transitional historical data helpe
 db_compat.rs   synchronous libSQL transaction/deadline/outcome facade
 defaults.rs    seeded rules / commands / templates
 types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)
-state.rs       AppState, OAuth client, per-guild config cache + version poll
+state.rs       BotState, compiled guild config cache + version poll
+web/state.rs   ApiState, dashboard caches + config read observation
+web/oauth.rs   dashboard OAuth client + identity models
 normalize.rs   bypass-resistant text normalization (NFD, zero-width, leetspeak)
 templates.rs   {variable} renderer shared by everything
 logging.rs     event → channel router + audit log

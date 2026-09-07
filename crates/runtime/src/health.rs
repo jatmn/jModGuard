@@ -5,7 +5,7 @@
 //! `/health` and `/health/` with 200 once the process has bound the port,
 //! without cookies, routing, or a database round-trip. `/` is not liveness.
 //! The API exposes the same paths on its public bind via axum, and answers
-//! probes on that socket until axum takes over (database open, AppState
+//! probes on that socket until axum takes over (database open, API state
 //! primary-version prime, router build). Application routes must not look
 //! successful during that window: they get `503`. `/api` uses the JSON
 //! `{"error":"not ready"}` shape so the SPA can retry. Browser navigations

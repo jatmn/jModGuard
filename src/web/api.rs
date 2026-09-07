@@ -9,19 +9,19 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tower_sessions::Session;
 
+use super::state::ApiState;
 use super::{
     ApiError, ApiResult, AuthCtx, authorize_manage_guild, guild_scope, is_bot_owner,
     require_bot_owner,
 };
 use crate::db;
-use crate::state::AppState;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
 
 /// Authorizes an endpoint that operates on a real Discord guild. Global
 /// configuration (`guild_id = 0`) is intentionally handled by configuration
 /// routes, but it must never reach Discord REST or guild-local audit tables.
 async fn real_guild_scope(
-    app: &Arc<AppState>,
+    app: &Arc<ApiState>,
     session: &Session,
     guild_id: u64,
 ) -> ApiResult<AuthCtx> {
@@ -48,7 +48,7 @@ fn settings_wire(settings: &impl serde::Serialize) -> serde_json::Value {
 }
 
 pub async fn guild_config(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -189,7 +189,7 @@ pub struct SettingsBody {
 }
 
 pub async fn update_settings(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<SettingsBody>,
@@ -214,7 +214,6 @@ pub async fn update_settings(
         body.sync_nickname,
     )
     .await?;
-    app.invalidate_configs();
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -236,7 +235,7 @@ pub struct RuleBody {
 }
 
 pub async fn get_rule(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, rule_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -260,7 +259,7 @@ pub async fn get_rule(
 }
 
 pub async fn put_rule(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<RuleBody>,
@@ -271,7 +270,6 @@ pub async fn put_rule(
     }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     db::upsert_rule(&app.db, scope, &rule_id, &body.data).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -281,7 +279,7 @@ pub struct ScopeBody {
 }
 
 pub async fn delete_rule(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
@@ -289,12 +287,11 @@ pub async fn delete_rule(
     let auth = guild_scope(&app, &session, guild_id).await?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     db::delete_rule(&app.db, scope, &rule_id).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub(crate) fn scope_from(
-    app: &AppState,
+    app: &ApiState,
     auth: &AuthCtx,
     scope: &Option<String>,
     guild_id: u64,
@@ -321,7 +318,7 @@ pub struct BadwordBody {
 }
 
 pub async fn list_badwords(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -332,7 +329,7 @@ pub async fn list_badwords(
 }
 
 pub async fn add_badword(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<BadwordBody>,
@@ -340,12 +337,11 @@ pub async fn add_badword(
     let auth = guild_scope(&app, &session, guild_id).await?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let id = db::add_badword(&app.db, scope, &body.pattern, body.note.as_deref()).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
 pub async fn delete_badword(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, word_id)): Path<(u64, i64)>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -367,10 +363,7 @@ pub async fn delete_badword(
     // Post-auth miss (TOCTOU race / already deleted) must stay uniform — do not
     // surface guild-scoped DB wording if the layer ever diverges again.
     match db::delete_badword(&app.db, word_id, word.guild_id).await {
-        Ok(()) => {
-            app.invalidate_configs();
-            Ok(Json(serde_json::json!({ "ok": true })))
-        }
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(e) if e.to_string().contains("badword not found") => Err(not_found()),
         Err(e) => Err(ApiError(e)),
     }
@@ -387,7 +380,7 @@ pub struct CommandBody {
 }
 
 pub async fn list_commands(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -398,7 +391,7 @@ pub async fn list_commands(
 }
 
 pub async fn get_command(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, name)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -439,7 +432,7 @@ fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
 }
 
 pub async fn put_command(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<CommandBody>,
@@ -451,12 +444,11 @@ pub async fn put_command(
     data.name = name.clone();
     validate_command_descriptor(&data)?;
     db::upsert_command(&app.db, scope, &name, &data).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn create_command(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<CommandBody>,
@@ -468,12 +460,11 @@ pub async fn create_command(
     data.name = name.clone();
     validate_command_descriptor(&data)?;
     db::upsert_command(&app.db, scope, &name, &data).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 pub async fn delete_command(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
@@ -481,7 +472,6 @@ pub async fn delete_command(
     let auth = guild_scope(&app, &session, guild_id).await?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     db::delete_command(&app.db, scope, &name.to_lowercase()).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -496,7 +486,7 @@ pub struct TemplateBody {
 }
 
 pub async fn list_templates(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -507,7 +497,7 @@ pub async fn list_templates(
 }
 
 pub async fn get_template(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -527,7 +517,7 @@ pub async fn get_template(
 }
 
 pub async fn put_template(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<TemplateBody>,
@@ -538,12 +528,11 @@ pub async fn put_template(
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
     db::upsert_template(&app.db, scope, &event, &body.template).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn delete_template(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
@@ -551,7 +540,6 @@ pub async fn delete_template(
     let auth = guild_scope(&app, &session, guild_id).await?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     db::delete_template(&app.db, scope, &event).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -579,7 +567,7 @@ fn log_channels_wire(rows: Vec<(String, i64)>) -> Vec<serde_json::Value> {
 }
 
 pub async fn list_logchannels(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -592,7 +580,7 @@ pub async fn list_logchannels(
 }
 
 pub async fn get_logchannel(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -612,7 +600,7 @@ pub async fn get_logchannel(
 }
 
 pub async fn put_logchannel(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<LogChannelBody>,
@@ -635,12 +623,11 @@ pub async fn put_logchannel(
     .await
     .map_err(ApiError)?;
     db::upsert_log_channel(&app.db, scope, &event, body.channel_id).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn delete_logchannel(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
@@ -653,7 +640,6 @@ pub async fn delete_logchannel(
         )));
     }
     db::delete_log_channel(&app.db, scope, &event).await?;
-    app.invalidate_configs();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -669,7 +655,7 @@ pub struct CopyBody {
 }
 
 pub async fn copy_config(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<CopyBody>,
@@ -701,7 +687,6 @@ pub async fn copy_config(
         body.sections,
     )
     .await?;
-    app.invalidate_configs();
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -725,7 +710,7 @@ pub struct TestRegexBody {
 }
 
 pub async fn test_regex(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<TestRegexBody>,
@@ -761,7 +746,7 @@ pub struct EventsQuery {
 }
 
 pub async fn events(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Query(query): Query<EventsQuery>,
@@ -779,7 +764,7 @@ pub async fn events(
 }
 
 pub async fn bans(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Query(query): Query<SearchQuery>,
@@ -797,7 +782,7 @@ pub struct UnbanBody {
 }
 
 pub async fn unban(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
     Json(body): Json<UnbanBody>,
@@ -841,7 +826,7 @@ pub async fn unban(
 }
 
 pub async fn stats(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<ApiState>>,
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {

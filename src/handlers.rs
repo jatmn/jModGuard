@@ -17,15 +17,15 @@ use crate::automod::{MsgCtx, execute_pending};
 use crate::commands;
 use crate::db;
 use crate::logging;
-use crate::state::AppState;
+use crate::state::BotState;
 use crate::templates;
 
 pub struct Handler {
-    pub app: Arc<AppState>,
+    pub app: Arc<BotState>,
 }
 
 impl Handler {
-    fn app(&self) -> &Arc<AppState> {
+    fn app(&self) -> &Arc<BotState> {
         &self.app
     }
 }

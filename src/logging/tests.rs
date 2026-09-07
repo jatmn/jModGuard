@@ -67,7 +67,7 @@ fn delivery_disables_mentions_and_embeds_and_bounds_unicode() {
 }
 
 struct Fixture {
-    app: Arc<AppState>,
+    app: Arc<BotState>,
     path: std::path::PathBuf,
 }
 impl Fixture {
@@ -79,7 +79,7 @@ impl Fixture {
         cfg.log.discord_concurrency = 1;
         cfg.log.discord_timeout_secs = 1;
         Self {
-            app: AppState::new(cfg, db).unwrap(),
+            app: BotState::new(cfg, db).unwrap(),
             path,
         }
     }
@@ -247,6 +247,6 @@ fn invalid_delivery_budgets_fail_before_building_runtime_state() {
         let mut cfg = Config::default();
         cfg.log.discord_concurrency = concurrency;
         cfg.log.discord_timeout_secs = timeout;
-        assert!(AppState::new(cfg, db).is_err());
+        assert!(BotState::new(cfg, db).is_err());
     }
 }

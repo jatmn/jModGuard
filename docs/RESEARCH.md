@@ -82,7 +82,7 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 ## axum 0.8
 
 - `FromRef` derive needs the **macros** feature; here we pass
-  `Arc<AppState>` as state directly, so it is unused.
+  `Arc<ApiState>` as state directly, so it is unused.
 - Path params use `{name}` syntax: `"/api/guilds/{guild_id}/config"`.
 - tower-sessions 0.14 has no `cookie-store` feature (memory-store only);
   `Session::remove` is generic (`let _: Option<String> = …`).
