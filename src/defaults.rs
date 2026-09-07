@@ -338,7 +338,7 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "stats",
         "Utility",
-        "This server's stats (members, messages, events, warns, bans).",
+        "This server's retained moderation counts (records, warns, bans).",
         "!stats",
         "everyone",
         Behavior::Stats,

@@ -32,7 +32,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
   });
-  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -52,6 +52,38 @@ function findNode(root, predicate) {
 function textOf(root) {
   return (root.textContent || '') + (root.children || []).map(textOf).join('');
 }
+
+test('dashboard moderation counts stay with their requested server', async () => {
+  const pending = [];
+  const { app } = harness((url) => new Promise(resolve => pending.push({ url, resolve })));
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const first = app.tabDashboard();
+  app.state.guildId = app.state.guilds[1].id;
+  const second = app.tabDashboard();
+  assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/stats`);
+  assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
+  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
+  pending[1].resolve(response({ events: 7, warns: 2, bans: 1 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(value(second, 'Moderation records'), '7');
+  assert.equal(value(second, 'Warns'), '2');
+  assert.equal(value(second, 'Bans'), '1');
+  pending[0].resolve(response({ events: 900, warns: 8, bans: 3 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(value(first, 'Moderation records'), '900');
+  assert.equal(value(second, 'Moderation records'), '7');
+});
+
+test('dashboard does not show zero moderation counts when stats are unavailable', async () => {
+  const { app } = harness(async () => { throw new Error('offline'); });
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const dashboard = app.tabDashboard();
+  await new Promise(resolve => setImmediate(resolve));
+  for (const label of ['Moderation records', 'Warns', 'Bans']) {
+    const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
+    assert.equal(card.children[0].textContent, 'Unavailable');
+  }
+});
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
   const first = harness();

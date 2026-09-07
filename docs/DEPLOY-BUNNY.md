@@ -360,7 +360,8 @@ self-host.
    origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
-6. Configure a dry-run rule and check the audit event.
+6. Configure an `automod` log channel, enable a dry-run rule and check its Discord
+   report. Dry-run observations no longer appear as new SQL Audit Log rows.
 7. Restart the **API** app only: bot stays connected; users log in again.
 8. Restart the **bot** app only: API stays up; bot returns online.
 

@@ -823,12 +823,22 @@ pub struct Stats {
     pub bans: i64,
 }
 
-/// Per-guild retained moderation aggregates; ordinary activity is not collected.
+/// Per-guild identified moderation aggregates. Legacy unclassified plan summaries
+/// remain available through query_events, but cannot truthfully count as moderation.
 pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
     db.with_conn(move |conn| {
         let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
         Ok(Stats {
-            events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1")?,
+            events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
+                   event_type IN ('mod_action','timeout_add','timeout_remove',
+                                  'member_ban','member_unban','member_kick')
+                   OR CASE WHEN json_valid(data) THEN
+                     (event_type = 'automod'
+                      AND json_extract(data, '$.action') IN ('warn','timeout','kick','ban')
+                      AND COALESCE(json_extract(data, '$.dry_run'), 0) = 0)
+                     OR (event_type = 'plan_executed' AND json_type(data, '$.moderation') = 'true')
+                   ELSE 0 END
+                 )")?,
             warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,
             bans: one("SELECT COUNT(*) FROM bans WHERE guild_id = ?1")?,
         })

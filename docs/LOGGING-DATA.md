@@ -24,6 +24,10 @@ working state still needs the planned bounded exact-text/image redesign. Optiona
 before/deleted-content logging is not implemented. Routine reports are not retained for
 later recovery, and failed delivery is not reconstructed from Discord or SQL.
 
+Existing saved templates keep their wording, including old seeded defaults. Follow
+the [template adoption instructions](TEMPLATES.md#existing-saved-templates) to include
+message IDs and attachment counts on an existing installation.
+
 ## Delivery limits
 
 The bot admits up to `log.discord_concurrency` reports (default 8), with a total deadline
@@ -49,7 +53,13 @@ handling; they are not the complete durable case/evidence system. External audit
 attribution, truthful partial-action outcomes and selected evidence capture remain work.
 
 The Members view/endpoint and message-retention UI/API field are removed. Guild stats
-report retained moderation counts only. Old `messages`/`members`/`users` schema and data
+report identified moderation counts only. Counts include moderation events and live
+warn/timeout/kick/ban automod records, excluding dry runs. New moderation-plan summaries
+carry a `moderation: true` classification flag, which does not assert step success. Older
+plan summaries have only command/step counts and cannot be classified reliably, so
+they are excluded from this aggregate. All existing rows, including routine history and
+unclassified plans, remain accessible in the Audit Log. Warns and bans retain their
+separate table counts. Old `messages`/`members`/`users` schema and data
 helpers remain as temporary scaffolding for the fresh tenant model and existing DB
 regressions; services are guarded against calling them. Old internal retention fields
 have no live collection effect. This wave leaves migrations and bootstrap unchanged and

@@ -414,6 +414,14 @@ function tabDashboard() {
   const rulesDry = cfg.rules.filter((r) => r.effective.dry_run).length;
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
+  const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans']]
+    .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
+  const guildId = state.guildId;
+  api(`/api/guilds/${guildId}/stats`).then(counts => {
+    moderation.forEach(({ key, value }) => { value.textContent = counts[key] == null ? 'Unavailable' : String(counts[key]); });
+  }).catch(() => {
+    moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
+  });
   return el("div", {},
     el("section", { class: "hero" },
       el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
@@ -430,8 +438,10 @@ function tabDashboard() {
       stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
       stat("Log channels", chans),
       stat("Badword patterns", cfg.badwords.length),
-      stat("Chat history", "Not stored"),
+      stat("Routine chat collection", "Off"),
+      ...moderation.map(({ value, label }) => el('div', { class: 'stat' }, value, el('div', { class: 'label', text: label }))),
     ),
+    el('p', { class: 'muted', text: 'Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.' }),
     el("div", { class: "card", style: "margin-top:16px" },
       el("h3", { text: "Getting started" }),
       el("p", { class: "muted", text: isBotOwner()
@@ -892,7 +902,7 @@ function tabTemplates() {
   return el("div", {},
     el("h2", { text: "Event templates" }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Templates render into the configured log channels. Variables: {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {message_link} {count} {age} {joined} {duration} {time}."),
+      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. Earlier text and deleted content are not retained. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed."),
     ...state.config.templates.map((t) => templateCard(t)),
   );
 }

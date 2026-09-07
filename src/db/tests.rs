@@ -876,6 +876,87 @@ fn guild_stats_are_scoped_not_global() {
 }
 
 #[test]
+fn moderation_stats_exclude_routine_and_unclassified_history() {
+    let tmp = tmp_db_path("moderation_stats_history");
+    let db = Db::open(&tmp, 2).unwrap();
+    let baseline = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let routine = [
+        ("system", serde_json::json!({})),
+        ("message_edit", serde_json::json!({})),
+        ("message_delete", serde_json::json!({})),
+        ("automod", serde_json::json!({"action":"log"})),
+        ("automod", serde_json::json!({"action":"delete"})),
+        (
+            "automod",
+            serde_json::json!({"action":"ban", "dry_run":true}),
+        ),
+        (
+            "plan_executed",
+            serde_json::json!({"command":"old", "steps":1}),
+        ),
+        ("plan_executed", serde_json::json!({"moderation":false})),
+        ("plan_executed", serde_json::json!({"moderation":"true"})),
+    ];
+    for (event, data) in &routine {
+        tokio_test_block_on(insert_event(&db, 11, event, None, None, data)).unwrap();
+    }
+    // Transitional rows can contain malformed JSON; they must not break stats.
+    db.with_conn_sync(|conn| {
+        conn.execute_batch(
+            "INSERT INTO events (guild_id,event_type,data,created_at)
+             VALUES (11,'automod','invalid',''), (11,'plan_executed',NULL,'');",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tokio_test_block_on(guild_stats(&db, 11)).unwrap().events, 0);
+    let retained = [
+        ("mod_action", serde_json::json!({"action":"warn"})),
+        ("timeout_add", serde_json::json!({})),
+        ("timeout_remove", serde_json::json!({})),
+        ("member_ban", serde_json::json!({})),
+        ("member_unban", serde_json::json!({})),
+        ("member_kick", serde_json::json!({})),
+        ("automod", serde_json::json!({"action":"warn"})),
+        (
+            "automod",
+            serde_json::json!({"action":"timeout", "dry_run":false}),
+        ),
+        ("automod", serde_json::json!({"action":"kick"})),
+        ("automod", serde_json::json!({"action":"ban"})),
+        (
+            "plan_executed",
+            serde_json::json!({"command":"new", "steps":1, "moderation":true}),
+        ),
+    ];
+    for guild in [11, 22] {
+        for (event, data) in &retained {
+            tokio_test_block_on(insert_event(&db, guild, event, None, None, data)).unwrap();
+        }
+    }
+    assert_eq!(
+        tokio_test_block_on(guild_stats(&db, 11)).unwrap().events,
+        retained.len() as i64
+    );
+    assert_eq!(
+        tokio_test_block_on(guild_stats(&db, 22)).unwrap().events,
+        retained.len() as i64
+    );
+    // Counting does not erase or hide the ambiguous/routine legacy audit rows.
+    assert_eq!(
+        tokio_test_block_on(query_events(&db, 11, None, None, 200))
+            .unwrap()
+            .len(),
+        routine.len() + 2 + retained.len()
+    );
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        baseline
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn dual_process_local_share_config_version() {
     // Bot migrates; API opens migrate=false; writer bump visible to both.
     let tmp = tmp_db_path("dual");

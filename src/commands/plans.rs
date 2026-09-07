@@ -104,7 +104,7 @@ async fn record_moderation_plan(
             "plan_executed",
             Some(actor),
             Some(actor),
-            &serde_json::json!({"command": command, "steps": steps.len()}),
+            &serde_json::json!({"command": command, "steps": steps.len(), "moderation": true}),
         )
         .await?;
     }
@@ -210,8 +210,12 @@ mod tests {
             assert_eq!(row.actor_id, Some(20));
             let data: serde_json::Value =
                 serde_json::from_str(row.data.as_deref().unwrap()).unwrap();
-            assert_eq!(data, serde_json::json!({"command":"moderate", "steps":1}));
+            assert_eq!(
+                data,
+                serde_json::json!({"command":"moderate", "steps":1, "moderation":true})
+            );
         }
+        assert_eq!(db::guild_stats(&db, 10).await.unwrap().events, 3);
         assert!(
             db::query_events(&db, 11, None, None, 10)
                 .await

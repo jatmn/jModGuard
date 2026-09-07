@@ -131,6 +131,17 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 Do **not** run a new API against a DB that has not been migrated by a new bot
 (or an equivalent migrate step).
 
+### Adopt basic report templates
+
+This logging wave preserves saved templates and commands, including old seeded values.
+Edit the `message_edit` and `message_delete` templates using the
+[provided basic report values](TEMPLATES.md#existing-saved-templates) to display message
+references and supplied attachment counts. Resetting only a guild template inherits its
+saved global value. Existing custom templates are never overwritten automatically.
+The saved `stats` command description may still mention member/message counts; update
+its description in Commands if needed. The command itself now reports moderation counts.
+Publish matching frontend/API artifacts and reload older settings pages.
+
 ## 6. Verify
 
 - Discord: prefix or slash command responds.

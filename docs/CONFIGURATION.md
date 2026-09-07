@@ -54,7 +54,7 @@ exits if that wait expires).
 | `badwords` | regex patterns (server + global) |
 | `members` | retired schema scaffolding; no live collection or WebUI member history |
 | `messages` | retired schema scaffolding; no live collection |
-| `events` | transitional retained moderation records; routine channel reports do not append here |
+| `events` | transitional moderation records and older routine history; new routine channel reports do not append here |
 | `warns` / `bans` | warnings and ban history |
 | `users` | retired schema scaffolding; no live collection |
 

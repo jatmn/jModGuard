@@ -111,13 +111,13 @@ the editor does not undo an acknowledged global write.
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | server stats: prefix, rules enabled, dry-runs, commands, log channels |
+| **Dashboard** | server configuration plus identified moderation records, warns and bans; unavailable counts are explicit |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
 | **Log Channels** | map each event type to a channel ID for that server |
-| **Audit Log** | retained moderation history (type, user, actor); routine events report to Discord channels |
+| **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Bans** | ban history + unban via the bot token (API process) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
