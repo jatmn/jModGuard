@@ -1,8 +1,7 @@
 use jmodguard::db::{
     Db, DbOpenOptions, add_badword, add_warn, bump_config_version, get_config_version,
     get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
-    mark_deleted_with_previous, mark_edited_with_previous, patch_settings, query_events,
-    record_message_activity, test_drop_next_commit_response,
+    patch_settings, query_events, test_drop_next_commit_response,
 };
 use jmodguard::state::ConfigCache;
 use std::path::PathBuf;
@@ -147,59 +146,15 @@ async fn bot_bootstrap_and_api_share_remote_database() {
             .any(|row| row.id == warn_id)
     );
 
-    // Edit/delete lookups are causally dependent on the original insert. They
-    // must read and mark through one primary-routed transaction rather than
-    // lose audit context to a lagging replica.
-    record_message_activity(
-        &bot,
-        9_001,
-        42,
-        300,
-        100,
-        "remote-user",
-        Some("Remote User"),
-        "before edit",
-        "[]",
-        "2026-01-01T00:00:00Z",
-    )
-    .await
-    .unwrap();
-    let edited = mark_edited_with_previous(&api, 9_001, 42, 300, Some(100), false, "after edit")
-        .await
-        .unwrap()
-        .expect("primary edit transaction should find the inserted message");
-    assert_eq!(edited.0, "before edit");
-    let deleted = mark_deleted_with_previous(&api, 9_001, 42, 300, false)
-        .await
-        .unwrap()
-        .expect("primary delete transaction should find the edited message");
-    assert_eq!(deleted.0, "after edit");
-
-    // Lifecycle gateway events can overtake the best-effort activity write.
-    // Their tombstones must survive the eventual message upsert remotely too.
-    assert!(
-        mark_edited_with_previous(&api, 9_002, 42, 300, Some(100), true, "early edit")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    record_message_activity(
-        &bot,
-        9_002,
-        42,
-        300,
-        100,
-        "remote-user",
-        Some("Remote User"),
-        "original content",
-        "[]",
-        "2026-01-01T00:00:00Z",
-    )
-    .await
-    .unwrap();
-    let after_reorder = mark_deleted_with_previous(&api, 9_002, 42, 300, false)
-        .await
-        .unwrap()
-        .expect("late activity upsert must preserve the earlier edit tombstone");
-    assert_eq!(after_reorder.0, "early edit");
+    // The fresh schema must not grow a chat or member archive on remote SQL.
+    // Exercise the same check on the remote transport as on local SQLite.
+    api.with_conn(|conn| {
+        use jmodguard::db::SqlExecutor;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('messages','members','users','mutes')",
+            (), |r| Ok(r.get(0)?),
+        )?;
+        anyhow::ensure!(count == 0, "retired history tables exist");
+        Ok(())
+    }).await.unwrap();
 }

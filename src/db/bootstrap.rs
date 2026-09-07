@@ -17,6 +17,48 @@ pub(super) fn configure_connection(connection: &Connection, remote: bool) -> Res
     }
 }
 
+/// Accept an empty database or this lineage, never an unrelated/previous install.
+/// Caller supplies a primary transaction so all checks share an authoritative snapshot.
+fn ensure_schema_family(conn: &impl SqlExecutor) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
+    if version == 0 && objects == 0 {
+        return Ok(());
+    }
+    let has_meta: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
+    let family = if has_meta == 1 {
+        meta_string_conn(conn, "schema_family")?
+    } else {
+        None
+    };
+    if family.as_deref() != Some(SCHEMA_FAMILY) {
+        return Err(UnsupportedSchema(
+            "unsupported database schema family; this release requires a fresh empty database or a database initialized by this baseline. Existing data was not adopted".into(),
+        ).into());
+    }
+    if version < 1 {
+        return Err(UnsupportedSchema(
+            "invalid schema version for an initialized jModGuard database".into(),
+        )
+        .into());
+    }
+    if version > MIGRATIONS.len() as i64 {
+        return Err(UnsupportedSchema(
+            "database schema is newer than this binary; use a compatible release".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // Migration selection must be authoritative. A lagging remote replica can
     // otherwise report vN-1 after vN committed and make us replay a
@@ -24,6 +66,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;
         let tx = conn.transaction_primary_read()?;
+        ensure_schema_family(&tx)?;
         // Recheck while holding the primary write lock. Separate bot
         // processes can otherwise both decide to replay a non-idempotent
         // migration from the same stale pre-lock user_version.
@@ -72,6 +115,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
 }
 
 pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
+    ensure_schema_family(conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let required = MIGRATIONS.len() as i64;
     if version < required {

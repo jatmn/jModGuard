@@ -119,7 +119,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
         .db
         .with_conn(|conn| {
             conn.execute_batch(
-                "DROP TABLE messages; DROP TABLE members; DROP TABLE users; DROP TABLE events;",
+                "DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS members; DROP TABLE IF EXISTS users; DROP TABLE events;",
             )?;
             Ok(())
         })

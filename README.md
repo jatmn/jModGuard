@@ -1,5 +1,9 @@
 # jModGuard
 
+**Database compatibility:** this release requires a fresh database or the recognized
+`jmodguard-core-1` family. Earlier databases/backups require their matching old release;
+they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
+
 An optional conductor foundation is available for local development; operational
 updates and backups are still pending. The existing bot/API installation does not
 require it. See [implementation status](docs/OVERHAUL.md).

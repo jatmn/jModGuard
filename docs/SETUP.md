@@ -1,5 +1,9 @@
 # jModGuard Setup Guide
 
+**Database compatibility:** this release requires a fresh database or the recognized
+`jmodguard-core-1` family. Earlier databases/backups require their matching old release;
+they cannot be adopted by this baseline. See [database setup and recovery](DATABASE-BASELINE.md).
+
 A data-driven Discord moderation bot: automod against spam bots, per-server
 config with global fallback, editable commands/events/templates, and a WebUI.
 

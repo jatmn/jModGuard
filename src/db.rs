@@ -13,11 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// SQL operations on connections supplied by the public `Db::with_conn` API.
+pub use crate::db_compat::SqlExecutor;
 #[cfg(debug_assertions)]
 pub use crate::db_compat::test_drop_next_commit_response;
 use crate::db_compat::{
-    Connection, DbRuntime, OptionalExtension, Row, SqlExecutor, Value,
-    database_operation_timed_out, params, params_from_iter,
+    Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out, params,
+    params_from_iter,
 };
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
@@ -47,9 +49,21 @@ const MIGRATIONS: &[&str] = &[
 /// because the server may have committed before the response was lost.
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(75);
 
-/// Largest supported retention period. It stays below chrono's representable
-/// duration range and is also enforced at the WebUI/database write boundary.
+/// Transitional internal settings validation; no chat history is collected.
+/// Remove with the old settings shape in the fresh tenant/config model.
 pub const MAX_RETENTION_DAYS: u32 = 100_000;
+
+/// Identifies this fresh schema lineage; versions only have meaning within it.
+const SCHEMA_FAMILY: &str = "jmodguard-core-1";
+
+#[derive(Debug)]
+pub struct UnsupportedSchema(pub String);
+impl std::fmt::Display for UnsupportedSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for UnsupportedSchema {}
 
 /// API-open failure: the remote token can read schema but cannot write.
 /// Distinct from `SchemaNotReady` so startup does not retry a permanent
@@ -177,6 +191,12 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
 /// transport errors. Auth failures still fail immediately. Shared by the
 /// API (`migrate=false`) and the bot (`migrate=true`).
 pub fn is_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
+    if err
+        .chain()
+        .any(|e| e.downcast_ref::<UnsupportedSchema>().is_some())
+    {
+        return false;
+    }
     if is_schema_not_ready(err) || is_sqlite_startup_lock(err) {
         return true;
     }

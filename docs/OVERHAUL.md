@@ -2,12 +2,15 @@
 
 The overhaul lands in independently reviewed changes. The service foundation is followed
 by routine logging/data minimization. The existing bot/API and optional inactive conductor
-remain independently buildable. See [logging/data behavior](LOGGING-DATA.md).
+remain independently buildable. A fresh schema baseline now removes the archive tables
+and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
+[database setup boundary](DATABASE-BASELINE.md).
 
 ## Foundation compatibility
 
 - The foundation preserved the database and WebUI contracts. The logging wave below
-  intentionally removes routine-history UI/API surfaces; migrations remain unchanged.
+  intentionally removed routine-history UI/API surfaces. The subsequent schema baseline
+  now requires an empty database or the recognized `jmodguard-core-1` family.
 - Bot/API binary names, Cargo feature flags and health/shutdown module paths remain
   available. Existing container definitions include the new workspace directories.
   Bare Cargo commands still select the application; conductor builds use an explicit
@@ -20,9 +23,8 @@ remain independently buildable. See [logging/data behavior](LOGGING-DATA.md).
 
 The target has three Rust services (Discord bot, guild API and installation conductor)
 and a static WebUI. Generic setup, releases and recovery tooling will live in this
-repository; private installation credentials stay with the operator. A later, explicitly
-incompatible fresh-installation baseline will be reviewed separately. That future
-baseline will not import old databases; it is not activated by this foundation.
+repository; private installation credentials stay with the operator. This schema baseline
+does not import old databases. The fuller tenant/case model remains a later change.
 
 ## Implemented: service foundation
 
@@ -54,9 +56,19 @@ Discord fields, with no reconstructed transcript. Discord delivery is bounded by
 configurable concurrency/deadline, suppresses mentions/previews and has no waiting backlog.
 The Members view/endpoint and retention setting are removed; stats show moderation
 records only. Selected moderation records and moderation-plan summaries remain durable.
-Historical schema/helpers remain transitional; no existing rows are erased by this wave.
+The subsequent fresh baseline removes historical schema/helpers; unsupported existing
+databases are refused without rewriting their application rows.
 Deploy matching frontend/API artifacts and reload old pages that submit retention settings.
 This does not implement new image detection, the case/evidence model or tenant routing.
+
+## Implemented: fresh schema baseline
+
+The initial migration omits chat, member, user and mute archive tables and writes the
+schema-family marker atomically with the initial tables/version. Both processes reject
+unmarked, foreign, invalid or newer schemas before changing bootstrap state. The bot
+can resume initialization within this lineage; the API waits for completed bootstrap.
+Warnings, bans, selected events, configuration and nickname reconciliation remain usable.
+No old deployment conversion or data deletion is performed.
 
 ## Next implementation slices
 

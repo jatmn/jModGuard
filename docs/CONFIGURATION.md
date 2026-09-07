@@ -33,7 +33,8 @@ Environment-only (not in `config.toml`):
 
 ## Database (runtime config)
 
-All of this is managed via the WebUI or bot commands; the schema lives in
+This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
+is managed via the WebUI or bot commands; the schema lives in
 `migrations/` (`0001_init.sql` through `0005_mutation_receipts_nickname_jobs.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
@@ -42,7 +43,7 @@ exits if that wait expires).
 
 | Table | Holds |
 |---|---|
-| `meta` | durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
+| `meta` | schema family/version support and durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
 | `nickname_reconcile` | generation-numbered nickname jobs with pending/dormant/terminal state, persisted retry schedule, attempt count, and last operator-visible error |
 | `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
 | `guild_settings` | prefix and bot nickname as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
@@ -50,13 +51,10 @@ exits if that wait expires).
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
 | `log_channels` | event type → channel mapping (per server only) |
-| `legacy_global_log_channels` | global mappings retired by migration 0003; inspect them while recreating per-server mappings |
+| `legacy_global_log_channels` | transitional empty global-channel scaffolding; new mappings are per server |
 | `badwords` | regex patterns (server + global) |
-| `members` | retired schema scaffolding; no live collection or WebUI member history |
-| `messages` | retired schema scaffolding; no live collection |
-| `events` | transitional moderation records and older routine history; new routine channel reports do not append here |
+| `events` | selected moderation records and classified moderation-plan summaries; routine channel reports do not append here |
 | `warns` / `bans` | warnings and ban history |
-| `users` | retired schema scaffolding; no live collection |
 
 Environment variables override `config.toml` values (see table).
 
@@ -130,5 +128,6 @@ not measured throughput budgets. See [logging/data status](LOGGING-DATA.md).
 
 The internal settings/schema still contain the retired `retention_days` field during
 this staged refactor. It has no live message-retention effect and is absent from API
-responses; settings requests containing it are rejected. New tenant schema work will
-remove the old helpers/tables. No existing deployment data is migrated or cleaned here.
+responses; settings requests containing it are rejected. The archive tables and helpers
+are removed from this fresh baseline. Unsupported existing databases are refused, not
+migrated or cleaned. The full tenant/case model remains future work.
