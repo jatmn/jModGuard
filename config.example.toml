@@ -1,5 +1,7 @@
 # jModGuard configuration.
 # Copy this file to `config.toml` and fill in your values.
+# The bot ignores [web] and web/OAuth environment overrides; the API validates them.
+# Both processes still require discord.token for their current Discord operations.
 #
 # Dual-process local run:
 #   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway

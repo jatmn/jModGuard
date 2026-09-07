@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::Config;
+use crate::config::BotProcessConfig;
 use crate::db::Db;
 use std::sync::Mutex;
 
@@ -75,7 +75,7 @@ impl Fixture {
         let path =
             std::env::temp_dir().join(format!("jmodguard_logs_{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
-        let mut cfg = Config::default();
+        let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = 1;
         cfg.log.discord_timeout_secs = 1;
         Self {
@@ -244,7 +244,7 @@ fn invalid_delivery_budgets_fail_before_building_runtime_state() {
     let f = Fixture::new();
     for (concurrency, timeout) in [(0, 1), (1, 0), (1, u64::MAX)] {
         let db = Db::open(&f.path, 2).unwrap();
-        let mut cfg = Config::default();
+        let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = concurrency;
         cfg.log.discord_timeout_secs = timeout;
         assert!(BotState::new(cfg, db).is_err());

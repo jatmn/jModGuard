@@ -30,9 +30,14 @@ collection effect. Unsupported databases are refused without changing applicatio
 Bot and API construct distinct runtime state: `state::BotState` and `web::state::ApiState`.
 Keep OAuth/display caches in `web`; keep automod, compiled guild configs, cooldowns,
 log-delivery limits and slash synchronization in bot state. The API reads configuration
-from the DB directly and maintains only its version observation/read floor. Common
-configuration and API bot-token REST remain transitional; this is not credential or
-package isolation. See `docs/ARCHITECTURE.md`.
+from the DB directly and maintains only its version observation/read floor.
+`BotState` accepts `BotProcessConfig` (no dashboard fields); `ApiState` accepts
+`ApiProcessConfig`. Keep the full loader adapter private. Bot parsing/environment
+application must not retain OAuth config; API loading must retain its CORS/public-origin
+checks. Both config types still need bot tokens for their current Discord operations.
+Common bot/log settings, DB privileges and package dependencies remain transitional.
+Process `db_open_options()` fixes the migration role: bot true, API false. Tracing takes
+only `LogConfig`. See `docs/ARCHITECTURE.md`; this is not an OS secret boundary.
 
 ## Commands
 
@@ -144,8 +149,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   from Storage and proxies `/api` `/login` `/oauth` to a private API
   container (same origin; no CORS). `web.cors_origins` /
   `JMODGUARD_CORS_ORIGINS` exist only for a split-origin experiment.
-  `https` `web.base_url` is the public CDN hostname. `Config::validate_cors`
-  runs in `jmodguard-api` only. A public bind (`0.0.0.0`) must also pass
+  `https` `web.base_url` is the public CDN hostname. CORS validation
+  runs through `ApiProcessConfig::load` only. A public bind (`0.0.0.0`) must also pass
   `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost).
   Operators must set the CDN origin themselves; Magic Container hostnames
   are not a stable class this check can reject.
@@ -223,7 +228,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 src/lib.rs              shared library
 src/bin/jmodguard-bot.rs
 src/bin/jmodguard-api.rs
-src/config.rs           config.toml + env (db.url/token, config_poll_secs)
+src/config.rs           typed bot/API config loaders + shared env/DB selection
 src/db.rs               local/remote libSQL pool + public data-layer facade
 src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
 src/db/configuration.rs config CRUD + resolved snapshots

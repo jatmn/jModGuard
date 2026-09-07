@@ -1,7 +1,7 @@
 //! jModGuard API / WebUI process (axum only — no Discord gateway).
 
 use anyhow::{Context as _, Result};
-use jmodguard::config::Config;
+use jmodguard::config::ApiProcessConfig;
 use jmodguard::db::Db;
 use jmodguard::web::state::ApiState;
 use jmodguard::{health, init_tracing, shutdown_signal, web};
@@ -10,9 +10,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = Config::load()?;
-    cfg.validate_cors()?;
-    cfg.validate_public_base_url()?;
+    let cfg = ApiProcessConfig::load()?;
 
     if cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty() {
         anyhow::bail!(
@@ -31,7 +29,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    init_tracing(&cfg, "api");
+    init_tracing(&cfg.log, "api");
 
     if cfg.bot.owner_id == 0 {
         tracing::warn!(
@@ -54,7 +52,7 @@ async fn main() -> Result<()> {
 
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.
-    let opts = cfg.db_open_options(false);
+    let opts = cfg.db_open_options();
     let (attempts, delay) = jmodguard::db::startup_open_retry(&opts);
     let cfg_for_state = cfg.clone();
     let db_label = if cfg.db.url.is_empty() {

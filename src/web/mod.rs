@@ -252,7 +252,7 @@ struct ReturnToQuery {
 /// This is deliberately an exact-origin allowlist rather than an arbitrary URL:
 /// OAuth login/logout must not become open redirects. The configured CORS origins
 /// are the only supported separate SPA origins.
-fn return_to_or_root(cfg: &crate::config::Config, requested: Option<&str>) -> String {
+fn return_to_or_root(cfg: &crate::config::ApiProcessConfig, requested: Option<&str>) -> String {
     let Some(requested) = requested.map(|s| s.trim_end_matches('/')) else {
         return "/".into();
     };
@@ -305,7 +305,7 @@ async fn logout(
 /// CORS only governs whether a browser may read a response. It does not stop a
 /// simple cross-site form POST, which matters when a hosted SPA requires
 /// SameSite=None session cookies. Validate the origin at this mutation gate.
-fn trusted_web_origin(cfg: &crate::config::Config, headers: &HeaderMap) -> bool {
+fn trusted_web_origin(cfg: &crate::config::ApiProcessConfig, headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         return false;
     };
@@ -331,7 +331,7 @@ fn random_oauth_state() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn public_cookie_policy(cfg: &crate::config::Config) -> (bool, SameSite) {
+fn public_cookie_policy(cfg: &crate::config::ApiProcessConfig) -> (bool, SameSite) {
     let secure = cfg
         .web
         .base_url
@@ -1014,7 +1014,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.web.cors_origins = vec!["https://admin.example.com".into()];
         let app = router(crate::web::state::ApiState::new(cfg, db).unwrap());
         std::fs::remove_file(&tmp).ok();
@@ -1308,7 +1308,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_auth_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.bot.owner_id = owner_id;
         let app = ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
@@ -1555,7 +1555,7 @@ mod tests {
 
     #[test]
     fn post_auth_return_only_accepts_configured_spa_origins() {
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.web.cors_origins = vec!["https://admin.example.com".into()];
 
         assert_eq!(
@@ -1571,7 +1571,7 @@ mod tests {
 
     #[test]
     fn logout_origin_must_be_the_ui_or_configured_spa() {
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.web.base_url = "https://api.example.com/control".into();
         cfg.web.cors_origins = vec!["https://admin.example.com".into()];
 

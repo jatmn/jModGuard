@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::automod::AutomodEngine;
-use crate::config::Config;
+use crate::config::BotProcessConfig;
 use crate::db::{self, Db};
 use crate::types::{CommandDef, GuildSettings, RuleDef};
 
@@ -47,7 +47,7 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
-    pub cfg: Arc<Config>,
+    pub cfg: Arc<BotProcessConfig>,
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
@@ -75,7 +75,7 @@ pub struct BotState {
 }
 
 impl BotState {
-    pub fn new(cfg: Config, db: Db) -> Result<Arc<Self>> {
+    pub fn new(cfg: BotProcessConfig, db: Db) -> Result<Arc<Self>> {
         anyhow::ensure!(
             cfg.log.discord_concurrency > 0
                 && cfg.log.discord_concurrency <= tokio::sync::Semaphore::MAX_PERMITS,
@@ -563,7 +563,7 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::BotProcessConfig;
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
 
@@ -605,7 +605,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = BotState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(BotProcessConfig::default(), bot_db).unwrap();
         // Already primed at construction — unchanged version must not invalidate.
         assert!(!tokio_test_block_on(bot.poll_config_version()).unwrap());
         tokio_test_block_on(db::upsert_settings(&api_db, 7, &GuildSettings::default())).unwrap();
@@ -647,7 +647,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = BotState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(BotProcessConfig::default(), bot_db).unwrap();
         let guild_id = 99u64;
 
         // Warm cache with default prefix — no poll yet.
@@ -698,7 +698,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = BotState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(BotProcessConfig::default(), bot_db).unwrap();
         let guild_id = 123u64;
         let baseline = bot.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
@@ -763,7 +763,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = BotState::new(Config::default(), db).unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
         let versions = db::get_primary_versions_sync(&app.db).unwrap();
         let before_write = app.db.config_write_generation();
         let replacement = "replacement-slash-revision".to_string();
@@ -802,7 +802,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = BotState::new(Config::default(), db).unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
         let initial_slash = app.acknowledged_slash_registry_version();
         let initial_config = app.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
@@ -867,7 +867,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = BotState::new(Config::default(), db).unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
         app.db.require_config_version(11);
         app.configs.require_version(11);
         app.last_config_version.store(11, Ordering::SeqCst);
@@ -924,7 +924,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = BotState::new(Config::default(), db).unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
         let remote = 7u64;
 
         assert_eq!(
