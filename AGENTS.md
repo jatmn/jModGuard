@@ -27,6 +27,13 @@ records and moderation-plan summaries; routine plan/dry-run/log/delete observati
 not create durable audit rows. Internal retention fields remain transitional with no
 collection effect. Unsupported databases are refused without changing application rows.
 
+Bot and API construct distinct runtime state: `state::BotState` and `web::state::ApiState`.
+Keep OAuth/display caches in `web`; keep automod, compiled guild configs, cooldowns,
+log-delivery limits and slash synchronization in bot state. The API reads configuration
+from the DB directly and maintains only its version observation/read floor. Common
+configuration and API bot-token REST remain transitional; this is not credential or
+package isolation. See `docs/ARCHITECTURE.md`.
+
 ## Commands
 
 ```bash
@@ -82,8 +89,9 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   (`src/templates.rs`) — no hardcoded chat messages in behaviors.
 - Config writers bump durable `config_version` and replace its revision token
   in the DB layer (same
-  transaction as the write); call sites still call `app.invalidate_configs()`
-  for same-process freshness. Both bot and API poll `config_version` for
+  transaction as the write); bot call sites still call `app.invalidate_configs()`
+  for same-process freshness. API writers need no compiled-cache invalidation; DB writes
+  advance their read floor. Both bot and API poll `config_version` for
   cross-process invalidation. Command registry writers (commands table /
   command copies) also bump `slash_registry_version` and replace its revision
   token; the bot peeks that
@@ -94,8 +102,10 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   guilds every tick). Empty guild cache defers without invalidating. A failed
   guild that leaves the cache keeps the observation pending; retry it when it
   returns, then commit only after every failed guild syncs successfully.
-  `AppState::new` primes both version baselines from the DB so the first poll
-  has no unobserved window (never use a “skip first observation” sentinel).
+  `BotState::new` primes both version baselines; `ApiState::new` primes its config
+  observation. The first poll has no unobserved window (never use a “skip first
+  observation” sentinel). Serialize API observation/primary reconciliation and preserve
+  the DB write-generation check against concurrent local writes.
 - Runtime moderation writers (events/warns/bans) must **not** bump
   `config_version`.
 - Global WebUI routes (`guild_id=0`) and body `scope: "global"` require
@@ -149,7 +159,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `/health` are unauthenticated process liveness probes (`ok`, no database).
   Bind and accept them **before** opening the database. On the API public
   bind, only `/health` returns 200 until axum takes over (database open,
-  AppState primary-version prime, router build); `/api` returns JSON 503
+  ApiState primary-version prime, router build); `/api` returns JSON 503
   `{"error":"not ready"}` and `Retry-After`, and `/login` / `/oauth` return
   HTML 503 that refreshes in place. Do not put session middleware on
   `/health`. If the env var is set, bind failure is fatal.
@@ -227,7 +237,9 @@ src/discord.rs          Discord REST helpers (nickname retries)
 crates/runtime/src/health.rs process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
-src/state.rs            AppState + config cache + version poll
+src/state.rs            BotState + compiled config cache + version poll
+src/web/state.rs        ApiState + config read observation
+src/web/oauth.rs        dashboard OAuth client and identity models
 src/automod.rs          rule engine + action executor
 src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans

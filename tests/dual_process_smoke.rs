@@ -1,3 +1,5 @@
+#![cfg(feature = "web")]
+
 //! End-to-end smoke for the dual-process architecture (no Discord network).
 //!
 //! Mirrors dual-process checks documented in `docs/ARCHITECTURE.md` / CI:
@@ -7,7 +9,8 @@
 
 use jmodguard::config::Config;
 use jmodguard::db::{self, Db, DbOpenOptions};
-use jmodguard::state::AppState;
+use jmodguard::state::BotState;
+use jmodguard::web::state::ApiState;
 use std::path::PathBuf;
 
 fn tmp_db_path(label: &str) -> PathBuf {
@@ -59,8 +62,8 @@ async fn smoke_dual_process_config_sync() {
 
         let mut cfg = Config::default();
         cfg.bot.config_poll_secs = 1;
-        let bot = AppState::new(cfg.clone(), bot_db).expect("bot AppState");
-        let api = AppState::new(cfg, api_db).expect("api AppState");
+        let bot = BotState::new(cfg.clone(), bot_db).expect("BotState");
+        let api = ApiState::new(cfg, api_db).expect("ApiState");
 
         let guild_id: u64 = 55_555;
 
@@ -69,7 +72,7 @@ async fn smoke_dual_process_config_sync() {
         assert!(baseline > 0, "initial seed must be versioned");
         assert_eq!(db::get_config_version(&api.db).await.unwrap(), baseline);
 
-        // Already primed at AppState::new — unchanged version must not invalidate.
+        // Already primed at state construction — unchanged version must not invalidate.
         assert!(!bot.poll_config_version().await.unwrap());
         assert!(!api.poll_config_version().await.unwrap());
 
@@ -87,7 +90,6 @@ async fn smoke_dual_process_config_sync() {
         )
         .await
         .unwrap();
-        api.invalidate_configs();
 
         assert_eq!(db::get_config_version(&bot.db).await.unwrap(), baseline + 1);
         assert!(

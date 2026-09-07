@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
 use jmodguard::handlers::Handler;
-use jmodguard::state::AppState;
+use jmodguard::state::BotState;
 use jmodguard::{db, init_tracing, shutdown_signal};
 use serenity::builder::EditMember;
 use serenity::cache::Settings as CacheSettings;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 async fn reconcile_nickname_job(
-    app: Arc<AppState>,
+    app: Arc<BotState>,
     http: Arc<serenity::http::Http>,
     me: serenity::model::id::UserId,
     job: db::NicknameReconcileJob,
@@ -110,15 +110,33 @@ async fn reconcile_nickname_job(
     }
 }
 
-async fn drain_nickname_reconciles(app: &Arc<AppState>, http: &Arc<serenity::http::Http>) {
+async fn drain_nickname_reconciles(
+    app: &Arc<BotState>,
+    http: &Arc<serenity::http::Http>,
+    identity: &tokio::sync::OnceCell<serenity::model::id::UserId>,
+) {
     // The bot is the sole nickname side-effect worker. Drain the
     // durable generation-checked outbox every tick so the last
     // committed DB value wins and Discord failures are retried.
     let now = chrono::Utc::now().timestamp();
     match db::pending_nickname_reconciles(&app.db, now, 25).await {
         Ok(pending) => {
-            let me = match app.bot_user_id().await {
-                Ok(id) => id,
+            if pending.is_empty() {
+                return;
+            }
+            let me = match identity
+                .get_or_try_init(|| async {
+                    let user = tokio::time::timeout(
+                        jmodguard::discord::DISCORD_REST_TIMEOUT,
+                        http.get_current_user(),
+                    )
+                    .await
+                    .context("timed out fetching bot identity")??;
+                    Ok::<_, anyhow::Error>(user.id)
+                })
+                .await
+            {
+                Ok(id) => *id,
                 Err(error) => {
                     tracing::warn!(
                         "nickname reconciliation deferred until Discord identity is available: {error:#}"
@@ -205,7 +223,7 @@ async fn main() -> Result<()> {
         }
     );
 
-    let app = AppState::new(cfg.clone(), db)?;
+    let app = BotState::new(cfg.clone(), db)?;
 
     // --- Discord client (needed for slash re-sync after config polls) --------
     let intents = GatewayIntents::GUILD_MEMBERS
@@ -236,11 +254,12 @@ async fn main() -> Result<()> {
         let app = Arc::clone(&app);
         let http = Arc::clone(&http);
         tokio::spawn(async move {
+            let identity = tokio::sync::OnceCell::new();
             let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                drain_nickname_reconciles(&app, &http).await;
+                drain_nickname_reconciles(&app, &http, &identity).await;
             }
         });
     }

@@ -3,7 +3,7 @@
 use anyhow::{Context as _, Result};
 use jmodguard::config::Config;
 use jmodguard::db::Db;
-use jmodguard::state::AppState;
+use jmodguard::web::state::ApiState;
 use jmodguard::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     }
 
     // Bind first so platform GET/HEAD /health succeeds while the remote
-    // database is still waking, the bot is still migrating, or AppState
+    // database is still waking, the bot is still migrating, or ApiState
     // primes primary version baselines (a blocking remote read). Only
     // /health is live on this socket until axum takes over; other paths
     // return 503. `serve_while` owns every pre-axum step so the bind is
@@ -73,11 +73,11 @@ async fn main() -> Result<()> {
                         )
                     })?;
                 tracing::info!("database ready (migrate=false) at {db_label}");
-                // `AppState::new` and `web::router` are synchronous. Run both
+                // `ApiState::new` and `web::router` are synchronous. Run both
                 // off the task that drives `serve_while` or `/health` stalls
                 // for the same remote round-trip / router build this listener
                 // exists to cover.
-                let app = tokio::task::spawn_blocking(move || AppState::new(cfg_for_state, db))
+                let app = tokio::task::spawn_blocking(move || ApiState::new(cfg_for_state, db))
                     .await
                     .context("app state worker stopped before returning")??;
                 let router_app = Arc::clone(&app);
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
                         match app.poll_config_version().await {
                             Ok(true) => {
                                 tracing::info!(
-                                    "config_version changed; guild config cache invalidated"
+                                    "config_version changed; API read observation updated"
                                 )
                             }
                             Ok(false) => {}

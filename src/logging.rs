@@ -9,7 +9,7 @@ use serenity::model::id::{ChannelId, GuildId, MessageId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::state::BotState;
 use crate::{db, templates};
 
 /// Resolves the log channel for an event type from the cached config.
@@ -22,7 +22,7 @@ fn channel_for(
 
 /// Sends one best-effort Discord log report. No message history or retry queue.
 pub async fn emit(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     guild_id: GuildId,
     event: &str,
@@ -52,7 +52,7 @@ pub(crate) enum Delivery {
 }
 
 pub(crate) async fn emit_to(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     sink: &impl LogDelivery,
     guild_id: GuildId,
     event: &str,
@@ -93,7 +93,7 @@ pub(crate) async fn emit_to(
     }
 }
 
-fn record_delivery_failure(app: &AppState) {
+fn record_delivery_failure(app: &BotState) {
     let count = app
         .log_delivery_failures
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -210,7 +210,7 @@ pub(crate) fn message_delete_report(
 /// Emits a mod-action event with actor context (used by command behaviors).
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_mod_action(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     guild_id: GuildId,
     action: &str,
@@ -240,7 +240,7 @@ pub async fn emit_mod_action(
 
 /// Emits a member event (join/leave/ban/unban/kick) with full member context.
 pub async fn emit_member_event(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     guild_id: GuildId,
     event: &str,

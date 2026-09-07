@@ -1,6 +1,8 @@
 //! WebUI: Discord OAuth2 login, session handling, and the REST API.
 
 pub mod api;
+pub mod oauth;
+pub mod state;
 
 use axum::extract::Query;
 use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
@@ -13,7 +15,8 @@ use tower_sessions::cookie::time::Duration as CookieDuration;
 use tower_sessions::cookie::{Cookie, SameSite};
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 
-use crate::state::{AppState, DiscordGuild, DiscordUser};
+use self::oauth::{DiscordGuild, DiscordUser};
+use self::state::ApiState;
 
 const SESSION_USER: &str = "discord_user_id";
 const SESSION_TOKEN: &str = "access_token";
@@ -90,13 +93,13 @@ impl AuthCtx {
 }
 
 /// True when the session user is the configured bot owner (`bot.owner_id` ≠ 0).
-pub fn is_bot_owner(app: &AppState, auth: &AuthCtx) -> bool {
+pub fn is_bot_owner(app: &ApiState, auth: &AuthCtx) -> bool {
     let owner = app.cfg.bot.owner_id;
     owner != 0 && auth.discord_user_id() == owner
 }
 
 /// Global config mutations (path `guild_id=0` or body `scope: "global"`) require owner.
-pub fn require_bot_owner(app: &AppState, auth: &AuthCtx) -> ApiResult<()> {
+pub fn require_bot_owner(app: &ApiState, auth: &AuthCtx) -> ApiResult<()> {
     if is_bot_owner(app, auth) {
         Ok(())
     } else {
@@ -123,17 +126,17 @@ const USER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const GUILD_DISPLAY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Loads the authenticated Discord user + guilds for **display** (cached OK).
-pub async fn require_auth(app: &Arc<AppState>, session: &Session) -> ApiResult<AuthCtx> {
+pub async fn require_auth(app: &Arc<ApiState>, session: &Session) -> ApiResult<AuthCtx> {
     require_auth_with(app, session, GuildListMode::CachedOk).await
 }
 
 /// Loads auth with a **fresh** Discord guild list for authorization decisions.
-pub async fn require_auth_fresh(app: &Arc<AppState>, session: &Session) -> ApiResult<AuthCtx> {
+pub async fn require_auth_fresh(app: &Arc<ApiState>, session: &Session) -> ApiResult<AuthCtx> {
     require_auth_with(app, session, GuildListMode::MustRefresh).await
 }
 
 async fn require_auth_with(
-    app: &Arc<AppState>,
+    app: &Arc<ApiState>,
     session: &Session,
     guild_mode: GuildListMode,
 ) -> ApiResult<AuthCtx> {
@@ -201,7 +204,7 @@ async fn require_auth_with(
     Ok(AuthCtx { user, guilds })
 }
 
-fn cached_user(app: &AppState, user_id: u64) -> Option<DiscordUser> {
+fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
     let entry = app.user_cache.get(&user_id)?;
     let (fetched_at, user) = entry.value();
     if fetched_at.elapsed() < USER_CACHE_TTL {
@@ -215,7 +218,7 @@ fn cached_user(app: &AppState, user_id: u64) -> Option<DiscordUser> {
 /// `MustRefresh` always returns `None` so callers hit Discord.
 fn take_cached_guilds(
     mode: GuildListMode,
-    app: &AppState,
+    app: &ApiState,
     user_id: u64,
 ) -> Option<Vec<DiscordGuild>> {
     if !guild_list_cache_allowed(mode) {
@@ -269,7 +272,7 @@ fn return_to_or_root(cfg: &crate::config::Config, requested: Option<&str>) -> St
 }
 
 async fn login(
-    state: axum::extract::State<Arc<AppState>>,
+    state: axum::extract::State<Arc<ApiState>>,
     Query(query): Query<ReturnToQuery>,
 ) -> Response {
     let state_token = random_oauth_state();
@@ -287,7 +290,7 @@ async fn login(
 
 async fn logout(
     session: Session,
-    state: axum::extract::State<Arc<AppState>>,
+    state: axum::extract::State<Arc<ApiState>>,
     headers: HeaderMap,
     Query(query): Query<ReturnToQuery>,
 ) -> Response {
@@ -434,7 +437,7 @@ fn oauth_csrf_ok(headers: &HeaderMap, query_state: Option<&str>) -> bool {
 
 async fn callback(
     session: Session,
-    state: axum::extract::State<Arc<AppState>>,
+    state: axum::extract::State<Arc<ApiState>>,
     headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
@@ -533,7 +536,7 @@ fn error_page(msg: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn api_me(
-    state: axum::extract::State<Arc<AppState>>,
+    state: axum::extract::State<Arc<ApiState>>,
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = require_auth(&state, &session).await?;
@@ -618,7 +621,7 @@ fn session_same_site(cross_origin: bool, secure: bool) -> tower_sessions::cookie
     }
 }
 
-pub fn router(app: Arc<AppState>) -> Router {
+pub fn router(app: Arc<ApiState>) -> Router {
     // In-memory sessions are intentional for a single API replica.
     // Sessions are lost on API restart; multi-replica needs a shared store.
     let session_store = MemoryStore::default();
@@ -778,7 +781,7 @@ pub fn router(app: Arc<AppState>) -> Router {
 /// `guild_id=0` is not a Discord guild — callers that mean global must use
 /// [`require_bot_owner`] / [`guild_scope`] instead.
 pub async fn authorize_manage_guild(
-    app: &Arc<AppState>,
+    app: &Arc<ApiState>,
     session: &Session,
     guild_id: u64,
 ) -> ApiResult<AuthCtx> {
@@ -799,7 +802,7 @@ pub async fn authorize_manage_guild(
 /// Authorizes a bot-token unban with fresh Discord ban authority, rather than
 /// configuration-only MANAGE_GUILD authority.
 pub async fn authorize_ban_members(
-    app: &Arc<AppState>,
+    app: &Arc<ApiState>,
     session: &Session,
     guild_id: u64,
 ) -> ApiResult<AuthCtx> {
@@ -827,7 +830,7 @@ pub async fn authorize_ban_members(
 /// Do **not** call `auth.can_manage(...)` on it. Use [`authorize_manage_guild`]
 /// for any secondary Discord guild check (e.g. copy source).
 pub async fn guild_scope(
-    app: &Arc<AppState>,
+    app: &Arc<ApiState>,
     session: &Session,
     guild_id: u64,
 ) -> ApiResult<AuthCtx> {
@@ -855,7 +858,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let app = crate::state::AppState::new(Default::default(), db).unwrap();
+        let app = crate::web::state::ApiState::new(Default::default(), db).unwrap();
         std::fs::remove_file(&tmp).ok();
         router(app)
     }
@@ -1013,7 +1016,7 @@ mod tests {
         let db = crate::db::Db::open(&tmp, 2).unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.web.cors_origins = vec!["https://admin.example.com".into()];
-        let app = router(crate::state::AppState::new(cfg, db).unwrap());
+        let app = router(crate::web::state::ApiState::new(cfg, db).unwrap());
         std::fs::remove_file(&tmp).ok();
         let res = app
             .oneshot(
@@ -1091,7 +1094,7 @@ mod tests {
                     http_get(addr, "/health"),
                 )
                 .await
-                .expect("health must answer during AppState prime and router build");
+                .expect("health must answer during ApiState prime and router build");
                 assert!(
                     health.starts_with("HTTP/1.1 200 OK"),
                     "startup liveness: {health}"
@@ -1290,7 +1293,7 @@ mod tests {
 
     fn auth_user(discord_id: u64) -> AuthCtx {
         AuthCtx {
-            user: crate::state::DiscordUser {
+            user: crate::web::oauth::DiscordUser {
                 id: discord_id.to_string(),
                 username: "tester".into(),
                 global_name: None,
@@ -1300,14 +1303,14 @@ mod tests {
         }
     }
 
-    fn app_with_owner(owner_id: u64) -> Arc<AppState> {
+    fn app_with_owner(owner_id: u64) -> Arc<ApiState> {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_auth_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.bot.owner_id = owner_id;
-        let app = AppState::new(cfg, db).unwrap();
+        let app = ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
         app
     }
@@ -1392,8 +1395,12 @@ mod tests {
         session
     }
 
-    fn seed_auth_caches(app: &AppState, user_id: u64, guilds: Vec<crate::state::DiscordGuild>) {
-        let user = crate::state::DiscordUser {
+    fn seed_auth_caches(
+        app: &ApiState,
+        user_id: u64,
+        guilds: Vec<crate::web::oauth::DiscordGuild>,
+    ) {
+        let user = crate::web::oauth::DiscordUser {
             id: user_id.to_string(),
             username: "tester".into(),
             global_name: None,
@@ -1472,13 +1479,13 @@ mod tests {
         // must call authorize_manage_guild(from) — never auth.can_manage(from)
         // on the destination AuthCtx.
         let stale = AuthCtx {
-            user: crate::state::DiscordUser {
+            user: crate::web::oauth::DiscordUser {
                 id: "99".into(),
                 username: "owner".into(),
                 global_name: None,
                 avatar: None,
             },
-            guilds: vec![crate::state::DiscordGuild {
+            guilds: vec![crate::web::oauth::DiscordGuild {
                 id: "111".into(),
                 name: "revoked".into(),
                 icon: None,

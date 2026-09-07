@@ -256,7 +256,7 @@ The Bunny API image does not embed or serve the UI at `/`; a default
 local API build (`embed-ui`) may serve `/`. Do not treat `/` on
 the container or its endpoint hostname as a ready check. Platform and
 Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. Until axum
-takes over (database open, AppState primary-version prime, router
+takes over (database open, API state primary-version prime, router
 build), only `/health` returns `200`. `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord

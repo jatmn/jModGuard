@@ -70,9 +70,23 @@ can resume initialization within this lineage; the API waits for completed boots
 Warnings, bans, selected events, configuration and nickname reconciliation remain usable.
 No old deployment conversion or data deletion is performed.
 
+## Implemented: separate runtime state
+
+Bot and API use distinct state types. The API no longer allocates the moderation engine,
+compiled guild configuration cache, command cooldowns, log-delivery limits or slash-sync
+state. The bot no longer allocates an OAuth HTTP client or dashboard display caches.
+OAuth code is compiled with `web`. API configuration reads remain direct database reads,
+with primary-confirmed version observation and protection against concurrent local writes.
+
+The shared configuration shape and package still exist. The API still requires a bot
+token for direct unban and log-channel validation; the bot uses its Gateway/REST token
+as before. This slice adds no queue, changes no schema or wire contract, and does not
+claim credential/dependency isolation or measured memory savings. The optional conductor
+remains inactive. See [runtime state ownership](ARCHITECTURE.md#runtime-state-ownership).
+
 ## Next implementation slices
 
-1. Separate bot/API state and credentials. Replace API bot-token operations with typed,
+1. Separate process configuration and credentials. Replace API bot-token operations with typed,
    durable bot actions, preserving current guild permission checks and explicit outcomes.
    Complete bot/API crate boundaries without pulling gateway/cache state into the API.
 2. Implement the fresh data model and tenant routing: shared/dedicated guild placement,

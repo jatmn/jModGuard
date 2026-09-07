@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::state::{AppState, CachedGuildConfig};
+use crate::state::{BotState, CachedGuildConfig};
 use crate::templates;
 use crate::types::CommandDef;
 use crate::{db, logging};
@@ -91,7 +91,7 @@ impl PermLevel {
 
 /// Computes the caller's effective permission level for a guild.
 pub fn perm_level(
-    app: &AppState,
+    app: &BotState,
     guild_roles: &StdHashMap<serenity::model::id::RoleId, Role>,
     member: &serenity::model::guild::Member,
 ) -> PermLevel {
@@ -156,7 +156,7 @@ async fn guild_snapshot(
 }
 
 fn check_enforcement(
-    app: &AppState,
+    app: &BotState,
     _cfg: &CachedGuildConfig,
     cmd: &CommandDef,
     guild_roles: &StdHashMap<serenity::model::id::RoleId, Role>,
@@ -186,7 +186,7 @@ fn check_enforcement(
 
 /// Caller context passed to behavior executors.
 pub struct CmdEnv<'a> {
-    pub app: &'a Arc<AppState>,
+    pub app: &'a Arc<BotState>,
     pub ctx: &'a Context,
     pub cmd: &'a CommandDef,
     pub guild_id: GuildId,
@@ -208,7 +208,7 @@ pub struct BehaviorOutcome {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_prefix(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     cfg: Arc<CachedGuildConfig>,
     msg: &serenity::model::channel::Message,
@@ -334,7 +334,7 @@ pub async fn handle_prefix(
 // ---------------------------------------------------------------------------
 
 /// Registers guild slash commands from the command registry.
-pub async fn sync_slash_commands(app: &Arc<AppState>, ctx: &Context, guild_id: GuildId) -> bool {
+pub async fn sync_slash_commands(app: &Arc<BotState>, ctx: &Context, guild_id: GuildId) -> bool {
     let target = match db::get_slash_registry_version(&app.db).await {
         Ok(version) => version.max(app.acknowledged_slash_registry_version()),
         Err(error) => {
@@ -349,7 +349,7 @@ pub async fn sync_slash_commands(app: &Arc<AppState>, ctx: &Context, guild_id: G
 /// are read from one database snapshot. A lagging replica is retried instead
 /// of allowing Discord to accept stale rows under a newer acknowledged version.
 pub async fn sync_slash_commands_versioned_http(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     http: impl AsRef<serenity::http::Http>,
     guild_id: GuildId,
     target_version: u64,
@@ -483,7 +483,7 @@ struct SlashCtx {
     options: Vec<(String, String)>,
 }
 
-pub async fn handle_interaction(app: &Arc<AppState>, ctx: &Context, interaction: Interaction) {
+pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction: Interaction) {
     let Interaction::Command(interaction) = interaction else {
         return;
     };
@@ -685,7 +685,7 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
 }
 
 async fn send_outcome(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     cmd: &CommandDef,
     guild_id: GuildId,
@@ -706,7 +706,7 @@ async fn send_outcome(
 }
 
 async fn log_outcome(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     cmd: &CommandDef,
     guild_id: GuildId,
@@ -728,7 +728,7 @@ async fn log_outcome(
 }
 
 fn cooldown_check(
-    app: &AppState,
+    app: &BotState,
     guild_id: GuildId,
     user: serenity::model::id::UserId,
     cmd: &CommandDef,

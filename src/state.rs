@@ -1,5 +1,4 @@
-//! Shared application state: DB, config, automod engine, OAuth client,
-//! and the per-guild config cache (with global fallback + invalidation).
+//! Bot runtime state and compiled guild configuration cache.
 
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
@@ -40,7 +39,13 @@ pub enum SlashResyncPlan {
     Sync { guilds: Vec<u64>, invalidate: bool },
 }
 
-pub struct AppState {
+/// Discord runtime state has no dashboard OAuth client.
+/// ```compile_fail
+/// fn dashboard(state: &jmodguard::state::BotState) {
+///     let _ = &state.oauth;
+/// }
+/// ```
+pub struct BotState {
     pub db: Db,
     pub cfg: Arc<Config>,
     pub configs: ConfigCache,
@@ -48,15 +53,6 @@ pub struct AppState {
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
     pub log_delivery_slots: tokio::sync::Semaphore,
     pub log_delivery_failures: AtomicU64,
-    #[allow(dead_code)]
-    pub http: reqwest::Client,
-    /// Lazy Discord REST client (bot token). Created on first API use
-    /// (nickname / unban) so the bot process does not allocate unused Http.
-    discord_http_cell: std::sync::OnceLock<Arc<serenity::http::Http>>,
-    /// Cached bot user id after first Discord `/users/@me` (API nickname apply).
-    /// `tokio::sync::OnceCell` so concurrent first callers share one REST fetch.
-    bot_user_id: tokio::sync::OnceCell<serenity::model::id::UserId>,
-    pub oauth: OAuthClient,
     pub start: Instant,
     pub slash_synced: AtomicBool,
     /// Last observed durable `config_version` from the DB.
@@ -76,12 +72,9 @@ pub struct AppState {
     version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
-    /// Per-user OAuth guild-list cache (discord_user_id -> (fetched_at, guilds)).
-    pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
-    pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
 }
 
-impl AppState {
+impl BotState {
     pub fn new(cfg: Config, db: Db) -> Result<Arc<Self>> {
         anyhow::ensure!(
             cfg.log.discord_concurrency > 0
@@ -96,23 +89,12 @@ impl AppState {
             "log.discord_timeout_secs must be positive"
         );
         let log_delivery_slots = tokio::sync::Semaphore::new(cfg.log.discord_concurrency);
-        let http = reqwest::Client::builder()
-            .user_agent("jModGuard (discord moderation bot)")
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("failed to build http client")?;
-        let oauth = OAuthClient {
-            client_id: cfg.web.oauth_client_id.clone(),
-            client_secret: cfg.web.oauth_client_secret.clone(),
-            redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
-            http: http.clone(),
-        };
         // Prime from DB at construction — never leave an "unobserved" sentinel.
         // Cache population is independent of the poll task; skipping the first
         // poll invalidate (old u64::MAX heuristic) let a warm cache miss writes
         // that landed before the first successful poll.
         let primed = db::get_primary_versions_sync(&db)
-            .context("failed to read primary version baselines while building AppState")?;
+            .context("failed to read primary version baselines while building BotState")?;
         db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
@@ -122,10 +104,6 @@ impl AppState {
             cooldowns: DashMap::new(),
             log_delivery_slots,
             log_delivery_failures: AtomicU64::new(0),
-            oauth,
-            http,
-            discord_http_cell: std::sync::OnceLock::new(),
-            bot_user_id: tokio::sync::OnceCell::new(),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
             last_config_version: AtomicU64::new(primed.config),
@@ -135,37 +113,7 @@ impl AppState {
             force_slash_registry_retry: AtomicBool::new(false),
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
-            guild_cache: DashMap::new(),
-            user_cache: DashMap::new(),
         }))
-    }
-
-    /// Discord REST client for API-side bot-token calls (lazy).
-    pub fn discord_http(&self) -> &serenity::http::Http {
-        self.discord_http_cell
-            .get_or_init(|| {
-                let token = format!("Bot {}", self.cfg.discord.token);
-                Arc::new(serenity::http::Http::new(&token))
-            })
-            .as_ref()
-    }
-
-    /// Bot's Discord user id (cached after first REST lookup).
-    pub async fn bot_user_id(&self) -> Result<serenity::model::id::UserId> {
-        self.bot_user_id
-            .get_or_try_init(|| async {
-                let me = self.discord_http();
-                let me = tokio::time::timeout(
-                    crate::discord::DISCORD_REST_TIMEOUT,
-                    me.get_current_user(),
-                )
-                .await
-                .context("timed out fetching bot user id from Discord")?
-                .context("failed to fetch bot user id from Discord")?;
-                Ok::<_, anyhow::Error>(me.id)
-            })
-            .await
-            .copied()
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -414,229 +362,6 @@ impl AppState {
 }
 
 // ---------------------------------------------------------------------------
-// Discord OAuth2 (manual, dependency-free of the oauth2 crate)
-// ---------------------------------------------------------------------------
-
-pub struct OAuthClient {
-    pub client_id: String,
-    pub client_secret: String,
-    pub redirect_uri: String,
-    pub http: reqwest::Client,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub expires_in: u64,
-    pub scope: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DiscordUser {
-    pub id: String,
-    pub username: String,
-    pub global_name: Option<String>,
-    pub avatar: Option<String>,
-}
-
-impl DiscordUser {
-    pub fn avatar_url(&self) -> String {
-        match &self.avatar {
-            Some(a) if a.starts_with("a_") => format!(
-                "https://cdn.discordapp.com/avatars/{}/{}.gif?size=128",
-                self.id, a
-            ),
-            Some(a) => format!(
-                "https://cdn.discordapp.com/avatars/{}/{}.png?size=128",
-                self.id, a
-            ),
-            None => {
-                let default = (self.id.parse::<u64>().unwrap_or(0) >> 22) % 6;
-                format!("https://cdn.discordapp.com/embed/avatars/{default}.png")
-            }
-        }
-    }
-}
-
-/// Discord returns `permissions` as an integer in `/users/@me/guilds`
-/// (despite documenting it as a string), so accept both.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum PermissionsField {
-    Number(u64),
-    String(String),
-}
-
-impl PermissionsField {
-    pub fn as_u64(&self) -> u64 {
-        match self {
-            PermissionsField::Number(n) => *n,
-            PermissionsField::String(s) => s.parse().unwrap_or(0),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DiscordGuild {
-    pub id: String,
-    pub name: String,
-    pub icon: Option<String>,
-    pub owner: bool,
-    pub permissions: Option<PermissionsField>,
-}
-
-impl DiscordGuild {
-    pub fn manage_permission(&self) -> bool {
-        const MANAGE_GUILD: u64 = 1 << 5;
-        if self.owner {
-            return true;
-        }
-        self.permissions
-            .as_ref()
-            .map(|p| p.as_u64() & MANAGE_GUILD != 0)
-            .unwrap_or(false)
-    }
-
-    /// WebUI configuration rights do not imply authority to remove bans.
-    pub fn ban_members_permission(&self) -> bool {
-        const ADMINISTRATOR: u64 = 1 << 3;
-        const BAN_MEMBERS: u64 = 1 << 2;
-        self.owner
-            || self
-                .permissions
-                .as_ref()
-                .map(|p| p.as_u64() & (ADMINISTRATOR | BAN_MEMBERS) != 0)
-                .unwrap_or(false)
-    }
-}
-
-impl OAuthClient {
-    pub fn authorize_url(&self, state: &str) -> String {
-        let redirect = percent_encoding::utf8_percent_encode(
-            &self.redirect_uri,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
-        format!(
-            "https://discord.com/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
-            self.client_id, redirect, "identify%20guilds", state
-        )
-    }
-
-    pub async fn exchange_code(&self, code: &str) -> Result<TokenResponse> {
-        self.token_request("authorization_code", code, None).await
-    }
-
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
-        self.token_request("refresh_token", refresh_token, None)
-            .await
-    }
-
-    async fn token_request(
-        &self,
-        grant_type: &str,
-        value: &str,
-        _code_verifier: Option<&str>,
-    ) -> Result<TokenResponse> {
-        let resp = self
-            .http
-            .post("https://discord.com/api/oauth2/token")
-            .form(&[
-                ("client_id", self.client_id.as_str()),
-                ("client_secret", self.client_secret.as_str()),
-                ("grant_type", grant_type),
-                ("redirect_uri", self.redirect_uri.as_str()),
-                (
-                    if grant_type == "authorization_code" {
-                        "code"
-                    } else {
-                        "refresh_token"
-                    },
-                    value,
-                ),
-            ])
-            .send()
-            .await
-            .context("oauth token request failed")?;
-        let status = resp.status();
-        let bytes = resp.bytes().await?;
-        if !status.is_success() {
-            anyhow::bail!(
-                "discord oauth error {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-        }
-        serde_json::from_slice(&bytes).context("invalid oauth token response")
-    }
-
-    pub async fn me(&self, access_token: &str) -> Result<DiscordUser> {
-        let resp = self
-            .http
-            .get("https://discord.com/api/users/@me")
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("discord me request failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("discord me request failed with {}", resp.status());
-        }
-        resp.json().await.context("invalid discord user response")
-    }
-
-    pub async fn my_guilds(&self, access_token: &str) -> Result<Vec<DiscordGuild>> {
-        // Discord paginates at 200 guilds; a single GET silently drops every
-        // server past the first page and deny WebUI manage access for them.
-        const PAGE_LIMIT: usize = 200;
-        let mut all = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let mut url = format!("https://discord.com/api/users/@me/guilds?limit={PAGE_LIMIT}");
-            if let Some(ref cursor) = after {
-                url.push_str("&after=");
-                url.push_str(cursor);
-            }
-            let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(access_token)
-                .send()
-                .await
-                .context("discord guilds request failed")?;
-            if !resp.status().is_success() {
-                anyhow::bail!("discord guilds request failed with {}", resp.status());
-            }
-            let page: Vec<DiscordGuild> = resp
-                .json()
-                .await
-                .context("invalid discord guilds response")?;
-            match next_guilds_after_cursor(&page, PAGE_LIMIT) {
-                Some(next) => {
-                    all.extend(page);
-                    after = Some(next);
-                }
-                None => {
-                    all.extend(page);
-                    break;
-                }
-            }
-        }
-        Ok(all)
-    }
-}
-
-/// Cursor for the next Discord `/users/@me/guilds` page, or `None` when the
-/// current page is the last (`len < page_limit`, including empty).
-///
-/// Extracted so pagination termination is unit-tested without HTTP.
-pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize) -> Option<String> {
-    if page.len() < page_limit {
-        None
-    } else {
-        page.last().map(|g| g.id.clone())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // per-guild config cache
 // ---------------------------------------------------------------------------
 
@@ -880,7 +605,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(Config::default(), bot_db).unwrap();
         // Already primed at construction — unchanged version must not invalidate.
         assert!(!tokio_test_block_on(bot.poll_config_version()).unwrap());
         tokio_test_block_on(db::upsert_settings(&api_db, 7, &GuildSettings::default())).unwrap();
@@ -922,7 +647,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(Config::default(), bot_db).unwrap();
         let guild_id = 99u64;
 
         // Warm cache with default prefix — no poll yet.
@@ -973,7 +698,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let bot = AppState::new(Config::default(), bot_db).unwrap();
+        let bot = BotState::new(Config::default(), bot_db).unwrap();
         let guild_id = 123u64;
         let baseline = bot.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
@@ -1038,7 +763,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = AppState::new(Config::default(), db).unwrap();
+        let app = BotState::new(Config::default(), db).unwrap();
         let versions = db::get_primary_versions_sync(&app.db).unwrap();
         let before_write = app.db.config_write_generation();
         let replacement = "replacement-slash-revision".to_string();
@@ -1077,7 +802,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = AppState::new(Config::default(), db).unwrap();
+        let app = BotState::new(Config::default(), db).unwrap();
         let initial_slash = app.acknowledged_slash_registry_version();
         let initial_config = app.last_config_version.load(Ordering::SeqCst);
         assert_eq!(
@@ -1142,7 +867,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = AppState::new(Config::default(), db).unwrap();
+        let app = BotState::new(Config::default(), db).unwrap();
         app.db.require_config_version(11);
         app.configs.require_version(11);
         app.last_config_version.store(11, Ordering::SeqCst);
@@ -1199,7 +924,7 @@ mod tests {
             retention_days: 7,
         })
         .unwrap();
-        let app = AppState::new(Config::default(), db).unwrap();
+        let app = BotState::new(Config::default(), db).unwrap();
         let remote = 7u64;
 
         assert_eq!(
@@ -1266,76 +991,5 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
-    }
-
-    #[test]
-    fn guild_page_cursor_stops_on_short_page() {
-        fn g(id: &str) -> DiscordGuild {
-            DiscordGuild {
-                id: id.into(),
-                name: "n".into(),
-                icon: None,
-                owner: false,
-                permissions: None,
-            }
-        }
-        let full: Vec<_> = (0..200).map(|i| g(&i.to_string())).collect();
-        assert_eq!(next_guilds_after_cursor(&full, 200).as_deref(), Some("199"));
-        let short = vec![g("200"), g("201")];
-        assert_eq!(next_guilds_after_cursor(&short, 200), None);
-        assert_eq!(next_guilds_after_cursor(&[], 200), None);
-
-        // Simulate two-page merge the way my_guilds does.
-        let mut all = Vec::new();
-        let mut after = next_guilds_after_cursor(&full, 200);
-        all.extend(full);
-        assert_eq!(after.as_deref(), Some("199"));
-        let page2 = vec![g("200")];
-        after = next_guilds_after_cursor(&page2, 200);
-        all.extend(page2);
-        assert!(after.is_none());
-        assert_eq!(all.len(), 201);
-        assert_eq!(all.last().unwrap().id, "200");
-    }
-
-    #[test]
-    fn guild_permissions_accepts_integer_and_string() {
-        // Discord actually returns an integer here (docs say string).
-        let g: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#,
-        )
-        .unwrap();
-        assert!(g.manage_permission(), "MANAGE_GUILD (32) set");
-        let g: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":"32"}"#,
-        )
-        .unwrap();
-        assert!(g.manage_permission(), "string form works too");
-        let g: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":1}"#,
-        )
-        .unwrap();
-        assert!(!g.manage_permission(), "no MANAGE_GUILD");
-        let g: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":true,"permissions":0}"#,
-        )
-        .unwrap();
-        assert!(g.manage_permission(), "owner bypass");
-    }
-
-    #[test]
-    fn ban_permission_is_not_implied_by_manage_guild() {
-        let manage_only: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#,
-        )
-        .unwrap();
-        assert!(manage_only.manage_permission());
-        assert!(!manage_only.ban_members_permission());
-
-        let ban: DiscordGuild = serde_json::from_str(
-            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":4}"#,
-        )
-        .unwrap();
-        assert!(ban.ban_members_permission());
     }
 }

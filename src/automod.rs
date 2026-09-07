@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::normalize;
-use crate::state::{AppState, CachedGuildConfig};
+use crate::state::{BotState, CachedGuildConfig};
 use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
 
@@ -338,7 +338,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Executes a decided automod action (or logs it in dry-run mode).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_pending(
-    app: &Arc<AppState>,
+    app: &Arc<BotState>,
     ctx: &Context,
     guild_id: GuildId,
     target: &serenity::model::user::User,
