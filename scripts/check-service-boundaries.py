@@ -8,6 +8,23 @@ FORBIDDEN = {"jmodguard", "jmodguard-bot", "jmodguard-api", "serenity"}
 
 
 def main():
+    # Historical schema helpers remain available for existing DB regressions;
+    # production handlers, commands and HTTP paths must not resume collection.
+    retired = ("record_message_activity(", "mark_edited_with_previous(",
+               "mark_deleted_with_previous(", "mark_deleted_bulk(", "backfill_members(",
+               "db::member_joined(", "db::member_left(", "db::upsert_user(",
+               "db::bump_message(", "db::insert_message(", "db::purge_old_messages(",
+               "db::search_members(", "db::member_row(")
+    source = ROOT / "src"
+    paths = [source / name for name in ("handlers.rs", "logging.rs", "automod.rs", "state.rs")]
+    for directory in ("bin", "commands", "web"):
+        paths.extend((source / directory).rglob("*.rs"))
+    for path in paths:
+        text = path.read_text()
+        for forbidden in retired:
+            if forbidden in text:
+                raise SystemExit(f"Retired routine-history operation: {path}: {forbidden}")
+
     for package in ("jmodguard-runtime", "jmodguard-conductor"):
         result = subprocess.run(
             ["cargo", "tree", "--locked", "--offline", "-p", package,

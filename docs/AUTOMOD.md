@@ -78,11 +78,15 @@ never trigger.
 ## Dry-run mode
 
 With dry-run on, the rule evaluates normally but instead of acting it posts a
-`[DRY RUN] would <action>` entry to the automod log channel and records the
-event. **Recommended workflow:** enable the bot, set all rules to dry-run,
+`[DRY RUN] would <action>` entry to the configured automod log channel. It does
+not create a SQL audit row. **Recommended workflow:** enable the bot, set all rules to dry-run,
 watch for a few days, then switch them live one by one.
 
 ## Evidence
 
-Every fired rule writes an audit event (`events` table, visible in the WebUI
-Audit Log) containing the rule, action, reason, and a content snapshot.
+Live warn/timeout/kick/ban actions retain an audit event (`events` table, visible
+in the WebUI Audit Log) containing the rule, action, reason, and selected evidence.
+Dry-run, log-only and delete-only observations report to the configured Discord
+channel without a SQL copy. Delivery is best effort and is not replayed after failure.
+Existing event rows remain visible; these transitional records do not establish
+per-action success. See [logging/data behavior](LOGGING-DATA.md).

@@ -1,8 +1,11 @@
 //! Event routing: renders a template for an event type and posts it to the
-//! configured guild-scoped log channel, plus audit-log recording.
+//! configured guild-scoped log channel. Routine delivery never archives an event.
 
+use serenity::builder::{CreateAllowedMentions, CreateMessage};
 use serenity::client::Context;
-use serenity::model::id::GuildId;
+use serenity::model::channel::MessageFlags;
+use serenity::model::event::MessageUpdateEvent;
+use serenity::model::id::{ChannelId, GuildId, MessageId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -17,40 +20,190 @@ fn channel_for(
     cfg.log_channels.get(event).copied()
 }
 
-/// Emits an event: writes to the audit log table and posts the rendered
-/// template to the configured log channel (if any). Never panics on errors;
-/// failures are traced only.
+/// Sends one best-effort Discord log report. No message history or retry queue.
 pub async fn emit(
     app: &Arc<AppState>,
     ctx: &Context,
     guild_id: GuildId,
     event: &str,
-    mut vars: BTreeMap<String, String>,
+    vars: BTreeMap<String, String>,
 ) {
-    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
-    vars.insert("guild".into(), guild_id.get().to_string());
+    emit_to(app, ctx.http.as_ref(), guild_id, event, vars).await;
+}
 
-    let cfg = match app.configs.get(&app.db, guild_id.get()).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("emit {event}: config load failed: {e:#}");
-            return;
+#[serenity::async_trait]
+pub(crate) trait LogDelivery: Sync {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()>;
+}
+#[serenity::async_trait]
+impl LogDelivery for serenity::http::Http {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        channel.send_message(self, message).await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Sent,
+    Unconfigured,
+    Dropped,
+    Failed,
+}
+
+pub(crate) async fn emit_to(
+    app: &Arc<AppState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    mut vars: BTreeMap<String, String>,
+) -> Delivery {
+    // Admission never waits or creates a backlog holding raw event content.
+    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
+        record_delivery_failure(app);
+        return Delivery::Dropped;
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(app.cfg.log.discord_timeout_secs),
+        async {
+            let cfg = app.configs.get(&app.db, guild_id.get()).await?;
+            let Some(channel_id) = channel_for(&cfg, event) else {
+                return Ok(Delivery::Unconfigured);
+            };
+            vars.insert("event".into(), event.to_owned());
+            vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
+            vars.insert("guild".into(), guild_id.get().to_string());
+            let template = cfg
+                .templates
+                .get(event)
+                .map(String::as_str)
+                .unwrap_or_else(|| default_template(event));
+            let rendered = templates::render_bounded(template, &vars, 2000);
+            sink.send(channel_id, log_message(&rendered)).await?;
+            Ok::<_, anyhow::Error>(Delivery::Sent)
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(delivery)) => delivery,
+        _ => {
+            record_delivery_failure(app);
+            Delivery::Failed
         }
-    };
+    }
+}
 
-    let Some(channel_id) = channel_for(&cfg, event) else {
-        return;
-    };
+fn record_delivery_failure(app: &AppState) {
+    let count = app
+        .log_delivery_failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    // Sparse diagnostics, without message bodies or one log entry per raid event.
+    if count.is_power_of_two() {
+        tracing::warn!(
+            count,
+            "Discord log reports dropped or failed; inspect log channel configuration and delivery capacity"
+        );
+    }
+}
 
-    let template: String = cfg
-        .templates
-        .get(event)
-        .cloned()
-        .unwrap_or_else(|| default_template(event).to_string());
+fn log_message(content: &str) -> CreateMessage {
+    CreateMessage::new()
+        .content(clip(content, 2000))
+        .allowed_mentions(
+            CreateAllowedMentions::new()
+                .all_users(false)
+                .all_roles(false)
+                .everyone(false)
+                .replied_user(false),
+        )
+        .flags(MessageFlags::SUPPRESS_EMBEDS)
+}
 
-    let rendered = templates::render(&template, &vars);
-    if let Err(e) = channel_id.say(&ctx.http, &rendered).await {
-        tracing::warn!("emit {event} to {channel_id}: {e}");
+/// Bound UTF-16 units too, so astral characters cannot exceed Discord's limit.
+fn clip(text: &str, limit: usize) -> String {
+    let mut out = String::new();
+    let mut units = 0;
+    for ch in text.chars() {
+        if units + ch.len_utf16() > limit.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        units += ch.len_utf16();
+    }
+    out
+}
+
+pub(crate) struct MessageReport {
+    pub guild_id: GuildId,
+    pub event: &'static str,
+    pub vars: BTreeMap<String, String>,
+}
+
+fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("channel".into(), format!("<#{channel}>")),
+        ("message_id".into(), id.to_string()),
+        (
+            "message_url".into(),
+            format!("https://discord.com/channels/{guild}/{channel}/{id}"),
+        ),
+        ("mention".into(), "unavailable".into()),
+        ("user".into(), "unavailable".into()),
+        ("user_id".into(), "unavailable".into()),
+        ("before".into(), "not retained".into()),
+        ("content".into(), "not retained".into()),
+    ])
+}
+
+/// Use only fields in the delivered update; cache-filled values are not edit history.
+/// Embed/pin-only refreshes do not prove a content edit and produce no report.
+pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<MessageReport> {
+    let guild_id = event.guild_id?;
+    if event.content.is_none() && event.attachments.is_none() {
+        return None;
+    }
+    let mut vars = message_vars(guild_id, event.channel_id, event.id);
+    vars.insert(
+        "after".into(),
+        event
+            .content
+            .as_deref()
+            .map(|s| clip(s, 1000))
+            .unwrap_or_else(|| "not supplied in this update".into()),
+    );
+    vars.insert(
+        "attachments".into(),
+        event
+            .attachments
+            .as_ref()
+            .map(|a| a.len().to_string())
+            .unwrap_or_else(|| "not supplied in this update".into()),
+    );
+    if let Some(author) = &event.author {
+        vars.extend(templates::user_vars(
+            author.id.get(),
+            &author.name,
+            &author.name,
+        ));
+    }
+    Some(MessageReport {
+        guild_id,
+        event: "message_edit",
+        vars,
+    })
+}
+
+pub(crate) fn message_delete_report(
+    guild_id: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+) -> MessageReport {
+    MessageReport {
+        guild_id,
+        event: "message_delete",
+        vars: message_vars(guild_id, channel, id),
     }
 }
 
@@ -116,3 +269,6 @@ fn default_template(event: &str) -> &'static str {
         .map(|(_, t)| t)
         .unwrap_or("**{event}**\n{content}")
 }
+
+#[cfg(test)]
+mod tests;

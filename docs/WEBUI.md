@@ -111,16 +111,19 @@ the editor does not undo an acknowledged global write.
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | server stats: prefix, rules enabled, dry-runs, commands, log channels |
+| **Dashboard** | server configuration plus identified moderation records, warns and bans; unavailable counts are explicit |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
 | **Log Channels** | map each event type to a channel ID for that server |
-| **Members** | search members: join count, message count, first/last seen |
-| **Audit Log** | filterable event history (type, user, actor) |
+| **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Bans** | ban history + unban via the bot token (API process) |
-| **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear), message retention (per-server purge); global prefix (owner only); **copy config from another server** |
+| **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
+
+Routine message/member history and chat-retention controls are removed. Saved Members
+tabs reopen on Dashboard. Publish matching API/frontend versions; older pages submitting
+retention settings must reload. See [logging/data behavior](LOGGING-DATA.md).
 
 ## Global vs per-server config
 
@@ -175,7 +178,6 @@ GET    /api/guilds/{id}/templates/{event}     PUT/DELETE …
 GET    /api/guilds/{id}/logchannels/{event}   PUT/DELETE …
 POST   /api/guilds/{id}/copy
 POST   /api/guilds/{id}/testregex      # pattern/sample length + compile limits
-GET    /api/guilds/{id}/members?q=&limit=
 GET    /api/guilds/{id}/events?event=&user=&limit=
 GET    /api/guilds/{id}/bans
 POST   /api/guilds/{id}/unban

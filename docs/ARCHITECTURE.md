@@ -36,8 +36,8 @@ by processes on different hosts.
 
 Config writers bump a durable `meta.config_version` row and replace its
 `meta.config_revision` token **inside the DB layer**
-(same transaction as the write). Runtime writers (messages, members, events,
-warns, bans, users) do **not** bump it.
+(same transaction as the write). Runtime moderation writers (events,
+warns, bans) do **not** bump it.
 
 Both processes poll `bot.config_poll_secs` (default 5) and invalidate their
 in-memory guild config cache when the version changes. Command registry writers

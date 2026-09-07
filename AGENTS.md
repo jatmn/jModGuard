@@ -18,6 +18,14 @@ No live provider testing or deployment is part of the current local implementati
 This foundation preserves existing database migrations and bot/API configuration.
 Fresh-database enforcement and other incompatible cutovers belong in separate changes.
 
+Routine collection of message text/attachments and member/user activity is retired.
+See `docs/LOGGING-DATA.md`. Do not call historical archive helpers from runtime paths.
+Basic events report to Discord using supplied fields, with bounded delivery and no
+history reconstruction. General message caching stays disabled. Keep selected moderation
+records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
+not create durable audit rows. The old schema and internal retention fields remain
+transitional; this wave does not delete existing records.
+
 ## Commands
 
 ```bash
@@ -87,7 +95,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   returns, then commit only after every failed guild syncs successfully.
   `AppState::new` primes both version baselines from the DB so the first poll
   has no unobserved window (never use a “skip first observation” sentinel).
-- Runtime writers (messages/members/events/warns/bans/users) must **not** bump
+- Runtime moderation writers (events/warns/bans) must **not** bump
   `config_version`.
 - Global WebUI routes (`guild_id=0`) and body `scope: "global"` require
   `bot.owner_id` == logged-in user.
@@ -165,7 +173,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `!prefix` / `!setname` / WebUI settings patch only the changed fields.
   WebUI/API `null` on a field clears that override (inherit parent); omitted
   fields are left unchanged (`de_settings_patch_field` — default Option nesting
-  would treat JSON `null` as omitted). Empty prefix/retention in the WebUI
+  would treat JSON `null` as omitted). Empty prefix in the WebUI
   clears an existing override (`null`); empty bot nickname still means
   clear-to-empty.
   Empty prefix values are rejected by `patch_settings`. Bot migrate-open
@@ -181,12 +189,12 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   re-pass. Every committed `guild_settings` mutation (patch, copy settings,
   test upsert, heal) calls
   `refresh_settings_heal_checksum_conn` so the fast-path stays accurate.
-- Message retention purge is **per-guild** via the same field-level resolution
-  (`0` keeps forever). `bot.retention_days` / `bot.default_prefix` are synced
+- The historical retention field remains internal, with no live collection or purge
+  task and no UI/API control. `bot.retention_days` / `bot.default_prefix` are synced
   into durable `meta.settings_terminal_defaults` on bot migrate-open (bot is
   authority) and read from that meta row on every settings resolve (not cached
   at process open) as the final fallback when neither guild nor global sets a
-  field — shared by WebUI / `get_settings` / config cache / purge so bot and
+  field — shared by `get_settings` / config cache so bot and
   API cannot diverge. The API refuses to open until that meta row and the
   bot-written bootstrap-complete marker exist (start the bot first).
 - Cross-process config lag up to `config_poll_secs` after a successful baseline
@@ -210,7 +218,7 @@ src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
 src/db/configuration.rs config CRUD + resolved snapshots
 src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
-src/db/moderation.rs    members/messages/retention/audit/warns/bans
+src/db/moderation.rs    moderation records plus transitional historical data helpers
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)

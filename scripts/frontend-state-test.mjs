@@ -32,7 +32,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
   });
-  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -52,6 +52,38 @@ function findNode(root, predicate) {
 function textOf(root) {
   return (root.textContent || '') + (root.children || []).map(textOf).join('');
 }
+
+test('dashboard moderation counts stay with their requested server', async () => {
+  const pending = [];
+  const { app } = harness((url) => new Promise(resolve => pending.push({ url, resolve })));
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const first = app.tabDashboard();
+  app.state.guildId = app.state.guilds[1].id;
+  const second = app.tabDashboard();
+  assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/stats`);
+  assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
+  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
+  pending[1].resolve(response({ events: 7, warns: 2, bans: 1 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(value(second, 'Moderation records'), '7');
+  assert.equal(value(second, 'Warns'), '2');
+  assert.equal(value(second, 'Bans'), '1');
+  pending[0].resolve(response({ events: 900, warns: 8, bans: 3 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(value(first, 'Moderation records'), '900');
+  assert.equal(value(second, 'Moderation records'), '7');
+});
+
+test('dashboard does not show zero moderation counts when stats are unavailable', async () => {
+  const { app } = harness(async () => { throw new Error('offline'); });
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const dashboard = app.tabDashboard();
+  await new Promise(resolve => setImmediate(resolve));
+  for (const label of ['Moderation records', 'Warns', 'Bans']) {
+    const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
+    assert.equal(card.children[0].textContent, 'Unavailable');
+  }
+});
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
   const first = harness();
@@ -87,6 +119,15 @@ test('blocked browser storage does not block navigation or restoration', () => {
   assert.doesNotThrow(() => app.restoreWorkspace());
   assert.doesNotThrow(() => app.persistWorkspace());
   assert.equal(app.state.guildId, app.state.guilds[0].id);
+});
+
+test('saved Members tab falls back to the dashboard after history removal', () => {
+  const { app, storage } = harness();
+  const guildId = app.state.guilds[1].id;
+  storage.set(app.workspaceKey(), JSON.stringify({ guildId, tab: 'members' }));
+  app.restoreWorkspace();
+  assert.equal(app.state.guildId, guildId);
+  assert.equal(app.state.tab, 'dashboard');
 });
 
 test('dropdown option arrays become real nodes and boolean false stays false', () => {
@@ -176,22 +217,19 @@ test('settings patches send only changed fields to the selected server', async (
   assert.equal(calls[1].method, 'GET');
 });
 
-test('settings keep clear-to-inherit, empty nickname, and zero retention distinct', async () => {
+test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
   inputs[1].value = '';
-  inputs[2].value = '0';
   await save.listeners.click({});
-  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '', retention_days: 0 });
+  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '' });
 });
 
-test('fractional retention is rejected before a save request', async () => {
-  const { calls, inputs, save } = settingsHarness();
-  inputs[2].value = '1.5';
-  await save.listeners.click({});
-  assert.equal(calls.length, 0);
+test('settings do not expose historical chat-retention controls', () => {
+  const { elements, inputs } = settingsHarness();
+  assert.equal(inputs.filter(n => n.attrs.type === 'number').length, 0);
+  assert.ok(!elements.some(n => /retention|keep forever/i.test(n.textContent || '')));
 });
-
 
 test('partial settings actions preserve dirty sibling fields in the same card', () => {
   const { app, nodes } = harness();

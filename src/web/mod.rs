@@ -726,7 +726,6 @@ pub fn router(app: Arc<AppState>) -> Router {
             "/api/guilds/{guild_id}/testregex",
             axum::routing::post(api::test_regex),
         )
-        .route("/api/guilds/{guild_id}/members", get(api::members))
         .route("/api/guilds/{guild_id}/events", get(api::events))
         .route("/api/guilds/{guild_id}/bans", get(api::bans))
         .route(
@@ -912,6 +911,20 @@ mod tests {
             session.get::<u64>(SESSION_USER).await.unwrap().is_none(),
             "pre-login session must not receive the Discord user id"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_members_history_endpoint_is_not_served() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/guilds/123/members")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

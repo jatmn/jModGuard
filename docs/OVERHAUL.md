@@ -1,13 +1,13 @@
 # Overhaul implementation status
 
-The overhaul lands in independently reviewed changes. This first wave adds the Cargo
-workspace, shared process utilities and an optional conductor development foundation.
-Existing bot/API installation and upgrade instructions continue to apply.
+The overhaul lands in independently reviewed changes. The service foundation is followed
+by routine logging/data minimization. The existing bot/API and optional inactive conductor
+remain independently buildable. See [logging/data behavior](LOGGING-DATA.md).
 
-## Compatibility of this wave
+## Foundation compatibility
 
-- Existing database migrations, bootstrap, configuration and WebUI contracts are unchanged.
-  There is no database reset, schema-family gate or data conversion in this change.
+- The foundation preserved the database and WebUI contracts. The logging wave below
+  intentionally removes routine-history UI/API surfaces; migrations remain unchanged.
 - Bot/API binary names, Cargo feature flags and health/shutdown module paths remain
   available. Existing container definitions include the new workspace directories.
   Bare Cargo commands still select the application; conductor builds use an explicit
@@ -46,6 +46,18 @@ This is application source, not a separate proof project. No prototype's fixture
 schema, hardcoded test budgets, synthetic login or same-host recovery lock is being
 presented as a completed production control system.
 
+## Implemented: routine logging without SQL history
+
+Routine message/member/user collection, roster backfill, tracking state and periodic
+SQL message cleanup are removed. Basic edit/delete/join/leave reports use delivered
+Discord fields, with no reconstructed transcript. Discord delivery is bounded by
+configurable concurrency/deadline, suppresses mentions/previews and has no waiting backlog.
+The Members view/endpoint and retention setting are removed; stats show moderation
+records only. Selected moderation records and moderation-plan summaries remain durable.
+Historical schema/helpers remain transitional; no existing rows are erased by this wave.
+Deploy matching frontend/API artifacts and reload old pages that submit retention settings.
+This does not implement new image detection, the case/evidence model or tenant routing.
+
 ## Next implementation slices
 
 1. Separate bot/API state and credentials. Replace API bot-token operations with typed,
@@ -64,5 +76,5 @@ presented as a completed production control system.
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
 provider durability, distributed writer exclusion, access policy or billed resource use.
-The foundation does not yet change message retention, split database credentials,
-remove the API bot token or deliver operational conductor features.
+Database credential separation, API bot-token removal and operational conductor features
+remain pending. Logging changes are described above; they do not establish full guild erasure.

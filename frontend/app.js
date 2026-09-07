@@ -23,7 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "members", "events", "bans", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "settings"];
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -359,7 +359,7 @@ function selectedGuild() {
 function renderTab() {
   const map = {
     dashboard: tabDashboard, rules: tabRules, badwords: tabBadwords, commands: tabCommands,
-    templates: tabTemplates, logchannels: tabLogChannels, members: tabMembers,
+    templates: tabTemplates, logchannels: tabLogChannels,
     events: tabEvents, bans: tabBans, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
@@ -414,6 +414,14 @@ function tabDashboard() {
   const rulesDry = cfg.rules.filter((r) => r.effective.dry_run).length;
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
+  const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans']]
+    .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
+  const guildId = state.guildId;
+  api(`/api/guilds/${guildId}/stats`).then(counts => {
+    moderation.forEach(({ key, value }) => { value.textContent = counts[key] == null ? 'Unavailable' : String(counts[key]); });
+  }).catch(() => {
+    moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
+  });
   return el("div", {},
     el("section", { class: "hero" },
       el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
@@ -430,8 +438,10 @@ function tabDashboard() {
       stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
       stat("Log channels", chans),
       stat("Badword patterns", cfg.badwords.length),
-      stat("Retention", Number(cfg.settings.retention_days) === 0 ? "forever" : `${cfg.settings.retention_days}d`),
+      stat("Routine chat collection", "Off"),
+      ...moderation.map(({ value, label }) => el('div', { class: 'stat' }, value, el('div', { class: 'label', text: label }))),
     ),
+    el('p', { class: 'muted', text: 'Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.' }),
     el("div", { class: "card", style: "margin-top:16px" },
       el("h3", { text: "Getting started" }),
       el("p", { class: "muted", text: isBotOwner()
@@ -892,7 +902,7 @@ function tabTemplates() {
   return el("div", {},
     el("h2", { text: "Event templates" }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Templates render into the configured log channels. Variables: {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {message_link} {count} {age} {joined} {duration} {time}."),
+      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. Earlier text and deleted content are not retained. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed."),
     ...state.config.templates.map((t) => templateCard(t)),
   );
 }
@@ -973,45 +983,8 @@ function tabLogChannels() {
 }
 
 // ---------------------------------------------------------------------------
-// members / events / bans
+// events / bans
 // ---------------------------------------------------------------------------
-
-function tabMembers() {
-  const q = el("input", { type: "text", placeholder: "search name or id" });
-  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Member", "User ID", "Status", "Joins", "Messages", "First joined", "Last left"].map((text) => el("th", { text })))), el("tbody", {}));
-  const guildId = state.guildId;
-  let request = 0;
-  const tbody = () => table.querySelector("tbody");
-  const run = async () => {
-    const current = ++request;
-    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, text: "Loading…" })));
-    try {
-      const rows = await api(`/api/guilds/${guildId}/members?q=${encodeURIComponent(q.value || "")}&limit=100`);
-      if (current !== request) return;
-      tbody().innerHTML = "";
-      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 7, class: "muted", text: "No matching records." })));
-      rows.forEach((r) => tbody().append(el("tr", {},
-        el("td", { text: r.username || String(r.user_id) }),
-        el("td", { class: "mono", text: r.user_id }),
-        el("td", { text: r.currently_in ? "in server" : "left" }),
-        el("td", { text: `joined ${r.join_count}x` }),
-        el("td", { text: `${r.message_count} msgs` }),
-        el("td", { class: "muted", text: r.first_joined_at ? new Date(r.first_joined_at).toLocaleString() : "-" }),
-        el("td", { class: "muted", text: r.last_left_at ? new Date(r.last_left_at).toLocaleString() : "-" }),
-      )));
-    } catch (e) {
-      if (current !== request) return;
-      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 7, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
-    }
-  };
-  q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
-  run().catch((e) => toast(e.message, "error"));
-  return el("div", {},
-    el("h2", { text: "Members" }),
-    el("div", { class: "row", style: "margin-bottom:12px" }, q, el("button", { class: "btn", text: "Search", onclick: run })),
-    table,
-  );
-}
 
 function tabEvents() {
   const typeSel = el("select", {}, el("option", { value: "", text: "all types" }),
@@ -1109,7 +1082,6 @@ function tabSettings() {
   const ov = cfg.settings_override || {};
   const prefix = el("input", { type: "text", value: cfg.settings.prefix });
   const botName = el("input", { type: "text", value: cfg.settings.bot_name });
-  const retention = el("input", { type: "number", min: 0, value: cfg.settings.retention_days });
 
   const srcSel = el("select", {},
     ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => el("option", { value: g.id, text: g.name })),
@@ -1176,12 +1148,6 @@ function tabSettings() {
           "Empty clears the Discord nickname. Nicknames are configured per server.",
           false,
         ),
-        settingsField(
-          "Message retention (days)",
-          retention,
-          "retention_days",
-          "0 = keep forever. Empty + Save clears a server override (inherit global).",
-        ),
       ),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         // Tri-state body: omit unchanged, null clears override, value sets.
@@ -1202,24 +1168,7 @@ function tabSettings() {
         if (botName.value !== cfg.settings.bot_name) {
           body.bot_name = botName.value;
         }
-        const rawDays = String(retention.value ?? "").trim();
-        if (rawDays === "") {
-          // Empty means "clear override / inherit" — never "forever" (that is 0).
-          // Without an override, blank is invalid (same fail-closed rule as prefix).
-          if (ov.retention_days != null) body.retention_days = null;
-          else {
-            toast("Enter retention days (0 = forever). Empty only clears a server override.", "error");
-            return;
-          }
-        } else {
-          const days = Number(rawDays);
-          if (!Number.isSafeInteger(days) || days < 0) {
-            toast("Retention must be a non-negative whole number (0 = keep forever)", "error");
-            return;
-          }
-          if (days !== cfg.settings.retention_days) body.retention_days = days;
-        }
-        if (body.prefix === undefined && body.bot_name === undefined && body.retention_days === undefined) {
+        if (body.prefix === undefined && body.bot_name === undefined) {
           toast("No settings changes", "success");
           return;
         }
@@ -1359,7 +1308,7 @@ function bootUi() {
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !["members", "events", "bans"].includes(state.tab)) markDirty();
+    if (event.target.matches("input, textarea, select") && !["events", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }

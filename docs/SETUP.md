@@ -31,7 +31,7 @@ This guide covers everything from zero to a running bot on **Linux**
 2. Left sidebar → **Bot**:
    - Click **Reset Token** and copy the token. Treat it like a password.
    - Enable these **Privileged Gateway Intents**:
-     - **Server Members Intent** — **required** (join/leave tracking)
+     - **Server Members Intent** — **required** (member events and moderation)
      - **Message Content Intent** — **required** (message filtering)
      - **Presence Intent** — not used by jModGuard (safe to leave off)
 3. Left sidebar → **OAuth2 → General**:

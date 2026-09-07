@@ -64,10 +64,7 @@ default_prefix = "!"
 # Leaving at 0 blocks all global WebUI mutations. Enable Developer Mode in
 # Discord, right-click your avatar -> Copy User ID.
 owner_id = 0
-# Terminal retention fallback when neither guild nor global overrides it. The
-# bot refreshes it at startup (0 = keep forever). Values above 100000 are
-# rejected, matching WebUI writes and the purge maximum.
-retention_days = 7
+# The retired chat-history retention field is no longer an operator setting.
 # Presence status text shown under the bot's name.
 status = "moderating"
 # How often each process polls durable config_version (cross-process cache invalidation).
@@ -81,3 +78,7 @@ level = "info"
 # Env: JMODGUARD_LOG_DIRECTORY. The container images set it to empty so logs
 # are visible in the platform log stream.
 directory = "logs"
+# Discord report delivery: no waiting backlog; excess reports are dropped.
+# These bootstrap controls will move into Administration.
+discord_concurrency = 8       # JMODGUARD_LOG_DISCORD_CONCURRENCY
+discord_timeout_secs = 10     # JMODGUARD_LOG_DISCORD_TIMEOUT_SECS

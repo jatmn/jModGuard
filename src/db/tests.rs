@@ -853,24 +853,106 @@ fn guild_stats_are_scoped_not_global() {
     let db = Db::open(&tmp, 2).unwrap();
     let g1 = 111i64;
     let g2 = 222i64;
-    tokio_test_block_on(crate::db::bump_message(&db, g1, 1, "a")).unwrap();
-    tokio_test_block_on(crate::db::bump_message(&db, g1, 2, "b")).unwrap();
-    tokio_test_block_on(crate::db::bump_message(&db, g2, 3, "c")).unwrap();
     tokio_test_block_on(crate::db::add_warn(&db, g1, 1, 9, "spam")).unwrap();
     tokio_test_block_on(crate::db::add_warn(&db, g2, 3, 9, "spam")).unwrap();
+    tokio_test_block_on(crate::db::add_warn(&db, g2, 4, 9, "spam")).unwrap();
+    tokio_test_block_on(crate::db::record_ban(&db, g2, 4, Some(9), "spam")).unwrap();
+    // No historical member/message tables are needed for guild stats.
+    db.with_conn_sync(|conn| {
+        conn.execute_batch("DROP TABLE messages; DROP TABLE members;")?;
+        Ok(())
+    })
+    .unwrap();
     let s1 = tokio_test_block_on(crate::db::guild_stats(&db, g1)).unwrap();
     let s2 = tokio_test_block_on(crate::db::guild_stats(&db, g2)).unwrap();
-    assert_eq!(s1.members, 2);
-    assert_eq!(s2.members, 1);
     assert_eq!(s1.warns, 1);
-    assert_eq!(s2.warns, 1);
-    assert_eq!(s1.guilds, 1);
-    let global = tokio_test_block_on(crate::db::stats(&db)).unwrap();
-    assert_eq!(global.members, 3);
-    assert_eq!(global.warns, 2);
-    // Discord !stats / WebUI must use guild_stats — prove g1 never sees g2 totals.
-    assert_ne!(s1.members, global.members);
-    assert_ne!(s1.warns, global.warns);
+    assert_eq!(s2.warns, 2);
+    assert_eq!(s1.bans, 0);
+    assert_eq!(s2.bans, 1);
+    let wire = serde_json::to_value(s1).unwrap();
+    assert!(wire.get("messages").is_none());
+    assert!(wire.get("members").is_none());
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn moderation_stats_exclude_routine_and_unclassified_history() {
+    let tmp = tmp_db_path("moderation_stats_history");
+    let db = Db::open(&tmp, 2).unwrap();
+    let baseline = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let routine = [
+        ("system", serde_json::json!({})),
+        ("message_edit", serde_json::json!({})),
+        ("message_delete", serde_json::json!({})),
+        ("automod", serde_json::json!({"action":"log"})),
+        ("automod", serde_json::json!({"action":"delete"})),
+        (
+            "automod",
+            serde_json::json!({"action":"ban", "dry_run":true}),
+        ),
+        (
+            "plan_executed",
+            serde_json::json!({"command":"old", "steps":1}),
+        ),
+        ("plan_executed", serde_json::json!({"moderation":false})),
+        ("plan_executed", serde_json::json!({"moderation":"true"})),
+    ];
+    for (event, data) in &routine {
+        tokio_test_block_on(insert_event(&db, 11, event, None, None, data)).unwrap();
+    }
+    // Transitional rows can contain malformed JSON; they must not break stats.
+    db.with_conn_sync(|conn| {
+        conn.execute_batch(
+            "INSERT INTO events (guild_id,event_type,data,created_at)
+             VALUES (11,'automod','invalid',''), (11,'plan_executed',NULL,'');",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tokio_test_block_on(guild_stats(&db, 11)).unwrap().events, 0);
+    let retained = [
+        ("mod_action", serde_json::json!({"action":"warn"})),
+        ("timeout_add", serde_json::json!({})),
+        ("timeout_remove", serde_json::json!({})),
+        ("member_ban", serde_json::json!({})),
+        ("member_unban", serde_json::json!({})),
+        ("member_kick", serde_json::json!({})),
+        ("automod", serde_json::json!({"action":"warn"})),
+        (
+            "automod",
+            serde_json::json!({"action":"timeout", "dry_run":false}),
+        ),
+        ("automod", serde_json::json!({"action":"kick"})),
+        ("automod", serde_json::json!({"action":"ban"})),
+        (
+            "plan_executed",
+            serde_json::json!({"command":"new", "steps":1, "moderation":true}),
+        ),
+    ];
+    for guild in [11, 22] {
+        for (event, data) in &retained {
+            tokio_test_block_on(insert_event(&db, guild, event, None, None, data)).unwrap();
+        }
+    }
+    assert_eq!(
+        tokio_test_block_on(guild_stats(&db, 11)).unwrap().events,
+        retained.len() as i64
+    );
+    assert_eq!(
+        tokio_test_block_on(guild_stats(&db, 22)).unwrap().events,
+        retained.len() as i64
+    );
+    // Counting does not erase or hide the ambiguous/routine legacy audit rows.
+    assert_eq!(
+        tokio_test_block_on(query_events(&db, 11, None, None, 200))
+            .unwrap()
+            .len(),
+        routine.len() + 2 + retained.len()
+    );
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        baseline
+    );
     cleanup_db(&tmp);
 }
 

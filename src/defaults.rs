@@ -338,7 +338,7 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "stats",
         "Utility",
-        "This server's stats (members, messages, events, warns, bans).",
+        "This server's retained moderation counts (records, warns, bans).",
         "!stats",
         "everyone",
         Behavior::Stats,
@@ -422,11 +422,11 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "message_edit",
-            "**:pencil2: Message edited in {channel}**\nAuthor: {mention}\nBefore: {before}\nAfter: {after}",
+            "**:pencil2: Message updated in {channel}**\nMessage: {message_url}\nAuthor: {mention}\nCurrent text: {after}\nAttachments: {attachments}",
         ),
         (
             "message_delete",
-            "**:wastebasket: Message deleted in {channel}**\nAuthor: {mention}\nContent: {content}",
+            "**:wastebasket: Message deleted in {channel}**\nMessage ID: `{message_id}`\nAuthor unavailable; content not retained.",
         ),
         (
             "message_bulk_delete",

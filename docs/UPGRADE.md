@@ -114,7 +114,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
    inheritance. Runtime reads ignore corrupt rows so inheritance remains
    available, but only a bot migrate-open durably heals them. The bot also writes durable
    `meta.settings_terminal_defaults` from `bot.default_prefix` /
-   `bot.retention_days` on every migrate-open; both processes read that meta
+   the transitional `bot.retention_days` field on every migrate-open (routine chat
+   collection/purge and its UI control are retired); both processes read that meta
    row on each settings resolve (not cached at open). The API **refuses to
    open** if that meta row is missing — start the bot first (do not let the API
    seed terminal defaults from its own config). Legacy settings heal is skipped
@@ -129,6 +130,17 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 Do **not** run a new API against a DB that has not been migrated by a new bot
 (or an equivalent migrate step).
+
+### Adopt basic report templates
+
+This logging wave preserves saved templates and commands, including old seeded values.
+Edit the `message_edit` and `message_delete` templates using the
+[provided basic report values](TEMPLATES.md#existing-saved-templates) to display message
+references and supplied attachment counts. Resetting only a guild template inherits its
+saved global value. Existing custom templates are never overwritten automatically.
+The saved `stats` command description may still mention member/message counts; update
+its description in Commands if needed. The command itself now reports moderation counts.
+Publish matching frontend/API artifacts and reload older settings pages.
 
 ## 6. Verify
 

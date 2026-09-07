@@ -470,12 +470,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
-            // Never call process-wide `db::stats()` here (cross-guild leak to everyone).
             let s = db::guild_stats(&env.app.db, env.guild_id.get() as i64).await?;
             let uptime = format!("{:?}", env.app.start.elapsed());
             let response = format!(
-                "**Stats** (this server)\nUptime: {uptime}\nMembers tracked: {}\nMessages in store: {}\nEvents logged: {}\nWarns: {}\nBans: {}",
-                s.members, s.messages, s.events, s.warns, s.bans
+                "**Stats** (this server)\nUptime: {uptime}\nModeration records: {}\nWarns: {}\nBans: {}",
+                s.events, s.warns, s.bans
             );
             Ok(BehaviorOutcome {
                 response: Some(response),

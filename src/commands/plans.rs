@@ -1,7 +1,8 @@
 //! Action-plan executor for custom commands.
 //!
 //! Steps run sequentially; each failing step is traced and execution
-//! continues. All steps are audited via the `plan_executed` log event.
+//! continues. Plans report through the `plan_executed` Discord event; plans with
+//! moderation steps also retain their existing durable execution summary.
 
 use anyhow::{Result, anyhow};
 use serenity::model::id::{RoleId, UserId};
@@ -60,14 +61,12 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
     };
     vars.insert("content".into(), content.clone());
 
-    // audit the plan run
-    let _ = db::insert_event(
+    let _ = record_moderation_plan(
         &env.app.db,
         env.guild_id.get() as i64,
-        "plan_executed",
-        Some(env.actor.get() as i64),
-        Some(env.actor.get() as i64),
-        &serde_json::json!({"command": env.cmd.name, "steps": steps.len()}),
+        env.actor.get() as i64,
+        &env.cmd.name,
+        steps,
     )
     .await;
     logging::emit(
@@ -87,6 +86,29 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         },
         vars,
     })
+}
+
+async fn record_moderation_plan(
+    db: &db::Db,
+    guild_id: i64,
+    actor: i64,
+    command: &str,
+    steps: &[PlanStep],
+) -> Result<()> {
+    if plan_requires_target(steps) {
+        // Preserve the existing summary, not a claim that every step succeeded.
+        // Per-step outcomes and evidence belong to the later case model.
+        db::insert_event(
+            db,
+            guild_id,
+            "plan_executed",
+            Some(actor),
+            Some(actor),
+            &serde_json::json!({"command": command, "steps": steps.len(), "moderation": true}),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn plan_requires_target(steps: &[PlanStep]) -> bool {
@@ -143,6 +165,69 @@ async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::mod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn routine_plans_leave_no_sql_summary_but_moderation_plans_keep_theirs() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_plan_audit_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let baseline = db::get_config_version(&db).await.unwrap();
+        for steps in [
+            vec![PlanStep::Reply {
+                template: "hello".into(),
+            }],
+            vec![PlanStep::Log {
+                event: "system".into(),
+                template: "hello".into(),
+            }],
+        ] {
+            record_moderation_plan(&db, 10, 20, "routine", &steps)
+                .await
+                .unwrap();
+        }
+        assert!(
+            db::query_events(&db, 10, None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for step in [
+            PlanStep::Timeout { minutes: 5 },
+            PlanStep::Kick,
+            PlanStep::Ban { delete_days: 0 },
+        ] {
+            record_moderation_plan(&db, 10, 20, "moderate", &[step])
+                .await
+                .unwrap();
+        }
+        let rows = db::query_events(&db, 10, Some("plan_executed"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row.actor_id, Some(20));
+            let data: serde_json::Value =
+                serde_json::from_str(row.data.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                data,
+                serde_json::json!({"command":"moderate", "steps":1, "moderation":true})
+            );
+        }
+        assert_eq!(db::guild_stats(&db, 10).await.unwrap().events, 3);
+        assert!(
+            db::query_events(&db, 11, None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db::get_config_version(&db).await.unwrap(), baseline);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[test]
     fn only_moderation_steps_require_a_target() {

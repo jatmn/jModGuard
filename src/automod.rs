@@ -378,15 +378,6 @@ pub async fn execute_pending(
                 .to_string(),
         );
         logging::emit(app, ctx, guild_id, "automod", v).await;
-        let _ = db::insert_event(
-            &app.db,
-            guild_id.get() as i64,
-            "automod",
-            Some(target.id.get() as i64),
-            None,
-            &serde_json::json!({"dry_run": true, "rule": pending.rule_id, "action": rule.action, "reason": reason, "evidence": pending.evidence}),
-        )
-        .await;
         return;
     }
 
@@ -453,15 +444,23 @@ pub async fn execute_pending(
         }
     }
 
-    let _ = db::insert_event(
-        &app.db,
-        guild_id.get() as i64,
-        "automod",
-        Some(target.id.get() as i64),
-        None,
-        &serde_json::json!({"rule": pending.rule_id, "action": rule.action, "reason": reason, "evidence": pending.evidence}),
-    )
-    .await;
+    // Log-only/delete-only observations are routine Discord reports. Retain
+    // selected moderation records until the typed case model replaces this table.
+    if matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
+        let evidence = serde_json::json!({
+            "rule": pending.rule_id, "action": rule.action,
+            "reason": reason, "evidence": pending.evidence,
+        });
+        let _ = db::insert_event(
+            &app.db,
+            guild_id.get() as i64,
+            "automod",
+            Some(target.id.get() as i64),
+            None,
+            &evidence,
+        )
+        .await;
+    }
 
     let mut v = vars;
     v.insert(
