@@ -1,5 +1,9 @@
 # Deploy on Bunny.net
 
+**Database compatibility:** this release requires a fresh database or the recognized
+`jmodguard-core-1` family. Earlier databases/backups require their matching old release;
+they cannot be adopted by this baseline. See [database setup and recovery](DATABASE-BASELINE.md).
+
 Bunny.net is the first-class, out-of-the-box cloud provider: Bunny Database,
 private Magic Containers for the bot and API, and the admin WebUI on Bunny
 Storage served through a Pull Zone / CDN.

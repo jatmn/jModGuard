@@ -15,16 +15,17 @@ slice is implemented, with corresponding regression coverage.
 The conductor currently reports liveness/version but readiness remains 503. Do not
 expose operational routes until owner authorization and durable control state exist.
 No live provider testing or deployment is part of the current local implementation.
-This foundation preserves existing database migrations and bot/API configuration.
-Fresh-database enforcement and other incompatible cutovers belong in separate changes.
+Bot/API configuration remains available. The current baseline requires a fresh database
+or the recognized `jmodguard-core-1` family; see `docs/DATABASE-BASELINE.md`. Preserve
+family/version checks before bootstrap writes. Never adopt an unmarked old database.
 
 Routine collection of message text/attachments and member/user activity is retired.
-See `docs/LOGGING-DATA.md`. Do not call historical archive helpers from runtime paths.
+See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
 Basic events report to Discord using supplied fields, with bounded delivery and no
 history reconstruction. General message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
-not create durable audit rows. The old schema and internal retention fields remain
-transitional; this wave does not delete existing records.
+not create durable audit rows. Internal retention fields remain transitional with no
+collection effect. Unsupported databases are refused without changing application rows.
 
 ## Commands
 
@@ -154,7 +155,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `/health`. If the env var is set, bind failure is fatal.
 - Discord snowflake IDs on the WebUI wire are **strings** (never JS `Number`).
   Audit-event `data` blobs stringify integers above JS `Number.MAX_SAFE_INTEGER`
-  at write and on read (legacy rows). `WarnRow` / `BanRow` / `MemberRow` /
+  at write and on read (legacy rows). `WarnRow` / `BanRow` /
   `EventRow` / `BadwordView` snowflake fields use the same string serde.
 - Bot nickname: WebUI empty field, `!setname` with no args / `clear` / `-`, and
   `/setname` with the optional `name` omitted all clear the Discord nickname and
@@ -218,7 +219,7 @@ src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
 src/db/configuration.rs config CRUD + resolved snapshots
 src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
-src/db/moderation.rs    moderation records plus transitional historical data helpers
+src/db/moderation.rs    selected moderation records and statistics
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)

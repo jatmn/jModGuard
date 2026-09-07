@@ -42,36 +42,6 @@ CREATE TABLE IF NOT EXISTS badwords (
 );
 CREATE INDEX IF NOT EXISTS idx_badwords_guild ON badwords(guild_id);
 
-CREATE TABLE IF NOT EXISTS members (
-    guild_id        INTEGER NOT NULL,
-    user_id         INTEGER NOT NULL,
-    username        TEXT,
-    first_joined_at TEXT,
-    last_joined_at  TEXT,
-    last_left_at    TEXT,
-    join_count      INTEGER NOT NULL DEFAULT 0,
-    message_count   INTEGER NOT NULL DEFAULT 0,
-    last_seen_at    TEXT,
-    currently_in    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_members_guild ON members(guild_id);
-
-CREATE TABLE IF NOT EXISTS messages (
-    message_id  INTEGER NOT NULL PRIMARY KEY,
-    guild_id    INTEGER NOT NULL,
-    channel_id  INTEGER NOT NULL,
-    author_id   INTEGER NOT NULL,
-    content     TEXT,
-    attachments TEXT,
-    created_at  TEXT NOT NULL,
-    deleted_at  TEXT,
-    edited_at   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_messages_author ON messages(author_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_guild ON messages(guild_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
-
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id   INTEGER NOT NULL,
@@ -94,16 +64,6 @@ CREATE TABLE IF NOT EXISTS warns (
 );
 CREATE INDEX IF NOT EXISTS idx_warns_user ON warns(guild_id, user_id);
 
-CREATE TABLE IF NOT EXISTS mutes (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id     INTEGER NOT NULL,
-    user_id      INTEGER NOT NULL,
-    moderator_id INTEGER,
-    until        TEXT,
-    reason       TEXT,
-    created_at   TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS bans (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id     INTEGER NOT NULL,
@@ -115,10 +75,10 @@ CREATE TABLE IF NOT EXISTS bans (
 );
 CREATE INDEX IF NOT EXISTS idx_bans_guild ON bans(guild_id, user_id);
 
-CREATE TABLE IF NOT EXISTS users (
-    user_id     INTEGER NOT NULL PRIMARY KEY,
-    username    TEXT,
-    global_name TEXT,
-    avatar      TEXT,
-    updated_at  TEXT
+-- Fresh overhaul databases have a family marker from the same transaction as
+-- their first tables. Unmarked/foreign databases must not be adopted implicitly.
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
+INSERT INTO meta (key, value) VALUES ('schema_family', 'jmodguard-core-1');

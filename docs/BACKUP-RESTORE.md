@@ -1,5 +1,9 @@
 # Backup and restore
 
+**Database compatibility:** this release requires a fresh database or the recognized
+`jmodguard-core-1` family. Earlier databases/backups require their matching old release;
+they cannot be adopted by this baseline. See [database setup and recovery](DATABASE-BASELINE.md).
+
 This document separates a provider's internal durability from an
 operator-controlled backup that can be exported, retained independently, and
 restored into a different database.
