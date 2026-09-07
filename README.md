@@ -105,7 +105,7 @@ commercial licensing is granted by the author only.
 ## Development
 
 ```bash
-cargo test --locked
+cargo test --locked --workspace
 cargo clippy --locked --bins -- -D warnings
 cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
 cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
@@ -142,7 +142,7 @@ templates.rs   {variable} renderer shared by everything
 logging.rs     event → channel router + audit log
 automod.rs     rule engine (sliding windows, escalation) + action executor
 handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
-health.rs      GET/HEAD /health liveness listener (no axum; API serves same path until axum)
+crates/runtime/src/health.rs  GET/HEAD /health liveness listener (no axum; API serves same path until axum)
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/      admin SPA (Bunny Storage/CDN; local API embed)
