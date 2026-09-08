@@ -48,13 +48,17 @@ build has since moved `latest`. Input-based skipping applies to fresh jobs.
 
 A working repository SSH deploy key does **not** grant GHCR push access.
 GitHub's automatic Actions `GITHUB_TOKEN` is not supplied to self-hosted
-Buildkite jobs. Configure these values in your private Buildkite/agent setup:
+Buildkite jobs. There is no Pipeline Settings → Environment page. Official
+Buildkite docs put non-secret values in a top-level YAML `env` attribute
+([environment variables](https://buildkite.com/docs/pipelines/configure/environment-variables))
+and tokens in cluster Secrets
+([Buildkite secrets](https://buildkite.com/docs/pipelines/security/secrets/buildkite-secrets)).
 
 | Value | Where and purpose |
 |---|---|
-| `GHCR_USERNAME` | Non-secret environment variable: GitHub account owning the registry token. |
-| `GHCR_TOKEN` | Buildkite secret with this exact key, or an existing protected agent hook that supplies this environment variable. Must be able to push both `jmodguard-bot` and `jmodguard-api` packages. |
-| `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker. If absent, `GHCR_TOKEN` is used and must also read this private repository. |
+| `GHCR_USERNAME` | Non-secret. Set in this repo's `.buildkite/pipeline.yml` `env:` (already `jatmn`). The other official place is **Pipeline settings → Steps** (YAML editor) with a top-level `env:` before `steps`. |
+| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push both `jmodguard-bot` and `jmodguard-api`. |
+| `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker. If absent, `GHCR_TOKEN` is used and must also read this private repository. Do not set this to GitHub Actions' automatic token. |
 
 For personal access tokens, GitHub's container registry requires a **classic
 PAT** with `write:packages` and access to the existing packages. While this
@@ -109,9 +113,10 @@ backward; production must keep using approved image digests.
 
 ## Cutover verification
 
-1. Confirm `GHCR_USERNAME`, registry/source access and secret restrictions above
-   in Buildkite. Confirm Docker/Buildx on the `linux` agents. Existing clone/test
-   success alone does not prove publication access.
+1. Confirm `GHCR_USERNAME` is in `.buildkite/pipeline.yml`, `GHCR_TOKEN` exists
+   under **Agents → cluster → Secrets** (not pipeline settings), and the secret
+   policy plus Docker/Buildx on the `linux` agents. Existing clone/test success
+   alone does not prove publication access.
 2. Merge the reviewed migration and confirm the next main Buildkite build passes
    both tests, preparation, and both image publications. If a publish fails,
    correct the credential/agent setup and retry it; no GHA fallback starts.

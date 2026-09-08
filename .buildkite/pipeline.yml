@@ -4,6 +4,10 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Non-secret GHCR login name. There is no Pipeline Settings → Environment page;
+  # Buildkite applies this top-level env to uploaded jobs.
+  # https://buildkite.com/docs/pipelines/configure/environment-variables
+  GHCR_USERNAME: jatmn
   # Bound compiler memory on self-hosted runners. CI checks need assertions,
   # not full debugger symbols or incremental state discarded by git clean.
   CARGO_BUILD_JOBS: "1"
