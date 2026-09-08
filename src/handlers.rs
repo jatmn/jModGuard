@@ -110,6 +110,20 @@ impl EventHandler for Handler {
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
         let app = Arc::clone(self.app());
         let gid = guild.id;
+        if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
+            &app.db,
+            gid.get(),
+            guild.joined_at.timestamp_nanos_opt(),
+            guild.unavailable,
+            true,
+        )
+        .await
+        {
+            tracing::warn!(
+                guild_id = gid.get(),
+                "guild membership observation deferred: {error:#}"
+            );
+        }
         // No guild_settings seed on join — global inheritance stays unblocked.
         if !commands::sync_slash_commands(&app, &ctx, gid).await {
             app.retry_slash_registry_version();
@@ -136,12 +150,24 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn guild_delete(
-        &self,
-        _ctx: Context,
-        incomplete: UnavailableGuild,
-        _full: Option<Guild>,
-    ) {
+    async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        let joined = full
+            .filter(|guild| guild.id == incomplete.id)
+            .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
+        if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
+            &self.app().db,
+            incomplete.id.get(),
+            joined,
+            incomplete.unavailable,
+            false,
+        )
+        .await
+        {
+            tracing::warn!(
+                guild_id = incomplete.id.get(),
+                "guild retirement lacks confirmed membership or database access: {error:#}"
+            );
+        }
         // `unavailable=true` is a temporary Discord outage, not a departure.
         // A real removal remains dormant until guild_create reactivates it.
         if !incomplete.unavailable

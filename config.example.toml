@@ -55,6 +55,16 @@ oauth_client_secret = ""
 # leaves this empty. Env: JMODGUARD_CORS_ORIGINS. `*` is not allowed.
 # cors_origins = ["https://admin.example.com"]
 
+# Bot-only positive membership repair; the API ignores this section and its env vars.
+# This checks the bot's own membership, never a member roster. See docs/ENROLLMENTS.md.
+[enrollment]
+enabled = true            # JMODGUARD_ENROLLMENT_REPAIR_ENABLED (true/false)
+poll_secs = 15            # JMODGUARD_ENROLLMENT_POLL_SECS; minimum 1
+batch_size = 16           # JMODGUARD_ENROLLMENT_BATCH_SIZE; 1..200 guilds/page
+sweep_pause_secs = 3600   # JMODGUARD_ENROLLMENT_SWEEP_PAUSE_SECS; minimum 1
+retry_secs = 60           # JMODGUARD_ENROLLMENT_RETRY_SECS; minimum 1
+request_timeout_secs = 10 # JMODGUARD_ENROLLMENT_REQUEST_TIMEOUT_SECS; 1..300
+
 [bot]
 # Used as the durable terminal fallback when neither a guild nor the global
 # settings row overrides the field. The bot refreshes that fallback from this

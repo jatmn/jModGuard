@@ -41,7 +41,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0006_bot_actions.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0007_guild_enrollments.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it
@@ -137,3 +137,10 @@ this staged refactor. It has no live message-retention effect and is absent from
 responses; settings requests containing it are rejected. The archive tables and helpers
 are removed from this fresh baseline. Unsupported existing databases are refused, not
 migrated or cleaned. The full tenant/case model remains future work.
+
+## Bot membership repair
+
+Bot-only `[enrollment]` config controls positive membership discovery: enable/disable,
+page size, polling, sweep pause, retry delay and per-request timeout. The API ignores
+these TOML fields and their `JMODGUARD_ENROLLMENT_*` overrides. See
+[defaults, bounds and behavior](ENROLLMENTS.md#bounded-positive-repair).

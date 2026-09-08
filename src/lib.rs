@@ -12,6 +12,7 @@ pub mod db;
 mod db_compat;
 pub mod defaults;
 pub mod discord;
+pub mod enrollment_repair;
 pub mod handlers;
 pub use jmodguard_runtime::health;
 pub mod ids;
