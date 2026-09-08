@@ -2,7 +2,7 @@ name: images
 
 # Publish both GHCR images from a GitHub Release or a manual source_ref
 # (tag or full SHA, not a branch). Everyday pushes do not run this
-# workflow. Path-filtered Publish bot/API/database image workflows on main
+# workflow. Path-filtered Publish bot/API image workflows on main
 # build one image at a time. Each publish retags :latest for that package
 # and retains earlier versions for approved releases and rollback.
 on:

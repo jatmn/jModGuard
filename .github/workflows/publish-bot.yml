@@ -1,4 +1,6 @@
-# Rebuild only the Discord bot image on push to main. No workflow_dispatch:
+# Rebuild the Discord bot image for code or migration changes on main.
+# The bot applies SQL, so migrations share this trigger to avoid duplicate builds.
+# No workflow_dispatch:
 # a feature branch must not retag :latest. Manual publishes use images.yml.
 
 name: Publish bot image
@@ -8,6 +10,7 @@ on:
     branches: [main]
     paths:
       - Dockerfile.bot
+      - migrations/**
       - src/bin/jmodguard-bot.rs
       - src/handlers.rs
       - src/automod.rs

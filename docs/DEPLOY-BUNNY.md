@@ -138,12 +138,23 @@ GHCR has two publish styles:
 
 - **`images` workflow** (a GitHub Release, or Run workflow with a tag or
   full SHA): builds **both** images. It still rejects branch names.
-- **Path-filtered workflows on `main`**: `Publish bot image`, `Publish
-  database image` (bot image, because the bot applies SQL), and `Publish
-  API image`. These run only on push to `main` (no manual dispatch, so a
+- **Path-filtered workflows on `main`**: `Publish bot image` and `Publish
+  API image`. Migration changes trigger the bot workflow because the bot
+  applies SQL. A push changing both bot code and migrations builds the bot
+  image once. These run only on push to `main` (no manual dispatch, so a
   feature branch cannot retag `:latest`). A CSS-only change does not
   build either container. Manual publishes still use the `images`
   workflow with a tag or full SHA.
+
+Buildkite runs automatic tests; these GitHub Actions workflows publish the
+container images. They can use self-hosted compute while their logs and status
+remain in GitHub Actions. Each publisher first runs a small `pick-runner` job on
+`ubuntu-latest`, then sends the image build to an online runner labeled
+`self-hosted`, `linux`, and `proxmox`. A busy online runner queues the build.
+If no matching runner is online or the runners API cannot be read, the image
+build falls back to GitHub-hosted compute. `RUNNER_READ_TOKEN` must be able to
+list repository runners for reliable selection. The separate `CI failover`
+workflow runs tests on GitHub-hosted compute only when manually dispatched.
 
 There is nothing for Magic Containers to pull until one of those publishes.
 Each run retags `:latest` for **that** package and retains older versions.
