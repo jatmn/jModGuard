@@ -38,6 +38,9 @@ last commit in a push. Frontend/docs-only changes skip image compilation when
 the published source can be verified. Missing image labels, unavailable Git
 history or registry inspection errors cause a rebuild. Both images use the
 shared source trees, so shared Rust/migration changes can build both images.
+Skipping also requires `latest` and its labeled source-SHA tag to contain the
+same manifest. If a previous push updated only one tag, a retry republishes
+the image to repair the incomplete publication.
 
 ## Registry credentials: required before merging the migration
 

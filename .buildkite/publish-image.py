@@ -94,7 +94,15 @@ def changed_since_publication(component, sha, image, env):
         # configuration so migration/recipe changes cannot be skipped.
         paths = ["Dockerfile." + component, "Cargo.toml", "Cargo.lock",
                  "rust-toolchain.toml", "src", "crates", "migrations", "vendor", ".buildkite"]
-        return bool(git("diff", "--name-only", previous, sha, "--", *paths))
+        if git("diff", "--name-only", previous, sha, "--", *paths):
+            return True
+        # Tag pushes are separate writes: latest can succeed before the SHA
+        # push fails. A retry must repair that partial publication, not skip it.
+        latest = run("docker", "buildx", "imagetools", "inspect", image + ":latest",
+                     "--raw", capture_output=True, env=env).stdout
+        immutable = run("docker", "buildx", "imagetools", "inspect", image + ":" + previous,
+                        "--raw", capture_output=True, env=env).stdout
+        return not latest.strip() or latest != immutable
     except (subprocess.CalledProcessError, ValueError, KeyError, TypeError):
         # First publish, absent history, registry failures and foreign manifests
         # all require a build. They must never look like unchanged source.

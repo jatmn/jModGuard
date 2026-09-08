@@ -203,6 +203,9 @@ class GitSourceTests(unittest.TestCase):
 
         def command(*args, **kwargs):
             if args[0] == "docker":
+                if "--raw" in args:
+                    self.assertIn(args[4], ("image:latest", "image:" + self.base))
+                    return subprocess.CompletedProcess(args, 0, '{"schemaVersion":2}')
                 return subprocess.CompletedProcess(args, 0, json.dumps(config))
             return real_run(*args, **kwargs)
 
@@ -219,6 +222,75 @@ class GitSourceTests(unittest.TestCase):
                 # Unknown objects must not be mistaken for an empty diff.
                 with patch.object(publisher, "git", side_effect=subprocess.CalledProcessError(128, ["git"])):
                     self.assertTrue(publisher.changed_since_publication("bot", self.base, "image", {}))
+
+    def test_unchanged_source_requires_matching_latest_and_source_sha_manifests(self):
+        head = self.commit("docs/new.md")
+        config = {"config": {"Labels": {"org.opencontainers.image.revision": self.base,
+                                        "org.opencontainers.image.source": publisher.REPOSITORY}}}
+        manifest = '{"schemaVersion":2,"config":{"digest":"sha256:fixture"}}'
+        for immutable, rebuild in ((None, True), ("different manifest", True),
+                                   ("", True), (manifest, False)):
+            with self.subTest(immutable=immutable):
+                real_run = publisher.run
+
+                def command(*args, **kwargs):
+                    if args[0] != "docker":
+                        return real_run(*args, **kwargs)
+                    if "--raw" not in args:
+                        return subprocess.CompletedProcess(args, 0, json.dumps(config))
+                    self.assertIn(args[4], ("image:latest", "image:" + self.base))
+                    content = manifest if args[4] == "image:latest" else immutable
+                    if content is None:
+                        raise subprocess.CalledProcessError(1, args)
+                    return subprocess.CompletedProcess(args, 0, content)
+
+                with patch.object(publisher, "run", side_effect=command):
+                    self.assertEqual(publisher.changed_since_publication("bot", head, "image", {}),
+                                     rebuild)
+
+    def test_retry_repairs_partial_publication_before_skipping(self):
+        for component in ("bot", "api"):
+            with self.subTest(component=component):
+                image = "ghcr.io/jatmn/jmodguard-" + component
+                registry = {}
+                exports = []
+                manifest = '{"schemaVersion":2,"config":{"digest":"sha256:fixture"}}'
+                config = {"config": {"Labels": {"org.opencontainers.image.revision": self.base,
+                                                "org.opencontainers.image.source": publisher.REPOSITORY}}}
+                plan = {"mode": "main", "ref": "", "commit": self.base, "sha": self.base, "tag": ""}
+                env = MAIN | {"BUILDKITE_COMMIT": self.base, "GHCR_USERNAME": "fixture",
+                              "GHCR_TOKEN": "fixture-token", "GITHUB_TOKEN": "",
+                              "BUILDKITE_GITHUB_EVENT": "push", "BUILDKITE_TAG": "",
+                              "JMODGUARD_PUBLISH_SOURCE": ""}
+                real_run = publisher.run
+
+                def command(*args, **kwargs):
+                    if args[0] == "git":
+                        return real_run(*args, **kwargs)
+                    if args[:3] == ("buildkite-agent", "meta-data", "get"):
+                        return subprocess.CompletedProcess(args, 0, json.dumps(plan))
+                    if args[:3] == ("docker", "buildx", "imagetools"):
+                        if args[4] not in registry:
+                            raise subprocess.CalledProcessError(1, args)
+                        content = registry[args[4]] if "--raw" in args else json.dumps(config)
+                        return subprocess.CompletedProcess(args, 0, content)
+                    if args[:3] == ("docker", "buildx", "build"):
+                        exports.append(args)
+                        registry[image + ":latest"] = manifest
+                        if len(exports) == 1:
+                            raise subprocess.CalledProcessError(1, args)
+                        registry[image + ":" + self.base] = manifest
+                    return subprocess.CompletedProcess(args, 0, "")
+
+                with patch.dict(os.environ, env), patch.object(publisher, "run", side_effect=command):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        publisher.publish(component)
+                    self.assertNotIn(image + ":" + self.base, registry)
+                    publisher.publish(component)
+                    self.assertEqual(registry[image + ":" + self.base], registry[image + ":latest"])
+                    self.assertEqual(len(exports), 2)
+                    publisher.publish(component)
+                    self.assertEqual(len(exports), 2)
 
 
 if __name__ == "__main__":
