@@ -1,5 +1,7 @@
 # jModGuard
 
+[![Build status](https://badge.buildkite.com/38ea07d60d3ab8cf765aa025cb56cbdb65d3e17d437b5f0c98.svg)](https://buildkite.com/jatmn/jmodguard)
+
 **Database compatibility:** this release requires a fresh database or the recognized
 `jmodguard-core-1` family. Earlier databases/backups require their matching old release;
 they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
