@@ -28,6 +28,8 @@ token. The nickname outbox is separate and continues to operate as before.
 - Pending work can be cancelled within its guild. A direct log-channel upsert/delete
   supersedes active queued work for that guild/event atomically, so late completion
   cannot overwrite the newer setting. It cannot undo a remote effect already performed.
+  Clearing an absent mapping still supersedes queued changes, but does not advance
+  configuration versions or revisions when no mapping was deleted.
 - Cleanup removes only a bounded batch of resolved operational history. Age uses the
   later of completion and request timestamp. It never purges unresolved uncertain work
   or retained moderation audits. Deletions and a monotonically increasing admission

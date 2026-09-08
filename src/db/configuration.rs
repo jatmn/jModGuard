@@ -308,12 +308,16 @@ pub async fn delete_log_channel(db: &Db, guild_id: i64, event: &str) -> Result<(
     let event = event.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute(
+        let deleted = tx.execute(
             "DELETE FROM log_channels WHERE guild_id=?1 AND event_type=?2",
             params![guild_id, event.as_str()],
         )?;
         supersede_log_action(&tx, guild_id, &event)?;
-        bump_config_version_conn(&tx)?;
+        // A clear supersedes queued intent even when the mapping is absent,
+        // but only a changed mapping invalidates configuration caches.
+        if deleted > 0 {
+            bump_config_version_conn(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     })

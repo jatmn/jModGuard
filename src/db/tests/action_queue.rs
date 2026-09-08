@@ -412,8 +412,53 @@ async fn newer_direct_log_settings_supersede_old_work_and_cannot_be_overwritten(
 }
 
 #[tokio::test]
+async fn absent_log_deletes_preserve_versions_but_supersede_queued_work() {
+    let f = Fixture::new();
+    let versions = get_version_state(&f.db).await.unwrap();
+    let generation = f.db.config_write_generation();
+    delete_log_channel(&f.db, 10, "member_join").await.unwrap();
+    assert_eq!(get_version_state(&f.db).await.unwrap(), versions);
+    assert_eq!(f.db.config_write_generation(), generation);
+
+    for state in ["pending", "claimed", "running", "uncertain"] {
+        let mut job = f.enqueue(10, state, channel(Some(100))).await;
+        if state != "pending" {
+            job = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+        }
+        if matches!(state, "running" | "uncertain") {
+            assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        }
+        if state == "uncertain" {
+            assert!(
+                finish_bot_action(&f.db, &job, "uncertain", "unknown")
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(f.state(&job).await, state);
+        delete_log_channel(&f.db, 10, "member_join").await.unwrap();
+        assert_eq!(f.state(&job).await, "cancelled");
+        assert!(!begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        assert!(
+            !finish_bot_action(&f.db, &job, "succeeded", "late")
+                .await
+                .unwrap()
+        );
+        assert!(list_log_channels(&f.db, 10).await.unwrap().is_empty());
+        assert_eq!(get_version_state(&f.db).await.unwrap(), versions);
+        assert_eq!(f.db.config_write_generation(), generation);
+    }
+    // Repeating the clear after supersession is a no-op as well.
+    delete_log_channel(&f.db, 10, "member_join").await.unwrap();
+    assert_eq!(get_version_state(&f.db).await.unwrap(), versions);
+}
+
+#[tokio::test]
 async fn failed_direct_config_write_does_not_supersede_pending_work() {
     let f = Fixture::new();
+    upsert_log_channel(&f.db, 10, "member_join", 300)
+        .await
+        .unwrap();
     let pending = f.enqueue(10, "rollback", channel(Some(100))).await;
     f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_config_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'test failure'); END")).await.unwrap();
     assert!(
@@ -422,7 +467,7 @@ async fn failed_direct_config_write_does_not_supersede_pending_work() {
             .is_err()
     );
     assert!(delete_log_channel(&f.db, 10, "member_join").await.is_err());
-    assert!(list_log_channels(&f.db, 10).await.unwrap().is_empty());
+    assert_eq!(list_log_channels(&f.db, 10).await.unwrap()[0].1, 300);
     assert_eq!(f.state(&pending).await, "pending");
 }
 
