@@ -210,7 +210,10 @@ def publish(component):
         run("docker", "login", "ghcr.io", "--username", username,
             "--password-stdin", input=token, env=env, capture_output=True)
         image = "ghcr.io/jatmn/jmodguard-" + component
-        if mode == "main" and not changed_since_publication(component, sha, image, env):
+        # An explicit retry must restore its selected source's tags even if a
+        # newer build has since published identical inputs under a different SHA.
+        if (mode == "main" and env.get("BUILDKITE_RETRY_COUNT", "0") == "0"
+                and not changed_since_publication(component, sha, image, env)):
             print(f"{component}: image inputs match the last publication; no rebuild")
             return
         # A separate clean worktree excludes CI output and any untracked source.

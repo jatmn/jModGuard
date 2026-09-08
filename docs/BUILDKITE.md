@@ -41,6 +41,8 @@ shared source trees, so shared Rust/migration changes can build both images.
 Skipping also requires `latest` and its labeled source-SHA tag to contain the
 same manifest. If a previous push updated only one tag, a retry republishes
 the image to repair the incomplete publication.
+Explicit job retries always republish their pinned source, even if a newer
+build has since moved `latest`. Input-based skipping applies to fresh jobs.
 
 ## Registry credentials: required before merging the migration
 

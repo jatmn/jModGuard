@@ -17,7 +17,7 @@ spec.loader.exec_module(publisher)
 HEAD = "a" * 40
 BASE = "b" * 40
 MAIN = {"BUILDKITE": "true", "BUILDKITE_SOURCE": "webhook", "BUILDKITE_BRANCH": "main",
-        "BUILDKITE_COMMIT": HEAD, "BUILDKITE_PULL_REQUEST": "false"}
+        "BUILDKITE_COMMIT": HEAD, "BUILDKITE_PULL_REQUEST": "false", "BUILDKITE_RETRY_COUNT": "0"}
 
 
 class PublicationTests(unittest.TestCase):
@@ -248,7 +248,7 @@ class GitSourceTests(unittest.TestCase):
                     self.assertEqual(publisher.changed_since_publication("bot", head, "image", {}),
                                      rebuild)
 
-    def test_retry_repairs_partial_publication_before_skipping(self):
+    def test_partial_publication_is_repaired_before_fresh_build_skips(self):
         for component in ("bot", "api"):
             with self.subTest(component=component):
                 image = "ghcr.io/jatmn/jmodguard-" + component
@@ -291,6 +291,43 @@ class GitSourceTests(unittest.TestCase):
                     self.assertEqual(len(exports), 2)
                     publisher.publish(component)
                     self.assertEqual(len(exports), 2)
+
+    def test_retried_job_republishes_its_source_after_newer_build(self):
+        newer = self.commit("docs/after.md")
+        publisher.git("checkout", "--detach", self.base)
+        for component in ("bot", "api"):
+            with self.subTest(component=component):
+                image = "ghcr.io/jatmn/jmodguard-" + component
+                exports = []
+                published = {image + ":latest", image + ":" + newer}
+                config = {"config": {"Labels": {"org.opencontainers.image.revision": newer,
+                                                "org.opencontainers.image.source": publisher.REPOSITORY}}}
+                plan = {"mode": "main", "ref": "", "commit": self.base, "sha": self.base, "tag": ""}
+                env = MAIN | {"BUILDKITE_COMMIT": self.base, "GHCR_USERNAME": "fixture",
+                              "GHCR_TOKEN": "fixture-token", "GITHUB_TOKEN": "",
+                              "BUILDKITE_GITHUB_EVENT": "push", "BUILDKITE_TAG": "",
+                              "JMODGUARD_PUBLISH_SOURCE": "", "BUILDKITE_RETRY_COUNT": "1"}
+                real_run = publisher.run
+
+                def command(*args, **kwargs):
+                    if args[0] == "git":
+                        return real_run(*args, **kwargs)
+                    if args[:3] == ("buildkite-agent", "meta-data", "get"):
+                        return subprocess.CompletedProcess(args, 0, json.dumps(plan))
+                    if args[:3] == ("docker", "buildx", "imagetools"):
+                        if args[4] not in published:
+                            raise subprocess.CalledProcessError(1, args)
+                        content = '{"schemaVersion":2}' if "--raw" in args else json.dumps(config)
+                        return subprocess.CompletedProcess(args, 0, content)
+                    if args[:3] == ("docker", "buildx", "build"):
+                        exports.append(args)
+                        published.update(args[i + 1] for i, arg in enumerate(args) if arg == "--tag")
+                    return subprocess.CompletedProcess(args, 0, "")
+
+                with patch.dict(os.environ, env), patch.object(publisher, "run", side_effect=command):
+                    publisher.publish(component)
+                self.assertEqual(len(exports), 1)
+                self.assertIn(image + ":" + self.base, published)
 
 
 if __name__ == "__main__":
