@@ -19,3 +19,6 @@ Automated verification (no Discord tokens):
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.
+
+CI and image publication run on self-hosted Buildkite agents. Setup and manual
+builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.

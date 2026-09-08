@@ -13,6 +13,7 @@ env:
 
 steps:
   - label: "test"
+    key: test
     timeout_in_minutes: 30
     command: |
       set -eu
@@ -35,6 +36,7 @@ steps:
           ;;
       esac
       cargo fetch --locked
+      python3 .buildkite/publish-image-test.py
       cargo test --locked --workspace
       cargo test --locked --no-default-features --lib
       cargo clippy --locked --bins -- -D warnings
@@ -53,6 +55,7 @@ steps:
       cargo build --locked --bin jmodguard-api --no-default-features --features web
 
   - label: "remote-database"
+    key: remote-database
     timeout_in_minutes: 30
     command: |
       set -euo pipefail
@@ -98,3 +101,28 @@ steps:
         exit 1
       fi
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
+
+  - label: "prepare image publication"
+    key: prepare-images
+    depends_on: [test, remote-database]
+    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    timeout_in_minutes: 5
+    command: python3 .buildkite/publish-image.py prepare
+
+  - label: "publish bot image"
+    key: publish-bot
+    depends_on: prepare-images
+    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-bot
+    timeout_in_minutes: 45
+    command: python3 .buildkite/publish-image.py bot
+
+  - label: "publish api image"
+    key: publish-api
+    depends_on: prepare-images
+    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-api
+    timeout_in_minutes: 45
+    command: python3 .buildkite/publish-image.py api
