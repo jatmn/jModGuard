@@ -79,7 +79,8 @@ The bot's [membership observer](ENROLLMENTS.md) records Gateway joins/departures
 known context and runs bounded, configurable positive REST repair. It keeps one SQL row
 per guild and one pagination cursor, reuses the existing HTTP client, and does no
 per-message work. API configuration has no enrollment-repair fields. Observation state
-is not yet consumed by API permissions, queue dispatch or nickname reconciliation.
+now scopes inactive queue storage, but is not yet consumed by API permissions, a running
+queue dispatcher or nickname reconciliation.
 
 ## Config cache invalidation
 
@@ -123,8 +124,9 @@ without rolling back durable settings.
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0007. Migration 0006 adds inactive action storage and its replay floor.
-Migration 0007 adds bot membership observations without queue/nickname binding.
+migrations 0001–0008. Migration 0006 adds inactive action storage and its replay floor.
+Migration 0007 adds bot membership observations. Migration 0008 binds inactive queue
+storage and captured queue scope to those observations; nickname binding remains pending.
 Current unban/log-channel WebUI operations still follow their direct API path.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
@@ -157,7 +159,7 @@ src/web/state.rs           ApiState and config-version observation
 src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0007_guild_enrollments
+migrations/                0001_init through 0008_action_enrollments
 Dockerfile.bot
 Dockerfile.api
 ```

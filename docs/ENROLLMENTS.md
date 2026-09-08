@@ -5,10 +5,11 @@ adds `guild_enrollments` to `jmodguard-core-1`: one row per observed guild conta
 random identity, the bot's join timestamp in nanoseconds, and active/inactive state.
 No member roster, message history, or per-user activity is collected by this feature.
 
-This is an observation foundation, not an authorization or erasure boundary. Existing
+This observation plus queue-storage foundation is not a complete authorization or erasure
+boundary. Existing
 API permissions, direct Discord actions, settings and nickname reconciliation continue
-to operate independently of it. The administrative action queue remains inactive and
-unbound. No queue/nickname payload adopts a membership just because this row exists.
+to operate independently of it. The administrative action queue remains inactive; its storage is now bound explicitly
+to membership (below). Nickname payloads still operate independently.
 
 ## Gateway observations
 
@@ -67,6 +68,20 @@ reads). Actual rate depends on guild count, timeouts, pagination and configured 
 Resource/billing savings are not measured. Existing Gateway cache policy is unchanged;
 this does not establish the final minimal bot memory footprint.
 
+## Inactive queue binding
+
+Migration 0008 adds explicit enrollment ID/join timestamp to new administrative actions.
+Retirement/replacement invalidates unstarted claims and makes running outcomes uncertain
+in the same transaction. Queue admission, reads, cancellation and local completion are
+membership-aware. Captured-scope helpers reject a membership change between authorization
+and the queue transaction. Direct log configuration changes preserve unresolved history
+from older memberships. See [the queue storage contract](BOT-ACTIONS.md).
+
+No queue worker or endpoint is enabled. Existing nickname and direct API Discord actions
+remain independent; this layer cannot recall a Discord request or establish full tenant
+isolation. Current membership observations still need live validation/reconciliation and
+must not alone authorize an effect or erase data.
+
 ## Schema and remaining work
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
@@ -75,7 +90,7 @@ it does not infer membership from existing guild settings or old queue jobs. Ver
 on startup; rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 
-Queue/nickname enrollment binding, fresh user permission and bot membership checks around
+Nickname enrollment binding, runtime queue integration, fresh user permission and bot membership checks around
 side effects, captured API transaction scope, stale browser context, case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that

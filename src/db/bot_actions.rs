@@ -1,4 +1,4 @@
-//! Durable queue storage only. No current HTTP admission or Discord worker uses it.
+//! Inactive action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
 
@@ -12,6 +12,9 @@ pub struct BotAction {
     pub action: Action,
     pub state: String,
     pub outcome: Option<String>,
+    pub enrollment_id: Option<String>,
+    #[serde(serialize_with = "crate::ids::ser_opt_i64_str")]
+    pub joined_at_ns: Option<i64>,
     pub created_at: i64,
     pub expires_at: i64,
     #[serde(skip)]
@@ -23,7 +26,10 @@ impl BotAction {
         self.state == "claimed" && self.claim.is_some()
     }
 }
-const COLS: &str = "id,guild_id,actor_id,payload,state,outcome,created_at,expires_at,claim";
+const ACTIVE: &str =
+    "EXISTS(SELECT 1 FROM guild_enrollments e WHERE e.guild_id=bot_actions.guild_id
+    AND e.id=bot_actions.enrollment_id AND e.joined_at_ns=bot_actions.joined_at_ns AND e.active=1)";
+const COLS: &str = "id,guild_id,actor_id,payload,state,outcome,created_at,expires_at,claim,enrollment_id,joined_at_ns";
 
 fn row_action(r: &Row) -> Result<BotAction> {
     Ok(BotAction {
@@ -36,10 +42,43 @@ fn row_action(r: &Row) -> Result<BotAction> {
         created_at: r.get(6)?,
         expires_at: r.get(7)?,
         claim: r.get(8)?,
+        enrollment_id: r.get(9)?,
+        joined_at_ns: r.get(10)?,
     })
 }
 fn key() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+// Internal callers can resolve current membership at the transaction. Dashboard
+// callers must preserve the identity already authorized for the request.
+struct ActionScope {
+    guild: i64,
+    expected: Option<GuildEnrollment>,
+}
+impl From<i64> for ActionScope {
+    fn from(guild: i64) -> Self {
+        Self {
+            guild,
+            expected: None,
+        }
+    }
+}
+impl From<&GuildEnrollment> for ActionScope {
+    fn from(enrollment: &GuildEnrollment) -> Self {
+        Self {
+            guild: enrollment.guild_id,
+            expected: Some(enrollment.clone()),
+        }
+    }
+}
+impl ActionScope {
+    fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
+        if let Some(enrollment) = &self.expected {
+            super::enrollments::verify_enrollment_conn(conn, enrollment)?;
+        }
+        Ok(())
+    }
 }
 
 /// Unknown remote commit outcomes must be retried with the same request key.
@@ -52,6 +91,32 @@ pub async fn enqueue_bot_action(
     now: i64,
     limits: Limits,
 ) -> Result<BotAction> {
+    enqueue_bot_action_inner(db, guild.into(), actor, request, action, now, limits).await
+}
+
+/// Queue admission cannot bind a previously authorized intent to a later membership.
+pub async fn enqueue_enrolled_bot_action(
+    db: &Db,
+    enrollment: &GuildEnrollment,
+    actor: i64,
+    request: &str,
+    action: Action,
+    now: i64,
+    limits: Limits,
+) -> Result<BotAction> {
+    enqueue_bot_action_inner(db, enrollment.into(), actor, request, action, now, limits).await
+}
+
+async fn enqueue_bot_action_inner(
+    db: &Db,
+    scope: ActionScope,
+    actor: i64,
+    request: &str,
+    action: Action,
+    now: i64,
+    limits: Limits,
+) -> Result<BotAction> {
+    let guild = scope.guild;
     limits.validate()?;
     action.validate()?;
     anyhow::ensure!(guild > 0 && actor > 0, "invalid guild or actor");
@@ -71,6 +136,11 @@ pub async fn enqueue_bot_action(
     );
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        scope.verify_conn(&tx)?;
+        let enrollment = match scope.expected {
+            Some(enrollment) => enrollment,
+            None => super::enrollments::active_enrollment_conn(&tx, guild)?.context("bot membership is not enrolled")?,
+        };
         let existing = tx
             .query_row(
                 &format!("SELECT {COLS} FROM bot_actions WHERE guild_id=?1 AND request_key=?2"),
@@ -83,6 +153,10 @@ pub async fn enqueue_bot_action(
                 existing.actor_id == actor && existing.action == action,
                 "request key conflicts with another action"
             );
+            if existing.enrollment_id.as_deref() != Some(enrollment.id.as_str())
+                || existing.joined_at_ns != Some(enrollment.joined_at_ns) {
+                return Err(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
+            }
             tx.finish_read()?;
             return Ok(existing);
         }
@@ -92,9 +166,9 @@ pub async fn enqueue_bot_action(
             return Err(crate::bot_actions::RequestKeyError::Expired.into());
         }
         let count: i64 = tx.query_row(
-            "SELECT count(*) FROM bot_actions WHERE guild_id=?1
+            "SELECT count(*) FROM bot_actions WHERE guild_id=?1 AND enrollment_id=?2
              AND state IN ('pending','claimed','running','uncertain')",
-            params![guild],
+            params![guild, enrollment.id.as_str()],
             |r| Ok(r.get(0)?),
         )?;
         anyhow::ensure!(
@@ -102,9 +176,9 @@ pub async fn enqueue_bot_action(
             "guild action queue is full"
         );
         let active: i64 = tx.query_row(
-            "SELECT count(*) FROM bot_actions WHERE guild_id=?1 AND resource=?2
+            "SELECT count(*) FROM bot_actions WHERE guild_id=?1 AND resource=?2 AND enrollment_id=?3
              AND state IN ('pending','claimed','running','uncertain')",
-            params![guild, resource.as_str()],
+            params![guild, resource.as_str(), enrollment.id.as_str()],
             |r| Ok(r.get(0)?),
         )?;
         anyhow::ensure!(
@@ -116,8 +190,8 @@ pub async fn enqueue_bot_action(
             .context("action expiry overflow")?;
         tx.execute(
             "INSERT INTO bot_actions
-             (id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9)",
+             (id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at,enrollment_id,joined_at_ns)
+             VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?11)",
             params![
                 id.as_str(),
                 guild,
@@ -127,7 +201,9 @@ pub async fn enqueue_bot_action(
                 payload,
                 now,
                 expires,
-                request_time
+                request_time,
+                enrollment.id,
+                enrollment.joined_at_ns
             ],
         )?;
         let result = tx.query_row(
@@ -142,12 +218,26 @@ pub async fn enqueue_bot_action(
 }
 
 pub async fn bot_action(db: &Db, guild: i64, id: &str) -> Result<Option<BotAction>> {
+    bot_action_inner(db, guild.into(), id).await
+}
+
+pub async fn enrolled_bot_action(
+    db: &Db,
+    enrollment: &GuildEnrollment,
+    id: &str,
+) -> Result<Option<BotAction>> {
+    bot_action_inner(db, enrollment.into(), id).await
+}
+
+async fn bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Result<Option<BotAction>> {
+    let guild = scope.guild;
     let id = id.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
+        scope.verify_conn(&tx)?;
         let job = tx
             .query_row(
-                &format!("SELECT {COLS} FROM bot_actions WHERE guild_id=?1 AND id=?2"),
+                &format!("SELECT {COLS} FROM bot_actions WHERE guild_id=?1 AND id=?2 AND {ACTIVE}"),
                 params![guild, id],
                 row_action,
             )
@@ -159,10 +249,25 @@ pub async fn bot_action(db: &Db, guild: i64, id: &str) -> Result<Option<BotActio
 }
 
 pub async fn recent_bot_actions(db: &Db, guild: i64) -> Result<Vec<BotAction>> {
+    recent_bot_actions_inner(db, guild.into()).await
+}
+
+pub async fn recent_enrolled_bot_actions(
+    db: &Db,
+    enrollment: &GuildEnrollment,
+) -> Result<Vec<BotAction>> {
+    recent_bot_actions_inner(db, enrollment.into()).await
+}
+
+async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<BotAction>> {
+    let guild = scope.guild;
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
+        scope.verify_conn(&tx)?;
         let mut stmt = tx.prepare(&format!(
             "SELECT {COLS} FROM bot_actions WHERE guild_id=?1
+             AND enrollment_id=(SELECT id FROM guild_enrollments WHERE guild_id=?1 AND active=1)
+             AND {ACTIVE}
              ORDER BY created_at DESC,id DESC LIMIT 50"
         ))?;
         let rows = stmt.query_map(params![guild], row_action)?;
@@ -180,8 +285,8 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
         let due: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bot_actions WHERE state='pending'
-             OR (state IN ('claimed','running') AND expires_at<=?1))",
+            &format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE (state='pending'
+             OR (state IN ('claimed','running') AND expires_at<=?1)) AND {ACTIVE})"),
             params![now],
             |r| Ok(r.get(0)?),
         )?;
@@ -202,7 +307,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
             params![now],
         )?;
         let job = tx.query_row(
-            &format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1
+            &format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
                       ORDER BY created_at,id LIMIT 1"),
             params![now],
             row_action,
@@ -232,13 +337,15 @@ pub async fn begin_bot_action(db: &Db, job: &BotAction, now: i64) -> Result<bool
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if !claimed_identity_matches(&tx, &job)? {
+        if !claimed_identity_matches(&tx, &job, None)? {
             tx.finish_read()?;
             return Ok(false);
         }
         let n = tx.execute(
-            "UPDATE bot_actions SET state='running'
-             WHERE id=?1 AND claim=?2 AND state='claimed' AND expires_at>?3",
+            &format!(
+                "UPDATE bot_actions SET state='running'
+             WHERE id=?1 AND claim=?2 AND state='claimed' AND expires_at>?3 AND {ACTIVE}"
+            ),
             params![job.id, job.claim, now],
         )?;
         tx.commit()?;
@@ -262,13 +369,15 @@ pub async fn finish_bot_action(
     let (job, state, outcome) = (job.clone(), state.to_owned(), outcome.to_owned());
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if !claimed_identity_matches(&tx, &job)? {
+        if !claimed_identity_matches(&tx, &job, None)? {
             tx.finish_read()?;
             return Ok(false);
         }
         let changed = tx.execute(
-            "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
-             WHERE id=?3 AND claim=?4 AND state IN ('running','uncertain')",
+            &format!(
+                "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
+             WHERE id=?3 AND claim=?4 AND state IN ('running','uncertain') AND {ACTIVE}"
+            ),
             params![
                 state.as_str(),
                 outcome.as_str(),
@@ -309,12 +418,28 @@ pub async fn finish_bot_action(
 }
 
 pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {
+    cancel_bot_action_inner(db, guild.into(), id).await
+}
+
+pub async fn cancel_enrolled_bot_action(
+    db: &Db,
+    enrollment: &GuildEnrollment,
+    id: &str,
+) -> Result<bool> {
+    cancel_bot_action_inner(db, enrollment.into(), id).await
+}
+
+async fn cancel_bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Result<bool> {
+    let guild = scope.guild;
     let id = id.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        scope.verify_conn(&tx)?;
         let n = tx.execute(
-            "UPDATE bot_actions SET state='cancelled',outcome='cancelled_before_execution',
-             finished_at=unixepoch() WHERE guild_id=?1 AND id=?2 AND state='pending'",
+            &format!(
+                "UPDATE bot_actions SET state='cancelled',outcome='cancelled_before_execution',
+             finished_at=unixepoch() WHERE guild_id=?1 AND id=?2 AND state='pending' AND {ACTIVE}"
+            ),
             params![guild, id],
         )?;
         tx.commit()?;
@@ -326,9 +451,11 @@ pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {
 /// Direct bot/config writers supersede queued log changes in the same transaction.
 pub(super) fn supersede_log_action(conn: &impl SqlExecutor, guild: i64, event: &str) -> Result<()> {
     conn.execute(
-        "UPDATE bot_actions SET state='cancelled',outcome='superseded_by_config_write',
+        &format!(
+            "UPDATE bot_actions SET state='cancelled',outcome='superseded_by_config_write',
          finished_at=unixepoch() WHERE guild_id=?1 AND resource=?2
-         AND state IN ('pending','claimed','running','uncertain')",
+         AND state IN ('pending','claimed','running','uncertain') AND {ACTIVE}"
+        ),
         params![guild, format!("log:{event}")],
     )?;
     Ok(())
@@ -388,18 +515,37 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
     .await
 }
 
-fn claimed_identity_matches(conn: &impl SqlExecutor, job: &BotAction) -> Result<bool> {
+fn claimed_identity_matches(
+    conn: &impl SqlExecutor,
+    job: &BotAction,
+    expected_state: Option<&str>,
+) -> Result<bool> {
     let stored = conn
         .query_row(
-            &format!("SELECT {COLS} FROM bot_actions WHERE id=?1 AND claim=?2"),
+            &format!("SELECT {COLS} FROM bot_actions WHERE id=?1 AND claim=?2 AND {ACTIVE}"),
             params![job.id.as_str(), job.claim.as_deref()],
             row_action,
         )
         .optional()?;
     Ok(stored.is_some_and(|stored| {
-        stored.guild_id == job.guild_id
+        expected_state.is_none_or(|state| stored.state == state)
+            && stored.guild_id == job.guild_id
             && stored.actor_id == job.actor_id
+            && stored.enrollment_id == job.enrollment_id
+            && stored.joined_at_ns == job.joined_at_ns
             && stored.action == job.action
             && stored.expires_at == job.expires_at
     }))
+}
+
+/// Recheck committed membership after HTTP validation, immediately before dispatch.
+pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
+    let job = job.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let valid = claimed_identity_matches(&tx, &job, Some("running"))?;
+        tx.finish_read()?;
+        Ok(valid)
+    })
+    .await
 }

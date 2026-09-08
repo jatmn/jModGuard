@@ -121,6 +121,19 @@ Queue activation and nickname/API enrollment fencing are not enabled here. Curre
 and nickname operations keep their existing path; missing observations do not disable them.
 No data erasure, new dependency or tenant-isolation claim is part of this wave.
 
+## Implemented: membership-bound action storage
+
+New administrative queue rows capture the active bot enrollment identity and join time.
+Retirement/replacement invalidates pending/claimed work and preserves running work as
+uncertain atomically. Admission, status, cancellation and claim completion require the
+current membership; captured-scope entry points also reject changes since authorization.
+Migration 0008 does not adopt old unbound jobs. Existing reviewed log-write semantics,
+replay cutoff and no-write membership observations are preserved.
+
+This still enables no HTTP queue route or worker. Discord permissions/membership must be
+checked around dispatch before activation; API token removal and nickname enrollment
+binding remain separate. See [the queue contract](BOT-ACTIONS.md#membership-bound-storage).
+
 ## Next implementation slices
 
 1. Complete credential separation. Replace API bot-token operations with typed,

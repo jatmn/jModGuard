@@ -46,12 +46,18 @@ monotonic replay fencing, bounded cleanup and direct log-config supersession ato
 Queue history is operational metadata, separate from retained moderation audit records.
 The service-boundary guard rejects runtime queue consumers in this slice.
 
-The bot records its own membership observations; see `docs/ENROLLMENTS.md`. Keep this
-separate from API authorization and queue/nickname effects until their full fencing lands.
+The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
+bind inactive queue storage, while runtime API/nickname authority remains separate.
 Positive repair must stay bounded, use the existing bot HTTP/identity, never fetch a
 member roster or infer removal from omissions/errors. Missing/outage Gateway context
 cannot retire an observation. Matching joins must write no rows/receipts or config versions.
 Only BotProcessConfig loads enrollment repair controls; API ignores their TOML/env values.
+
+Queue membership changes invalidate old work atomically. Preserve delayed receipt creation
+for matching/stale observation no-ops. Future dashboard queue callers must use captured
+`*_enrolled_*` scope helpers, not guild-ID helpers that resolve membership at execution.
+Keep old uncertain outcomes separate from newer membership config writes. No queue HTTP
+admission/worker is enabled; full Discord permission/membership checks remain prerequisites.
 
 ## Commands
 
@@ -266,7 +272,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0007_guild_enrollments
+migrations/             0001_init through 0008_action_enrollments
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```
