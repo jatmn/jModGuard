@@ -226,7 +226,8 @@ async fn main() -> Result<()> {
     let app = BotState::new(cfg.clone(), db)?;
 
     // --- Discord client (needed for slash re-sync after config polls) --------
-    let intents = GatewayIntents::GUILD_MEMBERS
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
         | GatewayIntents::GUILD_MODERATION;
@@ -247,6 +248,42 @@ async fn main() -> Result<()> {
 
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
+
+    if cfg.enrollment.enabled {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        let cache = Arc::clone(&cache);
+        let mut repair = jmodguard::enrollment_repair::EnrollmentRepair::new(
+            cfg.enrollment.clone(),
+            std::time::Instant::now(),
+        )?;
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(u64::from(app.cfg.enrollment.poll_secs)));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = shutdown_signal() => break, _ = tick.tick() => {} }
+                let Some(source) =
+                    jmodguard::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
+                else {
+                    continue;
+                };
+                let result = tokio::select! {
+                    _ = shutdown_signal() => break,
+                    result = repair.step(&app.db, &source) => result,
+                };
+                match result {
+                    Ok(Some(report)) if report.failed > 0 => tracing::warn!(
+                        failed = report.failed,
+                        checked = report.checked,
+                        "membership repair incomplete; failed guilds will be revisited next sweep"
+                    ),
+                    Err(error) => tracing::warn!("membership discovery deferred: {error:#}"),
+                    _ => {}
+                }
+            }
+        });
+    }
 
     // --- config_version poll (cross-process cache invalidation) --------------
     let poll_secs = cfg.bot.config_poll_secs.max(1);

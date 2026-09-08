@@ -147,6 +147,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     );
 
     exercise_action_storage(&bot, &api).await;
+    exercise_membership_storage(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -229,4 +230,43 @@ async fn exercise_action_storage(bot: &Db, api: &Db) {
         1
     );
     assert_eq!(version, get_config_version(api).await.unwrap());
+}
+
+async fn exercise_membership_storage(bot: &Db, api: &Db) {
+    use jmodguard::db::{enroll_guild, guild_enrollment, retire_guild_enrollment};
+    let version = get_config_version(api).await.unwrap();
+    test_drop_next_commit_response();
+    let first = enroll_guild(bot, 800, 100).await.unwrap().unwrap();
+    assert_eq!(
+        guild_enrollment(api, 800).await.unwrap(),
+        Some(first.clone())
+    );
+    // A rollback can hide executed receipt writes from row-count assertions.
+    // Exercise the remote-only receipt path and reject the INSERT itself.
+    bot.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_matching_receipt BEFORE INSERT ON mutation_receipts
+             BEGIN SELECT RAISE(ABORT, 'matching observation wrote a receipt'); END",
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        enroll_guild(bot, 800, 100).await.unwrap(),
+        Some(first.clone())
+    );
+    assert!(enroll_guild(bot, 800, 99).await.unwrap().is_none());
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_matching_receipt"))
+        .await
+        .unwrap();
+    assert!(guild_enrollment(api, 801).await.unwrap().is_none());
+    test_drop_next_commit_response();
+    retire_guild_enrollment(bot, 800, 100).await.unwrap();
+    assert!(enroll_guild(bot, 800, 100).await.unwrap().is_none());
+    assert!(guild_enrollment(api, 800).await.unwrap().is_none());
+    let next = enroll_guild(bot, 800, 101).await.unwrap().unwrap();
+    assert_ne!(first.id, next.id);
+    retire_guild_enrollment(bot, 800, 100).await.unwrap();
+    assert_eq!(guild_enrollment(api, 800).await.unwrap(), Some(next));
+    assert_eq!(get_config_version(api).await.unwrap(), version);
 }

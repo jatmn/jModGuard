@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0006. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0007. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -57,3 +57,11 @@ bot/API builds. Older binaries that support only version 5 reject version 6 on s
 rollback requires the matching pre-upgrade database backup, not a version-marker edit.
 This does not add a production backup implementation or an old-lineage migration.
 The queue is [inactive storage groundwork](BOT-ACTIONS.md), not an enabled service.
+
+## Membership observation extension
+
+Migration 0007 adds an empty `guild_enrollments` table for the bot's own membership
+observations. It does not infer a join from old settings/jobs or bind queue/nickname work.
+The bot initializes it; the matching API waits for completed bootstrap. Older binaries
+supporting only version6 reject version7. Preserve matched pre-upgrade backups for rollback.
+No data erasure or authorization boundary is activated. See [membership observations](ENROLLMENTS.md).

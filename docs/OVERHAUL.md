@@ -109,6 +109,18 @@ uses it. Current WebUI actions and the API bot token remain in place. Enrollment
 fresh permission checks and dispatch/outcome protection must be complete before activation.
 No dependency was added. See [the storage contract](BOT-ACTIONS.md).
 
+## Implemented: bot membership observations
+
+The bot records its own per-guild membership separately from user permissions. Gateway
+observations and bounded positive REST repair preserve reconnect identity and reject
+older/retired joins. Repair reuses the Gateway HTTP client, stores no member roster and
+has bot-only configurable page/deadline/pause controls, including a disable switch.
+Migration 0007 adds only this observation table. See [membership behavior](ENROLLMENTS.md).
+
+Queue activation and nickname/API enrollment fencing are not enabled here. Current API
+and nickname operations keep their existing path; missing observations do not disable them.
+No data erasure, new dependency or tenant-isolation claim is part of this wave.
+
 ## Next implementation slices
 
 1. Complete credential separation. Replace API bot-token operations with typed,

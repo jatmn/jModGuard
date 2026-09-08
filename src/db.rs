@@ -29,6 +29,8 @@ mod bot_actions;
 pub use bot_actions::*;
 mod bootstrap;
 pub use bootstrap::*;
+mod enrollments;
+pub use enrollments::*;
 mod configuration;
 pub use configuration::*;
 mod nickname_jobs;
@@ -45,6 +47,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_nickname_reconcile.sql"),
     include_str!("../migrations/0005_mutation_receipts_nickname_jobs.sql"),
     include_str!("../migrations/0006_bot_actions.sql"),
+    include_str!("../migrations/0007_guild_enrollments.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.

@@ -14,7 +14,8 @@ def main():
     api_paths = list((ROOT / "src/web").rglob("*.rs")) + [ROOT / "src/bin/jmodguard-api.rs"]
     for path in api_paths:
         source = path.read_text()
-        for forbidden in ("crate::state::", "jmodguard::state::"):
+        for forbidden in ("crate::state::", "jmodguard::state::", "enrollment_repair::",
+                          "guild_enrollment(", "enroll_guild(", "retire_guild_enrollment("):
             if forbidden in source:
                 raise SystemExit(f"Bot state dependency in API: {path}: {forbidden}")
     for name in ("src/state.rs", "src/bin/jmodguard-bot.rs"):

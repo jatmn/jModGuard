@@ -153,6 +153,6 @@ crates/runtime/src/health.rs  GET/HEAD /health liveness listener (no axum; API s
 commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
 web/           axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/      admin SPA (Bunny Storage/CDN; local API embed)
-migrations/    0001_init through 0006_bot_actions
+migrations/    0001_init through 0007_guild_enrollments
 Dockerfile.bot / Dockerfile.api
 ```

@@ -10,6 +10,7 @@ use crate::db::{DbOpenOptions, MAX_RETENTION_DAYS};
 #[derive(Default)]
 // Private loader adapter; runtime constructors accept only a process configuration.
 struct Config {
+    pub enrollment: EnrollmentConfig,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub web: WebConfig,
@@ -114,6 +115,71 @@ impl Default for LogConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EnrollmentConfig {
+    pub enabled: bool,
+    pub poll_secs: u32,
+    pub batch_size: u32,
+    pub sweep_pause_secs: u32,
+    pub retry_secs: u32,
+    pub request_timeout_secs: u32,
+}
+impl Default for EnrollmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_secs: 15,
+            batch_size: 16,
+            sweep_pause_secs: 3600,
+            retry_secs: 60,
+            request_timeout_secs: 10,
+        }
+    }
+}
+impl EnrollmentConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.poll_secs > 0 && self.sweep_pause_secs > 0 && self.retry_secs > 0,
+            "enrollment intervals must be positive"
+        );
+        anyhow::ensure!(
+            (1..=200).contains(&self.batch_size),
+            "enrollment batch size must be 1..200"
+        );
+        anyhow::ensure!(
+            (1..=300).contains(&self.request_timeout_secs),
+            "enrollment request timeout must be 1..300 seconds"
+        );
+        Ok(())
+    }
+    fn apply_env(&mut self) -> Result<()> {
+        if let Ok(value) = env::var("JMODGUARD_ENROLLMENT_REPAIR_ENABLED") {
+            self.enabled = value
+                .parse()
+                .context("invalid JMODGUARD_ENROLLMENT_REPAIR_ENABLED (expected true/false)")?;
+        }
+        for (name, target) in [
+            ("JMODGUARD_ENROLLMENT_POLL_SECS", &mut self.poll_secs),
+            ("JMODGUARD_ENROLLMENT_BATCH_SIZE", &mut self.batch_size),
+            (
+                "JMODGUARD_ENROLLMENT_SWEEP_PAUSE_SECS",
+                &mut self.sweep_pause_secs,
+            ),
+            ("JMODGUARD_ENROLLMENT_RETRY_SECS", &mut self.retry_secs),
+            (
+                "JMODGUARD_ENROLLMENT_REQUEST_TIMEOUT_SECS",
+                &mut self.request_timeout_secs,
+            ),
+        ] {
+            if let Ok(value) = env::var(name) {
+                *target = value.parse().with_context(|| format!("invalid {name}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration retained by the Discord worker. It cannot hold OAuth credentials.
 /// ```compile_fail
 /// fn oauth_access(cfg: &jmodguard::config::BotProcessConfig) {
@@ -123,6 +189,7 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct BotProcessConfig {
+    pub enrollment: EnrollmentConfig,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub bot: BotConfig,
@@ -144,6 +211,7 @@ pub struct ApiProcessConfig {
 impl From<Config> for BotProcessConfig {
     fn from(c: Config) -> Self {
         Self {
+            enrollment: c.enrollment,
             discord: c.discord,
             db: c.db,
             bot: c.bot,
@@ -165,6 +233,7 @@ impl From<Config> for ApiProcessConfig {
 impl From<BotProcessConfig> for Config {
     fn from(c: BotProcessConfig) -> Self {
         Self {
+            enrollment: c.enrollment,
             discord: c.discord,
             db: c.db,
             web: WebConfig::default(),
@@ -176,6 +245,7 @@ impl From<BotProcessConfig> for Config {
 impl From<ApiProcessConfig> for Config {
     fn from(c: ApiProcessConfig) -> Self {
         Self {
+            enrollment: EnrollmentConfig::default(),
             discord: c.discord,
             db: c.db,
             web: c.web,
@@ -240,6 +310,9 @@ impl Config {
             Self::default()
         };
         cfg.apply_env_for(api)?;
+        if !api {
+            cfg.enrollment.validate()?;
+        }
         Ok(cfg)
     }
 
@@ -324,6 +397,9 @@ impl Config {
     }
 
     fn apply_env_for(&mut self, api: bool) -> Result<()> {
+        if !api {
+            self.enrollment.apply_env()?;
+        }
         if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
             self.discord.token = v.trim().to_string();
         }
@@ -578,6 +654,60 @@ mod tests {
         assert!(Config::parse_file("[web]\nbind=[", false).is_err());
         assert!(Config::parse_file("[discord]\ntoken=123", false).is_err());
         assert!(Config::parse_file("[discord]\ntoken=123", true).is_err());
+    }
+
+    #[test]
+    fn membership_repair_config_is_bot_only_and_bounded() {
+        let raw = "[enrollment]\nenabled=false\nbatch_size=3\npoll_secs=7\nsweep_pause_secs=60\nretry_secs=4\nrequest_timeout_secs=2";
+        let bot: super::BotProcessConfig = Config::parse_file(raw, false).unwrap().into();
+        assert!(!bot.enrollment.enabled);
+        assert_eq!(bot.enrollment.batch_size, 3);
+        bot.enrollment.validate().unwrap();
+        assert!(Config::parse_file("[enrollment]\nbatch_size='invalid'", false).is_err());
+        assert!(Config::parse_file("[enrollment]\nbatch_size='invalid'", true).is_ok());
+        for raw in [
+            "poll_secs=0",
+            "sweep_pause_secs=0",
+            "retry_secs=0",
+            "batch_size=0",
+            "batch_size=201",
+            "request_timeout_secs=0",
+            "request_timeout_secs=301",
+        ] {
+            assert!(
+                toml::from_str::<super::EnrollmentConfig>(raw)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn membership_repair_environment_applies_only_to_bot() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&[
+            "JMODGUARD_ENROLLMENT_BATCH_SIZE",
+            "JMODGUARD_ENROLLMENT_REPAIR_ENABLED",
+        ]);
+        unsafe {
+            std::env::set_var("JMODGUARD_ENROLLMENT_BATCH_SIZE", "4");
+            std::env::set_var("JMODGUARD_ENROLLMENT_REPAIR_ENABLED", "false");
+        }
+        let mut bot = Config::parse_file("[enrollment]\nbatch_size=3", false).unwrap();
+        bot.apply_env_for(false).unwrap();
+        assert_eq!(bot.enrollment.batch_size, 4);
+        assert!(!bot.enrollment.enabled);
+        unsafe {
+            std::env::set_var("JMODGUARD_ENROLLMENT_BATCH_SIZE", "bad");
+        }
+        assert!(bot.apply_env_for(false).is_err());
+        let mut api = Config::default();
+        api.apply_env_for(true).unwrap();
+        assert_eq!(
+            api.enrollment.batch_size,
+            super::EnrollmentConfig::default().batch_size
+        );
     }
 
     #[test]
