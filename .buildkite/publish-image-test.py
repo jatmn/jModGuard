@@ -33,6 +33,13 @@ class PublicationTests(unittest.TestCase):
                 self.assertIsNone(publisher.request(MAIN | changes))
         with self.assertRaises(ValueError):
             publisher.request({})
+        # Leftover manual source on a webhook must not block automatic publication.
+        self.assertEqual(publisher.request(MAIN | {"JMODGUARD_PUBLISH_SOURCE": HEAD}), ("main", ""))
+        self.assertEqual(
+            publisher.request(MAIN | {"BUILDKITE_TAG": "v1", "BUILDKITE_BRANCH": "v1",
+                                       "JMODGUARD_PUBLISH_SOURCE": HEAD}),
+            ("tag", "refs/tags/v1"),
+        )
 
     def test_manual_requires_main_and_explicit_immutable_or_tag_source(self):
         env = MAIN | {"BUILDKITE_SOURCE": "ui"}
@@ -121,6 +128,29 @@ class PublicationTests(unittest.TestCase):
         calls = self.exercise_publish(changed=False)
         self.assertFalse(any(args[:3] == ("docker", "buildx", "build") for args, _ in calls))
         self.assertFalse(any(args[:2] == ("git", "worktree") for args, _ in calls))
+        self.assertFalse(any(args[:3] == ("buildkite-agent", "secret", "get") for args, _ in calls))
+        self.assertFalse(any(args[:2] == ("docker", "login") for args, _ in calls))
+        self.assertFalse(any(args[:3] == ("buildkite-agent", "redactor", "add") for args, _ in calls))
+
+    def test_unchanged_main_skips_without_registry_credentials(self):
+        calls = []
+        env = MAIN | {"GITHUB_TOKEN": ""}
+        plan = {"mode": "main", "ref": "", "commit": HEAD, "sha": HEAD, "tag": ""}
+
+        def command(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:3] == ("buildkite-agent", "meta-data", "get"):
+                return subprocess.CompletedProcess(args, 0, json.dumps(plan))
+            raise AssertionError("skip path must not run " + " ".join(args))
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+            env["TMPDIR"] = scratch
+            with patch.dict(os.environ, env, clear=True), patch.object(publisher, "git", side_effect=[HEAD, ""]), \
+                 patch.object(publisher, "run", side_effect=command), \
+                 patch.object(publisher, "changed_since_publication", return_value=False):
+                publisher.publish("api")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][:3], ("buildkite-agent", "meta-data", "get"))
 
     def test_publish_flags_credentials_and_cleanup(self):
         calls = self.exercise_publish()

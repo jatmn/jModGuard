@@ -17,6 +17,7 @@ DOCKER_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 
 def run(*args, **kwargs):
     kwargs.setdefault("check", True)
+    kwargs["shell"] = False
     return subprocess.run(args, text=True, **kwargs)
 
 
@@ -34,8 +35,12 @@ def request(env):
     branch = env.get("BUILDKITE_BRANCH", "")
     tag = env.get("BUILDKITE_TAG", "")
     manual = env.get("JMODGUARD_PUBLISH_SOURCE", "")
-    if manual:
-        if source not in {"ui", "api"} or branch != "main" or tag:
+    # Honor the manual source only on UI/API builds. A leftover value on a
+    # webhook push must not block automatic main/tag publication.
+    if source in {"ui", "api"}:
+        if not manual:
+            return None
+        if branch != "main" or tag:
             raise ValueError("Manual publication requires a UI/API build on main")
         # A full SHA or explicit tag avoids interpreting a branch as a source.
         if not SHA.fullmatch(manual) and not manual.startswith("refs/tags/"):
@@ -186,6 +191,15 @@ def publish(component):
     if mode == "manual":
         # The prepare job may run on a different agent with a different clone.
         resolve_source("manual", sha, head)
+    image = "ghcr.io/jatmn/jmodguard-" + component
+    # An explicit retry must restore its selected source's tags even if a
+    # newer build has since published identical inputs under a different SHA.
+    # Inspect public GHCR history before fetching push credentials so docs-only
+    # main pushes skip without GHCR_TOKEN or docker login.
+    if (mode == "main" and env.get("BUILDKITE_RETRY_COUNT", "0") == "0"
+            and not changed_since_publication(component, sha, image, env)):
+        print(f"{component}: image inputs match the last publication; no rebuild")
+        return
     username = env.get("GHCR_USERNAME", "")
     if not username:
         raise ValueError("Set GHCR_USERNAME to the GitHub account owning the GHCR credential")
@@ -209,13 +223,6 @@ def publish(component):
         Path(env["DOCKER_CONFIG"]).mkdir(mode=0o700)
         run("docker", "login", "ghcr.io", "--username", username,
             "--password-stdin", input=token, env=env, capture_output=True)
-        image = "ghcr.io/jatmn/jmodguard-" + component
-        # An explicit retry must restore its selected source's tags even if a
-        # newer build has since published identical inputs under a different SHA.
-        if (mode == "main" and env.get("BUILDKITE_RETRY_COUNT", "0") == "0"
-                and not changed_since_publication(component, sha, image, env)):
-            print(f"{component}: image inputs match the last publication; no rebuild")
-            return
         # A separate clean worktree excludes CI output and any untracked source.
         # Manual builds use current main's publisher to build older source safely.
         context = Path(scratch) / "source"

@@ -26,7 +26,10 @@ credential must also fetch tags and full commits from this repository.
 Publishing uses the existing Docker daemon's BuildKit cache and inline cache
 metadata in the published image; it does not depend on the Actions cache service.
 
-Both test jobs must pass before preparation and publication. Bot and API
+Both test jobs must pass before preparation and publication. Prepare and publish
+steps are scheduled only for webhook main pushes, webhook tag builds, and UI/API
+builds on `main` with `JMODGUARD_PUBLISH_SOURCE`. Scheduled or plain UI test
+builds on `main` do not enqueue those jobs. Bot and API
 publication each have a concurrency limit of one across this pipeline's builds.
 There is one publisher per component, including migration changes. Keep those
 concurrency group names consistent if another pipeline publishes the same packages.
@@ -35,7 +38,9 @@ Main builds compare each package's last published source revision to the new
 commit across the Dockerfile, Cargo/toolchain files, shared source trees and
 publishing configuration. This includes all intervening commits, not just the
 last commit in a push. Frontend/docs-only changes skip image compilation when
-the published source can be verified. Missing image labels, unavailable Git
+the published source can be verified. That skip inspects public GHCR history
+before fetching `GHCR_TOKEN` or logging in, so missing push credentials cannot
+fail a docs-only main build. Missing image labels, unavailable Git
 history or registry inspection errors cause a rebuild. Both images use the
 shared source trees, so shared Rust/migration changes can build both images.
 Skipping also requires `latest` and its labeled source-SHA tag to contain the
@@ -78,7 +83,8 @@ the secret policy. An agent hook must impose equivalent restrictions if it
 supplies credentials instead of Buildkite Secrets.
 
 Each publisher fetches the secret only after validating the build and source
-plan, adds it to Buildkite's log redactor, logs into GHCR using stdin, and uses
+plan **and** deciding a rebuild is required, adds it to Buildkite's log redactor,
+logs into GHCR using stdin, and uses
 a temporary Docker configuration removed on normal completion/failure. The
 source credential reaches Docker through a BuildKit secret, not a build arg.
 An interrupted/killed agent may need its normal workspace cleanup before reuse.
@@ -89,8 +95,10 @@ in your deployment. Publishing never grants public access or deploys containers.
 
 ## Main, tags and manual builds
 
-- Keep branch/PR builds enabled as appropriate for CI. PRs and non-main branch
-  builds run tests only. Main webhook pushes can publish changed images.
+- Keep branch/PR builds enabled as appropriate for CI. PRs, scheduled builds, and
+  UI/API builds without `JMODGUARD_PUBLISH_SOURCE` run tests only. Main webhook
+  pushes can publish changed images. A leftover `JMODGUARD_PUBLISH_SOURCE` on a
+  webhook build is ignored so automatic publication still runs.
 - For automatic tag publication, enable **Build tags** in the pipeline's GitHub
   settings and ensure branch filters allow your release tags. Use trusted tags
   containing this Buildkite pipeline. This replaces GitHub's release-published

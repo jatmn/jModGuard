@@ -141,7 +141,7 @@ its build logs. See [Buildkite setup](BUILDKITE.md) for GHCR credentials,
 agent requirements, tag builds and manual publication.
 
 - **Push to `main`**: each component compares its Docker inputs with its last
-  published source revision. Unchanged inputs (including frontend-only changes)
+  published source revision before fetching GHCR push credentials. Unchanged inputs (including frontend-only changes)
   skip the image build. Both Dockerfiles consume shared Rust source and migrations,
   so those changes can rebuild both images, once each. Missing revision/history
   information conservatively causes a rebuild.

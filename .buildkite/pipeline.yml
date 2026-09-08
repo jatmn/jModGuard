@@ -106,17 +106,26 @@ steps:
       fi
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
 
+  # Match publish-image.py request(): webhook main push, webhook tag, or
+  # UI/API on main with JMODGUARD_PUBLISH_SOURCE. Schedule/UI test builds skip.
   - label: "prepare image publication"
     key: prepare-images
     depends_on: [test, remote-database]
-    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    if: &publish_if
+      build.pull_request.id == null && (
+        (build.source == "webhook" && build.tag != null) ||
+        (build.source == "webhook" && build.branch == "main" && build.tag == null &&
+          (build.env("BUILDKITE_GITHUB_EVENT") == null || build.env("BUILDKITE_GITHUB_EVENT") == "push")) ||
+        ((build.source == "ui" || build.source == "api") &&
+          build.env("JMODGUARD_PUBLISH_SOURCE") != null && build.env("JMODGUARD_PUBLISH_SOURCE") != "")
+      )
     timeout_in_minutes: 5
     command: python3 .buildkite/publish-image.py prepare
 
   - label: "publish bot image"
     key: publish-bot
     depends_on: prepare-images
-    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    if: *publish_if
     concurrency: 1
     concurrency_group: jmodguard/ghcr-bot
     timeout_in_minutes: 45
@@ -125,7 +134,7 @@ steps:
   - label: "publish api image"
     key: publish-api
     depends_on: prepare-images
-    if: build.pull_request.id == null && (build.branch == "main" || build.tag != null)
+    if: *publish_if
     concurrency: 1
     concurrency_group: jmodguard/ghcr-api
     timeout_in_minutes: 45
