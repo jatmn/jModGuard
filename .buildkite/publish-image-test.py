@@ -51,6 +51,16 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             publisher.request(env | {"BUILDKITE_BRANCH": "feature", "JMODGUARD_PUBLISH_SOURCE": HEAD})
 
+    def test_run_allowlists_programs_and_cannot_enable_shell(self):
+        with patch.object(publisher.subprocess, "run",
+                           return_value=subprocess.CompletedProcess(["git"], 0, "")) as mocked:
+            publisher.run("git", "status", shell=True)
+            argv, kwargs = mocked.call_args
+            self.assertEqual(argv[0][0], "git")
+            self.assertFalse(kwargs["shell"])
+        with self.assertRaises(ValueError):
+            publisher.run("bash", "-c", "true")
+
     def test_pr_and_test_only_builds_do_not_read_secrets_or_run_commands(self):
         for env in (MAIN | {"BUILDKITE_PULL_REQUEST": "1"}, MAIN | {"BUILDKITE_SOURCE": "ui"}):
             with patch.dict(os.environ, env, clear=True), patch.object(publisher, "run") as run:

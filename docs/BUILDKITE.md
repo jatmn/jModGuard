@@ -27,8 +27,10 @@ Publishing uses the existing Docker daemon's BuildKit cache and inline cache
 metadata in the published image; it does not depend on the Actions cache service.
 
 Both test jobs must pass before preparation and publication. Prepare and publish
-steps are scheduled only for webhook main pushes, webhook tag builds, and UI/API
-builds on `main` with `JMODGUARD_PUBLISH_SOURCE`. Scheduled or plain UI test
+steps are scheduled for webhook main pushes, webhook tag builds, and UI/API
+builds that set `JMODGUARD_PUBLISH_SOURCE`. Manual publication still requires
+`main` and no tag in the publisher: an invalid UI/API source fails after tests
+instead of looking like a successful skip. Scheduled or plain UI test
 builds on `main` do not enqueue those jobs. Bot and API
 publication each have a concurrency limit of one across this pipeline's builds.
 There is one publisher per component, including migration changes. Keep those

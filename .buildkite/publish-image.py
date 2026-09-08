@@ -15,10 +15,17 @@ SHA = re.compile(r"[0-9a-f]{40}")
 DOCKER_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 
 
-def run(*args, **kwargs):
+def run(program, *args, **kwargs):
+    """Run an argv list. The program name is allowlisted; never a shell string."""
     kwargs.setdefault("check", True)
     kwargs["shell"] = False
-    return subprocess.run(args, text=True, **kwargs)
+    if program == "git":
+        return subprocess.run(["git", *args], text=True, **kwargs)
+    if program == "docker":
+        return subprocess.run(["docker", *args], text=True, **kwargs)
+    if program == "buildkite-agent":
+        return subprocess.run(["buildkite-agent", *args], text=True, **kwargs)
+    raise ValueError("unexpected program " + repr(program))
 
 
 def git(*args):
