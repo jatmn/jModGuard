@@ -39,6 +39,13 @@ Common bot/log settings, DB privileges and package dependencies remain transitio
 Process `db_open_options()` fixes the migration role: bot true, API false. Tracing takes
 only `LogConfig`. See `docs/ARCHITECTURE.md`; this is not an OS secret boundary.
 
+The action queue is an inactive data-layer foundation; see `docs/BOT-ACTIONS.md`.
+Do not add runtime admission, workers or cleanup scheduling until enrollment, fresh
+permission checks and dispatch/outcome fencing are complete. Keep claim identity checks,
+monotonic replay fencing, bounded cleanup and direct log-config supersession atomic.
+Queue history is operational metadata, separate from retained moderation audit records.
+The service-boundary guard rejects runtime queue consumers in this slice.
+
 ## Commands
 
 ```bash
@@ -234,6 +241,8 @@ src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
 src/db/configuration.rs config CRUD + resolved snapshots
 src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
+src/db/bot_actions.rs   inactive action queue storage
+src/bot_actions.rs      typed action payloads and storage limits
 src/db/moderation.rs    selected moderation records and statistics
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
@@ -250,7 +259,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0005_mutation_receipts_nickname_jobs
+migrations/             0001_init through 0006_bot_actions
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

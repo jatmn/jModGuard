@@ -25,6 +25,8 @@ use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
 };
 
+mod bot_actions;
+pub use bot_actions::*;
 mod bootstrap;
 pub use bootstrap::*;
 mod configuration;
@@ -42,6 +44,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_archive_global_log_channels.sql"),
     include_str!("../migrations/0004_nickname_reconcile.sql"),
     include_str!("../migrations/0005_mutation_receipts_nickname_jobs.sql"),
+    include_str!("../migrations/0006_bot_actions.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.

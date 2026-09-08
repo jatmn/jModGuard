@@ -97,6 +97,18 @@ loader adapter and shared bot/log settings remain implementation scaffolding. Th
 no queue, schema or dependency change, and does not isolate OS environment/filesystem
 secrets or database privileges. See [process configuration](ARCHITECTURE.md#process-configuration).
 
+## Implemented: inactive durable action storage
+
+Typed unban/log-channel requests now have transactional deduplication, capacity/target
+exclusion, exclusive claims, claim-bound local completion and bounded resolved-history
+cleanup with a durable replay cutoff. Direct log-channel writes cancel superseded queued
+settings in the same transaction. Migration 0006 extends `jmodguard-core-1`.
+
+This is library groundwork: no HTTP admission, worker, scheduler, process setting or UI
+uses it. Current WebUI actions and the API bot token remain in place. Enrollment identity,
+fresh permission checks and dispatch/outcome protection must be complete before activation.
+No dependency was added. See [the storage contract](BOT-ACTIONS.md).
+
 ## Next implementation slices
 
 1. Complete credential separation. Replace API bot-token operations with typed,

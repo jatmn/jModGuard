@@ -146,6 +146,8 @@ async fn bot_bootstrap_and_api_share_remote_database() {
             .any(|row| row.id == warn_id)
     );
 
+    exercise_action_storage(&bot, &api).await;
+
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
     api.with_conn(|conn| {
@@ -157,4 +159,74 @@ async fn bot_bootstrap_and_api_share_remote_database() {
         anyhow::ensure!(count == 0, "retired history tables exist");
         Ok(())
     }).await.unwrap();
+}
+
+// Queue storage only: this test never sends a Discord request.
+async fn exercise_action_storage(bot: &Db, api: &Db) {
+    use jmodguard::bot_actions::{Action, Limits};
+    use jmodguard::db::{
+        begin_bot_action, bot_action, claim_bot_action, enqueue_bot_action, finish_bot_action,
+    };
+    let version = get_config_version(api).await.unwrap();
+    let action = Action::Unban {
+        user_id: 901,
+        reason: "remote storage smoke".into(),
+    };
+    test_drop_next_commit_response();
+    let first = enqueue_bot_action(
+        api,
+        900,
+        902,
+        "1000_remote",
+        action.clone(),
+        1000,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    let retry = enqueue_bot_action(
+        api,
+        900,
+        902,
+        "1000_remote",
+        action,
+        1000,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.id, retry.id);
+    assert!(bot_action(bot, 901, &first.id).await.unwrap().is_none());
+    let claim = claim_bot_action(bot, 1001).await.unwrap().unwrap();
+    assert_eq!(claim.id, first.id);
+    test_drop_next_commit_response();
+    assert!(begin_bot_action(bot, &claim, 1001).await.unwrap());
+    assert!(!begin_bot_action(bot, &claim, 1001).await.unwrap());
+    test_drop_next_commit_response();
+    assert!(
+        finish_bot_action(bot, &claim, "succeeded", "synthetic_storage_result")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !finish_bot_action(bot, &claim, "succeeded", "duplicate")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        bot_action(api, 900, &first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    assert_eq!(
+        query_events(api, 900, Some("member_unban"), None, 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(version, get_config_version(api).await.unwrap());
 }

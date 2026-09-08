@@ -5,6 +5,7 @@
 //! - `jmodguard-api` — axum HTTP API / WebUI only
 
 pub mod automod;
+pub mod bot_actions;
 pub mod commands;
 pub mod config;
 pub mod db;

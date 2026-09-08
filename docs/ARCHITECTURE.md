@@ -48,8 +48,9 @@ The processes have separate state types in the current shared application crate:
 
 Existing unban and log-channel validation still use a lazy bot-token REST client owned
 by `ApiState`. Both processes still require the bot token under the existing startup
-contract. The durable action queue, API bot-token removal and independent bot/API
-packages remain separate work. No dependency is added; resource savings are not measured.
+contract. The action queue now has an [inactive storage foundation](BOT-ACTIONS.md).
+Queue activation, API bot-token removal and independent bot/API packages remain separate
+work. No dependency is added; resource savings are not measured.
 
 ## Process configuration
 
@@ -114,7 +115,8 @@ without rolling back durable settings.
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0005. The runtime-state split changes no schema or stored data.
+migrations 0001–0006. Migration 0006 adds inactive action storage and its replay floor.
+Current unban/log-channel WebUI operations still follow their direct API path.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
   versions, heals settings, then publishes a
@@ -146,7 +148,7 @@ src/web/state.rs           ApiState and config-version observation
 src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0005_mutation_receipts_nickname_jobs
+migrations/                0001_init through 0006_bot_actions
 Dockerfile.bot
 Dockerfile.api
 ```
