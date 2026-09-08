@@ -6,12 +6,13 @@ struct Fixture {
     path: PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    async fn new() -> Self {
         let path = tmp_db_path("action_history");
-        Self {
-            db: Db::open(&path, 2).unwrap(),
-            path,
+        let db = Db::open(&path, 2).unwrap();
+        for guild in [10, 20, 21, 22, 23] {
+            enroll_guild(&db, guild, 100).await.unwrap();
         }
+        Self { db, path }
     }
     async fn enqueue(&self, nonce: &str, now: i64) -> BotAction {
         enqueue_bot_action(
@@ -75,7 +76,7 @@ fn limits() -> Limits {
 
 #[tokio::test]
 async fn pruning_is_bounded_preserves_unresolved_and_uses_completion_age() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let mut eligible = Vec::new();
     for state in ["succeeded", "failed", "cancelled", "expired"] {
         let job = f.enqueue(state, 1000).await;
@@ -158,7 +159,7 @@ async fn pruning_is_bounded_preserves_unresolved_and_uses_completion_age() {
 
 #[tokio::test]
 async fn old_keys_cannot_replay_after_cleanup_restart_or_retention_increase() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let job = f.enqueue("retry", 1000).await;
     f.mark(&job, "succeeded", 1001).await;
     // An extant receipt can still acknowledge a retry after its admission window.
@@ -223,7 +224,7 @@ async fn old_keys_cannot_replay_after_cleanup_restart_or_retention_increase() {
 
 #[tokio::test]
 async fn cleanup_and_its_replay_fence_roll_back_together_and_idle_cleanup_does_not_write() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     f.db.with_conn(|conn| {
         conn.execute_batch("CREATE TRIGGER reject_floor_update BEFORE UPDATE ON meta
             WHEN NEW.key='action_request_floor' BEGIN SELECT RAISE(ABORT,'test fence failure'); END")
@@ -247,7 +248,7 @@ async fn cleanup_and_its_replay_fence_roll_back_together_and_idle_cleanup_does_n
 
 #[tokio::test]
 async fn racing_cleanup_and_duplicate_admission_never_create_new_work() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let job = f.enqueue("race", 1000).await;
     f.mark(&job, "succeeded", 1001).await;
     let (cleanup, retry) = tokio::join!(
@@ -275,7 +276,7 @@ async fn racing_cleanup_and_duplicate_admission_never_create_new_work() {
 
 #[tokio::test]
 async fn malformed_future_and_expired_ids_are_rejected_and_cleanup_is_indexed() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     for key in [
         "no-timestamp",
         "",

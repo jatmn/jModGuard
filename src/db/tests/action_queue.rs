@@ -6,12 +6,13 @@ struct Fixture {
     path: PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    async fn new() -> Self {
         let path = tmp_db_path("action_queue");
-        Self {
-            db: Db::open(&path, 2).unwrap(),
-            path,
+        let db = Db::open(&path, 2).unwrap();
+        for guild in [10, 20, 21, 22, 23] {
+            enroll_guild(&db, guild, 100).await.unwrap();
         }
+        Self { db, path }
     }
     async fn enqueue(&self, guild: i64, nonce: &str, action: Action) -> BotAction {
         enqueue_bot_action(
@@ -56,7 +57,7 @@ fn channel(id: Option<i64>) -> Action {
 
 #[tokio::test]
 async fn admission_deduplicates_scopes_and_bounds_pending_work() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let version = get_config_version(&f.db).await.unwrap();
     let (a, b) = tokio::join!(
         enqueue_bot_action(
@@ -147,7 +148,7 @@ async fn admission_deduplicates_scopes_and_bounds_pending_work() {
 
 #[tokio::test]
 async fn claims_are_exclusive_and_execution_is_consumed_once() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let pending = f.enqueue(10, "claim", unban(99)).await;
     assert!(
         !finish_bot_action(&f.db, &pending, "succeeded", "not_started")
@@ -187,7 +188,7 @@ async fn claims_are_exclusive_and_execution_is_consumed_once() {
 
 #[tokio::test]
 async fn expiry_never_retries_running_work_and_pending_cancellation_releases_target() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let pending = f.enqueue(10, "cancel", unban(99)).await;
     assert!(cancel_bot_action(&f.db, 10, &pending.id).await.unwrap());
     assert!(!cancel_bot_action(&f.db, 10, &pending.id).await.unwrap());
@@ -226,7 +227,7 @@ async fn expiry_never_retries_running_work_and_pending_cancellation_releases_tar
 
 #[tokio::test]
 async fn modified_claim_identity_cannot_authorize_execution_or_completion() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     f.enqueue(10, "identity", unban(99)).await;
     let original = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
     let mut variants = Vec::new();
@@ -291,7 +292,7 @@ async fn modified_claim_identity_cannot_authorize_execution_or_completion() {
 
 #[tokio::test]
 async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     record_ban(&f.db, 10, 99, Some(42), "spam").await.unwrap();
     record_ban(&f.db, 20, 99, Some(42), "other guild")
         .await
@@ -355,7 +356,7 @@ async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
 
 #[tokio::test]
 async fn newer_direct_log_settings_supersede_old_work_and_cannot_be_overwritten() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     for clear in [false, true] {
         f.enqueue(10, if clear { "clear" } else { "set" }, channel(Some(100)))
             .await;
@@ -413,7 +414,7 @@ async fn newer_direct_log_settings_supersede_old_work_and_cannot_be_overwritten(
 
 #[tokio::test]
 async fn absent_log_deletes_preserve_versions_but_supersede_queued_work() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let versions = get_version_state(&f.db).await.unwrap();
     let generation = f.db.config_write_generation();
     delete_log_channel(&f.db, 10, "member_join").await.unwrap();
@@ -455,7 +456,7 @@ async fn absent_log_deletes_preserve_versions_but_supersede_queued_work() {
 
 #[tokio::test]
 async fn failed_direct_config_write_does_not_supersede_pending_work() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     upsert_log_channel(&f.db, 10, "member_join", 300)
         .await
         .unwrap();
@@ -504,7 +505,7 @@ fn action_payloads_reject_unknown_operations_and_fields() {
 #[tokio::test]
 async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomically() {
     for present in [false, true] {
-        let f = Fixture::new();
+        let f = Fixture::new().await;
         if present {
             upsert_log_channel(&f.db, 10, "member_join", 100)
                 .await
@@ -602,7 +603,7 @@ fn action_channel_ids_follow_shared_snowflake_input_and_string_output() {
 
 #[tokio::test]
 async fn numeric_action_channel_input_survives_storage_restart_and_retry() {
-    let f = Fixture::new();
+    let f = Fixture::new().await;
     let action: Action = serde_json::from_str(
         r#"{"kind":"set_log_channel","event":"member_join","channel_id":9007199254740993}"#,
     )

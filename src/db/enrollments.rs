@@ -14,19 +14,7 @@ pub async fn guild_enrollment(db: &Db, guild: i64) -> Result<Option<GuildEnrollm
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let result = tx
-            .query_row(
-                "SELECT id,joined_at_ns FROM guild_enrollments WHERE guild_id=?1 AND active=1",
-                params![guild],
-                |r| {
-                    Ok(GuildEnrollment {
-                        guild_id: guild,
-                        id: r.get(0)?,
-                        joined_at_ns: r.get(1)?,
-                    })
-                },
-            )
-            .optional()?;
+        let result = active_enrollment_conn(&tx, guild)?;
         tx.finish_read()?;
         Ok(result)
     })
@@ -86,6 +74,15 @@ async fn observe_membership(
         // The primary snapshot already holds the write lock: enabling recovery
         // here preserves the comparison/write atomicity without no-op receipts.
         tx.ensure_mutation_receipt()?;
+        // Membership transition and invalidation commit together. Never replay running work.
+        tx.execute(
+            "UPDATE bot_actions SET state='cancelled',outcome='enrollment_ended',finished_at=unixepoch()
+             WHERE guild_id=?1 AND state IN ('pending','claimed')", params![guild],
+        )?;
+        tx.execute(
+            "UPDATE bot_actions SET state='uncertain',outcome='enrollment_ended'
+             WHERE guild_id=?1 AND state='running'", params![guild],
+        )?;
         let id = format!("{:032x}", rand::random::<u128>());
         tx.execute(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,?3,?4)
@@ -102,3 +99,51 @@ async fn observe_membership(
     })
     .await
 }
+
+pub(super) fn active_enrollment_conn(
+    conn: &impl SqlExecutor,
+    guild: i64,
+) -> Result<Option<GuildEnrollment>> {
+    conn.query_row(
+        "SELECT id,joined_at_ns FROM guild_enrollments WHERE guild_id=?1 AND active=1",
+        params![guild],
+        |r| {
+            Ok(GuildEnrollment {
+                guild_id: guild,
+                id: r.get(0)?,
+                joined_at_ns: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Verify a captured identity inside the same primary snapshot as its queue operation.
+/// It identifies an enrollment; it does not confer user permissions.
+pub(super) fn verify_enrollment_conn(
+    conn: &impl SqlExecutor,
+    expected: &GuildEnrollment,
+) -> Result<()> {
+    if expected.guild_id <= 0 {
+        return Err(EnrollmentChanged.into());
+    }
+    let current = active_enrollment_conn(conn, expected.guild_id).map_err(|error| {
+        tracing::warn!(
+            guild_id = expected.guild_id,
+            "enrollment verification failed: {error:#}"
+        );
+        EnrollmentUnverified
+    })?;
+    if current.as_ref() != Some(expected) {
+        return Err(EnrollmentChanged.into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Server membership changed. Reload before making a new request.")]
+pub struct EnrollmentChanged;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Server access could not be verified. Try again shortly.")]
+pub struct EnrollmentUnverified;

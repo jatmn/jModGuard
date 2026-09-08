@@ -25,8 +25,8 @@ shared library. Ordinary event reporting and the detector's working state do not
 SQL history. Warnings, bans, selected events, nickname jobs and mutation receipts remain
 in the new schema; this does not import records from an unsupported database.
 
-The application is still being overhauled. The full case/evidence model, enrollment
-identities, shared/dedicated routing, scoped database privileges, erasure and recovery
+The application is still being overhauled. The full case/evidence model, membership-scoped tenant
+data, shared/dedicated routing, scoped database privileges, erasure and recovery
 contracts are not implemented by this baseline. Existing configuration/default healing,
 legacy global-channel schema scaffolding and the unused internal retention field await
 later cleanup; they do not provide old-environment import support.
@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0007. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0008. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -65,3 +65,12 @@ observations. It does not infer a join from old settings/jobs or bind queue/nick
 The bot initializes it; the matching API waits for completed bootstrap. Older binaries
 supporting only version6 reject version7. Preserve matched pre-upgrade backups for rollback.
 No data erasure or authorization boundary is activated. See [membership observations](ENROLLMENTS.md).
+
+## Action membership extension
+
+Migration 0008 binds new queue work to observed membership without recreating the table
+introduced in 0007. Earlier actions are never adopted: unstarted work becomes cancelled,
+running work uncertain, and resolved/uncertain receipts remain. All existing settings and
+moderation data stay in place. Queue execution remains inactive. Deploy matched builds
+with bot migration first; version7 binaries reject version8, so use the matched pre-upgrade
+backup for rollback. See [membership-bound queue storage](BOT-ACTIONS.md#membership-bound-storage).

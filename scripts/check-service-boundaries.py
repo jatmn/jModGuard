@@ -28,7 +28,7 @@ def main():
     # Queue storage is intentionally inactive until enrollment, authorization and
     # dispatch/outcome fencing land together. DB helpers and their tests are allowed;
     # runtime consumers must be an explicit change to this boundary.
-    queue_names = re.compile(r"\b(?:enqueue_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|cancel_bot_action|prune_bot_action_history|recent_bot_actions|bot_action|bot_actions)\b")
+    queue_names = re.compile(r"\b(?:enqueue_enrolled_bot_action|enrolled_bot_action|recent_enrolled_bot_actions|cancel_enrolled_bot_action|bot_action_can_dispatch|enqueue_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|cancel_bot_action|prune_bot_action_history|recent_bot_actions|bot_action|bot_actions)\b")
     for path in (ROOT / "src").rglob("*.rs"):
         relative = path.relative_to(ROOT / "src")
         if relative.parts[0] == "db" or relative.as_posix() in {"db.rs", "bot_actions.rs", "lib.rs"}:

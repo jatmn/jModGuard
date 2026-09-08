@@ -148,6 +148,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
 
     exercise_action_storage(&bot, &api).await;
     exercise_membership_storage(&bot, &api).await;
+    exercise_captured_action_membership(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -168,6 +169,7 @@ async fn exercise_action_storage(bot: &Db, api: &Db) {
     use jmodguard::db::{
         begin_bot_action, bot_action, claim_bot_action, enqueue_bot_action, finish_bot_action,
     };
+    jmodguard::db::enroll_guild(bot, 900, 100).await.unwrap();
     let version = get_config_version(api).await.unwrap();
     let action = Action::Unban {
         user_id: 901,
@@ -269,4 +271,64 @@ async fn exercise_membership_storage(bot: &Db, api: &Db) {
     retire_guild_enrollment(bot, 800, 100).await.unwrap();
     assert_eq!(guild_enrollment(api, 800).await.unwrap(), Some(next));
     assert_eq!(get_config_version(api).await.unwrap(), version);
+}
+
+async fn exercise_captured_action_membership(bot: &Db, api: &Db) {
+    use jmodguard::bot_actions::{Action, Limits};
+    use jmodguard::db::*;
+    let old = enroll_guild(bot, 700, 100).await.unwrap().unwrap();
+    let first = enqueue_enrolled_bot_action(
+        api,
+        &old,
+        42,
+        "1000_bound",
+        Action::Unban {
+            user_id: 99,
+            reason: "storage test".into(),
+        },
+        1000,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    let claim = claim_bot_action(bot, 1001).await.unwrap().unwrap();
+    assert_eq!(claim.id, first.id);
+    assert!(begin_bot_action(bot, &claim, 1001).await.unwrap());
+    test_drop_next_commit_response();
+    retire_guild_enrollment(bot, 700, 100).await.unwrap();
+    assert!(
+        !finish_bot_action(bot, &claim, "succeeded", "late")
+            .await
+            .unwrap()
+    );
+    let current = enroll_guild(bot, 700, 101).await.unwrap().unwrap();
+    assert!(
+        recent_enrolled_bot_actions(api, &old)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        cancel_enrolled_bot_action(api, &old, &first.id)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        recent_enrolled_bot_actions(api, &current)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    api.with_conn(move |conn| {
+        let state: String = conn.query_row(
+            "SELECT state FROM bot_actions WHERE id=?1",
+            [first.id],
+            |r| Ok(r.get(0)?),
+        )?;
+        assert_eq!(state, "uncertain");
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

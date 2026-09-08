@@ -100,6 +100,10 @@ impl Limits {
 #[derive(Debug, thiserror::Error)]
 pub enum RequestKeyError {
     #[error(
+        "The action belongs to an earlier bot membership. Verify its outcome before deliberately starting a new request."
+    )]
+    EnrollmentChanged,
+    #[error(
         "The saved action request is invalid or your device clock is ahead. Check your clock and the previous outcome before starting a new request."
     )]
     Invalid,
