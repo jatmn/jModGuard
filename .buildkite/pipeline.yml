@@ -16,6 +16,12 @@ env:
   CARGO_INCREMENTAL: "0"
 
 steps:
+  - label: "ghcr credential probe"
+    key: ghcr-probe
+    if: build.message =~ /\[ghcr-probe\]/
+    timeout_in_minutes: 10
+    command: python3 .buildkite/ghcr-probe.py
+
   - label: "test"
     key: test
     timeout_in_minutes: 30
