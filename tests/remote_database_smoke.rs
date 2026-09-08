@@ -241,10 +241,24 @@ async fn exercise_membership_storage(bot: &Db, api: &Db) {
         guild_enrollment(api, 800).await.unwrap(),
         Some(first.clone())
     );
+    // A rollback can hide executed receipt writes from row-count assertions.
+    // Exercise the remote-only receipt path and reject the INSERT itself.
+    bot.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_matching_receipt BEFORE INSERT ON mutation_receipts
+             BEGIN SELECT RAISE(ABORT, 'matching observation wrote a receipt'); END",
+        )
+    })
+    .await
+    .unwrap();
     assert_eq!(
         enroll_guild(bot, 800, 100).await.unwrap(),
         Some(first.clone())
     );
+    assert!(enroll_guild(bot, 800, 99).await.unwrap().is_none());
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_matching_receipt"))
+        .await
+        .unwrap();
     assert!(guild_enrollment(api, 801).await.unwrap().is_none());
     test_drop_next_commit_response();
     retire_guild_enrollment(bot, 800, 100).await.unwrap();

@@ -60,7 +60,7 @@ async fn observe_membership(
         "invalid guild membership observation"
     );
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         let current = tx
             .query_row(
                 "SELECT id,joined_at_ns,active FROM guild_enrollments WHERE guild_id=?1",
@@ -83,6 +83,9 @@ async fn observe_membership(
                 }));
             }
         }
+        // The primary snapshot already holds the write lock: enabling recovery
+        // here preserves the comparison/write atomicity without no-op receipts.
+        tx.ensure_mutation_receipt()?;
         let id = format!("{:032x}", rand::random::<u128>());
         tx.execute(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,?3,?4)

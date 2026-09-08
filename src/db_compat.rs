@@ -261,39 +261,14 @@ impl Connection {
             self.inner
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
         )?;
-        let receipt = self.runtime.is_remote().then(|| {
-            format!(
-                "{:032x}{:032x}",
-                rand::random::<u128>(),
-                rand::random::<u128>()
-            )
-        });
-        let transaction = self.wrap_transaction(inner, receipt);
-        if let Some(receipt) = transaction.mutation_receipt.as_deref() {
-            transaction.execute(
-                "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
-                params![receipt],
-            )?;
-            // Deterministic, bounded cleanup: receipts are only needed for an
-            // immediate ambiguous-COMMIT reconciliation. Prune at a rate that
-            // exceeds creation without turning each message write into a
-            // global delete or retaining a full day of indexed rows.
-            if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
-                transaction.execute(
-                    "DELETE FROM mutation_receipts WHERE receipt_id IN (
-                         SELECT receipt_id FROM mutation_receipts
-                         WHERE created_at < unixepoch() - 600
-                         ORDER BY created_at LIMIT 1000
-                     )",
-                    (),
-                )?;
-            }
-        }
+        let mut transaction = self.wrap_transaction(inner, None);
+        transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
 
     /// Starts an IMMEDIATE transaction routed to the primary without creating
-    /// a mutation receipt. Use only for authoritative reads and migrations.
+    /// a mutation receipt. Before non-migration writes, enable a mutation receipt
+    /// on the returned transaction so lost COMMIT responses remain recoverable.
     pub fn transaction_primary_read(&self) -> Result<Transaction> {
         let inner = self.runtime.block_on_database(
             "begin primary read transaction",
@@ -427,6 +402,36 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Enable remote commit recovery only once a primary snapshot needs a write.
+    /// Call before executing mutations; read-only exits need no receipt or pruning.
+    pub(crate) fn ensure_mutation_receipt(&mut self) -> Result<()> {
+        if !self.runtime.is_remote() || self.mutation_receipt.is_some() {
+            return Ok(());
+        }
+        let receipt = format!(
+            "{:032x}{:032x}",
+            rand::random::<u128>(),
+            rand::random::<u128>()
+        );
+        self.execute(
+            "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
+            params![receipt.as_str()],
+        )?;
+        self.mutation_receipt = Some(receipt);
+        // Keep the existing bounded cleanup rate for receipt-bearing writes.
+        if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
+            self.execute(
+                "DELETE FROM mutation_receipts WHERE receipt_id IN (
+                     SELECT receipt_id FROM mutation_receipts
+                     WHERE created_at < unixepoch() - 600
+                     ORDER BY created_at LIMIT 1000
+                 )",
+                (),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         self.runtime
             .block_on_database("transaction execute_batch", self.inner().execute_batch(sql))?;
