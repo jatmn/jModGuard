@@ -269,7 +269,12 @@ pub async fn finish_bot_action(
         let changed = tx.execute(
             "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
              WHERE id=?3 AND claim=?4 AND state IN ('running','uncertain')",
-            params![state.as_str(), outcome.as_str(), job.id.as_str(), job.claim.as_deref()],
+            params![
+                state.as_str(),
+                outcome.as_str(),
+                job.id.as_str(),
+                job.claim.as_deref()
+            ],
         )?;
         if changed == 0 {
             tx.finish_read()?;
@@ -284,7 +289,8 @@ pub async fn finish_bot_action(
                     )?;
                     let data = serde_json::json!({
                         "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
-                    }).to_string();
+                    })
+                    .to_string();
                     tx.execute(
                         "INSERT INTO events(guild_id,event_type,user_id,actor_id,data,created_at)
                          VALUES(?1,'member_unban',?2,?3,?4,?5)",
@@ -292,19 +298,7 @@ pub async fn finish_bot_action(
                     )?;
                 }
                 Action::SetLogChannel { event, channel_id } => {
-                    if let Some(channel) = channel_id {
-                        tx.execute(
-                            "INSERT INTO log_channels(guild_id,event_type,channel_id) VALUES(?1,?2,?3)
-                             ON CONFLICT(guild_id,event_type) DO UPDATE SET channel_id=excluded.channel_id",
-                            params![job.guild_id, event.as_str(), *channel],
-                        )?;
-                    } else {
-                        tx.execute(
-                            "DELETE FROM log_channels WHERE guild_id=?1 AND event_type=?2",
-                            params![job.guild_id, event.as_str()],
-                        )?;
-                    }
-                    bump_config_version_conn(&tx)?;
+                    write_log_channel_conn(&tx, job.guild_id, event, *channel_id)?;
                 }
             }
         }

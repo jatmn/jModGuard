@@ -279,6 +279,32 @@ pub async fn list_log_channels(db: &Db, guild_id: i64) -> Result<Vec<(String, i6
     .await
 }
 
+/// Shared mapping/version semantics for direct writes and queued completion.
+/// The caller owns the transaction and any queue state or supersession update.
+pub(super) fn write_log_channel_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    event: &str,
+    channel_id: Option<i64>,
+) -> Result<()> {
+    let changed = if let Some(channel_id) = channel_id {
+        conn.execute(
+            "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(guild_id, event_type) DO UPDATE SET channel_id = excluded.channel_id",
+            params![guild_id, event, channel_id],
+        )?
+    } else {
+        conn.execute(
+            "DELETE FROM log_channels WHERE guild_id=?1 AND event_type=?2",
+            params![guild_id, event],
+        )?
+    };
+    if changed > 0 {
+        bump_config_version_conn(conn)?;
+    }
+    Ok(())
+}
+
 pub async fn upsert_log_channel(
     db: &Db,
     guild_id: i64,
@@ -291,13 +317,8 @@ pub async fn upsert_log_channel(
     let event = event.to_string();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute(
-            "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT(guild_id, event_type) DO UPDATE SET channel_id = excluded.channel_id",
-            params![guild_id, event.as_str(), channel_id],
-        )?;
+        write_log_channel_conn(&tx, guild_id, &event, Some(channel_id))?;
         supersede_log_action(&tx, guild_id, &event)?;
-        bump_config_version_conn(&tx)?;
         tx.commit()?;
         Ok(())
     })
@@ -308,16 +329,9 @@ pub async fn delete_log_channel(db: &Db, guild_id: i64, event: &str) -> Result<(
     let event = event.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let deleted = tx.execute(
-            "DELETE FROM log_channels WHERE guild_id=?1 AND event_type=?2",
-            params![guild_id, event.as_str()],
-        )?;
+        write_log_channel_conn(&tx, guild_id, &event, None)?;
+        // A clear supersedes queued intent even when the mapping is absent.
         supersede_log_action(&tx, guild_id, &event)?;
-        // A clear supersedes queued intent even when the mapping is absent,
-        // but only a changed mapping invalidates configuration caches.
-        if deleted > 0 {
-            bump_config_version_conn(&tx)?;
-        }
         tx.commit()?;
         Ok(())
     })

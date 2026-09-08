@@ -500,3 +500,141 @@ fn action_payloads_reject_unknown_operations_and_fields() {
     assert!(json.contains("\"9007199254740993\""));
     assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
 }
+
+#[tokio::test]
+async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomically() {
+    for present in [false, true] {
+        let f = Fixture::new();
+        if present {
+            upsert_log_channel(&f.db, 10, "member_join", 100)
+                .await
+                .unwrap();
+        }
+        f.enqueue(10, "queued_clear", channel(None)).await;
+        let job = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+        assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        let before = get_version_state(&f.db).await.unwrap();
+        let generation = f.db.config_write_generation();
+        f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_clear_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'version write rejected'); END")).await.unwrap();
+        if present {
+            assert!(
+                finish_bot_action(&f.db, &job, "succeeded", "cleared")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(f.state(&job).await, "running");
+            assert_eq!(list_log_channels(&f.db, 10).await.unwrap()[0].1, 100);
+            assert_eq!(get_version_state(&f.db).await.unwrap(), before);
+            assert_eq!(f.db.config_write_generation(), generation);
+            f.db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_clear_version"))
+                .await
+                .unwrap();
+        }
+        // An absent mapping completes even when any version write would fail.
+        assert!(
+            finish_bot_action(&f.db, &job, "succeeded", "cleared")
+                .await
+                .unwrap()
+        );
+        assert_eq!(f.state(&job).await, "succeeded");
+        assert!(list_log_channels(&f.db, 10).await.unwrap().is_empty());
+        let after = get_version_state(&f.db).await.unwrap();
+        if present {
+            assert_eq!(after.config, before.config + 1);
+            assert_ne!(after.config_revision, before.config_revision);
+            assert_eq!(after.slash, before.slash);
+            assert_eq!(after.slash_revision, before.slash_revision);
+            assert!(f.db.config_write_generation() > generation);
+        } else {
+            assert_eq!(after, before);
+            assert_eq!(f.db.config_write_generation(), generation);
+        }
+        assert!(
+            !finish_bot_action(&f.db, &job, "succeeded", "duplicate")
+                .await
+                .unwrap()
+        );
+        assert_eq!(get_version_state(&f.db).await.unwrap(), after);
+    }
+}
+
+#[test]
+fn action_channel_ids_follow_shared_snowflake_input_and_string_output() {
+    for value in ["123", "\"123\"", "9007199254740993", "\"9007199254740993\""] {
+        let input = format!(
+            "{{\"kind\":\"set_log_channel\",\"event\":\"member_join\",\"channel_id\":{value}}}"
+        );
+        let action: Action = serde_json::from_str(&input).unwrap();
+        action.validate().unwrap();
+        let output = serde_json::to_value(&action).unwrap();
+        assert!(output["channel_id"].is_string());
+        assert_eq!(serde_json::from_value::<Action>(output).unwrap(), action);
+    }
+    let clear: Action = serde_json::from_str(
+        r#"{"kind":"set_log_channel","event":"member_join","channel_id":null}"#,
+    )
+    .unwrap();
+    assert_eq!(clear, channel(None));
+    assert!(serde_json::to_value(clear).unwrap()["channel_id"].is_null());
+    for value in ["0", "-1", "\"0\"", "\"-1\""] {
+        let action: Action = serde_json::from_str(&format!(
+            "{{\"kind\":\"set_log_channel\",\"event\":\"member_join\",\"channel_id\":{value}}}"
+        ))
+        .unwrap();
+        assert!(action.validate().is_err());
+    }
+    for value in [
+        "true",
+        "1.5",
+        "{}",
+        "[]",
+        "\"invalid\"",
+        "9223372036854775808",
+    ] {
+        assert!(
+            serde_json::from_str::<Action>(&format!(
+                "{{\"kind\":\"set_log_channel\",\"event\":\"member_join\",\"channel_id\":{value}}}"
+            ))
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn numeric_action_channel_input_survives_storage_restart_and_retry() {
+    let f = Fixture::new();
+    let action: Action = serde_json::from_str(
+        r#"{"kind":"set_log_channel","event":"member_join","channel_id":9007199254740993}"#,
+    )
+    .unwrap();
+    let first = f.enqueue(10, "numeric_channel", action.clone()).await;
+    let reopened = Db::open(&f.path, 2).unwrap();
+    let retry = enqueue_bot_action(
+        &reopened,
+        10,
+        42,
+        "1000_numeric_channel",
+        channel(Some(9_007_199_254_740_993)),
+        1001,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.id, retry.id);
+    let job = claim_bot_action(&reopened, 1001).await.unwrap().unwrap();
+    assert_eq!(job.action, action);
+    assert_eq!(
+        serde_json::to_value(&job).unwrap()["action"]["channel_id"],
+        "9007199254740993"
+    );
+    assert!(begin_bot_action(&reopened, &job, 1001).await.unwrap());
+    assert!(
+        finish_bot_action(&reopened, &job, "succeeded", "configured")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        list_log_channels(&reopened, 10).await.unwrap()[0].1,
+        9_007_199_254_740_993
+    );
+}

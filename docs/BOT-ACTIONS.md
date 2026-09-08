@@ -9,7 +9,8 @@ token. The nickname outbox is separate and continues to operate as before.
 
 - Admission accepts positive guild/actor IDs and validated typed payloads. No SQL,
   executable code, arbitrary URLs or credentials are part of the action protocol.
-  Snowflakes serialize as strings; claim tokens are never serialized.
+  Snowflakes accept string or integer input and serialize as strings; an optional
+  channel ID also accepts/serializes null for a clear. Claim tokens are never serialized.
 - A request key is `<positive Unix seconds>_<nonce>` (at most 64 ASCII characters).
   Retrying the same guild/key/actor/payload returns the existing receipt. A conflicting
   actor or payload fails. Unknown remote commit outcomes require the **same** key.
@@ -25,6 +26,9 @@ token. The nickname outbox is separate and continues to operate as before.
   one transaction. This records a **trusted caller's reported result**, not proof that
   Discord performed an operation. SQL receipts cannot make a remote Discord action
   atomic or guarantee exactly-once delivery. A future worker must report outcomes honestly.
+  Direct writes and queued completion share log-mapping/version semantics: a clear
+  advances configuration versions/revisions only when a mapping is actually deleted.
+  An absent-mapping queued clear still commits its completed action state atomically.
 - Pending work can be cancelled within its guild. A direct log-channel upsert/delete
   supersedes active queued work for that guild/event atomically, so late completion
   cannot overwrite the newer setting. It cannot undo a remote effect already performed.

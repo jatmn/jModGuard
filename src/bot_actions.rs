@@ -21,18 +21,8 @@ mod snowflake {
     pub use crate::ids::ser_i64_str as serialize;
 }
 mod optional_snowflake {
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S: Serializer>(value: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(n) => s.serialize_some(&n.to_string()),
-            None => s.serialize_none(),
-        }
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-        Option::<String>::deserialize(d)?
-            .map(|s| s.parse().map_err(serde::de::Error::custom))
-            .transpose()
-    }
+    pub use crate::ids::de_opt_i64 as deserialize;
+    pub use crate::ids::ser_opt_i64_str as serialize;
 }
 impl Action {
     pub fn validate(&self) -> Result<()> {
