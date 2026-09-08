@@ -107,7 +107,7 @@ steps:
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
 
   # Match publish-image.py request(): webhook main push, webhook tag, or
-  # UI/API on main with JMODGUARD_PUBLISH_SOURCE. Schedule/UI test builds skip.
+  # UI/API with JMODGUARD_PUBLISH_SOURCE (Python still requires main and no tag).
   - label: "prepare image publication"
     key: prepare-images
     depends_on: [test, remote-database]
