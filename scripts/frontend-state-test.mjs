@@ -32,7 +32,7 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
   });
-  const app = vm.runInContext(`${source}\n({state, el, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -434,4 +434,77 @@ test('a refused command save retains its checkbox value for the next save', asyn
   assert.equal(calls[0].data.enabled, false);
   assert.equal(calls[1].data.enabled, false);
   assert.equal(findNode(content, (n) => n === modal), null);
+});
+
+test('configuration mutations retain the loaded membership without refreshing or retrying', async () => {
+  const calls = [];
+  const { app } = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Membership changed' }) };
+  });
+  app.state.config = { enrollment_id: 'old-membership' };
+  for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy']]) {
+    const count = calls.length;
+    await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, {}), /Membership changed/);
+    assert.equal(calls.length, count + 1);
+    assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'old-membership');
+  }
+  for (const path of ['/api/guilds/0/settings', `/api/guilds/${app.state.guilds[1].id}/settings`]) {
+    await assert.rejects(app.api(path, 'PUT', {}));
+    assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
+  }
+});
+
+test('drafts survive retries only within the captured bot membership', () => {
+  for (const next of ['original', 'replacement']) {
+    const { app, nodes } = harness();
+    const input = { value: 'Saved value' };
+    app.state.config = null;
+    app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Old draft' }], 'original');
+    app.state.config = { enrollment_id: next };
+    nodes.get('#content').querySelector = () => input;
+    app.restoreDrafts();
+    assert.equal(input.value, next === 'original' ? 'Old draft' : 'Saved value');
+    assert.equal(app.isDirty(), next === 'original');
+  }
+});
+
+test('an async action cannot restore drafts into a replacement membership', async () => {
+  const { app, nodes } = harness();
+  app.state.config = { enrollment_id: 'original' };
+  const input = { value: 'Old draft', _initialValue: 'Saved', dataset: { inputKey: '0' } };
+  nodes.get('#content').querySelectorAll = () => [input];
+  nodes.get('#content').querySelector = () => input;
+  await app.handleEvent({ closest: () => ({ contains: () => false }), isConnected: false }, async () => {
+    app.state.config = { enrollment_id: 'replacement' };
+    input.value = 'New membership value';
+  }, {});
+  assert.equal(input.value, 'New membership value');
+  assert.equal(app.isDirty(), false);
+});
+
+test('copy captures source membership on selection and sends both page scopes', async () => {
+  const calls = [];
+  const cfg = { enrollment_id: 'destination', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '!' } };
+  const { app, elements } = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (opts.method === 'POST') return response({ copied: ['settings'] });
+    return response(url.includes('987654321098765433') ? { enrollment_id: 'selected-source' } : cfg);
+  });
+  app.state.config = cfg;
+  app.state.tab = 'settings';
+  app.tabSettings();
+  const source = elements.find(n => n.tag === 'select' && n.listeners.change);
+  const copy = elements.find(n => n.tag === 'button' && n.textContent === 'Copy');
+  source.value = app.state.guilds[1].id;
+  source.selectedOptions = [{ textContent: 'Second' }];
+  await copy.listeners.click({});
+  assert.equal(calls.length, 0, 'copy waits for an explicitly loaded source');
+  await source.listeners.change({});
+  assert.equal(calls.length, 1);
+  await copy.listeners.click({});
+  const sent = calls.find(c => c.opts.method === 'POST');
+  assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
+  assert.equal(sent.opts.headers['x-jmodguard-enrollment'], 'destination');
+  assert.equal(calls.filter(c => c.url.includes('987654321098765433')).length, 1, 'copy must not refresh the selected source token');
 });

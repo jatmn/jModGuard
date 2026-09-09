@@ -159,9 +159,23 @@ global configuration from a guild page retain the original guild membership chec
 settings patches cannot bypass verification or create recovery receipts. Existing settings,
 nickname, checksum, validation and version behavior shares the same implementation.
 
-This groundwork adds no runtime consumer, new schema or dependency. Current API and bot
-callers remain independently usable; complete admission/browser scope integration follows.
+These operations share the existing mutations without a new schema or dependency. The
+API/browser integration below now consumes them; bot configuration callers retain existing helpers.
 See [captured configuration scopes](CONFIGURATION-SCOPES.md).
+
+## Implemented: API configuration admission and browser membership
+
+Guild API access now requires fresh Discord user permissions and primary active bot
+membership. Configuration snapshots verify the captured membership with the data;
+configuration writes verify it transactionally. The browser sends the loaded membership
+and retains the selected source for copies. Old pages cannot silently edit a replacement
+installation. Retry can restore drafts only within the same membership.
+
+Deploy matching API/frontend builds and reload old pages. Global routes remain owner-only;
+global targets through guild paths retain that page's membership. Direct unban/log-channel
+execution remains in the API, with the bot token still required. No administrative queue
+worker, schema migration, erasure or full tenant-isolation guarantee is added. See
+[the HTTP and browser contract](CONFIGURATION-SCOPES.md#http-and-browser-contract).
 
 ## Next implementation slices
 

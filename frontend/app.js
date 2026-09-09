@@ -56,13 +56,19 @@ function captureDrafts(node) {
       input._initialValue !== undefined && input.value !== input._initialValue)
     .map((input) => ({ key: input.dataset.inputKey, value: input.value }));
 }
-function retainDrafts(guildId, tab, drafts) {
+function retainDrafts(guildId, tab, drafts, enrollmentId = state.config?.enrollment_id) {
   if (!drafts.length || guildId !== state.guildId || tab !== state.tab) return;
-  pendingDrafts = { guildId, tab, drafts };
+  pendingDrafts = { guildId, tab, drafts, enrollmentId };
   restoreDrafts();
 }
 function restoreDrafts() {
   if (!pendingDrafts || pendingDrafts.guildId !== state.guildId || pendingDrafts.tab !== state.tab) return;
+  if (state.config && pendingDrafts.enrollmentId !== state.config.enrollment_id) {
+    pendingDrafts = null;
+    dirty = false;
+    updateWorkspaceStatus();
+    return;
+  }
   markDirty();
   // The unavailable/loading screen has no inputs. Keep the draft until Retry succeeds.
   if (!state.config) return;
@@ -85,14 +91,14 @@ function setBusy(value) {
 }
 async function handleEvent(node, handler, event) {
   if (busy) return;
-  const guildId = state.guildId, tab = state.tab;
+  const guildId = state.guildId, tab = state.tab, enrollmentId = state.config?.enrollment_id;
   const drafts = captureDrafts(node);
   try {
     const result = handler(event);
     if (result && typeof result.then === "function") {
       setBusy(true);
       await result;
-      if (!node.isConnected) retainDrafts(guildId, tab, drafts);
+      if (!node.isConnected) retainDrafts(guildId, tab, drafts, enrollmentId);
     }
   } catch (e) { toast(e.message || String(e), "error"); }
   finally { if (busy) setBusy(false); }
@@ -199,6 +205,12 @@ function setStartupStatus(text) {
 async function api(path, method = "GET", body = null, signal) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
+  // Bind edits to the membership whose configuration this page loaded. Never
+  // fetch a new token or retry a rejected edit against a replacement installation.
+  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy)(?:\/|$)/);
+  if (method !== "GET" && edit && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
+    opts.headers["x-jmodguard-enrollment"] = state.config.enrollment_id;
+  }
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -333,6 +345,11 @@ async function loadConfig() {
   try {
     const config = await api(`/api/guilds/${guildId}/config`);
     if (request !== configRequest || guildId !== state.guildId) return;
+    if (state.config && state.config.enrollment_id !== config.enrollment_id) {
+      pendingDrafts = null;
+      dirty = false;
+      toast("Bot membership changed. Configuration reloaded; review it before making changes.", "info");
+    }
     state.config = config;
     return true;
   } catch (e) {
@@ -1083,12 +1100,21 @@ function tabSettings() {
   const prefix = el("input", { type: "text", value: cfg.settings.prefix });
   const botName = el("input", { type: "text", value: cfg.settings.bot_name });
 
-  const srcSel = el("select", {},
+  let sourceEnrollment = null;
+  const srcSel = el("select", { onchange: async () => {
+    sourceEnrollment = null;
+    const guildId = srcSel.value;
+    if (!guildId) return;
+    try {
+      const source = await api(`/api/guilds/${guildId}/config`);
+      if (srcSel.value === guildId && source.enrollment_id) {
+        sourceEnrollment = { guildId, id: source.enrollment_id };
+      }
+    } catch (e) { toast("Could not load source server: " + e.message, "error"); }
+  } },
+    el("option", { value: "", text: "Select a source server" }),
     ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => el("option", { value: g.id, text: g.name })),
   );
-  if (state.guilds.filter((g) => g.id !== state.guildId).length === 0) {
-    srcSel.append(el("option", { value: "", text: "No other servers" }));
-  }
   const sectionSel = el("select", {},
     ["all", "rules", "badwords", "commands", "templates", "settings"]
       .map((s) => el("option", { value: s, text: s === "all" ? "everything" : s })),
@@ -1229,11 +1255,11 @@ function tabSettings() {
       el("div", { class: "row" },
         srcSel, sectionSel,
         el("button", { class: "btn primary", text: "Copy", onclick: async () => {
-          if (!srcSel.value) return toast("Select a source server", "error");
+          if (!sourceEnrollment || sourceEnrollment.guildId !== srcSel.value) return toast("Select a source server to load its current configuration", "error");
           if (!confirm(`Copy ${sectionSel.value} from ${srcSel.selectedOptions[0].textContent}?`)) return;
           try {
             let res = await api(`/api/guilds/${state.guildId}/copy`, "POST", {
-              from_guild_id: String(srcSel.value), sections: [sectionSel.value],
+              from_guild_id: String(srcSel.value), from_enrollment_id: sourceEnrollment.id, sections: [sectionSel.value],
             });
             if (!await loadConfig()) return;
             let msg = `Copied: ${(res.copied || []).join(", ") || "(nothing)"}`;

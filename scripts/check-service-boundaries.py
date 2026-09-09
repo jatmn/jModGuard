@@ -13,9 +13,11 @@ def main():
     # The Rust state types/compile-fail docs provide the corresponding field boundary.
     api_paths = list((ROOT / "src/web").rglob("*.rs")) + [ROOT / "src/bin/jmodguard-api.rs"]
     for path in api_paths:
+        if path.name == "enrollment_tests.rs":
+            continue
         source = path.read_text()
         for forbidden in ("crate::state::", "jmodguard::state::", "enrollment_repair::",
-                          "guild_enrollment(", "enroll_guild(", "retire_guild_enrollment(", "nickname_worker::"):
+                          "enroll_guild(", "retire_guild_enrollment(", "nickname_worker::"):
             if forbidden in source:
                 raise SystemExit(f"Bot state dependency in API: {path}: {forbidden}")
     for name in ("src/state.rs", "src/bin/jmodguard-bot.rs"):
@@ -38,14 +40,14 @@ def main():
     print("Action queue remains storage-only")
 
     # Captured configuration primitives are not API authorization on their own.
-    # Runtime adoption must arrive with the complete admission/browser contract.
+    # DB/API adoption includes admission and browser tokens; bot paths remain separate.
     scoped_config = re.compile(r"\b(?:ConfigurationScope|ConfigurationWriteScope|patch_enrolled_settings|copy_enrolled_guild_config|(?:upsert|delete)_enrolled_(?:rule|command|template)|(?:add|delete)_enrolled_badword)\b")
     for path in (ROOT / "src").rglob("*.rs"):
-        if path.relative_to(ROOT / "src").parts[0] == "db":
+        if path.relative_to(ROOT / "src").parts[0] in {"db", "web"}:
             continue
         if scoped_config.search(path.read_text()):
-            raise SystemExit(f"Inactive scoped configuration consumed by runtime code: {path}")
-    print("Captured configuration remains data-layer groundwork")
+            raise SystemExit(f"Captured configuration outside the DB/API boundary: {path}")
+    print("Captured configuration is confined to DB/API code")
 
     for package in ("jmodguard-runtime", "jmodguard-conductor"):
         result = subprocess.run(

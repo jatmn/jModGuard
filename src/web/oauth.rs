@@ -6,6 +6,8 @@ pub struct OAuthClient {
     pub client_secret: String,
     pub redirect_uri: String,
     pub http: reqwest::Client,
+    #[cfg(test)]
+    pub guilds_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -171,10 +173,13 @@ impl OAuthClient {
         // Discord paginates at 200 guilds; a single GET silently drops every
         // server past the first page and deny WebUI manage access for them.
         const PAGE_LIMIT: usize = 200;
+        let endpoint = "https://discord.com/api/users/@me/guilds";
+        #[cfg(test)]
+        let endpoint = self.guilds_endpoint.as_deref().unwrap_or(endpoint);
         let mut all = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let mut url = format!("https://discord.com/api/users/@me/guilds?limit={PAGE_LIMIT}");
+            let mut url = format!("{endpoint}?limit={PAGE_LIMIT}");
             if let Some(ref cursor) = after {
                 url.push_str("&after=");
                 url.push_str(cursor);
