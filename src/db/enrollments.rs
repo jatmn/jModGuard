@@ -171,3 +171,52 @@ pub struct EnrollmentChanged;
 #[derive(Debug, thiserror::Error)]
 #[error("Server access could not be verified. Try again shortly.")]
 pub struct EnrollmentUnverified;
+
+/// Explicit configuration scope captured at authorization. This is not a credential:
+/// callers still enforce user permissions; transactions verify the enrollment identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationScope {
+    Global,
+    Guild(GuildEnrollment),
+}
+impl ConfigurationScope {
+    pub fn guild_id(&self) -> i64 {
+        match self {
+            Self::Global => GLOBAL_SCOPE,
+            Self::Guild(enrollment) => enrollment.guild_id,
+        }
+    }
+    pub(super) fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
+        if let Self::Guild(expected) = self {
+            verify_enrollment_conn(conn, expected)?;
+        }
+        Ok(())
+    }
+}
+
+/// A configuration edit retains both the page's enrollment and its authorized target.
+/// Only that same scope or global configuration may be targeted. User/owner permissions
+/// are still enforced by the caller; this value is not a credential.
+#[derive(Debug, Clone)]
+pub struct ConfigurationWriteScope {
+    request: ConfigurationScope,
+    target: ConfigurationScope,
+}
+impl ConfigurationWriteScope {
+    pub fn new(request: ConfigurationScope, target: ConfigurationScope) -> Result<Self> {
+        if target != request && target != ConfigurationScope::Global {
+            return Err(EnrollmentChanged.into());
+        }
+        Ok(Self { request, target })
+    }
+    pub fn guild_id(&self) -> i64 {
+        self.target.guild_id()
+    }
+    pub(super) fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
+        self.request.verify_conn(conn)?;
+        if self.request != self.target {
+            self.target.verify_conn(conn)?;
+        }
+        Ok(())
+    }
+}

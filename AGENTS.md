@@ -61,6 +61,15 @@ for matching/stale observation no-ops. Future dashboard queue callers must use c
 Keep old uncertain outcomes separate from newer membership config writes. No queue HTTP
 admission/worker is enabled; full Discord permission/membership checks remain prerequisites.
 
+Captured configuration operations are inactive data-layer groundwork; see
+`docs/CONFIGURATION-SCOPES.md`. Keep request/target and copy source/destination identity
+checks in the mutation transaction and reuse verify_enrollment_conn. Scope objects confer
+no user or owner permission. Empty captured settings patches verify membership using a
+primary read without mutation receipts; actual writes enable recovery after verification.
+Preserve shared settings/nickname/checksum/version and validate-before-replace semantics.
+Runtime adoption requires complete API admission and browser scope handling; the service
+boundary guard rejects current runtime consumers. Existing guild-ID paths remain in use.
+
 ## Commands
 
 ```bash

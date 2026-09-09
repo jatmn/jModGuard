@@ -144,3 +144,10 @@ Bot-only `[enrollment]` config controls positive membership discovery: enable/di
 page size, polling, sweep pause, retry delay and per-request timeout. The API ignores
 these TOML fields and their `JMODGUARD_ENROLLMENT_*` overrides. See
 [defaults, bounds and behavior](ENROLLMENTS.md#bounded-positive-repair).
+
+## Captured-scope data operations
+
+New data-layer operations check the request's captured membership within configuration
+transactions, preserving existing inheritance, nickname and version semantics. Current API
+and bot callers retain their existing paths; this is groundwork for complete admission and
+browser scope handling. See [configuration scopes](CONFIGURATION-SCOPES.md).

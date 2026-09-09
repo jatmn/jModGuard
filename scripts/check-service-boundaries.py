@@ -37,6 +37,16 @@ def main():
             raise SystemExit(f"Inactive queue consumed by runtime code: {path}")
     print("Action queue remains storage-only")
 
+    # Captured configuration primitives are not API authorization on their own.
+    # Runtime adoption must arrive with the complete admission/browser contract.
+    scoped_config = re.compile(r"\b(?:ConfigurationScope|ConfigurationWriteScope|patch_enrolled_settings|copy_enrolled_guild_config|(?:upsert|delete)_enrolled_(?:rule|command|template)|(?:add|delete)_enrolled_badword)\b")
+    for path in (ROOT / "src").rglob("*.rs"):
+        if path.relative_to(ROOT / "src").parts[0] == "db":
+            continue
+        if scoped_config.search(path.read_text()):
+            raise SystemExit(f"Inactive scoped configuration consumed by runtime code: {path}")
+    print("Captured configuration remains data-layer groundwork")
+
     for package in ("jmodguard-runtime", "jmodguard-conductor"):
         result = subprocess.run(
             ["cargo", "tree", "--locked", "--offline", "-p", package,

@@ -110,6 +110,16 @@ The checks cannot recall a Discord request after it is sent or guarantee atomici
 SQL and Discord. Run one bot worker; exclusive replica ownership and full captured settings/
 API scope remain unimplemented. This does not certify tenant isolation or automatic recovery.
 
+## Captured configuration storage
+
+The database now provides captured-scope settings, copy, rule, command, template and badword
+operations. They verify the original membership inside the same primary transaction;
+copies check both ends and global writes from a guild context retain that context's check.
+Empty settings patches also verify before reading, without writing receipts or versions.
+These helpers are not yet used by API or bot runtime callers. See
+[the contract and caller responsibilities](CONFIGURATION-SCOPES.md). No schema change or
+new authorization surface is introduced; full captured API/browser integration remains.
+
 ## Schema and remaining work
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;

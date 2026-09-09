@@ -124,6 +124,12 @@ These checks cannot recall an already-sent Discord edit or provide exclusive bot
 ownership. Current settings/API authorization is unchanged; full captured API scope and
 writer coordination remain separate work. Use one bot worker for this implementation.
 
+Captured configuration data operations now retain the original guild membership through
+the primary write transaction, including both sides of a copy and the guild context of a
+global edit. Empty scoped settings patches verify before reading. These library operations
+are not wired into runtime API/bot callers yet; see [configuration scopes](CONFIGURATION-SCOPES.md).
+Full API/browser admission remains separate, and the schema is unchanged by this work.
+
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
