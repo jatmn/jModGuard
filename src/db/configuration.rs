@@ -887,9 +887,16 @@ pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
     Ok(load_config_parts_with_version(db, guild_id).await?.2)
 }
 
-async fn load_web_config_snapshot_primary(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
+async fn load_web_config_snapshot_primary(
+    db: &Db,
+    guild_id: i64,
+    expected: Option<ConfigurationScope>,
+) -> Result<WebConfigSnapshot> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         let version = get_config_version_conn(&tx)?;
         let settings = settings_web_bundle_conn(&tx, guild_id)?;
         let nickname_reconcile = if guild_id == GLOBAL_SCOPE {
@@ -944,7 +951,7 @@ async fn load_web_config_snapshot_primary(db: &Db, guild_id: i64) -> Result<WebC
 /// has its own lifecycle rather than `config_version`, so a replica snapshot
 /// cannot establish freshness for every operator-visible field.
 pub async fn load_web_config_snapshot(db: &Db, guild_id: i64) -> Result<WebConfigSnapshot> {
-    let snapshot = load_web_config_snapshot_primary(db, guild_id).await?;
+    let snapshot = load_web_config_snapshot_primary(db, guild_id, None).await?;
     anyhow::ensure!(
         snapshot.version >= db.required_config_version(),
         "primary WebUI config snapshot is below the process's committed-version floor"
@@ -1218,4 +1225,17 @@ pub async fn delete_enrolled_badword(
     id: i64,
 ) -> Result<()> {
     delete_badword_inner(db, id, scope.guild_id(), Some(scope)).await
+}
+
+/// Read the configuration and verify the captured membership in one primary snapshot.
+pub async fn load_enrolled_web_config_snapshot(
+    db: &Db,
+    scope: ConfigurationScope,
+) -> Result<WebConfigSnapshot> {
+    let snapshot = load_web_config_snapshot_primary(db, scope.guild_id(), Some(scope)).await?;
+    anyhow::ensure!(
+        snapshot.version >= db.required_config_version(),
+        "primary WebUI config snapshot is below the process's committed-version floor"
+    );
+    Ok(snapshot)
 }

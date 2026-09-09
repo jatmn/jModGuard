@@ -79,8 +79,8 @@ The bot's [membership observer](ENROLLMENTS.md) records Gateway joins/departures
 known context and runs bounded, configurable positive REST repair. It keeps one SQL row
 per guild and one pagination cursor, reuses the existing HTTP client, and does no
 per-message work. API configuration has no enrollment-repair fields. Observation state
-now scopes inactive queue storage, but is not yet consumed by API permissions, a running
-queue dispatcher or nickname reconciliation.
+scopes inactive queue storage, nickname reconciliation and API configuration access.
+It does not enable a running administrative queue dispatcher.
 
 ## Config cache invalidation
 
@@ -121,14 +121,16 @@ migrated unbound jobs require a fresh save or Re-sync; no automatic initial nick
 is issued. See [nickname reconciliation](ENROLLMENTS.md#nickname-reconciliation).
 
 These checks cannot recall an already-sent Discord edit or provide exclusive bot-replica
-ownership. Current settings/API authorization is unchanged; full captured API scope and
-writer coordination remain separate work. Use one bot worker for this implementation.
+ownership. Configuration API scope is implemented below; writer coordination remains
+separate work. Use one bot worker for this implementation.
 
 Captured configuration data operations now retain the original guild membership through
 the primary write transaction, including both sides of a copy and the guild context of a
 global edit. Empty scoped settings patches verify before reading. These library operations
-are not wired into runtime API/bot callers yet; see [configuration scopes](CONFIGURATION-SCOPES.md).
-Full API/browser admission remains separate, and the schema is unchanged by this work.
+are used by the API after fresh user permission and primary membership admission; see
+[configuration scopes](CONFIGURATION-SCOPES.md) for page/source tokens and stale-edit behavior.
+The configuration snapshot verifies membership alongside the data. Other reads and direct
+Discord actions still need their complete transaction/dispatch boundaries. The schema is unchanged.
 
 ## Migrations
 

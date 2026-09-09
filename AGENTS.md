@@ -47,7 +47,7 @@ Queue history is operational metadata, separate from retained moderation audit r
 The service-boundary guard rejects runtime queue consumers in this slice.
 
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
-bind inactive queue storage and the nickname outbox; API authorization remains separate.
+bind inactive queue storage, the nickname outbox and API configuration scope.
 Positive repair must stay bounded, use the existing bot HTTP/identity, never fetch a
 member roster or infer removal from omissions/errors. Missing/outage Gateway context
 cannot retire an observation. Healthy matching joins write no rows/receipts; resuming a
@@ -61,14 +61,16 @@ for matching/stale observation no-ops. Future dashboard queue callers must use c
 Keep old uncertain outcomes separate from newer membership config writes. No queue HTTP
 admission/worker is enabled; full Discord permission/membership checks remain prerequisites.
 
-Captured configuration operations are inactive data-layer groundwork; see
-`docs/CONFIGURATION-SCOPES.md`. Keep request/target and copy source/destination identity
-checks in the mutation transaction and reuse verify_enrollment_conn. Scope objects confer
-no user or owner permission. Empty captured settings patches verify membership using a
-primary read without mutation receipts; actual writes enable recovery after verification.
-Preserve shared settings/nickname/checksum/version and validate-before-replace semantics.
-Runtime adoption requires complete API admission and browser scope handling; the service
-boundary guard rejects current runtime consumers. Existing guild-ID paths remain in use.
+The API uses captured configuration operations; see `docs/CONFIGURATION-SCOPES.md`.
+Require fresh Discord permission then primary active membership before guild access.
+Loaded configuration supplies a membership token; require it for guild configuration edits
+and separately for a selected copy source. Never silently refresh/rebind an old browser edit.
+Keep request/target and copy source/destination checks in the mutation transaction; scope
+objects confer no user/owner permission. Global targets through guild paths retain the guild
+check; explicit guild-0 routes remain independently owner-only. Preserve settings/read floors,
+nickname/checksum/version and validate-before-replace semantics. Empty captured settings
+patches verify using a primary read without mutation receipts. Direct unban/log-channel
+execution, complete tenant isolation and worker coordination remain separate work.
 
 ## Commands
 
@@ -217,7 +219,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   Gateway context must not mutate jobs through a separate guild-only lifecycle helper.
   No initial nickname edit is created on join. Nicknames remain guild-only. Final
   DB checks cannot recall a Discord request already sent or coordinate multiple bot
-  replicas; writer leases and complete captured API scope remain later work.
+  replicas; writer leases and queued administrative dispatch remain later work.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.

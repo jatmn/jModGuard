@@ -38,6 +38,32 @@ pub struct ApiError(pub anyhow::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is::<crate::db::EnrollmentUnverified>() {
+            return ApiError(GuildAccessError::Unverified.into()).into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<crate::db::EnrollmentChanged>() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string(), "code": "guild_enrollment_changed"
+                })),
+            )
+                .into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<GuildAccessError>() {
+            let (status, code) = match error {
+                GuildAccessError::Inactive => (StatusCode::CONFLICT, "guild_enrollment_inactive"),
+                GuildAccessError::Unverified => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "guild_access_unverified")
+                }
+            };
+            return (
+                status,
+                Json(serde_json::json!({"error": error.to_string(), "code": code})),
+            )
+                .into_response();
+        }
+
         let body = serde_json::json!({ "error": format!("{:#}", self.0) });
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
     }
@@ -59,6 +85,7 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 pub struct AuthCtx {
     pub user: DiscordUser,
     pub guilds: Vec<DiscordGuild>,
+    enrollment: Option<crate::db::GuildEnrollment>,
 }
 
 impl AuthCtx {
@@ -159,7 +186,11 @@ async fn require_auth_with(
             Some(u) => u,
             None => app.oauth.me(&token).await.map_err(ApiError)?,
         };
-        return Ok(AuthCtx { user, guilds });
+        return Ok(AuthCtx {
+            user,
+            guilds,
+            enrollment: None,
+        });
     }
 
     // Authorization / cold display: always re-fetch guilds from Discord.
@@ -201,7 +232,11 @@ async fn require_auth_with(
 
     app.guild_cache.insert(user_id, (now, guilds.clone()));
     app.user_cache.insert(user_id, (now, user.clone()));
-    Ok(AuthCtx { user, guilds })
+    Ok(AuthCtx {
+        user,
+        guilds,
+        enrollment: None,
+    })
 }
 
 fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
@@ -624,7 +659,10 @@ fn session_same_site(cross_origin: bool, secure: bool) -> tower_sessions::cookie
 pub fn router(app: Arc<ApiState>) -> Router {
     // In-memory sessions are intentional for a single API replica.
     // Sessions are lost on API restart; multi-replica needs a shared store.
-    let session_store = MemoryStore::default();
+    router_with_store(app, MemoryStore::default())
+}
+
+fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
     // Secure cookies when the public URL is HTTPS (deploy behind TLS).
     let secure = app
         .cfg
@@ -761,6 +799,7 @@ pub fn router(app: Arc<ApiState>) -> Router {
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::ACCEPT,
                 axum::http::header::COOKIE,
+                axum::http::HeaderName::from_static("x-jmodguard-enrollment"),
             ])
             .allow_credentials(true);
         sessioned.layer(cors)
@@ -773,6 +812,102 @@ pub fn router(app: Arc<ApiState>) -> Router {
         .route("/health/", get(health))
         .merge(sessioned)
         .with_state(app.clone())
+}
+
+/// Membership admission failures contain no database diagnostics or tenant data.
+#[derive(Debug)]
+enum GuildAccessError {
+    Inactive,
+    Unverified,
+}
+impl std::fmt::Display for GuildAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Inactive => "The bot has no active enrollment in this server.",
+            Self::Unverified => "Server access could not be verified. Try again shortly.",
+        })
+    }
+}
+impl std::error::Error for GuildAccessError {}
+
+/// Call after fresh Discord permission authorization. This primary read is an
+/// admission gate, not a lock covering the handler's later data transactions.
+async fn require_active_enrollment(
+    app: &ApiState,
+    guild: u64,
+) -> ApiResult<crate::db::GuildEnrollment> {
+    let guild = i64::try_from(guild)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| ApiError(anyhow::anyhow!("invalid guild id")))?;
+    match crate::db::guild_enrollment(&app.db, guild).await {
+        Ok(Some(enrollment)) => Ok(enrollment),
+        Ok(None) => Err(ApiError(GuildAccessError::Inactive.into())),
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild,
+                "guild access verification unavailable: {error:#}"
+            );
+            Err(ApiError(GuildAccessError::Unverified.into()))
+        }
+    }
+}
+
+fn configuration_scope(
+    app: &ApiState,
+    auth: &AuthCtx,
+    guild: u64,
+) -> ApiResult<crate::db::ConfigurationScope> {
+    if guild == 0 {
+        require_bot_owner(app, auth)?;
+        return Ok(crate::db::ConfigurationScope::Global);
+    }
+    Ok(crate::db::ConfigurationScope::Guild(authorized_enrollment(
+        auth, guild,
+    )?))
+}
+
+fn authorized_enrollment(auth: &AuthCtx, guild: u64) -> ApiResult<crate::db::GuildEnrollment> {
+    match &auth.enrollment {
+        Some(enrollment) if guild > 0 && u64::try_from(enrollment.guild_id).ok() == Some(guild) => {
+            Ok(enrollment.clone())
+        }
+        _ => Err(ApiError(crate::db::EnrollmentChanged.into())),
+    }
+}
+
+fn configuration_write_scope(
+    app: &ApiState,
+    auth: &AuthCtx,
+    guild: u64,
+    target: i64,
+) -> ApiResult<crate::db::ConfigurationWriteScope> {
+    let target =
+        u64::try_from(target).map_err(|_| ApiError(crate::db::EnrollmentChanged.into()))?;
+    Ok(crate::db::ConfigurationWriteScope::new(
+        configuration_scope(app, auth, guild)?,
+        configuration_scope(app, auth, target)?,
+    )?)
+}
+
+fn check_enrollment_token(auth: &AuthCtx, guild: u64, token: Option<&str>) -> ApiResult<()> {
+    if guild == 0 {
+        return Ok(());
+    }
+    let enrollment = authorized_enrollment(auth, guild)?;
+    if token != Some(enrollment.id.as_str()) {
+        return Err(ApiError(crate::db::EnrollmentChanged.into()));
+    }
+    Ok(())
+}
+fn check_page_enrollment(auth: &AuthCtx, guild: u64, headers: &HeaderMap) -> ApiResult<()> {
+    check_enrollment_token(
+        auth,
+        guild,
+        headers
+            .get("x-jmodguard-enrollment")
+            .and_then(|v| v.to_str().ok()),
+    )
 }
 
 /// Authorize Discord MANAGE_GUILD for a real guild id with a **fresh** guild list.
@@ -790,12 +925,13 @@ pub async fn authorize_manage_guild(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));
     }
-    let auth = require_auth_fresh(app, session).await?;
+    let mut auth = require_auth_fresh(app, session).await?;
     if !auth.can_manage(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));
     }
+    auth.enrollment = Some(require_active_enrollment(app, guild_id).await?);
     Ok(auth)
 }
 
@@ -811,12 +947,13 @@ pub async fn authorize_ban_members(
             "this operation requires a Discord server"
         )));
     }
-    let auth = require_auth_fresh(app, session).await?;
+    let mut auth = require_auth_fresh(app, session).await?;
     if !auth.can_ban_members(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot unban members in this server (needs BAN_MEMBERS permission)"
         )));
     }
+    auth.enrollment = Some(require_active_enrollment(app, guild_id).await?);
     Ok(auth)
 }
 
@@ -1293,6 +1430,7 @@ mod tests {
 
     fn auth_user(discord_id: u64) -> AuthCtx {
         AuthCtx {
+            enrollment: None,
             user: crate::web::oauth::DiscordUser {
                 id: discord_id.to_string(),
                 username: "tester".into(),
@@ -1395,7 +1533,7 @@ mod tests {
         session
     }
 
-    fn seed_auth_caches(
+    pub(super) fn seed_auth_caches(
         app: &ApiState,
         user_id: u64,
         guilds: Vec<crate::web::oauth::DiscordGuild>,
@@ -1479,6 +1617,7 @@ mod tests {
         // must call authorize_manage_guild(from) — never auth.can_manage(from)
         // on the destination AuthCtx.
         let stale = AuthCtx {
+            enrollment: None,
             user: crate::web::oauth::DiscordUser {
                 id: "99".into(),
                 username: "owner".into(),
@@ -1595,3 +1734,6 @@ mod tests {
         assert!(!trusted_web_origin(&cfg, &HeaderMap::new()));
     }
 }
+
+#[cfg(test)]
+mod enrollment_tests;

@@ -52,10 +52,12 @@ pub async fn guild_config(
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let guild = guild_id as i64;
-
-    let snapshot = db::load_web_config_snapshot(&app.db, guild).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    let snapshot = db::load_enrolled_web_config_snapshot(
+        &app.db,
+        super::configuration_scope(&app, &auth, guild_id)?,
+    )
+    .await?;
 
     // rules: effective + scope info
     let default_rules = crate::defaults::default_rules();
@@ -156,6 +158,7 @@ pub async fn guild_config(
     }
 
     Ok(Json(serde_json::json!({
+        "enrollment_id": auth.enrollment.as_ref().map(|e| e.id.as_str()),
         "settings": settings_wire(&snapshot.settings.settings),
         "settings_override": settings_wire(&snapshot.settings.settings_override),
         "global_settings": settings_wire(&snapshot.settings.global_settings),
@@ -191,10 +194,12 @@ pub struct SettingsBody {
 pub async fn update_settings(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<SettingsBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     if guild_id == 0 && body.bot_name.is_some() {
         return Err(ApiError(anyhow::anyhow!(
             "global bot_name is not supported; set the Discord nickname per server"
@@ -205,12 +210,11 @@ pub async fn update_settings(
     // override. Values equal to the parent layer are stripped so global
     // inheritance keeps working.
     let nickname_queued = (body.bot_name.is_some() || body.sync_nickname) && guild_id != 0;
-    let settings = db::patch_settings_with_nickname_reconcile(
+    let settings = db::patch_enrolled_settings(
         &app.db,
-        guild_id as i64,
+        super::configuration_scope(&app, &auth, guild_id)?,
         body.prefix,
         body.bot_name,
-        None,
         body.sync_nickname,
     )
     .await?;
@@ -261,15 +265,23 @@ pub async fn get_rule(
 pub async fn put_rule(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<RuleBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     if !crate::types::RULE_IDS.contains(&rule_id.as_str()) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
     }
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::upsert_rule(&app.db, scope, &rule_id, &body.data).await?;
+    db::upsert_enrolled_rule(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &rule_id,
+        &body.data,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -281,12 +293,19 @@ pub struct ScopeBody {
 pub async fn delete_rule(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_rule(&app.db, scope, &rule_id).await?;
+    db::delete_enrolled_rule(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &rule_id,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -331,21 +350,31 @@ pub async fn list_badwords(
 pub async fn add_badword(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<BadwordBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    let id = db::add_badword(&app.db, scope, &body.pattern, body.note.as_deref()).await?;
+    let id = db::add_enrolled_badword(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &body.pattern,
+        body.note.as_deref(),
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
 pub async fn delete_badword(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, word_id)): Path<(u64, i64)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     // Uniform "not found" for missing / wrong-guild / non-owner global — never
     // distinguish existence across scopes (error-oracle / IDOR probe).
     let not_found = || ApiError(anyhow::anyhow!("badword not found"));
@@ -362,7 +391,13 @@ pub async fn delete_badword(
     }
     // Post-auth miss (TOCTOU race / already deleted) must stay uniform — do not
     // surface guild-scoped DB wording if the layer ever diverges again.
-    match db::delete_badword(&app.db, word_id, word.guild_id).await {
+    match db::delete_enrolled_badword(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, word.guild_id)?,
+        word_id,
+    )
+    .await
+    {
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(e) if e.to_string().contains("badword not found") => Err(not_found()),
         Err(e) => Err(ApiError(e)),
@@ -434,44 +469,67 @@ fn validate_command_descriptor(cmd: &CommandDef) -> ApiResult<()> {
 pub async fn put_command(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<CommandBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let name = name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
     validate_command_descriptor(&data)?;
-    db::upsert_command(&app.db, scope, &name, &data).await?;
+    db::upsert_enrolled_command(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &name,
+        &data,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn create_command(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<CommandBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let name = body.data.name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
     validate_command_descriptor(&data)?;
-    db::upsert_command(&app.db, scope, &name, &data).await?;
+    db::upsert_enrolled_command(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &name,
+        &data,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 pub async fn delete_command(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_command(&app.db, scope, &name.to_lowercase()).await?;
+    db::delete_enrolled_command(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &name.to_lowercase(),
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -519,27 +577,42 @@ pub async fn get_template(
 pub async fn put_template(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<TemplateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if !crate::types::EVENT_TYPES.contains(&event.as_str()) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
-    db::upsert_template(&app.db, scope, &event, &body.template).await?;
+    db::upsert_enrolled_template(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &event,
+        &body.template,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn delete_template(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
-    db::delete_template(&app.db, scope, &event).await?;
+    db::delete_enrolled_template(
+        &app.db,
+        super::configuration_write_scope(&app, &auth, guild_id, scope)?,
+        &event,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -651,39 +724,48 @@ pub async fn delete_logchannel(
 pub struct CopyBody {
     #[serde(deserialize_with = "crate::ids::de_u64")]
     from_guild_id: u64,
+    from_enrollment_id: Option<String>,
     sections: Vec<String>,
 }
 
 pub async fn copy_config(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<CopyBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // Destination: owner gate when guild_id=0, else fresh Manage Guild.
-    let _dest = guild_scope(&app, &session, guild_id).await?;
-    // Source is a *second* Discord guild authorization. Never reuse `_dest`'s
+    let dest = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&dest, guild_id, &headers)?;
+    // Source is a *second* Discord guild authorization. Never reuse `dest`'s
     // AuthCtx: when destination is global, guild_scope returns CachedOk and
     // can_manage(from) would trust a stale ≤60s guild list (owner demoted on
     // source could still copy into global). Always refresh for source.
-    if authorize_manage_guild(&app, &session, body.from_guild_id)
+    let source = authorize_manage_guild(&app, &session, body.from_guild_id)
         .await
-        .is_err()
-    {
-        return Err(ApiError(anyhow::anyhow!(
-            "you cannot manage the source server"
-        )));
-    }
+        .map_err(|error| {
+            if error.0.is::<super::GuildAccessError>() {
+                error
+            } else {
+                ApiError(anyhow::anyhow!("you cannot manage the source server"))
+            }
+        })?;
 
+    super::check_enrollment_token(
+        &source,
+        body.from_guild_id,
+        body.from_enrollment_id.as_deref(),
+    )?;
     let wants_settings = body.sections.iter().any(|s| s == "settings" || s == "all");
 
     // Settings copy atomically commits the desired nickname and outbox row;
     // the bot applies Discord from that durable state.
     let nickname_queued = wants_settings && guild_id != 0;
-    let result = db::copy_guild_config(
+    let result = db::copy_enrolled_guild_config(
         &app.db,
-        body.from_guild_id as i64,
-        guild_id as i64,
+        super::configuration_scope(&app, &source, body.from_guild_id)?,
+        super::configuration_scope(&app, &dest, guild_id)?,
         body.sections,
     )
     .await?;

@@ -6,8 +6,9 @@ random identity, the bot's join timestamp in nanoseconds, and active/inactive st
 No member roster, message history, or per-user activity is collected by this feature.
 
 Observations bind inactive administrative queue storage and the active nickname outbox.
-They are not a complete authorization or erasure boundary. API permissions, direct unban/
-log-channel actions and settings authorization keep their existing path. The administrative
+API guild access now checks them after fresh Discord user permissions; configuration
+reads/writes retain captured membership. They are not a complete authorization or erasure
+boundary. Direct unban/log-channel actions keep their API execution path. The administrative
 queue remains inactive; nickname dispatch adds its own fresh Discord verification below.
 
 ## Gateway observations
@@ -107,8 +108,8 @@ No new task, HTTP client, cache or library is added. The existing worker loads u
 and runs up to4 concurrently. Each dispatch adds one own-member read; stale jobs skip HTTP.
 Existing retry/deadline limits remain bootstrap implementation limits, not measured capacity.
 The checks cannot recall a Discord request after it is sent or guarantee atomicity between
-SQL and Discord. Run one bot worker; exclusive replica ownership and full captured settings/
-API scope remain unimplemented. This does not certify tenant isolation or automatic recovery.
+SQL and Discord. Run one bot worker; exclusive replica ownership remains unimplemented.
+This does not certify tenant isolation or automatic recovery.
 
 ## Captured configuration storage
 
@@ -116,9 +117,10 @@ The database now provides captured-scope settings, copy, rule, command, template
 operations. They verify the original membership inside the same primary transaction;
 copies check both ends and global writes from a guild context retain that context's check.
 Empty settings patches also verify before reading, without writing receipts or versions.
-These helpers are not yet used by API or bot runtime callers. See
-[the contract and caller responsibilities](CONFIGURATION-SCOPES.md). No schema change or
-new authorization surface is introduced; full captured API/browser integration remains.
+The API now uses these helpers after fresh permission and active membership admission.
+Configuration snapshots return a membership token required on edits; copies retain both
+page and selected-source membership. See [the HTTP contract](CONFIGURATION-SCOPES.md#http-and-browser-contract).
+Bot configuration callers retain their existing helpers. No schema change is introduced.
 
 ## Schema and remaining work
 
@@ -129,7 +131,7 @@ rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 
 Runtime administrative queue integration, fresh user permission and bot membership checks around
-side effects, captured API transaction scope, stale browser context, case/evidence isolation,
+side effects, remaining data-read transaction scopes, case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that
 purge design. Local tests do not certify tenant isolation or Discord/Bunny behavior.

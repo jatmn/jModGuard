@@ -424,6 +424,11 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
         .await
         .unwrap();
     assert_eq!(settings.prefix, "source");
+    let snapshot = load_enrolled_web_config_snapshot(api, source.clone())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.settings.settings.prefix, "source");
+    assert!(snapshot.version >= api.required_config_version());
     bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_config_noop_receipt"))
         .await
         .unwrap();
@@ -472,6 +477,13 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
         copy_enrolled_guild_config(api, source.clone(), destination, vec!["all".into()])
             .await
             .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        load_enrolled_web_config_snapshot(api, source.clone())
+            .await
+            .err()
+            .unwrap()
             .is::<EnrollmentChanged>()
     );
     let global = ConfigurationWriteScope::new(source, ConfigurationScope::Global).unwrap();

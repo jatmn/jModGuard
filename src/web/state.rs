@@ -38,6 +38,8 @@ impl ApiState {
             client_secret: cfg.web.oauth_client_secret.clone(),
             redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
             http,
+            #[cfg(test)]
+            guilds_endpoint: None,
         };
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;
