@@ -22,3 +22,34 @@ this repository — document those in your own ops environment.
 
 CI and image publication run on self-hosted Buildkite agents. Setup and manual
 builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
+
+## Dependency updates
+
+`.github/dependabot.yml` schedules weekly Cargo workspace and Dockerfile
+checks after it is merged to `main`. Cargo minor and patch version updates
+are grouped; major updates remain separate. Each ecosystem permits up to
+five open version-update PRs. Review and run the Buildkite checks before
+merging dependency updates.
+
+The `libsql-sqlite3-parser` Git patch is excluded from automatic updates:
+maintain its reviewed revision and security regression test manually.
+The vendored `tokio-tungstenite` compatibility patch also requires manual
+maintenance. Rust builder images are excluded because their versions must
+stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
+and the Buildkite agents. Docker checks cover the root `Dockerfile.*` files;
+they do not update image references embedded in the Buildkite pipeline.
+
+Dependabot supports private source repositories. The Cargo Git patch points
+back to this repository; it is not a GitHub Packages registry dependency.
+If a job reports private Git authentication failures, inspect its update log
+and the repository's Dependabot access settings. Do not put tokens in YAML.
+The separate GitHub Packages automatic-access feature requires granting the
+consuming repository Read access under the package's **Manage Actions access**
+settings; it does not provide credentials to Buildkite.
+
+Dependabot alerts and security updates are separate repository settings.
+Keep both enabled under **Settings → Advanced Security → Dependabot**;
+the weekly schedule controls version updates, not the timing of security
+fixes. Check update logs under **Insights → Dependency graph → Dependabot**
+after merging the configuration. These jobs generate PRs; application CI
+and image publication remain on Buildkite.

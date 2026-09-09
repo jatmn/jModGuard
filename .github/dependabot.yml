@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # This security patch lives at a reviewed revision on a separate branch
+    # of this repository. Replacing it requires manual regression testing.
+    ignore:
+      - dependency-name: libsql-sqlite3-parser
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Rust images must move together with rust-toolchain.toml, Cargo.toml,
+    # and the Buildkite agents; Dependabot cannot coordinate those pins.
+    ignore:
+      - dependency-name: rust
