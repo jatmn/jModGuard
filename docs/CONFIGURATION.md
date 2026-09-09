@@ -41,7 +41,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0008_action_enrollments.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0009_nickname_enrollments.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it
@@ -50,7 +50,7 @@ exits if that wait expires).
 | Table | Holds |
 |---|---|
 | `meta` | schema family/version support and durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
-| `nickname_reconcile` | generation-numbered nickname jobs with pending/dormant/terminal state, persisted retry schedule, attempt count, and last operator-visible error |
+| `nickname_reconcile` | request/membership-bound nickname jobs with captured nickname, pending/dormant/terminal state, persisted retries and last operator-visible error |
 | `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
 | `guild_settings` | prefix and bot nickname as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |
 | `rules` | the 7 automod rules (server + global rows) |

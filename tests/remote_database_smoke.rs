@@ -149,6 +149,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_action_storage(&bot, &api).await;
     exercise_membership_storage(&bot, &api).await;
     exercise_captured_action_membership(&bot, &api).await;
+    exercise_nickname_membership(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -331,4 +332,72 @@ async fn exercise_captured_action_membership(bot: &Db, api: &Db) {
     })
     .await
     .unwrap();
+}
+
+async fn exercise_nickname_membership(bot: &Db, api: &Db) {
+    use jmodguard::db::*;
+    enroll_guild(bot, 600, 100).await.unwrap();
+    test_drop_next_commit_response();
+    patch_settings(api, 600, None, Some(Some("first".into())), None)
+        .await
+        .unwrap();
+    let old = pending_nickname_reconciles(bot, 0, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    finish_nickname_reconcile(bot, &old, "dormant", "unknown_guild", "unknown", 1)
+        .await
+        .unwrap();
+    test_drop_next_commit_response();
+    enroll_guild(bot, 600, 100).await.unwrap();
+    let resumed = pending_nickname_reconciles(bot, 0, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(resumed.job_id, old.job_id);
+    assert!(resumed.generation > old.generation);
+    // Healthy repeats preserve the reviewed receipt-free observation behavior.
+    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_nickname_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END")).await.unwrap();
+    enroll_guild(bot, 600, 100).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_nickname_noop_receipt"))
+        .await
+        .unwrap();
+    test_drop_next_commit_response();
+    retire_guild_enrollment(bot, 600, 100).await.unwrap();
+    assert!(
+        !nickname_reconcile_can_dispatch(bot, &resumed)
+            .await
+            .unwrap()
+    );
+    enroll_guild(bot, 600, 101).await.unwrap();
+    assert!(
+        pending_nickname_reconciles(bot, i64::MAX, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    patch_settings(api, 600, None, Some(Some("new".into())), None)
+        .await
+        .unwrap();
+    let current = pending_nickname_reconciles(bot, 0, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    acknowledge_nickname_reconcile(bot, &resumed).await.unwrap();
+    schedule_nickname_reconcile_retry(bot, &resumed, 1, "late", "late")
+        .await
+        .unwrap();
+    assert!(
+        nickname_reconcile_can_dispatch(bot, &current)
+            .await
+            .unwrap()
+    );
+    test_drop_next_commit_response();
+    acknowledge_nickname_reconcile(bot, &current).await.unwrap();
+    assert!(
+        pending_nickname_reconciles(bot, i64::MAX, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

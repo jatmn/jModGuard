@@ -5,25 +5,26 @@ adds `guild_enrollments` to `jmodguard-core-1`: one row per observed guild conta
 random identity, the bot's join timestamp in nanoseconds, and active/inactive state.
 No member roster, message history, or per-user activity is collected by this feature.
 
-This observation plus queue-storage foundation is not a complete authorization or erasure
-boundary. Existing
-API permissions, direct Discord actions, settings and nickname reconciliation continue
-to operate independently of it. The administrative action queue remains inactive; its storage is now bound explicitly
-to membership (below). Nickname payloads still operate independently.
+Observations bind inactive administrative queue storage and the active nickname outbox.
+They are not a complete authorization or erasure boundary. API permissions, direct unban/
+log-channel actions and settings authorization keep their existing path. The administrative
+queue remains inactive; nickname dispatch adds its own fresh Discord verification below.
 
 ## Gateway observations
 
 The bot subscribes to the nonprivileged `GUILDS` intent in addition to its existing
 intents. Guild Create supplies a join timestamp. A matching active join keeps the same
-identity without writing another row or mutation receipt. A newer join replaces it;
+identity. Healthy repeats write no row or mutation receipt; a matching observation may
+resume a dormant nickname request bound to that exact membership. A newer join replaces it;
 older observations cannot replace a newer one. A retired join cannot be reactivated by
 an observation carrying that same timestamp.
 
 Guild Delete records retirement only when it represents a departure and Serenity supplies
 matching cached guild context with a usable join timestamp. Outage/unavailable events,
 missing context and unsupported IDs/timestamps do not retire a membership. Failures are
-logged and do not block the existing slash/nickname lifecycle paths permanently. Those
-paths keep their own existing lifecycle behavior; this wave does not fence their effects.
+logged; slash synchronization remains independent. Membership transitions invalidate
+nickname work atomically. There is no separate guild-only nickname departure/reactivation
+call that could affect a newer membership after stale or missing event context.
 
 The stored observation is not proof of current membership forever. Missed or contextless
 removals remain unresolved; cached delete context and reordered gateway/REST observations
@@ -39,8 +40,9 @@ own member record for each returned guild, sequentially. It records positive joi
 observations using the same monotonic primary transaction as gateway observations.
 
 The task retains only a pagination cursor and next-run time between steps. A matching
-observation writes no membership/config/nickname row or mutation receipt. No configuration
-version is bumped. There is no per-message work, new HTTP client, library or member cache.
+observation with no same-membership dormant nickname request writes no row or mutation
+receipt. Resuming a dormant request changes its generation/state with a recovery receipt,
+without changing membership identity or configuration version. There is no per-message work, new HTTP client, library or member cache.
 
 | Bot `[enrollment]` setting | Default | Environment override |
 |---|---:|---|
@@ -77,20 +79,46 @@ membership-aware. Captured-scope helpers reject a membership change between auth
 and the queue transaction. Direct log configuration changes preserve unresolved history
 from older memberships. See [the queue storage contract](BOT-ACTIONS.md).
 
-No queue worker or endpoint is enabled. Existing nickname and direct API Discord actions
-remain independent; this layer cannot recall a Discord request or establish full tenant
-isolation. Current membership observations still need live validation/reconciliation and
+No queue worker or endpoint is enabled. Direct API Discord actions remain independent;
+this layer cannot recall a Discord request or establish full tenant isolation. Current membership observations still need live validation/reconciliation and
 must not alone authorize an effect or erase data.
+
+## Nickname reconciliation
+
+Migration 0009 extends the existing one-row-per-guild nickname outbox. A settings save or
+explicit Re-sync captures a random request ID, effective nickname and active enrollment in
+the same transaction. No membership means a dormant unbound request. Pending reads join the
+active membership and return the captured payload; they do not recalculate it at dispatch.
+
+The bot checks the exact primary request, then fetches only its own Discord member record
+with the existing REST deadline. A mismatched join leaves the job dormant; an unavailable
+or invalid response schedules bounded retries without retiring the guild. After a matching
+response it checks the primary request again before editing. Retry/failure/acknowledgment
+compare request ID, enrollment, join, nickname, generation and attempt. Deleting a completed
+row and reusing generation1 therefore cannot let an old completion delete a new request.
+
+Retirement/replacement makes existing work dormant atomically. Neither a new join nor
+migration adopts old/unbound work or creates an initial nickname edit. Confirm the bot is
+present, then save its nickname or use **Re-sync Discord nickname** to submit fresh work.
+A reconnect/positive repair may resume only a dormant request in that same membership;
+terminal errors still need operator correction and a fresh request. Settings are retained.
+
+No new task, HTTP client, cache or library is added. The existing worker loads up to25 jobs
+and runs up to4 concurrently. Each dispatch adds one own-member read; stale jobs skip HTTP.
+Existing retry/deadline limits remain bootstrap implementation limits, not measured capacity.
+The checks cannot recall a Discord request after it is sent or guarantee atomicity between
+SQL and Discord. Run one bot worker; exclusive replica ownership and full captured settings/
+API scope remain unimplemented. This does not certify tenant isolation or automatic recovery.
 
 ## Schema and remaining work
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
-it does not infer membership from existing guild settings or old queue jobs. Versions
-1–6 in the recognized lineage can advance normally. Version-6 binaries reject version7
-on startup; rollback needs matching binaries and the pre-upgrade database backup.
+it does not infer membership from existing guild settings or old queue jobs. The current
+recognized lineage extends through migration0009. Version8 binaries reject version9;
+rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 
-Nickname enrollment binding, runtime queue integration, fresh user permission and bot membership checks around
+Runtime administrative queue integration, fresh user permission and bot membership checks around
 side effects, captured API transaction scope, stale browser context, case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that

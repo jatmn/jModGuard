@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0008. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0009. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -74,3 +74,12 @@ running work uncertain, and resolved/uncertain receipts remain. All existing set
 moderation data stay in place. Queue execution remains inactive. Deploy matched builds
 with bot migration first; version7 binaries reject version8, so use the matched pre-upgrade
 backup for rollback. See [membership-bound queue storage](BOT-ACTIONS.md#membership-bound-storage).
+
+## Nickname membership extension
+
+Migration 0009 captures request identity, membership and immutable nickname on new work.
+Existing nickname rows become dormant and remain unbound, even if an active membership
+already exists. They require a fresh settings save or Re-sync after membership observation;
+startup and rejoin never adopt them. Settings/moderation records remain intact. Deploy
+matched bot/API builds, bot first. Version8 binaries reject version9; rollback requires
+matching pre-upgrade backup and binaries. No live upgrade/restore automation is supplied.

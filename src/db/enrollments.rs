@@ -62,8 +62,26 @@ async fn observe_membership(
                 return Ok(None);
             }
             if *joined == joined_at_ns && present {
-                // Healthy reconnect/REST observation writes no row or mutation receipt.
-                tx.finish_read()?;
+                // Healthy observations are write-free; only a dormant request bound
+                // to this exact membership may be resumed after positive confirmation.
+                let dormant: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nickname_reconcile WHERE guild_id=?1
+                     AND enrollment_id=?2 AND state='dormant' AND job_id IS NOT NULL
+                     AND nickname IS NOT NULL)",
+                    params![guild, id.as_str()], |r| Ok(r.get(0)?),
+                )?;
+                if dormant {
+                    tx.ensure_mutation_receipt()?;
+                    tx.execute(
+                        "UPDATE nickname_reconcile SET generation=generation+1,state='pending',
+                         attempt_count=0,next_attempt_at=0,last_error_code=NULL,last_error=NULL,
+                         last_error_at=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND state='dormant'",
+                        params![guild, id.as_str()],
+                    )?;
+                    tx.commit()?;
+                } else {
+                    tx.finish_read()?;
+                }
                 return Ok(Some(GuildEnrollment {
                     guild_id: guild,
                     id: id.clone(),
@@ -82,6 +100,12 @@ async fn observe_membership(
         tx.execute(
             "UPDATE bot_actions SET state='uncertain',outcome='enrollment_ended'
              WHERE guild_id=?1 AND state='running'", params![guild],
+        )?;
+        tx.execute(
+            "UPDATE nickname_reconcile SET generation=generation+1,state='dormant',
+             next_attempt_at=0,last_error_code='enrollment_ended',
+             last_error='fresh nickname request required',last_error_at=unixepoch()
+             WHERE guild_id=?1 AND state!='dormant'", params![guild],
         )?;
         let id = format!("{:032x}", rand::random::<u128>());
         tx.execute(

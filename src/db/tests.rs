@@ -2132,6 +2132,7 @@ fn seeded_commands_publish_a_primary_registry_version() {
 fn nickname_outbox_generation_cannot_ack_a_newer_write() {
     let tmp = tmp_db_path("nickname_outbox_generation");
     let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 42, 100)).unwrap();
     tokio_test_block_on(patch_settings(
         &db,
         42,
@@ -2152,11 +2153,11 @@ fn nickname_outbox_generation_cannot_ack_a_newer_write() {
         None,
     ))
     .unwrap();
-    tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 1)).unwrap();
+    tokio_test_block_on(acknowledge_nickname_reconcile(&db, &first[0])).unwrap();
     let second = tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap();
     assert_eq!(second[0].nickname, "second");
     assert_eq!((second[0].guild_id, second[0].generation), (42, 2));
-    tokio_test_block_on(acknowledge_nickname_reconcile(&db, 42, 2)).unwrap();
+    tokio_test_block_on(acknowledge_nickname_reconcile(&db, &second[0])).unwrap();
     assert!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25))
             .unwrap()
@@ -2169,6 +2170,7 @@ fn nickname_outbox_generation_cannot_ack_a_newer_write() {
 fn nickname_reconcile_exists_before_settings_commit() {
     let tmp = tmp_db_path("nickname_outbox_precommit");
     let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 43, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 43)).unwrap();
     assert_eq!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap()[0].nickname,
@@ -2179,7 +2181,7 @@ fn nickname_reconcile_exists_before_settings_commit() {
 }
 
 #[test]
-fn nickname_outbox_migration_queues_existing_guild_nicknames() {
+fn nickname_outbox_migration_does_not_adopt_unbound_guild_nicknames() {
     let tmp = tmp_db_path("nickname_outbox_migration");
     let legacy = Connection::open(&tmp).unwrap();
     for (index, sql) in MIGRATIONS[..4].iter().enumerate() {
@@ -2209,14 +2211,18 @@ fn nickname_outbox_migration_queues_existing_guild_nicknames() {
     drop(legacy);
 
     let db = Db::open(&tmp, 2).unwrap();
-    let pending = tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25)).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 42, 100)).unwrap();
+    assert!(
+        tokio_test_block_on(pending_nickname_reconciles(&db, 0, 25))
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
-        pending
-            .iter()
-            .map(|job| (job.guild_id, job.nickname.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(42, "Legacy nickname")],
-        "migration must bridge pre-outbox guild-local nickname configuration"
+        tokio_test_block_on(nickname_reconcile_status(&db, 42))
+            .unwrap()
+            .unwrap()
+            .state,
+        "dormant"
     );
     cleanup_db(&tmp);
 }
@@ -2225,6 +2231,7 @@ fn nickname_outbox_migration_queues_existing_guild_nicknames() {
 fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
     let tmp = tmp_db_path("nickname_outbox_lifecycle");
     let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 44, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 44)).unwrap();
     let mut job = tokio_test_block_on(pending_nickname_reconciles(&db, 100, 25))
         .unwrap()
@@ -2263,7 +2270,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
             .is_empty(),
         "terminal work must not make another API attempt"
     );
-    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 44, false)).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 44, 100)).unwrap();
     assert_eq!(
         tokio_test_block_on(nickname_reconcile_status(&db, 44))
             .unwrap()
@@ -2273,46 +2280,43 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
         "a gateway reconnect must preserve an operator-actionable terminal failure"
     );
 
+    tokio_test_block_on(enroll_guild(&db, 45, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 45)).unwrap();
-    tokio_test_block_on(dormancy_nickname_reconcile(&db, 45, "departed")).unwrap();
+    tokio_test_block_on(retire_guild_enrollment(&db, 45, 100)).unwrap();
     assert!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
             .unwrap()
             .is_empty(),
         "departed guild work must remain dormant"
     );
-    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 45, false)).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 45, 101)).unwrap();
     assert_eq!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
             .unwrap()
             .len(),
-        1,
-        "guild_create must reactivate dormant work without resetting terminal rows"
+        0,
+        "rejoin must not reactivate work from a prior enrollment"
     );
 
-    tokio_test_block_on(activate_nickname_reconcile_for_guild_create(&db, 46, true)).unwrap();
+    tokio_test_block_on(enroll_guild(&db, 46, 100)).unwrap();
     assert_eq!(
         tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
             .unwrap()
             .iter()
             .filter(|job| job.guild_id == 46)
             .count(),
-        1,
-        "a genuine first guild join must create initial reconciliation work"
+        0,
+        "a first join needs no nickname mutation; Discord already starts without a nickname"
     );
 
+    tokio_test_block_on(enroll_guild(&db, 47, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 47)).unwrap();
     let in_flight = tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
         .unwrap()
         .into_iter()
         .find(|job| job.guild_id == 47)
         .unwrap();
-    tokio_test_block_on(dormancy_nickname_reconcile(
-        &db,
-        47,
-        "departed during request",
-    ))
-    .unwrap();
+    tokio_test_block_on(retire_guild_enrollment(&db, 47, 100)).unwrap();
     tokio_test_block_on(finish_nickname_reconcile(
         &db,
         &in_flight,
@@ -2322,12 +2326,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
         20_001,
     ))
     .unwrap();
-    tokio_test_block_on(acknowledge_nickname_reconcile(
-        &db,
-        in_flight.guild_id,
-        in_flight.generation,
-    ))
-    .unwrap();
+    tokio_test_block_on(acknowledge_nickname_reconcile(&db, &in_flight)).unwrap();
     assert_eq!(
         tokio_test_block_on(nickname_reconcile_status(&db, 47))
             .unwrap()
@@ -2337,6 +2336,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
         "late completion of an invalidated generation must not erase departure state"
     );
 
+    tokio_test_block_on(enroll_guild(&db, 48, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 48)).unwrap();
     let terminal = tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
         .unwrap()
@@ -2540,3 +2540,5 @@ mod action_queue;
 mod enrollments;
 
 mod action_enrollments;
+
+mod nickname_enrollments;

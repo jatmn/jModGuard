@@ -17,6 +17,7 @@ pub mod handlers;
 pub use jmodguard_runtime::health;
 pub mod ids;
 pub mod logging;
+pub mod nickname_worker;
 pub mod normalize;
 mod remote_https;
 pub mod state;
