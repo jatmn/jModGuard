@@ -129,22 +129,6 @@ impl EventHandler for Handler {
             app.retry_slash_registry_version();
         }
 
-        // Guild lifecycle is distinct from settings/explicit repair. A
-        // reconnect preserves terminal operator errors; dormant work is
-        // reactivated, and a genuinely new guild receives initial work.
-        if let Err(error) = db::activate_nickname_reconcile_for_guild_create(
-            &app.db,
-            gid.get() as i64,
-            is_new.unwrap_or(false),
-        )
-        .await
-        {
-            tracing::warn!(
-                guild_id = gid.get(),
-                "failed to queue nickname reconciliation on guild_create: {error:#}"
-            );
-        }
-
         if is_new.unwrap_or(false) {
             tracing::info!("joined new guild {gid} ({})", guild.name);
         }
@@ -166,21 +150,6 @@ impl EventHandler for Handler {
             tracing::warn!(
                 guild_id = incomplete.id.get(),
                 "guild retirement lacks confirmed membership or database access: {error:#}"
-            );
-        }
-        // `unavailable=true` is a temporary Discord outage, not a departure.
-        // A real removal remains dormant until guild_create reactivates it.
-        if !incomplete.unavailable
-            && let Err(error) = db::dormancy_nickname_reconcile(
-                &self.app().db,
-                incomplete.id.get() as i64,
-                "bot removed from guild",
-            )
-            .await
-        {
-            tracing::warn!(
-                guild_id = incomplete.id.get(),
-                "failed to mark nickname work dormant: {error:#}"
             );
         }
     }

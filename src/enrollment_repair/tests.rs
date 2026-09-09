@@ -179,7 +179,7 @@ async fn healthy_repair_does_not_write_enrollment_or_nickname_state() {
     let before = db::enroll_guild(&f.db, 10, 100).await.unwrap();
     db::request_nickname_reconcile(&f.db, 10).await.unwrap();
     f.db.with_conn(|conn| {
-        conn.execute("UPDATE nickname_reconcile SET state='dormant' WHERE guild_id=10",())?;
+        conn.execute("UPDATE nickname_reconcile SET state='terminal' WHERE guild_id=10",())?;
         conn.execute_batch("CREATE TRIGGER block_enrollment BEFORE UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'unexpected enrollment write'); END;
             CREATE TRIGGER block_nickname BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'unexpected nickname write'); END")
     }).await.unwrap();

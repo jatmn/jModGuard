@@ -47,10 +47,12 @@ Queue history is operational metadata, separate from retained moderation audit r
 The service-boundary guard rejects runtime queue consumers in this slice.
 
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
-bind inactive queue storage, while runtime API/nickname authority remains separate.
+bind inactive queue storage and the nickname outbox; API authorization remains separate.
 Positive repair must stay bounded, use the existing bot HTTP/identity, never fetch a
 member roster or infer removal from omissions/errors. Missing/outage Gateway context
-cannot retire an observation. Matching joins must write no rows/receipts or config versions.
+cannot retire an observation. Healthy matching joins write no rows/receipts; resuming a
+dormant request in that exact membership is a mutation with recovery receipts. No
+configuration version changes on observations.
 Only BotProcessConfig loads enrollment repair controls; API ignores their TOML/env values.
 
 Queue membership changes invalidate old work atomically. Preserve delayed receipt creation
@@ -195,15 +197,18 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   `EventRow` / `BadwordView` snowflake fields use the same string serde.
 - Bot nickname: WebUI empty field, `!setname` with no args / `clear` / `-`, and
   `/setname` with the optional `name` omitted all clear the Discord nickname and
-  persist `bot_name=""`. Settings and a generation-numbered outbox row commit
-  atomically; only the bot drains that row and mutates Discord. Transient failures
-  use persisted bounded backoff, permanent failures become terminal, and a real
-  guild departure makes the row dormant until rejoin. Generation-checked
-  acknowledgement makes the final committed value win across bot/API races.
-  Nicknames are deliberately guild-only; the WebUI does not offer a global
-  nickname override. `guild_create` uses a lifecycle-only transition: reconnects
-  preserve terminal failures, dormant work is reactivated, and a genuinely new
-  guild gets initial work (including an empty nickname).
+  persist `bot_name=""`. Settings and a nickname outbox row commit atomically with a
+  random request ID, captured nickname and current membership ID. Only the bot drains
+  it, checking the stored request before/after a bounded own-member Discord read.
+  Acknowledgment/retry/failure must match the complete request and active membership.
+  Never adopt old or unbound jobs on rejoin. A fresh save or explicit Re-sync submits
+  replacement work; missing enrollment leaves it dormant. Matching observations may
+  resume only same-membership dormant work, preserving terminal errors and healthy
+  no-op receipt behavior. Retirement/replacement invalidates jobs atomically; missing
+  Gateway context must not mutate jobs through a separate guild-only lifecycle helper.
+  No initial nickname edit is created on join. Nicknames remain guild-only. Final
+  DB checks cannot recall a Discord request already sent or coordinate multiple bot
+  replicas; writer leases and complete captured API scope remain later work.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.
@@ -262,6 +267,7 @@ src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)
 src/discord.rs          Discord REST helpers (nickname retries)
+src/nickname_worker.rs  membership/request-checked nickname dispatch
 crates/runtime/src/health.rs process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
@@ -273,7 +279,7 @@ src/handlers.rs         gateway events
 src/commands/           engine, behaviors, plans
 src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0008_action_enrollments
+migrations/             0001_init through 0009_nickname_enrollments
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

@@ -3,7 +3,8 @@
 The library has a queue for typed unban and log-channel requests. Neither service admits
 these requests, dispatches them, schedules cleanup or exposes them through HTTP/the WebUI.
 Existing unban and log-channel validation still run directly in the API using its bot
-token. The nickname outbox is separate and continues to operate as before.
+token. The nickname outbox remains a separate active path; see
+[nickname membership checks](ENROLLMENTS.md#nickname-reconciliation).
 
 ## Storage contract
 

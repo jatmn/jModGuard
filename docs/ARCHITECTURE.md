@@ -110,23 +110,27 @@ as authoritative. Non-reusable revision tokens also distinguish counters that
 return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers.
 
-Nickname changes commit a generation-numbered durable outbox row in the same
-settings transaction. The bot is the sole Discord nickname writer: it drains
-due work through primary-routed reads and acknowledges only the generation it
-applied. Transient Discord failures use persisted exponential backoff with
-jitter and a bounded retry budget. Permanent rejections become terminal,
-operator-visible rows; guild departure makes work dormant until `guild_create`
-reactivates it. Reconnects leave terminal failures untouched; only a settings
-change or explicit operator repair supersedes them. This makes the final
-committed nickname win across bot/API races and survives cancelled requests
-without rolling back durable settings.
+Nickname changes commit a durable outbox row in the settings transaction, capturing the
+nickname, random request ID and active membership. The bot drains primary-routed due work,
+checks the exact request, reads its own current Discord member record with a deadline, and
+checks the request again before editing. Retry, failure and acknowledgment match immutable
+request fields, attempt/generation and membership. Transient failures keep bounded backoff;
+permanent failures remain operator-visible. Membership changes invalidate work atomically.
+Only a confirmed matching membership can resume its own dormant request. New joins and
+migrated unbound jobs require a fresh save or Re-sync; no automatic initial nickname edit
+is issued. See [nickname reconciliation](ENROLLMENTS.md#nickname-reconciliation).
+
+These checks cannot recall an already-sent Discord edit or provide exclusive bot-replica
+ownership. Current settings/API authorization is unchanged; full captured API scope and
+writer coordination remain separate work. Use one bot worker for this implementation.
 
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0008. Migration 0006 adds inactive action storage and its replay floor.
+migrations 0001–0009. Migration 0006 adds inactive action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds inactive queue
-storage and captured queue scope to those observations; nickname binding remains pending.
+storage and captured queue scope to those observations. Migration 0009 binds nickname
+requests without adopting earlier work.
 Current unban/log-channel WebUI operations still follow their direct API path.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
@@ -159,7 +163,7 @@ src/web/state.rs           ApiState and config-version observation
 src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0008_action_enrollments
+migrations/                0001_init through 0009_nickname_enrollments
 Dockerfile.bot
 Dockerfile.api
 ```

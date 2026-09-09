@@ -117,8 +117,8 @@ older/retired joins. Repair reuses the Gateway HTTP client, stores no member ros
 has bot-only configurable page/deadline/pause controls, including a disable switch.
 Migration 0007 adds only this observation table. See [membership behavior](ENROLLMENTS.md).
 
-Queue activation and nickname/API enrollment fencing are not enabled here. Current API
-and nickname operations keep their existing path; missing observations do not disable them.
+This observation slice did not activate queue or nickname/API enrollment fencing.
+Subsequent nickname binding is described below; direct API actions remain as before.
 No data erasure, new dependency or tenant-isolation claim is part of this wave.
 
 ## Implemented: membership-bound action storage
@@ -131,8 +131,25 @@ Migration 0008 does not adopt old unbound jobs. Existing reviewed log-write sema
 replay cutoff and no-write membership observations are preserved.
 
 This still enables no HTTP queue route or worker. Discord permissions/membership must be
-checked around dispatch before activation; API token removal and nickname enrollment
-binding remain separate. See [the queue contract](BOT-ACTIONS.md#membership-bound-storage).
+checked around dispatch before activation; API token removal remains separate.
+Nickname enrollment binding is now implemented in its own path below. See [the queue contract](BOT-ACTIONS.md#membership-bound-storage).
+
+## Implemented: nickname request and membership checks
+
+The active nickname outbox captures a random request ID, nickname and observed membership
+in the settings transaction. Its worker checks the primary request before and after a
+bounded Discord own-member read. Stale attempt/completion results cannot update or remove
+replacement work. Membership transitions invalidate nickname work in the same transaction;
+matching observations resume only their own dormant request and preserve terminal failures.
+Healthy observation no-ops still create no mutation receipt. The previous unscoped Gateway
+nickname lifecycle calls are removed.
+
+Migration 0009 leaves old jobs dormant and unbound. New joins do not replay them or issue
+an initial nickname edit; save/re-sync after membership is observed. The existing WebUI
+explains that recovery path. This uses the current HTTP client, batch/concurrency limits
+and retry scheduling, with no dependency additions. It does not enable the administrative
+queue, remove API credentials or establish multi-replica exclusion/full tenant isolation.
+See [the lifecycle contract and limits](ENROLLMENTS.md#nickname-reconciliation).
 
 ## Next implementation slices
 
