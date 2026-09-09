@@ -25,19 +25,21 @@ builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
 
 ## Dependency updates
 
-`.github/dependabot.yml` schedules weekly Cargo workspace and Dockerfile
+`.github/dependabot.yml` schedules weekly Cargo workspace
 checks after it is merged to `main`. Cargo minor and patch version updates
-are grouped; major updates remain separate. Each ecosystem permits up to
+are grouped; major updates remain separate. Dependabot permits up to
 five open version-update PRs. Review and run the Buildkite checks before
 merging dependency updates.
 
 The `libsql-sqlite3-parser` Git patch is excluded from automatic updates:
 maintain its reviewed revision and security regression test manually.
 The vendored `tokio-tungstenite` compatibility patch also requires manual
-maintenance. Rust builder images are excluded because their versions must
+maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
-and the Buildkite agents. Docker checks cover the root `Dockerfile.*` files;
-they do not update image references embedded in the Buildkite pipeline.
+and the Buildkite agents. The runtime image uses the floating
+`debian:bookworm-slim` alias without a digest, which does not give Dependabot
+a version or digest to update. There is no Docker update job; this setup
+also does not update image references embedded in the Buildkite pipeline.
 
 Dependabot supports private source repositories. The Cargo Git patch points
 back to this repository; it is not a GitHub Packages registry dependency.
