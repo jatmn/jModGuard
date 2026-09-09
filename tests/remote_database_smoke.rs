@@ -150,6 +150,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_membership_storage(&bot, &api).await;
     exercise_captured_action_membership(&bot, &api).await;
     exercise_nickname_membership(&bot, &api).await;
+    exercise_configuration_scopes(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -399,5 +400,92 @@ async fn exercise_nickname_membership(bot: &Db, api: &Db) {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
+    use jmodguard::db::*;
+    let source = ConfigurationScope::Guild(enroll_guild(bot, 500, 100).await.unwrap().unwrap());
+    let destination =
+        ConfigurationScope::Guild(enroll_guild(bot, 501, 100).await.unwrap().unwrap());
+    test_drop_next_commit_response();
+    patch_enrolled_settings(
+        api,
+        source.clone(),
+        Some(Some("source".into())),
+        Some(Some("name".into())),
+        false,
+    )
+    .await
+    .unwrap();
+    // Empty patches still verify membership but must not insert recovery receipts.
+    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_config_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END")).await.unwrap();
+    let settings = patch_enrolled_settings(api, source.clone(), None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(settings.prefix, "source");
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_config_noop_receipt"))
+        .await
+        .unwrap();
+    let write = ConfigurationWriteScope::new(source.clone(), source.clone()).unwrap();
+    test_drop_next_commit_response();
+    let word = add_enrolled_badword(api, write, "scope-sentinel", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_badwords(api, 500)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.id == word)
+            .count(),
+        1
+    );
+    test_drop_next_commit_response();
+    copy_enrolled_guild_config(
+        api,
+        source.clone(),
+        destination.clone(),
+        vec!["settings".into(), "badwords".into()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        get_settings_primary(api, 501).await.unwrap().prefix,
+        "source"
+    );
+    let jobs = pending_nickname_reconciles(bot, 0, 25).await.unwrap();
+    assert!(
+        jobs.iter()
+            .any(|job| job.guild_id == 501 && job.nickname == "name")
+    );
+    retire_guild_enrollment(bot, 500, 100).await.unwrap();
+    enroll_guild(bot, 500, 101).await.unwrap();
+    let before = get_primary_versions(bot).await.unwrap();
+    assert!(
+        patch_enrolled_settings(api, source.clone(), None, None, false)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    assert!(
+        copy_enrolled_guild_config(api, source.clone(), destination, vec!["all".into()])
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    let global = ConfigurationWriteScope::new(source, ConfigurationScope::Global).unwrap();
+    assert!(
+        upsert_enrolled_template(api, global, "scope-sentinel", "rejected")
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+    let after = get_primary_versions(bot).await.unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
+    assert_eq!(before.slash_revision, after.slash_revision);
+    assert_eq!(
+        get_settings_primary(api, 501).await.unwrap().prefix,
+        "source"
     );
 }

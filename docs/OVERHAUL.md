@@ -151,6 +151,18 @@ and retry scheduling, with no dependency additions. It does not enable the admin
 queue, remove API credentials or establish multi-replica exclusion/full tenant isolation.
 See [the lifecycle contract and limits](ENROLLMENTS.md#nickname-reconciliation).
 
+## Implemented: captured configuration data operations
+
+The data layer adds settings/copy and configuration CRUD variants that verify captured
+membership within their primary transaction. Copies check both endpoints; writes targeting
+global configuration from a guild page retain the original guild membership check. Empty
+settings patches cannot bypass verification or create recovery receipts. Existing settings,
+nickname, checksum, validation and version behavior shares the same implementation.
+
+This groundwork adds no runtime consumer, new schema or dependency. Current API and bot
+callers remain independently usable; complete admission/browser scope integration follows.
+See [captured configuration scopes](CONFIGURATION-SCOPES.md).
+
 ## Next implementation slices
 
 1. Complete credential separation. Replace API bot-token operations with typed,

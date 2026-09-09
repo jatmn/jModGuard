@@ -61,9 +61,9 @@ async fn upsert_row<T: Serialize + Send + 'static>(
     table: &'static str,
     key_cols: &'static str,
     key_params: Vec<Value>,
-    data_col: &'static str,
     data: T,
     bump_slash_registry: bool,
+    expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     let json = serde_json::to_string(&data)?;
     db.with_conn(move |conn| {
@@ -75,10 +75,13 @@ async fn upsert_row<T: Serialize + Send + 'static>(
             .join(", ");
         let n = key_params.len() + 1;
         let tx = conn.transaction_immediate()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         tx.execute(
             &format!(
-                "INSERT INTO {table} ({key_cols}, {data_col}) VALUES ({keys}, ?{n})
-                 ON CONFLICT({key_cols}) DO UPDATE SET {data_col} = excluded.{data_col}"
+                "INSERT INTO {table} ({key_cols}, data) VALUES ({keys}, ?{n})
+                 ON CONFLICT({key_cols}) DO UPDATE SET data = excluded.data"
             ),
             params_from_iter(key_params.into_iter().chain(std::iter::once(json.into()))),
         )?;
@@ -98,6 +101,7 @@ async fn delete_row(
     key_cols: &'static str,
     key_params: Vec<Value>,
     bump_slash_registry: bool,
+    expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     db.with_conn(move |conn| {
         let keys = key_params
@@ -107,6 +111,9 @@ async fn delete_row(
             .collect::<Vec<_>>()
             .join(", ");
         let tx = conn.transaction_immediate()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         let n = tx.execute(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
             params_from_iter(key_params),
@@ -143,9 +150,9 @@ pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) 
         "rules",
         "guild_id, rule_id",
         vec![guild_id.into(), rule_id.to_string().into()],
-        "data",
         rule.clone(),
         false,
+        None,
     )
     .await
 }
@@ -157,6 +164,7 @@ pub async fn delete_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<()> {
         "guild_id, rule_id",
         vec![guild_id.into(), rule_id.to_string().into()],
         false,
+        None,
     )
     .await
 }
@@ -181,9 +189,9 @@ pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef
         "commands",
         "guild_id, name",
         vec![guild_id.into(), name.to_string().into()],
-        "data",
         cmd.clone(),
         true,
+        None,
     )
     .await
 }
@@ -195,6 +203,7 @@ pub async fn delete_command(db: &Db, guild_id: i64, name: &str) -> Result<()> {
         "guild_id, name",
         vec![guild_id.into(), name.to_string().into()],
         true,
+        None,
     )
     .await
 }
@@ -220,9 +229,22 @@ pub async fn list_templates(db: &Db, guild_id: i64) -> Result<Vec<(String, Strin
 }
 
 pub async fn upsert_template(db: &Db, guild_id: i64, event: &str, template: &str) -> Result<()> {
+    upsert_template_inner(db, guild_id, event, template, None).await
+}
+
+async fn upsert_template_inner(
+    db: &Db,
+    guild_id: i64,
+    event: &str,
+    template: &str,
+    expected: Option<ConfigurationWriteScope>,
+) -> Result<()> {
     let (event, template) = (event.to_string(), template.to_string());
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         tx.execute(
             "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET template = excluded.template",
@@ -242,6 +264,7 @@ pub async fn delete_template(db: &Db, guild_id: i64, event: &str) -> Result<()> 
         "guild_id, event_type",
         vec![guild_id.into(), event.to_string().into()],
         false,
+        None,
     )
     .await
 }
@@ -412,11 +435,24 @@ pub async fn list_badwords(db: &Db, guild_id: i64) -> Result<Vec<Badword>> {
 }
 
 pub async fn add_badword(db: &Db, guild_id: i64, pattern: &str, note: Option<&str>) -> Result<i64> {
+    add_badword_inner(db, guild_id, pattern, note, None).await
+}
+
+async fn add_badword_inner(
+    db: &Db,
+    guild_id: i64,
+    pattern: &str,
+    note: Option<&str>,
+    expected: Option<ConfigurationWriteScope>,
+) -> Result<i64> {
     // Single gate for every writer (API, future commands) — reject before INSERT.
     crate::normalize::compile_user_regex(pattern).map_err(|e| anyhow::anyhow!(e))?;
     let (pattern, note) = (pattern.to_string(), note.map(|s| s.to_string()));
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         tx.execute(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
             params![guild_id, pattern, note],
@@ -458,8 +494,20 @@ pub async fn get_badword_primary(db: &Db, id: i64) -> Result<Option<Badword>> {
 /// Callers that want to delete a global row must pass `GLOBAL_SCOPE` and
 /// enforce owner auth at the API layer.
 pub async fn delete_badword(db: &Db, id: i64, guild_id: i64) -> Result<()> {
+    delete_badword_inner(db, id, guild_id, None).await
+}
+
+async fn delete_badword_inner(
+    db: &Db,
+    id: i64,
+    guild_id: i64,
+    expected: Option<ConfigurationWriteScope>,
+) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
         let n = tx.execute(
             "DELETE FROM badwords WHERE id = ?1 AND guild_id = ?2",
             params![id, guild_id],
@@ -556,10 +604,42 @@ pub async fn copy_guild_config(
     dst: i64,
     sections: Vec<String>,
 ) -> Result<CopyResult> {
+    copy_guild_config_inner(db, src, dst, sections, None).await
+}
+
+/// Both scopes are checked inside the same primary write transaction as the copy.
+pub async fn copy_enrolled_guild_config(
+    db: &Db,
+    source: ConfigurationScope,
+    destination: ConfigurationScope,
+    sections: Vec<String>,
+) -> Result<CopyResult> {
+    copy_guild_config_inner(
+        db,
+        source.guild_id(),
+        destination.guild_id(),
+        sections,
+        Some((source, destination)),
+    )
+    .await
+}
+
+async fn copy_guild_config_inner(
+    db: &Db,
+    src: i64,
+    dst: i64,
+    sections: Vec<String>,
+    expected: Option<(ConfigurationScope, ConfigurationScope)>,
+) -> Result<CopyResult> {
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
         let tx = conn.transaction_immediate()?;
+        if let Some((source, destination)) = &expected {
+            source.verify_conn(&tx)?;
+            destination.verify_conn(&tx)?;
+        }
+
         let defaults = terminal_defaults_conn(&tx)?;
         // Always re-validate in the same primary snapshot as the write.
         validate_copy_sections(src, dst, &sections)?;
@@ -1038,4 +1118,104 @@ pub async fn load_slash_commands_with_version_primary(
         Ok((versions.slash, versions.slash_revision, commands))
     })
     .await
+}
+
+// Captured-scope entry points for future dashboard integration. Check inside each mutation.
+pub async fn upsert_enrolled_rule(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    upsert_row(
+        db,
+        "rules",
+        "guild_id, rule_id",
+        vec![scope.guild_id().into(), id.to_owned().into()],
+        rule.clone(),
+        false,
+        Some(scope),
+    )
+    .await
+}
+pub async fn delete_enrolled_rule(db: &Db, scope: ConfigurationWriteScope, id: &str) -> Result<()> {
+    delete_row(
+        db,
+        "rules",
+        "guild_id, rule_id",
+        vec![scope.guild_id().into(), id.to_owned().into()],
+        false,
+        Some(scope),
+    )
+    .await
+}
+pub async fn upsert_enrolled_command(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    name: &str,
+    command: &CommandDef,
+) -> Result<()> {
+    upsert_row(
+        db,
+        "commands",
+        "guild_id, name",
+        vec![scope.guild_id().into(), name.to_owned().into()],
+        command.clone(),
+        true,
+        Some(scope),
+    )
+    .await
+}
+pub async fn delete_enrolled_command(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    name: &str,
+) -> Result<()> {
+    delete_row(
+        db,
+        "commands",
+        "guild_id, name",
+        vec![scope.guild_id().into(), name.to_owned().into()],
+        true,
+        Some(scope),
+    )
+    .await
+}
+pub async fn upsert_enrolled_template(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    event: &str,
+    template: &str,
+) -> Result<()> {
+    upsert_template_inner(db, scope.guild_id(), event, template, Some(scope)).await
+}
+pub async fn delete_enrolled_template(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    event: &str,
+) -> Result<()> {
+    delete_row(
+        db,
+        "templates",
+        "guild_id, event_type",
+        vec![scope.guild_id().into(), event.to_owned().into()],
+        false,
+        Some(scope),
+    )
+    .await
+}
+pub async fn add_enrolled_badword(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    pattern: &str,
+    note: Option<&str>,
+) -> Result<i64> {
+    add_badword_inner(db, scope.guild_id(), pattern, note, Some(scope)).await
+}
+pub async fn delete_enrolled_badword(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: i64,
+) -> Result<()> {
+    delete_badword_inner(db, id, scope.guild_id(), Some(scope)).await
 }

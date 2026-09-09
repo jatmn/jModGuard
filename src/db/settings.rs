@@ -229,6 +229,47 @@ pub async fn patch_settings_with_nickname_reconcile(
     retention_days: crate::types::SettingsPatchField<u32>,
     reconcile_nickname: bool,
 ) -> Result<GuildSettings> {
+    patch_settings_inner(
+        db,
+        guild_id,
+        prefix,
+        bot_name,
+        retention_days,
+        reconcile_nickname,
+        None,
+    )
+    .await
+}
+
+/// Dashboard writes retain the exact membership authorized before this transaction.
+pub async fn patch_enrolled_settings(
+    db: &Db,
+    scope: ConfigurationScope,
+    prefix: crate::types::SettingsPatchField<String>,
+    bot_name: crate::types::SettingsPatchField<String>,
+    reconcile_nickname: bool,
+) -> Result<GuildSettings> {
+    patch_settings_inner(
+        db,
+        scope.guild_id(),
+        prefix,
+        bot_name,
+        None,
+        reconcile_nickname,
+        Some(scope),
+    )
+    .await
+}
+
+async fn patch_settings_inner(
+    db: &Db,
+    guild_id: i64,
+    prefix: crate::types::SettingsPatchField<String>,
+    bot_name: crate::types::SettingsPatchField<String>,
+    retention_days: crate::types::SettingsPatchField<u32>,
+    reconcile_nickname: bool,
+    expected: Option<ConfigurationScope>,
+) -> Result<GuildSettings> {
     if let Some(Some(nickname)) = &bot_name {
         validate_discord_nickname(nickname)?;
     }
@@ -251,14 +292,25 @@ pub async fn patch_settings_with_nickname_reconcile(
     }
     // No-op patch: return current effective settings without bumping versions.
     let settings_changed = prefix.is_some() || bot_name.is_some() || retention_days.is_some();
-    if !settings_changed && !reconcile_nickname {
+    if !settings_changed && !reconcile_nickname && expected.is_none() {
         return get_settings(db, guild_id).await;
     }
     let nickname_changed = (bot_name.is_some() || reconcile_nickname) && guild_id != GLOBAL_SCOPE;
     let write_guard = Arc::clone(&db.settings_write_lock).lock_owned().await;
     db.with_conn(move |conn| {
         let _write_guard = write_guard;
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
+        if let Some(scope) = &expected {
+            scope.verify_conn(&tx)?;
+        }
+        if !settings_changed && !reconcile_nickname {
+            let defaults = terminal_defaults_conn(&tx)?;
+            let settings = effective_settings_conn(&tx, guild_id, &defaults)?;
+            tx.finish_read()?;
+            return Ok(settings);
+        }
+
+        tx.ensure_mutation_receipt()?;
         let defaults = terminal_defaults_conn(&tx)?;
         let parent = parent_settings_conn(&tx, guild_id, &defaults)?;
         let mut ov = read_settings_override_conn(&tx, guild_id)?.unwrap_or_default();
