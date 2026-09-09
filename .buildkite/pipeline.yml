@@ -4,6 +4,10 @@ agents:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Non-secret GHCR login name. There is no Pipeline Settings → Environment page;
+  # Buildkite applies this top-level env to uploaded jobs.
+  # https://buildkite.com/docs/pipelines/configure/environment-variables
+  GHCR_USERNAME: jatmn
   # Bound compiler memory on self-hosted runners. CI checks need assertions,
   # not full debugger symbols or incremental state discarded by git clean.
   CARGO_BUILD_JOBS: "1"
@@ -13,6 +17,7 @@ env:
 
 steps:
   - label: "test"
+    key: test
     timeout_in_minutes: 30
     command: |
       set -eu
@@ -35,6 +40,7 @@ steps:
           ;;
       esac
       cargo fetch --locked
+      python3 .buildkite/publish-image-test.py
       cargo test --locked --workspace
       cargo test --locked --no-default-features --lib
       cargo clippy --locked --bins -- -D warnings
@@ -53,6 +59,7 @@ steps:
       cargo build --locked --bin jmodguard-api --no-default-features --features web
 
   - label: "remote-database"
+    key: remote-database
     timeout_in_minutes: 30
     command: |
       set -euo pipefail
@@ -98,3 +105,38 @@ steps:
         exit 1
       fi
       cargo test --locked --test remote_database_smoke -- --ignored --nocapture
+
+  # Match publish-image.py request() success paths, except UI/API with
+  # JMODGUARD_PUBLISH_SOURCE is scheduled even off main / with a tag so Python
+  # can fail an invalid manual instead of a green skip of an attempted publish.
+  - label: "prepare image publication"
+    key: prepare-images
+    depends_on: [test, remote-database]
+    if: &publish_if
+      build.pull_request.id == null && (
+        (build.source == "webhook" && build.tag != null) ||
+        (build.source == "webhook" && build.branch == "main" && build.tag == null &&
+          (build.env("BUILDKITE_GITHUB_EVENT") == null || build.env("BUILDKITE_GITHUB_EVENT") == "push")) ||
+        ((build.source == "ui" || build.source == "api") &&
+          build.env("JMODGUARD_PUBLISH_SOURCE") != null && build.env("JMODGUARD_PUBLISH_SOURCE") != "")
+      )
+    timeout_in_minutes: 5
+    command: python3 .buildkite/publish-image.py prepare
+
+  - label: "publish bot image"
+    key: publish-bot
+    depends_on: prepare-images
+    if: *publish_if
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-bot
+    timeout_in_minutes: 45
+    command: python3 .buildkite/publish-image.py bot
+
+  - label: "publish api image"
+    key: publish-api
+    depends_on: prepare-images
+    if: *publish_if
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-api
+    timeout_in_minutes: 45
+    command: python3 .buildkite/publish-image.py api

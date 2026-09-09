@@ -134,16 +134,25 @@ these files.
 
 ## 3. Build and publish both images
 
-GHCR has two publish styles:
+Buildkite's self-hosted `linux` queue runs tests and publishes the bot/API
+images after both test jobs pass. This repository has no GitHub Actions jobs
+or runner fallback. GitHub still displays the Buildkite status and a link to
+its build logs. See [Buildkite setup](BUILDKITE.md) for GHCR credentials,
+agent requirements, tag builds and manual publication.
 
-- **`images` workflow** (a GitHub Release, or Run workflow with a tag or
-  full SHA): builds **both** images. It still rejects branch names.
-- **Path-filtered workflows on `main`**: `Publish bot image`, `Publish
-  database image` (bot image, because the bot applies SQL), and `Publish
-  API image`. These run only on push to `main` (no manual dispatch, so a
-  feature branch cannot retag `:latest`). A CSS-only change does not
-  build either container. Manual publishes still use the `images`
-  workflow with a tag or full SHA.
+- **Push to `main`**: each component compares its Docker inputs with its last
+  published source revision by inspecting public GHCR history before fetching GHCR push credentials. Unchanged inputs (including frontend-only changes)
+  skip the image build. Private packages still require registry access and may rebuild. Both Dockerfiles consume shared Rust source and migrations,
+  so those changes can rebuild both images, once each. Missing revision/history
+  information conservatively causes a rebuild.
+- **Tag build**: when Buildkite's **Build tags** setting is enabled, a pushed tag
+  publishes both images after tests. This replaces the GitHub Release trigger;
+  publishing a GitHub Release alone does not create an additional image build.
+- **Manual publication**: start a Buildkite build on current `main` with
+  `JMODGUARD_PUBLISH_SOURCE` set to a full lowercase 40-character commit SHA or
+  `refs/tags/<tag>`. A single preparation job resolves that source for both
+  images. Plain branch names and abbreviated SHAs are rejected. A manual build
+  without this variable runs tests only. PR builds never publish.
 
 There is nothing for Magic Containers to pull until one of those publishes.
 Each run retags `:latest` for **that** package and retains older versions.
@@ -158,11 +167,11 @@ ghcr.io/jatmn/jmodguard-bot:latest
 ghcr.io/jatmn/jmodguard-api:latest
 ```
 
-The same digest is also tagged with the release name (for example `v1.2.3`).
-A manual run tags the digest with the peeled commit SHA and, if
-`source_ref` was a Git tag, that tag with `/` replaced by `-`
-(`release/2025` → `release-2025`). Tags are resolved to a commit SHA
-before checkout so a force-moved tag cannot change what gets compiled.
+A tag build also tags the digest with the tag name (for example `v1.2.3`).
+A manual tag source adds that tag too, with `/` and `+` replaced by `-`
+(`release/2025` → `release-2025`). An invalid Docker tag omits only the extra
+tag; `latest` and the full SHA are still published. Both components use one
+resolved source SHA, so moving a tag between jobs cannot split their sources.
 Publishing does not prune older GHCR versions. Retain the currently approved
 and rollback digests before building a candidate. Any later manual cleanup must
 consult deployment inventories; the public source cannot know which private
@@ -179,9 +188,9 @@ and verify rollout.
 The Bunny API image is JSON + OAuth only. It does not embed `frontend/`.
 A default local API build still can (`embed-ui`).
 
-Magic Containers trusts public GHCR. The `images` workflow tries to mark
-those packages public after the first push. If that is denied, set
-visibility on
+Magic Containers trusts public GHCR. Set each image package public in GitHub
+if it is not already public; publishing does not change package visibility.
+Use
 `https://github.com/jatmn/jModGuard/pkgs/container/jmodguard-bot` and
 `.../jmodguard-api`. If you keep them private, add a GitHub registry PAT
 in Magic Containers.
