@@ -936,3 +936,67 @@ async fn action_requests_require_ids_reject_forged_authority_and_report_expiry()
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn moderation_pages_require_loaded_membership_and_current_permissions() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let old = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    db::insert_event(
+        &f.app.db,
+        10,
+        "member_ban",
+        Some(123),
+        None,
+        &serde_json::json!({"reason":"fixture"}),
+    )
+    .await
+    .unwrap();
+    db::record_ban(&f.app.db, 10, 123, None, "fixture")
+        .await
+        .unwrap();
+    for path in ["events?user=123&limit=1", "bans?limit=1", "stats"] {
+        let path = format!("/api/guilds/10/{path}");
+        let (status, body) = f.request_token("GET", &path, "", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "guild_enrollment_changed");
+        assert_eq!(
+            f.request_token("GET", &path, "", Some(&old.id)).await.0,
+            StatusCode::OK
+        );
+    }
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    for route in ["events", "bans", "stats"] {
+        let path = format!("/api/guilds/10/{route}");
+        let (status, body) = f.request_token("GET", &path, "", Some(&old.id)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "guild_enrollment_changed");
+        assert_eq!(f.request("GET", &path, "").await.0, StatusCode::OK);
+        assert_eq!(
+            f.request("GET", &format!("/api/guilds/0/{route}"), "")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    f.discord.guilds.lock().unwrap().clear();
+    for route in ["events", "bans", "stats"] {
+        assert_eq!(
+            f.request("GET", &format!("/api/guilds/10/{route}"), "")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn moderation_event_user_filter_rejects_ids_outside_database_range() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let (status, body) = f
+        .request("GET", "/api/guilds/10/events?user=18446744073709551615", "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid user id");
+}

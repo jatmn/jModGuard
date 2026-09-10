@@ -589,3 +589,19 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   await refresh.listeners.click({});
   assert.equal(calls.length,4);
 });
+
+test('moderation reads send the loaded page membership including query-string routes', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
+  h.app.state.config = { enrollment_id: 'page-membership' };
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats']) {
+    await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
+    assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
+  }
+  await h.app.api('/api/guilds/987654321098765433/stats');
+  assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
+  h.app.state.config = null;
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/stats`);
+  assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
+  assert.equal(calls.length, 5, 'reads must not silently load a new membership');
+});

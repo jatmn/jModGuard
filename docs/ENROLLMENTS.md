@@ -129,7 +129,9 @@ recognized lineage extends through migration0009. Version8 binaries reject versi
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 
-Remaining data-read transaction scopes, case/evidence isolation,
+[Moderation event, ban and statistics reads](MODERATION-READS.md) now retain captured
+membership through their primary snapshot and require the loaded page token.
+Remaining individual configuration read scopes, case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that
 purge design. Local tests do not certify tenant isolation or Discord/Bunny behavior.

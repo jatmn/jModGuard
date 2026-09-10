@@ -2544,3 +2544,5 @@ mod action_enrollments;
 mod nickname_enrollments;
 
 mod configuration_enrollments;
+
+mod moderation_enrollments;

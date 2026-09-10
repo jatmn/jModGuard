@@ -48,6 +48,11 @@ def main():
         if path.name != "enrollment_tests.rs" and forbidden_api.search(path.read_text()):
             raise SystemExit(f"Unscoped queue access or worker operation in API: {path}")
     print("API captured admission and bot dispatch boundaries pass")
+    unscoped_moderation = re.compile(r"\b(?:query_events|list_bans|guild_stats)\s*\(")
+    for path in api_paths:
+        if path.name != "enrollment_tests.rs" and unscoped_moderation.search(path.read_text()):
+            raise SystemExit(f"Unscoped moderation read in API: {path}")
+    print("API moderation reads retain captured membership")
 
     # Captured configuration primitives are not API authorization on their own.
     # DB/API adoption includes admission and browser tokens; bot paths remain separate.

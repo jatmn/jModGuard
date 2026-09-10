@@ -232,7 +232,19 @@ whole workspace; old root web-feature commands must switch to documented package
 Binary names, environment/TOML, schema, API/browser contracts and one-bot/one-API topology
 are unchanged. No live provider or resource measurement is established by these builds.
 
+## Implemented: membership-bound moderation reads
+
+Audit events, ban history and statistics require fresh guild permissions and loaded page
+membership, then verify that captured membership alongside data in one primary snapshot.
+Empty reads cannot bypass the check; all statistics counts share that snapshot. Shared SQL
+preserves filters, limits, ordering and wire values. No schema, dependency, cache or polling
+is added. Reads create no mutation receipts or version changes. Matching API/frontend builds
+are required. See [the contract and limits](MODERATION-READS.md).
+
 ## Next implementation slices
+
+First complete captured snapshots for individual configuration GET reads (rules, badwords,
+commands, templates and log channels), preserving global/inherited visibility semantics.
 
 1. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient

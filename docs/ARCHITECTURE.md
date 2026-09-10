@@ -138,8 +138,9 @@ the primary write transaction, including both sides of a copy and the guild cont
 global edit. Empty scoped settings patches verify before reading. These library operations
 are used by the API after fresh user permission and primary membership admission; see
 [configuration scopes](CONFIGURATION-SCOPES.md) for page/source tokens and stale-edit behavior.
-The configuration snapshot verifies membership alongside the data. Other data reads
-still need complete scoped transaction boundaries; queued actions use captured membership. The schema is unchanged.
+The configuration snapshot and [moderation reads](MODERATION-READS.md) verify membership
+alongside their data. Individual configuration GET reads still need captured transaction
+boundaries; queued actions use captured membership. The schema is unchanged.
 
 ## Migrations
 
