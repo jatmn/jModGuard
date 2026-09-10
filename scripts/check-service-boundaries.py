@@ -54,6 +54,15 @@ def main():
             raise SystemExit(f"Unscoped moderation read in API: {path}")
     print("API moderation reads retain captured membership")
 
+    for path in api_paths:
+        if path.name == "enrollment_tests.rs":
+            continue
+        # Handler names intentionally match some DB operation names; inspect qualified DB references.
+        source = path.read_text()
+        if re.search(r"\bdb::(?:get_rule|list_rules|list_badwords|list_commands|get_command_row|list_templates|get_template_row|list_log_channels|load_web_config_snapshot)\b", source):
+            raise SystemExit(f"Unscoped configuration read in API: {path}")
+    print("API configuration reads retain captured membership")
+
     # Captured configuration primitives are not API authorization on their own.
     # DB/API adoption includes admission and browser tokens; bot paths remain separate.
     scoped_config = re.compile(r"\b(?:ConfigurationScope|ConfigurationWriteScope|patch_enrolled_settings|copy_enrolled_guild_config|(?:upsert|delete)_enrolled_(?:rule|command|template)|(?:add|delete)_enrolled_badword)\b")

@@ -153,6 +153,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
     exercise_moderation_scopes(&bot, &api).await;
+    exercise_configuration_reads(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -655,4 +656,80 @@ async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
     }
     // Historical guild rows remain; membership checks are not a purge mechanism.
     assert_eq!(enrolled_guild_stats(api, current).await.unwrap().events, 1);
+}
+
+async fn exercise_configuration_reads(bot: &Db, api: &Db) {
+    use jmodguard::db::*;
+    let original = enroll_guild(bot, 460, 100).await.unwrap().unwrap();
+    let scope = ConfigurationScope::Guild(original.clone());
+    for (guild, text) in [(0, "global read"), (460, "guild read")] {
+        upsert_template(bot, guild, "read-scope", text)
+            .await
+            .unwrap();
+        let mut cmd = jmodguard::defaults::default_commands()[0].clone();
+        cmd.name = "read-scope".into();
+        cmd.description = text.into();
+        upsert_command(bot, guild, "read-scope", &cmd)
+            .await
+            .unwrap();
+    }
+    let before = get_config_version(api).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_individual_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    for captured in [scope.clone(), ConfigurationScope::Global] {
+        let pair = get_enrolled_template(api, captured.clone(), "read-scope")
+            .await
+            .unwrap();
+        assert_eq!(pair.global.as_deref(), Some("global read"));
+        assert_eq!(
+            pair.guild.as_deref(),
+            Some(if captured.guild_id() == 0 {
+                "global read"
+            } else {
+                "guild read"
+            })
+        );
+        let commands = list_enrolled_commands(api, captured.clone()).await.unwrap();
+        assert!(
+            commands
+                .global
+                .iter()
+                .any(|(name, cmd)| name == "read-scope" && cmd.description == "global read")
+        );
+        get_enrolled_command(api, captured.clone(), "read-scope")
+            .await
+            .unwrap();
+        get_enrolled_rule(api, captured.clone(), "absent")
+            .await
+            .unwrap();
+        list_enrolled_templates(api, captured.clone())
+            .await
+            .unwrap();
+        list_enrolled_badwords(api, captured.clone()).await.unwrap();
+        list_enrolled_log_channels(api, captured).await.unwrap();
+    }
+    assert_eq!(get_config_version(api).await.unwrap(), before);
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_individual_read_receipt"))
+        .await
+        .unwrap();
+    retire_guild_enrollment(bot, 460, 100).await.unwrap();
+    enroll_guild(bot, 460, 101).await.unwrap();
+    for result in [
+        get_enrolled_rule(api, scope.clone(), "absent")
+            .await
+            .map(|_| ()),
+        get_enrolled_command(api, scope.clone(), "absent")
+            .await
+            .map(|_| ()),
+        list_enrolled_commands(api, scope.clone()).await.map(|_| ()),
+        get_enrolled_template(api, scope.clone(), "read-scope")
+            .await
+            .map(|_| ()),
+        list_enrolled_templates(api, scope.clone())
+            .await
+            .map(|_| ()),
+        list_enrolled_badwords(api, scope.clone()).await.map(|_| ()),
+        list_enrolled_log_channels(api, scope).await.map(|_| ()),
+    ] {
+        assert!(result.unwrap_err().is::<EnrollmentChanged>());
+    }
 }

@@ -40,7 +40,8 @@ installation. After rejoin, a newly authorized page can still read the guild's r
 Guild erasure, case/evidence isolation, tenant routing, database credential separation and
 missed Discord departure reconciliation remain separate work. Discord permission checks and
 SQL are not one transaction. The main configuration bundle already has a captured snapshot;
-individual rule, badword, command, template and log-channel GET reads still need that boundary.
+individual rule, badword, command, template and log-channel GET reads now also have
+[captured snapshots](CONFIGURATION-SCOPES.md#individual-configuration-reads).
 
 Local tests cover permission loss, old/missing page tokens, forged/stale scopes, waiting for
 a membership-changing writer, empty reads, unavailable membership storage, guild isolation,

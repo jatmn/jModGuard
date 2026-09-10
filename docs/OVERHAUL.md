@@ -241,10 +241,17 @@ preserves filters, limits, ordering and wire values. No schema, dependency, cach
 is added. Reads create no mutation receipts or version changes. Matching API/frontend builds
 are required. See [the contract and limits](MODERATION-READS.md).
 
-## Next implementation slices
+## Implemented: individual configuration read snapshots
 
-First complete captured snapshots for individual configuration GET reads (rules, badwords,
-commands, templates and log channels), preserving global/inherited visibility semantics.
+Rule, badword, command, template and log-channel GET reads now require loaded page membership
+and verify it with data on primary. Guild/global layers share one snapshot; badwords retain
+inheritance and log channels stay scope-only. Explicit global context remains owner-only.
+Reads preserve the config-version floor without receipts/version changes, and use targeted
+section/key queries instead of loading the full bundle. No schema, dependency, cache or
+polling is added. Deploy matching API/frontend builds and reload old pages. See
+[individual configuration reads](CONFIGURATION-SCOPES.md#individual-configuration-reads).
+
+## Next implementation slices
 
 1. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient

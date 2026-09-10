@@ -7,8 +7,8 @@ The request is never silently rebound to the replacement membership.
 
 The dashboard now uses these operations for settings, rules, commands, templates, badwords
 and configuration copies. Guild requests first require fresh Discord user permissions and
-an active bot membership from the primary database. The configuration bundle captures membership
-and data in the same primary snapshot; writes verify it again in their transaction.
+an active bot membership from the primary database. Configuration reads capture membership
+and their data in the same primary snapshot; writes verify it again in their transaction.
 Bot configuration callers retain their guild-ID operations. No schema or dependency is added.
 
 ## Scope and caller responsibilities
@@ -70,7 +70,8 @@ and requires captured administrative queue access.
 ## HTTP and browser contract
 
 `GET /api/guilds/{id}/config` returns `enrollment_id` alongside the configuration. For a
-nonzero guild path, configuration mutations must send it as `x-jmodguard-enrollment`.
+nonzero guild path, configuration mutations and the individual reads below must send it as
+`x-jmodguard-enrollment`. The initial `/config` request obtains that token without requiring one.
 The token identifies the page's bot membership; it grants no permissions and is not a
 configuration revision or an optimistic lock between concurrent editors. Fresh Discord
 permissions still apply on every guild request, including installation-owner requests.
@@ -78,7 +79,7 @@ permissions still apply on every guild request, including installation-owner req
 Missing/stale tokens return HTTP 409 with `guild_enrollment_changed`. An absent/retired
 membership returns 409 `guild_enrollment_inactive`. Membership verification failures return
 503 `guild_access_unverified` without DB details. The browser does not refresh tokens or
-retry a rejected mutation automatically. Reload configuration and review before resubmitting.
+retry a rejected read or mutation automatically. Reload configuration and review before resubmitting.
 Unsaved drafts may survive a failed refresh only within the same captured membership.
 
 Copy selection loads the source configuration and retains its membership. The copy body
@@ -91,15 +92,47 @@ Explicit `/api/guilds/0/...` routes are an independent owner-only global context
 no guild token. Copying into global configuration still requires the selected source token.
 
 Deploy matching API and frontend builds and reload previously open pages: older frontend
-builds lack these tokens and their guild configuration edits are rejected. The bot must
+builds lack the required tokens on some routes and those guild requests are rejected. The bot must
 have observed each guild before its dashboard is accessible; existing settings alone do
 not grant access. No installation-owner bypass or automatic enrollment adoption is provided.
 
 [Moderation event, ban and statistics reads](MODERATION-READS.md) also require the page token
-and verify membership with their data. Other individual configuration GET routes check
-membership at admission but still need scoped snapshots. Unban and log-channel operations
+and verify membership with their data. Individual configuration reads now follow the same
+captured membership contract described below. Unban and log-channel operations
 use the page token and a stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
 retain captured membership and current action permissions.
 A missed Discord departure may leave an observation stale until reconciled. This wave does
 not provide full tenant isolation, erasure, distributed worker ownership or atomicity across
 Discord and SQL. The API no longer retains or needs a bot token.
+
+## Individual configuration reads
+
+The following GET routes retain the loaded page membership after fresh permission checks:
+
+| Path after `/api/guilds/{id}/` | Data in one primary snapshot |
+|---|---|
+| `rules/{rule_id}` | Requested rule's guild/global rows; existing default resolution follows. |
+| `commands`, `commands/{name}` | Guild/global lists or requested command rows. Name normalization and default fallback are unchanged. |
+| `templates`, `templates/{event}` | Guild/global lists or requested template rows; existing default fallback follows. |
+| `badwords` | Guild and global rows together, in existing ID order; validation status is computed after reading. |
+| `logchannels`, `logchannels/{event}` | Only that scope's mappings; no global inheritance; channel IDs remain strings on the wire. |
+
+The seven `get_enrolled_*`/`list_enrolled_*` data helpers use the existing `ConfigurationScope`.
+Guild/global pairs return `ConfigurationLayers`; a global owner context retains the previous
+response shape with global rows in both fields. Scope values are not credentials. HTTP must
+still require the installation owner for guild zero and fresh Manage Guild authority for
+real guilds, including when the user is the installation owner.
+
+The primary read verifies membership even for empty results, captures the configuration
+version and reads only the needed section or key. Its version must satisfy the process's
+committed-version floor, as for the main configuration bundle. It adds no mutation receipt,
+version change, schema, dependency, pool, cache or polling. Shared SQL/decoding preserves bot
+helpers and response semantics. The primary writer lock spans verification and data queries;
+large configuration collections still need performance measurement. This change does not
+add pagination, resource limits or distributed scaling.
+
+Local and disposable libSQL tests cover stale/forged scopes, global owner versus guild
+permissions, page tokens, empty/unavailable reads, read floors, receipt/version preservation,
+inheritance, exact keys, foreign-guild exclusion and wire values. Local tests also cover a
+read waiting behind a membership-changing writer and paired layers during concurrent
+updates. No live provider behavior or complete tenant isolation is established by these tests.
