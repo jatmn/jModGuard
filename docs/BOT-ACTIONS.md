@@ -1,4 +1,4 @@
-# Durable action storage (inactive)
+# Durable action storage and dispatch library (inactive)
 
 The library has a queue for typed unban and log-channel requests. Neither service admits
 these requests, dispatches them, schedules cleanup or exposes them through HTTP/the WebUI.
@@ -29,7 +29,7 @@ token. The nickname outbox remains a separate active path; see
 - Completion commits its status and local unban record/audit or log-setting change in
   one transaction. This records a **trusted caller's reported result**, not proof that
   Discord performed an operation. SQL receipts cannot make a remote Discord action
-  atomic or guarantee exactly-once delivery. A future worker must report outcomes honestly.
+  atomic or guarantee exactly-once delivery. The dispatch library reports outcomes as described below.
   Direct writes and queued completion share log-mapping/version semantics: a clear
   advances configuration versions/revisions only when a mapping is actually deleted.
   An absent-mapping queued clear still commits its completed action state atomically.
@@ -79,12 +79,67 @@ Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
 bot first; rollback needs matched pre-upgrade backup/binaries. This is an internal library
-contract change with no current HTTP producer or worker.
+contract change with no current HTTP producer or running worker.
+
+## Dispatch library
+
+`action_worker` now provides a bot-side executor and sequential batch drain. Neither
+binary calls it yet: there is no queue producer, scheduler, cleanup task or runtime setting.
+Existing direct API operations and the active nickname worker keep their current behavior.
+The service-boundary guard permits this library and its tests, but rejects runtime use.
+
+The executor consumes an immutable claim on the primary before any Discord operation.
+A copied/stale/modified claim cannot begin again. It checks the bot's own join timestamp
+through REST, then fetches the acting user's member record and guild roles. Unban requires
+BAN_MEMBERS; log configuration requires MANAGE_GUILD. Guild owner and administrator
+permissions are honored; installation-owner status grants no dispatch bypass. No OAuth,
+member roster, message cache, new client or additional library is needed. Callers supply
+the bot's existing HTTP client and real cached bot identity; placeholder identity is refused.
+
+Immediately before unban, a primary check verifies the running claim and active membership
+again. Channel changes verify a text-based channel belongs to that guild. Clear requires no
+channel lookup. Final SQL completion rechecks the claim/membership and preserves direct
+configuration supersession. Failed validation produces a failed receipt without dispatch.
+
+The configured timeout bounds validation and the Discord mutation. A timeout before invoking
+unban is failed; after invocation it is uncertain. Discord's specific Unknown Ban response
+is an already-unbanned success, other explicit client rejections are failed (except 408),
+and transport/server/timeout ambiguity is uncertain. The worker does not automatically
+resend failed or uncertain actions. The underlying SDK's HTTP/rate-limit behavior remains;
+this is not a guarantee of exactly one wire request.
+
+`finish_dispatched_bot_action` shares the existing atomic receipt/effect/audit transaction.
+For a successful local log-setting result, it checks expiry after acquiring the primary
+writer lock. Expired local work becomes failed without changing mappings or configuration
+versions. Confirmed remote unban results may be recorded late in their original membership.
+The existing trusted `finish_bot_action` data-layer helper retains its earlier contract;
+worker integrations must use the deadline-aware variant.
+
+If receipt persistence fails after Discord was called, local effects roll back together;
+the worker reports the error and never resends the action. Aborting a worker after begin
+leaves consumed work running; later expiry processing marks it uncertain. No restart or
+claim timeout reclaims it. This favors avoiding duplicate effects over automatic completion.
+A missed departure, a permission change after the REST check, or a request already sent
+cannot be made atomic with SQL. Replica writer coordination and live Discord validation
+remain prerequisites for broader guarantees.
+
+`WorkerLimits` is a trusted library input separate from storage `Limits`: defaults are
+four sequential actions per drain and 15 seconds per validation/Discord operation block.
+Validation accepts 1–64 actions and 1–120 seconds and runs before consuming a claim.
+These are implementation defaults/bounds, not measured capacity or active deployment
+requirements. The activation wave must expose appropriate bot configuration controls.
+Claim and receipt SQL retain the existing database operation deadlines outside that block.
+
+Local worker tests cover duplicate/modified claims, cancellation/expiry, permission and
+membership changes, failed verification, current-role authorization, channel supersession,
+request timeouts, abandoned dispatch, receipt rollback, batch bounds and late local effects.
+The disposable remote-libSQL smoke exercises lost completion responses without resending
+and deadline-aware log completion. Mock outcomes do not validate live Discord behavior.
 
 ## Activation prerequisites
 
-Runtime consumers remain prohibited by the service-boundary check. A follow-up must
-use the captured membership throughout authorization/admission, enforce fresh Discord
+Runtime scheduling and API queue admission remain prohibited by the service-boundary check.
+A follow-up must use the captured membership throughout authorization/admission, enforce fresh Discord
 permissions and membership around admission/dispatch, and handle expiry, ambiguous results and late completions without replay or false success.
 It must also provide appropriate UI outcomes, runtime limits and cleanup scheduling.
 Do not remove the API bot token until all current API Discord operations have a complete

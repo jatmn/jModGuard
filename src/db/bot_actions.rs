@@ -362,6 +362,27 @@ pub async fn finish_bot_action(
     state: &str,
     outcome: &str,
 ) -> Result<bool> {
+    finish_bot_action_inner(db, job, state, outcome, false).await
+}
+
+/// Worker completion: a local log-setting effect must still be within its deadline
+/// when the primary writer lock is acquired. Remote unban results may arrive late.
+pub async fn finish_dispatched_bot_action(
+    db: &Db,
+    job: &BotAction,
+    state: &str,
+    outcome: &str,
+) -> Result<bool> {
+    finish_bot_action_inner(db, job, state, outcome, true).await
+}
+
+async fn finish_bot_action_inner(
+    db: &Db,
+    job: &BotAction,
+    state: &str,
+    outcome: &str,
+    enforce_local_deadline: bool,
+) -> Result<bool> {
     anyhow::ensure!(
         matches!(state, "succeeded" | "failed" | "uncertain"),
         "invalid action outcome"
@@ -373,6 +394,15 @@ pub async fn finish_bot_action(
             tx.finish_read()?;
             return Ok(false);
         }
+        let (state, outcome) = if enforce_local_deadline
+            && state == "succeeded"
+            && matches!(job.action, Action::SetLogChannel { .. })
+            && chrono::Utc::now().timestamp() >= job.expires_at
+        {
+            ("failed".to_owned(), "expired_before_execution".to_owned())
+        } else {
+            (state, outcome)
+        };
         let changed = tx.execute(
             &format!(
                 "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()

@@ -39,12 +39,18 @@ Common bot/log settings, DB privileges and package dependencies remain transitio
 Process `db_open_options()` fixes the migration role: bot true, API false. Tracing takes
 only `LogConfig`. See `docs/ARCHITECTURE.md`; this is not an OS secret boundary.
 
-The action queue is an inactive data-layer foundation; see `docs/BOT-ACTIONS.md`.
+The action queue and dispatch library remain inactive; see `docs/BOT-ACTIONS.md`.
 Do not add runtime admission, workers or cleanup scheduling until enrollment, fresh
 permission checks and dispatch/outcome fencing are complete. Keep claim identity checks,
 monotonic replay fencing, bounded cleanup and direct log-config supersession atomic.
 Queue history is operational metadata, separate from retained moderation audit records.
-The service-boundary guard rejects runtime queue consumers in this slice.
+The service-boundary guard allows only storage/dispatch library code and rejects runtime
+queue consumers in this slice. `action_worker` consumes claims once, rechecks fresh bot
+membership and actor permissions, and distinguishes failed validation from uncertain
+mutation outcomes. Reuse the bot HTTP client; no new client/task/cache. WorkerLimits are
+library parameters until activation. Worker completion must use finish_dispatched_bot_action:
+local log changes check expiry inside the primary transaction; known remote unban results
+may be recorded late. Failed receipts or shutdown must never automatically resend Discord.
 
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
 bind inactive queue storage, the nickname outbox and API configuration scope.
@@ -273,6 +279,7 @@ src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/bot_actions.rs   inactive action queue storage
 src/bot_actions.rs      typed action payloads and storage limits
+src/action_worker.rs    unscheduled bot dispatch library + validated worker parameters
 src/db/moderation.rs    selected moderation records and statistics
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback

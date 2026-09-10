@@ -177,6 +177,20 @@ execution remains in the API, with the bot token still required. No administrati
 worker, schema migration, erasure or full tenant-isolation guarantee is added. See
 [the HTTP and browser contract](CONFIGURATION-SCOPES.md#http-and-browser-contract).
 
+## Implemented: unscheduled administrative dispatch library
+
+The bot dispatch library consumes queued claims once and checks fresh bot membership and
+actor authority before effects. It rechecks primary claim/membership before unban and at
+completion; timeouts and ambiguous results never cause automatic replay. A local log-setting
+change that expires while waiting for the primary writer is rejected, while a known remote
+unban result can be recorded late. Existing atomic receipts, audit and version semantics remain.
+
+The library and mock/remote-SQL tests land before runtime activation. No binary schedules
+it, no API/UI admits queue requests, and the API still requires its bot token. Worker limits
+are validated library parameters. No new dependency, schema, client or active task is added.
+See [the dispatch contract](BOT-ACTIONS.md#dispatch-library). This is not live-provider or
+multi-replica certification.
+
 ## Next implementation slices
 
 1. Complete credential separation. Replace API bot-token operations with typed,

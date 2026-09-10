@@ -48,7 +48,7 @@ The processes have separate state types in the current shared application crate:
 
 Existing unban and log-channel validation still use a lazy bot-token REST client owned
 by `ApiState`. Both processes still require the bot token under the existing startup
-contract. The action queue now has an [inactive storage foundation](BOT-ACTIONS.md).
+contract. The action queue has [inactive storage and a dispatch library](BOT-ACTIONS.md).
 Queue activation, API bot-token removal and independent bot/API packages remain separate
 work. No dependency is added; resource savings are not measured.
 
