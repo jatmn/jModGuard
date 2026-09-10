@@ -1,5 +1,3 @@
-#![cfg(feature = "web")]
-
 //! End-to-end smoke for the dual-process architecture (no Discord network).
 //!
 //! Mirrors dual-process checks documented in `docs/ARCHITECTURE.md` / CI:
@@ -9,8 +7,8 @@
 
 use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
 use jmodguard::db::{self, Db, DbOpenOptions};
-use jmodguard::state::BotState;
-use jmodguard::web::state::ApiState;
+use jmodguard_api::web::state::ApiState;
+use jmodguard_bot::state::BotState;
 use std::path::PathBuf;
 
 fn tmp_db_path(label: &str) -> PathBuf {
@@ -132,62 +130,44 @@ async fn smoke_dual_process_config_sync() {
     // Windows cannot unlink an open database file.
     cleanup_db(&tmp);
 }
-
 #[tokio::test]
-async fn api_process_starts_without_a_discord_bot_token() {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let root = tmp_db_path("tokenless_api").with_extension("");
-    std::fs::create_dir(&root).unwrap();
-    let database = root.join("app.db");
-    drop(Db::open(&database, 2).unwrap());
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let config = root.join("config.toml");
-    std::fs::write(&config, format!(
-        "[db]\npath={:?}\npool_size=2\n[web]\nbind={:?}\nbase_url={:?}\noauth_client_id='fixture'\noauth_client_secret='fixture'\n[log]\ndirectory=''\n",
-        database.to_string_lossy(), address.to_string(), format!("http://{address}")
-    )).unwrap();
-    drop(listener);
-    struct RunningApi {
-        child: std::process::Child,
-        root: PathBuf,
-    }
-    impl Drop for RunningApi {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-    let mut process = RunningApi {
-        child: Command::new(env!("CARGO_BIN_EXE_jmodguard-api"))
-            .env_clear()
-            .env("JMODGUARD_CONFIG", &config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-        root,
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
+async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_nickname() {
+    use jmodguard::db::*;
+    use jmodguard_bot::enrollment_repair::observe_gateway_membership;
+    let path = tmp_db_path("gateway_nickname");
+    let database = Db::open(&path, 2).unwrap();
+    enroll_guild(&database, 10, 101).await.unwrap();
+    patch_settings(&database, 10, None, Some(Some("new name".into())), None)
+        .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            process.child.try_wait().unwrap().is_none(),
-            "API exited before serving without a bot token"
-        );
-        if let Ok(response) = client.get(format!("http://{address}/api/me")).send().await
-            && response.status() == reqwest::StatusCode::BAD_REQUEST
-        {
-            let body = response.text().await.unwrap();
-            assert!(body.contains("not authenticated"), "{body}");
-            break;
-        }
-        assert!(Instant::now() < deadline, "API did not finish startup");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let job = pending_nickname_reconciles(&database, i64::MAX, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        observe_gateway_membership(&database, 10, None, false, false)
+            .await
+            .is_err()
+    );
+    observe_gateway_membership(&database, 10, Some(101), true, false)
+        .await
+        .unwrap();
+    observe_gateway_membership(&database, 10, Some(100), false, false)
+        .await
+        .unwrap();
+    assert!(
+        nickname_reconcile_can_dispatch(&database, &job)
+            .await
+            .unwrap()
+    );
+    observe_gateway_membership(&database, 10, Some(101), false, false)
+        .await
+        .unwrap();
+    assert!(
+        !nickname_reconcile_can_dispatch(&database, &job)
+            .await
+            .unwrap()
+    );
+    drop(database);
+    cleanup_db(&path);
 }

@@ -1112,37 +1112,73 @@ name = "jmodguard"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "chrono",
- "dashmap 6.2.1",
  "fallible-iterator",
+ "http 1.5.0",
  "hyper 0.14.32",
  "jmodguard-runtime",
  "libsql",
  "libsql-sqlite3-parser",
  "parking_lot",
- "percent-encoding",
  "rand 0.10.2",
  "regex",
- "reqwest 0.13.4",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
  "serde_json",
- "serenity",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
  "toml",
- "tower 0.5.3",
- "tower-http",
- "tower-sessions",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
+]
+
+[[package]]
+name = "jmodguard-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "dashmap 6.2.1",
+ "jmodguard",
+ "jmodguard-bot",
+ "percent-encoding",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+ "tower-http",
+ "tower-sessions",
+ "tracing",
+]
+
+[[package]]
+name = "jmodguard-bot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap 6.2.1",
+ "jmodguard",
+ "parking_lot",
+ "rand 0.10.2",
+ "regex",
+ "serde",
+ "serde_json",
+ "serenity",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1156,6 +1192,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "jmodguard-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "jmodguard",
+ "jmodguard-api",
+ "jmodguard-bot",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

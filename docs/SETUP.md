@@ -94,10 +94,10 @@ gh auth setup-git
 git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
 # rust-toolchain.toml selects Rust 1.96.0 via rustup.
-# Bot without the `web` feature (no axum / sessions / SPA embed).
-cargo build --locked --release --bin jmodguard-bot --no-default-features
-# API with the default `web` feature.
-cargo build --locked --release --bin jmodguard-api
+# Independent bot package (no dashboard stack).
+cargo build --locked --release -p jmodguard-bot
+# API with the default embedded frontend.
+cargo build --locked --release -p jmodguard-api
 ```
 
 Once the repository is public, skip the authentication commands; a normal
@@ -108,9 +108,10 @@ Binaries:
 - `target/release/jmodguard-api` — WebUI/API
 
 There are **no system dependencies** — SQLite is compiled in, TLS is rustls.
-Start the bot once before the API so the schema is migrated. Do **not** use
-`cargo build --bins` for production: that builds the bot with the default
-`web` feature and embeds the SPA into the Discord process.
+Start the bot once before the API so the schema is migrated. Select each production
+service with `-p` as above. Bare `cargo build --bins` builds all workspace binaries,
+including the unfinished conductor. For a Bunny API without embedded pages, use
+`cargo build --locked --release -p jmodguard-api --no-default-features`.
 
 ## 6. Configure
 
@@ -243,8 +244,8 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
 
 ```bash
 git pull
-cargo build --locked --release --bin jmodguard-bot --no-default-features
-cargo build --locked --release --bin jmodguard-api
+cargo build --locked --release -p jmodguard-bot
+cargo build --locked --release -p jmodguard-api
 # restart both services; the database and config persist
 ```
 

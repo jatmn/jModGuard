@@ -23,18 +23,24 @@ TLS/authentication is verified during deployment acceptance. Local SQLite
 uses WAL mode, so its file must not be placed on a network filesystem or opened
 by processes on different hosts.
 
-## Feature split
+## Package boundaries
 
-- Feature `web` (default with `embed-ui`): axum, tower-sessions. `embed-ui`
-  bakes `frontend/` into the API for local SETUP.md.
-- Bunny API images build `--no-default-features --features web` (JSON + OAuth
-  only). The admin UI is Storage + Pull Zone.
-- Build the **bot** with `--no-default-features`.
-- The **API** binary requires `web` (`required-features = ["web"]`).
+- `jmodguard` is the shared configuration/model/database library. It has neither the
+  bot nor dashboard stack. Root config uses the existing `url` and `http` types directly.
+- `jmodguard-bot` owns Discord Gateway/REST, caches, moderation, commands and workers.
+  Build it with `cargo build --locked -p jmodguard-bot`.
+- `jmodguard-api` owns HTTP/OAuth, sessions and dashboard state. Its production graph
+  contains no Serenity or WebSocket stack. Default `embed-ui` embeds root `frontend/`;
+  Bunny builds `cargo build --locked -p jmodguard-api --no-default-features` for JSON/OAuth.
+- Runtime and conductor retain their independent graphs. Integration tests explicitly
+  join service libraries; the API's dev-only bot dependency retains HTTP-to-worker tests.
+- Bare workspace commands include every package. Select production builds with `-p`;
+  the former root `web` feature no longer exists. Binary names, config and wire contracts
+  are unchanged. Dependency separation does not provide SQL privilege or tenant isolation.
 
 ## Runtime state ownership
 
-The processes have separate state types in the current shared application crate:
+The processes own separate state types in their respective service packages:
 
 - `BotState` owns compiled guild configuration, automod working state, command cooldowns,
   Discord log-delivery limits and slash-command synchronization. It does not construct
@@ -49,8 +55,8 @@ The processes have separate state types in the current shared application crate:
 Unban and log-channel changes use [queued administrative actions](BOT-ACTIONS.md). The
 API returns receipts; the bot validates and dispatches with its existing HTTP client.
 `ApiState` has no bot-token client. One bot task polls and cleans bounded batches;
-independent bot/API packages remain separate work. No dependency is added; resource
-savings are not measured.
+independent bot/API packages now enforce production dependency boundaries. External
+versions are unchanged; resource savings are not measured.
 
 ## Process configuration
 
@@ -167,11 +173,11 @@ Unban/log-channel WebUI operations now use API admission and bot dispatch.
 
 ```
 src/lib.rs                 shared library
-src/bin/jmodguard-bot.rs
-src/bin/jmodguard-api.rs
-src/state.rs               BotState, compiled config cache and slash-version polling
-src/web/state.rs           ApiState and config-version observation
-src/web/oauth.rs           dashboard OAuth client and identity models
+crates/bot/src/main.rs
+crates/api/src/main.rs
+crates/bot/src/state.rs               BotState, compiled config cache and slash-version polling
+crates/api/src/web/state.rs           ApiState and config-version observation
+crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
 migrations/                0001_init through 0009_nickname_enrollments

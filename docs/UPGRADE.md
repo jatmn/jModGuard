@@ -55,8 +55,8 @@ From the tagged source:
 git fetch --tags
 git checkout vX.Y.Z   # or your chosen tag
 
-cargo build --release --locked --bin jmodguard-bot --no-default-features
-cargo build --release --locked --bin jmodguard-api
+cargo build --release --locked -p jmodguard-bot
+cargo build --release --locked -p jmodguard-api
 ```
 
 Or rebuild/push container images from `Dockerfile.bot` / `Dockerfile.api` at

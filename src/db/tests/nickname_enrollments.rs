@@ -253,30 +253,6 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
 }
 
 #[tokio::test]
-async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_nickname() {
-    use crate::enrollment_repair::observe_gateway_membership;
-    let f = Fixture::new();
-    enroll_guild(&f.db, 10, 101).await.unwrap();
-    let job = f.request(10, "new name").await;
-    assert!(
-        observe_gateway_membership(&f.db, 10, None, false, false)
-            .await
-            .is_err()
-    );
-    observe_gateway_membership(&f.db, 10, Some(101), true, false)
-        .await
-        .unwrap();
-    observe_gateway_membership(&f.db, 10, Some(100), false, false)
-        .await
-        .unwrap();
-    assert!(nickname_reconcile_can_dispatch(&f.db, &job).await.unwrap());
-    observe_gateway_membership(&f.db, 10, Some(101), false, false)
-        .await
-        .unwrap();
-    assert!(!nickname_reconcile_can_dispatch(&f.db, &job).await.unwrap());
-}
-
-#[tokio::test]
 async fn version_eight_upgrade_does_not_bind_existing_nickname_to_active_membership() {
     let path = tmp_db_path("nickname_version_eight");
     let conn = Connection::open(&path).unwrap();

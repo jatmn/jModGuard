@@ -1,0 +1,32 @@
+[package]
+name = "jmodguard-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["embed-ui"]
+embed-ui = []
+
+[dependencies]
+rand = "0.10"
+jmodguard = { path = "../.." }
+anyhow = "1"
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "form"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
+tower-http = { version = "0.6", features = ["cors", "set-header"] }
+tower-sessions = { version = "0.14", features = ["memory-store"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tower = "0.5.3"
+async-trait = "0.1"
+jmodguard-bot = { path = "../bot" } # HTTP-to-worker regression fixtures only

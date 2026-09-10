@@ -689,9 +689,9 @@ fn action_key(label: &str) -> String {
 
 #[tokio::test]
 async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable() {
-    use crate::action_worker::{DiscordActions, Outcome, WorkerLimits};
+    use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
     struct Allowed;
-    #[serenity::async_trait]
+    #[async_trait::async_trait]
     impl DiscordActions for Allowed {
         async fn membership_matches(&self, _: &db::BotAction) -> anyhow::Result<bool> {
             Ok(true)
@@ -725,7 +725,7 @@ async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable()
         .request("PUT", "/api/guilds/10/logchannels/message_edit", &body)
         .await;
     assert_eq!(replay["id"], queued["id"]);
-    crate::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
+    jmodguard_bot::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
         .await
         .unwrap();
     let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
@@ -748,7 +748,7 @@ async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable()
     assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
     assert_eq!(queued["state"], "pending");
     assert_eq!(db::list_log_channels(&f.app.db, 10).await.unwrap().len(), 1);
-    crate::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
+    jmodguard_bot::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
         .await
         .unwrap();
     assert!(

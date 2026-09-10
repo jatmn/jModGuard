@@ -1,12 +1,12 @@
 //! jModGuard Discord bot process (gateway only — health listener optional).
 
 use anyhow::{Context as _, Result};
-use jmodguard::config::BotProcessConfig;
-use jmodguard::db::Db;
-use jmodguard::handlers::Handler;
-use jmodguard::nickname_worker::reconcile_nickname_job;
-use jmodguard::state::BotState;
-use jmodguard::{db, init_tracing, shutdown_signal};
+use jmodguard_bot::config::BotProcessConfig;
+use jmodguard_bot::db::Db;
+use jmodguard_bot::handlers::Handler;
+use jmodguard_bot::nickname_worker::reconcile_nickname_job;
+use jmodguard_bot::state::BotState;
+use jmodguard_bot::{db, init_tracing, shutdown_signal};
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ async fn drain_nickname_reconciles(
             let me = match identity
                 .get_or_try_init(|| async {
                     let user = tokio::time::timeout(
-                        jmodguard::discord::DISCORD_REST_TIMEOUT,
+                        jmodguard_bot::discord::DISCORD_REST_TIMEOUT,
                         http.get_current_user(),
                     )
                     .await
@@ -89,9 +89,9 @@ async fn main() -> Result<()> {
     // port while `open_with_until_ready` waits on a waking database or a
     // local SQLite lock.
     if let Some(bind) = cfg.health_bind() {
-        let listener = jmodguard::health::bind(&bind).await?;
+        let listener = jmodguard_bot::health::bind(&bind).await?;
         tokio::spawn(async move {
-            if let Err(error) = jmodguard::health::serve_listener(listener).await {
+            if let Err(error) = jmodguard_bot::health::serve_listener(listener).await {
                 tracing::error!("health listener exited: {error:#}");
             }
         });
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
         let app = Arc::clone(&app);
         let http = Arc::clone(&http);
         let cache = Arc::clone(&cache);
-        let mut repair = jmodguard::enrollment_repair::EnrollmentRepair::new(
+        let mut repair = jmodguard_bot::enrollment_repair::EnrollmentRepair::new(
             cfg.enrollment.clone(),
             std::time::Instant::now(),
         )?;
@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! { _ = shutdown_signal() => break, _ = tick.tick() => {} }
                 let Some(source) =
-                    jmodguard::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
+                    jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                 else {
                     continue;
                 };
@@ -206,17 +206,17 @@ async fn main() -> Result<()> {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
                         let Some(membership) =
-                            jmodguard::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
+                            jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                         else {
                             continue;
                         };
-                        let discord = jmodguard::action_worker::LiveDiscord {
+                        let discord = jmodguard_bot::action_worker::LiveDiscord {
                             http: &http,
                             bot_user_id: membership.bot_user_id,
                         };
                         tokio::select! {
                             _ = shutdown_signal() => break,
-                            result = jmodguard::action_worker::drain(&app.db, &discord, &app.cfg.action_worker.limits) => {
+                            result = jmodguard_bot::action_worker::drain(&app.db, &discord, &app.cfg.action_worker.limits) => {
                                 if let Err(error) = result { tracing::warn!("bot action queue unavailable: {error:#}"); }
                             }
                         }
@@ -283,12 +283,12 @@ async fn main() -> Result<()> {
                         let cached: Vec<u64> =
                             cache.guilds().into_iter().map(|g| g.get()).collect();
                         match app.plan_slash_resync(remote, &cached) {
-                            jmodguard::state::SlashResyncPlan::Defer => {
+                            jmodguard_bot::state::SlashResyncPlan::Defer => {
                                 tracing::debug!(
                                     "slash re-sync deferred: guild cache empty (will retry)"
                                 );
                             }
-                            jmodguard::state::SlashResyncPlan::Sync { guilds, invalidate } => {
+                            jmodguard_bot::state::SlashResyncPlan::Sync { guilds, invalidate } => {
                                 tracing::info!(
                                     "slash_registry_version changed; re-syncing Discord slash \
                                      commands ({} guild(s))",
@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
                                 }
                                 let mut failed = std::collections::HashSet::new();
                                 for gid in guilds {
-                                    if !jmodguard::commands::sync_slash_commands_versioned_http(
+                                    if !jmodguard_bot::commands::sync_slash_commands_versioned_http(
                                         &app,
                                         &http,
                                         serenity::model::id::GuildId::new(gid),

@@ -41,7 +41,7 @@ pub enum SlashResyncPlan {
 
 /// Discord runtime state has no dashboard OAuth client.
 /// ```compile_fail
-/// fn dashboard(state: &jmodguard::state::BotState) {
+/// fn dashboard(state: &jmodguard_bot::state::BotState) {
 ///     let _ = &state.oauth;
 /// }
 /// ```
@@ -608,7 +608,14 @@ mod tests {
         let bot = BotState::new(BotProcessConfig::default(), bot_db).unwrap();
         // Already primed at construction — unchanged version must not invalidate.
         assert!(!tokio_test_block_on(bot.poll_config_version()).unwrap());
-        tokio_test_block_on(db::upsert_settings(&api_db, 7, &GuildSettings::default())).unwrap();
+        tokio_test_block_on(db::patch_settings(
+            &api_db,
+            7,
+            Some(Some("!api".into())),
+            None,
+            None,
+        ))
+        .unwrap();
         assert!(tokio_test_block_on(bot.poll_config_version()).unwrap());
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
@@ -656,7 +663,14 @@ mod tests {
 
         let mut settings = GuildSettings::default();
         settings.prefix = "!api-wrote".into();
-        tokio_test_block_on(db::upsert_settings(&api_db, guild_id as i64, &settings)).unwrap();
+        tokio_test_block_on(db::patch_settings(
+            &api_db,
+            guild_id as i64,
+            Some(Some(settings.prefix)),
+            None,
+            None,
+        ))
+        .unwrap();
 
         // First poll after a write must invalidate (primed baseline ≠ remote).
         assert!(tokio_test_block_on(bot.poll_config_version()).unwrap());

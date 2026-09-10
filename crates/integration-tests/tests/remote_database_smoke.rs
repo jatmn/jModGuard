@@ -3,7 +3,7 @@ use jmodguard::db::{
     get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
     patch_settings, query_events, test_drop_next_commit_response,
 };
-use jmodguard::state::ConfigCache;
+use jmodguard_bot::state::ConfigCache;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -504,12 +504,12 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
 }
 
 async fn exercise_dispatch_completion(bot: &Db) {
-    use jmodguard::action_worker::{DiscordActions, Outcome, WorkerLimits, execute};
     use jmodguard::bot_actions::{Action, Limits};
     use jmodguard::db::*;
+    use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits, execute};
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct ReceiptLoss(AtomicUsize);
-    #[serenity::async_trait]
+    #[async_trait::async_trait]
     impl DiscordActions for ReceiptLoss {
         async fn membership_matches(&self, _: &BotAction) -> anyhow::Result<bool> {
             Ok(true)

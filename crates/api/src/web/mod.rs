@@ -632,7 +632,7 @@ fn static_handler(content: &'static str, content_type: &'static str) -> impl Int
 #[cfg(feature = "embed-ui")]
 async fn index() -> impl IntoResponse {
     static_handler(
-        include_str!("../../frontend/index.html"),
+        include_str!("../../../../frontend/index.html"),
         "text/html; charset=utf-8",
     )
 }
@@ -648,7 +648,7 @@ async fn health() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn app_js() -> impl IntoResponse {
     static_handler(
-        include_str!("../../frontend/app.js"),
+        include_str!("../../../../frontend/app.js"),
         "application/javascript; charset=utf-8",
     )
 }
@@ -656,7 +656,7 @@ async fn app_js() -> impl IntoResponse {
 #[cfg(feature = "embed-ui")]
 async fn style_css() -> impl IntoResponse {
     static_handler(
-        include_str!("../../frontend/style.css"),
+        include_str!("../../../../frontend/style.css"),
         "text/css; charset=utf-8",
     )
 }
@@ -1028,7 +1028,7 @@ mod tests {
         #[derive(Debug, Clone, Default)]
         struct FailingDeleteStore;
 
-        #[serenity::async_trait]
+        #[async_trait::async_trait]
         impl tower_sessions::SessionStore for FailingDeleteStore {
             async fn create(
                 &self,

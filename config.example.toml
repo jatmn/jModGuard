@@ -4,8 +4,8 @@
 # Only the bot loads discord.token; the API uses OAuth and queues bot actions.
 #
 # Dual-process local run:
-#   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway
-#   cargo run --bin jmodguard-api                       # HTTP API/WebUI (waits ~30s locally for bot migrate)
+#   cargo run -p jmodguard-bot  # migrates DB, Discord gateway
+#   cargo run -p jmodguard-api                       # HTTP API/WebUI (waits ~30s locally for bot migrate)
 
 [discord]
 # Bot token from https://discord.com/developers/applications
