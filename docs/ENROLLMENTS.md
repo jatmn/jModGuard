@@ -125,7 +125,7 @@ Bot configuration callers retain their existing helpers. No schema change is int
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
 it does not infer membership from existing guild settings or old queue jobs. The current
-recognized lineage extends through migration0009. Version8 binaries reject version9;
+recognized lineage extends through migration0010. Version9 binaries reject version10;
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 

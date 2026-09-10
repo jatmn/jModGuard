@@ -37,6 +37,7 @@ mod nickname_jobs;
 pub use nickname_jobs::*;
 mod moderation;
 pub use moderation::*;
+pub mod guild_stores;
 mod settings;
 pub use settings::*;
 
@@ -50,6 +51,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_guild_enrollments.sql"),
     include_str!("../migrations/0008_action_enrollments.sql"),
     include_str!("../migrations/0009_nickname_enrollments.sql"),
+    include_str!("../migrations/0010_guild_store_catalog.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.

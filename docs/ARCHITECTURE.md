@@ -143,13 +143,21 @@ The configuration bundle, individual configuration GET reads and
 layers share a primary snapshot and preserve the process read floor; queued actions use
 captured membership. The schema is unchanged.
 
+## Guild-store catalog foundation
+
+[Guild-store catalog storage](GUILD-STORES.md) now records opaque identities, immutable
+shared/dedicated ownership and initial placements. It is not connected to runtime routing;
+current bot/API data still uses one configured database. No provisioning, moves, extra
+connections, caches or polling are enabled. The later directory database split must preserve
+these identities while adding credential resolution and data-side placement checks.
+
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0009. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0010. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
-requests without adopting earlier work.
+requests without adopting earlier work. Migration0010 adds the inactive guild-store catalog.
 Unban/log-channel WebUI operations now use API admission and bot dispatch.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
@@ -182,7 +190,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0009_nickname_enrollments
+migrations/                0001_init through 0010_guild_store_catalog
 Dockerfile.bot
 Dockerfile.api
 ```

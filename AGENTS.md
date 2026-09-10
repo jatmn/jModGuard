@@ -87,6 +87,13 @@ guild/global layers together, badword inheritance and guild-only log-channel map
 global context remains owner-only. Targeted rule/command/template reads must not load the
 entire configuration bundle. Complete tenant isolation and replica coordination remain separate work.
 
+The guild-store catalog is an inactive data-layer foundation; see `docs/GUILD-STORES.md`.
+Migration0010 adds empty nonsecret store/placement tables. Do not infer initial placement
+from settings/enrollments or connect these helpers to runtime routing/UI yet. Store ownership
+is immutable; initial assignment refuses changing a placement. Matching retries are receipt-
+free; real writes use existing recovery receipts and never bump config/slash versions.
+No URLs/credentials belong in the catalog. Placement revisions do not fence data writers.
+
 ## Commands
 
 ```bash
@@ -307,7 +314,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0009_nickname_enrollments
+migrations/             0001_init through 0010_guild_store_catalog
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

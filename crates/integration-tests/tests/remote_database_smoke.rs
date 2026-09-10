@@ -154,6 +154,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_configuration_scopes(&bot, &api).await;
     exercise_moderation_scopes(&bot, &api).await;
     exercise_configuration_reads(&bot, &api).await;
+    exercise_guild_store_catalog(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -732,4 +733,84 @@ async fn exercise_configuration_reads(bot: &Db, api: &Db) {
     ] {
         assert!(result.unwrap_err().is::<EnrollmentChanged>());
     }
+}
+
+async fn exercise_guild_store_catalog(bot: &Db, api: &Db) {
+    use jmodguard::db::guild_stores::*;
+    let shared = StoreId::new();
+    let dedicated = StoreId::new();
+    let version = get_config_version(api).await.unwrap();
+    test_drop_next_commit_response();
+    let store = register_store(bot, shared.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    assert_eq!(store_registration(api, &shared).await.unwrap(), Some(store));
+    register_store(
+        bot,
+        dedicated.clone(),
+        StorePolicy::Dedicated { guild_id: 480 },
+    )
+    .await
+    .unwrap();
+    test_drop_next_commit_response();
+    let placement = assign_initial_placement(bot, 470, shared.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        guild_placement(api, 470).await.unwrap(),
+        Some(placement.clone())
+    );
+    assign_initial_placement(bot, 471, shared.clone())
+        .await
+        .unwrap();
+    assign_initial_placement(bot, 480, dedicated.clone())
+        .await
+        .unwrap();
+    bot.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_store_catalog_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    register_store(api, shared.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    assert_eq!(
+        assign_initial_placement(api, 470, shared.clone())
+            .await
+            .unwrap(),
+        placement
+    );
+    guild_placement(api, 471).await.unwrap().unwrap();
+    assert!(matches!(
+        assign_initial_placement(api, 472, dedicated.clone())
+            .await
+            .unwrap_err()
+            .downcast_ref::<CatalogConflict>(),
+        Some(CatalogConflict::DedicatedOwner)
+    ));
+    assert!(matches!(
+        assign_initial_placement(api, 480, shared.clone())
+            .await
+            .unwrap_err()
+            .downcast_ref::<CatalogConflict>(),
+        Some(CatalogConflict::Placement)
+    ));
+    let rejected = StoreId::new();
+    assert!(
+        register_store(api, rejected.clone(), StorePolicy::Shared)
+            .await
+            .is_err()
+    );
+    assert!(store_registration(api, &rejected).await.unwrap().is_none());
+    assert!(assign_initial_placement(api, 481, shared).await.is_err());
+    assert!(guild_placement(api, 481).await.unwrap().is_none());
+    bot.with_conn(|c| c.execute_batch("DROP TRIGGER reject_store_catalog_receipt"))
+        .await
+        .unwrap();
+    // Remote stream constraints must reject cross-owner placement without relying on PRAGMAs.
+    bot.with_conn(move |c| {
+        use jmodguard::db::{params, SqlExecutor};
+        let tx = c.transaction_primary_read()?;
+        assert!(tx.execute("INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(472,?1,'11111111111111111111111111111111')", params![dedicated.as_str()]).is_err());
+        assert!(tx.execute("INSERT OR REPLACE INTO guild_store_catalog(store_id,dedicated_guild_id) VALUES(?1,NULL)", params![dedicated.as_str()]).is_err());
+        tx.finish_read()
+    }).await.unwrap();
+    assert!(guild_placement(api, 472).await.unwrap().is_none());
+    assert_eq!(get_config_version(api).await.unwrap(), version);
 }
