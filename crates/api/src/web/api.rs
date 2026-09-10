@@ -243,9 +243,12 @@ pub struct RuleBody {
 pub async fn get_rule(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, rule_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
     if !crate::types::RULE_IDS.contains(&rule_id.as_str()) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
     }
@@ -254,8 +257,8 @@ pub async fn get_rule(
         .position(|r| *r == rule_id.as_str())
         .unwrap();
     let def = crate::defaults::default_rules()[idx].clone();
-    let guild_override = db::get_rule(&app.db, guild_id as i64, &rule_id).await?;
-    let global = db::get_rule(&app.db, GLOBAL_SCOPE, &rule_id).await?;
+    let layers = db::get_enrolled_rule(&app.db, scope, &rule_id).await?;
+    let (guild_override, global) = (layers.guild, layers.global);
     let effective = db::resolve(&guild_override, &global, &def);
     Ok(Json(serde_json::json!({
         "effective": effective,
@@ -341,10 +344,13 @@ pub struct BadwordBody {
 pub async fn list_badwords(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let words = db::list_badwords(&app.db, guild_id as i64).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let words = db::list_enrolled_badwords(&app.db, scope).await?;
     let words: Vec<_> = words.iter().map(|w| w.with_status()).collect();
     Ok(Json(serde_json::json!(words)))
 }
@@ -419,23 +425,29 @@ pub struct CommandBody {
 pub async fn list_commands(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let g = db::list_commands(&app.db, guild_id as i64).await?;
-    let gl = db::list_commands(&app.db, GLOBAL_SCOPE).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let layers = db::list_enrolled_commands(&app.db, scope).await?;
+    let (g, gl) = (layers.guild, layers.global);
     Ok(Json(serde_json::json!({ "guild": g, "global": gl })))
 }
 
 pub async fn get_command(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, name)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
-    let guild_override = db::get_command_row(&app.db, guild_id as i64, &name).await?;
-    let global = db::get_command_row(&app.db, GLOBAL_SCOPE, &name).await?;
+    let layers = db::get_enrolled_command(&app.db, scope, &name).await?;
+    let (guild_override, global) = (layers.guild, layers.global);
     let def = crate::defaults::default_commands()
         .into_iter()
         .find(|c| c.name == name);
@@ -548,22 +560,28 @@ pub struct TemplateBody {
 pub async fn list_templates(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let g = db::list_templates(&app.db, guild_id as i64).await?;
-    let gl = db::list_templates(&app.db, GLOBAL_SCOPE).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let layers = db::list_enrolled_templates(&app.db, scope).await?;
+    let (g, gl) = (layers.guild, layers.global);
     Ok(Json(serde_json::json!({ "guild": g, "global": gl })))
 }
 
 pub async fn get_template(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let guild_override = db::get_template_row(&app.db, guild_id as i64, &event).await?;
-    let global = db::get_template_row(&app.db, GLOBAL_SCOPE, &event).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let layers = db::get_enrolled_template(&app.db, scope, &event).await?;
+    let (guild_override, global) = (layers.guild, layers.global);
     let def = crate::defaults::default_templates()
         .into_iter()
         .find(|(e, _)| *e == event)
@@ -646,10 +664,13 @@ fn log_channels_wire(rows: Vec<(String, i64)>) -> Vec<serde_json::Value> {
 pub async fn list_logchannels(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let g = db::list_log_channels(&app.db, guild_id as i64).await?;
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let g = db::list_enrolled_log_channels(&app.db, scope).await?;
     Ok(Json(serde_json::json!({
         "guild": log_channels_wire(g),
         "global": [],
@@ -659,10 +680,13 @@ pub async fn list_logchannels(
 pub async fn get_logchannel(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = guild_scope(&app, &session, guild_id).await?;
-    let guild_override = db::list_log_channels(&app.db, guild_id as i64)
+    let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_scope(&app, &auth, guild_id)?;
+    let guild_override = db::list_enrolled_log_channels(&app.db, scope)
         .await?
         .into_iter()
         .find(|(e, _)| e == &event)

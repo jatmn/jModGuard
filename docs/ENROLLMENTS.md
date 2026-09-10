@@ -131,7 +131,8 @@ No previous deployment is imported and no guild data is purged.
 
 [Moderation event, ban and statistics reads](MODERATION-READS.md) now retain captured
 membership through their primary snapshot and require the loaded page token.
-Remaining individual configuration read scopes, case/evidence isolation,
+Individual configuration GET reads now retain that same page membership with guild/global
+layers in one primary snapshot; explicit global context stays owner-only. Case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that
 purge design. Local tests do not certify tenant isolation or Discord/Bunny behavior.

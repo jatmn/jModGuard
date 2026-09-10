@@ -605,3 +605,22 @@ test('moderation reads send the loaded page membership including query-string ro
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
   assert.equal(calls.length, 5, 'reads must not silently load a new membership');
 });
+
+test('individual configuration GETs retain loaded membership without rebinding global or foreign scopes', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => { calls.push({url, opts}); return response({}); });
+  h.app.state.config = { enrollment_id: 'loaded-config-membership' };
+  const routes = ['rules/spam?probe=1', 'badwords', 'commands', 'commands/test', 'templates', 'templates/message_edit', 'logchannels', 'logchannels/message_edit'];
+  for (const route of routes) {
+    await h.app.api(`/api/guilds/${h.app.state.guildId}/${route}`);
+    assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'loaded-config-membership');
+  }
+  for (const guild of ['0', '987654321098765433']) {
+    await h.app.api(`/api/guilds/${guild}/commands`);
+    assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
+  }
+  h.app.state.config = null;
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/commands`);
+  assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
+  assert.equal(calls.length, routes.length + 3);
+});

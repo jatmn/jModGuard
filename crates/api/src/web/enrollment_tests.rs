@@ -1000,3 +1000,151 @@ async fn moderation_event_user_filter_rejects_ids_outside_database_range() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid user id");
 }
+
+fn configuration_read_routes() -> Vec<String> {
+    vec![
+        format!("rules/{}", crate::types::RULE_IDS[0]),
+        "badwords".into(),
+        "commands".into(),
+        "commands/fixture".into(),
+        "templates".into(),
+        "templates/fixture".into(),
+        "logchannels".into(),
+        "logchannels/fixture".into(),
+    ]
+}
+
+#[tokio::test]
+async fn individual_configuration_reads_require_page_membership_and_fresh_guild_permission() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let original = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    for suffix in configuration_read_routes() {
+        let path = format!("/api/guilds/10/{suffix}");
+        let (status, body) = f.request_token("GET", &path, "", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+        assert_eq!(body["code"], "guild_enrollment_changed");
+        assert_eq!(
+            f.request_token("GET", &path, "", Some(&original.id))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    for suffix in configuration_read_routes() {
+        let path = format!("/api/guilds/10/{suffix}");
+        let (status, body) = f.request_token("GET", &path, "", Some(&original.id)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "guild_enrollment_changed");
+        assert_eq!(f.request("GET", &path, "").await.0, StatusCode::OK);
+    }
+    f.discord.guilds.lock().unwrap().clear();
+    for suffix in configuration_read_routes() {
+        assert_eq!(
+            f.request("GET", &format!("/api/guilds/10/{suffix}"), "")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Explicit owner global context remains independent of any guild membership.
+        assert_eq!(
+            f.request_token("GET", &format!("/api/guilds/0/{suffix}"), "", None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn individual_configuration_reads_keep_global_context_owner_only() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    for suffix in configuration_read_routes() {
+        assert_eq!(
+            f.request("GET", &format!("/api/guilds/0/{suffix}"), "")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            f.request("GET", &format!("/api/guilds/10/{suffix}"), "")
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wire_shapes() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    for (guild, label) in [(0, "global"), (10, "guild"), (20, "foreign")] {
+        db::upsert_template(&f.app.db, guild, "fixture", label)
+            .await
+            .unwrap();
+        let mut command = crate::defaults::default_commands()[0].clone();
+        command.name = "fixture".into();
+        command.description = label.into();
+        db::upsert_command(&f.app.db, guild, "fixture", &command)
+            .await
+            .unwrap();
+        db::upsert_log_channel(&f.app.db, guild, "fixture", 1329331947876479006 + guild)
+            .await
+            .unwrap();
+        db::add_badword(&f.app.db, guild, label, None)
+            .await
+            .unwrap();
+    }
+    let (_, template) = f
+        .request("GET", "/api/guilds/10/templates/fixture", "")
+        .await;
+    assert_eq!(
+        template,
+        serde_json::json!({"effective":"guild","guild_override":"guild","global":"global"})
+    );
+    let (_, command) = f
+        .request("GET", "/api/guilds/10/commands/FIXTURE", "")
+        .await;
+    assert_eq!(command["effective"]["description"], "guild");
+    assert_eq!(command["global"]["description"], "global");
+    db::delete_template(&f.app.db, 10, "fixture").await.unwrap();
+    let (_, inherited) = f
+        .request("GET", "/api/guilds/10/templates/fixture", "")
+        .await;
+    assert_eq!(inherited["effective"], "global");
+    assert!(inherited["guild_override"].is_null());
+    let (_, channels) = f.request("GET", "/api/guilds/10/logchannels", "").await;
+    assert_eq!(
+        channels,
+        serde_json::json!({"guild":[{"event":"fixture","channel_id":"1329331947876479016"}],"global":[]})
+    );
+    let (_, channel) = f
+        .request("GET", "/api/guilds/10/logchannels/fixture", "")
+        .await;
+    assert_eq!(
+        channel,
+        serde_json::json!({"effective":"1329331947876479016","guild_override":"1329331947876479016","global":null})
+    );
+    let (_, absent) = f
+        .request("GET", "/api/guilds/10/logchannels/absent", "")
+        .await;
+    assert_eq!(
+        absent,
+        serde_json::json!({"effective":null,"guild_override":null,"global":null})
+    );
+    let (_, words) = f.request("GET", "/api/guilds/10/badwords", "").await;
+    let patterns: Vec<_> = words
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["pattern"].as_str().unwrap())
+        .collect();
+    assert!(
+        patterns.contains(&"guild")
+            && patterns.contains(&"global")
+            && !patterns.contains(&"foreign")
+    );
+}

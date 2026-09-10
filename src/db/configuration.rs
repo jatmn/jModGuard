@@ -31,29 +31,37 @@ pub(crate) async fn load_rows<T: DeserializeOwned + Send + 'static>(
     key_col: &'static str,
     key_value: Option<&str>,
 ) -> Result<Vec<(String, T)>> {
-    let key_value = key_value.map(|s| s.to_string());
-    db.with_conn(move |conn| {
-        let sql = if key_value.is_some() {
-            format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1 AND {key_col} = ?2")
-        } else {
-            format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1")
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let mut args: Vec<Value> = vec![guild_id.into()];
-        if let Some(kv) = &key_value {
-            args.push(kv.to_string().into());
-        }
-        let rows = stmt.query_map(params_from_iter(args), |r| {
-            Ok((r.get::<String>(0)?, r.get::<String>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (k, v) = row?;
-            out.push((k, read_json(&v, table)?));
-        }
-        Ok(out)
-    })
-    .await
+    let key_value = key_value.map(str::to_owned);
+    db.with_conn(move |conn| load_rows_conn(conn, guild_id, table, key_col, key_value.as_deref()))
+        .await
+}
+
+fn load_rows_conn<T: DeserializeOwned>(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    table: &'static str,
+    key_col: &'static str,
+    key_value: Option<&str>,
+) -> Result<Vec<(String, T)>> {
+    let sql = if key_value.is_some() {
+        format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1 AND {key_col} = ?2")
+    } else {
+        format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1")
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let mut args: Vec<Value> = vec![guild_id.into()];
+    if let Some(kv) = key_value {
+        args.push(kv.to_string().into());
+    }
+    let rows = stmt.query_map(params_from_iter(args), |r| {
+        Ok((r.get::<String>(0)?, r.get::<String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (k, v) = row?;
+        out.push((k, read_json(&v, table)?));
+    }
+    Ok(out)
 }
 
 async fn upsert_row<T: Serialize + Send + 'static>(
@@ -213,19 +221,21 @@ pub async fn delete_command(db: &Db, guild_id: i64, name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub async fn list_templates(db: &Db, guild_id: i64) -> Result<Vec<(String, String)>> {
-    db.with_conn(move |conn| {
-        let mut stmt =
-            conn.prepare("SELECT event_type, template FROM templates WHERE guild_id = ?1")?;
-        let rows = stmt.query_map(params![guild_id], |r| {
-            Ok((r.get::<String>(0)?, r.get::<String>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .await
+    db.with_conn(move |conn| list_templates_conn(conn, guild_id))
+        .await
+}
+
+fn list_templates_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT event_type, template FROM templates WHERE guild_id = ?1")?;
+    let rows = stmt.query_map(params![guild_id], |r| {
+        Ok((r.get::<String>(0)?, r.get::<String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub async fn upsert_template(db: &Db, guild_id: i64, event: &str, template: &str) -> Result<()> {
@@ -270,16 +280,22 @@ pub async fn delete_template(db: &Db, guild_id: i64, event: &str) -> Result<()> 
 }
 
 pub async fn get_template_row(db: &Db, guild_id: i64, event: &str) -> Result<Option<String>> {
-    let (guild_id, event) = (guild_id, event.to_string());
-    db.with_conn(move |conn| {
-        conn.query_row(
-            "SELECT template FROM templates WHERE guild_id = ?1 AND event_type = ?2",
-            params![guild_id, event],
-            |r| Ok(r.get(0)?),
-        )
-        .optional()
-    })
-    .await
+    let event = event.to_owned();
+    db.with_conn(move |conn| get_template_row_conn(conn, guild_id, &event))
+        .await
+}
+
+fn get_template_row_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    event: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT template FROM templates WHERE guild_id = ?1 AND event_type = ?2",
+        params![guild_id, event],
+        |r| Ok(r.get(0)?),
+    )
+    .optional()
 }
 
 // ---------------------------------------------------------------------------
@@ -287,19 +303,21 @@ pub async fn get_template_row(db: &Db, guild_id: i64, event: &str) -> Result<Opt
 // ---------------------------------------------------------------------------
 
 pub async fn list_log_channels(db: &Db, guild_id: i64) -> Result<Vec<(String, i64)>> {
-    db.with_conn(move |conn| {
-        let mut stmt =
-            conn.prepare("SELECT event_type, channel_id FROM log_channels WHERE guild_id = ?1")?;
-        let rows = stmt.query_map(params![guild_id], |r| {
-            Ok((r.get::<String>(0)?, r.get::<i64>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .await
+    db.with_conn(move |conn| list_log_channels_conn(conn, guild_id))
+        .await
+}
+
+fn list_log_channels_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Vec<(String, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT event_type, channel_id FROM log_channels WHERE guild_id = ?1")?;
+    let rows = stmt.query_map(params![guild_id], |r| {
+        Ok((r.get::<String>(0)?, r.get::<i64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Shared mapping/version semantics for direct writes and queued completion.
@@ -412,26 +430,28 @@ impl Badword {
 }
 
 pub async fn list_badwords(db: &Db, guild_id: i64) -> Result<Vec<Badword>> {
-    db.with_conn(move |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, guild_id, pattern, note FROM badwords
-             WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![guild_id, GLOBAL_SCOPE], |r| {
-            Ok(Badword {
-                id: r.get(0)?,
-                guild_id: r.get(1)?,
-                pattern: r.get(2)?,
-                note: r.get(3)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .await
+    db.with_conn(move |conn| list_badwords_conn(conn, guild_id))
+        .await
+}
+
+fn list_badwords_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Vec<Badword>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, guild_id, pattern, note FROM badwords
+         WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![guild_id, GLOBAL_SCOPE], |r| {
+        Ok(Badword {
+            id: r.get(0)?,
+            guild_id: r.get(1)?,
+            pattern: r.get(2)?,
+            note: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub async fn add_badword(db: &Db, guild_id: i64, pattern: &str, note: Option<&str>) -> Result<i64> {
@@ -1238,4 +1258,133 @@ pub async fn load_enrolled_web_config_snapshot(
         "primary WebUI config snapshot is below the process's committed-version floor"
     );
     Ok(snapshot)
+}
+
+/// Guild and global layers from one captured primary snapshot. For Global scope
+/// both fields contain the global rows, preserving the dashboard's existing shape.
+#[derive(Debug)]
+pub struct ConfigurationLayers<T> {
+    pub guild: T,
+    pub global: T,
+}
+
+async fn configuration_read<T: Send + 'static>(
+    db: &Db,
+    scope: ConfigurationScope,
+    read: impl FnOnce(&crate::db_compat::Transaction, i64) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (version, result) = db
+        .with_conn(move |conn| {
+            let tx = conn.transaction_primary_read()?;
+            scope.verify_conn(&tx)?;
+            let version = get_config_version_conn(&tx)?;
+            let result = read(&tx, scope.guild_id())?;
+            tx.finish_read()?;
+            Ok((version, result))
+        })
+        .await?;
+    anyhow::ensure!(
+        version >= db.required_config_version(),
+        "primary configuration read is below the process's committed-version floor"
+    );
+    Ok(result)
+}
+
+fn read_layers<T: Clone>(
+    guild: i64,
+    read: impl Fn(i64) -> Result<T>,
+) -> Result<ConfigurationLayers<T>> {
+    let guild_rows = read(guild)?;
+    let global = if guild == GLOBAL_SCOPE {
+        guild_rows.clone()
+    } else {
+        read(GLOBAL_SCOPE)?
+    };
+    Ok(ConfigurationLayers {
+        guild: guild_rows,
+        global,
+    })
+}
+
+/// Read only the requested rule's two layers, verifying membership even if absent.
+pub async fn get_enrolled_rule(
+    db: &Db,
+    scope: ConfigurationScope,
+    id: &str,
+) -> Result<ConfigurationLayers<Option<RuleDef>>> {
+    let id = id.to_owned();
+    configuration_read(db, scope, move |tx, guild| {
+        read_layers(guild, |g| {
+            Ok(
+                load_rows_conn::<RuleDef>(tx, g, "rules", "rule_id", Some(&id))?
+                    .into_iter()
+                    .next()
+                    .map(|(_, row)| row),
+            )
+        })
+    })
+    .await
+}
+
+pub async fn list_enrolled_commands(
+    db: &Db,
+    scope: ConfigurationScope,
+) -> Result<ConfigurationLayers<Vec<(String, CommandDef)>>> {
+    configuration_read(db, scope, |tx, guild| {
+        read_layers(guild, |g| load_rows_conn(tx, g, "commands", "name", None))
+    })
+    .await
+}
+
+pub async fn get_enrolled_command(
+    db: &Db,
+    scope: ConfigurationScope,
+    name: &str,
+) -> Result<ConfigurationLayers<Option<CommandDef>>> {
+    let name = name.to_owned();
+    configuration_read(db, scope, move |tx, guild| {
+        read_layers(guild, |g| {
+            Ok(
+                load_rows_conn::<CommandDef>(tx, g, "commands", "name", Some(&name))?
+                    .into_iter()
+                    .next()
+                    .map(|(_, row)| row),
+            )
+        })
+    })
+    .await
+}
+
+pub async fn list_enrolled_templates(
+    db: &Db,
+    scope: ConfigurationScope,
+) -> Result<ConfigurationLayers<Vec<(String, String)>>> {
+    configuration_read(db, scope, |tx, guild| {
+        read_layers(guild, |g| list_templates_conn(tx, g))
+    })
+    .await
+}
+
+pub async fn get_enrolled_template(
+    db: &Db,
+    scope: ConfigurationScope,
+    event: &str,
+) -> Result<ConfigurationLayers<Option<String>>> {
+    let event = event.to_owned();
+    configuration_read(db, scope, move |tx, guild| {
+        read_layers(guild, |g| get_template_row_conn(tx, g, &event))
+    })
+    .await
+}
+
+/// Badwords include global rows; log-channel mappings below never inherit them.
+pub async fn list_enrolled_badwords(db: &Db, scope: ConfigurationScope) -> Result<Vec<Badword>> {
+    configuration_read(db, scope, list_badwords_conn).await
+}
+
+pub async fn list_enrolled_log_channels(
+    db: &Db,
+    scope: ConfigurationScope,
+) -> Result<Vec<(String, i64)>> {
+    configuration_read(db, scope, list_log_channels_conn).await
 }

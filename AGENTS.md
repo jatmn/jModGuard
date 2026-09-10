@@ -81,8 +81,11 @@ patches verify using a primary read without mutation receipts. Unban/log-channel
 use the queue. Moderation event/ban/statistics GET routes also require loaded page membership
 and captured primary reads; see `docs/MODERATION-READS.md`. Keep the API guard against
 unscoped moderation helpers. These reads create no receipts or version changes; the primary
-writer lock spans verification and data. Individual configuration GET reads still need
-captured snapshots. Complete tenant isolation and replica coordination remain separate work.
+writer lock spans verification and data. Individual configuration GET reads also require page
+membership and captured primary snapshots, preserving the config-version read floor. Keep
+guild/global layers together, badword inheritance and guild-only log-channel mappings; explicit
+global context remains owner-only. Targeted rule/command/template reads must not load the
+entire configuration bundle. Complete tenant isolation and replica coordination remain separate work.
 
 ## Commands
 

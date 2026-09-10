@@ -208,7 +208,7 @@ async function api(path, method = "GET", body = null, signal) {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|unban|actions|events|bans|stats)(?:\/|\?|$)/);
-  if (edit && (method !== "GET" || ["actions", "events", "bans", "stats"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
+  if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "bans", "stats"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
     opts.headers["x-jmodguard-enrollment"] = state.config.enrollment_id;
   }
   const controller = signal ? null : new AbortController();
