@@ -23,7 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "settings"];
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -207,8 +207,8 @@ async function api(path, method = "GET", body = null, signal) {
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
   // Bind edits to the membership whose configuration this page loaded. Never
   // fetch a new token or retry a rejected edit against a replacement installation.
-  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy)(?:\/|$)/);
-  if (method !== "GET" && edit && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
+  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|unban|actions)(?:\/|$)/);
+  if (edit && (method !== "GET" || edit[2] === "actions") && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
     opts.headers["x-jmodguard-enrollment"] = state.config.enrollment_id;
   }
   const controller = signal ? null : new AbortController();
@@ -222,7 +222,9 @@ async function api(path, method = "GET", body = null, signal) {
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
     if (!res.ok) {
       const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
-      throw apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
+      const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
+      error.code = data && data.code;
+      throw error;
     }
     return data;
   } catch (e) {
@@ -231,6 +233,56 @@ async function api(path, method = "GET", body = null, signal) {
     }
     throw e;
   } finally { if (timeout !== null) clearTimeout(timeout); }
+}
+
+// Persist an unacknowledged request in this browser tab so a lost response or
+// page reload cannot silently create a second intent. Accepted work is visible
+// in Bot actions; this is admission feedback, not a Discord success claim.
+async function submitBotAction(path, method, body) {
+  const canonicalBody = Object.fromEntries(Object.keys(body).sort().map(key => [key, body[key]]));
+  const key = `${workspaceKey()}:action:${method}:${path}:${JSON.stringify(canonicalBody)}`;
+  const enrollmentId = state.config?.enrollment_id;
+  const guildId = path.split("/")[3];
+  if (!enrollmentId || guildId !== state.guildId) throw new Error("Reload this server before requesting an action.");
+  let saved;
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    saved = raw ? JSON.parse(raw) : { request_id: `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`, enrollment_id: enrollmentId };
+    window.sessionStorage.setItem(key, JSON.stringify(saved));
+  } catch (_) {
+    throw new Error("Browser session storage must be available and valid to safely submit bot actions.");
+  }
+  if (!saved || typeof saved.request_id !== "string" || saved.enrollment_id !== enrollmentId) {
+    if (confirm("This saved request belongs to an earlier bot membership. Check Discord for its outcome. Clear the saved request without submitting another action?")) {
+      window.sessionStorage.removeItem(key);
+    }
+    throw new Error("Saved request was not submitted. Review the current server before making a new request.");
+  }
+  const requestId = saved.request_id;
+  let job;
+  try {
+    job = await api(path, method, { ...body, request_id: requestId });
+  } catch (error) {
+    if (((error.status === 410 && error.code === "action_request_expired") ||
+         (error.status === 400 && error.code === "action_request_invalid") ||
+         (error.status === 409 && error.code === "action_enrollment_changed")) &&
+        confirm("The earlier action may already have run, and its result may no longer be listed. Have you checked Bot actions and Discord, and want to clear this saved request? This will not submit another action.")) {
+      window.sessionStorage.removeItem(key);
+      throw new Error("Saved request cleared. Review the current state, then submit again only if another action is needed.");
+    }
+    throw error;
+  }
+  if (!job || typeof job.id !== "string" || job.guild_id !== guildId || job.actor_id !== state.me.user.id || job.enrollment_id !== enrollmentId || !["pending", "claimed", "running", "succeeded", "failed", "uncertain", "cancelled", "expired"].includes(job.state)) {
+    throw new Error("Action acknowledgment was invalid. Check Bot actions; retrying here will reuse the same request ID.");
+  }
+  try { window.sessionStorage.removeItem(key); } catch (_) { /* Retaining the same ID is safe. */ }
+  const completed = job.state === "succeeded";
+  const waiting = ["pending", "claimed", "running"].includes(job.state);
+  toast(completed ? "Bot action completed. See Bot actions for details." :
+    waiting ? "Action queued. Check Bot actions for the result." :
+      `Action ${job.state}: ${job.outcome || "Check Bot actions for details."}`,
+    completed ? "success" : waiting ? "info" : "error");
+  return job;
 }
 
 /** CDN Storage can serve this page while the API origin is still binding or
@@ -377,7 +429,7 @@ function renderTab() {
   const map = {
     dashboard: tabDashboard, rules: tabRules, badwords: tabBadwords, commands: tabCommands,
     templates: tabTemplates, logchannels: tabLogChannels,
-    events: tabEvents, bans: tabBans, settings: tabSettings,
+    events: tabEvents, bans: tabBans, actions: tabActions, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === state.tab);
@@ -970,10 +1022,15 @@ function templateCard(t) {
 // ---------------------------------------------------------------------------
 
 function tabLogChannels() {
+  const guildId = state.guildId;
   return el("div", {},
     el("h2", { text: "Log channels" }),
+    el("button", { class: "btn", text: "Refresh configuration", onclick: async () => {
+      if (!canLeave()) return;
+      if (await loadConfig()) renderTab();
+    } }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Each event type routes to a channel in this server. Enter a channel ID or mention (<#id>)."),
+      "Each event type routes to a channel in this server. Enter a channel ID or mention (<#id>). Changes are queued for bot validation; check Bot actions for results, then refresh this page."),
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
       const scopeSel = scopeSelect("This server", "Global", false);
@@ -983,16 +1040,10 @@ function tabLogChannels() {
         el("button", { class: "btn small primary", text: "Set", onclick: async () => {
           const v = input.value.trim().replace(/[<#>]/g, "");
           if (!v) return toast("Enter a channel id", "error");
-          await api(`/api/guilds/${state.guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
-          if (!await loadConfig()) return;
-          toast("Log channel set", "success");
-          renderTab();
+          await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
         } }),
         el("button", { class: "btn small", text: "Clear", onclick: async () => {
-          await api(`/api/guilds/${state.guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
-          if (!await loadConfig()) return;
-          toast("Cleared", "success");
-          renderTab();
+          await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
         } }),
       );
     }),
@@ -1069,9 +1120,7 @@ function tabBans() {
         el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
           if (!confirm(`Unban ${r.user_id}?`)) return;
           try {
-            await api(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
-            toast("Unbanned", "success");
-            run();
+            await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
           } catch (e) {
             toast(e.message || String(e), "error");
           }
@@ -1085,7 +1134,7 @@ function tabBans() {
   run().catch((e) => toast(e.message, "error"));
   return el("div", {},
     el("h2", { text: "Bans" }),
-    el("p", { class: "muted", style: "margin-bottom:12px" }, "Bans performed by the bot (automod + commands). Unban via the API here or in Discord."),
+    el("p", { class: "muted", style: "margin-bottom:12px" }, "Bans performed by the bot (automod + commands). Request an unban here or unban in Discord. Check Bot actions for queued results."),
     table,
   );
 }
@@ -1093,6 +1142,44 @@ function tabBans() {
 // ---------------------------------------------------------------------------
 // settings
 // ---------------------------------------------------------------------------
+
+function tabActions() {
+  const guildId = state.guildId;
+  const body = el("tbody", {});
+  const table = el("table", {}, el("thead", {}, el("tr", {},
+    ...["Requested", "Action", "Requested by", "Status", "Result", "Controls"].map((text) => el("th", { text })))), body);
+  let request = 0;
+  const run = async () => {
+    const current = ++request;
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 6, text: "Loading…" })));
+    try {
+      const jobs = await api(`/api/guilds/${guildId}/actions`);
+      if (current !== request) return;
+      body.replaceChildren();
+      if (!jobs.length) body.append(el("tr", {}, el("td", { colspan: 6, text: "No bot actions yet." })));
+      for (const job of jobs) {
+        const target = job.action.kind === "unban" ? `Unban ${job.action.user_id}` :
+          `${job.action.event}: ${job.action.channel_id || "clear log channel"}`;
+        body.append(el("tr", {},
+          el("td", { text: new Date(job.created_at * 1000).toLocaleString() }),
+          el("td", { text: target }), el("td", { text: job.actor_id }),
+          el("td", { text: job.state === "uncertain" ? "Outcome unknown" : job.state }),
+          el("td", { text: job.outcome || "—" }),
+          el("td", {}, job.state === "pending" ? el("button", { class: "btn small", text: "Cancel", onclick: async () => {
+            await api(`/api/guilds/${guildId}/actions/${encodeURIComponent(job.id)}`, "DELETE");
+            await run();
+          } }) : null)));
+      }
+    } catch (e) {
+      if (current !== request) return;
+      body.replaceChildren(el("tr", {}, el("td", { colspan: 6, text: "Could not load actions: " + e.message })));
+    }
+  };
+  run();
+  return el("div", {}, el("h2", { text: "Bot actions" }),
+    el("p", { class: "muted", text: "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. You can cancel work that has not yet been claimed." }),
+    el("button", { class: "btn", text: "Refresh", onclick: run }), table);
+}
 
 function tabSettings() {
   const cfg = state.config;

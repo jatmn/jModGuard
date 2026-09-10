@@ -34,26 +34,24 @@ from the DB directly and maintains only its version observation/read floor.
 `BotState` accepts `BotProcessConfig` (no dashboard fields); `ApiState` accepts
 `ApiProcessConfig`. Keep the full loader adapter private. Bot parsing/environment
 application must not retain OAuth config; API loading must retain its CORS/public-origin
-checks. Both config types still need bot tokens for their current Discord operations.
+checks. Only the bot config retains a Discord bot token; the API retains OAuth credentials.
 Common bot/log settings, DB privileges and package dependencies remain transitional.
 Process `db_open_options()` fixes the migration role: bot true, API false. Tracing takes
 only `LogConfig`. See `docs/ARCHITECTURE.md`; this is not an OS secret boundary.
 
-The action queue and dispatch library remain inactive; see `docs/BOT-ACTIONS.md`.
-Do not add runtime admission, workers or cleanup scheduling until enrollment, fresh
-permission checks and dispatch/outcome fencing are complete. Keep claim identity checks,
+The API admits typed administrative actions and the bot dispatches them; see
+`docs/BOT-ACTIONS.md`. Require fresh permissions, page membership and stable request keys. Keep claim identity checks,
 monotonic replay fencing, bounded cleanup and direct log-config supersession atomic.
 Queue history is operational metadata, separate from retained moderation audit records.
-The service-boundary guard allows only storage/dispatch library code and rejects runtime
-queue consumers in this slice. `action_worker` consumes claims once, rechecks fresh bot
+The service-boundary guard rejects unscoped API queue access and API bot-token dispatch. `action_worker` consumes claims once, rechecks fresh bot
 membership and actor permissions, and distinguishes failed validation from uncertain
-mutation outcomes. Reuse the bot HTTP client; no new client/task/cache. WorkerLimits are
-library parameters until activation. Worker completion must use finish_dispatched_bot_action:
+mutation outcomes. Reuse the bot HTTP client; no additional client/cache. One bot task polls and cleans
+bounded batches, with skipped missed ticks. Worker limits/timers are bot-only config. Worker completion must use finish_dispatched_bot_action:
 local log changes check expiry inside the primary transaction; known remote unban results
 may be recorded late. Failed receipts or shutdown must never automatically resend Discord.
 
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
-bind inactive queue storage, the nickname outbox and API configuration scope.
+bind queue storage, the nickname outbox and API configuration scope.
 Positive repair must stay bounded, use the existing bot HTTP/identity, never fetch a
 member roster or infer removal from omissions/errors. Missing/outage Gateway context
 cannot retire an observation. Healthy matching joins write no rows/receipts; resuming a
@@ -62,10 +60,10 @@ configuration version changes on observations.
 Only BotProcessConfig loads enrollment repair controls; API ignores their TOML/env values.
 
 Queue membership changes invalidate old work atomically. Preserve delayed receipt creation
-for matching/stale observation no-ops. Future dashboard queue callers must use captured
+for matching/stale observation no-ops. Dashboard queue callers must use captured
 `*_enrolled_*` scope helpers, not guild-ID helpers that resolve membership at execution.
-Keep old uncertain outcomes separate from newer membership config writes. No queue HTTP
-admission/worker is enabled; full Discord permission/membership checks remain prerequisites.
+Keep old uncertain outcomes separate from newer membership config writes. Admission is
+not success: the browser retains keys after lost responses and exposes receipt states.
 
 The API uses captured configuration operations; see `docs/CONFIGURATION-SCOPES.md`.
 Require fresh Discord permission then primary active membership before guild access.
@@ -75,8 +73,8 @@ Keep request/target and copy source/destination checks in the mutation transacti
 objects confer no user/owner permission. Global targets through guild paths retain the guild
 check; explicit guild-0 routes remain independently owner-only. Preserve settings/read floors,
 nickname/checksum/version and validate-before-replace semantics. Empty captured settings
-patches verify using a primary read without mutation receipts. Direct unban/log-channel
-execution, complete tenant isolation and worker coordination remain separate work.
+patches verify using a primary read without mutation receipts. Unban/log-channel actions
+use the queue. Complete tenant isolation and replica coordination remain separate work.
 
 ## Commands
 
@@ -225,7 +223,7 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   Gateway context must not mutate jobs through a separate guild-only lifecycle helper.
   No initial nickname edit is created on join. Nicknames remain guild-only. Final
   DB checks cannot recall a Discord request already sent or coordinate multiple bot
-  replicas; writer leases and queued administrative dispatch remain later work.
+  replicas; writer leases remain later work.
 - `guild_settings` rows are **partial overrides** (field-level merge: guild →
   global → config terminal defaults from `bot.default_prefix` /
   `bot.retention_days`). Joining a server does **not** insert a settings row.
@@ -277,9 +275,9 @@ src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
 src/db/configuration.rs config CRUD + resolved snapshots
 src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
-src/db/bot_actions.rs   inactive action queue storage
+src/db/bot_actions.rs   action queue storage
 src/bot_actions.rs      typed action payloads and storage limits
-src/action_worker.rs    unscheduled bot dispatch library + validated worker parameters
+src/action_worker.rs    bot dispatch library (worker parameters in bot_actions)
 src/db/moderation.rs    selected moderation records and statistics
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback

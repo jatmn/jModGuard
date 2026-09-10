@@ -78,11 +78,10 @@ state. The bot no longer allocates an OAuth HTTP client or dashboard display cac
 OAuth code is compiled with `web`. API configuration reads remain direct database reads,
 with primary-confirmed version observation and protection against concurrent local writes.
 
-The shared package still exists. The API still requires a bot
-token for direct unban and log-channel validation; the bot uses its Gateway/REST token
-as before. This slice adds no queue, changes no schema or wire contract, and does not
-claim credential/dependency isolation or measured memory savings. The optional conductor
-remains inactive. See [runtime state ownership](ARCHITECTURE.md#runtime-state-ownership).
+The shared package still exists. State separation introduced no schema/dependency change
+and does not establish measured memory savings. Administrative action activation below
+now removes the API's bot token; independent packages remain future work. The optional
+conductor remains inactive. See [runtime ownership](ARCHITECTURE.md#runtime-state-ownership).
 
 ## Implemented: typed process configuration
 
@@ -92,22 +91,20 @@ the API still loads and validates them. Common settings and environment/DB crede
 precedence remain unchanged. DB-open options encode each process's existing migration
 role; tracing consumes only logging settings.
 
-The API retains its bot token for current direct Discord actions. The private common
+The API now omits its bot token following action activation below. The private common
 loader adapter and shared bot/log settings remain implementation scaffolding. This adds
 no queue, schema or dependency change, and does not isolate OS environment/filesystem
 secrets or database privileges. See [process configuration](ARCHITECTURE.md#process-configuration).
 
-## Implemented: inactive durable action storage
+## Implemented: durable action storage
 
 Typed unban/log-channel requests now have transactional deduplication, capacity/target
 exclusion, exclusive claims, claim-bound local completion and bounded resolved-history
 cleanup with a durable replay cutoff. Direct log-channel writes cancel superseded queued
 settings in the same transaction. Migration 0006 extends `jmodguard-core-1`.
 
-This is library groundwork: no HTTP admission, worker, scheduler, process setting or UI
-uses it. Current WebUI actions and the API bot token remain in place. Enrollment identity,
-fresh permission checks and dispatch/outcome protection must be complete before activation.
-No dependency was added. See [the storage contract](BOT-ACTIONS.md).
+This initially landed as library groundwork; membership, dispatch and runtime integration
+follow below. No dependency was added. See [the action contract](BOT-ACTIONS.md).
 
 ## Implemented: bot membership observations
 
@@ -118,7 +115,7 @@ has bot-only configurable page/deadline/pause controls, including a disable swit
 Migration 0007 adds only this observation table. See [membership behavior](ENROLLMENTS.md).
 
 This observation slice did not activate queue or nickname/API enrollment fencing.
-Subsequent nickname binding is described below; direct API actions remain as before.
+Subsequent nickname binding and administrative activation are described below.
 No data erasure, new dependency or tenant-isolation claim is part of this wave.
 
 ## Implemented: membership-bound action storage
@@ -130,8 +127,7 @@ current membership; captured-scope entry points also reject changes since author
 Migration 0008 does not adopt old unbound jobs. Existing reviewed log-write semantics,
 replay cutoff and no-write membership observations are preserved.
 
-This still enables no HTTP queue route or worker. Discord permissions/membership must be
-checked around dispatch before activation; API token removal remains separate.
+Storage binding landed before the fresh dispatch checks and runtime activation below.
 Nickname enrollment binding is now implemented in its own path below. See [the queue contract](BOT-ACTIONS.md#membership-bound-storage).
 
 ## Implemented: nickname request and membership checks
@@ -172,12 +168,12 @@ and retains the selected source for copies. Old pages cannot silently edit a rep
 installation. Retry can restore drafts only within the same membership.
 
 Deploy matching API/frontend builds and reload old pages. Global routes remain owner-only;
-global targets through guild paths retain that page's membership. Direct unban/log-channel
-execution remains in the API, with the bot token still required. No administrative queue
-worker, schema migration, erasure or full tenant-isolation guarantee is added. See
+global targets through guild paths retain that page's membership. Administrative actions
+now use the queue integration below. No schema migration, erasure or full tenant-isolation
+guarantee was added by configuration admission. See
 [the HTTP and browser contract](CONFIGURATION-SCOPES.md#http-and-browser-contract).
 
-## Implemented: unscheduled administrative dispatch library
+## Implemented: administrative dispatch library
 
 The bot dispatch library consumes queued claims once and checks fresh bot membership and
 actor authority before effects. It rechecks primary claim/membership before unban and at
@@ -185,17 +181,38 @@ completion; timeouts and ambiguous results never cause automatic replay. A local
 change that expires while waiting for the primary writer is rejected, while a known remote
 unban result can be recorded late. Existing atomic receipts, audit and version semantics remain.
 
-The library and mock/remote-SQL tests land before runtime activation. No binary schedules
-it, no API/UI admits queue requests, and the API still requires its bot token. Worker limits
-are validated library parameters. No new dependency, schema, client or active task is added.
+The library and mock/remote-SQL tests landed before runtime activation. The worker denies
+actively timed-out non-owner/non-administrator members and warns if a reported completion
+cannot be persisted because the action was superseded or membership ended. It never resends.
 See [the dispatch contract](BOT-ACTIONS.md#dispatch-library). This is not live-provider or
 multi-replica certification.
 
+## Implemented: administrative runtime and API credential separation
+
+The API admits typed unban/log-channel actions after fresh permissions and captured page
+membership checks, returning HTTP202 receipts. Status/cancellation retain those checks and
+filter by current action authority. The frontend saves a request key and membership before
+sending, retains it after an unknown response, and requires explicit clearing before a
+separate new submission after expiry or membership change. The Actions tab refreshes on
+request and permits pending cancellation; it never treats admission as completed moderation.
+
+One bot task sequentially drains bounded batches using the existing HTTP client and real
+Gateway identity. A second timer in that task prunes bounded resolved history; missed ticks
+are skipped. Validated storage policy is shared by bot/API; worker limits and scheduling
+are bot-only. The API removes its bot-token config field, startup requirement and client;
+OAuth still handles login and fresh guild permissions. No schema, dependency or new client
+is added. Deploy matching bot/API/frontend builds, bot first, and reload old pages.
+
+Local HTTP/browser tests cover replay, stale membership, action-specific permissions,
+status/cancellation and invalid/expired keys. An actual API process starts without a bot
+token. Storage/worker tests use mock Discord and disposable loopback libSQL, not live
+provider operations. One bot and one API remain the supported topology; database write
+credentials are still shared. See [runtime controls](BOT-ACTIONS.md#runtime-controls).
+
 ## Next implementation slices
 
-1. Complete credential separation. Replace API bot-token operations with typed,
-   durable bot actions, preserving current guild permission checks and explicit outcomes.
-   Complete bot/API crate boundaries without pulling gateway/cache state into the API.
+1. Complete independent bot/API crate boundaries without pulling gateway/cache state
+   into the API. Preserve the merged queue, browser, worker and Buildkite protections.
 2. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient
    message context. Correct exact repeated-image matching in the actual event pipeline.
@@ -209,5 +226,5 @@ multi-replica certification.
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
 provider durability, distributed writer exclusion, access policy or billed resource use.
-Database credential separation, API bot-token removal and operational conductor features
+Database credential separation and operational conductor features
 remain pending. Logging changes are described above; they do not establish full guild erasure.

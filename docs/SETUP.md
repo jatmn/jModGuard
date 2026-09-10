@@ -138,7 +138,9 @@ owner_id = 123456789012345678               # your Discord user ID
 - **`owner_id` is required for global config.** Leaving it at `0` blocks every
   WebUI “Global” edit (global prefix, global rules/commands/templates/badwords).
   The API logs a startup warning when `owner_id` is unset.
-- The bot token can also be set via the environment: `JMODGUARD_DISCORD_TOKEN`.
+- Only the bot needs the bot token (`JMODGUARD_DISCORD_TOKEN`); the API uses OAuth.
+  Deploy matching bot/API/frontend builds. Administrative changes are queued; use the
+  Actions tab to refresh their status. See [action settings](BOT-ACTIONS.md#runtime-controls).
 
 ## 7. Run
 

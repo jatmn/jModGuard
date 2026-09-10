@@ -1,9 +1,10 @@
-# Durable action storage and dispatch library (inactive)
+# Queued administrative actions
 
-The library has a queue for typed unban and log-channel requests. Neither service admits
-these requests, dispatches them, schedules cleanup or exposes them through HTTP/the WebUI.
-Existing unban and log-channel validation still run directly in the API using its bot
-token. The nickname outbox remains a separate active path; see
+The API queues typed unban and log-channel requests and returns HTTP 202 with a receipt.
+The bot executes them using its existing Discord client. The WebUI reports pending work
+and provides an Actions tab for manual status refresh and pending cancellation. Acceptance
+is not completion. The API needs OAuth credentials but no bot token.
+The nickname outbox remains a separate active path; see
 [nickname membership checks](ENROLLMENTS.md#nickname-reconciliation).
 
 ## Storage contract
@@ -45,12 +46,11 @@ token. The nickname outbox remains a separate active path; see
   or a later retention increase. Extant matching receipts can acknowledge retries only
   within their original current membership.
 
-`bot_actions::Limits` supplies storage-only defaults: 32 active requests per guild,
+`bot_actions::Limits`, configured through `[actions]` in both services, supplies defaults: 32 active requests per guild,
 300-second maximum age, seven-day resolved-history retention and 128-row cleanup batch.
-They are library parameters with validation, **not runtime settings or active schedules**.
-No queue maintenance task or new dependency is added. A future activation must expose
-appropriate controls and run bounded housekeeping; this slice creates no runtime queue
-traffic. Protocol forward clock tolerance is five minutes. Poll-time expiry processing
+The bot runs one sequential task with poll and cleanup timers, skipping missed ticks.
+Polling defaults to five seconds and cleanup to one hour. No new client or dependency is
+added; the worker waits for a real Gateway bot identity before draining. Protocol forward clock tolerance is five minutes. Poll-time expiry processing
 is capped at 64 rows per state group and recent history reads at 50 rows.
 
 ## Membership-bound storage
@@ -63,7 +63,7 @@ and does not block a new membership's target. Direct log writes do not cancel th
 uncertain record; erasure/reconciliation remain separate work.
 
 Use `enqueue_enrolled_bot_action`, `enrolled_bot_action`, `recent_enrolled_bot_actions`
-and `cancel_enrolled_bot_action` for future callers that have captured membership during
+and `cancel_enrolled_bot_action` for API callers that have captured membership during
 authorization. Each verifies guild, enrollment ID and join timestamp inside the primary
 transaction before admitting/replaying, reading or cancelling. Changed identity returns
 `EnrollmentChanged`; failed membership verification returns `EnrollmentUnverified` without
@@ -71,22 +71,20 @@ exposing database details. These values identify a scope; they grant no user per
 
 The existing guild-ID helpers remain trusted internal operations: they resolve current
 membership at the operation, without protecting an earlier authorization snapshot. They
-must not replace captured-scope helpers in future dashboard routes. Status reads hide
+must not replace captured-scope helpers in dashboard routes. Status reads hide
 old/unbound memberships. `bot_action_can_dispatch` rechecks running claim identity and
 current membership at the primary; it does not perform Discord validation or a mutation.
 
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
-bot first; rollback needs matched pre-upgrade backup/binaries. This is an internal library
-contract change with no current HTTP producer or running worker.
+bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage remains steps 0001–0009.
 
 ## Dispatch library
 
-`action_worker` now provides a bot-side executor and sequential batch drain. Neither
-binary calls it yet: there is no queue producer, scheduler, cleanup task or runtime setting.
-Existing direct API operations and the active nickname worker keep their current behavior.
-The service-boundary guard permits this library and its tests, but rejects runtime use.
+`action_worker` provides the bot-side executor and sequential batch drain, scheduled by
+`jmodguard-bot`. The API uses only captured admission/read/cancel helpers. The
+service-boundary guard rejects unscoped API queue access and bot-token dispatch in the API.
 
 The executor consumes an immutable claim on the primary before any Discord operation.
 A copied/stale/modified claim cannot begin again. It checks the bot's own join timestamp
@@ -132,7 +130,7 @@ remain prerequisites for broader guarantees.
 four sequential actions per drain and 15 seconds per validation/Discord operation block.
 Validation accepts 1–64 actions and 1–120 seconds and runs before consuming a claim.
 These are implementation defaults/bounds, not measured capacity or active deployment
-requirements. The activation wave must expose appropriate bot configuration controls.
+requirements. Bot-only `[action_worker]` configuration exposes these limits and timers.
 Claim and receipt SQL retain the existing database operation deadlines outside that block.
 
 Local worker tests cover duplicate/modified claims, cancellation/expiry, permission and
@@ -141,14 +139,48 @@ request timeouts, abandoned dispatch, receipt rollback, batch bounds and late lo
 The disposable remote-libSQL smoke exercises lost completion responses without resending
 and deadline-aware log completion. Mock outcomes do not validate live Discord behavior.
 
-## Activation prerequisites
+## HTTP, browser and deployment contract
 
-Runtime scheduling and API queue admission remain prohibited by the service-boundary check.
-A follow-up must use the captured membership throughout authorization/admission, enforce fresh Discord
-permissions and membership around admission/dispatch, and handle expiry, ambiguous results and late completions without replay or false success.
-It must also provide appropriate UI outcomes, runtime limits and cleanup scheduling.
-Do not remove the API bot token until all current API Discord operations have a complete
-replacement. Public library helpers are trusted internal operations, not a security API.
+Unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and clear log channel
+(`DELETE .../logchannels/{event}`) require a JSON `request_id` and the loaded page's
+`x-jmodguard-enrollment` header. Routes are under `/api/guilds/{guild_id}`. Actor identity
+comes from the session, never the body. Every request rechecks Discord permissions.
+`GET .../actions` and `DELETE .../actions/{id}` also require the page membership; status
+returns up to the latest 50 receipts filtered to the caller's current action permissions.
+Only pending work can be cancelled. Global guild-0 paths do not admit actions.
+
+The browser saves the request key, payload identity and membership in session storage
+before sending. A lost response retains that key across retries/reloads in the same tab.
+It clears it only after a valid receipt or explicit user confirmation. Old-membership,
+expired or invalid keys require explicit clearing and a separate reviewed submission;
+there is no automatic retry with a new key. Denied session storage prevents submission.
+The Actions tab uses manual refresh, with no background polling. Refresh log configuration
+or bans after completion to see the applied result. “Outcome unknown” requires inspection;
+submitting fresh work can repeat an effect already performed.
+
+Deploy matching bot, API and frontend builds, bot first, and reload old browser pages.
+Older clients without request IDs/page headers are rejected. Use one bot and one API;
+shared sessions, distributed worker ownership and complete tenant isolation remain future
+work. Both services still require database write access. Public library helpers are trusted
+internal operations, not a security API. Assign the bot token only to the bot and OAuth
+credentials only to the API; ignoring a shared file's fields does not hide its raw contents.
+
+## Runtime controls
+
+Environment overrides TOML. `[actions]` is shared; configure the same storage policy in
+both processes. `[action_worker]` is bot-only and ignored by the API. UI controls remain
+future work. All timers must be positive; protocol bounds remain validated in code.
+
+| Section / field | Default | Environment override |
+|---|---:|---|
+| `actions.pending_per_guild` | 32 | `JMODGUARD_ACTION_PENDING_PER_GUILD` |
+| `actions.max_age_secs` | 300 | `JMODGUARD_ACTION_MAX_AGE_SECS` |
+| `actions.history_retention_secs` | 604800 | `JMODGUARD_ACTION_HISTORY_RETENTION_SECS` |
+| `actions.cleanup_batch_size` | 128 | `JMODGUARD_ACTION_CLEANUP_BATCH_SIZE` |
+| `action_worker.poll_secs` | 5 | `JMODGUARD_ACTION_POLL_SECS` |
+| `action_worker.cleanup_interval_secs` | 3600 | `JMODGUARD_ACTION_CLEANUP_INTERVAL_SECS` |
+| `action_worker.batch_size` | 4 | `JMODGUARD_ACTION_BATCH_SIZE` |
+| `action_worker.request_timeout_secs` | 15 | `JMODGUARD_ACTION_REQUEST_TIMEOUT_SECS` |
 
 Migrations 0006 and 0008 extend the recognized `jmodguard-core-1` baseline; start the matching bot
 before the API. See [schema/setup and rollback boundaries](DATABASE-BASELINE.md).

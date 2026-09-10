@@ -10,6 +10,8 @@ use crate::db::{DbOpenOptions, MAX_RETENTION_DAYS};
 #[derive(Default)]
 // Private loader adapter; runtime constructors accept only a process configuration.
 struct Config {
+    pub actions: crate::bot_actions::Limits,
+    pub action_worker: ActionWorkerConfig,
     pub enrollment: EnrollmentConfig,
     pub discord: DiscordConfig,
     pub db: DbConfig,
@@ -189,6 +191,8 @@ impl EnrollmentConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct BotProcessConfig {
+    pub actions: crate::bot_actions::Limits,
+    pub action_worker: ActionWorkerConfig,
     pub enrollment: EnrollmentConfig,
     pub discord: DiscordConfig,
     pub db: DbConfig,
@@ -196,12 +200,14 @@ pub struct BotProcessConfig {
     pub log: LogConfig,
 }
 
-/// API process configuration. The bot token remains required for direct REST actions;
-/// remove it only when those operations have a complete replacement.
+/// API process configuration has no bot credential or worker controls.
+/// ```compile_fail
+/// fn bot_secret(cfg: &jmodguard::config::ApiProcessConfig) { let _ = &cfg.discord; }
+/// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ApiProcessConfig {
-    pub discord: DiscordConfig,
+    pub actions: crate::bot_actions::Limits,
     pub db: DbConfig,
     pub web: WebConfig,
     pub bot: BotConfig,
@@ -211,6 +217,8 @@ pub struct ApiProcessConfig {
 impl From<Config> for BotProcessConfig {
     fn from(c: Config) -> Self {
         Self {
+            actions: c.actions,
+            action_worker: c.action_worker,
             enrollment: c.enrollment,
             discord: c.discord,
             db: c.db,
@@ -222,7 +230,7 @@ impl From<Config> for BotProcessConfig {
 impl From<Config> for ApiProcessConfig {
     fn from(c: Config) -> Self {
         Self {
-            discord: c.discord,
+            actions: c.actions,
             db: c.db,
             web: c.web,
             bot: c.bot,
@@ -233,6 +241,8 @@ impl From<Config> for ApiProcessConfig {
 impl From<BotProcessConfig> for Config {
     fn from(c: BotProcessConfig) -> Self {
         Self {
+            actions: c.actions,
+            action_worker: c.action_worker,
             enrollment: c.enrollment,
             discord: c.discord,
             db: c.db,
@@ -245,8 +255,10 @@ impl From<BotProcessConfig> for Config {
 impl From<ApiProcessConfig> for Config {
     fn from(c: ApiProcessConfig) -> Self {
         Self {
+            actions: c.actions,
+            action_worker: ActionWorkerConfig::default(),
             enrollment: EnrollmentConfig::default(),
-            discord: c.discord,
+            discord: DiscordConfig::default(),
             db: c.db,
             web: c.web,
             bot: c.bot,
@@ -310,8 +322,10 @@ impl Config {
             Self::default()
         };
         cfg.apply_env_for(api)?;
+        cfg.actions.validate()?;
         if !api {
             cfg.enrollment.validate()?;
+            cfg.action_worker.validate()?;
         }
         Ok(cfg)
     }
@@ -399,10 +413,34 @@ impl Config {
     fn apply_env_for(&mut self, api: bool) -> Result<()> {
         if !api {
             self.enrollment.apply_env()?;
+            self.action_worker.apply_env()?;
+            if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
+                self.discord.token = v.trim().to_string();
+            }
         }
-        if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
-            self.discord.token = v.trim().to_string();
+        for (name, target) in [
+            (
+                "JMODGUARD_ACTION_PENDING_PER_GUILD",
+                &mut self.actions.pending_per_guild,
+            ),
+            (
+                "JMODGUARD_ACTION_MAX_AGE_SECS",
+                &mut self.actions.max_age_secs,
+            ),
+            (
+                "JMODGUARD_ACTION_HISTORY_RETENTION_SECS",
+                &mut self.actions.history_retention_secs,
+            ),
+            (
+                "JMODGUARD_ACTION_CLEANUP_BATCH_SIZE",
+                &mut self.actions.cleanup_batch_size,
+            ),
+        ] {
+            if let Ok(value) = env::var(name) {
+                *target = value.parse().with_context(|| format!("invalid {name}"))?;
+            }
         }
+        self.actions.validate()?;
         if let Ok(v) = env::var("JMODGUARD_DB_PATH") {
             self.db.path = PathBuf::from(v.trim());
         }
@@ -644,6 +682,49 @@ mod tests {
     }
 
     #[test]
+    fn action_configuration_separates_admission_from_bot_scheduling() {
+        let raw = "[actions]\npending_per_guild=7\nmax_age_secs=30\n[action_worker]\npoll_secs=9\nbatch_size=2\nrequest_timeout_secs=4\ncleanup_interval_secs=90\n";
+        let bot = Config::parse_file(raw, false).unwrap();
+        let api = Config::parse_file(raw, true).unwrap();
+        assert_eq!(bot.actions.pending_per_guild, 7);
+        assert_eq!(api.actions.pending_per_guild, 7);
+        assert_eq!(bot.action_worker.poll_secs, 9);
+        assert_eq!(bot.action_worker.limits.batch_size, 2);
+        assert_eq!(bot.action_worker.limits.request_timeout_secs, 4);
+        bot.action_worker.validate().unwrap();
+        assert_eq!(api.action_worker.poll_secs, 5);
+        assert!(Config::parse_file("[action_worker]\npoll_secs='bad'", true).is_ok());
+        assert!(Config::parse_file("[action_worker]\npoll_secs='bad'", false).is_err());
+        assert!(Config::parse_file("[actions]\npending_per_guild='bad'", true).is_err());
+    }
+
+    #[test]
+    fn worker_environment_overrides_are_validated_only_by_bot() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&[
+            "JMODGUARD_ACTION_POLL_SECS",
+            "JMODGUARD_ACTION_BATCH_SIZE",
+            "JMODGUARD_ACTION_PENDING_PER_GUILD",
+        ]);
+        unsafe {
+            std::env::set_var("JMODGUARD_ACTION_POLL_SECS", "0");
+            std::env::set_var("JMODGUARD_ACTION_PENDING_PER_GUILD", "5");
+        }
+        let mut api = Config::default();
+        api.apply_env_for(true).unwrap();
+        assert_eq!(api.actions.pending_per_guild, 5);
+        let mut bot = Config::default();
+        assert!(bot.apply_env_for(false).is_err());
+        unsafe {
+            std::env::set_var("JMODGUARD_ACTION_POLL_SECS", "8");
+            std::env::set_var("JMODGUARD_ACTION_BATCH_SIZE", "2");
+        }
+        bot.apply_env_for(false).unwrap();
+        assert_eq!(bot.action_worker.poll_secs, 8);
+        assert_eq!(bot.action_worker.limits.batch_size, 2);
+    }
+
+    #[test]
     fn bot_file_ignores_dashboard_fields_but_api_validates_them() {
         let raw = "[discord]\ntoken='bot-token'\n[web]\noauth_client_secret=123\nbind=[]\n";
         let bot = Config::parse_file(raw, false).unwrap();
@@ -653,7 +734,7 @@ mod tests {
         // TOML syntax still has to be valid, even in an ignored section.
         assert!(Config::parse_file("[web]\nbind=[", false).is_err());
         assert!(Config::parse_file("[discord]\ntoken=123", false).is_err());
-        assert!(Config::parse_file("[discord]\ntoken=123", true).is_err());
+        assert!(Config::parse_file("[discord]\ntoken=123", true).is_ok());
     }
 
     #[test]
@@ -754,7 +835,7 @@ mod tests {
         assert_eq!(api.web.oauth_client_secret, "oauth-secret");
         assert_eq!(api.web.base_url, "https://dashboard.invalid");
         assert_eq!(bot.discord.token, "bot-secret");
-        assert_eq!(api.discord.token, "bot-secret");
+        assert!(api.discord.token.is_empty());
     }
 
     #[test]
@@ -1055,5 +1136,52 @@ mod tests {
             err.to_string().contains("bot.retention_days"),
             "unexpected: {err:#}"
         );
+    }
+}
+
+/// Bot-only queue scheduling. API ignores this file section and its environment keys.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ActionWorkerConfig {
+    pub poll_secs: u32,
+    pub cleanup_interval_secs: u32,
+    #[serde(flatten)]
+    pub limits: crate::bot_actions::WorkerLimits,
+}
+impl Default for ActionWorkerConfig {
+    fn default() -> Self {
+        Self {
+            poll_secs: 5,
+            cleanup_interval_secs: 3600,
+            limits: Default::default(),
+        }
+    }
+}
+impl ActionWorkerConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.poll_secs > 0 && self.cleanup_interval_secs > 0,
+            "action intervals must be positive"
+        );
+        self.limits.validate()
+    }
+    fn apply_env(&mut self) -> Result<()> {
+        for (name, target) in [
+            ("JMODGUARD_ACTION_POLL_SECS", &mut self.poll_secs),
+            (
+                "JMODGUARD_ACTION_CLEANUP_INTERVAL_SECS",
+                &mut self.cleanup_interval_secs,
+            ),
+            ("JMODGUARD_ACTION_BATCH_SIZE", &mut self.limits.batch_size),
+            (
+                "JMODGUARD_ACTION_REQUEST_TIMEOUT_SECS",
+                &mut self.limits.request_timeout_secs,
+            ),
+        ] {
+            if let Ok(value) = env::var(name) {
+                *target = value.parse().with_context(|| format!("invalid {name}"))?;
+            }
+        }
+        self.validate()
     }
 }
