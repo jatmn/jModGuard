@@ -4,6 +4,7 @@
 //! - `jmodguard-bot` — Discord gateway only
 //! - `jmodguard-api` — axum HTTP API / WebUI only
 
+pub mod action_worker;
 pub mod automod;
 pub mod bot_actions;
 pub mod commands;

@@ -149,6 +149,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_action_storage(&bot, &api).await;
     exercise_membership_storage(&bot, &api).await;
     exercise_captured_action_membership(&bot, &api).await;
+    exercise_dispatch_completion(&bot).await;
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
 
@@ -499,5 +500,106 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
     assert_eq!(
         get_settings_primary(api, 501).await.unwrap().prefix,
         "source"
+    );
+}
+
+async fn exercise_dispatch_completion(bot: &Db) {
+    use jmodguard::action_worker::{DiscordActions, Outcome, WorkerLimits, execute};
+    use jmodguard::bot_actions::{Action, Limits};
+    use jmodguard::db::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ReceiptLoss(AtomicUsize);
+    #[serenity::async_trait]
+    impl DiscordActions for ReceiptLoss {
+        async fn membership_matches(&self, _: &BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            test_drop_next_commit_response();
+            Outcome {
+                state: "succeeded",
+                code: "unbanned",
+            }
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    enroll_guild(bot, 600, 1).await.unwrap();
+    let job = enqueue_bot_action(
+        bot,
+        600,
+        42,
+        &format!("{now}_worker"),
+        Action::Unban {
+            user_id: 99,
+            reason: "fixture".into(),
+        },
+        now,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    let claim = claim_bot_action(bot, now).await.unwrap().unwrap();
+    assert_eq!(claim.id, job.id);
+    let discord = ReceiptLoss(AtomicUsize::new(0));
+    execute(bot, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    execute(bot, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(discord.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        bot_action(bot, 600, &job.id).await.unwrap().unwrap().state,
+        "succeeded"
+    );
+    let audits = query_events(bot, 600, None, None, 10).await.unwrap();
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|event| event.event_type == "member_unban")
+            .count(),
+        1
+    );
+
+    let old = now - 1000;
+    let job = enqueue_bot_action(
+        bot,
+        600,
+        42,
+        &format!("{old}_late-log"),
+        Action::SetLogChannel {
+            event: "message_edit".into(),
+            channel_id: Some(123),
+        },
+        old,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    let claim = claim_bot_action(bot, old).await.unwrap().unwrap();
+    assert_eq!(claim.id, job.id);
+    assert!(begin_bot_action(bot, &claim, old).await.unwrap());
+    let before = get_primary_versions(bot).await.unwrap();
+    test_drop_next_commit_response();
+    assert!(
+        finish_dispatched_bot_action(bot, &claim, "succeeded", "log_channel_set")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        bot_action(bot, 600, &job.id).await.unwrap().unwrap().state,
+        "failed"
+    );
+    assert!(list_log_channels(bot, 600).await.unwrap().is_empty());
+    assert_eq!(
+        get_primary_versions(bot).await.unwrap().config_revision,
+        before.config_revision
     );
 }

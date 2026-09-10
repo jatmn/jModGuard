@@ -17,7 +17,7 @@ def main():
             continue
         source = path.read_text()
         for forbidden in ("crate::state::", "jmodguard::state::", "enrollment_repair::",
-                          "enroll_guild(", "retire_guild_enrollment(", "nickname_worker::"):
+                          "enroll_guild(", "retire_guild_enrollment(", "nickname_worker::", "action_worker::"):
             if forbidden in source:
                 raise SystemExit(f"Bot state dependency in API: {path}: {forbidden}")
     for name in ("src/state.rs", "src/bin/jmodguard-bot.rs"):
@@ -28,16 +28,22 @@ def main():
     print("Bot/API runtime state boundaries pass")
 
     # Queue storage is intentionally inactive until enrollment, authorization and
-    # dispatch/outcome fencing land together. DB helpers and their tests are allowed;
+    # dispatch/outcome fencing land together. DB/dispatch libraries and tests are allowed;
     # runtime consumers must be an explicit change to this boundary.
-    queue_names = re.compile(r"\b(?:enqueue_enrolled_bot_action|enrolled_bot_action|recent_enrolled_bot_actions|cancel_enrolled_bot_action|bot_action_can_dispatch|enqueue_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|cancel_bot_action|prune_bot_action_history|recent_bot_actions|bot_action|bot_actions)\b")
+    queue_names = re.compile(r"\b(?:enqueue_enrolled_bot_action|enrolled_bot_action|recent_enrolled_bot_actions|cancel_enrolled_bot_action|bot_action_can_dispatch|enqueue_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|finish_dispatched_bot_action|cancel_bot_action|prune_bot_action_history|recent_bot_actions|bot_action|bot_actions)\b")
     for path in (ROOT / "src").rglob("*.rs"):
         relative = path.relative_to(ROOT / "src")
-        if relative.parts[0] == "db" or relative.as_posix() in {"db.rs", "bot_actions.rs", "lib.rs"}:
+        if relative.parts[0] == "db" or relative.as_posix() in {"db.rs", "bot_actions.rs", "lib.rs", "action_worker.rs"} or relative.parts[0] == "action_worker":
             continue
         if queue_names.search(path.read_text()):
             raise SystemExit(f"Inactive queue consumed by runtime code: {path}")
-    print("Action queue remains storage-only")
+    for path in (ROOT / "src").rglob("*.rs"):
+        relative = path.relative_to(ROOT / "src")
+        if relative.as_posix() in {"lib.rs", "action_worker.rs"} or relative.parts[0] == "action_worker":
+            continue
+        if re.search(r"\baction_worker\b", path.read_text()):
+            raise SystemExit(f"Inactive dispatch worker consumed by runtime code: {path}")
+    print("Action queue and dispatch library remain unscheduled")
 
     # Captured configuration primitives are not API authorization on their own.
     # DB/API adoption includes admission and browser tokens; bot paths remain separate.
