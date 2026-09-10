@@ -136,7 +136,18 @@ fn actor_authorized(
         Action::SetLogChannel { .. } => Permissions::MANAGE_GUILD,
     };
     let permissions = guild.member_permissions(member);
-    guild.owner_id == member.user.id || permissions.administrator() || permissions.contains(needed)
+    if guild.owner_id == member.user.id || permissions.administrator() {
+        return true;
+    }
+    // Serenity's role calculation does not include Discord's member timeout.
+    // Timed-out members retain only view/history permissions until it expires.
+    if member
+        .communication_disabled_until
+        .is_some_and(|until| until > serenity::model::Timestamp::now())
+    {
+        return false;
+    }
+    permissions.contains(needed)
 }
 
 fn classify_unban_response(status: u16, code: isize) -> Outcome {
@@ -221,7 +232,15 @@ pub async fn execute(
             Outcome::failed("validation_timed_out")
         }
     });
-    db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await?;
+    if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
+        tracing::warn!(
+            action_id = %job.id,
+            reported_state = outcome.state,
+            reported_outcome = outcome.code,
+            mutation_started = mutation_started.load(std::sync::atomic::Ordering::Relaxed),
+            "bot action completion rejected; recorded state preserved; action will not be resent"
+        );
+    }
     Ok(())
 }
 /// Bounded sequential batch. No process restart or lease expiry replays a claim.

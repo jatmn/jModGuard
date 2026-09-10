@@ -92,7 +92,9 @@ The executor consumes an immutable claim on the primary before any Discord opera
 A copied/stale/modified claim cannot begin again. It checks the bot's own join timestamp
 through REST, then fetches the acting user's member record and guild roles. Unban requires
 BAN_MEMBERS; log configuration requires MANAGE_GUILD. Guild owner and administrator
-permissions are honored; installation-owner status grants no dispatch bypass. No OAuth,
+permissions are honored; installation-owner status grants no dispatch bypass. An active
+member timeout denies either action for non-owner, non-administrator actors, even when
+their roles retain the required permission; authorization resumes after expiry. No OAuth,
 member roster, message cache, new client or additional library is needed. Callers supply
 the bot's existing HTTP client and real cached bot identity; placeholder identity is refused.
 
@@ -116,8 +118,11 @@ The existing trusted `finish_bot_action` data-layer helper retains its earlier c
 worker integrations must use the deadline-aware variant.
 
 If receipt persistence fails after Discord was called, local effects roll back together;
-the worker reports the error and never resends the action. Aborting a worker after begin
-leaves consumed work running; later expiry processing marks it uncertain. No restart or
+the worker reports the error and never resends the action. If completion is rejected
+because the action was superseded or its membership ended, the worker warns with the
+action ID, reported state/outcome and whether the remote mutation started. It preserves
+the recorded cancellation or uncertainty and does not retry the action. Aborting a worker
+after begin leaves consumed work running; later expiry processing marks it uncertain. No restart or
 claim timeout reclaims it. This favors avoiding duplicate effects over automatic completion.
 A missed departure, a permission change after the REST check, or a request already sent
 cannot be made atomic with SQL. Replica writer coordination and live Discord validation

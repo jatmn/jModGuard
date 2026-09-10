@@ -614,6 +614,30 @@ fn rest_actor_permissions_use_current_roles_and_action_specific_authority() {
     }
     member.roles.clear(); // A removed role cannot keep cached administrator authority.
     assert!(!actor_authorized(&guild, &member, &unban(99)));
+
+    member.roles = vec![role.id];
+    role.permissions = Permissions::BAN_MEMBERS | Permissions::MANAGE_GUILD;
+    guild.roles.insert(role.id, role.clone());
+    member.communication_disabled_until =
+        Some(serenity::model::Timestamp::from_unix_timestamp(now() + 3600).unwrap());
+    for action in [unban(99), log_channel(Some(123)), log_channel(None)] {
+        assert!(!actor_authorized(&guild, &member, &action));
+    }
+    for timeout in [
+        None,
+        Some(serenity::model::Timestamp::from_unix_timestamp(now() - 1).unwrap()),
+    ] {
+        member.communication_disabled_until = timeout;
+        assert!(actor_authorized(&guild, &member, &unban(99)));
+        assert!(actor_authorized(&guild, &member, &log_channel(None)));
+    }
+    member.communication_disabled_until =
+        Some(serenity::model::Timestamp::from_unix_timestamp(now() + 3600).unwrap());
+    role.permissions = Permissions::ADMINISTRATOR;
+    guild.roles.insert(role.id, role);
+    assert!(actor_authorized(&guild, &member, &unban(99)));
+    assert!(actor_authorized(&guild, &member, &log_channel(None)));
+    member.roles.clear();
     guild.owner_id = member.user.id;
     assert!(actor_authorized(&guild, &member, &unban(99)));
     assert!(actor_authorized(&guild, &member, &log_channel(None)));
@@ -785,4 +809,155 @@ async fn aborted_worker_does_not_reclaim_a_dispatched_mutation() {
     drain(&f.db, &mock, &WorkerLimits::default()).await.unwrap();
     assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.status(&original).await.state, "uncertain");
+}
+
+#[tokio::test]
+async fn rejected_completion_reports_outcome_without_overwriting_or_resending() {
+    // Other tests exercise the same tracing callsite without a subscriber.
+    // Capture diagnostics in an isolated process rather than installing a global
+    // subscriber that would alter logging for the entire parallel test suite.
+    const CHILD: &str = "JMODGUARD_RECEIPT_LOG_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "action_worker::tests::rejected_completion_reports_outcome_without_overwriting_or_resending",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct SupersedeDuringDispatch<'a> {
+        db: &'a Db,
+        calls: AtomicUsize,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for SupersedeDuringDispatch<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, guild: i64, _: i64) -> Result<bool> {
+            db::upsert_log_channel(self.db, guild, "message_edit", 456).await?;
+            Ok(true)
+        }
+        async fn unban(&self, guild: i64, _: i64, _: &str) -> Outcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            db::retire_guild_enrollment(self.db, guild, 1)
+                .await
+                .unwrap();
+            db::enroll_guild(self.db, guild, 2).await.unwrap();
+            Outcome::succeeded("unbanned")
+        }
+    }
+
+    let log = CapturedLog(Arc::new(Mutex::new(Vec::new())));
+    let writer = log.clone();
+    let subscriber = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    for action in [unban(99), log_channel(Some(123))] {
+        log.0.lock().unwrap().clear();
+        let f = Fixture::new();
+        let remote = matches!(action, Action::Unban { .. });
+        let job = f.enqueue(10, "rejected_receipt", action).await;
+        let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+        let discord = SupersedeDuringDispatch {
+            db: &f.db,
+            calls: AtomicUsize::new(0),
+        };
+        execute(&f.db, &discord, &claim, &WorkerLimits::default())
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("bot action completion rejected"),
+            "{output}"
+        );
+        assert!(output.contains(&job.id), "{output}");
+        assert!(output.contains("reported_state=\"succeeded\""), "{output}");
+        let outcome = if remote {
+            "unbanned"
+        } else {
+            "log_channel_set"
+        };
+        assert!(output.contains(outcome), "{output}");
+        assert!(
+            output.contains(&format!("mutation_started={remote}")),
+            "{output}"
+        );
+        execute(&f.db, &discord, &claim, &WorkerLimits::default())
+            .await
+            .unwrap();
+        let id = job.id.clone();
+        let (state, outcome): (String, String) =
+            f.db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT state,outcome FROM bot_actions WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        if remote {
+            assert_eq!(
+                (state.as_str(), outcome.as_str()),
+                ("uncertain", "enrollment_ended")
+            );
+            assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(
+                (state.as_str(), outcome.as_str()),
+                ("cancelled", "superseded_by_config_write")
+            );
+            assert_eq!(
+                db::list_log_channels(&f.db, 10).await.unwrap(),
+                vec![("message_edit".into(), 456)]
+            );
+            assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+        }
+        assert!(
+            db::query_events(&f.db, 10, None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reopened = Db::open(&f.path, 2).unwrap();
+        assert!(
+            db::claim_bot_action(&reopened, now() + 1000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
