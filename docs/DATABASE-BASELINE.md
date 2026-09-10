@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0009. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0010. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -84,3 +84,12 @@ already exists. They require a fresh settings save or Re-sync after membership o
 startup and rejoin never adopt them. Settings/moderation records remain intact. Deploy
 matched bot/API builds, bot first. Version8 binaries reject version9; rollback requires
 matching pre-upgrade backup and binaries. No live upgrade/restore automation is supplied.
+
+## Guild-store catalog extension
+
+Migration0010 adds empty `guild_store_catalog` and `guild_store_placements` tables with
+SQL constraints/triggers for valid shared/dedicated ownership. It does not infer placements
+from existing configuration, membership or data and does not move any records. Current
+bot/API operation continues against the configured database. Deploy matched builds, bot
+first; version9 binaries reject version10. Rollback requires matching pre-upgrade backup
+and binaries. See [catalog scope and limits](GUILD-STORES.md).

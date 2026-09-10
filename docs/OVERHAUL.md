@@ -251,9 +251,20 @@ section/key queries instead of loading the full bundle. No schema, dependency, c
 polling is added. Deploy matching API/frontend builds and reload old pages. See
 [individual configuration reads](CONFIGURATION-SCOPES.md#individual-configuration-reads).
 
+## Implemented: inactive guild-store catalog
+
+The data layer can register an opaque shared/dedicated store identity and assign an initial
+guild placement with a revision. Dedicated ownership is enforced by both transactional
+helpers and SQL triggers without foreign-key PRAGMA dependence. Matching retries write no
+receipts; actual writes retain lost-commit recovery. Conflicting registrations and placement
+changes are refused. Migration0010 starts empty, preserving current records and runtime.
+There are no credentials, provider resources, routing caches, extra pools or tasks. Matched
+bot/API builds are required. See [the catalog contract](GUILD-STORES.md).
+
 ## Next implementation slices
 
-1. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
+1. Build on the inactive catalog with actual store identity verification, data-side placement
+   checks and the fresh data model/tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient
    message context. Correct exact repeated-image matching in the actual event pipeline.
 2. Add durable sessions, owner/guild authorization surfaces and effective settings with
