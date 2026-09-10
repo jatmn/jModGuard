@@ -66,8 +66,21 @@ pub async fn query_events(
     user_id: Option<i64>,
     limit: i64,
 ) -> Result<Vec<EventRow>> {
+    let event_type = event_type.map(str::to_owned);
+    db.with_conn(move |conn| {
+        query_events_conn(conn, guild_id, event_type.as_deref(), user_id, limit)
+    })
+    .await
+}
+
+fn query_events_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    event_type: Option<&str>,
+    user_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
     let limit = limit.clamp(1, 200);
-    let event_type = event_type.map(|s| s.to_string());
     let mut sql = String::from(
         "SELECT id, guild_id, event_type, user_id, actor_id, data, created_at
          FROM events WHERE guild_id = ?1",
@@ -84,31 +97,28 @@ pub async fn query_events(
     sql.push_str(" ORDER BY id DESC LIMIT ?");
     args.push(limit.into());
 
-    db.with_conn(move |conn| {
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| {
-            Ok(EventRow {
-                id: r.get(0)?,
-                guild_id: r.get(1)?,
-                event_type: r.get(2)?,
-                user_id: r.get(3)?,
-                actor_id: r.get(4)?,
-                data: r.get(5)?,
-                created_at: r.get(6)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let mut row = row?;
-            // Heal legacy rows that stored snowflakes as JSON numbers.
-            if let Some(raw) = row.data.take() {
-                row.data = Some(crate::ids::wire_safe_event_data_json(&raw));
-            }
-            out.push(row);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args), |r| {
+        Ok(EventRow {
+            id: r.get(0)?,
+            guild_id: r.get(1)?,
+            event_type: r.get(2)?,
+            user_id: r.get(3)?,
+            actor_id: r.get(4)?,
+            data: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let mut row = row?;
+        // Heal legacy rows that stored snowflakes as JSON numbers.
+        if let Some(raw) = row.data.take() {
+            row.data = Some(crate::ids::wire_safe_event_data_json(&raw));
         }
-        Ok(out)
-    })
-    .await
+        out.push(row);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,30 +263,32 @@ pub async fn mark_unbanned(db: &Db, guild_id: i64, user_id: i64) -> Result<()> {
 }
 
 pub async fn list_bans(db: &Db, guild_id: i64, limit: i64) -> Result<Vec<BanRow>> {
+    db.with_conn(move |conn| list_bans_conn(conn, guild_id, limit))
+        .await
+}
+
+fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<Vec<BanRow>> {
     let limit = limit.clamp(1, 200);
-    db.with_conn(move |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active
+    let mut stmt = conn.prepare(
+        "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active
              FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![guild_id, limit], |r| {
-            Ok(BanRow {
-                id: r.get(0)?,
-                guild_id: r.get(1)?,
-                user_id: r.get(2)?,
-                moderator_id: r.get(3)?,
-                reason: r.get(4)?,
-                created_at: r.get(5)?,
-                active: r.get::<i64>(6)? != 0,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .await
+    )?;
+    let rows = stmt.query_map(params![guild_id, limit], |r| {
+        Ok(BanRow {
+            id: r.get(0)?,
+            guild_id: r.get(1)?,
+            user_id: r.get(2)?,
+            moderator_id: r.get(3)?,
+            reason: r.get(4)?,
+            created_at: r.get(5)?,
+            active: r.get::<i64>(6)? != 0,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,10 +305,14 @@ pub struct Stats {
 /// Per-guild identified moderation aggregates. Legacy unclassified plan summaries
 /// remain available through query_events, but cannot truthfully count as moderation.
 pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
-    db.with_conn(move |conn| {
-        let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
-        Ok(Stats {
-            events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
+    db.with_conn(move |conn| guild_stats_conn(conn, guild_id))
+        .await
+}
+
+fn guild_stats_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Stats> {
+    let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
+    Ok(Stats {
+        events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
                    event_type IN ('mod_action','timeout_add','timeout_remove',
                                   'member_ban','member_unban','member_kick')
                    OR CASE WHEN json_valid(data) THEN
@@ -306,11 +322,9 @@ pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
                      OR (event_type = 'plan_executed' AND json_type(data, '$.moderation') = 'true')
                    ELSE 0 END
                  )")?,
-            warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,
-            bans: one("SELECT COUNT(*) FROM bans WHERE guild_id = ?1")?,
-        })
+        warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,
+        bans: one("SELECT COUNT(*) FROM bans WHERE guild_id = ?1")?,
     })
-    .await
 }
 
 /// Parses an RFC3339 timestamp into a friendly relative duration string.
@@ -330,4 +344,53 @@ pub fn time_ago(ts: &Option<String>) -> String {
     } else {
         format!("{}d ago", secs / 86400)
     }
+}
+
+/// Membership and moderation data share one primary read transaction. Captured
+/// identity is not user authorization; HTTP callers must still check permissions.
+async fn enrolled_moderation_read<T: Send + 'static>(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    read: impl FnOnce(&crate::db_compat::Transaction, i64) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        let result = read(&tx, enrollment.guild_id)?;
+        tx.finish_read()?;
+        Ok(result)
+    })
+    .await
+}
+
+/// Read audit rows in the captured active membership, retaining filters/order/limits.
+pub async fn query_enrolled_events(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    event_type: Option<&str>,
+    user_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    let event_type = event_type.map(str::to_owned);
+    enrolled_moderation_read(db, enrollment, move |tx, guild| {
+        query_events_conn(tx, guild, event_type.as_deref(), user_id, limit)
+    })
+    .await
+}
+
+/// Read ban history in the captured active membership.
+pub async fn list_enrolled_bans(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    limit: i64,
+) -> Result<Vec<BanRow>> {
+    enrolled_moderation_read(db, enrollment, move |tx, guild| {
+        list_bans_conn(tx, guild, limit)
+    })
+    .await
+}
+
+/// Read all moderation counters in the same captured primary snapshot.
+pub async fn enrolled_guild_stats(db: &Db, enrollment: GuildEnrollment) -> Result<Stats> {
+    enrolled_moderation_read(db, enrollment, guild_stats_conn).await
 }

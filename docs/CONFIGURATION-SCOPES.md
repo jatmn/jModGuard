@@ -7,7 +7,7 @@ The request is never silently rebound to the replacement membership.
 
 The dashboard now uses these operations for settings, rules, commands, templates, badwords
 and configuration copies. Guild requests first require fresh Discord user permissions and
-an active bot membership from the primary database. Configuration reads capture membership
+an active bot membership from the primary database. The configuration bundle captures membership
 and data in the same primary snapshot; writes verify it again in their transaction.
 Bot configuration callers retain their guild-ID operations. No schema or dependency is added.
 
@@ -95,9 +95,10 @@ builds lack these tokens and their guild configuration edits are rejected. The b
 have observed each guild before its dashboard is accessible; existing settings alone do
 not grant access. No installation-owner bypass or automatic enrollment adoption is provided.
 
-Other guild data routes also check active membership at admission, but their later reads
-are not all scoped snapshots. Unban and log-channel operations use the page token and a
-stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
+[Moderation event, ban and statistics reads](MODERATION-READS.md) also require the page token
+and verify membership with their data. Other individual configuration GET routes check
+membership at admission but still need scoped snapshots. Unban and log-channel operations
+use the page token and a stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
 retain captured membership and current action permissions.
 A missed Discord departure may leave an observation stale until reconciled. This wave does
 not provide full tenant isolation, erasure, distributed worker ownership or atomicity across

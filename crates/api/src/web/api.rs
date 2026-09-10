@@ -856,15 +856,22 @@ pub struct EventsQuery {
 pub async fn events(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = real_guild_scope(&app, &session, guild_id).await?;
-    let rows = db::query_events(
+    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let enrollment = super::authorized_enrollment(&auth, guild_id)?;
+    let rows = db::query_enrolled_events(
         &app.db,
-        guild_id as i64,
+        enrollment,
         query.event.as_deref(),
-        query.user.map(|u| u as i64),
+        query
+            .user
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?,
         query.limit.unwrap_or(50),
     )
     .await?;
@@ -874,11 +881,14 @@ pub async fn events(
 pub async fn bans(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Query(query): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = real_guild_scope(&app, &session, guild_id).await?;
-    let rows = db::list_bans(&app.db, guild_id as i64, query.limit.unwrap_or(100)).await?;
+    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let enrollment = super::authorized_enrollment(&auth, guild_id)?;
+    let rows = db::list_enrolled_bans(&app.db, enrollment, query.limit.unwrap_or(100)).await?;
     Ok(Json(serde_json::json!(rows)))
 }
 
@@ -917,11 +927,14 @@ pub async fn unban(
 pub async fn stats(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     // Guild-scoped only — never expose cross-guild aggregates to a guild admin.
-    let s = db::guild_stats(&app.db, guild_id as i64).await?;
+    let s = db::enrolled_guild_stats(&app.db, enrollment).await?;
     Ok(Json(serde_json::json!(s)))
 }
 

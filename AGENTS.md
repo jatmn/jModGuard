@@ -78,7 +78,11 @@ objects confer no user/owner permission. Global targets through guild paths reta
 check; explicit guild-0 routes remain independently owner-only. Preserve settings/read floors,
 nickname/checksum/version and validate-before-replace semantics. Empty captured settings
 patches verify using a primary read without mutation receipts. Unban/log-channel actions
-use the queue. Complete tenant isolation and replica coordination remain separate work.
+use the queue. Moderation event/ban/statistics GET routes also require loaded page membership
+and captured primary reads; see `docs/MODERATION-READS.md`. Keep the API guard against
+unscoped moderation helpers. These reads create no receipts or version changes; the primary
+writer lock spans verification and data. Individual configuration GET reads still need
+captured snapshots. Complete tenant isolation and replica coordination remain separate work.
 
 ## Commands
 

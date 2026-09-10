@@ -152,6 +152,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_dispatch_completion(&bot).await;
     exercise_nickname_membership(&bot, &api).await;
     exercise_configuration_scopes(&bot, &api).await;
+    exercise_moderation_scopes(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -602,4 +603,56 @@ async fn exercise_dispatch_completion(bot: &Db) {
         get_primary_versions(bot).await.unwrap().config_revision,
         before.config_revision
     );
+}
+
+async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
+    use jmodguard::db::{
+        EnrollmentChanged, enroll_guild, enrolled_guild_stats, list_enrolled_bans,
+        query_enrolled_events, record_ban, retire_guild_enrollment,
+    };
+    let scope = enroll_guild(bot, 450, 100).await.unwrap().unwrap();
+    insert_event(
+        bot,
+        450,
+        "member_ban",
+        Some(451),
+        Some(452),
+        &serde_json::json!({"source":"scope-smoke"}),
+    )
+    .await
+    .unwrap();
+    record_ban(bot, 450, 451, Some(452), "scope smoke")
+        .await
+        .unwrap();
+    let version = get_config_version(api).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_moderation_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    let events = query_enrolled_events(api, scope.clone(), Some("member_ban"), Some(451), 1)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].guild_id, 450);
+    let bans = list_enrolled_bans(api, scope.clone(), 1).await.unwrap();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].user_id, 451);
+    let stats = enrolled_guild_stats(api, scope.clone()).await.unwrap();
+    assert_eq!((stats.events, stats.bans, stats.warns), (1, 1, 0));
+    assert_eq!(get_config_version(api).await.unwrap(), version);
+    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_moderation_read_receipt"))
+        .await
+        .unwrap();
+    retire_guild_enrollment(bot, 450, 100).await.unwrap();
+    let current = enroll_guild(bot, 450, 101).await.unwrap().unwrap();
+    for error in [
+        query_enrolled_events(api, scope.clone(), None, None, 50)
+            .await
+            .unwrap_err(),
+        list_enrolled_bans(api, scope.clone(), 100)
+            .await
+            .unwrap_err(),
+        enrolled_guild_stats(api, scope).await.unwrap_err(),
+    ] {
+        assert!(error.is::<EnrollmentChanged>());
+    }
+    // Historical guild rows remain; membership checks are not a purge mechanism.
+    assert_eq!(enrolled_guild_stats(api, current).await.unwrap().events, 1);
 }
