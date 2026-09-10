@@ -205,9 +205,15 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
-                        let bot_user_id = cache.current_user().id;
-                        if bot_user_id.get() <= 1 { continue; }
-                        let discord = jmodguard::action_worker::LiveDiscord { http: &http, bot_user_id };
+                        let Some(membership) =
+                            jmodguard::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
+                        else {
+                            continue;
+                        };
+                        let discord = jmodguard::action_worker::LiveDiscord {
+                            http: &http,
+                            bot_user_id: membership.bot_user_id,
+                        };
                         tokio::select! {
                             _ = shutdown_signal() => break,
                             result = jmodguard::action_worker::drain(&app.db, &discord, &app.cfg.action_worker.limits) => {
