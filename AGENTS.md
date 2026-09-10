@@ -6,10 +6,13 @@ Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Upgrades: `docs/UPGRADE.md`.
 ## Incremental overhaul
 
 The first compatible foundation is integrated here. See `docs/OVERHAUL.md` for scope.
-The workspace adds `crates/runtime` (shared process primitives) and `crates/conductor`
-(independent control process). Do not import the broad `jmodguard` application crate,
-Serenity or bot/API state into those crates. The existing bot/API feature/state/config
-invariants below describe current code; replace them deliberately as their overhaul
+The workspace has independent `crates/bot` and `crates/api` services, shared root
+`jmodguard` data/configuration, `crates/runtime` process primitives and `crates/conductor`
+control-process foundation. Do not import the root data crate, Serenity or bot/API state
+into runtime/conductor. Root data must not depend on either service; production bot and
+API dependency graphs must remain independent. Cross-service tests live in
+`crates/integration-tests`; API dev-dependencies also exercise the HTTP-to-worker handoff.
+The existing bot/API state/config invariants below describe current code; replace them deliberately as their overhaul
 slice is implemented, with corresponding regression coverage.
 
 The conductor currently reports liveness/version but readiness remains 503. Do not
@@ -35,7 +38,8 @@ from the DB directly and maintains only its version observation/read floor.
 `ApiProcessConfig`. Keep the full loader adapter private. Bot parsing/environment
 application must not retain OAuth config; API loading must retain its CORS/public-origin
 checks. Only the bot config retains a Discord bot token; the API retains OAuth credentials.
-Common bot/log settings, DB privileges and package dependencies remain transitional.
+Common bot/log settings and DB privileges remain transitional. Production dependencies
+are separated by package; the API has no Serenity/Gateway/cache dependency.
 Process `db_open_options()` fixes the migration role: bot true, API false. Tracing takes
 only `LogConfig`. See `docs/ARCHITECTURE.md`; this is not an OS secret boundary.
 
@@ -80,13 +84,13 @@ use the queue. Complete tenant isolation and replica coordination remain separat
 
 ```bash
 cargo test --locked --workspace
-cargo test --locked --no-default-features --lib
-cargo clippy --locked --bins -- -D warnings
-cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
-cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
-cargo build --locked --bin jmodguard-bot --no-default-features
-cargo build --locked --bin jmodguard-api
-cargo build --locked --bin jmodguard-api --no-default-features --features web
+cargo test --locked -p jmodguard-api --no-default-features --lib
+cargo clippy --locked --workspace --bins --lib -- -D warnings
+cargo clippy --locked -p jmodguard-bot -- -D warnings
+cargo clippy --locked -p jmodguard-api --no-default-features -- -D warnings
+cargo build --locked -p jmodguard-bot
+cargo build --locked -p jmodguard-api
+cargo build --locked -p jmodguard-api --no-default-features
 node --test scripts/frontend-state-test.mjs
 node --test scripts/frontend-warmup-test.mjs
 node --test scripts/publish-frontend-test.mjs
@@ -101,8 +105,8 @@ python3 scripts/check-service-boundaries.py
 Local dual-process:
 
 ```bash
-cargo run --bin jmodguard-bot --no-default-features   # migrates DB; Discord gateway
-cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m remote for bot migrate, then serves HTTP
+cargo run -p jmodguard-bot   # migrates DB; Discord gateway
+cargo run -p jmodguard-api                         # waits ~30s locally / ~6m remote for bot migrate, then serves HTTP
 ```
 
 ## Version pins (verified)
@@ -169,10 +173,11 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
   but none compile, **refuse** (error) and leave destination unchanged — never
   DELETE-then-filter. Empty source clears destination (intentional).
   `compile_user_regex` is the single gate for add / copy / cache load / tester.
-- Feature `web` (default with `embed-ui`): axum + tower-sessions. `embed-ui`
-  bakes `frontend/` into the API for local SETUP.md. Bunny API images build
-  `--no-default-features --features web` so containers do not contain the
-  admin UI. Build the bot with `--no-default-features`.
+- Select service packages explicitly: `-p jmodguard-bot` or `-p jmodguard-api`.
+  API default `embed-ui` includes the root `frontend/` for local use; API
+  `--no-default-features` builds JSON/OAuth for Bunny. There is no root `web` feature.
+  Keep embedding paths relative to the new API source. Bot never needs dashboard features.
+  Bare Cargo commands select all workspace packages; production builds must use `-p`.
 - Sessions use `MemoryStore` intentionally for a **single** API process; lost on
   restart. Cookie name is `jmodguard_session` (Magic Container sticky
   sessions must use that name). Shared session store is a future
@@ -267,8 +272,8 @@ cargo run --bin jmodguard-api                         # waits ~30s locally / ~6m
 
 ```
 src/lib.rs              shared library
-src/bin/jmodguard-bot.rs
-src/bin/jmodguard-api.rs
+crates/bot/src/main.rs
+crates/api/src/main.rs
 src/config.rs           typed bot/API config loaders + shared env/DB selection
 src/db.rs               local/remote libSQL pool + public data-layer facade
 src/db/bootstrap.rs     migrations/startup fencing/versioning/settings heal
@@ -277,23 +282,23 @@ src/db/settings.rs      inherited settings reads/writes
 src/db/nickname_jobs.rs durable Discord nickname reconciliation jobs
 src/db/bot_actions.rs   action queue storage
 src/bot_actions.rs      typed action payloads and storage limits
-src/action_worker.rs    bot dispatch library (worker parameters in bot_actions)
+crates/bot/src/action_worker.rs    bot dispatch library (worker parameters in bot_actions)
 src/db/moderation.rs    selected moderation records and statistics
 src/db/tests.rs         database unit and regression tests
 src/db_compat.rs        synchronous facade + remote deadlines/rollback
 src/remote_https.rs     rustls 0.23 HTTPS connector for remote libSQL (hyper 0.14)
-src/discord.rs          Discord REST helpers (nickname retries)
-src/nickname_worker.rs  membership/request-checked nickname dispatch
+crates/bot/src/discord.rs          Discord REST helpers (nickname retries)
+crates/bot/src/nickname_worker.rs  membership/request-checked nickname dispatch
 crates/runtime/src/health.rs process-local GET/HEAD /health listener (bot; API bind until axum)
 src/defaults.rs         seeded rules/commands/templates
 src/types.rs            serde models (RuleDef/CommandDef/Behavior/PlanStep)
-src/state.rs            BotState + compiled config cache + version poll
-src/web/state.rs        ApiState + config read observation
-src/web/oauth.rs        dashboard OAuth client and identity models
-src/automod.rs          rule engine + action executor
-src/handlers.rs         gateway events
-src/commands/           engine, behaviors, plans
-src/web/                axum API + OAuth (feature web; embed-ui serves frontend/ locally)
+crates/bot/src/state.rs            BotState + compiled config cache + version poll
+crates/api/src/web/state.rs        ApiState + config read observation
+crates/api/src/web/oauth.rs        dashboard OAuth client and identity models
+crates/bot/src/automod.rs          rule engine + action executor
+crates/bot/src/handlers.rs         gateway events
+crates/bot/src/commands/           engine, behaviors, plans
+crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
 migrations/             0001_init through 0009_nickname_enrollments
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor

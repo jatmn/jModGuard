@@ -1,7 +1,7 @@
 use super::*;
 use crate::bot_actions::Limits;
 use crate::db::SqlExecutor;
-use libsql::params;
+use crate::db::params;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Fixture {

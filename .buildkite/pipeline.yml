@@ -42,10 +42,10 @@ steps:
       cargo fetch --locked
       python3 .buildkite/publish-image-test.py
       cargo test --locked --workspace
-      cargo test --locked --no-default-features --lib
-      cargo clippy --locked --bins -- -D warnings
-      cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
-      cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
+      cargo test --locked -p jmodguard-api --no-default-features --lib
+      cargo clippy --locked --workspace --bins --lib -- -D warnings
+      cargo clippy --locked -p jmodguard-bot -- -D warnings
+      cargo clippy --locked -p jmodguard-api --no-default-features -- -D warnings
       cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
       cargo build --locked -p jmodguard-conductor
       python3 scripts/check-service-boundaries.py
@@ -53,10 +53,10 @@ steps:
       node --test scripts/frontend-warmup-test.mjs
       node --test scripts/publish-frontend-test.mjs
       python3 scripts/frontend-release-test.py
-      cargo test --locked --test dual_process_smoke -- --nocapture
-      cargo build --locked --bin jmodguard-bot --no-default-features
-      cargo build --locked --bin jmodguard-api
-      cargo build --locked --bin jmodguard-api --no-default-features --features web
+      cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture
+      cargo build --locked -p jmodguard-bot
+      cargo build --locked -p jmodguard-api
+      cargo build --locked -p jmodguard-api --no-default-features
 
   - label: "remote-database"
     key: remote-database
@@ -104,7 +104,7 @@ steps:
         echo "$$NAME did not become healthy after 30 attempts" >&2
         exit 1
       fi
-      cargo test --locked --test remote_database_smoke -- --ignored --nocapture
+      cargo test --locked -p jmodguard-integration-tests --test remote_database_smoke -- --ignored --nocapture
 
   # Match publish-image.py request() success paths, except UI/API with
   # JMODGUARD_PUBLISH_SOURCE is scheduled even off main / with a tag so Python

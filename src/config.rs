@@ -358,7 +358,7 @@ impl Config {
         if !bind_is_unspecified(&self.web.bind) {
             return Ok(());
         }
-        let url = reqwest::Url::parse(&self.web.base_url)
+        let url = url::Url::parse(&self.web.base_url)
             .with_context(|| format!("invalid web.base_url `{}`", self.web.base_url))?;
         let host = url.host_str().unwrap_or("");
         if host_is_loopback(host) {
@@ -399,7 +399,7 @@ impl Config {
                 );
             }
             origin
-                .parse::<reqwest::header::HeaderValue>()
+                .parse::<http::header::HeaderValue>()
                 .with_context(|| format!("invalid web.cors_origins entry `{origin}`"))?;
         }
         Ok(())

@@ -13,7 +13,7 @@ fn read_json<T: DeserializeOwned>(data: &str, what: &str) -> Result<T> {
 }
 
 /// Resolves a per-guild row against the global row, falling back to `default`.
-pub(crate) fn resolve<T: Clone>(guild_row: &Option<T>, global_row: &Option<T>, default: &T) -> T {
+pub fn resolve<T: Clone>(guild_row: &Option<T>, global_row: &Option<T>, default: &T) -> T {
     guild_row
         .clone()
         .or_else(|| global_row.clone())

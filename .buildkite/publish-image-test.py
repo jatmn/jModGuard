@@ -255,6 +255,24 @@ class GitSourceTests(unittest.TestCase):
             head = self.commit("docs/new.md")
             self.assertTrue(publisher.changed_since_publication("bot", head, "image", {}))
 
+    def test_service_package_changes_trigger_both_copied_build_contexts(self):
+        real_run = publisher.run
+        for path in ("crates/bot/src/main.rs", "crates/api/src/web/api.rs",
+                     "crates/runtime/src/health.rs"):
+            previous = publisher.git("rev-parse", "HEAD")
+            head = self.commit(path)
+            config = {"config": {"Labels": {"org.opencontainers.image.revision": previous,
+                                            "org.opencontainers.image.source": publisher.REPOSITORY}}}
+
+            def command(*args, **kwargs):
+                if args[0] == "docker":
+                    return subprocess.CompletedProcess(args, 0, json.dumps(config))
+                return real_run(*args, **kwargs)
+
+            with self.subTest(path=path), patch.object(publisher, "run", side_effect=command):
+                for component in ("bot", "api"):
+                    self.assertTrue(publisher.changed_since_publication(component, head, "image", {}))
+
     def test_unknown_registry_history_rebuilds(self):
         for config in ({}, {"config": {"Labels": {"org.opencontainers.image.revision": "c" * 40,
                                                   "org.opencontainers.image.source": publisher.REPOSITORY}}}):

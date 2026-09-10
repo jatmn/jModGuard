@@ -13,8 +13,8 @@ and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
   now requires an empty database or the recognized `jmodguard-core-1` family.
 - Bot/API binary names, Cargo feature flags and health/shutdown module paths remain
   available. Existing container definitions include the new workspace directories.
-  Bare Cargo commands still select the application; conductor builds use an explicit
-  package selection, and CI uses `--workspace` to include all tests.
+  Bare Cargo commands now select all workspace packages; production builds select a
+  service explicitly, and CI uses `--workspace` to include all tests.
 - Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
   deployment approval flow remain in place; the conductor is not auto-published or
   required for startup.
@@ -29,7 +29,8 @@ does not import old databases. The fuller tenant/case model remains a later chan
 ## Implemented: service foundation
 
 - The repository is a Cargo workspace. `jmodguard` still contains the existing bot/API
-  implementation; `jmodguard-runtime` contains shared shutdown and health utilities;
+  data/model/configuration library after the package split below; `jmodguard-runtime`
+  contains shared shutdown and health utilities;
   `jmodguard-conductor` is an independently built control process.
 - Existing bot/API entry points use the extracted utilities through the existing public
   module paths. Their startup, health and shutdown behavior remains covered by tests.
@@ -75,12 +76,12 @@ No old deployment conversion or data deletion is performed.
 Bot and API use distinct state types. The API no longer allocates the moderation engine,
 compiled guild configuration cache, command cooldowns, log-delivery limits or slash-sync
 state. The bot no longer allocates an OAuth HTTP client or dashboard display caches.
-OAuth code is compiled with `web`. API configuration reads remain direct database reads,
+OAuth code now lives in the API package. API configuration reads remain direct database reads,
 with primary-confirmed version observation and protection against concurrent local writes.
 
-The shared package still exists. State separation introduced no schema/dependency change
-and does not establish measured memory savings. Administrative action activation below
-now removes the API's bot token; independent packages remain future work. The optional
+State separation introduced no schema/dependency change and does not establish measured
+memory savings. Administrative activation below removes the API's bot token; the later
+package split now confines each service's implementation and production dependencies. The optional
 conductor remains inactive. See [runtime ownership](ARCHITECTURE.md#runtime-state-ownership).
 
 ## Implemented: typed process configuration
@@ -209,18 +210,38 @@ token. Storage/worker tests use mock Discord and disposable loopback libSQL, not
 provider operations. One bot and one API remain the supported topology; database write
 credentials are still shared. See [runtime controls](BOT-ACTIONS.md#runtime-controls).
 
+## Implemented: independent bot/API packages
+
+Bot and API source now live in `crates/bot` and `crates/api`; the root library contains
+shared configuration/model/database code. The API production dependency graph excludes
+Serenity and WebSockets; the bot excludes Axum and dashboard sessions. Runtime/conductor
+boundaries remain. No external package version changes or new third-party packages are
+introduced: shared config directly uses the existing url/http types, and API tests use
+existing async-trait instead of Serenity's macro re-export.
+
+Moved tests preserve worker, membership, browser/config and receipt behavior. Cross-service
+DB tests live in a dev-only integration package; actual token-free API startup lives beside
+its binary. The API's dev-only bot dependency keeps the HTTP-to-worker regression intact.
+Only existing shared read-floor/resolve/SQL-param interfaces needed across crates are exposed;
+claims and the full config loader adapter remain private. Database privileges are unchanged.
+
+Buildkite and Docker now select packages explicitly. Publication already tracks all crates;
+tests verify service-source changes still trigger image publication. Local API embedding uses
+the root frontend; Bunny API builds without embedding. Bare Cargo commands include the
+whole workspace; old root web-feature commands must switch to documented package commands.
+Binary names, environment/TOML, schema, API/browser contracts and one-bot/one-API topology
+are unchanged. No live provider or resource measurement is established by these builds.
+
 ## Next implementation slices
 
-1. Complete independent bot/API crate boundaries without pulling gateway/cache state
-   into the API. Preserve the merged queue, browser, worker and Buildkite protections.
-2. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
+1. Implement the fresh data model and tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient
    message context. Correct exact repeated-image matching in the actual event pipeline.
-3. Add durable sessions, owner/guild authorization surfaces and effective settings with
+2. Add durable sessions, owner/guild authorization surfaces and effective settings with
    revision handling. Backend authority must enforce every UI permission.
-4. Build release manifests/artifacts, the conductor control store and provider adapter,
+3. Build release manifests/artifacts, the conductor control store and provider adapter,
    then authenticated updates and portable backup/restore using the validated contracts.
-5. Complete guild/operator UI, backup scheduling/download/upload/restore, system metrics,
+4. Complete guild/operator UI, backup scheduling/download/upload/restore, system metrics,
    setup and provider documentation. Replace the old private-ops workflow before launch.
 
 Each slice must keep local tests runnable and record what is implemented versus pending.

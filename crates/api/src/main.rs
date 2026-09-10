@@ -1,10 +1,10 @@
 //! jModGuard API / WebUI process (axum only — no Discord gateway).
 
 use anyhow::{Context as _, Result};
-use jmodguard::config::ApiProcessConfig;
-use jmodguard::db::Db;
-use jmodguard::web::state::ApiState;
-use jmodguard::{health, init_tracing, shutdown_signal, web};
+use jmodguard_api::config::ApiProcessConfig;
+use jmodguard_api::db::Db;
+use jmodguard_api::web::state::ApiState;
+use jmodguard_api::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.
     let opts = cfg.db_open_options();
-    let (attempts, delay) = jmodguard::db::startup_open_retry(&opts);
+    let (attempts, delay) = jmodguard_api::db::startup_open_retry(&opts);
     let cfg_for_state = cfg.clone();
     let db_label = if cfg.db.url.is_empty() {
         cfg.db.path.display().to_string()

@@ -13,14 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// SQL operations on connections supplied by the public `Db::with_conn` API.
-pub use crate::db_compat::SqlExecutor;
 #[cfg(debug_assertions)]
 pub use crate::db_compat::test_drop_next_commit_response;
 use crate::db_compat::{
-    Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out, params,
+    Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out,
     params_from_iter,
 };
+// SQL operations/parameters for connections supplied by Db::with_conn.
+pub use crate::db_compat::{SqlExecutor, params};
 use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
 };
@@ -692,7 +692,7 @@ impl Db {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn require_config_version(&self, version: u64) {
+    pub fn require_config_version(&self, version: u64) {
         let _floor = self.config_floor_lock.lock();
         self.required_config_version
             .fetch_max(version, std::sync::atomic::Ordering::SeqCst);

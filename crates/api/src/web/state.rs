@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 /// Dashboard state cannot run the moderation engine.
 /// ```compile_fail
-/// fn moderation(state: &jmodguard::web::state::ApiState) {
+/// fn moderation(state: &jmodguard_api::web::state::ApiState) {
 ///     let _ = &state.automod;
 /// }
 /// ```

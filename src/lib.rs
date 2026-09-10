@@ -1,31 +1,17 @@
-//! jModGuard shared library: Discord bot logic, libSQL data layer, and WebUI/API.
-//!
-//! Two binaries consume this crate:
-//! - `jmodguard-bot` — Discord gateway only
-//! - `jmodguard-api` — axum HTTP API / WebUI only
+//! Shared jModGuard configuration, data model, database and tracing setup.
+//! Service implementations live in independent bot and API packages.
 
-pub mod action_worker;
-pub mod automod;
 pub mod bot_actions;
-pub mod commands;
 pub mod config;
 pub mod db;
 mod db_compat;
 pub mod defaults;
-pub mod discord;
-pub mod enrollment_repair;
-pub mod handlers;
 pub use jmodguard_runtime::health;
 pub mod ids;
-pub mod logging;
-pub mod nickname_worker;
 pub mod normalize;
 mod remote_https;
-pub mod state;
 pub mod templates;
 pub mod types;
-#[cfg(feature = "web")]
-pub mod web;
 
 use crate::config::LogConfig;
 pub use jmodguard_runtime::shutdown_signal;

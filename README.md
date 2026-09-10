@@ -50,10 +50,10 @@ both the clone and Cargo's later git fetch of this same repo. An SSH key or
 ```bash
 git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
-# Bot without the `web` feature (no axum / sessions / SPA embed).
-cargo build --locked --release --bin jmodguard-bot --no-default-features
-# API with the default `web` feature.
-cargo build --locked --release --bin jmodguard-api
+# Independent bot package (no dashboard stack).
+cargo build --locked --release -p jmodguard-bot
+# API with the default embedded frontend.
+cargo build --locked --release -p jmodguard-api
 cp config.example.toml config.toml     # add your token + OAuth ids
 ./target/release/jmodguard-bot         # Discord gateway (migrates DB)
 ./target/release/jmodguard-api         # WebUI/API on http://localhost:8080
@@ -113,48 +113,31 @@ commercial licensing is granted by the author only.
 
 ```bash
 cargo test --locked --workspace
-cargo clippy --locked --bins -- -D warnings
-cargo clippy --locked --bin jmodguard-bot --no-default-features -- -D warnings
-cargo clippy --locked --bin jmodguard-api --no-default-features --features web -- -D warnings
-cargo build --locked --bin jmodguard-bot --no-default-features
-cargo build --locked --bin jmodguard-api
+cargo clippy --locked --workspace --bins --lib -- -D warnings
+cargo clippy --locked -p jmodguard-bot -- -D warnings
+cargo clippy --locked -p jmodguard-api --no-default-features -- -D warnings
+cargo build --locked -p jmodguard-bot
+cargo build --locked -p jmodguard-api
 # or: ./scripts/smoke-dual-process.sh
 ```
 
-Feature `web` enables axum + tower-sessions. Default also enables `embed-ui`,
-which bakes `frontend/` into the API for a local SETUP.md run. Always build
-the bot with `--no-default-features`. The Bunny API image builds
-`--no-default-features --features web` so the container has no admin UI.
-The API binary requires `web` (`required-features = ["web"]`).
+Bot and API are independent Cargo packages. The API defaults to `embed-ui` for local
+use; `cargo build -p jmodguard-api --no-default-features` builds JSON/OAuth without
+embedding the frontend, as used by Bunny. The bot never depends on the dashboard stack.
+The old root `web` feature is removed. Select production builds with `-p`; bare workspace
+commands include all packages, while `cargo test --workspace` preserves full test coverage.
 
 ## Source layout
 
-```
-lib.rs         shared crate root (modules + init_tracing; web behind feature)
-bin/jmodguard-bot.rs   Discord gateway only (migrate=true, config_version poll)
-bin/jmodguard-api.rs   axum API/WebUI only (migrate=false; requires feature web)
-config.rs      config.toml + env overrides (db.url/token, config_poll_secs)
-db.rs          local/remote libSQL pool and public data-layer facade
-db/bootstrap.rs        migrations, startup fencing, versions, settings healing
-db/configuration.rs    rules, commands, templates, badwords, config snapshots
-db/settings.rs         inherited settings reads/writes
-db/nickname_jobs.rs    durable Discord nickname reconciliation jobs
-db/moderation.rs       moderation records and transitional historical data helpers
-db_compat.rs   synchronous libSQL transaction/deadline/outcome facade
-defaults.rs    seeded rules / commands / templates
-types.rs       serde models (RuleDef, CommandDef, Behavior, PlanStep, …)
-state.rs       BotState, compiled guild config cache + version poll
-web/state.rs   ApiState, dashboard caches + config read observation
-web/oauth.rs   dashboard OAuth client + identity models
-normalize.rs   bypass-resistant text normalization (NFD, zero-width, leetspeak)
-templates.rs   {variable} renderer shared by everything
-logging.rs     event → channel router + audit log
-automod.rs     rule engine (sliding windows, escalation) + action executor
-handlers.rs    gateway events (join/leave, messages, edits, deletes, bans)
-crates/runtime/src/health.rs  GET/HEAD /health liveness listener (no axum; API serves same path until axum)
-commands/      data-driven engine: dispatch, permissions, behaviors, plans, slash
-web/           axum API + OAuth (feature web; embed-ui serves frontend/ locally)
-frontend/      admin SPA (Bunny Storage/CDN; local API embed)
-migrations/    0001_init through 0009_nickname_enrollments
-Dockerfile.bot / Dockerfile.api
+```text
+src/                       shared model, configuration, database, normalization and templates
+crates/bot/src/            Discord Gateway, moderation, commands and action/nickname workers
+crates/api/src/            HTTP/OAuth API and dashboard state
+crates/api/tests/          actual API startup regression
+crates/integration-tests/  shared-DB, cross-service and optional remote-libSQL regressions
+crates/runtime/            shared process health/shutdown utilities
+crates/conductor/          independent control-service foundation (operational API pending)
+frontend/                  static dashboard (Bunny Storage/CDN or local API embed)
+migrations/                jmodguard-core-1, steps 0001–0009
+Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 ```
