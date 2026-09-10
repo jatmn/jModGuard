@@ -1,5 +1,5 @@
 //! API-owned dashboard state without moderation or compiled guild caches.
-//! Bot-token REST remains here until the durable action queue replaces direct calls.
+//! Discord mutations are admitted to the bot queue; this state has no bot token/client.
 use super::oauth::{DiscordGuild, DiscordUser, OAuthClient};
 use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
@@ -18,8 +18,6 @@ pub struct ApiState {
     pub db: Db,
     pub cfg: Arc<ApiProcessConfig>,
     pub oauth: OAuthClient,
-    /// Transitional lazy bot-token REST client for existing API actions.
-    discord_http_cell: std::sync::OnceLock<Arc<serenity::http::Http>>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -48,21 +46,10 @@ impl ApiState {
             db,
             cfg: Arc::new(cfg),
             oauth,
-            discord_http_cell: std::sync::OnceLock::new(),
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
         }))
-    }
-
-    /// Discord REST client for API-side bot-token calls (lazy).
-    pub fn discord_http(&self) -> &serenity::http::Http {
-        self.discord_http_cell
-            .get_or_init(|| {
-                let token = format!("Bot {}", self.cfg.discord.token);
-                Arc::new(serenity::http::Http::new(&token))
-            })
-            .as_ref()
     }
 
     /// API requests load config from the DB directly; no compiled bot cache is

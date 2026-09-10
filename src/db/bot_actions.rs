@@ -1,4 +1,4 @@
-//! Inactive action storage with current and captured membership checks.
+//! Durable action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
 

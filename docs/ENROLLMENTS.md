@@ -5,11 +5,10 @@ adds `guild_enrollments` to `jmodguard-core-1`: one row per observed guild conta
 random identity, the bot's join timestamp in nanoseconds, and active/inactive state.
 No member roster, message history, or per-user activity is collected by this feature.
 
-Observations bind inactive administrative queue storage and the active nickname outbox.
+Observations bind administrative actions and the nickname outbox.
 API guild access now checks them after fresh Discord user permissions; configuration
 reads/writes retain captured membership. They are not a complete authorization or erasure
-boundary. Direct unban/log-channel actions keep their API execution path. The administrative
-queue remains inactive; nickname dispatch adds its own fresh Discord verification below.
+boundary. Administrative and nickname dispatch each add fresh Discord verification.
 
 ## Gateway observations
 
@@ -71,7 +70,7 @@ reads). Actual rate depends on guild count, timeouts, pagination and configured 
 Resource/billing savings are not measured. Existing Gateway cache policy is unchanged;
 this does not establish the final minimal bot memory footprint.
 
-## Inactive queue binding
+## Queue binding
 
 Migration 0008 adds explicit enrollment ID/join timestamp to new administrative actions.
 Retirement/replacement invalidates unstarted claims and makes running outcomes uncertain
@@ -80,8 +79,8 @@ membership-aware. Captured-scope helpers reject a membership change between auth
 and the queue transaction. Direct log configuration changes preserve unresolved history
 from older memberships. See [the queue storage contract](BOT-ACTIONS.md).
 
-No queue worker or endpoint is enabled. Direct API Discord actions remain independent;
-this layer cannot recall a Discord request or establish full tenant isolation. Current membership observations still need live validation/reconciliation and
+The API admits captured actions and the bot dispatches them with fresh membership and
+actor permission checks. This layer cannot recall a Discord request or establish full tenant isolation. Current membership observations still need live validation/reconciliation and
 must not alone authorize an effect or erase data.
 
 ## Nickname reconciliation
@@ -130,8 +129,7 @@ recognized lineage extends through migration0009. Version8 binaries reject versi
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported and no guild data is purged.
 
-Runtime administrative queue integration, fresh user permission and bot membership checks around
-side effects, remaining data-read transaction scopes, case/evidence isolation,
+Remaining data-read transaction scopes, case/evidence isolation,
 shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
 separate work. Inactive membership rows are transitional lifecycle metadata awaiting that
 purge design. Local tests do not certify tenant isolation or Discord/Bunny behavior.

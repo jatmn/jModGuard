@@ -187,6 +187,50 @@ async fn main() -> Result<()> {
         });
     }
 
+    // One sequential administrative worker plus bounded periodic history cleanup.
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        let cache = Arc::clone(&cache);
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(u64::from(
+                app.cfg.action_worker.poll_secs,
+            )));
+            let mut cleanup = tokio::time::interval(Duration::from_secs(u64::from(
+                app.cfg.action_worker.cleanup_interval_secs,
+            )));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal() => break,
+                    _ = poll.tick() => {
+                        let Some(membership) =
+                            jmodguard::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
+                        else {
+                            continue;
+                        };
+                        let discord = jmodguard::action_worker::LiveDiscord {
+                            http: &http,
+                            bot_user_id: membership.bot_user_id,
+                        };
+                        tokio::select! {
+                            _ = shutdown_signal() => break,
+                            result = jmodguard::action_worker::drain(&app.db, &discord, &app.cfg.action_worker.limits) => {
+                                if let Err(error) = result { tracing::warn!("bot action queue unavailable: {error:#}"); }
+                            }
+                        }
+                    }
+                    _ = cleanup.tick() => {
+                        if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await {
+                            tracing::warn!("bot action history cleanup failed: {error:#}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // --- config_version poll (cross-process cache invalidation) --------------
     let poll_secs = cfg.bot.config_poll_secs.max(1);
     {

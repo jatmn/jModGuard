@@ -182,7 +182,12 @@ impl Fixture {
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8(bytes.to_vec()).unwrap())
+            }),
+        )
     }
     async fn enroll(&self, guild: i64) {
         db::enroll_guild(&self.app.db, guild, 100).await.unwrap();
@@ -676,4 +681,258 @@ async fn configuration_snapshot_checks_its_captured_membership() {
     db::load_enrolled_web_config_snapshot(&f.app.db, db::ConfigurationScope::Guild(current))
         .await
         .unwrap();
+}
+
+fn action_key(label: &str) -> String {
+    format!("{}_{}", chrono::Utc::now().timestamp(), label)
+}
+
+#[tokio::test]
+async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable() {
+    use crate::action_worker::{DiscordActions, Outcome, WorkerLimits};
+    struct Allowed;
+    #[serenity::async_trait]
+    impl DiscordActions for Allowed {
+        async fn membership_matches(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+    }
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let body = serde_json::json!({"request_id":action_key("set"),"channel_id":"123"}).to_string();
+    let (status, queued) = f
+        .request("PUT", "/api/guilds/10/logchannels/message_edit", &body)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+    assert!(queued.get("claim").is_none());
+    assert!(
+        db::list_log_channels(&f.app.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_, replay) = f
+        .request("PUT", "/api/guilds/10/logchannels/message_edit", &body)
+        .await;
+    assert_eq!(replay["id"], queued["id"]);
+    crate::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
+        .await
+        .unwrap();
+    let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history[0]["state"], "succeeded");
+    assert_eq!(
+        db::list_log_channels(&f.app.db, 10).await.unwrap(),
+        vec![("message_edit".into(), 123)]
+    );
+    let (_, replay) = f
+        .request("PUT", "/api/guilds/10/logchannels/message_edit", &body)
+        .await;
+    assert_eq!(replay["id"], queued["id"]);
+    assert_eq!(replay["state"], "succeeded");
+
+    let clear = serde_json::json!({"request_id":action_key("clear")}).to_string();
+    let (status, queued) = f
+        .request("DELETE", "/api/guilds/10/logchannels/message_edit", &clear)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+    assert_eq!(db::list_log_channels(&f.app.db, 10).await.unwrap().len(), 1);
+    crate::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert!(
+        db::list_log_channels(&f.app.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_, replay) = f
+        .request("DELETE", "/api/guilds/10/logchannels/message_edit", &clear)
+        .await;
+    assert_eq!(replay["id"], queued["id"]);
+    assert_eq!(replay["state"], "succeeded");
+}
+
+#[tokio::test]
+async fn actions_require_page_membership_and_reject_rebinding_saved_requests() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let (_, config) = f.request("GET", "/api/guilds/10/config", "").await;
+    let old = config["enrollment_id"].as_str();
+    let body = serde_json::json!({"request_id":action_key("unban"),"user_id":"99"}).to_string();
+    let (_, queued) = f.request("POST", "/api/guilds/10/unban", &body).await;
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    for token in [None, old] {
+        for (method, path, body) in [
+            ("POST", "/api/guilds/10/unban".to_owned(), body.clone()),
+            (
+                "PUT",
+                "/api/guilds/10/logchannels/message_edit".into(),
+                serde_json::json!({"request_id":action_key("log"),"channel_id":"123"}).to_string(),
+            ),
+            (
+                "DELETE",
+                "/api/guilds/10/logchannels/message_edit".into(),
+                serde_json::json!({"request_id":action_key("clear")}).to_string(),
+            ),
+            ("GET", "/api/guilds/10/actions".into(), String::new()),
+            (
+                "DELETE",
+                format!("/api/guilds/10/actions/{}", queued["id"].as_str().unwrap()),
+                String::new(),
+            ),
+        ] {
+            let (status, body) = f.request_token(method, &path, &body, token).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {path}: {body}");
+        }
+    }
+    let (status, rejected) = f.request("POST", "/api/guilds/10/unban", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "action_enrollment_changed");
+    assert!(
+        db::recent_bot_actions(&f.app.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn action_visibility_cancellation_and_admission_follow_current_action_permissions() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let (_, unban) = f
+        .request(
+            "POST",
+            "/api/guilds/10/unban",
+            &serde_json::json!({"request_id":action_key("ban"),"user_id":"99"}).to_string(),
+        )
+        .await;
+    let (_, log) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/logchannels/message_edit",
+            &serde_json::json!({"request_id":action_key("log"),"channel_id":"123"}).to_string(),
+        )
+        .await;
+    let mut manage_only = managed_guild(10);
+    manage_only.permissions = Some(oauth::PermissionsField::Number(1 << 5));
+    *f.discord.guilds.lock().unwrap() = vec![manage_only];
+    let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["id"], log["id"]);
+    let path = format!("/api/guilds/10/actions/{}", unban["id"].as_str().unwrap());
+    assert_eq!(
+        f.request("DELETE", &path, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/guilds/10/unban",
+            &serde_json::json!({"request_id":action_key("denied"),"user_id":"100"}).to_string()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let path = format!("/api/guilds/10/actions/{}", log["id"].as_str().unwrap());
+    assert_eq!(f.request("DELETE", &path, "").await.0, StatusCode::OK);
+    let mut ban_only = managed_guild(10);
+    ban_only.permissions = Some(oauth::PermissionsField::Number(1 << 2));
+    *f.discord.guilds.lock().unwrap() = vec![ban_only];
+    let (_, history) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["id"], unban["id"]);
+    assert_eq!(
+        f.request("DELETE", &path, "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request("GET", "/api/guilds/20/actions", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request("GET", "/api/guilds/0/actions", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    f.discord.guilds.lock().unwrap().clear();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/actions", "").await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn action_requests_require_ids_reject_forged_authority_and_report_expiry() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/guilds/10/unban",
+            serde_json::json!({"user_id":"99"}),
+        ),
+        (
+            "PUT",
+            "/api/guilds/10/logchannels/message_edit",
+            serde_json::json!({"channel_id":"123"}),
+        ),
+        (
+            "DELETE",
+            "/api/guilds/10/logchannels/message_edit",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/api/guilds/10/unban",
+            serde_json::json!({"request_id":action_key("forged"),"user_id":"99","actor_id":"123"}),
+        ),
+    ] {
+        assert_eq!(
+            f.request(method, path, &body.to_string()).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    for (key, status, code) in [
+        (
+            "invalid".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "action_request_invalid",
+        ),
+        (
+            format!("{}_old", chrono::Utc::now().timestamp() - 10 * 86400),
+            StatusCode::GONE,
+            "action_request_expired",
+        ),
+    ] {
+        let (actual, body) = f
+            .request(
+                "POST",
+                "/api/guilds/10/unban",
+                &serde_json::json!({"request_id":key,"user_id":"99"}).to_string(),
+            )
+            .await;
+        assert_eq!(actual, status, "{body}");
+        assert_eq!(body["code"], code);
+    }
+    assert!(
+        db::recent_bot_actions(&f.app.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

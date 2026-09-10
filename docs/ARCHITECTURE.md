@@ -46,11 +46,11 @@ The processes have separate state types in the current shared application crate:
   directly; the API no longer constructs the bot's compiled configuration cache,
   moderation engine, cooldown maps, log-delivery semaphore or slash-sync state.
 
-Existing unban and log-channel validation still use a lazy bot-token REST client owned
-by `ApiState`. Both processes still require the bot token under the existing startup
-contract. The action queue has [inactive storage and a dispatch library](BOT-ACTIONS.md).
-Queue activation, API bot-token removal and independent bot/API packages remain separate
-work. No dependency is added; resource savings are not measured.
+Unban and log-channel changes use [queued administrative actions](BOT-ACTIONS.md). The
+API returns receipts; the bot validates and dispatches with its existing HTTP client.
+`ApiState` has no bot-token client. One bot task polls and cleans bounded batches;
+independent bot/API packages remain separate work. No dependency is added; resource
+savings are not measured.
 
 ## Process configuration
 
@@ -63,10 +63,13 @@ credentialed CORS and public HTTPS origin checks, before opening its listener.
 
 The file path (`JMODGUARD_CONFIG` or `config.toml`), environment names, environment-over-file
 precedence, atomic remote DB credential selection and common bot/log settings remain.
-API configuration still includes its required bot token. This narrows retained typed
+API configuration has no Discord bot-token field and ignores `[discord]`,
+`[action_worker]` and their environment overrides. This narrows retained typed
 configuration; it is not an OS secret boundary. A process can still read environment
 variables or the raw contents of a shared file made available to it. Assign OAuth
-secrets only to the API in a deployment that needs process-level secret separation.
+secrets only to the API and the bot token only to the bot in a deployment that needs
+process-level secret separation. Shared action storage limits and bot-only scheduling
+controls are documented in [BOT-ACTIONS.md](BOT-ACTIONS.md#runtime-controls).
 
 The process config builds DB options without a caller-supplied migration flag: bot
 options initialize the database, API options wait for completed initialization. This
@@ -79,8 +82,8 @@ The bot's [membership observer](ENROLLMENTS.md) records Gateway joins/departures
 known context and runs bounded, configurable positive REST repair. It keeps one SQL row
 per guild and one pagination cursor, reuses the existing HTTP client, and does no
 per-message work. API configuration has no enrollment-repair fields. Observation state
-scopes inactive queue storage, nickname reconciliation and API configuration access.
-It does not enable a running administrative queue dispatcher.
+scopes queued actions, nickname reconciliation and API configuration access.
+Action dispatch additionally checks fresh bot membership and actor permissions.
 
 ## Config cache invalidation
 
@@ -129,17 +132,17 @@ the primary write transaction, including both sides of a copy and the guild cont
 global edit. Empty scoped settings patches verify before reading. These library operations
 are used by the API after fresh user permission and primary membership admission; see
 [configuration scopes](CONFIGURATION-SCOPES.md) for page/source tokens and stale-edit behavior.
-The configuration snapshot verifies membership alongside the data. Other reads and direct
-Discord actions still need their complete transaction/dispatch boundaries. The schema is unchanged.
+The configuration snapshot verifies membership alongside the data. Other data reads
+still need complete scoped transaction boundaries; queued actions use captured membership. The schema is unchanged.
 
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0009. Migration 0006 adds inactive action storage and its replay floor.
-Migration 0007 adds bot membership observations. Migration 0008 binds inactive queue
+migrations 0001–0009. Migration 0006 adds action storage and its replay floor.
+Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work.
-Current unban/log-channel WebUI operations still follow their direct API path.
+Unban/log-channel WebUI operations now use API admission and bot dispatch.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
   versions, heals settings, then publishes a

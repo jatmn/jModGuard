@@ -1,7 +1,7 @@
 # jModGuard configuration.
 # Copy this file to `config.toml` and fill in your values.
 # The bot ignores [web] and web/OAuth environment overrides; the API validates them.
-# Both processes still require discord.token for their current Discord operations.
+# Only the bot loads discord.token; the API uses OAuth and queues bot actions.
 #
 # Dual-process local run:
 #   cargo run --bin jmodguard-bot --no-default-features  # migrates DB, Discord gateway
@@ -10,8 +10,7 @@
 [discord]
 # Bot token from https://discord.com/developers/applications
 # (Bot -> Token -> Reset Token). Also overridable via JMODGUARD_DISCORD_TOKEN.
-# Required by jmodguard-bot. Also required by jmodguard-api for WebUI unban
-# (Discord REST). Env: JMODGUARD_DISCORD_TOKEN.
+# Required only by jmodguard-bot; the API ignores this section and token override.
 token = ""
 
 [db]
@@ -94,3 +93,18 @@ directory = "logs"
 # These bootstrap controls will move into Administration.
 discord_concurrency = 8       # JMODGUARD_LOG_DISCORD_CONCURRENCY
 discord_timeout_secs = 10     # JMODGUARD_LOG_DISCORD_TIMEOUT_SECS
+
+# Administrative action policy; set the same values in bot and API.
+# Environment overrides and protocol bounds: docs/BOT-ACTIONS.md.
+[actions]
+pending_per_guild = 32
+max_age_secs = 300
+history_retention_secs = 604800
+cleanup_batch_size = 128
+
+# Bot-only sequential dispatch and bounded cleanup; API ignores this section.
+[action_worker]
+poll_secs = 5
+cleanup_interval_secs = 3600
+batch_size = 4
+request_timeout_secs = 15

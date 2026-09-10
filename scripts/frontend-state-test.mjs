@@ -3,16 +3,18 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { randomUUID } from 'node:crypto';
 
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
 // Minimal DOM boundary: assertions inspect the actual children/attributes that
 // production el() sends to the browser, without duplicating its implementation.
-function harness(fetchImpl = async () => {}, storage = new Map()) {
+function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
   const node = (tag) => ({
     tag, nodeType: 1, children: [], attrs: {}, dataset: {}, listeners: {}, disabled: false,
     classList: { toggle() {} },
     focus() {},
+    replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
     append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
     set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
     remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
@@ -29,14 +31,14 @@ function harness(fetchImpl = async () => {}, storage = new Map()) {
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) } },
-    fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm: () => true,
+    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
+    fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage };
+  return { app, elements, nodes, storage, session };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -507,4 +509,83 @@ test('copy captures source membership on selection and sends both page scopes', 
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
   assert.equal(sent.opts.headers['x-jmodguard-enrollment'], 'destination');
   assert.equal(calls.filter(c => c.url.includes('987654321098765433')).length, 1, 'copy must not refresh the selected source token');
+});
+
+function queuedAction(state = 'pending') {
+  return { id: 'job', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'membership', state, action: {kind:'unban',user_id:'99'} };
+}
+const actionPath = '/api/guilds/987654321098765432/unban';
+
+test('lost action acknowledgment reuses request and membership across reload', async () => {
+  const calls = [], session = new Map();
+  const first = harness(async (_,opts) => { calls.push(opts); throw new Error('lost response'); }, new Map(), session);
+  first.app.state.config = { enrollment_id:'membership' };
+  await assert.rejects(first.app.submitBotAction(actionPath, 'POST', {user_id:'99',reason:'test'}), /lost response/);
+  assert.equal(session.size,1);
+  const next = harness(async (_,opts) => { calls.push(opts); return response(queuedAction()); },new Map(),session);
+  next.app.state.config = { enrollment_id:'membership' };
+  await next.app.submitBotAction(actionPath,'POST',{reason:'test',user_id:'99'});
+  assert.equal(JSON.parse(calls[0].body).request_id, JSON.parse(calls[1].body).request_id);
+  assert.equal(calls[1].headers['x-jmodguard-enrollment'],'membership');
+  assert.equal(session.size,0);
+  assert.match(next.nodes.get('#toast').textContent,/queued/);
+  assert.doesNotMatch(next.nodes.get('#toast').textContent,/completed|Unbanned/);
+});
+
+test('saved action cannot move to replacement membership; clearing never submits', async () => {
+  const session = new Map();
+  const first = harness(async () => { throw new Error('lost'); },new Map(),session);
+  first.app.state.config = { enrollment_id:'old' };
+  await assert.rejects(first.app.submitBotAction(actionPath,'POST',{user_id:'99'}));
+  for (const accept of [false,true]) {
+    let calls=0;
+    const next=harness(async()=>{calls++; return response(queuedAction());},new Map(),session,()=>accept);
+    next.app.state.config={enrollment_id:'replacement'};
+    await assert.rejects(next.app.submitBotAction(actionPath,'POST',{user_id:'99'}),/not submitted/);
+    assert.equal(calls,0);
+    assert.equal(session.size,accept?0:1);
+  }
+});
+
+test('expired or invalid action recovery clears only after explicit acknowledgment', async () => {
+  for (const [status,code] of [[410,'action_request_expired'],[400,'action_request_invalid'],[409,'action_enrollment_changed']]) {
+    let calls=0;
+    const h=harness(async()=>{calls++;return {ok:false,status,headers:{get:()=>null},text:async()=>JSON.stringify({error:'rejected',code})};});
+    h.app.state.config={enrollment_id:'membership'};
+    await assert.rejects(h.app.submitBotAction(actionPath,'POST',{user_id:'99'}),/Saved request cleared/);
+    assert.equal(calls,1);
+    assert.equal(h.session.size,0);
+  }
+});
+
+test('invalid action acknowledgments retain request identity; unavailable storage prevents dispatch', async () => {
+  for (const job of [{}, {...queuedAction(),enrollment_id:'other'}, {...queuedAction(),guild_id:'other'}, {...queuedAction(),actor_id:'other'}]) {
+    const h=harness(async()=>response(job));
+    h.app.state.config={enrollment_id:'membership'};
+    await assert.rejects(h.app.submitBotAction(actionPath,'POST',{user_id:'99'}),/acknowledgment was invalid/);
+    assert.equal(h.session.size,1);
+  }
+  let calls=0;
+  const h=harness(async()=>{calls++;},new Map(),{get(){throw new Error('disabled');}});
+  h.app.state.config={enrollment_id:'membership'};
+  await assert.rejects(h.app.submitBotAction(actionPath,'POST',{user_id:'99'}),/session storage/);
+  assert.equal(calls,0);
+});
+
+test('actions refresh only on demand and cancellation includes membership', async () => {
+  const calls=[];
+  const h=harness(async(url,opts)=>{calls.push({url,opts});return response(opts.method==='GET'?[queuedAction()]:{ok:true});});
+  h.app.state.config={enrollment_id:'membership'};
+  h.app.tabActions();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
+  const cancel=h.elements.find(n=>n.tag==='button'&&n.textContent==='Cancel');
+  await cancel.listeners.click({});
+  assert.equal(calls[1].opts.method,'DELETE');
+  assert.equal(calls[1].opts.headers['x-jmodguard-enrollment'],'membership');
+  assert.equal(calls[2].opts.method,'GET');
+  const refresh=h.elements.find(n=>n.tag==='button'&&n.textContent==='Refresh');
+  await refresh.listeners.click({});
+  assert.equal(calls.length,4);
 });

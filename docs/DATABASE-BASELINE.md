@@ -56,7 +56,8 @@ and moderation records; the API waits for the updated bootstrap marker. Deploy m
 bot/API builds. Older binaries that support only version 5 reject version 6 on startup;
 rollback requires the matching pre-upgrade database backup, not a version-marker edit.
 This does not add a production backup implementation or an old-lineage migration.
-The queue is [inactive storage groundwork](BOT-ACTIONS.md), not an enabled service.
+This storage foundation is now used by [queued administrative actions](BOT-ACTIONS.md);
+runtime activation adds no further schema change.
 
 ## Membership observation extension
 
@@ -71,7 +72,7 @@ No data erasure or authorization boundary is activated. See [membership observat
 Migration 0008 binds new queue work to observed membership without recreating the table
 introduced in 0007. Earlier actions are never adopted: unstarted work becomes cancelled,
 running work uncertain, and resolved/uncertain receipts remain. All existing settings and
-moderation data stay in place. Queue execution remains inactive. Deploy matched builds
+moderation data stay in place. Runtime activation is documented separately. Deploy matched builds
 with bot migration first; version7 binaries reject version8, so use the matched pre-upgrade
 backup for rollback. See [membership-bound queue storage](BOT-ACTIONS.md#membership-bound-storage).
 

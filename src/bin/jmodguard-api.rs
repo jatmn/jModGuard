@@ -21,14 +21,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // WebUI unban calls Discord REST with the bot token.
-    if cfg.discord.token.is_empty() {
-        anyhow::bail!(
-            "Discord bot token required for jmodguard-api (WebUI unban). Set \
-             `token` in config.toml or JMODGUARD_DISCORD_TOKEN."
-        );
-    }
-
     init_tracing(&cfg.log, "api");
 
     if cfg.bot.owner_id == 0 {

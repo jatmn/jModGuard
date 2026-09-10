@@ -64,7 +64,7 @@ rollback, waiting for the settings lock, exact badword scope and unchanged versi
 The disposable remote libSQL test covers lost commit responses for scoped settings, inserts
 and copies and verifies receipt-free empty patches. It does not establish live Bunny or
 Discord behavior. The service-boundary guard permits the DB/API captured configuration path
-while keeping administrative queue consumers inactive.
+and requires captured administrative queue access.
 
 
 ## HTTP and browser contract
@@ -96,8 +96,9 @@ have observed each guild before its dashboard is accessible; existing settings a
 not grant access. No installation-owner bypass or automatic enrollment adoption is provided.
 
 Other guild data routes also check active membership at admission, but their later reads
-are not all scoped snapshots. Direct unban and log-channel operations retain their existing
-API execution path and do not yet implement this page-token/queued-dispatch contract.
+are not all scoped snapshots. Unban and log-channel operations use the page token and a
+stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
+retain captured membership and current action permissions.
 A missed Discord departure may leave an observation stale until reconciled. This wave does
 not provide full tenant isolation, erasure, distributed worker ownership or atomicity across
-Discord and SQL. The API still needs its bot token for direct operations.
+Discord and SQL. The API no longer retains or needs a bot token.

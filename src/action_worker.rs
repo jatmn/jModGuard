@@ -1,4 +1,4 @@
-//! Inactive bot dispatch library. Neither binary schedules this worker yet.
+//! Bot dispatch library, scheduled by the bot with bounded sequential batches.
 //! Authority is re-read at execution; uncertain Discord outcomes are not replayed.
 use crate::{
     bot_actions::Action,
@@ -10,34 +10,7 @@ use serenity::model::{
     permissions::Permissions,
 };
 
-/// Trusted library parameters, not active runtime settings. The activation wave
-/// must load these from bot configuration before scheduling bounded batches.
-#[derive(Debug, Clone)]
-pub struct WorkerLimits {
-    pub batch_size: u32,
-    pub request_timeout_secs: u32,
-}
-impl Default for WorkerLimits {
-    fn default() -> Self {
-        Self {
-            batch_size: 4,
-            request_timeout_secs: 15,
-        }
-    }
-}
-impl WorkerLimits {
-    pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            (1..=64).contains(&self.batch_size),
-            "invalid action worker batch size"
-        );
-        anyhow::ensure!(
-            (1..=120).contains(&self.request_timeout_secs),
-            "invalid action request timeout"
-        );
-        Ok(())
-    }
-}
+pub use crate::bot_actions::WorkerLimits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome {

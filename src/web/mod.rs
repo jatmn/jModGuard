@@ -64,6 +64,24 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        if let Some(key_error) = self.0.downcast_ref::<crate::bot_actions::RequestKeyError>() {
+            let (status, code) = match key_error {
+                crate::bot_actions::RequestKeyError::EnrollmentChanged => {
+                    (StatusCode::CONFLICT, "action_enrollment_changed")
+                }
+                crate::bot_actions::RequestKeyError::Expired => {
+                    (StatusCode::GONE, "action_request_expired")
+                }
+                crate::bot_actions::RequestKeyError::Invalid => {
+                    (StatusCode::BAD_REQUEST, "action_request_invalid")
+                }
+            };
+            return (
+                status,
+                Json(serde_json::json!({ "error": key_error.to_string(), "code": code })),
+            )
+                .into_response();
+        }
         let body = serde_json::json!({ "error": format!("{:#}", self.0) });
         (StatusCode::BAD_REQUEST, Json(body)).into_response()
     }
@@ -772,6 +790,11 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route(
             "/api/guilds/{guild_id}/unban",
             axum::routing::post(api::unban),
+        )
+        .route("/api/guilds/{guild_id}/actions", get(api::actions))
+        .route(
+            "/api/guilds/{guild_id}/actions/{id}",
+            axum::routing::delete(api::cancel_action),
         )
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
         .layer(session_layer)

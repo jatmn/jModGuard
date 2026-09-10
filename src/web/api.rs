@@ -5,6 +5,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use std::sync::Arc;
 use tower_sessions::Session;
@@ -14,6 +15,7 @@ use super::{
     ApiError, ApiResult, AuthCtx, authorize_manage_guild, guild_scope, is_bot_owner,
     require_bot_owner,
 };
+use crate::bot_actions::Action;
 use crate::db;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
 
@@ -621,7 +623,9 @@ pub async fn delete_template(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogChannelBody {
+    request_id: String,
     scope: Option<String>,
     #[serde(deserialize_with = "crate::ids::de_i64")]
     channel_id: i64,
@@ -675,10 +679,12 @@ pub async fn get_logchannel(
 pub async fn put_logchannel(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<LogChannelBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if scope == GLOBAL_SCOPE {
         return Err(ApiError(anyhow::anyhow!(
@@ -688,32 +694,52 @@ pub async fn put_logchannel(
     if !crate::types::EVENT_TYPES.contains(&event.as_str()) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
-    crate::discord::validate_log_channel_guild(
-        app.discord_http(),
+    enqueue_action(
+        &app,
         guild_id,
-        serenity::model::id::ChannelId::new(body.channel_id as u64),
+        &auth,
+        &body.request_id,
+        Action::SetLogChannel {
+            event,
+            channel_id: Some(body.channel_id),
+        },
     )
     .await
-    .map_err(ApiError)?;
-    db::upsert_log_channel(&app.db, scope, &event, body.channel_id).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearLogChannelBody {
+    scope: Option<String>,
+    request_id: String,
 }
 
 pub async fn delete_logchannel(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
-    Json(body): Json<ScopeBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+    Json(body): Json<ClearLogChannelBody>,
+) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
     let auth = guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if scope == GLOBAL_SCOPE {
         return Err(ApiError(anyhow::anyhow!(
             "log channels must be configured per guild"
         )));
     }
-    db::delete_log_channel(&app.db, scope, &event).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    enqueue_action(
+        &app,
+        guild_id,
+        &auth,
+        &body.request_id,
+        Action::SetLogChannel {
+            event,
+            channel_id: None,
+        },
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +883,9 @@ pub async fn bans(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnbanBody {
+    request_id: String,
     #[serde(deserialize_with = "crate::ids::de_u64")]
     user_id: u64,
     reason: Option<String>,
@@ -866,45 +894,24 @@ pub struct UnbanBody {
 pub async fn unban(
     State(app): State<Arc<ApiState>>,
     session: Session,
+    headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<UnbanBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
     let auth = super::authorize_ban_members(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
     let reason = body.reason.unwrap_or_else(|| "unbanned via WebUI".into());
 
-    // Discord is the source of truth for ban status. Local `bans` is a mirror
-    // (also healed by GUILD_BAN_REMOVE on the bot). Never fail the request after
-    // Discord already unbanned — that lied to operators and left confusing drift.
-    app.discord_http()
-        .remove_ban(
-            serenity::model::id::GuildId::new(guild_id),
-            serenity::model::id::UserId::new(body.user_id),
-            Some(&reason),
-        )
-        .await
-        .map_err(|e| ApiError(anyhow::anyhow!("discord unban failed: {e}")))?;
-
-    if let Err(e) = db::mark_unbanned(&app.db, guild_id as i64, body.user_id as i64).await {
-        tracing::warn!(
-            "local ban mirror update failed after Discord unban \
-             (guild={guild_id} user={}): {e:#}; gateway event may heal",
-            body.user_id
-        );
-    }
-    let actor_id = auth.user.id.parse::<u64>().ok().map(|x| x as i64);
-    if let Err(e) = db::insert_event(
-        &app.db,
-        guild_id as i64,
-        "member_unban",
-        Some(body.user_id as i64),
-        actor_id,
-        &serde_json::json!({"reason": reason, "source": "webui"}),
+    let user_id =
+        i64::try_from(body.user_id).map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?;
+    enqueue_action(
+        &app,
+        guild_id,
+        &auth,
+        &body.request_id,
+        Action::Unban { user_id, reason },
     )
     .await
-    {
-        tracing::warn!("failed to record webui unban event: {e:#}");
-    }
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn stats(
@@ -966,4 +973,94 @@ mod tests {
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
     }
+}
+
+pub(super) async fn enqueue_action(
+    app: &Arc<ApiState>,
+    guild: u64,
+    auth: &AuthCtx,
+    request: &str,
+    action: Action,
+) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
+    action.validate()?;
+    let enrollment = super::authorized_enrollment(auth, guild)?;
+    let actor = i64::try_from(auth.discord_user_id())
+        .map_err(|_| ApiError(anyhow::anyhow!("invalid actor id")))?;
+    let job = db::enqueue_enrolled_bot_action(
+        &app.db,
+        &enrollment,
+        actor,
+        request,
+        action,
+        chrono::Utc::now().timestamp(),
+        app.cfg.actions.clone(),
+    )
+    .await
+    .map_err(|error| {
+        if error.is::<db::EnrollmentChanged>() {
+            return ApiError(crate::bot_actions::RequestKeyError::EnrollmentChanged.into());
+        }
+        if error.is::<db::EnrollmentUnverified>()
+            || error.is::<crate::bot_actions::RequestKeyError>()
+        {
+            return ApiError(error);
+        }
+        tracing::warn!("bot action admission failed: {error:#}");
+        ApiError(anyhow::anyhow!(
+            "Could not queue action. Check pending actions and retry using the same request ID."
+        ))
+    })?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action) -> bool {
+    match action {
+        Action::Unban { .. } => auth.can_ban_members(guild),
+        Action::SetLogChannel { .. } => auth.can_manage(guild),
+    }
+}
+
+pub async fn actions(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild): Path<u64>,
+) -> ApiResult<Json<Vec<db::BotAction>>> {
+    let mut auth = super::require_auth_fresh(&app, &session).await?;
+    if guild == 0 || (!auth.can_manage(guild) && !auth.can_ban_members(guild)) {
+        return Err(ApiError(anyhow::anyhow!("actions not available")));
+    }
+    let enrollment = super::require_active_enrollment(&app, guild).await?;
+    auth.enrollment = Some(enrollment.clone());
+    super::check_page_enrollment(&auth, guild, &headers)?;
+    let mut jobs = db::recent_enrolled_bot_actions(&app.db, &enrollment).await?;
+    jobs.retain(|j| can_access_action(&auth, guild, &j.action));
+    Ok(Json(jobs))
+}
+
+pub async fn cancel_action(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild, id)): Path<(u64, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut auth = super::require_auth_fresh(&app, &session).await?;
+    if guild == 0 || (!auth.can_manage(guild) && !auth.can_ban_members(guild)) {
+        return Err(ApiError(anyhow::anyhow!("action not available")));
+    }
+    let enrollment = super::require_active_enrollment(&app, guild).await?;
+    auth.enrollment = Some(enrollment.clone());
+    super::check_page_enrollment(&auth, guild, &headers)?;
+    let job = db::enrolled_bot_action(&app.db, &enrollment, &id)
+        .await?
+        .ok_or_else(|| ApiError(anyhow::anyhow!("action not available")))?;
+    if !can_access_action(&auth, guild, &job.action) {
+        return Err(ApiError(anyhow::anyhow!("action not available")));
+    }
+    if !db::cancel_enrolled_bot_action(&app.db, &enrollment, &id).await? {
+        return Err(ApiError(anyhow::anyhow!(
+            "only a pending action can be cancelled"
+        )));
+    }
+    Ok(Json(serde_json::json!({"ok":true})))
 }

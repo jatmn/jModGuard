@@ -5,15 +5,14 @@ database (everything server-related, editable at runtime).
 
 The bot and API load `BotProcessConfig` and `ApiProcessConfig` respectively. Existing
 file/env names remain valid. The bot ignores `[web]` fields and web/OAuth env overrides;
-the API continues to validate them. The shared file must have valid TOML syntax. Both
-processes still need their bot token for existing Discord operations; this change does
-not activate the action queue. See [process configuration](ARCHITECTURE.md#process-configuration).
+the API continues to validate them. The shared file must have valid TOML syntax. Only
+the bot loads its bot token; the API uses OAuth and queues administrative actions. See [process configuration](ARCHITECTURE.md#process-configuration).
 
 ## config.toml
 
 | Key | Default | Description |
 |---|---|---|
-| `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required by bot; also by API for WebUI unban |
+| `discord.token` | — | Bot token (env: `JMODGUARD_DISCORD_TOKEN`). Required only by bot; ignored by API |
 | `db.path` | `jmodguard.db` | Local SQLite file (env: `JMODGUARD_DB_PATH`) |
 | `db.url` | — | Remote libSQL URL; empty = local path. Environment overrides are accepted only as a complete URL/token pair. |
 | `db.token` | — | Remote DB access token; required with `db.url`. Complete `JMODGUARD_DB_URL`/`JMODGUARD_DB_TOKEN` takes precedence over the complete Bunny-injected pair. |
@@ -29,6 +28,9 @@ not activate the action queue. See [process configuration](ARCHITECTURE.md#proce
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
+
+Administrative policy (`[actions]`) is shared by bot/API; scheduling (`[action_worker]`)
+is bot-only. See [all action defaults and environment overrides](BOT-ACTIONS.md#runtime-controls).
 
 Environment-only (not in `config.toml`):
 
@@ -50,6 +52,8 @@ exits if that wait expires).
 | Table | Holds |
 |---|---|
 | `meta` | schema family/version support and durable counters plus non-reusable revision tokens (`config_version`/`config_revision` for cache invalidation; `slash_registry_version`/`slash_registry_revision` for Discord slash re-sync) |
+| `guild_enrollments` | the bot's own observed guild membership, not a member roster |
+| `bot_actions` | typed administrative requests, membership-bound claims and outcome receipts; bounded resolved-history retention |
 | `nickname_reconcile` | request/membership-bound nickname jobs with captured nickname, pending/dormant/terminal state, persisted retries and last operator-visible error |
 | `mutation_receipts` | short-lived commit-outcome receipts that establish remote mutation results after an ambiguous COMMIT response |
 | `guild_settings` | prefix and bot nickname as **partial overrides** (row per server; `guild_id=0` = global). Missing fields inherit from the next layer. |

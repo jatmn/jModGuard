@@ -278,7 +278,6 @@ instead of spinning forever. OAuth CSRF is a cookie, so a restart between
 that one process (`jmodguard_session`).
 
 ```dotenv
-JMODGUARD_DISCORD_TOKEN=SECRET
 JMODGUARD_WEB_BIND=0.0.0.0:8080
 JMODGUARD_WEB_BASE_URL=https://YOUR-CDN-HOSTNAME
 JMODGUARD_OAUTH_CLIENT_ID=SECRET
@@ -303,8 +302,11 @@ https://YOUR-CDN-HOSTNAME/oauth/callback
 ```
 
 Leave `JMODGUARD_CORS_ORIGINS` unset. Same-origin via the Pull Zone does
-not need CORS. The API still needs the Discord bot token for OAuth, the
-guild list, and WebUI unban.
+not need CORS. The API uses OAuth for login and guild permissions; only the bot
+receives `JMODGUARD_DISCORD_TOKEN`. WebUI unban/log-channel changes queue actions
+for the bot and return receipts. Deploy matching bot/API/frontend builds and reload
+old pages. See [action settings and status](BOT-ACTIONS.md); set the same `[actions]`
+storage policy in both processes, and worker controls only on the bot.
 
 Both containers need **full-access** database tokens. A read-only Bunny
 token will fail API startup (the API probes a no-op write after schema

@@ -1,4 +1,4 @@
-//! Inactive queue foundation: typed API-to-bot requests. No opaque SQL, URLs, executable code or credentials.
+//! Durable queue protocol: typed API-to-bot requests. No opaque SQL, URLs, executable code or credentials.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ impl Action {
     }
 }
 
-/// Storage limits supplied by trusted callers; not loaded by either running service.
+/// Storage limits loaded by bot/API; keep matching admission/retention values.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Limits {
@@ -132,4 +132,33 @@ pub(crate) fn request_key_time(request: &str, now: i64) -> Result<i64> {
         (time > 0 && time <= now.checked_add(300)?).then_some(time)
     };
     valid().ok_or_else(|| RequestKeyError::Invalid.into())
+}
+
+/// Validated bot dispatch parameters, loaded through action_worker configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WorkerLimits {
+    pub batch_size: u32,
+    pub request_timeout_secs: u32,
+}
+impl Default for WorkerLimits {
+    fn default() -> Self {
+        Self {
+            batch_size: 4,
+            request_timeout_secs: 15,
+        }
+    }
+}
+impl WorkerLimits {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=64).contains(&self.batch_size),
+            "invalid action worker batch size"
+        );
+        anyhow::ensure!(
+            (1..=120).contains(&self.request_timeout_secs),
+            "invalid action request timeout"
+        );
+        Ok(())
+    }
 }
