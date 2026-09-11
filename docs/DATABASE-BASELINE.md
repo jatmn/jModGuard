@@ -93,3 +93,12 @@ from existing configuration, membership or data and does not move any records. C
 bot/API operation continues against the configured database. Deploy matched builds, bot
 first; version9 binaries reject version10. Rollback requires matching pre-upgrade backup
 and binaries. See [catalog scope and limits](GUILD-STORES.md).
+
+## Separate guild-store family
+
+The inactive `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version1,
+using `migrations/guild/0001_identity.sql`. It is a different database with identity,
+initial placement bindings and receipts only. Core remains at migration0010; bot/API
+startup never creates this family. Each opener refuses the other family, even though
+version numbers may overlap. No records are moved and no runtime routing is enabled.
+See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).

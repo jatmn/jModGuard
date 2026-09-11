@@ -261,10 +261,24 @@ changes are refused. Migration0010 starts empty, preserving current records and 
 There are no credentials, provider resources, routing caches, extra pools or tasks. Matched
 bot/API builds are required. See [the catalog contract](GUILD-STORES.md).
 
+## Implemented: inactive separate guild-store identity
+
+A separate `jmodguard-guild-1` schema and private-pool `GuildDataStore` wrapper verify
+expected identity/ownership and install/check initial catalog placement revisions.
+Foreign/core/unmarked schemas and conflicting bindings are refused. Matching retries
+write nothing; initialization and binding recover lost commit responses on primary.
+The wrapper reuses existing transport/pool/receipt code with no new dependency.
+Core schema and current bot/API operation are unchanged. See [store contracts](GUILD-STORES.md).
+
+These checks establish neither live routing nor distributed writer exclusion. Actual
+membership/placement-scoped data operations must check scope in their own transaction;
+restored copies can have identical identity stamps. CI uses a separate empty disposable
+libSQL server for each schema's smoke test. No live provider behavior is established.
+
 ## Next implementation slices
 
-1. Build on the inactive catalog with actual store identity verification, data-side placement
-   checks and the fresh data model/tenant routing: shared/dedicated guild placement,
+1. Build on the inactive catalog and store identity/bindings with transactional scoped
+   data operations and the fresh data model/tenant routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient
    message context. Correct exact repeated-image matching in the actual event pipeline.
 2. Add durable sessions, owner/guild authorization surfaces and effective settings with

@@ -258,7 +258,7 @@ class GitSourceTests(unittest.TestCase):
     def test_service_package_changes_trigger_both_copied_build_contexts(self):
         real_run = publisher.run
         for path in ("crates/bot/src/main.rs", "crates/api/src/web/api.rs",
-                     "crates/runtime/src/health.rs"):
+                     "crates/runtime/src/health.rs", "migrations/guild/0001_identity.sql"):
             previous = publisher.git("rev-parse", "HEAD")
             head = self.commit(path)
             config = {"config": {"Labels": {"org.opencontainers.image.revision": previous,

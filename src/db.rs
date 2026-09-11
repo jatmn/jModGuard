@@ -37,6 +37,7 @@ mod nickname_jobs;
 pub use nickname_jobs::*;
 mod moderation;
 pub use moderation::*;
+pub mod guild_data;
 pub mod guild_stores;
 mod settings;
 pub use settings::*;
@@ -366,6 +367,67 @@ impl Db {
     }
 
     pub fn open_with(opts: DbOpenOptions) -> Result<Self> {
+        let opts_defaults = GuildSettings {
+            prefix: opts.default_prefix.clone(),
+            bot_name: GuildSettings::default().bot_name,
+            retention_days: opts.retention_days,
+        };
+        Self::open_with_bootstrap(
+            &opts,
+            |bootstrap| {
+                if opts.migrate {
+                    // Hide readiness only when this open will actually rebuild
+                    // schema/defaults. Clearing on every reconnect made a
+                    // retryable pool failure look like an incomplete first boot
+                    // and blocked the API for the whole remote retry window.
+                    if migrate_open_needs_api_fence(bootstrap)? {
+                        clear_bootstrap_complete(bootstrap)?;
+                    }
+                    migrate_conn(bootstrap)?;
+                    // Bot is authority for terminal defaults: sync from config every
+                    // migrate-open so both processes resolve empty global fields from
+                    // the same durable meta row (not each process's config.toml).
+                    write_terminal_defaults_meta(bootstrap, &opts_defaults)?;
+                    seed_globals_conn(
+                        bootstrap,
+                        &opts.default_prefix,
+                        opts.retention_days,
+                        &opts_defaults,
+                    )?;
+                    // Idempotent when guild_settings changed; skipped via checksum when not.
+                    heal_default_guild_settings_conn(bootstrap, &opts_defaults)?;
+                } else {
+                    // One primary-routed snapshot is the API readiness barrier.
+                    // Replica reads can otherwise see an old completed marker
+                    // while a new bot bootstrap is in progress on the primary.
+                    let _ = read_bootstrap_defaults_primary(bootstrap)?;
+                    // Bunny issues read-only tokens alongside full-access. The API
+                    // only SELECTs during open, so a read-only token would pass
+                    // bootstrap and fail later on the first WebUI write.
+                    ensure_api_writes_allowed(bootstrap)?;
+                }
+                Ok(())
+            },
+            |bootstrap| {
+                if opts.migrate {
+                    write_meta_string_conn(
+                        bootstrap,
+                        META_BOOTSTRAP_COMPLETE,
+                        &MIGRATIONS.len().to_string(),
+                    )?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    // Share transport/pool creation while keeping core and guild-store schemas separate.
+    // No caller can obtain an unchecked pool before its initializer succeeds.
+    fn open_with_bootstrap(
+        opts: &DbOpenOptions,
+        initialize: impl FnOnce(&mut Connection) -> Result<()>,
+        ready: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
         let remote = !opts.url.trim().is_empty();
         if remote && opts.token.trim().is_empty() {
             anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
@@ -388,12 +450,6 @@ impl Db {
         };
         let database = Arc::new(database);
 
-        let opts_defaults = GuildSettings {
-            prefix: opts.default_prefix.clone(),
-            bot_name: GuildSettings::default().bot_name,
-            retention_days: opts.retention_days,
-        };
-
         // Migrate / schema-check on a dedicated connection first, so no other
         // connections are racing the DDL at startup.
         {
@@ -409,37 +465,7 @@ impl Db {
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
-            if opts.migrate {
-                // Hide readiness only when this open will actually rebuild
-                // schema/defaults. Clearing on every reconnect made a
-                // retryable pool failure look like an incomplete first boot
-                // and blocked the API for the whole remote retry window.
-                if migrate_open_needs_api_fence(&bootstrap)? {
-                    clear_bootstrap_complete(&bootstrap)?;
-                }
-                migrate_conn(&mut bootstrap)?;
-                // Bot is authority for terminal defaults: sync from config every
-                // migrate-open so both processes resolve empty global fields from
-                // the same durable meta row (not each process's config.toml).
-                write_terminal_defaults_meta(&bootstrap, &opts_defaults)?;
-                seed_globals_conn(
-                    &mut bootstrap,
-                    &opts.default_prefix,
-                    opts.retention_days,
-                    &opts_defaults,
-                )?;
-                // Idempotent when guild_settings changed; skipped via checksum when not.
-                heal_default_guild_settings_conn(&mut bootstrap, &opts_defaults)?;
-            } else {
-                // One primary-routed snapshot is the API readiness barrier.
-                // Replica reads can otherwise see an old completed marker
-                // while a new bot bootstrap is in progress on the primary.
-                let _ = read_bootstrap_defaults_primary(&bootstrap)?;
-                // Bunny issues read-only tokens alongside full-access. The API
-                // only SELECTs during open, so a read-only token would pass
-                // bootstrap and fail later on the first WebUI write.
-                ensure_api_writes_allowed(&bootstrap)?;
-            }
+            initialize(&mut bootstrap)?;
 
             let pool_size = opts.pool_size.max(2) as usize;
             let mut connections = Vec::with_capacity(pool_size);
@@ -454,13 +480,7 @@ impl Db {
             // `open_with_until_ready` (remote first-boot) would otherwise
             // clear this marker after a later pool-connect failure, while an
             // API that already passed the gate is serving.
-            if opts.migrate {
-                write_meta_string_conn(
-                    &bootstrap,
-                    META_BOOTSTRAP_COMPLETE,
-                    &MIGRATIONS.len().to_string(),
-                )?;
-            }
+            ready(&bootstrap)?;
 
             Ok(Self {
                 _database: Arc::clone(&database),
