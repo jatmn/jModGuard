@@ -3,8 +3,12 @@ use super::guild_stores::{GuildPlacement, StorePolicy, StoreRegistration};
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
+
+const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
+mod tenant_logs;
+pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
 
 /// Trusted installation connection settings. Never accept these from a guild request.
 /// Deliberately has no Debug/Serialize implementation: token and URL may be sensitive.
@@ -42,10 +46,22 @@ fn owner(registration: &StoreRegistration) -> Option<i64> {
 }
 
 fn verify_identity(conn: &impl SqlExecutor, expected: &StoreRegistration) -> Result<()> {
+    verify_identity_version(conn, expected, VERSION)
+}
+
+fn verify_identity_version(
+    conn: &impl SqlExecutor,
+    expected: &StoreRegistration,
+    wanted: i64,
+) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
-    anyhow::ensure!(version == VERSION, StoreCheckError::Schema);
+    anyhow::ensure!(version == wanted, StoreCheckError::Schema);
     let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('store_identity','guild_bindings','mutation_receipts')) OR (type='trigger' AND name IN ('store_identity_no_replace','store_identity_no_update','store_identity_no_delete','guild_binding_owner','guild_binding_no_replace','guild_binding_no_update','guild_binding_no_delete'))", (), |r| Ok(r.get(0)?))?;
     anyhow::ensure!(tables == 10, StoreCheckError::Schema);
+    if wanted == 2 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_memberships','guild_log_channels')) OR (type='trigger' AND name IN ('guild_membership_binding','guild_membership_no_replace','guild_membership_update','guild_membership_no_delete','guild_log_channel_insert','guild_log_channel_update'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 8, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -63,19 +79,28 @@ fn initialize_store(
     expected: &StoreRegistration,
     create: bool,
 ) -> Result<()> {
-    let tx = conn.transaction_primary_read()?;
+    let mut tx = conn.transaction_primary_read()?;
     let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let objects: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
         (),
         |r| Ok(r.get(0)?),
     )?;
+    if create && version == 1 {
+        // Verify the old family and expected identity before extending it. No core migration.
+        verify_identity_version(&tx, expected, 1)?;
+        tx.ensure_mutation_receipt()?;
+        tx.execute_batch(TENANT_SCHEMA)?;
+        tx.pragma_update(None, "user_version", VERSION)?;
+        return tx.commit();
+    }
     if !create || version != 0 || objects != 0 {
         verify_identity(&tx, expected)?;
         tx.finish_read()?;
         return Ok(());
     }
     tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(TENANT_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete
@@ -168,14 +193,22 @@ impl GuildDataStore {
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_read()?;
-                verify_identity(&tx, &expected)?;
-                let current =
-                    binding_revision(&tx, placement.guild_id())?.ok_or(StoreCheckError::Unbound)?;
-                anyhow::ensure!(current == placement.revision(), StoreCheckError::Placement);
+                verify_bound_placement(&tx, &expected, &placement)?;
                 tx.finish_read()
             })
             .await
     }
+}
+
+fn verify_bound_placement(
+    conn: &impl SqlExecutor,
+    expected: &StoreRegistration,
+    placement: &GuildPlacement,
+) -> Result<()> {
+    verify_identity(conn, expected)?;
+    let current = binding_revision(conn, placement.guild_id())?.ok_or(StoreCheckError::Unbound)?;
+    anyhow::ensure!(current == placement.revision(), StoreCheckError::Placement);
+    Ok(())
 }
 
 fn binding_revision(conn: &impl SqlExecutor, guild: i64) -> Result<Option<String>> {

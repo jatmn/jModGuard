@@ -1,7 +1,7 @@
 //! Run against a fresh disposable remote database, separate from the core smoke DB.
-use jmodguard::db::guild_data::{GuildDataStore, GuildStoreOptions};
+use jmodguard::db::guild_data::{GuildDataScope, GuildDataStore, GuildStoreOptions};
 use jmodguard::db::guild_stores::*;
-use jmodguard::db::{Db, test_drop_next_commit_response};
+use jmodguard::db::{Db, GuildEnrollment, test_drop_next_commit_response};
 
 fn remote_options() -> GuildStoreOptions {
     GuildStoreOptions {
@@ -71,6 +71,63 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
         .unwrap();
     assert!(store.bind_initial_placement(wrong.clone()).await.is_err());
     assert!(store.verify_placement(wrong).await.is_err());
+    let scoped = GuildDataScope::new(
+        guild_placement(&catalog, 10).await.unwrap().unwrap(),
+        GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    assert!(store.log_channels(scoped.clone()).await.is_err());
+    test_drop_next_commit_response();
+    store.bind_initial_membership(scoped.clone()).await.unwrap();
+    let snapshot = reopened.log_channels(scoped.clone()).await.unwrap();
+    assert!(snapshot.channels().is_empty());
+    test_drop_next_commit_response();
+    // Matching initial binding and absent deletion must leave fault injection
+    // for the real mapping mutation, without a no-op mutation receipt.
+    reopened
+        .bind_initial_membership(scoped.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .set_log_channel(scoped.clone(), snapshot.revision(), "system", None)
+            .await
+            .unwrap(),
+        snapshot.revision()
+    );
+    let revision = store
+        .set_log_channel(scoped.clone(), snapshot.revision(), "system", Some(12))
+        .await
+        .unwrap();
+    let after = reopened.log_channels(scoped.clone()).await.unwrap();
+    assert_eq!(after.revision(), revision);
+    assert_eq!(after.channels(), &[("system".to_owned(), 12)]);
+    assert!(
+        reopened
+            .set_log_channel(scoped.clone(), snapshot.revision(), "system", Some(13))
+            .await
+            .is_err()
+    );
+    test_drop_next_commit_response();
+    store.close_membership(scoped.clone()).await.unwrap();
+    assert!(reopened.log_channels(scoped.clone()).await.is_err());
+    assert!(
+        reopened
+            .set_log_channel(scoped.clone(), &revision, "system", Some(13))
+            .await
+            .is_err()
+    );
+    assert!(
+        reopened
+            .bind_initial_membership(scoped.clone())
+            .await
+            .is_err()
+    );
+    reopened.close_membership(scoped).await.unwrap();
     drop((store, reopened, catalog));
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

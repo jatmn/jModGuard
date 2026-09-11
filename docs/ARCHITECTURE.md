@@ -158,6 +158,12 @@ still creates no such handles. Checks are snapshots, not writer leases or later-
 authorization; cloned stores can retain identical stamps. Actual data access and moves
 must combine checks with tenant operations and coordinated writer exclusion.
 
+[Captured tenant log-channel operations](TENANT-LOG-CHANNELS.md) now demonstrate that
+same-transaction boundary in the separate store: exact membership and placement accompany
+reads/edits, revision checks reject stale edits, and closure removes mappings and denies
+later access. This remains inactive; it does not replace core log configuration or queued
+completion, implement full guild purge, or coordinate directory/Discord state.
+
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,

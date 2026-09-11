@@ -96,8 +96,12 @@ No URLs/credentials belong in the catalog. Placement revisions do not fence data
 The separate inactive `db::guild_data` handle verifies `jmodguard-guild-1` identity and
 initial bindings. Keep its raw pool private; reuse the existing transport/recovery code.
 Never run core migrations/defaults on a guild store or adopt a foreign/unmarked schema.
-Identity and binding checks must share the transaction with future tenant data operations;
-a successful snapshot check does not authorize a later write. Cloned backups can retain
+Version2 adds inactive captured membership/log-channel operations; see
+`docs/TENANT-LOG-CHANNELS.md`. Identity/placement/membership checks must share the data
+transaction, including empty/no-op paths. Keep per-membership edit revisions and closure
+atomic with mappings; never rebind or reopen a closed scope automatically. Initial binding
+is trusted lifecycle work, not permission checking. No current runtime routing/queue/version
+integration or full erasure is enabled. A successful snapshot check never authorizes a later write. Cloned backups can retain
 the same identity/revision. Routing, lifecycle erasure and writer exclusion remain pending.
 
 ## Commands

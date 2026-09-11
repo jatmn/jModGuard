@@ -275,10 +275,25 @@ membership/placement-scoped data operations must check scope in their own transa
 restored copies can have identical identity stamps. CI uses a separate empty disposable
 libSQL server for each schema's smoke test. No live provider behavior is established.
 
+## Implemented: inactive captured tenant log-channel operations
+
+The separate guild store now binds an initial captured membership and checks it alongside
+store identity, placement and log mappings in one primary transaction. Revision checks
+reject stale edits; reads/no-op edits write nothing. Closing the exact membership removes
+its mappings and blocks later access/rebinding atomically. Version2 adds empty membership
+and mapping tables to the verified guild-store lineage; core stays version10. Existing
+shared event types bound mapping count, with no message/event payload collection or new
+dependency/task. See [the contract and limits](TENANT-LOG-CHANNELS.md).
+
+Current services still use core settings and the action queue. Directory/lifecycle
+coordination, full erasure/rejoin, global policy, queue completion/version observation and
+runtime authorization/routing remain pending. Closed identities are transitional storage
+barriers, not the final purge policy. No live provider proof or distributed writer lease.
+
 ## Next implementation slices
 
-1. Build on the inactive catalog and store identity/bindings with transactional scoped
-   data operations and the fresh data model/tenant routing: shared/dedicated guild placement,
+1. Extend the captured tenant log-channel pattern across the fresh data model/tenant
+   routing: shared/dedicated guild placement,
    scoped case/evidence identities, selected durable audit records and bounded transient
    message context. Correct exact repeated-image matching in the actual event pipeline.
 2. Add durable sessions, owner/guild authorization surfaces and effective settings with
