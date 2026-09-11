@@ -2,8 +2,9 @@
 
 The inactive guild-store library records selected attachment ownership and lifecycle state.
 It does not upload, fetch, serve or delete files, create URLs, bind Storage resources, run
-workers or enable current bot/API capture. Adapters, worker coordination, backend permissions
-and backup-copy lifecycle must land before activation.
+workers or enable current bot/API capture. The separate opt-in [local transfer backend](LOCAL-EVIDENCE.md)
+now implements local file I/O and exclusive coordination. Remote adapters, runtime worker
+coordination, backend permissions and backup-copy lifecycle must land before activation.
 
 ## Reservation and identity
 
@@ -90,7 +91,7 @@ Core stays0010; current bot/API never opens these stores.
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
 races, scope denial, bounded closed cleanup/pages, SQL guards, cancellation/purge rollback
 and version5 upgrade. A local file fixture simulates a late write before settlement/deletion;
-it is not a production adapter. Disposable libSQL injects lost responses for reservation,
+it is distinct from the real local backend linked above. Disposable libSQL injects lost responses for reservation,
 settlement, cancellation preparation, acknowledgment and parent cleanup. No live provider
 proof, serving permission, backup-copy erasure, resource measurement or full tenant-isolation
 guarantee is supplied.

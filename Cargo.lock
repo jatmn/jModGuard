@@ -1122,6 +1122,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "regex",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

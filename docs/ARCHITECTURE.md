@@ -168,14 +168,16 @@ Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for im
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
 batch cleanup. It remains inactive: current moderation handlers still write core records.
 Its [append-only history](CASE-HISTORY.md) preserves original facts and is removed with its
-parent case. No file evidence, backup cleanup, runtime permissions or full erasure is supplied yet.
+parent case. Runtime file capture, backup cleanup, permissions and full erasure remain pending.
 
 The inactive guild-store lineage supports [explicit case source association](CASE-SOURCES.md),
 including late links to removed parents. Runtime source matching and case adoption remain
 pending; current services continue to use core moderation records.
 Schema6 adds a [private evidence ownership journal](CASE-EVIDENCE.md) with bounded admission,
-settlement and cleanup acknowledgment. Actual object I/O, worker coordination, serving
-permissions and backup-copy cleanup remain disabled/pending.
+settlement and cleanup acknowledgment. An opt-in [Unix local transfer backend](LOCAL-EVIDENCE.md)
+now streams/verifies real files and holds an OS resource lock through journal settlement.
+Remote Storage transfers, runtime workers, serving permissions and backup-copy cleanup
+remain pending; current services do not activate the local backend.
 
 ## Migrations
 
