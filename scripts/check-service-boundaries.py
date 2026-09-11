@@ -74,7 +74,7 @@ def main():
     print("Captured configuration is confined to DB/API code")
 
     # Catalog storage is not yet runtime routing or a dashboard control surface.
-    catalog = re.compile(r"\b(?:guild_stores|guild_data|GuildDataStore|GuildDataScope|LogChannelSnapshot|CaseData|RecordCase|evidence_transfer|LocalEvidenceStore|EvidenceUpload|EvidenceTarget|EvidenceRequest|EvidenceJob|EvidenceCapture|CaseSourceMatch|LinkCaseSource|CaseHistoryData|CaseHistoryBody|AppendCaseHistory|register_store|assign_initial_placement|guild_placement|store_registration)\b")
+    catalog = re.compile(r"\b(?:guild_stores|guild_data|GuildDataStore|GuildDataScope|LogChannelSnapshot|CaseData|RecordCase|bunny_evidence|BunnyEvidenceStore|BunnyTransferLimits|evidence_transfer|LocalEvidenceStore|EvidenceUpload|EvidenceTarget|EvidenceRequest|EvidenceJob|EvidenceCapture|CaseSourceMatch|LinkCaseSource|CaseHistoryData|CaseHistoryBody|AppendCaseHistory|register_store|assign_initial_placement|guild_placement|store_registration)\b")
     for service in ("bot", "api", "conductor"):
         for path in (ROOT / f"crates/{service}/src").rglob("*.rs"):
             if catalog.search(path.read_text()):

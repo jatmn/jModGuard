@@ -2,6 +2,8 @@
 //! Service implementations live in independent bot and API packages.
 
 pub mod bot_actions;
+#[cfg(unix)]
+pub mod bunny_evidence;
 pub mod config;
 pub mod db;
 mod db_compat;

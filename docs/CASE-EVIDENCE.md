@@ -3,8 +3,9 @@
 The inactive guild-store library records selected attachment ownership and lifecycle state.
 It does not upload, fetch, serve or delete files, create URLs, bind Storage resources, run
 workers or enable current bot/API capture. The separate opt-in [local transfer backend](LOCAL-EVIDENCE.md)
-now implements local file I/O and exclusive coordination. Remote adapters, runtime worker
-coordination, backend permissions and backup-copy lifecycle must land before activation.
+implements local file I/O and exclusive coordination. The opt-in [Bunny adapter](BUNNY-EVIDENCE.md)
+adds HTTP transfer with durable single-use attempts. Runtime worker coordination, installation
+privacy verification, backend permissions and backup-copy lifecycle still precede activation.
 
 ## Reservation and identity
 
@@ -84,8 +85,8 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 ## Schema and validation
 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
-1–6; verified versions1–5 upgrade atomically without inventing attachments. Open requires6;
-older guild-store binaries reject6. Rollback needs matching pre-upgrade database/binary.
+1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
+Open requires7; older guild-store binaries reject7. Rollback needs matching pre-upgrade database/binary.
 Core stays0010; current bot/API never opens these stores.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal

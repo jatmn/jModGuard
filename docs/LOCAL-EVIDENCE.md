@@ -4,7 +4,7 @@ The opt-in Unix `evidence_transfer::LocalEvidenceStore` implements real file cap
 verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.md).
 It is a library backend for a dedicated local filesystem. Current bot/API/conductor
 services do not call it. There is no new scheduler, serving route or configuration default.
-Core remains0010 and guild schema remains6.
+Core remains0010; the current guild schema is7.
 
 ## Resource contract
 
@@ -61,8 +61,8 @@ waiter does not release the blocking task's permit or lock; the task completes i
 operation. A blocking reader must implement its own I/O deadlines. Process termination
 releases the OS lock, after which recovery inspects the durable artifacts.
 
-This local lock protocol does not prove that a timed-out remote PUT has stopped. A Bunny
-Storage adapter needs its own verified resource binding and uncertain-write protocol;
+This local lock protocol does not prove that a timed-out remote PUT has stopped. The separate [Bunny adapter](BUNNY-EVIDENCE.md)
+uses a durable single-use attempt and acceptance receipt;
 an HTTP timeout or object 404 cannot substitute for exclusive local ownership.
 
 ## Removal
@@ -87,6 +87,6 @@ process exclusion, identity/path guards, removal retries, preservation of unrela
 and closed-membership purge. Disposable libSQL also exercises real local files alongside
 lost reservation and deletion-acknowledgment responses.
 
-Bunny transfer, durable worker scheduling, serving permissions, portable backup-copy cleanup,
+Live Bunny validation, durable worker scheduling, serving permissions, portable backup-copy cleanup,
 runtime routing and UI remain separate work. Local filesystem tests establish neither
 provider behavior nor billed CPU/memory use.

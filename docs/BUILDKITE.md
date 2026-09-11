@@ -27,7 +27,9 @@ Publishing uses the existing Docker daemon's BuildKit cache and inline cache
 metadata in the published image; it does not depend on the Actions cache service.
 
 The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
-`jmodguard-integration-tests`, each with its own empty disposable libSQL container.
+`jmodguard-integration-tests`, plus the root library's
+`bunny_evidence::tests::remote_bunny_journal_recovers_commits`. Each uses its own empty
+disposable libSQL container; the Bunny test also starts a local HTTP storage fixture.
 They run sequentially with loopback-only ephemeral ports and cleanup on exit. Never point
 these ignored tests at an existing installation or share one database between the binaries.
 

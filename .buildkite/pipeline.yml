@@ -79,7 +79,7 @@ steps:
       esac
       cargo fetch --locked
       # Each schema test needs a distinct empty server. Never reset/adopt the core DB.
-      for TEST_TARGET in remote_database_smoke guild_store_smoke; do
+      for TEST_TARGET in remote_database_smoke guild_store_smoke bunny_evidence; do
         NAME="libsql-ci-$${BUILDKITE_JOB_ID}-$${TEST_TARGET}"
         trap 'docker rm -f "$$NAME"' EXIT
         docker run -d --name "$$NAME" -p 127.0.0.1::8080 \
@@ -106,7 +106,11 @@ steps:
           echo "$$NAME did not become healthy after 30 attempts" >&2
           exit 1
         fi
-        cargo test --locked -p jmodguard-integration-tests --test "$$TEST_TARGET" -- --ignored --nocapture
+        if [ "$$TEST_TARGET" = bunny_evidence ]; then
+          cargo test --locked -p jmodguard --lib bunny_evidence::tests::remote_bunny_journal_recovers_commits -- --ignored --exact --nocapture
+        else
+          cargo test --locked -p jmodguard-integration-tests --test "$$TEST_TARGET" -- --ignored --nocapture
+        fi
         docker rm -f "$$NAME"
         trap - EXIT
       done
