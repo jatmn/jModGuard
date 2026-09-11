@@ -69,7 +69,8 @@ parent and fails. The parent's minimal source replay marker survives; neither a 
 ID nor a retried old ID can append to it. There is no separate entry-edit/delete operation.
 
 Closing membership denies history access immediately. `purge_closed_cases` also deletes
-each purged parent's history atomically. Its batch count is parent cases, not total child
+each purged parent's history atomically. An [unsettled evidence object](CASE-EVIDENCE.md)
+blocks parent purge until cleanup is acknowledged. Its batch count is parent cases, not total child
 rows or bytes; cleanup work includes the admitted history for those cases. Per-case history
 budgets bound normal admitted growth, but lowering them does not shrink existing cleanup
 work. An interrupted failed transaction leaves the parent and its history together.
@@ -84,8 +85,8 @@ backup cleanup, external evidence ownership and distributed writer exclusion rem
 
 Guild migration0004 adds only the history table, constraints and parent/child triggers.
 Version5 additionally tracks [explicit case sources](CASE-SOURCES.md). `initialize` verifies
-and extends matching version1–4 stores to5, preserving cases, history, replay markers and
-settings. `open` requires5; old guild-store binaries reject5.
+and extends matching version1–5 stores to6, preserving cases, history, replay markers and
+settings. `open` requires6; old guild-store binaries reject6.
 Rollback needs matching pre-upgrade backup and binary. Core stays0010 and current bot/API
 continues using core moderation records.
 

@@ -66,7 +66,8 @@ detection or proof that Discord polling has reconciled every event.
 
 Closed membership denies all normal lookup/link operations immediately. `purge_closed_cases`
 then deletes the parent and its source mappings/history atomically; failures roll back the
-whole batch. The batch count measures parent cases, including their admitted children.
+whole batch. [Unsettled evidence ownership](CASE-EVIDENCE.md) blocks this purge until object
+cleanup is acknowledged. The batch count measures parent cases, including their admitted children.
 Source mappings contribute at most two rows per parent. Other guilds remain untouched.
 No independent source deletion or unlink API exists. SQL guards reject replacement, updates,
 orphan inserts and active-membership deletion without relying on FK/recursive-trigger PRAGMAs.
@@ -80,8 +81,9 @@ file evidence or backup copy is created by this slice.
 
 Guild migration0005 adds the source table and ownership triggers, backfilling original source
 keys for existing live, removed and closed cases. It does not guess counterpart IDs or alter
-case payload/history. `initialize` verifies versions1–4 and expected identity before upgrading
-atomically to5. Fresh initialization applies1–5; `open` requires5. Older guild binaries reject5;
+case payload/history. `initialize` verifies versions1–5 and expected identity before upgrading
+atomically to6. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
+applies1–6; `open` requires6. Older guild binaries reject6;
 rollback requires matching pre-upgrade database/binary. Current core remains0010 and current
 bot/API services do not use guild stores.
 

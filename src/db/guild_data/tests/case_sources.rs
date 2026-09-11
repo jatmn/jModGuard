@@ -535,7 +535,7 @@ async fn version_four_upgrade_indexes_live_removed_and_closed_cases() {
             );
             assert_eq!(
                 c.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))?,
-                5
+                6
             );
             Ok(())
         })

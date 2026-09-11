@@ -30,9 +30,9 @@ storage layer never guesses a match or merges two existing cases.
 Evidence is explicitly unavailable or a bounded nonempty list of selected text excerpts,
 with channel/message/author IDs and original timestamps. Guild/membership ownership comes
 from the case. No attachment URLs, arbitrary object keys, downloads or external evidence
-references are accepted. This completes deletion of the evidence this slice can own; file
-capture, hashes, richer proof and private Storage ownership remain later
-work. Text evidence is a selected subset, not a completeness guarantee or general history.
+references are accepted by `CaseData`. Separate [evidence ownership](CASE-EVIDENCE.md)
+now journals selected attachment reservations and cleanup; actual file capture, verification,
+serving and private Storage integration remain disabled. Text evidence is a selected subset, not a completeness guarantee or general history.
 Discord snowflake serialization reuses the existing string helpers.
 
 ## Operations and memory bounds
@@ -81,7 +81,8 @@ or recursive-trigger settings. Database administrators can still replace schema 
 
 Closing membership immediately denies all normal case access/writes. Case cleanup is a
 separate bounded operation; it can remove retained payloads and replay markers after closure
-without admitting stale work. Other guilds are untouched. The closed membership identity
+without admitting stale work. A parent with unsettled file-evidence ownership now blocks that
+purge batch until capture settlement and object deletion are acknowledged. Other guilds are untouched. The closed membership identity
 still blocks rebinding. This is not full guild erasure/rejoin or removal from backups: no
 backup copies or file evidence are created here, and directory/identity/backup lifecycle
 coordination remains required. No permanent departed-guild ledger is the product target.
@@ -89,10 +90,11 @@ coordination remains required. No permanent departed-guild ledger is the product
 ## Schema and validation
 
 Guild migration0003 adds only `guild_cases` and its indexes/guards within `jmodguard-guild-1`.
-`initialize` verifies the expected version1–4 family and identity before atomically extending
-it to5, preserving placement, settings and cases. Version4 adds owned history; version5 adds
-source mappings with original-key backfill. Fresh initialization applies all five steps.
-`open` requires5. Old guild-store binaries reject5; rollback needs matching pre-upgrade
+`initialize` verifies the expected version1–5 family and identity before atomically extending
+it to6, preserving placement, settings and cases. Version4 adds owned history; version5 adds
+source mappings with original-key backfill. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
+applies all six steps.
+`open` requires6. Old guild-store binaries reject6; rollback needs matching pre-upgrade
 backups and binaries. Core remains0010 and current services never open these guild stores.
 
 Local regressions cover scoped persistence/paging, source conflicts/concurrent retries,

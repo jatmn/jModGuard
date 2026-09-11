@@ -122,6 +122,13 @@ Require an already-bound anchor and reject conflicts; never infer matches or mer
 Preserve original facts and both source replay keys after removal, including late explicit
 links to removed parents. Closed cleanup removes owned keys atomically. No runtime adoption.
 
+Version6 adds the inactive evidence ownership journal; see `docs/CASE-EVIDENCE.md`.
+Reserve before object writes, preserve stable identity/byte admission, and never acknowledge
+capture settlement while a write can still arrive. Removal cancels/hides metadata immediately;
+closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jobs are snapshots,
+not leases or provider proof. No object worker, Storage adapter, serving route or backup-copy
+lifecycle is activated. Private evidence and backups-only resources must remain separate.
+
 ## Commands
 
 ```bash
