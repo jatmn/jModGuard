@@ -35,9 +35,18 @@ struct Bucket {
     budget: Budget,
     reported_until: Instant,
 }
+/// Replay/rate tombstone after posts are gone; does not occupy live author slots.
+struct Watermark {
+    retired_before: u64,
+    last_seen: Instant,
+    token: (u64, u64),
+    budget: Budget,
+    reported_until: Instant,
+}
 struct Guild {
     bytes: usize,
     authors: HashMap<u64, Bucket>,
+    watermarks: HashMap<u64, Watermark>,
     budget: Budget,
 }
 struct State {
@@ -49,6 +58,7 @@ struct State {
     bytes: usize,
     budget: Budget,
 }
+#[derive(Clone)]
 struct Budget {
     start: Instant,
     requests: u64,
@@ -89,6 +99,29 @@ impl Budget {
         self.bytes += bytes;
     }
 }
+struct Occupancy<'a> {
+    guilds: &'a mut HashMap<u64, Guild>,
+    index: &'a mut HashMap<Key, u64>,
+    bytes: &'a mut usize,
+    authors: &'a mut usize,
+}
+impl State {
+    fn occupancy(&mut self) -> Occupancy<'_> {
+        let Self {
+            guilds,
+            index,
+            bytes,
+            authors,
+            ..
+        } = self;
+        Occupancy {
+            guilds,
+            index,
+            bytes,
+            authors,
+        }
+    }
+}
 /// Replay tombstone is `retired_before` plus index removal — not a full-cost `Post`.
 fn retire_posts(
     bucket: &mut Bucket,
@@ -110,20 +143,68 @@ fn retire_posts(
     });
 }
 fn retire_author(
-    guilds: &mut HashMap<u64, Guild>,
-    index: &mut HashMap<Key, u64>,
-    bytes: &mut usize,
+    occupancy: &mut Occupancy<'_>,
     guild: u64,
     author: u64,
+    max_watermarks: usize,
     drop_post: impl FnMut(&Post) -> bool,
 ) {
-    let Some(g) = guilds.get_mut(&guild) else {
+    let Some(g) = occupancy.guilds.get_mut(&guild) else {
         return;
     };
-    let Some(b) = g.authors.get_mut(&author) else {
+    {
+        let Some(b) = g.authors.get_mut(&author) else {
+            return;
+        };
+        retire_posts(
+            b,
+            guild,
+            &mut g.bytes,
+            occupancy.index,
+            occupancy.bytes,
+            drop_post,
+        );
+    }
+    if g.authors
+        .get(&author)
+        .is_some_and(|bucket| bucket.posts.is_empty())
+    {
+        park_author(g, occupancy.authors, author, max_watermarks);
+    }
+}
+fn park_author(g: &mut Guild, authors: &mut usize, author: u64, max_watermarks: usize) {
+    let Some(b) = g.authors.remove(&author) else {
         return;
     };
-    retire_posts(b, guild, &mut g.bytes, index, bytes, drop_post);
+    *authors -= 1;
+    g.watermarks.insert(
+        author,
+        Watermark {
+            retired_before: b.retired_before,
+            last_seen: b.last_seen,
+            token: b.token,
+            budget: b.budget,
+            reported_until: b.reported_until,
+        },
+    );
+    while g.watermarks.len() > max_watermarks {
+        let Some(oldest) = g
+            .watermarks
+            .iter()
+            .filter(|(id, _)| **id != author)
+            .min_by_key(|(_, w)| w.last_seen)
+            .map(|(id, _)| *id)
+            .or_else(|| {
+                g.watermarks
+                    .iter()
+                    .min_by_key(|(_, w)| w.last_seen)
+                    .map(|(id, _)| *id)
+            })
+        else {
+            break;
+        };
+        g.watermarks.remove(&oldest);
+    }
 }
 pub struct Detector {
     limits: Limits,
@@ -178,6 +259,7 @@ impl Detector {
     }
     fn prune_at(&self, now: Instant) {
         let mut state = self.state.lock();
+        let max_watermarks = self.limits.max_authors_per_guild;
         let State {
             guilds,
             index,
@@ -186,19 +268,36 @@ impl Detector {
             ..
         } = &mut *state;
         guilds.retain(|guild, g| {
-            g.authors.retain(|author, b| {
-                let window = b.window;
-                retire_posts(b, *guild, &mut g.bytes, index, bytes, |p| {
-                    now.duration_since(p.at) >= window
-                });
-                let keep = now.duration_since(b.last_seen) < KEEP;
-                if !keep {
-                    *authors -= 1;
+            let ids: Vec<u64> = g.authors.keys().copied().collect();
+            for author in ids {
+                if let Some(window) = g.authors.get(&author).map(|b| b.window)
+                    && let Some(b) = g.authors.get_mut(&author)
+                {
+                    retire_posts(b, *guild, &mut g.bytes, index, bytes, |p| {
+                        now.duration_since(p.at) >= window
+                    });
                 }
-                let _ = author;
-                keep
-            });
-            !g.authors.is_empty() || now.duration_since(g.budget.start) < Duration::from_secs(60)
+                if g.authors.get(&author).is_some_and(|b| b.posts.is_empty()) {
+                    park_author(g, authors, author, max_watermarks);
+                } else if g
+                    .authors
+                    .get(&author)
+                    .is_some_and(|b| now.duration_since(b.last_seen) >= KEEP)
+                    && let Some(b) = g.authors.remove(&author)
+                {
+                    *authors -= 1;
+                    for p in &b.posts {
+                        index.remove(&(*guild, p.channel, p.id));
+                        *bytes -= p.cost;
+                        g.bytes -= p.cost;
+                    }
+                }
+            }
+            g.watermarks
+                .retain(|_, w| now.duration_since(w.last_seen) < KEEP);
+            !g.authors.is_empty()
+                || !g.watermarks.is_empty()
+                || now.duration_since(g.budget.start) < Duration::from_secs(60)
         });
     }
     /// Retain only a short tombstone: a duplicate create must not resurrect an edit/delete.
@@ -212,43 +311,44 @@ impl Detector {
         let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
             return;
         };
-        let State {
-            guilds,
-            index,
-            bytes,
-            ..
-        } = &mut *state;
-        retire_author(guilds, index, bytes, guild, author, |p| {
-            p.id == message && p.channel == channel
-        });
+        let mut occupancy = state.occupancy();
+        retire_author(
+            &mut occupancy,
+            guild,
+            author,
+            self.limits.max_authors_per_guild,
+            |p| p.id == message && p.channel == channel,
+        );
     }
     pub fn invalidate_author(&self, guild: u64, author: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
-        let State {
-            guilds,
-            index,
-            bytes,
-            ..
-        } = &mut *state;
-        retire_author(guilds, index, bytes, guild, author, |_| true);
+        let mut occupancy = state.occupancy();
+        retire_author(
+            &mut occupancy,
+            guild,
+            author,
+            self.limits.max_authors_per_guild,
+            |_| true,
+        );
     }
     pub fn invalidate_guild(&self, guild: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
-        let authors: Vec<u64> = state
+        let author_ids: Vec<u64> = state
             .guilds
             .get(&guild)
             .map(|g| g.authors.keys().copied().collect())
             .unwrap_or_default();
-        let State {
-            guilds,
-            index,
-            bytes,
-            ..
-        } = &mut *state;
-        for author in authors {
-            retire_author(guilds, index, bytes, guild, author, |_| true);
+        let mut occupancy = state.occupancy();
+        for author in author_ids {
+            retire_author(
+                &mut occupancy,
+                guild,
+                author,
+                self.limits.max_authors_per_guild,
+                |_| true,
+            );
         }
     }
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
@@ -269,42 +369,43 @@ impl Detector {
         // Expire this author in O(posts), keeping a bounded ID watermark
         // so expired/edited creates cannot return after a settings change.
         {
-            let State {
-                guilds,
-                index,
-                bytes,
-                ..
-            } = &mut *state;
-            if let Some(window) = guilds
+            let mut occupancy = state.occupancy();
+            if let Some(window) = occupancy
+                .guilds
                 .get(&guild)
                 .and_then(|g| g.authors.get(&author))
                 .map(|b| b.window)
             {
-                retire_author(guilds, index, bytes, guild, author, |p| {
-                    now.duration_since(p.at) >= window
-                });
+                retire_author(
+                    &mut occupancy,
+                    guild,
+                    author,
+                    self.limits.max_authors_per_guild,
+                    |p| now.duration_since(p.at) >= window,
+                );
             }
-            if guilds
+            if occupancy
+                .guilds
                 .get(&guild)
                 .and_then(|g| g.authors.get(&author))
                 .is_some_and(|b| b.token != token)
             {
-                retire_author(guilds, index, bytes, guild, author, |_| true);
-                if let Some(b) = guilds
-                    .get_mut(&guild)
-                    .and_then(|g| g.authors.get_mut(&author))
-                {
-                    b.token = token;
-                }
+                retire_author(
+                    &mut occupancy,
+                    guild,
+                    author,
+                    self.limits.max_authors_per_guild,
+                    |_| true,
+                );
             }
         }
-        if state.index.contains_key(&key)
-            || state
-                .guilds
-                .get(&guild)
-                .and_then(|g| g.authors.get(&author))
-                .is_some_and(|b| post.id <= b.retired_before)
-        {
+        let retired_before = state.guilds.get(&guild).and_then(|g| {
+            g.authors
+                .get(&author)
+                .map(|b| b.retired_before)
+                .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
+        });
+        if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
             return None;
         }
         let exists = state
@@ -344,17 +445,23 @@ impl Detector {
         let g = state.guilds.entry(guild).or_insert_with(|| Guild {
             bytes: 0,
             authors: HashMap::new(),
+            watermarks: HashMap::new(),
             budget: Budget::new(now),
         });
+        let watermark = g.watermarks.remove(&author);
         let b = g.authors.entry(author).or_insert_with(|| Bucket {
-            retired_before: 0,
+            retired_before: watermark.as_ref().map(|w| w.retired_before).unwrap_or(0),
             window: Duration::from_secs(policy.window_secs),
             last_seen: now,
-            token,
+            token: watermark.as_ref().map(|w| w.token).unwrap_or(token),
             posts: vec![],
-            budget: Budget::new(now),
-            reported_until: now,
+            budget: watermark
+                .as_ref()
+                .map(|w| w.budget.clone())
+                .unwrap_or_else(|| Budget::new(now)),
+            reported_until: watermark.as_ref().map(|w| w.reported_until).unwrap_or(now),
         });
+        b.token = token;
         if b.posts.len() >= self.limits.max_posts_per_author {
             self.capacity_drop();
             return None;
@@ -928,11 +1035,11 @@ mod tests {
         d.invalidate_author(1, 2);
         {
             let s = d.state.lock();
-            let b = &s.guilds[&1].authors[&2];
-            assert!(b.posts.is_empty());
+            assert!(s.guilds[&1].authors.get(&2).is_none());
             assert_eq!(s.bytes, 0);
             assert!(s.index.is_empty());
-            assert!(b.retired_before >= 3);
+            assert_eq!(s.authors, 0);
+            assert!(s.guilds[&1].watermarks[&2].retired_before >= 3);
         }
         assert!(admit(&d, 3, 12, now).is_none());
         assert!(admit(&d, 4, 13, now).is_none());
@@ -959,7 +1066,7 @@ mod tests {
         let s = d.state.lock();
         assert!(s.index.is_empty());
         assert_eq!(s.bytes, 0);
-        assert_eq!(s.guilds[&1].authors[&2].retired_before, 12);
+        assert_eq!(s.guilds[&1].watermarks[&2].retired_before, 12);
     }
     #[test]
     fn settings_change_drops_old_observations_and_old_job() {
@@ -1024,6 +1131,34 @@ mod tests {
         assert!(s.index.is_empty());
         assert_eq!(s.bytes, 0);
         assert_eq!(s.authors, 0);
+    }
+    #[test]
+    fn invalidation_parks_replay_watermark_without_holding_author_slots() {
+        let now = Instant::now();
+        let d = Detector::new(Limits {
+            max_authors: 1,
+            max_authors_per_guild: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(admit(&d, 1, 10, now).is_none());
+        assert!(
+            d.admit(1, 3, post(2, 11, now, &[1, 2]), (0, 0), &policy(), now)
+                .is_none()
+        );
+        d.invalidate_author(1, 2);
+        assert_eq!(d.state.lock().authors, 0);
+        let mut p = post(3, 12, now, &[1, 2]);
+        p.revision = d.revision();
+        assert!(d.admit(1, 3, p, (0, 0), &policy(), now).is_none());
+        {
+            let s = d.state.lock();
+            assert!(s.guilds[&1].authors.contains_key(&3));
+            assert!(!s.guilds[&1].authors.contains_key(&2));
+            assert!(s.guilds[&1].watermarks[&2].retired_before >= 1);
+            assert_eq!(s.authors, 1);
+        }
+        assert!(admit(&d, 1, 10, now).is_none());
     }
     #[test]
     fn metadata_budget_and_author_post_limit_do_not_grow() {

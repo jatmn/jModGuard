@@ -81,8 +81,9 @@ has the download deadline plus 15 seconds. Log delivery also uses existing limit
 
 Active references/hashes expire with the rule window (idle cleanup can add up to 60
 seconds). Invalidation and configuration-token changes retire those observations
-immediately: the author replay watermark and rate budgets remain, but post slots and
-metadata accounting are reclaimed so later creates are not blocked by dead entries.
+immediately: live author slots, post slots and metadata accounting are reclaimed so
+later creates are not blocked by dead entries. Replay watermarks stay in a separate
+bounded table (same per-guild author cap) with rate budgets until idle cleanup.
 Small author replay watermarks last at most 660 seconds after the last
 accepted create, plus the cleanup tick. These are transient RAM state, not SQL rows.
 All state is lost on restart. Event work touches one bounded author bucket; the global
