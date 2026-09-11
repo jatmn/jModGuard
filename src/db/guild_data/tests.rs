@@ -82,7 +82,7 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         .unwrap();
     store.db.with_conn(|c| {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
-        assert_eq!(count, 6, "store contains identity, bindings, receipts, membership, log routing and selected cases only");
+        assert_eq!(count, 7, "store contains identity, bindings, receipts, membership, log routing selected cases and owned history only");
         Ok(())
     }).await.unwrap();
     assert!(
@@ -120,7 +120,7 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
         raw.execute_batch("DROP TABLE sentinel").unwrap();
     }
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
-    for version in [0, 4] {
+    for version in [0, 5] {
         store
             .db
             .with_conn(move |c| c.pragma_update(None, "user_version", version))
@@ -131,7 +131,7 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
     }
     store
         .db
-        .with_conn(|c| c.pragma_update(None, "user_version", 3))
+        .with_conn(|c| c.pragma_update(None, "user_version", 4))
         .await
         .unwrap();
     store
@@ -308,3 +308,5 @@ async fn remote_option_mistakes_never_fall_back_to_local() {
 mod tenant_logs;
 
 mod cases;
+
+mod case_history;

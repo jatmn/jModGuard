@@ -142,14 +142,14 @@ impl Default for CaseLimits {
     }
 }
 impl CaseLimits {
-    fn validate(self) -> Result<()> {
+    pub(super) fn validate(self) -> Result<()> {
         anyhow::ensure!(
             self.max_record_bytes > 0 && self.max_evidence_items > 0 && self.max_page_size > 0,
             CaseError::Limit
         );
         Ok(())
     }
-    fn page(self, count: u32) -> Result<()> {
+    pub(super) fn page(self, count: u32) -> Result<()> {
         self.validate()?;
         anyhow::ensure!(count > 0 && count <= self.max_page_size, CaseError::Limit);
         Ok(())

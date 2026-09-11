@@ -96,12 +96,12 @@ and binaries. See [catalog scope and limits](GUILD-STORES.md).
 
 ## Separate guild-store family
 
-The inactive `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version3,
+The inactive `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version4,
 using `migrations/guild/0001_identity.sql`, `0002_tenant_log_channels.sql` and
-`0003_cases.sql`. This separate database holds identity, placement bindings, receipts,
-membership/log-channel settings and selected cases with bounded inline evidence.
-Initialize verifies and upgrades a matching version1/2 store atomically; open requires3. No membership is inferred during upgrade.
-Older guild-store binaries reject version3: use matching pre-upgrade backups/binaries
+`0003_cases.sql` plus `0004_case_history.sql`. This separate database holds identity, placement bindings, receipts,
+membership/log-channel settings and selected cases with bounded inline evidence and owned append-only history.
+Initialize verifies and upgrades a matching version1–3 store atomically; open requires4. No membership is inferred during upgrade.
+Older guild-store binaries reject version4: use matching pre-upgrade backups/binaries
 for rollback. See [tenant storage behavior](TENANT-LOG-CHANNELS.md). Core remains at
 migration0010; bot/API startup never creates this family. Each opener refuses the other family, even though
 version numbers may overlap. No records are moved and no runtime routing is enabled.

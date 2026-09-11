@@ -111,6 +111,12 @@ cleanup must stay bounded and refuse active memberships. Never infer success, fe
 evidence URLs, expire cases by age or expose removal without its backend permission and
 owned-evidence/backup lifecycle. Current services still use core moderation records.
 
+Version4 adds owned append-only case history; see `docs/CASE-HISTORY.md`. Preserve original
+facts, stable entry retries and per-case sequence order. Count/byte admission must share the
+append transaction; reads page IDs and bound single payloads. Parent removal/closed purge
+must remove owned history atomically without foreign-key PRAGMA reliance. Budgets are trusted
+explicit inputs; no new runtime defaults, permissions or automatic effective-outcome fold.
+
 ## Commands
 
 ```bash

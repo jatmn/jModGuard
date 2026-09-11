@@ -62,8 +62,9 @@ eviction. Capacity monitoring, total tenant budgets and admission policy remain 
 
 Real mutations use existing remote receipt recovery. Reads, identical retries, removed-key
 replays and missing removals create no receipts. Cases do not change log/config/slash
-revisions. Payloads are immutable; corrections/notes and source correlation need their own
-append-only design before this becomes the runtime audit system.
+revisions. Original payloads are immutable. [Append-only history](CASE-HISTORY.md) now records notes,
+corrections and selected policy context without rewriting them. Canonical source correlation
+and runtime presentation remain pending.
 
 ## Removal and closure
 
@@ -86,9 +87,9 @@ coordination remains required. No permanent departed-guild ledger is the product
 ## Schema and validation
 
 Guild migration0003 adds only `guild_cases` and its indexes/guards within `jmodguard-guild-1`.
-`initialize` verifies the expected version1/2 family and identity before atomically extending
-it to3, preserving placement and log settings. Fresh initialization applies all three steps;
-`open` requires3. Old guild-store binaries reject3; rollback needs matching pre-upgrade
+`initialize` verifies the expected version1–3 family and identity before atomically extending
+it to4, preserving placement, settings and cases. Version4 adds owned history and removal
+triggers; fresh initialization applies all four steps. `open` requires4. Old guild-store binaries reject4; rollback needs matching pre-upgrade
 backups and binaries. Core remains0010 and current services never open these guild stores.
 
 Local regressions cover scoped persistence/paging, source conflicts/concurrent retries,

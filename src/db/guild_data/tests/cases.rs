@@ -1,7 +1,7 @@
 use super::tenant_logs::scope;
 use super::*;
 
-fn data(source: i64) -> CaseData {
+pub(super) fn data(source: i64) -> CaseData {
     CaseData {
         source: CaseSource::DiscordAudit { entry_id: source },
         action: CaseAction::Ban,

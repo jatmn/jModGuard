@@ -303,6 +303,19 @@ File evidence, policy/proof enrichment, append-only corrections, canonical sourc
 permissions, capacity monitoring and backup-aware lifecycle remain before runtime adoption.
 No general chat/event archive, automatic age expiry or full-erasure claim is introduced.
 
+## Implemented: inactive append-only case history
+
+Guild schema4 adds ordered notes, outcome/reason corrections and selected policy context
+while preserving original case facts. Stable entry IDs make matching retries write-free;
+conflicts fail. Explicit per-case count/byte admission shares the primary append transaction.
+Single reads bound payload size, pages return references only. SQL triggers remove history
+with parent payload removal or closed-case purge and roll back both on failure. No new
+library/task/recorder is enabled. See [history contracts](CASE-HISTORY.md).
+
+Canonical source correlation, runtime permission/presentation, file evidence and complete
+lifecycle/backup cleanup remain pending. Corrections are observations, not inferred Discord
+success or automatic rewriting of effective state. Core remains10.
+
 ## Next implementation slices
 
 1. Extend the captured tenant log-channel pattern across the fresh data model/tenant
