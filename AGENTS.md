@@ -104,6 +104,13 @@ is trusted lifecycle work, not permission checking. No current runtime routing/q
 integration or full erasure is enabled. A successful snapshot check never authorizes a later write. Cloned backups can retain
 the same identity/revision. Routing, lifecycle erasure and writer exclusion remain pending.
 
+Version3 adds inactive selected cases/text evidence; see `docs/TENANT-CASES.md`. Reuse
+captured scope checks with data; preserve immutable source/payload retry semantics, bounded
+record/page inputs and payload-free replay markers after explicit removal. Closed-scope
+cleanup must stay bounded and refuse active memberships. Never infer success, fetch arbitrary
+evidence URLs, expire cases by age or expose removal without its backend permission and
+owned-evidence/backup lifecycle. Current services still use core moderation records.
+
 ## Commands
 
 ```bash

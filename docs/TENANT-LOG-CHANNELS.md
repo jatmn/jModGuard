@@ -62,12 +62,11 @@ trusted SQL access; these checks do not defend against an administrator replacin
 
 ## Schema, verification and remaining integration
 
-`jmodguard-guild-1` now uses migrations0001–0002. `GuildDataStore::initialize` verifies the
-expected version1 identity before upgrading it atomically to version2, preserving bindings
-and adding empty membership/mapping tables. `open` requires version2 and never migrates.
-Fresh initialization creates both steps atomically. Older guild-store binaries reject
-version2; rollback requires a matching pre-upgrade backup and binary. Core stays version10,
-and current services neither open nor upgrade these separate stores.
+`jmodguard-guild-1` uses migrations0001–0003. Version2 added empty membership/mapping
+tables; version3 adds [selected case storage](TENANT-CASES.md). `initialize` verifies the
+expected version1/2 identity before upgrading atomically to3, preserving bindings/settings.
+`open` requires3 and never migrates. Older guild-store binaries reject3; rollback requires
+matching pre-upgrade backup and binary. Core stays10; current services never open these stores.
 
 Local tests cover cross-guild isolation, wrong/missing/closed scopes, validation, persistence,
 all supported event types, conflicting edits, no-op writes, closure races/rollback, SQL
@@ -79,5 +78,5 @@ global policy/configuration, bounded store handles, queue completion/version obs
 and channel/user authorization. Closing this scope does not retire core membership, clear
 service caches or recall an already-sent Discord request. A database clone can retain the
 same identity and revisions; this is not distributed writer exclusion or a guild-move
-protocol. Cases/evidence, other tenant configuration and complete guild erasure remain later
-work. No live Bunny/Discord or resource-usage assurance is established by local tests.
+protocol. Selected cases/text evidence now use this same captured scope. File evidence, other tenant
+configuration and complete guild erasure remain later work. No live Bunny/Discord or resource-usage assurance is established by local tests.

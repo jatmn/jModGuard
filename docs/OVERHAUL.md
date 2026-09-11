@@ -290,6 +290,19 @@ coordination, full erasure/rejoin, global policy, queue completion/version obser
 runtime authorization/routing remain pending. Closed identities are transitional storage
 barriers, not the final purge policy. No live provider proof or distributed writer lease.
 
+## Implemented: inactive selected case and text-evidence storage
+
+Guild schema3 adds stable scoped case IDs, typed action/outcome facts and bounded selected
+text evidence. Recording uses stable source keys to deduplicate retries; conflicting facts
+fail. Payload removal retains minimal replay keys so the same source cannot recreate it.
+After membership closure, bounded cleanup can remove records/markers while stale work stays
+denied. Reads and mutations reuse captured primary scope and receipt recovery; no new
+library, task or runtime recorder is enabled. Core stays10. See [case contracts](TENANT-CASES.md).
+
+File evidence, policy/proof enrichment, append-only corrections, canonical source correlation,
+permissions, capacity monitoring and backup-aware lifecycle remain before runtime adoption.
+No general chat/event archive, automatic age expiry or full-erasure claim is introduced.
+
 ## Next implementation slices
 
 1. Extend the captured tenant log-channel pattern across the fresh data model/tenant

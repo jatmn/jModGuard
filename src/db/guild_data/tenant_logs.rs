@@ -5,8 +5,8 @@ use super::*;
 /// operations verify this exact context on the store primary, never re-resolve it.
 #[derive(Debug, Clone)]
 pub struct GuildDataScope {
-    placement: GuildPlacement,
-    enrollment: GuildEnrollment,
+    pub(super) placement: GuildPlacement,
+    pub(super) enrollment: GuildEnrollment,
 }
 impl GuildDataScope {
     pub fn new(placement: GuildPlacement, enrollment: GuildEnrollment) -> Result<Self> {
@@ -52,7 +52,7 @@ pub enum TenantDataError {
     Setting,
 }
 
-fn valid_token(token: &str) -> bool {
+pub(super) fn valid_token(token: &str) -> bool {
     token.len() == 32
         && token
             .bytes()
@@ -66,7 +66,7 @@ fn membership(conn: &impl SqlExecutor, guild: i64) -> Result<Option<(String, i64
     conn.query_row("SELECT enrollment_id,joined_at_ns,active,config_revision FROM guild_memberships WHERE guild_id=?1", params![guild], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
 }
 
-fn verify_scope(
+pub(super) fn verify_scope(
     conn: &impl SqlExecutor,
     expected: &StoreRegistration,
     scope: &GuildDataScope,

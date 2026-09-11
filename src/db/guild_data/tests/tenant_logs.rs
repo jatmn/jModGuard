@@ -7,7 +7,7 @@ fn enrollment(guild_id: i64, joined_at_ns: i64) -> GuildEnrollment {
         id: format!("{:032x}", rand::random::<u128>()),
     }
 }
-async fn scope(
+pub(super) async fn scope(
     f: &Fixture,
     store: &GuildDataStore,
     reg: &StoreRegistration,

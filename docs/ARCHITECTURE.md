@@ -164,6 +164,11 @@ reads/edits, revision checks reject stale edits, and closure removes mappings an
 later access. This remains inactive; it does not replace core log configuration or queued
 completion, implement full guild purge, or coordinate directory/Discord state.
 
+Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for immutable
+facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
+batch cleanup. It remains inactive: current moderation handlers still write core records.
+No file evidence, backup cleanup, runtime permissions or full erasure is supplied yet.
+
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
