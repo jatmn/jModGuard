@@ -62,14 +62,15 @@ log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.
 Version3 adds [selected cases and bounded text evidence](TENANT-CASES.md).
 Version4 adds [owned append-only case history](CASE-HISTORY.md).
 Version5 adds [explicit source associations](CASE-SOURCES.md).
-Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md), with object I/O still disabled.
+Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md), with current runtime capture still disabled.
+Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 There are no core configuration/default/enrollment tables or general event archives.
 Core bootstrap never applies this schema; the existing core version remains10.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching version1–5 store to version6, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version6 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching version1–6 store to version7, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version7 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

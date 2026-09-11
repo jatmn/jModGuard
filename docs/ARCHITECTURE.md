@@ -176,8 +176,10 @@ pending; current services continue to use core moderation records.
 Schema6 adds a [private evidence ownership journal](CASE-EVIDENCE.md) with bounded admission,
 settlement and cleanup acknowledgment. An opt-in [Unix local transfer backend](LOCAL-EVIDENCE.md)
 now streams/verifies real files and holds an OS resource lock through journal settlement.
-Remote Storage transfers, runtime workers, serving permissions and backup-copy cleanup
-remain pending; current services do not activate the local backend.
+The opt-in [Bunny HTTP backend](BUNNY-EVIDENCE.md) adds bounded streaming and guild schema7
+progress receipts; unresolved PUTs block settlement/deletion. Runtime workers, installation
+privacy checks, serving permissions and backup-copy cleanup remain pending. Current services
+do not activate either backend.
 
 ## Migrations
 

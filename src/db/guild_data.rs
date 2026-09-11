@@ -3,7 +3,7 @@ use super::guild_stores::{GuildPlacement, StorePolicy, StoreRegistration};
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 6;
+const VERSION: i64 = 7;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -11,6 +11,10 @@ const CASE_SCHEMA: &str = include_str!("../../migrations/guild/0003_cases.sql");
 const HISTORY_SCHEMA: &str = include_str!("../../migrations/guild/0004_case_history.sql");
 const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sources.sql");
 const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evidence.sql");
+const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
+mod bunny_transfer;
+#[cfg(unix)]
+pub(crate) use bunny_transfer::*;
 mod case_evidence;
 pub use case_evidence::*;
 mod case_sources;
@@ -90,6 +94,10 @@ fn verify_identity_version(
         let objects:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_evidence') OR (type='index' AND name IN ('guild_evidence_parent','guild_evidence_work','guild_evidence_cancel')) OR (type='trigger' AND name IN ('guild_evidence_insert','guild_evidence_update','guild_evidence_delete','guild_case_cancel_evidence','guild_case_purge_evidence'))",(),|r|Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 9, StoreCheckError::Schema);
     }
+    if wanted >= 7 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_bunny_evidence') OR (type='index' AND name='guild_bunny_resource') OR (type='trigger' AND name IN ('guild_bunny_insert','guild_bunny_update','guild_bunny_delete','guild_bunny_settlement','guild_bunny_purge','guild_bunny_forget'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 8, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -130,7 +138,10 @@ fn initialize_store(
         if version < 5 {
             tx.execute_batch(SOURCE_SCHEMA)?;
         }
-        tx.execute_batch(EVIDENCE_SCHEMA)?;
+        if version < 6 {
+            tx.execute_batch(EVIDENCE_SCHEMA)?;
+        }
+        tx.execute_batch(BUNNY_SCHEMA)?;
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -145,6 +156,7 @@ fn initialize_store(
     tx.execute_batch(HISTORY_SCHEMA)?;
     tx.execute_batch(SOURCE_SCHEMA)?;
     tx.execute_batch(EVIDENCE_SCHEMA)?;
+    tx.execute_batch(BUNNY_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete

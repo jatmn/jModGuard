@@ -360,6 +360,21 @@ runtime worker, source fetcher or serving endpoint is enabled. Bunny resource bi
 uncertain remote writes need a separate adapter; local locks are not a distributed lease.
 Permission checks, backup-copy lifecycle and complete tenant adoption remain pending.
 
+## Implemented: opt-in Bunny evidence transfers (wave 25)
+
+The Bunny Storage adapter streams selected evidence with explicit buffer/time limits,
+uppercase upload checksums and readback verification. Guild schema7 records a single-use
+PUT attempt before send and provider acceptance before verification/settlement. Uncertain
+attempts remain blocked across restart; early404 or matching bytes cannot authorize cleanup.
+Accepted work can reconcile without reuploading. Removal clears expected checksum metadata,
+and cleanup verifies object absence before SQL acknowledgment. See [Bunny evidence](BUNNY-EVIDENCE.md).
+
+Regional endpoints are allowlisted and authenticated resource markers checked; redirects,
+proxies and automatic request retries are absent. Existing HTTP/TLS/hash dependencies are
+reused. Current services/core0010 remain unchanged. Installer privacy checks, uncertain-upload
+operator resolution, live provider validation, runtime scheduling/authorization/serving and
+backup-copy lifecycle remain prerequisites to adoption.
+
 ## Next implementation slices
 
 1. Extend the captured tenant log-channel pattern across the fresh data model/tenant

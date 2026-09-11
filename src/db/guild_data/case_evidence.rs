@@ -23,7 +23,7 @@ pub struct EvidenceLimits {
     pub max_page_size: u32,
 }
 impl EvidenceLimits {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         anyhow::ensure!(
             self.max_items_per_case > 0
                 && self.max_file_bytes > 0
@@ -108,12 +108,16 @@ fn job(row: &Row, scope: &GuildDataScope) -> Result<EvidenceJob> {
         cancelled: row.get(5)?,
     })
 }
-struct Record {
-    job: EvidenceJob,
+pub(super) struct Record {
+    pub(super) job: EvidenceJob,
     origin: Option<EvidenceOrigin>,
     sha256: Option<String>,
 }
-fn record(conn: &impl SqlExecutor, scope: &GuildDataScope, id: &CaseId) -> Result<Option<Record>> {
+pub(super) fn record(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    id: &CaseId,
+) -> Result<Option<Record>> {
     conn.query_row("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256 FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r| {
         let origin = match r.get::<Option<i64>>(6)? {
             Some(channel_id)=>Some(EvidenceOrigin{channel_id,message_id:r.get(7)?,attachment_id:r.get(8)?}),None=>None
@@ -134,15 +138,28 @@ impl GuildDataStore {
         case: CaseId,
         id: CaseId,
     ) -> Result<EvidenceJob> {
+        self.find_evidence_transfer_job(scope, case, id)
+            .await?
+            .ok_or(CaseError::Conflict.into())
+    }
+    #[cfg(unix)]
+    pub(crate) async fn find_evidence_transfer_job(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        id: CaseId,
+    ) -> Result<Option<EvidenceJob>> {
         self.check_target(&scope.placement)?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_read()?;
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
-                let mut job = record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job;
-                anyhow::ensure!(job.case_id == case, CaseError::Conflict);
-                job.cancelled |= !active;
+                let mut job = record(&tx, &scope, &id)?.map(|r| r.job);
+                if let Some(job) = job.as_mut() {
+                    anyhow::ensure!(job.case_id == case, CaseError::Conflict);
+                    job.cancelled |= !active;
+                }
                 tx.finish_read()?;
                 Ok(job)
             })
