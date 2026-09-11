@@ -3,12 +3,15 @@ use super::guild_stores::{GuildPlacement, StorePolicy, StoreRegistration};
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
 const CASE_SCHEMA: &str = include_str!("../../migrations/guild/0003_cases.sql");
 const HISTORY_SCHEMA: &str = include_str!("../../migrations/guild/0004_case_history.sql");
+const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sources.sql");
+mod case_sources;
+pub use case_sources::*;
 mod case_history;
 pub use case_history::*;
 mod cases;
@@ -76,6 +79,10 @@ fn verify_identity_version(
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_history') OR (type='trigger' AND name IN ('guild_case_history_insert','guild_case_history_update','guild_case_history_delete','guild_case_remove_history','guild_case_purge_history'))", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 6, StoreCheckError::Schema);
     }
+    if wanted >= 5 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_sources') OR (type='trigger' AND name IN ('guild_case_source_insert','guild_case_source_update','guild_case_source_delete','guild_case_original_source','guild_case_purge_sources'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 6, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -110,7 +117,10 @@ fn initialize_store(
         if version < 3 {
             tx.execute_batch(CASE_SCHEMA)?;
         }
-        tx.execute_batch(HISTORY_SCHEMA)?;
+        if version < 4 {
+            tx.execute_batch(HISTORY_SCHEMA)?;
+        }
+        tx.execute_batch(SOURCE_SCHEMA)?;
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -123,6 +133,7 @@ fn initialize_store(
     tx.execute_batch(TENANT_SCHEMA)?;
     tx.execute_batch(CASE_SCHEMA)?;
     tx.execute_batch(HISTORY_SCHEMA)?;
+    tx.execute_batch(SOURCE_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete

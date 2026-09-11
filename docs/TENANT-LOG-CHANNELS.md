@@ -62,10 +62,10 @@ trusted SQL access; these checks do not defend against an administrator replacin
 
 ## Schema, verification and remaining integration
 
-`jmodguard-guild-1` uses migrations0001–0004. Version2 added empty membership/mapping
+`jmodguard-guild-1` uses migrations0001–0005. Version2 added empty membership/mapping
 tables; version3 adds [selected case storage](TENANT-CASES.md). `initialize` verifies the
-expected version1–3 identity before upgrading atomically to4, preserving bindings/settings.
-`open` requires4 and never migrates. Older guild-store binaries reject4; rollback requires
+expected version1–4 identity before upgrading atomically to5, preserving bindings/settings.
+`open` requires5 and never migrates. Older guild-store binaries reject5; rollback requires
 matching pre-upgrade backup and binary. Core stays10; current services never open these stores.
 
 Local tests cover cross-guild isolation, wrong/missing/closed scopes, validation, persistence,

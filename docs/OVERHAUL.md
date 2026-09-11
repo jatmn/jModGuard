@@ -299,8 +299,9 @@ After membership closure, bounded cleanup can remove records/markers while stale
 denied. Reads and mutations reuse captured primary scope and receipt recovery; no new
 library, task or runtime recorder is enabled. Core stays10. See [case contracts](TENANT-CASES.md).
 
-File evidence, policy/proof enrichment, append-only corrections, canonical source correlation,
-permissions, capacity monitoring and backup-aware lifecycle remain before runtime adoption.
+File evidence, richer proof, trusted runtime source matching, permissions, capacity monitoring
+and backup-aware lifecycle remain before runtime adoption. History and explicit source
+association are implemented below.
 No general chat/event archive, automatic age expiry or full-erasure claim is introduced.
 
 ## Implemented: inactive append-only case history
@@ -312,9 +313,23 @@ Single reads bound payload size, pages return references only. SQL triggers remo
 with parent payload removal or closed-case purge and roll back both on failure. No new
 library/task/recorder is enabled. See [history contracts](CASE-HISTORY.md).
 
-Canonical source correlation, runtime permission/presentation, file evidence and complete
+Trusted runtime source matching, permission/presentation, file evidence and complete
 lifecycle/backup cleanup remain pending. Corrections are observations, not inferred Discord
 success or automatic rewriting of effective state. Core remains10.
+
+## Implemented: explicit case source association (wave 22)
+
+Guild schema5 adds indexed application-operation/Discord-audit source mappings with original
+source backfill. Trusted callers can link a counterpart using an existing anchor and resolve
+canonical IDs without payload reads. Original facts/history remain immutable; conflicting
+identities fail and no cases are merged. Removed parents retain both replay keys and can
+accept a late opaque counterpart without reviving content. Closed-case cleanup atomically
+removes owned mappings. See [source contracts and limits](CASE-SOURCES.md).
+
+Current services/core0010 remain unchanged; no new dependency, worker or inference policy.
+Runtime source matching and durable reconciliation, permissions, richer/file evidence and
+full lifecycle/erasure/routing remain pending. Locally verified storage is not live Discord
+correlation proof, a complete guild purge or a provider resource measurement.
 
 ## Next implementation slices
 
