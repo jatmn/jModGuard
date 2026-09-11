@@ -93,6 +93,12 @@ from settings/enrollments or connect these helpers to runtime routing/UI yet. St
 is immutable; initial assignment refuses changing a placement. Matching retries are receipt-
 free; real writes use existing recovery receipts and never bump config/slash versions.
 No URLs/credentials belong in the catalog. Placement revisions do not fence data writers.
+The separate inactive `db::guild_data` handle verifies `jmodguard-guild-1` identity and
+initial bindings. Keep its raw pool private; reuse the existing transport/recovery code.
+Never run core migrations/defaults on a guild store or adopt a foreign/unmarked schema.
+Identity and binding checks must share the transaction with future tenant data operations;
+a successful snapshot check does not authorize a later write. Cloned backups can retain
+the same identity/revision. Routing, lifecycle erasure and writer exclusion remain pending.
 
 ## Commands
 

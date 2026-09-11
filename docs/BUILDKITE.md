@@ -26,6 +26,11 @@ credential must also fetch tags and full commits from this repository.
 Publishing uses the existing Docker daemon's BuildKit cache and inline cache
 metadata in the published image; it does not depend on the Actions cache service.
 
+The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
+`jmodguard-integration-tests`, each with its own empty disposable libSQL container.
+They run sequentially with loopback-only ephemeral ports and cleanup on exit. Never point
+these ignored tests at an existing installation or share one database between the binaries.
+
 Both test jobs must pass before preparation and publication. Prepare and publish
 steps are scheduled for webhook main pushes, webhook tag builds, and UI/API
 builds that set `JMODGUARD_PUBLISH_SOURCE`. Manual publication still requires

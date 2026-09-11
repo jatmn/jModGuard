@@ -149,7 +149,14 @@ captured membership. The schema is unchanged.
 shared/dedicated ownership and initial placements. It is not connected to runtime routing;
 current bot/API data still uses one configured database. No provisioning, moves, extra
 connections, caches or polling are enabled. The later directory database split must preserve
-these identities while adding credential resolution and data-side placement checks.
+these identities while adding credential resolution and transactional tenant operations.
+
+The inactive `GuildDataStore` library opens a separate `jmodguard-guild-1` database and
+verifies its identity/ownership against the catalog. It can bind/check initial guild
+revisions, with the raw pool private and the existing transport/recovery reused. Bot/API
+still creates no such handles. Checks are snapshots, not writer leases or later-operation
+authorization; cloned stores can retain identical stamps. Actual data access and moves
+must combine checks with tenant operations and coordinated writer exclusion.
 
 ## Migrations
 
