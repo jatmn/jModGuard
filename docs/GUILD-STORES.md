@@ -55,16 +55,17 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family starts at version1 from
-`migrations/guild/0001_identity.sql`. It contains only an immutable singleton identity
-(family, store ID, shared/dedicated owner), immutable initial guild/revision bindings and
-mutation receipts. There are no core settings, enrollments, defaults or moderation records.
+The separate `jmodguard-guild-1` family uses migrations0001–0002. Version1 introduced
+an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
+guild/revision bindings and mutation receipts. Version2 adds captured membership and
+log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
+There are no core configuration/default/enrollment tables or moderation records.
 Core bootstrap never applies this schema; the existing core version remains10.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, or verify an existing matching identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify an existing schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching version1 store to version2, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version2 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 
@@ -87,14 +88,14 @@ third-party dependency, service task, live connection or routing cache is enable
 
 Placement revisions are metadata, not writer leases. Looking up a placement cannot safely
 move a guild or stop an older process from writing. Runtime adoption must include
-identity/binding checks in the same transaction as actual tenant data operations,
+the captured checks used by tenant log-channel operations across the remaining data model,
 bounded handle/transport reuse, shared/dedicated routing, global-policy separation and
-coordinated quiescing before moves. The new snapshot check alone is insufficient.
+coordinated quiescing before moves. `verify_placement` alone is insufficient.
 There is deliberately no placement-update/delete or store-delete library operation yet.
 Raw SQL is not a supported move mechanism.
 
-The current tables are housed in the existing application database to land this foundation
-independently. The directory/global-policy database split remains future work. No guild data,
+The catalog tables remain in the existing application database; identity and tenant
+tables belong to separate guild-store databases. The directory/global-policy database split remains future work. No core guild data,
 case/evidence records or credentials are copied into these tables; historical guild data
 and membership are unchanged. This is not the final tenant schema or removal/purge mechanism.
 
