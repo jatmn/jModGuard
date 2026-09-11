@@ -167,7 +167,8 @@ completion, implement full guild purge, or coordinate directory/Discord state.
 Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for immutable
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
 batch cleanup. It remains inactive: current moderation handlers still write core records.
-No file evidence, backup cleanup, runtime permissions or full erasure is supplied yet.
+Its [append-only history](CASE-HISTORY.md) preserves original facts and is removed with its
+parent case. No file evidence, backup cleanup, runtime permissions or full erasure is supplied yet.
 
 ## Migrations
 
