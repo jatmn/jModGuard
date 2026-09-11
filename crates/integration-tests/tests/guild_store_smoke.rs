@@ -166,6 +166,86 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .unwrap(),
         Some(source_match.clone())
     );
+    let evidence_limits = EvidenceLimits {
+        max_items_per_case: 3,
+        max_file_bytes: 10,
+        max_case_bytes: 30,
+        max_page_size: 2,
+    };
+    let evidence_id = CaseId::new();
+    let evidence_request = EvidenceRequest {
+        storage_id: CaseId::new(),
+        bytes: 3,
+        origin: EvidenceOrigin {
+            channel_id: 1,
+            message_id: 2,
+            attachment_id: 3,
+        },
+    };
+    test_drop_next_commit_response();
+    assert!(
+        store
+            .reserve_case_evidence(
+                scoped.clone(),
+                case_id.clone(),
+                evidence_id.clone(),
+                evidence_request.clone(),
+                evidence_limits
+            )
+            .await
+            .unwrap()
+            .created
+    );
+    test_drop_next_commit_response();
+    assert!(
+        !reopened
+            .reserve_case_evidence(
+                scoped.clone(),
+                case_id.clone(),
+                evidence_id.clone(),
+                evidence_request,
+                evidence_limits
+            )
+            .await
+            .unwrap()
+            .created
+    );
+    assert_eq!(
+        reopened
+            .evidence_jobs(
+                scoped.clone(),
+                EvidenceWork::Capture,
+                None,
+                1,
+                evidence_limits
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .settle_evidence_capture(
+                scoped.clone(),
+                case_id.clone(),
+                evidence_id.clone(),
+                EvidenceCapture::Stored {
+                    bytes: 3,
+                    sha256: "a".repeat(64)
+                }
+            )
+            .await
+            .unwrap(),
+        EvidenceState::Available
+    );
+    assert!(
+        reopened
+            .available_case_evidence(scoped.clone(), case_id.clone(), evidence_id.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
     let history_limits = CaseHistoryLimits {
         entry: limits,
         max_entries: 10,
@@ -318,6 +398,38 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
+    // Case removal hides metadata and retains the object until cleanup is acknowledged.
+    let deletion = reopened
+        .evidence_jobs(
+            scoped.clone(),
+            EvidenceWork::Delete,
+            None,
+            1,
+            evidence_limits,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(deletion.id, evidence_id);
+    assert!(
+        reopened
+            .available_case_evidence(
+                scoped.clone(),
+                deletion.case_id.clone(),
+                evidence_id.clone()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    test_drop_next_commit_response();
+    assert!(
+        store
+            .confirm_evidence_deleted(scoped.clone(), deletion.case_id, evidence_id)
+            .await
+            .unwrap()
+    );
     let alias_facts = CaseData {
         source: app_source.clone(),
         ..facts.clone()
@@ -347,7 +459,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     store
         .append_case_history(
             scoped.clone(),
-            live_case,
+            live_case.clone(),
             history_id,
             history,
             history_limits,
@@ -401,6 +513,25 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             removed: true
         })
     );
+    let unfinished = CaseId::new();
+    store
+        .reserve_case_evidence(
+            scoped.clone(),
+            live_case.clone(),
+            unfinished.clone(),
+            EvidenceRequest {
+                storage_id: CaseId::new(),
+                bytes: 3,
+                origin: EvidenceOrigin {
+                    channel_id: 1,
+                    message_id: 2,
+                    attachment_id: 4,
+                },
+            },
+            evidence_limits,
+        )
+        .await
+        .unwrap();
     test_drop_next_commit_response();
     store.close_membership(scoped.clone()).await.unwrap();
     assert!(reopened.log_channels(scoped.clone()).await.is_err());
@@ -417,6 +548,60 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .is_err()
     );
     reopened.close_membership(scoped.clone()).await.unwrap();
+    assert!(
+        reopened
+            .available_case_evidence(scoped.clone(), live_case.clone(), unfinished.clone())
+            .await
+            .is_err()
+    );
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .cancel_closed_evidence(scoped.clone(), 1, evidence_limits)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .cancel_closed_evidence(scoped.clone(), 1, evidence_limits)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        reopened
+            .confirm_evidence_deleted(scoped.clone(), live_case.clone(), unfinished.clone())
+            .await
+            .is_err()
+    );
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .settle_evidence_capture(
+                scoped.clone(),
+                live_case.clone(),
+                unfinished.clone(),
+                EvidenceCapture::Discarded
+            )
+            .await
+            .unwrap(),
+        EvidenceState::CleanupPending
+    );
+    test_drop_next_commit_response();
+    assert!(
+        store
+            .confirm_evidence_deleted(scoped.clone(), live_case.clone(), unfinished.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .confirm_evidence_deleted(scoped.clone(), live_case, unfinished)
+            .await
+            .unwrap()
+    );
+
     test_drop_next_commit_response();
     assert_eq!(
         store

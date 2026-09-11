@@ -331,6 +331,20 @@ Runtime source matching and durable reconciliation, permissions, richer/file evi
 full lifecycle/erasure/routing remain pending. Locally verified storage is not live Discord
 correlation proof, a complete guild purge or a provider resource measurement.
 
+## Implemented: inactive evidence ownership journal (wave 23)
+
+Guild schema6 records selected object reservations, stable derived keys, explicit admission
+budgets and capture/cleanup states. Case removal clears origin/digest metadata and cancels
+capture; late settlement schedules deletion without reviving content. Guild closure denies
+reads immediately, with cancellation preparation in indexed batches. Parent purge refuses
+unsettled evidence and removes acknowledged ownership atomically. See [evidence contracts](CASE-EVIDENCE.md).
+
+No file bytes are fetched, uploaded, served or deleted by this journal. No new dependency,
+cache, task or service adoption is introduced; core0010 stays unchanged. Storage bindings,
+streaming adapters, exclusive writer coordination, uncertain-upload reconciliation, backend
+permissions and backup-copy lifecycle remain required before runtime activation. Local state
+transitions are not provider verification or a complete file-evidence implementation.
+
 ## Next implementation slices
 
 1. Extend the captured tenant log-channel pattern across the fresh data model/tenant

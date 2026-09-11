@@ -262,7 +262,8 @@ class GitSourceTests(unittest.TestCase):
                      "migrations/guild/0002_tenant_log_channels.sql",
                      "migrations/guild/0003_cases.sql",
                      "migrations/guild/0004_case_history.sql",
-                     "migrations/guild/0005_case_sources.sql"):
+                     "migrations/guild/0005_case_sources.sql",
+                     "migrations/guild/0006_case_evidence.sql"):
             previous = publisher.git("rev-parse", "HEAD")
             head = self.commit(path)
             config = {"config": {"Labels": {"org.opencontainers.image.revision": previous,
