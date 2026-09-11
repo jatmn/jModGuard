@@ -80,7 +80,10 @@ commands or ordinary automod. The full job, including config reconciliation/logg
 has the download deadline plus 15 seconds. Log delivery also uses existing limits.
 
 Active references/hashes expire with the rule window (idle cleanup can add up to 60
-seconds). Small author replay watermarks last at most 660 seconds after the last
+seconds). Invalidation and configuration-token changes retire those observations
+immediately: the author replay watermark and rate budgets remain, but post slots and
+metadata accounting are reclaimed so later creates are not blocked by dead entries.
+Small author replay watermarks last at most 660 seconds after the last
 accepted create, plus the cleanup tick. These are transient RAM state, not SQL rows.
 All state is lost on restart. Event work touches one bounded author bucket; the global
 expiry scan occurs only on the existing cleanup timer.

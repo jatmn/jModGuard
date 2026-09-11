@@ -89,6 +89,42 @@ impl Budget {
         self.bytes += bytes;
     }
 }
+/// Replay tombstone is `retired_before` plus index removal — not a full-cost `Post`.
+fn retire_posts(
+    bucket: &mut Bucket,
+    guild: u64,
+    guild_bytes: &mut usize,
+    index: &mut HashMap<Key, u64>,
+    bytes: &mut usize,
+    mut drop_post: impl FnMut(&Post) -> bool,
+) {
+    bucket.posts.retain(|p| {
+        if !drop_post(p) {
+            return true;
+        }
+        bucket.retired_before = bucket.retired_before.max(p.id);
+        index.remove(&(guild, p.channel, p.id));
+        *bytes -= p.cost;
+        *guild_bytes -= p.cost;
+        false
+    });
+}
+fn retire_author(
+    guilds: &mut HashMap<u64, Guild>,
+    index: &mut HashMap<Key, u64>,
+    bytes: &mut usize,
+    guild: u64,
+    author: u64,
+    drop_post: impl FnMut(&Post) -> bool,
+) {
+    let Some(g) = guilds.get_mut(&guild) else {
+        return;
+    };
+    let Some(b) = g.authors.get_mut(&author) else {
+        return;
+    };
+    retire_posts(b, guild, &mut g.bytes, index, bytes, drop_post);
+}
 pub struct Detector {
     limits: Limits,
     state: Mutex<State>,
@@ -151,16 +187,9 @@ impl Detector {
         } = &mut *state;
         guilds.retain(|guild, g| {
             g.authors.retain(|author, b| {
-                b.posts.retain(|p| {
-                    if now.duration_since(p.at) >= b.window {
-                        b.retired_before = b.retired_before.max(p.id);
-                        index.remove(&(*guild, p.channel, p.id));
-                        *bytes -= p.cost;
-                        g.bytes -= p.cost;
-                        false
-                    } else {
-                        true
-                    }
+                let window = b.window;
+                retire_posts(b, *guild, &mut g.bytes, index, bytes, |p| {
+                    now.duration_since(p.at) >= window
                 });
                 let keep = now.duration_since(b.last_seen) < KEEP;
                 if !keep {
@@ -183,46 +212,43 @@ impl Detector {
         let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
             return;
         };
-        if let Some(b) = state
-            .guilds
-            .get_mut(&guild)
-            .and_then(|g| g.authors.get_mut(&author))
-        {
-            for p in &mut b.posts {
-                if p.id == message && p.channel == channel {
-                    p.valid = false;
-                    p.files.clear();
-                    p.hashes = None;
-                }
-            }
-        }
+        let State {
+            guilds,
+            index,
+            bytes,
+            ..
+        } = &mut *state;
+        retire_author(guilds, index, bytes, guild, author, |p| {
+            p.id == message && p.channel == channel
+        });
     }
     pub fn invalidate_author(&self, guild: u64, author: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
-        if let Some(b) = state
-            .guilds
-            .get_mut(&guild)
-            .and_then(|g| g.authors.get_mut(&author))
-        {
-            for p in &mut b.posts {
-                p.valid = false;
-                p.files.clear();
-                p.hashes = None;
-            }
-        }
+        let State {
+            guilds,
+            index,
+            bytes,
+            ..
+        } = &mut *state;
+        retire_author(guilds, index, bytes, guild, author, |_| true);
     }
     pub fn invalidate_guild(&self, guild: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
-        if let Some(g) = state.guilds.get_mut(&guild) {
-            for b in g.authors.values_mut() {
-                for p in &mut b.posts {
-                    p.valid = false;
-                    p.files.clear();
-                    p.hashes = None;
-                }
-            }
+        let authors: Vec<u64> = state
+            .guilds
+            .get(&guild)
+            .map(|g| g.authors.keys().copied().collect())
+            .unwrap_or_default();
+        let State {
+            guilds,
+            index,
+            bytes,
+            ..
+        } = &mut *state;
+        for author in authors {
+            retire_author(guilds, index, bytes, guild, author, |_| true);
         }
     }
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
@@ -249,20 +275,27 @@ impl Detector {
                 bytes,
                 ..
             } = &mut *state;
-            if let Some(g) = guilds.get_mut(&guild)
-                && let Some(b) = g.authors.get_mut(&author)
+            if let Some(window) = guilds
+                .get(&guild)
+                .and_then(|g| g.authors.get(&author))
+                .map(|b| b.window)
             {
-                b.posts.retain(|p| {
-                    if now.duration_since(p.at) >= b.window {
-                        b.retired_before = b.retired_before.max(p.id);
-                        index.remove(&(guild, p.channel, p.id));
-                        *bytes -= p.cost;
-                        g.bytes -= p.cost;
-                        false
-                    } else {
-                        true
-                    }
+                retire_author(guilds, index, bytes, guild, author, |p| {
+                    now.duration_since(p.at) >= window
                 });
+            }
+            if guilds
+                .get(&guild)
+                .and_then(|g| g.authors.get(&author))
+                .is_some_and(|b| b.token != token)
+            {
+                retire_author(guilds, index, bytes, guild, author, |_| true);
+                if let Some(b) = guilds
+                    .get_mut(&guild)
+                    .and_then(|g| g.authors.get_mut(&author))
+                {
+                    b.token = token;
+                }
             }
         }
         if state.index.contains_key(&key)
@@ -325,15 +358,6 @@ impl Detector {
         if b.posts.len() >= self.limits.max_posts_per_author {
             self.capacity_drop();
             return None;
-        }
-        if b.token != token {
-            // Never reinterpret observations after configuration changes. Keep rate budgets/tombstones.
-            b.token = token;
-            for p in &mut b.posts {
-                p.valid = false;
-                p.files.clear();
-                p.hashes = None;
-            }
         }
         b.window = Duration::from_secs(policy.window_secs);
         b.last_seen = now;
@@ -766,7 +790,9 @@ mod tests {
         }
     }
     fn admit(d: &Detector, id: u64, channel: u64, at: Instant) -> Option<Job> {
-        d.admit(1, 2, post(id, channel, at, &[1, 2]), (0, 0), &policy(), at)
+        let mut p = post(id, channel, at, &[1, 2]);
+        p.revision = d.revision();
+        d.admit(1, 2, p, (0, 0), &policy(), at)
     }
     fn job(d: &Detector, at: Instant) -> Job {
         assert!(admit(d, 10, 100, at).is_none());
@@ -862,6 +888,65 @@ mod tests {
         }
     }
     #[test]
+    fn invalidation_reclaims_slots_and_bytes_without_resurrecting_ids() {
+        let now = Instant::now();
+        let d = Detector::new(Limits {
+            max_posts_per_author: 2,
+            metadata_bytes: 4096,
+            metadata_bytes_per_guild: 4096,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(admit(&d, 1, 10, now).is_none());
+        assert!(admit(&d, 2, 11, now).is_none());
+        assert!(admit(&d, 3, 12, now).is_none());
+        let before = d.state.lock();
+        assert_eq!(before.guilds[&1].authors[&2].posts.len(), 2);
+        let occupied = before.bytes;
+        drop(before);
+        d.invalidate(1, 10, 1);
+        {
+            let s = d.state.lock();
+            let b = &s.guilds[&1].authors[&2];
+            assert_eq!(b.posts.len(), 1);
+            assert_eq!(b.posts[0].id, 2);
+            assert!(b.retired_before >= 1);
+            assert!(!s.index.contains_key(&(1, 10, 1)));
+            assert!(s.bytes < occupied);
+        }
+        assert!(admit(&d, 1, 10, now).is_none());
+        assert!(admit(&d, 3, 12, now).is_none());
+        {
+            let s = d.state.lock();
+            let ids: Vec<_> = s.guilds[&1].authors[&2]
+                .posts
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            assert_eq!(ids, vec![2, 3]);
+        }
+        d.invalidate_author(1, 2);
+        {
+            let s = d.state.lock();
+            let b = &s.guilds[&1].authors[&2];
+            assert!(b.posts.is_empty());
+            assert_eq!(s.bytes, 0);
+            assert!(s.index.is_empty());
+            assert!(b.retired_before >= 3);
+        }
+        assert!(admit(&d, 3, 12, now).is_none());
+        assert!(admit(&d, 4, 13, now).is_none());
+        {
+            let s = d.state.lock();
+            let ids: Vec<_> = s.guilds[&1].authors[&2]
+                .posts
+                .iter()
+                .map(|p| p.id)
+                .collect();
+            assert_eq!(ids, vec![4]);
+        }
+    }
+    #[test]
     fn original_window_expires_even_when_hashes_arrive_late() {
         let now = Instant::now();
         let d = Detector::new(Limits::default()).unwrap();
@@ -886,11 +971,12 @@ mod tests {
                 .is_none()
         );
         assert_eq!(d.complete(j, &policy(), false, now), None);
-        assert!(
-            d.state.lock().guilds[&1].authors[&2].posts[..3]
-                .iter()
-                .all(|p| !p.valid)
-        );
+        let s = d.state.lock();
+        let b = &s.guilds[&1].authors[&2];
+        assert_eq!(b.posts.len(), 1);
+        assert_eq!(b.posts[0].id, 13);
+        assert!(b.posts[0].valid);
+        assert!(b.retired_before >= 12);
     }
     #[test]
     fn reports_are_throttled_and_failures_never_claim_a_match() {
