@@ -1,5 +1,5 @@
 //! Run against a fresh disposable remote database, separate from the core smoke DB.
-use jmodguard::db::guild_data::{GuildDataScope, GuildDataStore, GuildStoreOptions};
+use jmodguard::db::guild_data::*;
 use jmodguard::db::guild_stores::*;
 use jmodguard::db::{Db, GuildEnrollment, test_drop_next_commit_response};
 
@@ -112,6 +112,69 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
+    let case_id = CaseId::new();
+    let limits = CaseLimits::default();
+    let facts = CaseData {
+        source: CaseSource::DiscordAudit { entry_id: 123 },
+        action: CaseAction::Ban,
+        outcome: CaseOutcome::Uncertain,
+        subject_id: 1234,
+        actor_id: None,
+        occurred_at_ms: 1000,
+        reason: None,
+        evidence: CaseEvidence::Unavailable,
+    };
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .record_case(scoped.clone(), case_id.clone(), facts.clone(), limits)
+            .await
+            .unwrap(),
+        RecordCase::Created(case_id.clone())
+    );
+    assert_eq!(
+        reopened
+            .case(scoped.clone(), case_id.clone(), limits)
+            .await
+            .unwrap(),
+        Some(facts.clone())
+    );
+    test_drop_next_commit_response();
+    // Reads and duplicate source retries leave the injected lost response for removal.
+    assert_eq!(
+        reopened
+            .record_case(scoped.clone(), CaseId::new(), facts.clone(), limits)
+            .await
+            .unwrap(),
+        RecordCase::Existing(case_id.clone())
+    );
+    assert_eq!(
+        reopened
+            .case_ids(scoped.clone(), None, 1, limits)
+            .await
+            .unwrap(),
+        vec![case_id.clone()]
+    );
+    assert!(
+        store
+            .remove_case(scoped.clone(), case_id.clone())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        reopened
+            .record_case(scoped.clone(), CaseId::new(), facts, limits)
+            .await
+            .unwrap(),
+        RecordCase::Removed(case_id.clone())
+    );
+    assert!(
+        reopened
+            .case(scoped.clone(), case_id, limits)
+            .await
+            .unwrap()
+            .is_none()
+    );
     test_drop_next_commit_response();
     store.close_membership(scoped.clone()).await.unwrap();
     assert!(reopened.log_channels(scoped.clone()).await.is_err());
@@ -127,7 +190,22 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
-    reopened.close_membership(scoped).await.unwrap();
+    reopened.close_membership(scoped.clone()).await.unwrap();
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .purge_closed_cases(scoped.clone(), 1, limits)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .purge_closed_cases(scoped, 1, limits)
+            .await
+            .unwrap(),
+        0
+    );
     drop((store, reopened, catalog));
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
