@@ -6,6 +6,8 @@ pub mod config;
 pub mod db;
 mod db_compat;
 pub mod defaults;
+#[cfg(unix)]
+pub mod evidence_transfer;
 pub use jmodguard_runtime::health;
 pub mod ids;
 pub mod normalize;

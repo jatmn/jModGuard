@@ -126,6 +126,29 @@ fn live(conn: &impl SqlExecutor, scope: &GuildDataScope, case: &CaseId) -> Resul
 }
 
 impl GuildDataStore {
+    /// Crate-internal reload for object I/O: never accept a caller-mutated job/key.
+    #[cfg(unix)]
+    pub(crate) async fn evidence_transfer_job(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        id: CaseId,
+    ) -> Result<EvidenceJob> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
+                let mut job = record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job;
+                anyhow::ensure!(job.case_id == case, CaseError::Conflict);
+                job.cancelled |= !active;
+                tx.finish_read()?;
+                Ok(job)
+            })
+            .await
+    }
+
     /// Reserve before any external write. Existing reservations are snapshots for
     /// reconciliation, never automatic permission to restart an interrupted upload.
     pub async fn reserve_case_evidence(

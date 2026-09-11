@@ -246,6 +246,45 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .unwrap()
             .is_some()
     );
+    // Real local object I/O paired with the remote journal; a lost reservation
+    // response must not cause a second upload or leave deletion unacknowledged.
+    #[cfg(unix)]
+    let local_evidence = {
+        use jmodguard::evidence_transfer::{EvidenceTarget, EvidenceUpload, LocalEvidenceStore};
+        let storage_id = CaseId::new();
+        let root = std::env::temp_dir().join(format!("jmodguard-evidence-{}", storage_id.as_str()));
+        let backend = LocalEvidenceStore::initialize(root.clone(), storage_id.clone(), 2).unwrap();
+        let target = EvidenceTarget {
+            scope: scoped.clone(),
+            case_id: case_id.clone(),
+            evidence_id: CaseId::new(),
+        };
+        test_drop_next_commit_response();
+        assert_eq!(
+            backend
+                .capture(
+                    store.clone(),
+                    EvidenceUpload {
+                        target: target.clone(),
+                        request: EvidenceRequest {
+                            storage_id,
+                            bytes: 3,
+                            origin: EvidenceOrigin {
+                                channel_id: 1,
+                                message_id: 2,
+                                attachment_id: 4
+                            },
+                        },
+                        limits: evidence_limits,
+                    },
+                    std::io::Cursor::new(b"abc".to_vec())
+                )
+                .await
+                .unwrap(),
+            EvidenceState::Available
+        );
+        (backend, target, root)
+    };
     let history_limits = CaseHistoryLimits {
         entry: limits,
         max_entries: 10,
@@ -398,6 +437,21 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
+    #[cfg(unix)]
+    {
+        let (backend, target, root) = local_evidence;
+        test_drop_next_commit_response();
+        assert!(
+            backend
+                .cleanup(store.clone(), target.clone())
+                .await
+                .unwrap()
+        );
+        assert!(!backend.cleanup(reopened.clone(), target).await.unwrap());
+        assert!(!root.join("evidence").exists());
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     // Case removal hides metadata and retains the object until cleanup is acknowledged.
     let deletion = reopened
         .evidence_jobs(

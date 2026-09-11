@@ -129,6 +129,14 @@ closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jo
 not leases or provider proof. No object worker, Storage adapter, serving route or backup-copy
 lifecycle is activated. Private evidence and backups-only resources must remain separate.
 
+The opt-in Unix local evidence backend uses real bounded streaming and durable receipts;
+see `docs/LOCAL-EVIDENCE.md`. Hold its stable OS resource lock through I/O and SQL settlement,
+even if the async waiter is cancelled. Reload exact journal identity, never accept raw object
+keys or retry an existing reservation's source. Keep the evidence root private/dedicated;
+only verified file absence can acknowledge cleanup. Local advisory locks require cooperating
+writers and trusted parents; they do not establish remote PUT completion or restore fencing.
+Current services must not activate this backend until lifecycle/permissions/routing land.
+
 ## Commands
 
 ```bash

@@ -30,6 +30,8 @@ hyper = { version = "0.14", default-features = false, features = ["client", "htt
 libsql = { version = "0.9.30", default-features = false, features = ["core", "remote"] }
 rand = "0.10"
 regex = "1"
+# Reuse the crypto implementation already required by rustls for streaming SHA-256.
+ring = { version = "0.17", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"

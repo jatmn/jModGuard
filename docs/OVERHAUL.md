@@ -345,6 +345,21 @@ streaming adapters, exclusive writer coordination, uncertain-upload reconciliati
 permissions and backup-copy lifecycle remain required before runtime activation. Local state
 transitions are not provider verification or a complete file-evidence implementation.
 
+## Implemented: opt-in local evidence transfer (wave 24)
+
+A Unix local backend now reserves before streaming, verifies actual size/SHA-256, publishes
+synced completion receipts and settles the journal. An explicit-sized buffer bounds memory;
+SHA-256 reuses the existing ring package with no new locked packages. A stable resource
+identity, private path checks and per-resource OS lock coordinate cooperating local writers,
+including after async waiter cancellation. Recovery inspects completed artifacts without
+reuploading; cleanup verifies durable absence before SQL acknowledgment and preserves other
+objects. See [local transfer contracts](LOCAL-EVIDENCE.md).
+
+This is real local file I/O, exercised with local and disposable remote SQL. No new schema,
+runtime worker, source fetcher or serving endpoint is enabled. Bunny resource binding and
+uncertain remote writes need a separate adapter; local locks are not a distributed lease.
+Permission checks, backup-copy lifecycle and complete tenant adoption remain pending.
+
 ## Next implementation slices
 
 1. Extend the captured tenant log-channel pattern across the fresh data model/tenant
