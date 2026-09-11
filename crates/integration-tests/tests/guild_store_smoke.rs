@@ -139,6 +139,33 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .unwrap(),
         Some(facts.clone())
     );
+    let app_source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    let source_match = CaseSourceMatch {
+        id: case_id.clone(),
+        removed: false,
+    };
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .link_case_source(
+                scoped.clone(),
+                case_id.clone(),
+                facts.source.clone(),
+                app_source.clone()
+            )
+            .await
+            .unwrap(),
+        LinkCaseSource::Linked(source_match.clone())
+    );
+    assert_eq!(
+        reopened
+            .case_for_source(scoped.clone(), app_source.clone())
+            .await
+            .unwrap(),
+        Some(source_match.clone())
+    );
     let history_limits = CaseHistoryLimits {
         entry: limits,
         max_entries: 10,
@@ -193,6 +220,26 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     );
     test_drop_next_commit_response();
     // Reads and duplicate source/history retries leave the lost response for removal.
+    assert_eq!(
+        reopened
+            .link_case_source(
+                scoped.clone(),
+                case_id.clone(),
+                facts.source.clone(),
+                app_source.clone()
+            )
+            .await
+            .unwrap(),
+        LinkCaseSource::Existing(source_match.clone())
+    );
+    assert_eq!(
+        reopened
+            .case_for_source(scoped.clone(), app_source.clone())
+            .await
+            .unwrap(),
+        Some(source_match)
+    );
+
     assert_eq!(
         reopened
             .append_case_history(
@@ -271,10 +318,27 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
+    let alias_facts = CaseData {
+        source: app_source.clone(),
+        ..facts.clone()
+    };
+    let removed_match = reopened
+        .case_for_source(scoped.clone(), app_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(removed_match.removed);
+    assert_eq!(
+        reopened
+            .record_case(scoped.clone(), CaseId::new(), alias_facts, limits)
+            .await
+            .unwrap(),
+        RecordCase::Removed(removed_match.id)
+    );
     let live_case = CaseId::new();
     let live_facts = CaseData {
         source: CaseSource::DiscordAudit { entry_id: 124 },
-        ..facts
+        ..facts.clone()
     };
     store
         .record_case(scoped.clone(), live_case.clone(), live_facts, limits)
@@ -290,6 +354,53 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
         )
         .await
         .unwrap();
+    let late_id = CaseId::new();
+    let late_source = CaseSource::DiscordAudit { entry_id: 125 };
+    let late_app = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    store
+        .record_case(
+            scoped.clone(),
+            late_id.clone(),
+            CaseData {
+                source: late_source.clone(),
+                ..facts.clone()
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+    store
+        .remove_case(scoped.clone(), late_id.clone())
+        .await
+        .unwrap();
+    test_drop_next_commit_response();
+    assert_eq!(
+        store
+            .link_case_source(
+                scoped.clone(),
+                late_id.clone(),
+                late_source,
+                late_app.clone()
+            )
+            .await
+            .unwrap(),
+        LinkCaseSource::Linked(CaseSourceMatch {
+            id: late_id.clone(),
+            removed: true
+        })
+    );
+    assert_eq!(
+        reopened
+            .case_for_source(scoped.clone(), late_app)
+            .await
+            .unwrap(),
+        Some(CaseSourceMatch {
+            id: late_id,
+            removed: true
+        })
+    );
     test_drop_next_commit_response();
     store.close_membership(scoped.clone()).await.unwrap();
     assert!(reopened.log_channels(scoped.clone()).await.is_err());
@@ -309,6 +420,14 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     test_drop_next_commit_response();
     assert_eq!(
         store
+            .purge_closed_cases(scoped.clone(), 1, limits)
+            .await
+            .unwrap(),
+        1
+    );
+    test_drop_next_commit_response();
+    assert_eq!(
+        reopened
             .purge_closed_cases(scoped.clone(), 1, limits)
             .await
             .unwrap(),

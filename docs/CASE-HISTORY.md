@@ -83,8 +83,9 @@ backup cleanup, external evidence ownership and distributed writer exclusion rem
 ## Schema and validation
 
 Guild migration0004 adds only the history table, constraints and parent/child triggers.
-`initialize` verifies and extends matching version1–3 stores to4, preserving existing cases,
-source replay markers and settings. `open` requires4; old guild-store binaries reject4.
+Version5 additionally tracks [explicit case sources](CASE-SOURCES.md). `initialize` verifies
+and extends matching version1–4 stores to5, preserving cases, history, replay markers and
+settings. `open` requires5; old guild-store binaries reject5.
 Rollback needs matching pre-upgrade backup and binary. Core stays0010 and current bot/API
 continues using core moderation records.
 
@@ -93,6 +94,6 @@ retries, conflicts, count/byte/read limits, removal/append races, child-deletion
 closed cleanup, SQL guards, input validation and version3 upgrade. Disposable libSQL covers
 lost append/removal/purge responses, cross-handle reads and duplicate retries.
 
-Backend note/correction/view permissions, canonical source correlation, richer proof/evidence,
+Backend note/correction/view permissions, trusted runtime source matching, richer proof/evidence,
 capacity monitoring and runtime case presentation remain pending. Local tests establish no
 live Bunny/Discord behavior, resource measurements or complete tenant-isolation guarantee.

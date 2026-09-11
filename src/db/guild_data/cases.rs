@@ -47,7 +47,14 @@ pub enum CaseSource {
     },
 }
 impl CaseSource {
-    fn key(&self) -> Result<String> {
+    pub(super) fn kind(&self) -> i64 {
+        match self {
+            Self::Application { .. } => 0,
+            Self::DiscordAudit { .. } => 1,
+        }
+    }
+
+    pub(super) fn key(&self) -> Result<String> {
         match self {
             Self::Application { operation_id } => Ok(format!("app:{}", operation_id.as_str())),
             Self::DiscordAudit { entry_id } => {
@@ -229,16 +236,17 @@ impl GuildDataStore {
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_read()?;
             verify_scope(&tx, &expected, &scope, true)?;
+            let matched = super::case_sources::source_match(&tx, &scope, &source)?;
             // Fetch only matching identities and a SQL equality bit, never another payload.
-            let mut stmt = tx.prepare("SELECT case_id,source_key,deleted,payload=?4 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR source_key=?5)")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),payload.as_str(),source.as_str()], |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<bool>(2)?,r.get::<Option<bool>>(3)?)))?;
+            let mut stmt = tx.prepare("SELECT case_id,source_key,deleted,payload=?4 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR case_id=?5)")?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),payload.as_str(),matched.as_ref().map_or("", |m| m.id.as_str())], |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<bool>(2)?,r.get::<Option<bool>>(3)?)))?;
             let mut existing = None;
             for row in rows {
                 let (found, key, deleted, equal) = row?;
-                anyhow::ensure!(existing.is_none() && key==source, CaseError::Conflict);
+                anyhow::ensure!(existing.is_none() && matched.as_ref().is_some_and(|m| m.id.as_str()==found), CaseError::Conflict);
                 let found = CaseId::try_from(found)?;
                 existing = Some(if deleted { RecordCase::Removed(found) } else {
-                    anyhow::ensure!(equal==Some(true), CaseError::Conflict);
+                    anyhow::ensure!(key==source && equal==Some(true), CaseError::Conflict);
                     RecordCase::Existing(found)
                 });
             }

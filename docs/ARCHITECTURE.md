@@ -170,6 +170,10 @@ batch cleanup. It remains inactive: current moderation handlers still write core
 Its [append-only history](CASE-HISTORY.md) preserves original facts and is removed with its
 parent case. No file evidence, backup cleanup, runtime permissions or full erasure is supplied yet.
 
+The inactive guild-store schema5 supports [explicit case source association](CASE-SOURCES.md),
+including late links to removed parents. Runtime source matching and case adoption remain
+pending; current services continue to use core moderation records.
+
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,

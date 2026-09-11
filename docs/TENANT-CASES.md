@@ -23,14 +23,15 @@ The source key is unique within the captured guild membership. A retry with iden
 returns the original case ID even if the caller generated a different ID. Changed facts or
 reuse of an existing ID for another source fails. If both requested identities conflict with
 two records, the operation fails. Callers must retain the original source and payload across
-retries. This does not correlate an application's action with its separate Discord audit
-entry; future ingestion must choose/correlate canonical sources deliberately.
+retries. [Explicit source association](CASE-SOURCES.md) can now bind an application ID and
+Discord audit ID to one canonical case. Trusted runtime matching remains pending; the
+storage layer never guesses a match or merges two existing cases.
 
 Evidence is explicitly unavailable or a bounded nonempty list of selected text excerpts,
 with channel/message/author IDs and original timestamps. Guild/membership ownership comes
 from the case. No attachment URLs, arbitrary object keys, downloads or external evidence
 references are accepted. This completes deletion of the evidence this slice can own; file
-capture, hashes, policy snapshots, richer proof and private Storage ownership remain later
+capture, hashes, richer proof and private Storage ownership remain later
 work. Text evidence is a selected subset, not a completeness guarantee or general history.
 Discord snowflake serialization reuses the existing string helpers.
 
@@ -63,15 +64,16 @@ eviction. Capacity monitoring, total tenant budgets and admission policy remain 
 Real mutations use existing remote receipt recovery. Reads, identical retries, removed-key
 replays and missing removals create no receipts. Cases do not change log/config/slash
 revisions. Original payloads are immutable. [Append-only history](CASE-HISTORY.md) now records notes,
-corrections and selected policy context without rewriting them. Canonical source correlation
-and runtime presentation remain pending.
+corrections and selected policy context without rewriting them. Explicit source association
+is described in [case sources](CASE-SOURCES.md); trusted runtime matching and presentation
+remain pending.
 
 ## Removal and closure
 
 Removal clears subject, actor, reason, outcome, timestamp and all selected excerpts together.
-The remaining row contains guild/enrollment, case ID, source key and a deleted flag. Retain
-this minimal marker while the membership is active so replay of that same source cannot
-restore erased content. A newly invented source key is not the same replay; future trusted
+The remaining row contains guild/enrollment, case ID, source key and a deleted flag; owned
+source mappings retain an explicitly linked counterpart. Retain these minimal markers while
+the membership is active so replay of either registered source cannot restore erased content. A newly invented source key is not the same replay; future trusted
 producers must preserve/correlate source identity. This is not global audit replay detection.
 SQL guards reject updates except payload removal, INSERT OR REPLACE identity bypass and
 physical deletion of replay keys while membership is active, without relying on foreign-key
@@ -87,9 +89,10 @@ coordination remains required. No permanent departed-guild ledger is the product
 ## Schema and validation
 
 Guild migration0003 adds only `guild_cases` and its indexes/guards within `jmodguard-guild-1`.
-`initialize` verifies the expected version1–3 family and identity before atomically extending
-it to4, preserving placement, settings and cases. Version4 adds owned history and removal
-triggers; fresh initialization applies all four steps. `open` requires4. Old guild-store binaries reject4; rollback needs matching pre-upgrade
+`initialize` verifies the expected version1–4 family and identity before atomically extending
+it to5, preserving placement, settings and cases. Version4 adds owned history; version5 adds
+source mappings with original-key backfill. Fresh initialization applies all five steps.
+`open` requires5. Old guild-store binaries reject5; rollback needs matching pre-upgrade
 backups and binaries. Core remains0010 and current services never open these guild stores.
 
 Local regressions cover scoped persistence/paging, source conflicts/concurrent retries,

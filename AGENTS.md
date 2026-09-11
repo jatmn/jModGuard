@@ -117,6 +117,11 @@ append transaction; reads page IDs and bound single payloads. Parent removal/clo
 must remove owned history atomically without foreign-key PRAGMA reliance. Budgets are trusted
 explicit inputs; no new runtime defaults, permissions or automatic effective-outcome fold.
 
+Version5 adds explicit application/audit source associations; see `docs/CASE-SOURCES.md`.
+Require an already-bound anchor and reject conflicts; never infer matches or merge cases.
+Preserve original facts and both source replay keys after removal, including late explicit
+links to removed parents. Closed cleanup removes owned keys atomically. No runtime adoption.
+
 ## Commands
 
 ```bash
