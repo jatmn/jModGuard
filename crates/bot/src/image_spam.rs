@@ -541,6 +541,7 @@ pub fn observe(
     cfg: &CachedGuildConfig,
     msg: &Message,
     received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
     revision: u64,
 ) {
     let Some(guild) = msg.guild_id else { return };
@@ -560,7 +561,8 @@ pub fn observe(
     }
     // A replay cannot acquire a new window. Use the Discord create time, clamped
     // to this callback's monotonic reception time; old/future timestamps are skipped.
-    let age_ms = chrono::Utc::now().timestamp_millis() - msg.timestamp.timestamp_millis();
+    // Age is measured at handler entry so async config load cannot shrink coverage.
+    let age_ms = received_at.timestamp_millis() - msg.timestamp.timestamp_millis();
     if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 || msg.edited_timestamp.is_some() {
         return;
     }

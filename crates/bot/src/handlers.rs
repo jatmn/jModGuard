@@ -224,6 +224,7 @@ impl EventHandler for Handler {
 
     async fn message(&self, ctx: Context, msg: Message) {
         let received = std::time::Instant::now();
+        let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
@@ -259,7 +260,7 @@ impl EventHandler for Handler {
             cfg.templates.len()
         );
 
-        crate::image_spam::observe(&app, &ctx, &cfg, &msg, received, image_revision);
+        crate::image_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, image_revision);
         // Generic rules and prefix commands retain their existing bot exemption.
         if msg.author.bot {
             return;
