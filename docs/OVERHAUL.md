@@ -393,3 +393,17 @@ Live Bunny/Discord testing and deployment are deferred. Local tests do not estab
 provider durability, distributed writer exclusion, access policy or billed resource use.
 Database credential separation and operational conductor features
 remain pending. Logging changes are described above; they do not establish full guild erasure.
+
+## Implemented: bounded exact-image test mode
+
+The bot now observes new image messages through a separate bounded log-only pipeline,
+using streamed SHA-256 equality and a common distinct-image set across channels.
+The unsafe count-only attachment trigger is removed. The WebUI exposes test thresholds
+and labels legacy configurations inactive; shared validation refuses punitive test
+actions. No new dependency versions, schema changes or SQL message archival.
+See [IMAGE-SPAM.md](IMAGE-SPAM.md) for limits and coverage.
+
+This is the first live Gateway detector slice, not completed spam enforcement.
+Changed-image edits, fresh enforcement authority, actual matched-message deletion/ban,
+truthful receipts and selected case/evidence integration remain before protection is
+complete. Conductor/tenant foundations remain inactive as documented above.

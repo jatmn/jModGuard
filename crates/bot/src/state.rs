@@ -50,6 +50,7 @@ pub struct BotState {
     pub cfg: Arc<BotProcessConfig>,
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
+    pub image_spam: crate::image_spam::Detector,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
     pub log_delivery_slots: tokio::sync::Semaphore,
     pub log_delivery_failures: AtomicU64,
@@ -88,6 +89,7 @@ impl BotState {
                     .is_some(),
             "log.discord_timeout_secs must be positive"
         );
+        let image_spam = crate::image_spam::Detector::new(cfg.image_spam.clone())?;
         let log_delivery_slots = tokio::sync::Semaphore::new(cfg.log.discord_concurrency);
         // Prime from DB at construction — never leave an "unobserved" sentinel.
         // Cache population is independent of the poll task; skipping the first
@@ -101,6 +103,7 @@ impl BotState {
             cfg: Arc::new(cfg),
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
+            image_spam,
             cooldowns: DashMap::new(),
             log_delivery_slots,
             log_delivery_failures: AtomicU64::new(0),

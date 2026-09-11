@@ -22,10 +22,10 @@ fn rule(id: &str) -> RuleDef {
             vec![action(1, "ban", "Ping spam (@everyone/@here)", 0, 1)],
         ),
         "attachment_flood" => (
-            "Attachment flood",
-            "Many messages with 2+ attachments across multiple channels in a short window (crypto/money scam pattern).",
-            json!({"window_secs": 60, "min_messages": 2, "min_attachments": 2, "min_channels": 2}),
-            vec![action(1, "ban", "Attachment spam (likely scam)", 0, 1)],
+            "Exact image spam (test)",
+            "Log-only: the same distinct image files posted by one author across channels. Creates only; edited messages are excluded. Configure an automod log channel.",
+            json!({"mode":"exact_image_test", "window_secs": 60, "min_attachments": 2, "min_channels": 3}),
+            vec![action(1, "log", "Exact image spam test", 0, 0)],
         ),
         "new_member_url" => (
             "New-member URL",
@@ -81,7 +81,7 @@ fn rule(id: &str) -> RuleDef {
         name: name.into(),
         description: description.into(),
         enabled: true,
-        dry_run: false,
+        dry_run: id == "attachment_flood",
         params,
         actions,
         whitelist_roles: vec![],

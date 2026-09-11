@@ -9,6 +9,7 @@ pub mod commands;
 pub mod discord;
 pub mod enrollment_repair;
 pub mod handlers;
+pub mod image_spam;
 pub mod logging;
 pub mod nickname_worker;
 pub mod state;

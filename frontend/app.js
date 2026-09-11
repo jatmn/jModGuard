@@ -542,8 +542,10 @@ function tabRules() {
 
 function ruleCard(r) {
   const rule = r.effective;
-  const badge = !rule.enabled ? "off" : rule.dry_run ? "dry" : "on";
-  const label = !rule.enabled ? "disabled" : rule.dry_run ? "dry-run" : "enabled";
+  const image = r.rule_id === "attachment_flood";
+  const supported = !image || imageTestConfigured(rule);
+  const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
+  const label = !rule.enabled ? "disabled" : !supported ? "inactive — select image test mode" : image ? "log-only image test" : rule.dry_run ? "dry-run" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
       el("div", {},
@@ -558,8 +560,21 @@ function ruleCard(r) {
   );
 }
 
+function imageTestConfigured(rule) {
+  const p = rule.params || {};
+  return p.mode === "exact_image_test" && rule.dry_run === true &&
+    (rule.actions || []).every(a => a.action === "log") &&
+    Object.keys(p).every(k => ["mode", "window_secs", "min_channels", "min_attachments"].includes(k)) &&
+    [[p.window_secs, 1, 600], [p.min_channels, 2, 10], [p.min_attachments, 1, 10]]
+      .every(([n, min, max]) => Number.isInteger(n) && n >= min && n <= max);
+}
+
 function editRule(r) {
   const rule = JSON.parse(JSON.stringify(r.effective));
+  const image = r.rule_id === "attachment_flood";
+  const imageChannels = el("input", { type: "number", min: 2, max: 10, value: rule.params?.min_channels ?? 3 });
+  const imageCount = el("input", { type: "number", min: 1, max: 10, value: rule.params?.min_attachments ?? 2 });
+  const imageWindow = el("input", { type: "number", min: 1, max: 600, value: rule.params?.window_secs ?? 60 });
   const modal = overlay();
   const paramsText = el("textarea", { class: "mono" });
   paramsText.value = JSON.stringify(rule.params ?? {}, null, 2);
@@ -590,20 +605,25 @@ function editRule(r) {
       reason.onchange = () => (rule.actions[i].reason = reason.value);
     });
   };
-  renderActions();
+  if (!image) renderActions();
 
   const box = el("div", { class: "modal-box" },
     el("h3", { text: `Edit rule: ${r.name}` }),
     el("div", { class: "field" },
       el("label", { text: "Enabled" }),
       el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }),
-      el("label", { text: " Dry-run (log only)", style: "margin-left:14px" }),
-      el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) }),
+      image ? el("span", { text: " Log-only test mode; delete and ban are not available yet." }) :
+        el("label", {}, " Dry-run (log only)", el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) })),
     ),
-    el("div", { class: "field" },
+    image ? el("div", {},
+      el("p", { text: "Save to select exact-image test mode. Reports go to this server’s automod log channel. Only new messages with image metadata are tested; edited messages are excluded. Work limits can reduce coverage." }),
+      el("div", { class: "field" }, el("label", { text: "Distinct channels" }), imageChannels),
+      el("div", { class: "field" }, el("label", { text: "Common distinct images per message" }), imageCount),
+      el("div", { class: "field" }, el("label", { text: "Window (seconds)" }), imageWindow),
+    ) : el("div", { class: "field" },
       el("label", { text: "Parameters (JSON)" }), paramsText,
     ),
-    el("div", { class: "field" },
+    image ? null : el("div", { class: "field" },
       el("label", { text: "Action escalation" }), actionsRows,
       el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
@@ -616,7 +636,14 @@ function editRule(r) {
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
-          rule.params = JSON.parse(paramsText.value || "{}");
+          if (image) {
+            rule.params = { mode: "exact_image_test", min_channels: Number(imageChannels.value), min_attachments: Number(imageCount.value), window_secs: Number(imageWindow.value) };
+            rule.dry_run = true;
+            rule.actions = [{ at: 1, action: "log", reason: "Exact image spam test", duration_minutes: 0, delete_days: 0 }];
+            if (!imageTestConfigured(rule)) throw new Error("Channels must be 2–10, images 1–10, and window 1–600 seconds, all whole numbers.");
+          } else {
+            rule.params = JSON.parse(paramsText.value || "{}");
+          }
         } catch (e) { toast("Invalid params JSON: " + e.message, "error"); return; }
         rule.whitelist_roles = splitIds(whitelistText.value);
         rule.whitelist_channels = splitIds(channelsText.value);

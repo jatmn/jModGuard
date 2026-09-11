@@ -153,6 +153,7 @@ pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<Ru
 }
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
+    crate::image_spam::validate_rule(rule_id, rule)?;
     upsert_row(
         db,
         "rules",
@@ -692,6 +693,9 @@ async fn copy_guild_config_inner(
         }
 
         if wants("rules") {
+            for (id, rule) in load_rows_conn::<RuleDef>(&tx, src, "rules", "rule_id", None)? {
+                crate::image_spam::validate_rule(&id, &rule)?;
+            }
             if src != dst {
                 tx.execute("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
                 tx.execute(
@@ -1154,6 +1158,7 @@ pub async fn upsert_enrolled_rule(
     id: &str,
     rule: &RuleDef,
 ) -> Result<()> {
+    crate::image_spam::validate_rule(id, rule)?;
     upsert_row(
         db,
         "rules",

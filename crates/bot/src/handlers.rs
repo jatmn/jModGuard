@@ -135,6 +135,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        self.app.image_spam.invalidate_guild(incomplete.id.get());
         let joined = full
             .filter(|guild| guild.id == incomplete.id)
             .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
@@ -177,6 +178,9 @@ impl EventHandler for Handler {
         user: User,
         member_data: Option<Member>,
     ) {
+        self.app
+            .image_spam
+            .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
         let mut extra = BTreeMap::new();
         extra.insert(
@@ -219,13 +223,10 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        let received = std::time::Instant::now();
+        let image_revision = self.app.image_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
-
-        // ignore other bots and ourselves
-        if msg.author.bot {
-            return;
-        }
 
         if msg.content.is_empty() {
             warn_empty_content_once();
@@ -257,6 +258,12 @@ impl EventHandler for Handler {
             cfg.rules.len(),
             cfg.templates.len()
         );
+
+        crate::image_spam::observe(&app, &ctx, &cfg, &msg, received, image_revision);
+        // Generic rules and prefix commands retain their existing bot exemption.
+        if msg.author.bot {
+            return;
+        }
 
         // automod
         let member: Option<Member> = msg.member.clone().map(|m| Member::from(*m));
@@ -321,6 +328,11 @@ impl EventHandler for Handler {
         _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
+        if let Some(guild) = event.guild_id {
+            self.app
+                .image_spam
+                .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+        }
         if let Some(report) = logging::message_update_report(&event) {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
@@ -334,6 +346,9 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
+        self.app
+            .image_spam
+            .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         let report = logging::message_delete_report(guild_id, channel_id, deleted_message_id);
         logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
     }
@@ -346,6 +361,11 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
+        for id in &multiple_deleted_messages_ids {
+            self.app
+                .image_spam
+                .invalidate(guild_id.get(), channel_id.get(), id.get());
+        }
         let mut vars = BTreeMap::new();
         vars.insert("channel".into(), format!("<#{}>", channel_id));
         vars.insert(
@@ -360,8 +380,11 @@ impl EventHandler for Handler {
         ctx: Context,
         old_if_available: Option<Member>,
         new_if_available: Option<Member>,
-        _event: GuildMemberUpdateEvent,
+        event: GuildMemberUpdateEvent,
     ) {
+        self.app
+            .image_spam
+            .invalidate_author(event.guild_id.get(), event.user.id.get());
         let app = Arc::clone(self.app());
         let Some(new) = new_if_available else { return };
         let guild_id = new.guild_id;

@@ -145,6 +145,14 @@ markers do not prove zone privacy; installation checks, provider resolution, run
 and backup-copy lifecycle remain before activation. Core stays0010. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
+The attachment rule now uses a bounded Gateway create-only exact-image **test** path;
+see `docs/IMAGE-SPAM.md`. Never restore the count-only trigger or route matches into
+the generic punishment executor. Require an exact common distinct-hash set across
+channels, preserve original observation time and invalidation/replay guards, and keep
+work/metadata bounds with no background task queue. Test reports are best-effort Discord
+logs only, no SQL cases/evidence. Edits currently invalidate; punishment and selected
+evidence integration remain future work. Process budgets belong only to bot config.
+
 ## Commands
 
 ```bash

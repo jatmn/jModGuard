@@ -1,0 +1,383 @@
+//! Shared exact-image test policy and bounded Discord attachment hashing.
+//! No image decoding, arbitrary URL fetch, archive, or punishment API.
+use anyhow::{Result, ensure};
+use hyper::{Body, Client, body::HttpBody};
+use serde::Deserialize;
+use std::time::Duration;
+
+pub const MODE: &str = "exact_image_test";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    pub mode: String,
+    pub window_secs: u64,
+    pub min_channels: usize,
+    pub min_attachments: usize,
+}
+impl Policy {
+    pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {
+        let value: Self = serde_json::from_value(rule.params.clone())?;
+        ensure!(
+            value.mode == MODE && rule.dry_run,
+            "exact-image detection currently requires log-only test mode"
+        );
+        ensure!(
+            rule.actions.iter().all(|a| a.action == "log"),
+            "exact-image test mode cannot configure punitive actions"
+        );
+        ensure!(
+            (1..=600).contains(&value.window_secs),
+            "image window must be 1–600 seconds"
+        );
+        ensure!(
+            (2..=10).contains(&value.min_channels),
+            "image channel threshold must be 2–10"
+        );
+        ensure!(
+            (1..=10).contains(&value.min_attachments),
+            "common distinct images must be 1–10"
+        );
+        Ok(value)
+    }
+}
+
+/// Legacy attachment-count configurations stay inert until explicitly converted.
+pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
+    if id == "attachment_flood" && rule.params.get("mode").is_some() {
+        Policy::parse(rule)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Limits {
+    pub max_authors: usize,
+    pub max_authors_per_guild: usize,
+    pub max_posts_per_author: usize,
+    pub max_files_per_post: usize,
+    pub max_file_bytes: u64,
+    pub concurrency: usize,
+    pub timeout_secs: u64,
+    pub requests_per_minute: u64,
+    pub requests_per_guild_minute: u64,
+    pub requests_per_author_minute: u64,
+    pub bytes_per_minute: u64,
+    pub comparison_steps: usize,
+    pub metadata_bytes: usize,
+    pub metadata_bytes_per_guild: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_authors: 512,
+            max_authors_per_guild: 64,
+            max_posts_per_author: 16,
+            max_files_per_post: 10,
+            max_file_bytes: 8 * 1024 * 1024,
+            concurrency: 2,
+            timeout_secs: 10,
+            requests_per_minute: 120,
+            requests_per_guild_minute: 40,
+            requests_per_author_minute: 20,
+            bytes_per_minute: 64 * 1024 * 1024,
+            comparison_steps: 100_000,
+            metadata_bytes: 4 * 1024 * 1024,
+            metadata_bytes_per_guild: 1024 * 1024,
+        }
+    }
+}
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=100_000).contains(&self.max_authors),
+            "image max_authors must be 1–100000"
+        );
+        ensure!(
+            (1..=self.max_authors).contains(&self.max_authors_per_guild),
+            "invalid image guild author limit"
+        );
+        ensure!(
+            (2..=64).contains(&self.max_posts_per_author),
+            "image posts per author must be 2–64"
+        );
+        ensure!(
+            (1..=10).contains(&self.max_files_per_post),
+            "image files per post must be 1–10"
+        );
+        ensure!(
+            (1..=1024 * 1024 * 1024).contains(&self.max_file_bytes),
+            "image file byte limit must be 1–1GiB"
+        );
+        ensure!(
+            (1..=32).contains(&self.concurrency) && (1..=60).contains(&self.timeout_secs),
+            "invalid image concurrency/timeout"
+        );
+        ensure!(
+            self.requests_per_minute > 0
+                && self.requests_per_guild_minute > 0
+                && self.requests_per_author_minute > 0
+                && self.bytes_per_minute > 0,
+            "image rate budgets must be positive"
+        );
+        ensure!(
+            (4096..=1024 * 1024 * 1024).contains(&self.metadata_bytes)
+                && (4096..=self.metadata_bytes).contains(&self.metadata_bytes_per_guild),
+            "invalid image metadata byte budgets"
+        );
+        ensure!(
+            (1..=10_000_000).contains(&self.comparison_steps),
+            "image comparison steps must be 1–10000000"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct Attachment {
+    pub id: u64,
+    pub size: u64,
+    uri: hyper::Uri,
+}
+impl Attachment {
+    pub fn retained_bytes(&self) -> usize {
+        self.uri.to_string().len() + 160
+    }
+
+    pub fn new(channel: u64, id: u64, size: u64, url: &str, limit: u64) -> Result<Self> {
+        ensure!(
+            url.len() <= 2048 && size > 0 && size <= limit,
+            "unsupported image attachment size or URL"
+        );
+        let parsed = url::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid attachment URL"))?;
+        ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("cdn.discordapp.com")
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.port().is_none()
+                && parsed.fragment().is_none(),
+            "unsupported attachment origin"
+        );
+        let prefix = format!("/attachments/{channel}/{id}/");
+        let tail = parsed.path().strip_prefix(&prefix).unwrap_or_default();
+        ensure!(
+            !tail.is_empty()
+                && !tail.contains('/')
+                && !["%2f", "%5c", "%2e"]
+                    .iter()
+                    .any(|part| tail.to_ascii_lowercase().contains(part))
+                && !tail.contains('\\'),
+            "attachment path does not match Discord identifiers"
+        );
+        let uri = parsed
+            .as_str()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid attachment URI"))?;
+        Ok(Self { id, size, uri })
+    }
+}
+
+pub type Hash = [u8; 32];
+pub struct Hasher {
+    client: Client<crate::remote_https::HttpsConnector<hyper::client::HttpConnector>>,
+}
+impl Default for Hasher {
+    fn default() -> Self {
+        Self {
+            client: Client::builder()
+                .http1_max_buf_size(8192)
+                .retry_canceled_requests(false)
+                .pool_max_idle_per_host(2)
+                .build(crate::remote_https::https_connector()),
+        }
+    }
+}
+impl Hasher {
+    pub async fn hash(&self, attachment: &Attachment, timeout: Duration) -> Result<Hash> {
+        tokio::time::timeout(timeout, async {
+            let response = self
+                .client
+                .get(attachment.uri.clone())
+                .await
+                .map_err(|_| anyhow::anyhow!("image download failed"))?;
+            ensure!(
+                response.status() == hyper::StatusCode::OK,
+                "image download did not return 200"
+            );
+            ensure!(
+                !response
+                    .headers()
+                    .contains_key(hyper::header::CONTENT_ENCODING),
+                "encoded image response is unsupported"
+            );
+            hash_body(response.into_body(), attachment.size).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("image download timed out"))?
+    }
+}
+async fn hash_body(mut body: Body, expected: u64) -> Result<Hash> {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut bytes = 0u64;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|_| anyhow::anyhow!("image body failed"))?;
+        bytes = bytes
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("image body too large"))?;
+        ensure!(bytes <= expected, "image body exceeds declared size");
+        hash.update(&chunk);
+    }
+    ensure!(
+        bytes == expected,
+        "image body length differs from declared size"
+    );
+    Ok(hash.finish().as_ref().try_into().expect("SHA256 length"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn source_rejects_arbitrary_endpoints_and_mismatched_ids() {
+        for url in [
+            "http://cdn.discordapp.com/attachments/1/2/a.png",
+            "https://example.org/attachments/1/2/a.png",
+            "https://cdn.discordapp.com.evil.org/attachments/1/2/a.png",
+            "https://x@cdn.discordapp.com/attachments/1/2/a.png",
+            "https://cdn.discordapp.com:123/attachments/1/2/a.png",
+            "https://cdn.discordapp.com/attachments/2/2/a.png",
+            "https://cdn.discordapp.com/attachments/1/2/../a.png",
+            "https://cdn.discordapp.com/attachments/1/2/%2f.png",
+            "https://cdn.discordapp.com/attachments/1/2/a.png#fragment",
+        ] {
+            assert!(Attachment::new(1, 2, 3, url, 10).is_err(), "{url}");
+        }
+        assert!(
+            Attachment::new(
+                1,
+                2,
+                3,
+                "https://cdn.discordapp.com/attachments/1/2/a.png?ex=abc&is=abc&hm=abc",
+                10
+            )
+            .is_ok()
+        );
+        assert!(
+            Attachment::new(
+                1,
+                2,
+                11,
+                "https://cdn.discordapp.com/attachments/1/2/a.png",
+                10
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn hashes_bytes_and_rejects_truncation_or_overrun() {
+        let h = hash_body(Body::from("abc"), 3).await.unwrap();
+        assert_eq!(
+            h.as_slice(),
+            ring::digest::digest(&ring::digest::SHA256, b"abc").as_ref()
+        );
+        assert!(hash_body(Body::from("ab"), 3).await.is_err());
+        assert!(hash_body(Body::from("abcd"), 3).await.is_err());
+        assert_ne!(h, hash_body(Body::from("abd"), 3).await.unwrap());
+    }
+    #[tokio::test]
+    async fn transport_streams_without_redirects_and_has_a_deadline() {
+        use hyper::{
+            Response, Server,
+            service::{make_service_fn, service_fn},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let server =
+            Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_service_fn(move |_| {
+                let hits = Arc::clone(&seen);
+                async move {
+                    Ok::<_, std::convert::Infallible>(service_fn(
+                        move |request: hyper::Request<Body>| {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                let response = match request.uri().path() {
+                                    "/redirect" => Response::builder()
+                                        .status(302)
+                                        .header("location", "/ok")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                                    "/encoding" => Response::builder()
+                                        .header("content-encoding", "gzip")
+                                        .body(Body::from("abc"))
+                                        .unwrap(),
+                                    "/slow" => {
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                        Response::new(Body::from("abc"))
+                                    }
+                                    _ => Response::new(Body::from("abc")),
+                                };
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        },
+                    ))
+                }
+            }));
+        let address = server.local_addr();
+        let task = tokio::spawn(server);
+        let client = Hasher::default();
+        let mut source = Attachment::new(
+            1,
+            2,
+            3,
+            "https://cdn.discordapp.com/attachments/1/2/a.png",
+            10,
+        )
+        .unwrap();
+        // Private test fixture substitution, unavailable to production callers.
+        source.uri = format!("http://{address}/ok").parse().unwrap();
+        assert_eq!(
+            client.hash(&source, Duration::from_secs(1)).await.unwrap(),
+            hash_body(Body::from("abc"), 3).await.unwrap()
+        );
+        source.uri = format!("http://{address}/redirect").parse().unwrap();
+        assert!(client.hash(&source, Duration::from_secs(1)).await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "redirect must not issue a second request"
+        );
+        source.uri = format!("http://{address}/encoding").parse().unwrap();
+        assert!(client.hash(&source, Duration::from_secs(1)).await.is_err());
+        source.uri = format!("http://{address}/slow").parse().unwrap();
+        assert!(
+            client
+                .hash(&source, Duration::from_millis(30))
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn policy_requires_explicit_test_mode_and_valid_thresholds() {
+        let mut r = crate::defaults::default_rules().remove(1);
+        assert!(Policy::parse(&r).is_ok());
+        r.dry_run = false;
+        assert!(Policy::parse(&r).is_err());
+        r.dry_run = true;
+        r.params["min_channels"] = 1.into();
+        assert!(Policy::parse(&r).is_err());
+        r.params["min_channels"] = 3.into();
+        r.actions[0].action = "ban".into();
+        assert!(Policy::parse(&r).is_err());
+        r.params = serde_json::json!({"min_attachments":2});
+        assert!(Policy::parse(&r).is_err());
+        assert!(validate_rule("attachment_flood", &r).is_ok()); // inert legacy row
+    }
+}

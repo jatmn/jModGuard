@@ -108,3 +108,22 @@ poll_secs = 5
 cleanup_interval_secs = 3600
 batch_size = 4
 request_timeout_secs = 15
+
+# Bot-only exact-image test budgets; restart the bot after changing these.
+# Optional JMODGUARD_IMAGE_SPAM_LIMITS JSON replaces this section (missing keys
+# use defaults). Guild thresholds/test mode live in the WebUI rule editor.
+[image_spam]
+max_authors = 512
+max_authors_per_guild = 64
+max_posts_per_author = 16
+max_files_per_post = 10
+metadata_bytes = 4194304
+metadata_bytes_per_guild = 1048576
+max_file_bytes = 8388608
+concurrency = 2
+timeout_secs = 10
+requests_per_minute = 120
+requests_per_guild_minute = 40
+requests_per_author_minute = 20
+bytes_per_minute = 67108864
+comparison_steps = 100000

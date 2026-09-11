@@ -1,6 +1,7 @@
 # Automod
 
-jModGuard ships 7 detection rules. Every rule has:
+jModGuard ships 7 rule entries. The exact-image rule is currently log-only
+with the separate behavior below. The other rules support:
 
 - **parameters** (rule-specific, JSON),
 - an **action escalation table** — `at` = strike count at which an action
@@ -9,7 +10,7 @@ jModGuard ships 7 detection rules. Every rule has:
 - a **dry-run** toggle (log only, no action),
 - **scope**: per-server override or global default.
 
-Strikes are counted per (server, user, rule) in memory with 10-minute
+For the other rules, strikes are counted per (server, user, rule) in memory with 10-minute
 buckets; after 10 minutes of silence the counter resets. This is what keeps
 escalation accurate without false positives.
 
@@ -21,15 +22,13 @@ escalation accurate without false positives.
 - Default escalation: `1 → ban` (deletes 1 day of messages).
 - The classic spam-bot pattern: message containing @everyone/@here.
 
-### 2. `attachment_flood` — crypto/money-scam image floods
-- Params: `window_secs` (60), `min_messages` (2), `min_attachments` (2),
-  `min_channels` (2).
-- Triggers when a user posts ≥2 messages with ≥2 attachments each **across
-  ≥2 different channels** within the window — the signature of scam bots that
-  spray channels with images.
-- Because it requires *multiple channels*, it does **not** false-positive on
-  a user posting pictures in one channel.
-- Default escalation: `1 → ban`.
+### 2. `attachment_flood` — exact-image test
+- Log-only detection of a common set of identical image bytes from one author
+  across distinct channels. Defaults: 3 channels, 2 common images, 60 seconds.
+- Counts alone never trigger. Legacy rows are inactive until explicitly converted
+  in the rule editor. No punishment/escalation in this phase; creates only, with
+  conservative invalidation on edits/deletes and bounded work.
+- See [exact-image settings, resource budgets and coverage](IMAGE-SPAM.md).
 
 ### 3. `new_member_url` — link right after joining
 - Params: `grace_secs` (120) — the window after joining.
