@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{DbConfig, EvidenceConfig, GuildStoreConfig, GuildStoresConfig};
 use crate::db::guild_data::{CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource};
-use crate::db::guild_stores::guild_placement;
+use crate::db::guild_stores::{assign_initial_placement, guild_placement};
 use crate::db::{self, Db, SqlExecutor};
 
 struct Fixture {
@@ -692,4 +692,171 @@ async fn newer_departure_preserves_cleanup_of_last_known_membership() {
     );
     assert!(f.tenant.drive_erasure().await.unwrap());
     assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
+
+#[tokio::test]
+async fn stale_activation_cannot_recreate_or_erase_membership() {
+    for stage in 0..3 {
+        let f = Fixture::new();
+        let old = db::enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+        if stage > 0 {
+            f.tenant.activate(old.clone()).await.unwrap();
+        }
+        db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+        if stage > 0 {
+            assert!(f.tenant.drive_erasure().await.unwrap());
+        }
+        let current = if stage == 2 {
+            let current = enroll(&f, 10, 101).await;
+            f.tenant
+                .record_selected_case(current.clone(), case_data(1))
+                .await
+                .unwrap();
+            Some(current)
+        } else {
+            None
+        };
+        assert!(f.tenant.activate(old.clone()).await.unwrap().is_none());
+        assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        assert!(
+            f.tenant
+                .record_selected_case(old, case_data(2))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if let Some(current) = current {
+            let (store, scope) = f.tenant.live(current).await.unwrap();
+            assert_eq!(store.case_count(scope, case_limits()).await.unwrap(), 1);
+        } else {
+            assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn blocked_erasure_keeps_other_guilds_progressing_after_restart() {
+    use crate::db::guild_data::{EvidenceCapture, EvidenceOrigin, EvidenceRequest};
+    for offline in [false, true] {
+        let f = Fixture::new();
+        if offline {
+            db::enroll_guild(&f.db, 10, 100).await.unwrap();
+            let ghost = StoreId::new();
+            register_store(
+                &f.db,
+                ghost.clone(),
+                StorePolicy::Dedicated { guild_id: 10 },
+            )
+            .await
+            .unwrap();
+            assign_initial_placement(&f.db, 10, ghost).await.unwrap();
+        } else {
+            let old = enroll(&f, 10, 100).await;
+            let (store, scope) = f.tenant.live(old).await.unwrap();
+            let case = CaseId::new();
+            let id = CaseId::new();
+            store
+                .record_case(scope.clone(), case.clone(), case_data(1), case_limits())
+                .await
+                .unwrap();
+            store
+                .reserve_case_evidence(
+                    scope.clone(),
+                    case.clone(),
+                    id.clone(),
+                    EvidenceRequest {
+                        storage_id: CaseId::new(),
+                        bytes: 3,
+                        origin: EvidenceOrigin {
+                            channel_id: 1,
+                            message_id: 2,
+                            attachment_id: 3,
+                        },
+                    },
+                    evidence_limits(),
+                )
+                .await
+                .unwrap();
+            store
+                .settle_evidence_capture(
+                    scope,
+                    case,
+                    id,
+                    EvidenceCapture::Stored {
+                        bytes: 3,
+                        sha256: "a".repeat(64),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let healthy = enroll(&f, 20, 100).await;
+        f.tenant
+            .record_selected_case(healthy, case_data(2))
+            .await
+            .unwrap();
+        db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+        db::retire_guild_enrollment(&f.db, 20, 100).await.unwrap();
+        assert!(f.tenant.drive_erasure().await.is_err());
+        // A fresh process may retry the blocked guild, but must then advance.
+        let reopened = TenantRuntime::open(
+            &f.db,
+            &DbConfig {
+                path: f.path.clone(),
+                pool_size: 2,
+                ..Default::default()
+            },
+            &GuildStoresConfig::default(),
+            &EvidenceConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.drive_erasure().await.is_err());
+        assert!(reopened.drive_erasure().await.unwrap());
+        assert!(!db::guild_erasure_queued(&f.db, 20).await.unwrap());
+        assert!(guild_placement(&f.db, 20).await.unwrap().is_none());
+        assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        let rejoined = db::enroll_guild(&f.db, 20, 101).await.unwrap().unwrap();
+        assert!(reopened.activate(rejoined).await.unwrap().is_some());
+        // Wrap to a newly queued lower ID, then retry the still-durable failure.
+        let lower = db::enroll_guild(&f.db, 5, 100).await.unwrap().unwrap();
+        reopened.activate(lower).await.unwrap();
+        db::retire_guild_enrollment(&f.db, 5, 100).await.unwrap();
+        assert!(reopened.drive_erasure().await.unwrap());
+        assert!(guild_placement(&f.db, 5).await.unwrap().is_none());
+        assert!(reopened.drive_erasure().await.is_err());
+        assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn retirement_after_activation_admission_has_a_durable_obligation() {
+    let f = Fixture::new();
+    let old = db::enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let store = f.tenant.store_for_guild(10).unwrap();
+    let placement = admit_tenant_placement(&f.db, old.clone(), store.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admit_tenant_placement(&f.db, old.clone(), store.clone())
+            .await
+            .unwrap(),
+        Some(placement.clone())
+    );
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let job = db::next_guild_erasure(&f.db).await.unwrap().unwrap();
+    assert_eq!(job.enrollment, old);
+    assert_eq!(job.placement, placement);
+    assert!(
+        admit_tenant_placement(&f.db, old, store)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
 }

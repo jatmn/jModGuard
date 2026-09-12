@@ -62,23 +62,28 @@ pub async fn guild_erasure_queued(db: &Db, guild: i64) -> Result<bool> {
 }
 
 pub async fn next_guild_erasure(db: &Db) -> Result<Option<GuildErasureJob>> {
-    db.with_conn(|conn| {
+    next_guild_erasure_after(db, None).await
+}
+
+/// One indexed job lookup after the cursor, wrapping once at the end.
+/// The caller advances the cursor even when the selected job cannot finish.
+pub(crate) async fn next_guild_erasure_after(
+    db: &Db,
+    after: Option<i64>,
+) -> Result<Option<GuildErasureJob>> {
+    db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let row = tx
-            .query_row(
-                "SELECT guild_id,enrollment_id,joined_at_ns,store_id,placement_revision FROM guild_erasure_jobs ORDER BY created_at,guild_id LIMIT 1",
-                (),
-                |r| {
-                    Ok((
-                        r.get::<i64>(0)?,
-                        r.get::<String>(1)?,
-                        r.get::<i64>(2)?,
-                        r.get::<String>(3)?,
-                        r.get::<String>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let load = |after: i64| {
+            tx.query_row(
+                "SELECT guild_id,enrollment_id,joined_at_ns,store_id,placement_revision FROM guild_erasure_jobs WHERE guild_id>?1 ORDER BY guild_id LIMIT 1",
+                params![after],
+                |r| Ok((r.get::<i64>(0)?, r.get::<String>(1)?, r.get::<i64>(2)?, r.get::<String>(3)?, r.get::<String>(4)?)),
+            ).optional()
+        };
+        let mut row = load(after.unwrap_or(0))?;
+        if row.is_none() && after.is_some() {
+            row = load(0)?;
+        }
         tx.finish_read()?;
         let Some((guild_id, id, joined_at_ns, store_id, revision)) = row else {
             return Ok(None);

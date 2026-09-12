@@ -4,11 +4,11 @@ use crate::db::guild_data::{
     CaseLimits, EvidenceLimits, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
 };
 use crate::db::guild_stores::{
-    StoreId, StorePolicy, StoreRegistration, assign_initial_placement, clear_erased_placement,
+    StoreId, StorePolicy, StoreRegistration, admit_tenant_placement, clear_erased_placement,
     dedicated_store_registration, guild_placement, register_store, shared_store_registration,
 };
 use crate::db::{
-    self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure,
+    self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure_after,
     queue_guild_erasure, record_backup_cleanup_intent, wipe_departed_directory_guild_data,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,6 +39,7 @@ struct Inner {
     max_handles: usize,
     handles: Mutex<HandleCache>,
     evidence: EvidenceBackend,
+    erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
@@ -155,6 +156,7 @@ impl TenantRuntime {
                     map: HashMap::new(),
                 }),
                 evidence: open_evidence(core, evidence).await?,
+                erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
             }),
         })
@@ -172,11 +174,12 @@ impl TenantRuntime {
     pub async fn activate(&self, enrollment: GuildEnrollment) -> Result<Option<GuildDataScope>> {
         let lock = self.lock(enrollment.guild_id);
         let _guard = lock.lock().await;
-        if db::guild_erasure_queued(&self.core, enrollment.guild_id).await? {
-            return Ok(None);
-        }
         let store_id = self.store_for_guild(enrollment.guild_id)?;
-        let placement = assign_initial_placement(&self.core, enrollment.guild_id, store_id).await?;
+        let Some(placement) =
+            admit_tenant_placement(&self.core, enrollment.clone(), store_id).await?
+        else {
+            return Ok(None);
+        };
         let handle = self.handle(placement.store_id()).await?;
         handle.bind_initial_placement(placement.clone()).await?;
         if let Some((existing, _active)) = handle.stored_membership(placement.clone()).await? {
@@ -264,7 +267,14 @@ impl TenantRuntime {
     }
 
     pub async fn drive_erasure(&self) -> Result<bool> {
-        let Some(job) = next_guild_erasure(&self.core).await? else {
+        let job = {
+            let mut cursor = self.inner.erasure_cursor.lock().await;
+            let job = next_guild_erasure_after(&self.core, *cursor).await?;
+            // Advance before I/O so a failed guild cannot monopolize future ticks.
+            *cursor = job.as_ref().map(|job| job.guild_id);
+            job
+        };
+        let Some(job) = job else {
             return Ok(false);
         };
         let guild_id = job.guild_id;

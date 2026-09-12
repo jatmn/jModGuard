@@ -202,28 +202,60 @@ pub async fn assign_initial_placement(
 ) -> Result<GuildPlacement> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let store = registration_conn(&tx, &store_id)?.ok_or(CatalogConflict::UnknownStore)?;
-        anyhow::ensure!(store.policy.permits(guild), CatalogConflict::DedicatedOwner);
-        if let Some(existing) = placement_conn(&tx, guild)? {
-            anyhow::ensure!(existing.store_id == store_id, CatalogConflict::Placement);
-            tx.finish_read()?;
-            return Ok(existing);
-        }
-        let revision = format!("{:032x}", rand::random::<u128>());
-        tx.ensure_mutation_receipt()?;
-        tx.execute(
-            "INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(?1,?2,?3)",
-            params![guild, store_id.as_str(), revision.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(GuildPlacement {
-            guild_id: guild,
-            store_id,
-            revision,
-        })
+        assign_initial_placement_transaction(conn.transaction_primary_read()?, guild, store_id)
     })
     .await
+}
+
+/// Runtime admission: retirement either precedes this check or observes the
+/// placement in its own primary transaction and admits the cleanup obligation.
+pub(crate) async fn admit_tenant_placement(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    store_id: StoreId,
+) -> Result<Option<GuildPlacement>> {
+    anyhow::ensure!(enrollment.guild_id > 0, "invalid guild id");
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let current = super::enrollments::active_enrollment_conn(&tx, enrollment.guild_id)?;
+        let queued: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
+            params![enrollment.guild_id],
+            |r| Ok(r.get(0)?),
+        )?;
+        if current.as_ref() != Some(&enrollment) || queued {
+            tx.finish_read()?;
+            return Ok(None);
+        }
+        assign_initial_placement_transaction(tx, enrollment.guild_id, store_id).map(Some)
+    })
+    .await
+}
+
+fn assign_initial_placement_transaction(
+    mut tx: crate::db_compat::Transaction,
+    guild: i64,
+    store_id: StoreId,
+) -> Result<GuildPlacement> {
+    let store = registration_conn(&tx, &store_id)?.ok_or(CatalogConflict::UnknownStore)?;
+    anyhow::ensure!(store.policy.permits(guild), CatalogConflict::DedicatedOwner);
+    if let Some(existing) = placement_conn(&tx, guild)? {
+        anyhow::ensure!(existing.store_id == store_id, CatalogConflict::Placement);
+        tx.finish_read()?;
+        return Ok(existing);
+    }
+    let revision = format!("{:032x}", rand::random::<u128>());
+    tx.ensure_mutation_receipt()?;
+    tx.execute(
+        "INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(?1,?2,?3)",
+        params![guild, store_id.as_str(), revision.as_str()],
+    )?;
+    tx.commit()?;
+    Ok(GuildPlacement {
+        guild_id: guild,
+        store_id,
+        revision,
+    })
 }
 
 /// Remove a placement after owned live data is erased. This is not a guild move.

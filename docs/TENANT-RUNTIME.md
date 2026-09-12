@@ -18,7 +18,12 @@ store `id` rediscovers the stamped store identity, then the matching catalog row
 id is minted only when both are absent. There is no
 per-guild task or connection pool. A dedicated store is used only for its owner guild;
 every other guild uses the shared store. Initial placement is assigned once and cannot
-be changed by this runtime.
+be changed by this runtime. Activation checks the captured active core enrollment and
+absence of an erasure job in the same primary transaction that admits placement.
+A departure before admission prevents activation; a departure after admission sees
+that placement and queues cleanup. The runtime guild lock orders subsequent store
+binding against its erasure worker. Delayed activation cannot recreate an erased
+membership or enqueue erasure of a replacement membership.
 
 Membership checks run on real reads and writes. A closed or stale enrollment cannot
 record, list, serve or delete another membership's cases. Offline stores fail closed
@@ -76,6 +81,11 @@ identity and absence of the guild binding are checked without weakening normal d
 validation. If activation stopped after placement binding but before membership insertion,
 the same exact-placement recovery can remove that empty binding. Configuration deletions advance the existing observation metadata atomically;
 moderation-only cleanup does not bump configuration versions.
+
+The worker advances a bounded guild-ID cursor before each erasure attempt and wraps
+at the end of the queue. A failed guild stays queued, while later ticks can erase
+other guilds with healthy storage. The cursor is process-local and restarts from the
+beginning; durable jobs, rather than cursor state, preserve cleanup obligations.
 
 A later rejoin is a new enrollment on a fresh placement after erasure completes. Late
 events using the old enrollment cannot recreate erased facts. If a newer active
