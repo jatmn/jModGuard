@@ -218,14 +218,12 @@ pub async fn delete_case(
             true
         }
     };
-    if removed {
-        if let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await {
-            tracing::warn!(
-                guild_id,
-                case_id = %id.as_str(),
-                "backup cleanup intent not recorded after case removal: {error:#}"
-            );
-        }
+    if removed && let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await {
+        tracing::warn!(
+            guild_id,
+            case_id = %id.as_str(),
+            "backup cleanup intent not recorded after case removal: {error:#}"
+        );
     }
     Ok(Json(serde_json::json!({
         "removed": removed,
