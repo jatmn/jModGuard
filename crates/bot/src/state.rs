@@ -28,6 +28,47 @@ struct SlashSyncProgress {
     invalidated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GatewayCaseAction {
+    Ban,
+    Unban,
+}
+
+const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
+const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
+
+#[derive(Default)]
+struct GatewayCaseSuppressions {
+    entries: HashMap<(GatewayCaseAction, u64, u64), Instant>,
+}
+
+impl GatewayCaseSuppressions {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, expires| *expires > now);
+    }
+
+    fn insert(&mut self, action: GatewayCaseAction, guild: u64, user: u64) {
+        let now = Instant::now();
+        self.prune(now);
+        if self.entries.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, expires)| **expires)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries
+            .insert((action, guild, user), now + GATEWAY_CASE_SUPPRESSION_TTL);
+    }
+
+    fn remove(&mut self, action: GatewayCaseAction, guild: u64, user: u64) -> bool {
+        self.prune(Instant::now());
+        self.entries.remove(&(action, guild, user)).is_some()
+    }
+}
+
 /// Plan for one poll tick of slash re-sync work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashResyncPlan {
@@ -74,6 +115,7 @@ pub struct BotState {
     version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
+    gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
 }
 
 impl BotState {
@@ -120,7 +162,41 @@ impl BotState {
             force_slash_registry_retry: AtomicBool::new(false),
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
+            gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
         }))
+    }
+
+    pub(crate) fn suppress_next_gateway_case(
+        &self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) {
+        self.gateway_case_suppressions
+            .lock()
+            .insert(action, guild, user);
+    }
+
+    pub(crate) fn release_gateway_case_suppression(
+        &self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) {
+        self.gateway_case_suppressions
+            .lock()
+            .remove(action, guild, user);
+    }
+
+    pub(crate) fn consume_gateway_case_suppression(
+        &self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) -> bool {
+        self.gateway_case_suppressions
+            .lock()
+            .remove(action, guild, user)
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -573,6 +649,28 @@ mod tests {
     use crate::config::BotProcessConfig;
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
+
+    #[test]
+    fn gateway_case_suppressions_are_scoped_consumed_and_bounded() {
+        let mut suppressions = GatewayCaseSuppressions::default();
+        suppressions.insert(GatewayCaseAction::Ban, 10, 20);
+        assert!(!suppressions.remove(GatewayCaseAction::Unban, 10, 20));
+        assert!(suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(!suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+
+        suppressions.entries.insert(
+            (GatewayCaseAction::Ban, 30, 40),
+            Instant::now() - Duration::from_secs(1),
+        );
+        suppressions.insert(GatewayCaseAction::Unban, 30, 40);
+        assert!(!suppressions.remove(GatewayCaseAction::Ban, 30, 40));
+        assert!(suppressions.remove(GatewayCaseAction::Unban, 30, 40));
+
+        for user in 1..=(MAX_GATEWAY_CASE_SUPPRESSIONS as u64 + 1) {
+            suppressions.insert(GatewayCaseAction::Ban, 50, user);
+        }
+        assert_eq!(suppressions.entries.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
+    }
 
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()

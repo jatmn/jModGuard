@@ -106,7 +106,13 @@ unban is failed; after invocation it is uncertain. Discord's specific Unknown Ba
 is an already-unbanned success, other explicit client rejections are failed (except 408),
 and transport/server/timeout ambiguity is uncertain. The worker does not automatically
 resend failed or uncertain actions. The underlying SDK's HTTP/rate-limit behavior remains;
-this is not a guarantee of exactly one wire request.
+this is not a guarantee of exactly one wire request. Once an unban reaches the Discord
+mutation boundary, the worker also records one tenant case using the durable action ID as
+its application source, preserving the captured enrollment, actor and reason. Before
+dispatch it registers a bounded one-shot suppression so the matching gateway echo does
+not create another case; unmarked manual/external unbans still do. A definitive Discord
+rejection releases the marker immediately, while an uncertain result retains it for the
+bounded gateway window.
 
 `finish_dispatched_bot_action` shares the existing atomic receipt/effect/audit transaction.
 For a successful local log-setting result, it checks expiry after acquiring the primary

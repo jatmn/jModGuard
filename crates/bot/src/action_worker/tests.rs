@@ -50,6 +50,7 @@ impl Drop for Fixture {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
+        crate::tenant::remove_sidecars(&self.path);
     }
 }
 fn now() -> i64 {
@@ -190,6 +191,77 @@ async fn copied_claim_can_dispatch_only_once_and_audit_is_atomic() {
         initial_version,
         db::get_config_version(&f.db).await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn production_drain_records_one_stable_truthful_case_for_a_queued_unban() {
+    for (label, outcome, expected) in [
+        (
+            "succeeded",
+            Outcome::succeeded("unbanned"),
+            crate::db::guild_data::CaseOutcome::Succeeded,
+        ),
+        (
+            "failed",
+            Outcome::failed("discord_rejected"),
+            crate::db::guild_data::CaseOutcome::Failed,
+        ),
+        (
+            "uncertain",
+            Outcome::uncertain("discord_outcome_unknown"),
+            crate::db::guild_data::CaseOutcome::Uncertain,
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, unban(99)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = crate::tenant::TenantRuntime::open(
+            &f.db,
+            &crate::config::DbConfig {
+                path: f.path.clone(),
+                pool_size: 2,
+                ..Default::default()
+            },
+            &crate::config::GuildStoresConfig::default(),
+            &crate::config::EvidenceConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+        let discord = MockDiscord {
+            outcome,
+            ..Default::default()
+        };
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "{label}");
+        let case = store
+            .case(scope, ids[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.source,
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(job.id).unwrap(),
+            },
+            "{label}"
+        );
+        assert_eq!(case.action, crate::db::guild_data::CaseAction::Unban);
+        assert_eq!(case.outcome, expected, "{label}");
+        assert_eq!(case.actor_id, Some(42));
+        assert_eq!(case.reason.as_deref(), Some("test reason"));
+    }
 }
 
 #[tokio::test]

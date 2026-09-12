@@ -318,7 +318,7 @@ pub async fn case_count(
         Err(error) => {
             if matches!(
                 error.downcast_ref::<TenantError>(),
-                Some(TenantError::Unplaced | TenantError::Membership)
+                Some(TenantError::Unplaced | TenantError::Offline | TenantError::Membership)
             ) {
                 Ok(None)
             } else {

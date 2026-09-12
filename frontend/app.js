@@ -23,7 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "cases", "settings"];
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -1465,7 +1465,8 @@ function tabSettings() {
     el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
       try {
         const roles = roleInput.value.split(",").map((s) => s.trim()).filter(Boolean);
-        await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles, revision: roleRevision.value });
+        const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles, revision: roleRevision.value });
+        roleRevision.value = saved.revision;
         toast("Case-removal roles saved", "success");
       } catch (e) { toast(e.message || String(e), "error"); }
     } }),

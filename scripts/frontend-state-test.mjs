@@ -99,6 +99,18 @@ test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
   assert.equal(second.app.state.tab, 'settings');
 });
 
+test('cases is a valid navigation and restored workspace tab', () => {
+  const first = harness();
+  first.app.state.config = null;
+  first.app.navigate('cases');
+  assert.equal(first.app.state.tab, 'cases');
+  first.app.persistWorkspace();
+
+  const second = harness(undefined, first.storage);
+  second.app.restoreWorkspace();
+  assert.equal(second.app.state.tab, 'cases');
+});
+
 test('workspace validates membership, tab, user identity and malformed storage', () => {
   const { app, storage } = harness();
   storage.set(app.workspaceKey(), JSON.stringify({ guildId: '0', tab: 'bogus' }));
@@ -219,6 +231,39 @@ test('settings patches send only changed fields to the selected server', async (
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
   assert.ok(calls.some((c) => c.method === 'GET' && c.url.endsWith('/case-delete-roles')));
+});
+
+test('case-delete-role saves advance their revision token', async () => {
+  const calls = [];
+  let nextRevision = 2;
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const h = harness(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (url.endsWith('/case-delete-roles') && options.method === 'GET') {
+      return response({ roles: ['1'], revision: 'revision-1' });
+    }
+    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+      return response({ revision: `revision-${nextRevision++}` });
+    }
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const roleInput = h.elements.find(n => n.tag === 'input' && n.attrs.placeholder === 'Role IDs, comma-separated');
+  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  roleInput.value = '1, 2';
+  await saveRoles.listeners.click({});
+  roleInput.value = '2';
+  await saveRoles.listeners.click({});
+
+  const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
+  assert.equal(puts.length, 2);
+  assert.equal(puts[0].body.revision, 'revision-1');
+  assert.equal(puts[1].body.revision, 'revision-2');
 });
 
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {

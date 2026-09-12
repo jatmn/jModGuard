@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
                         };
                         tokio::select! {
                             _ = shutdown_signal() => break,
-                            result = jmodguard_bot::action_worker::drain(&app.db, &discord, &app.cfg.action_worker.limits) => {
+                            result = jmodguard_bot::action_worker::drain_with_state(&app, &discord, &app.cfg.action_worker.limits) => {
                                 if let Err(error) = result { tracing::warn!("bot action queue unavailable: {error:#}"); }
                             }
                         }

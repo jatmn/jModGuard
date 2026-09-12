@@ -145,12 +145,19 @@ pub async fn record_backup_cleanup_intent(
     .await
 }
 
-/// Delete this guild's directory-owned configuration and core moderation rows.
-/// Enrollment observation stays so older join timestamps cannot be resurrected.
-pub async fn wipe_directory_guild_data(db: &Db, guild: i64) -> Result<()> {
+/// Delete a departed guild's directory-owned configuration and core moderation rows.
+///
+/// The active-enrollment check and deletes share one primary transaction. A stale
+/// erasure job may still remove its closed guild-store scope, but it must not wipe
+/// directory data after a newer membership has become active.
+pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
+        if super::enrollments::active_enrollment_conn(&tx, guild)?.is_some() {
+            tx.finish_read()?;
+            return Ok(false);
+        }
         tx.ensure_mutation_receipt()?;
         for sql in [
             "DELETE FROM rules WHERE guild_id=?1",
@@ -167,7 +174,8 @@ pub async fn wipe_directory_guild_data(db: &Db, guild: i64) -> Result<()> {
         ] {
             tx.execute(sql, params![guild])?;
         }
-        tx.commit()
+        tx.commit()?;
+        Ok(true)
     })
     .await
 }

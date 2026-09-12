@@ -205,18 +205,24 @@ impl EventHandler for Handler {
             "banned (audit)",
         )
         .await;
-        crate::cases::record(
-            &app,
+        if !app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Ban,
             guild_id.get(),
-            crate::db::guild_data::CaseAction::Ban,
-            crate::db::guild_data::CaseOutcome::Succeeded,
             banned_user.id.get(),
-            None,
-            Some("banned".into()),
-            crate::db::guild_data::CaseEvidence::Unavailable,
-            crate::cases::application_source(),
-        )
-        .await;
+        ) {
+            crate::cases::record(
+                &app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Ban,
+                crate::db::guild_data::CaseOutcome::Succeeded,
+                banned_user.id.get(),
+                None,
+                Some("banned".into()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+        }
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "banned".into());
         logging::emit_member_event(&app, &ctx, guild_id, "member_ban", &banned_user, extra).await;
@@ -230,18 +236,24 @@ impl EventHandler for Handler {
             unbanned_user.id.get() as i64,
         )
         .await;
-        crate::cases::record(
-            &app,
+        if !app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Unban,
             guild_id.get(),
-            crate::db::guild_data::CaseAction::Unban,
-            crate::db::guild_data::CaseOutcome::Succeeded,
             unbanned_user.id.get(),
-            None,
-            Some("unbanned".into()),
-            crate::db::guild_data::CaseEvidence::Unavailable,
-            crate::cases::application_source(),
-        )
-        .await;
+        ) {
+            crate::cases::record(
+                &app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Unban,
+                crate::db::guild_data::CaseOutcome::Succeeded,
+                unbanned_user.id.get(),
+                None,
+                Some("unbanned".into()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+        }
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "unbanned".into());
         logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)

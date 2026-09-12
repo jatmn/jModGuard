@@ -27,6 +27,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
+            env.app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Ban,
+                env.guild_id.get(),
+                target.get(),
+            );
             let discord = if let Some(m) = member {
                 m.ban_with_reason(&env.ctx.http, *delete_days, &reason)
                     .await
@@ -36,6 +41,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     .await
             };
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                env.app.release_gateway_case_suppression(
+                    crate::state::GatewayCaseAction::Ban,
+                    env.guild_id.get(),
+                    target.get(),
+                );
+            }
             crate::cases::record(
                 env.app,
                 env.guild_id.get(),
@@ -81,12 +93,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let target_user = user_lookup(env, target).await?;
             // Discord is authoritative; local bans table is a mirror healed by
             // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
+            env.app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Unban,
+                env.guild_id.get(),
+                target.get(),
+            );
             let discord = env
                 .ctx
                 .http
                 .remove_ban(env.guild_id, target, Some(&reason))
                 .await;
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                env.app.release_gateway_case_suppression(
+                    crate::state::GatewayCaseAction::Unban,
+                    env.guild_id.get(),
+                    target.get(),
+                );
+            }
             crate::cases::record(
                 env.app,
                 env.guild_id.get(),

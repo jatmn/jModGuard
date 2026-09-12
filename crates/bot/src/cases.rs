@@ -40,6 +40,17 @@ pub fn text_excerpt(channel_id: u64, message_id: u64, author_id: u64, text: &str
     }])
 }
 
+pub(crate) async fn record_data(
+    tenant: &crate::tenant::TenantRuntime,
+    enrollment: db::GuildEnrollment,
+    data: CaseData,
+) {
+    let guild_id = enrollment.guild_id;
+    if let Err(error) = tenant.record_selected_case(enrollment, data).await {
+        tracing::warn!(guild_id, "selected case not recorded: {error:#}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
     app: &BotState,
@@ -74,7 +85,5 @@ pub async fn record(
         reason,
         evidence,
     };
-    if let Err(error) = app.tenant.record_selected_case(enrollment, data).await {
-        tracing::warn!(guild_id, "selected case not recorded: {error:#}");
-    }
+    record_data(&app.tenant, enrollment, data).await;
 }

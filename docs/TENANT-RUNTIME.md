@@ -28,7 +28,13 @@ Selected Discord moderation outcomes (ban, kick, warning, timeout, unban, timeou
 removal) are recorded in the guild store with attempted/succeeded/failed/uncertain
 outcomes. Core warn/ban mirror rows are still written only after a successful action so
 existing surfaces keep working. Dry-run, log-only and image-spam test reports do not
-create cases. Ordinary messages are not archived in SQL.
+create cases. Bot command, automod and queued WebUI action paths own these application
+cases. Gateway ban/unban observations continue to maintain core audit mirrors, but do
+not create a second tenant case for bot-owned actions: those paths register a bounded,
+one-shot in-process suppression before dispatch. Unmarked manual/external gateway
+actions still create a case. This is event ownership, not a guessed application/audit
+source association; trusted durable Discord-audit association remains pending. Ordinary
+messages are not archived in SQL.
 
 The dashboard Cases tab lists the current membership's records, notes, and authorized
 private evidence downloads. Case removal clears retained private facts. It does not
@@ -52,7 +58,10 @@ cleanup is not implemented; the intent exists so a later backup feature can fini
 controlled-copy deletion without reconstructing live data.
 
 A later rejoin is a new enrollment on a fresh placement after erasure completes. Late
-events using the old enrollment cannot recreate erased facts.
+events using the old enrollment cannot recreate erased facts. If a newer active
+enrollment is observed before an older erasure job reaches directory cleanup, the
+closed guild-store scope is still erased, but the stale job does not wipe directory
+configuration now owned by the active membership.
 
 ## Fresh installation
 

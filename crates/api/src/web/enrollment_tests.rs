@@ -734,9 +734,14 @@ async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable()
         .request("PUT", "/api/guilds/10/logchannels/message_edit", &body)
         .await;
     assert_eq!(replay["id"], queued["id"]);
-    jmodguard_bot::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
-        .await
-        .unwrap();
+    jmodguard_bot::action_worker::drain_with_tenant(
+        &f.app.db,
+        &f.app.tenant,
+        &Allowed,
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
     let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history[0]["state"], "succeeded");
@@ -757,9 +762,14 @@ async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable()
     assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
     assert_eq!(queued["state"], "pending");
     assert_eq!(db::list_log_channels(&f.app.db, 10).await.unwrap().len(), 1);
-    jmodguard_bot::action_worker::drain(&f.app.db, &Allowed, &WorkerLimits::default())
-        .await
-        .unwrap();
+    jmodguard_bot::action_worker::drain_with_tenant(
+        &f.app.db,
+        &f.app.tenant,
+        &Allowed,
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         db::list_log_channels(&f.app.db, 10)
             .await
@@ -1273,4 +1283,14 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{offline}");
     assert_eq!(offline["code"], "guild_store_offline");
     assert!(!offline.to_string().contains("private-reason"));
+
+    let (status, stats) = ghost.request("GET", "/api/guilds/10/stats", "").await;
+    assert_eq!(status, StatusCode::OK, "{stats}");
+    assert_eq!(stats["events"], 0);
+    assert_eq!(stats["warns"], 0);
+    assert_eq!(stats["bans"], 0);
+    assert!(
+        stats.get("cases").is_none(),
+        "offline tenant stats omit only their unavailable case count: {stats}"
+    );
 }

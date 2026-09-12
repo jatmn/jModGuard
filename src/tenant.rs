@@ -9,7 +9,7 @@ use crate::db::guild_stores::{
 };
 use crate::db::{
     self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure,
-    queue_guild_erasure, record_backup_cleanup_intent, wipe_directory_guild_data,
+    queue_guild_erasure, record_backup_cleanup_intent, wipe_departed_directory_guild_data,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
@@ -310,7 +310,13 @@ impl TenantRuntime {
             None,
         )
         .await?;
-        wipe_directory_guild_data(&self.core, job.guild_id).await?;
+        if !wipe_departed_directory_guild_data(&self.core, job.guild_id).await? {
+            tracing::info!(
+                guild_id = job.guild_id,
+                departed_enrollment = %job.enrollment.id,
+                "preserved directory data for a newer active guild enrollment"
+            );
+        }
         clear_erased_placement(&self.core, job.guild_id, &job.placement).await?;
         finish_guild_erasure(&self.core, job).await
     }

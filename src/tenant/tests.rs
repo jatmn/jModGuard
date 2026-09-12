@@ -193,10 +193,14 @@ async fn erasure_clears_owned_rows_and_queues_backup_intent() {
         .record_selected_case(enrollment.clone(), case_data(9))
         .await
         .unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     f.tenant.schedule_erasure(enrollment.clone()).await.unwrap();
     assert!(f.tenant.drive_erasure().await.unwrap());
     assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
     assert!(
         f.tenant
             .record_selected_case(enrollment, case_data(9))
@@ -215,6 +219,35 @@ async fn erasure_clears_owned_rows_and_queues_backup_intent() {
         .await
         .unwrap();
     assert_eq!(intents, 1);
+}
+
+#[tokio::test]
+async fn stale_erasure_does_not_wipe_a_rejoined_guilds_directory_data() {
+    let f = Fixture::new();
+    let departed = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(departed.clone(), case_data(9))
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.tenant.schedule_erasure(departed).await.unwrap();
+
+    let rejoined = db::enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+    assert!(
+        f.tenant.activate(rejoined.clone()).await.unwrap().is_none(),
+        "new tenant activation waits for the departed scope to be erased"
+    );
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "?");
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert!(
+        f.tenant.activate(rejoined).await.unwrap().is_some(),
+        "the current membership can bind after stale erasure completes"
+    );
 }
 
 #[tokio::test]
