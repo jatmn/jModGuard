@@ -263,20 +263,43 @@ pub async fn clear_erased_placement(
 }
 
 pub async fn shared_store_registration(db: &Db) -> Result<Option<StoreRegistration>> {
-    db.with_conn(|conn| {
+    catalog_registration(db, None).await
+}
+
+pub async fn dedicated_store_registration(
+    db: &Db,
+    guild_id: i64,
+) -> Result<Option<StoreRegistration>> {
+    anyhow::ensure!(guild_id > 0, "invalid guild id");
+    catalog_registration(db, Some(guild_id)).await
+}
+
+async fn catalog_registration(db: &Db, owner: Option<i64>) -> Result<Option<StoreRegistration>> {
+    db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let row = tx
-            .query_row(
-                "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id IS NULL ORDER BY store_id LIMIT 1",
-                (),
-                |r| Ok(r.get::<String>(0)?),
-            )
-            .optional()?;
+        let row = match owner {
+            None => tx
+                .query_row(
+                    "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id IS NULL ORDER BY store_id LIMIT 1",
+                    (),
+                    |r| Ok(r.get::<String>(0)?),
+                )
+                .optional()?,
+            Some(guild_id) => tx
+                .query_row(
+                    "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id=?1 ORDER BY store_id LIMIT 1",
+                    params![guild_id],
+                    |r| Ok(r.get::<String>(0)?),
+                )
+                .optional()?,
+        };
         tx.finish_read()?;
         Ok(match row {
             Some(id) => Some(StoreRegistration {
                 id: StoreId::parse(&id)?,
-                policy: StorePolicy::Shared,
+                policy: owner.map_or(StorePolicy::Shared, |guild_id| StorePolicy::Dedicated {
+                    guild_id,
+                }),
             }),
             None => None,
         })

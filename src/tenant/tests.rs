@@ -324,3 +324,143 @@ async fn handle_cache_stays_within_configured_bound() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[tokio::test]
+async fn empty_store_ids_stay_stable_across_runtime_reopen() {
+    let shared = std::env::temp_dir().join(format!(
+        "jmodguard_tenant_{:032x}.explicit.db",
+        rand::random::<u128>()
+    ));
+    let dedicated = std::env::temp_dir().join(format!(
+        "jmodguard_tenant_{:032x}.dedicated.db",
+        rand::random::<u128>()
+    ));
+    let stores = GuildStoresConfig {
+        max_handles: 4,
+        stores: vec![
+            GuildStoreConfig {
+                path: shared.clone(),
+                ..GuildStoreConfig::default()
+            },
+            GuildStoreConfig {
+                dedicated_guild_id: 20,
+                path: dedicated.clone(),
+                ..GuildStoreConfig::default()
+            },
+        ],
+    };
+    let f = Fixture::with_stores(
+        stores.clone(),
+        EvidenceConfig {
+            backend: "none".into(),
+            ..EvidenceConfig::default()
+        },
+    );
+    let shared_enrollment = enroll(&f, 10, 100).await;
+    let dedicated_enrollment = enroll(&f, 20, 100).await;
+    let shared_placement = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    let dedicated_placement = guild_placement(&f.db, 20).await.unwrap().unwrap();
+    f.tenant
+        .record_selected_case(shared_enrollment.clone(), case_data(1))
+        .await
+        .unwrap()
+        .unwrap();
+    f.tenant
+        .record_selected_case(dedicated_enrollment.clone(), case_data(2))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let db_cfg = DbConfig {
+        path: f.path.clone(),
+        pool_size: 2,
+        ..DbConfig::default()
+    };
+    let reopened = TenantRuntime::open(
+        &f.db,
+        &db_cfg,
+        &stores,
+        &EvidenceConfig {
+            backend: "none".into(),
+            ..EvidenceConfig::default()
+        },
+    )
+    .unwrap();
+    let shared_again = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    let dedicated_again = guild_placement(&f.db, 20).await.unwrap().unwrap();
+    assert_eq!(shared_placement.store_id(), shared_again.store_id());
+    assert_eq!(dedicated_placement.store_id(), dedicated_again.store_id());
+    assert_ne!(shared_again.store_id(), dedicated_again.store_id());
+    reopened.live(shared_enrollment.clone()).await.unwrap();
+    reopened.live(dedicated_enrollment.clone()).await.unwrap();
+    assert!(
+        reopened
+            .record_selected_case(shared_enrollment, case_data(3))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .record_selected_case(dedicated_enrollment, case_data(4))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let catalog =
+        f.db.with_conn(|c| {
+            Ok(
+                c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
+                    Ok(r.get::<i64>(0)?)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog, 2,
+        "reopen must not mint additional catalog identities"
+    );
+}
+
+#[tokio::test]
+async fn empty_implicit_shared_store_id_stays_stable_across_runtime_reopen() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let placement = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    let db_cfg = DbConfig {
+        path: f.path.clone(),
+        pool_size: 2,
+        ..DbConfig::default()
+    };
+    let reopened = TenantRuntime::open(
+        &f.db,
+        &db_cfg,
+        &GuildStoresConfig::default(),
+        &EvidenceConfig {
+            backend: "none".into(),
+            ..EvidenceConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        guild_placement(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .store_id(),
+        placement.store_id()
+    );
+    reopened.live(enrollment).await.unwrap();
+    let catalog =
+        f.db.with_conn(|c| {
+            Ok(
+                c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
+                    Ok(r.get::<i64>(0)?)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(catalog, 1);
+}

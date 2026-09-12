@@ -13,7 +13,9 @@ and are not exposed. The conductor still has no tenant routing.
 ## Routing and handles
 
 `TenantRuntime` registers configured stores, creates an empty matching store or reopens
-the same identity, and caches a small number of handles (default 8). There is no
+the same identity, and caches a small number of handles (default 8). An empty configured
+store `id` rediscovers the stamped store identity, then the matching catalog row; a new
+id is minted only when both are absent. There is no
 per-guild task or connection pool. A dedicated store is used only for its owner guild;
 every other guild uses the shared store. Initial placement is assigned once and cannot
 be changed by this runtime.

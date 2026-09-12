@@ -92,6 +92,28 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
 }
 
 #[tokio::test]
+async fn existing_registration_reads_stamped_identity_without_creating() {
+    let f = Fixture::new();
+    assert!(
+        GuildDataStore::existing_registration(f.options())
+            .unwrap()
+            .is_none()
+    );
+    let reg = f
+        .registration(StoreId::new(), StorePolicy::Dedicated { guild_id: 20 })
+        .await;
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let stamped = GuildDataStore::existing_registration(f.options())
+        .unwrap()
+        .expect("stamped identity");
+    assert_eq!(stamped, reg);
+    assert!(
+        GuildDataStore::existing_registration(options(&f.catalog_path)).is_err(),
+        "core databases are not empty guild stores"
+    );
+}
+
+#[tokio::test]
 async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;

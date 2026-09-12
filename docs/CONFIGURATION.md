@@ -17,7 +17,7 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `db.url` | — | Remote libSQL URL; empty = local path. Environment overrides are accepted only as a complete URL/token pair. |
 | `db.token` | — | Remote DB access token; required with `db.url`. Complete `JMODGUARD_DB_URL`/`JMODGUARD_DB_TOKEN` takes precedence over the complete Bunny-injected pair. |
 | `db.pool_size` | `8` | reusable connections and maximum concurrent database operations in each process (minimum 2) (env: `JMODGUARD_DB_POOL_SIZE`) |
-| `guild_stores.max_handles` | `8` | cached guild-store handles per process (2–32). A local core also creates `{db.path}.guild.db`. Remote cores need an explicit shared `[[guild_stores.stores]]` |
+| `guild_stores.max_handles` | `8` | cached guild-store handles per process (2–32). A local core also creates `{db.path}.guild.db`. Remote cores need an explicit shared `[[guild_stores.stores]]`. Empty store `id` values rediscover stamped/catalog identity. |
 | `evidence.backend` | `local` | private evidence backend: `local`, `bunny`, or `none` (env: `JMODGUARD_EVIDENCE_BACKEND`) |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |

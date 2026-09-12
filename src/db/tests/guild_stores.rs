@@ -129,6 +129,52 @@ async fn shared_and_dedicated_placements_persist_without_rerouting_or_rebinding(
 }
 
 #[tokio::test]
+async fn catalog_policy_lookups_return_matching_shared_or_dedicated_rows() {
+    let f = Fixture::new();
+    assert!(shared_store_registration(&f.db).await.unwrap().is_none());
+    assert!(
+        dedicated_store_registration(&f.db, 20)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let shared = StoreId::new();
+    let dedicated = StoreId::new();
+    register_store(&f.db, shared.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    register_store(
+        &f.db,
+        dedicated.clone(),
+        StorePolicy::Dedicated { guild_id: 20 },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shared_store_registration(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        &shared
+    );
+    assert_eq!(
+        dedicated_store_registration(&f.db, 20)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        &dedicated
+    );
+    assert!(
+        dedicated_store_registration(&f.db, 21)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn catalog_retries_and_reads_are_receipt_free_and_preserve_versions() {
     let f = Fixture::new();
     let id = StoreId::new();

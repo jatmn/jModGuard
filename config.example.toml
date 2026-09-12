@@ -37,7 +37,7 @@ pool_size = 8
 # [guild_stores]
 # max_handles = 8
 # [[guild_stores.stores]]
-# id = ""  # generated on first start if empty; then keep it stable
+# id = ""  # empty rediscovers stamped/catalog identity; minted only on first start
 # dedicated_guild_id = 0
 # path = "guild.db"
 # url = ""

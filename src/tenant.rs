@@ -5,7 +5,7 @@ use crate::db::guild_data::{
 };
 use crate::db::guild_stores::{
     StoreId, StorePolicy, StoreRegistration, assign_initial_placement, clear_erased_placement,
-    guild_placement, register_store, shared_store_registration,
+    dedicated_store_registration, guild_placement, register_store, shared_store_registration,
 };
 use crate::db::{
     self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure,
@@ -117,7 +117,7 @@ impl TenantRuntime {
         let pool = db.pool_size.max(2);
         let mut credentials = Vec::new();
         for configured in &stores.stores {
-            credentials.push(resolve_configured(configured, pool)?);
+            credentials.push(resolve_configured(core, configured, pool).await?);
         }
         if !credentials
             .iter()
@@ -514,13 +514,12 @@ impl TenantRuntime {
     }
 }
 
-fn resolve_configured(configured: &GuildStoreConfig, pool: u32) -> Result<ResolvedStore> {
+async fn resolve_configured(
+    core: &Db,
+    configured: &GuildStoreConfig,
+    pool: u32,
+) -> Result<ResolvedStore> {
     configured.validate()?;
-    let id = if configured.id.is_empty() {
-        StoreId::new()
-    } else {
-        StoreId::parse(&configured.id)?
-    };
     let policy = if configured.dedicated_guild_id > 0 {
         StorePolicy::Dedicated {
             guild_id: configured.dedicated_guild_id,
@@ -532,14 +531,20 @@ fn resolve_configured(configured: &GuildStoreConfig, pool: u32) -> Result<Resolv
         !configured.path.as_os_str().is_empty() || !configured.url.trim().is_empty(),
         "guild store path or url is required"
     );
+    let options = GuildStoreOptions {
+        path: configured.path.clone(),
+        url: configured.url.clone(),
+        token: configured.token.clone(),
+        pool_size: pool,
+    };
+    let id = if configured.id.is_empty() {
+        discover_store_id(core, &options, policy).await?
+    } else {
+        StoreId::parse(&configured.id)?
+    };
     Ok(ResolvedStore {
         registration: StoreRegistration::from_parts(id, policy),
-        options: GuildStoreOptions {
-            path: configured.path.clone(),
-            url: configured.url.clone(),
-            token: configured.token.clone(),
-            pool_size: pool,
-        },
+        options,
     })
 }
 
@@ -560,19 +565,38 @@ async fn default_shared(
             PathBuf::from(store)
         })
         .ok_or_else(|| anyhow!("missing local core database path"))?;
-    let id = shared_store_registration(core)
-        .await?
-        .map(|r| r.id().clone())
-        .unwrap_or_else(StoreId::new);
+    let options = GuildStoreOptions {
+        path,
+        url: String::new(),
+        token: String::new(),
+        pool_size: pool,
+    };
+    let id = discover_store_id(core, &options, StorePolicy::Shared).await?;
     Ok(ResolvedStore {
         registration: StoreRegistration::from_parts(id, StorePolicy::Shared),
-        options: GuildStoreOptions {
-            path,
-            url: String::new(),
-            token: String::new(),
-            pool_size: pool,
-        },
+        options,
     })
+}
+
+async fn discover_store_id(
+    core: &Db,
+    options: &GuildStoreOptions,
+    policy: StorePolicy,
+) -> Result<StoreId> {
+    if let Some(stamped) = GuildDataStore::existing_registration(options.clone())? {
+        anyhow::ensure!(
+            stamped.policy() == policy,
+            "configured guild store ownership conflicts with the store identity"
+        );
+        return Ok(stamped.id().clone());
+    }
+    let catalog = match policy {
+        StorePolicy::Shared => shared_store_registration(core).await?,
+        StorePolicy::Dedicated { guild_id } => dedicated_store_registration(core, guild_id).await?,
+    };
+    Ok(catalog
+        .map(|registration| registration.id().clone())
+        .unwrap_or_else(StoreId::new))
 }
 
 pub fn remove_sidecars(core: &std::path::Path) {

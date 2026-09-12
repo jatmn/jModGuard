@@ -1,5 +1,5 @@
 //! Separate guild-store identity, tenant data and coordinated live erasure.
-use super::guild_stores::{GuildPlacement, StorePolicy, StoreRegistration};
+use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistration};
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
@@ -64,6 +64,38 @@ fn owner(registration: &StoreRegistration) -> Option<i64> {
         StorePolicy::Shared => None,
         StorePolicy::Dedicated { guild_id } => Some(guild_id),
     }
+}
+
+fn read_existing_registration(conn: &impl SqlExecutor) -> Result<Option<StoreRegistration>> {
+    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
+    if version == 0 && objects == 0 {
+        return Ok(None);
+    }
+    let identity = conn
+        .query_row(
+            "SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?)),
+        )
+        .optional();
+    let Some((family, id, dedicated)) = identity.ok().flatten() else {
+        return Err(StoreCheckError::Schema.into());
+    };
+    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+    let policy = match dedicated {
+        None => StorePolicy::Shared,
+        Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
+        Some(_) => return Err(StoreCheckError::Identity.into()),
+    };
+    Ok(Some(StoreRegistration::from_parts(
+        StoreId::parse(&id)?,
+        policy,
+    )))
 }
 
 fn verify_identity(conn: &impl SqlExecutor, expected: &StoreRegistration) -> Result<()> {
@@ -213,6 +245,33 @@ impl GuildDataStore {
     /// Verify an existing store without creating its schema or bindings.
     pub fn open(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {
         Self::connect(options, expected, false)
+    }
+
+    /// Read a stamped installation identity without creating or upgrading schema.
+    /// Missing local files and empty databases return `None`.
+    pub fn existing_registration(options: GuildStoreOptions) -> Result<Option<StoreRegistration>> {
+        if options.url.trim().is_empty() && !options.path.exists() {
+            return Ok(None);
+        }
+        let mut found = None;
+        let opts = DbOpenOptions {
+            path: options.path,
+            url: options.url,
+            token: options.token,
+            pool_size: options.pool_size,
+            migrate: false,
+            default_prefix: String::new(),
+            retention_days: 0,
+        };
+        let _db = Db::open_with_bootstrap(
+            &opts,
+            |conn| {
+                found = read_existing_registration(conn)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok(found)
     }
     fn connect(
         options: GuildStoreOptions,
