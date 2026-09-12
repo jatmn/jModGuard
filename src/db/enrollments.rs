@@ -93,6 +93,20 @@ async fn observe_membership(
         // here preserves the comparison/write atomicity without no-op receipts.
         tx.ensure_mutation_receipt()?;
         // Membership transition and invalidation commit together. Never replay running work.
+        // A confirmed departure and its cleanup obligation are one commit.
+        // Retirement replaces the active identity, so it must not precede admission.
+        // A newer departure can follow a missed join; clean the known old identity
+        // as well. The earlier timestamp guard already rejected stale departures.
+        if !present
+            && let Some((id, joined, true)) = &current
+        {
+            tx.execute(
+                "INSERT INTO guild_erasure_jobs(guild_id,enrollment_id,joined_at_ns,store_id,placement_revision,created_at)
+                 SELECT guild_id,?2,?3,store_id,revision,unixepoch() FROM guild_store_placements
+                 WHERE guild_id=?1 AND NOT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
+                params![guild, id.as_str(), *joined],
+            )?;
+        }
         tx.execute(
             "UPDATE bot_actions SET state='cancelled',outcome='enrollment_ended',finished_at=unixepoch()
              WHERE guild_id=?1 AND state IN ('pending','claimed')", params![guild],

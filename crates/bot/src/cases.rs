@@ -51,10 +51,16 @@ pub(crate) async fn record_data(
     }
 }
 
+/// Capture at selected-operation admission, before its asynchronous effects.
+pub async fn capture(app: &BotState, guild: u64) -> Option<db::GuildEnrollment> {
+    let guild = i64::try_from(guild).ok()?;
+    db::guild_enrollment(&app.db, guild).await.ok().flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
     app: &BotState,
-    guild: u64,
+    enrollment: Option<db::GuildEnrollment>,
     action: CaseAction,
     outcome: CaseOutcome,
     subject: u64,
@@ -63,10 +69,7 @@ pub async fn record(
     evidence: CaseEvidence,
     source: CaseSource,
 ) {
-    let Ok(guild_id) = i64::try_from(guild) else {
-        return;
-    };
-    let Some(enrollment) = db::guild_enrollment(&app.db, guild_id).await.ok().flatten() else {
+    let Some(enrollment) = enrollment else {
         return;
     };
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
@@ -86,4 +89,65 @@ pub async fn record(
         evidence,
     };
     record_data(&app.tenant, enrollment, data).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn delayed_record_keeps_original_membership() {
+        let path =
+            std::env::temp_dir().join(format!("delayed_record_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(Default::default(), database).unwrap();
+        let old = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(old.clone()).await.unwrap();
+        // A behavior starts its Discord operation here; reply arrives after departure/rejoin.
+        db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
+        app.tenant.schedule_erasure(old.clone()).await.unwrap();
+        app.tenant.drive_erasure().await.unwrap();
+        let new = db::enroll_guild(&app.db, 10, 101).await.unwrap().unwrap();
+        app.tenant.activate(new.clone()).await.unwrap();
+        record(
+            &app,
+            Some(old),
+            CaseAction::Ban,
+            CaseOutcome::Succeeded,
+            99,
+            Some(42),
+            Some("old membership private reason".into()),
+            CaseEvidence::Unavailable,
+            application_source(),
+        )
+        .await;
+        let (s, scope) = app.tenant.live(new).await.unwrap();
+        assert_eq!(
+            s.case_count(scope.clone(), crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            0
+        );
+        record(
+            &app,
+            Some(scope.enrollment().clone()),
+            CaseAction::Ban,
+            CaseOutcome::Succeeded,
+            99,
+            None,
+            None,
+            CaseEvidence::Unavailable,
+            application_source(),
+        )
+        .await;
+        assert_eq!(
+            s.case_count(scope, crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            1
+        );
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

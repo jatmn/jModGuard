@@ -127,6 +127,13 @@ pub async fn record_backup_cleanup_intent(
     let object_key = object_key.map(str::to_owned);
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backup_cleanup_intents WHERE kind=?1 AND guild_id=?2
+             AND enrollment_id IS ?3 AND case_id IS ?4 AND evidence_id IS ?5 AND object_key IS ?6)",
+            params![kind.as_str(),guild,enrollment_id.as_deref(),case_id.as_deref(),evidence_id.as_deref(),object_key.as_deref()],
+            |r| Ok(r.get(0)?),
+        )?;
+        if exists { return tx.finish_read(); }
         tx.ensure_mutation_receipt()?;
         tx.execute(
             "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,case_id,evidence_id,object_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,unixepoch())",
@@ -159,7 +166,10 @@ pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<b
             return Ok(false);
         }
         tx.ensure_mutation_receipt()?;
-        for sql in [
+        let mut config_changed = false;
+        let mut commands_changed = false;
+        let mut settings_changed = false;
+        for (index, sql) in [
             "DELETE FROM rules WHERE guild_id=?1",
             "DELETE FROM commands WHERE guild_id=?1",
             "DELETE FROM templates WHERE guild_id=?1",
@@ -171,8 +181,23 @@ pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<b
             "DELETE FROM bans WHERE guild_id=?1",
             "DELETE FROM nickname_reconcile WHERE guild_id=?1",
             "DELETE FROM bot_actions WHERE guild_id=?1",
-        ] {
-            tx.execute(sql, params![guild])?;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let changed = tx.execute(sql, params![guild])? > 0;
+            config_changed |= index < 6 && changed;
+            commands_changed |= index == 1 && changed;
+            settings_changed |= index == 5 && changed;
+        }
+        if config_changed {
+            bump_config_version_conn(&tx)?;
+        }
+        if commands_changed {
+            bump_slash_registry_version_conn(&tx)?;
+        }
+        if settings_changed {
+            invalidate_settings_heal_checksum_conn(&tx)?;
         }
         tx.commit()?;
         Ok(true)

@@ -317,6 +317,7 @@ pub async fn execute_pending(
     msg_channel: Option<u64>,
     pending: &PendingAction,
 ) {
+    let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
     vars.insert("rule".into(), pending.rule_name.clone());
@@ -370,7 +371,7 @@ pub async fn execute_pending(
             .is_ok();
             crate::cases::record(
                 app,
-                guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Warning,
                 if warn_ok {
                     crate::db::guild_data::CaseOutcome::Succeeded
@@ -417,7 +418,7 @@ pub async fn execute_pending(
             };
             crate::cases::record(
                 app,
-                guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Timeout,
                 outcome,
                 target.id.get(),
@@ -451,7 +452,7 @@ pub async fn execute_pending(
             };
             crate::cases::record(
                 app,
-                guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
                 outcome,
                 target.id.get(),
@@ -496,7 +497,7 @@ pub async fn execute_pending(
             }
             crate::cases::record(
                 app,
-                guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
                 outcome,
                 target.id.get(),

@@ -1415,3 +1415,104 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
         .unwrap();
     assert_eq!(intents, 1);
 }
+
+#[tokio::test]
+async fn removed_case_retry_recovers_backup_intent() {
+    use crate::db::SqlExecutor;
+    use crate::db::guild_data::*;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let e = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(e.clone()).await.unwrap();
+    f.app
+        .tenant
+        .record_selected_case(
+            e,
+            CaseData {
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Warning,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 1,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+        )
+        .await
+        .unwrap();
+    let (_, listed) = f.request("GET", "/api/guilds/10/cases", "").await;
+    let id = listed["cases"][0].as_str().unwrap();
+    let url = format!("/api/guilds/10/cases/{id}");
+    let (denied, _) = f
+        .request("GET", "/api/guilds/10/cases?removed=true", "")
+        .await;
+    assert_ne!(denied, StatusCode::OK);
+    f.discord.guilds.lock().unwrap()[0].owner = true;
+    f.app.guild_cache.clear();
+    f.app.db.with_conn(|c|{c.execute_batch("CREATE TRIGGER review_fail BEFORE INSERT ON backup_cleanup_intents BEGIN SELECT RAISE(ABORT,'injected'); END")?;Ok(())}).await.unwrap();
+    let (status, first) = f.request("DELETE", &url, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["removed"], true);
+    f.app
+        .db
+        .with_conn(|c| {
+            c.execute_batch("DROP TRIGGER review_fail")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, second) = f.request("DELETE", &url, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["removed"], false);
+    let count: i64 = f
+        .app
+        .db
+        .with_conn(|c| {
+            c.query_row("SELECT count(*) FROM backup_cleanup_intents", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(first["cleanup_pending"], true);
+    assert_eq!(second["cleanup_pending"], false);
+    let (_, removed) = f
+        .request("GET", "/api/guilds/10/cases?removed=true", "")
+        .await;
+    assert_eq!(removed["cases"][0], id);
+    let (_, active) = f.request("GET", "/api/guilds/10/cases", "").await;
+    assert!(active["cases"].as_array().unwrap().is_empty());
+    f.request("DELETE", &url, "").await;
+    let count: i64 = f
+        .app
+        .db
+        .with_conn(|c| {
+            c.query_row("SELECT count(*) FROM backup_cleanup_intents", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    f.request(
+        "DELETE",
+        &format!("/api/guilds/10/cases/{}", "f".repeat(32)),
+        "",
+    )
+    .await;
+    let count: i64 = f
+        .app
+        .db
+        .with_conn(|c| {
+            c.query_row("SELECT count(*) FROM backup_cleanup_intents", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

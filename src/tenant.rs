@@ -286,20 +286,22 @@ impl TenantRuntime {
     async fn erase_job(&self, job: &GuildErasureJob) -> Result<()> {
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
-        handle.close_membership(scope.clone()).await?;
-        let limits = evidence_limits();
-        while handle
-            .cancel_closed_evidence(scope.clone(), limits.max_page_size, limits)
-            .await?
-            > 0
-        {}
-        self.cleanup_evidence(&handle, &scope).await?;
-        while handle
-            .purge_closed_cases(scope.clone(), case_limits().max_page_size, case_limits())
-            .await?
-            > 0
-        {}
-        handle.erase_closed_scope(scope).await?;
+        if !handle.finish_empty_erasure(scope.clone()).await? {
+            handle.close_membership(scope.clone()).await?;
+            let limits = evidence_limits();
+            while handle
+                .cancel_closed_evidence(scope.clone(), limits.max_page_size, limits)
+                .await?
+                > 0
+            {}
+            self.cleanup_evidence(&handle, &scope).await?;
+            while handle
+                .purge_closed_cases(scope.clone(), case_limits().max_page_size, case_limits())
+                .await?
+                > 0
+            {}
+            handle.erase_closed_scope(scope.clone()).await?;
+        }
         record_backup_cleanup_intent(
             &self.core,
             "guild",
@@ -352,13 +354,7 @@ impl TenantRuntime {
             for job in &jobs {
                 match &self.inner.evidence {
                     EvidenceBackend::None => {
-                        let _ = handle
-                            .confirm_evidence_deleted(
-                                scope.clone(),
-                                job.case_id.clone(),
-                                job.id.clone(),
-                            )
-                            .await;
+                        anyhow::bail!("private evidence cleanup requires its configured backend");
                     }
                     #[cfg(unix)]
                     EvidenceBackend::Local(store) => {

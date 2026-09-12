@@ -197,6 +197,7 @@ impl EventHandler for Handler {
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
         let app = Arc::clone(self.app());
+        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ = db::record_ban(
             &app.db,
             guild_id.get() as i64,
@@ -212,7 +213,7 @@ impl EventHandler for Handler {
         ) {
             crate::cases::record(
                 &app,
-                guild_id.get(),
+                enrollment,
                 crate::db::guild_data::CaseAction::Ban,
                 crate::db::guild_data::CaseOutcome::Succeeded,
                 banned_user.id.get(),
@@ -230,6 +231,7 @@ impl EventHandler for Handler {
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
         let app = Arc::clone(self.app());
+        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ = db::mark_unbanned(
             &app.db,
             guild_id.get() as i64,
@@ -243,7 +245,7 @@ impl EventHandler for Handler {
         ) {
             crate::cases::record(
                 &app,
-                guild_id.get(),
+                enrollment,
                 crate::db::guild_data::CaseAction::Unban,
                 crate::db::guild_data::CaseOutcome::Succeeded,
                 unbanned_user.id.get(),

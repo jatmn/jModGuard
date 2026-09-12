@@ -36,31 +36,46 @@ not create a second tenant case for bot-owned actions: those paths register a bo
 one-shot in-process suppression before dispatch. Unmarked manual/external gateway
 actions still create a case. This is event ownership, not a guessed application/audit
 source association; trusted durable Discord-audit association remains pending. Ordinary
-messages are not archived in SQL.
+messages are not archived in SQL. Selected operations capture their enrollment before
+asynchronous effects and carry it through result recording; completion never adopts a
+replacement enrollment.
 
-The dashboard Cases tab lists the current membership's records, notes, and authorized
-private evidence downloads. Case removal clears retained private facts in the guild-store
+The dashboard Cases tab pages through the current membership's records in opaque ID
+order, displays all admitted history (up to 64 entries) and selected inline text, and
+provides authorized private evidence downloads. Case removal clears retained private facts in the guild-store
 journal immediately. It does not reverse a Discord action. The delete HTTP response reports
-`removed` for that journal step; `cleanup_pending` is true when object-backend cleanup could
-not finish in the same request (pending delete jobs remain retryable). Server owners and
+`removed` for that journal step; `cleanup_pending` is true when object-backend cleanup or
+backup-reminder persistence could not finish in the same request. The administrator-only
+Removed records view pages through retained removal identities (`cases?removed=true`)
+and allows explicit cleanup retry, including after a reload. It never restores private
+payloads. Repeating DELETE recovers the backup reminder from a verified removal tombstone;
+reminder insertion is idempotent. There is no automatic active-guild retry worker. Server owners and
 Administrators may delete. Delegated case-removal role IDs can be stored, but current
 Discord OAuth (`identify guilds`) does not supply member roles, so those IDs are not applied
 yet.
 
 Local Unix evidence serving reads verified private objects after the journal confirms
 they are available. Bunny serving is opt-in and proxies a GET after the same journal
-check. Zone credentials never appear in API responses.
+check. Zone credentials never appear in API responses. If existing owned objects need
+cleanup while the backend is disabled, they remain pending: `none` is not proof of
+physical absence. Restore the owning backend and retry; do not change resource identity.
 
 ## Live erasure
 
-Guild Delete with usable membership context retires the core observation and queues a
-`guild_erasure_jobs` row. A bounded bot worker closes store membership, cancels in-flight
+Guild Delete with usable membership context retires the core observation and admits its
+`guild_erasure_jobs` row in the same core transaction when a placement exists. A failed
+queue write leaves retirement uncommitted so the confirmed departure can be retried. A bounded bot worker closes store membership, cancels in-flight
 evidence, removes owned objects, purges cases, deletes remaining store identity,
 records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
 join cannot be resurrected. There is no permanent departed-guild ledger. Backup-copy
 cleanup is not implemented; the intent exists so a later backup feature can finish
-controlled-copy deletion without reconstructing live data.
+controlled-copy deletion without reconstructing live data. The durable job can resume its
+core cleanup suffix after the store binding has already been erased: the exact store
+identity and absence of the guild binding are checked without weakening normal data-scope
+validation. If activation stopped after placement binding but before membership insertion,
+the same exact-placement recovery can remove that empty binding. Configuration deletions advance the existing observation metadata atomically;
+moderation-only cleanup does not bump configuration versions.
 
 A later rejoin is a new enrollment on a fresh placement after erasure completes. Late
 events using the old enrollment cannot recreate erased facts. If a newer active

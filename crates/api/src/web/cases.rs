@@ -16,6 +16,8 @@ use tower_sessions::Session;
 pub struct CasePage {
     after: Option<String>,
     limit: Option<u32>,
+    #[serde(default)]
+    removed: bool,
 }
 
 #[derive(Deserialize)]
@@ -79,9 +81,20 @@ pub async fn list_cases(
         .limit
         .unwrap_or(50)
         .clamp(1, tenant::case_limits().max_page_size);
-    let ids = store
-        .case_ids(scope, after, limit, tenant::case_limits())
-        .await?;
+    let ids = if page.removed {
+        if !can_delete_cases(&auth, guild_id) {
+            return Err(ApiError(anyhow::anyhow!(
+                "case cleanup requires Administrator permission"
+            )));
+        }
+        store
+            .removed_case_ids(scope, after, limit, tenant::case_limits())
+            .await?
+    } else {
+        store
+            .case_ids(scope, after, limit, tenant::case_limits())
+            .await?
+    };
     Ok(Json(serde_json::json!({
         "cases": ids.into_iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
         "can_delete": can_delete_cases(&auth, guild_id),
@@ -218,7 +231,11 @@ pub async fn delete_case(
             true
         }
     };
-    if removed && let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await {
+    let mut backup_cleanup_pending = false;
+    if (removed || store.case_removed(scope.clone(), id.clone()).await?)
+        && let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await
+    {
+        backup_cleanup_pending = true;
         tracing::warn!(
             guild_id,
             case_id = %id.as_str(),
@@ -227,7 +244,7 @@ pub async fn delete_case(
     }
     Ok(Json(serde_json::json!({
         "removed": removed,
-        "cleanup_pending": cleanup_pending,
+        "cleanup_pending": cleanup_pending || backup_cleanup_pending,
         "discord_action_reversed": false,
     })))
 }

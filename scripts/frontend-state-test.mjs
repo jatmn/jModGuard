@@ -11,7 +11,7 @@ const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), '
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
   const node = (tag) => ({
-    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, listeners: {}, disabled: false,
+    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
     classList: { toggle() {} },
     focus() {},
     replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
@@ -32,9 +32,9 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
-    fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
+    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -703,4 +703,54 @@ test('image test UI rejects invalid thresholds before the API request', async ()
   await findNode(modal,n=>n.textContent === 'Save').listeners.click({});
   assert.equal(sent,0);
   assert.match(h.nodes.get('#toast').textContent,/Channels must be/);
+});
+
+
+test('case administration reaches later pages, all admitted history and inline evidence', async () => {
+  const ids = Array.from({length: 51}, (_, i) => (i + 1).toString(16).padStart(32, '0'));
+  const calls = [];
+  const h = harness(async (url) => {
+    calls.push(url);
+    const u = new URL(url, 'https://fixture.test');
+    if (u.pathname.endsWith('/history')) {
+      const start = Number(u.searchParams.get('after'));
+      return response({history: Array.from({length: 32}, (_, i) => ({sequence: String(start + i + 1), entry: {body: {text: `note ${start + i + 1}`}}}))});
+    }
+    if (u.pathname.endsWith('/evidence')) return response({evidence: []});
+    if (u.pathname.endsWith('/cases')) return response({cases: u.searchParams.has('after') ? ids.slice(50) : ids.slice(0, 50), can_delete: true});
+    return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  const next = findNode(root, n => n.tag === 'button' && n.textContent === 'Next page');
+  assert.equal(next.disabled, false);
+  next.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
+  const caseButton = findNode(root, n => n.tag === 'button' && n.textContent === ids[50].slice(0, 8));
+  caseButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(root).includes('note 33'));
+  assert.ok(textOf(root).includes('note 64'));
+  const excerpt = findNode(root, n => n.tag === 'pre');
+  assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
+  assert.equal(next.disabled, true);
+});
+
+test('removed case recovery survives opening a new dashboard view and retries the exact identity', async () => {
+  const id = 'a'.repeat(32);
+  const calls = [];
+  const h = harness(async (url, options) => {
+    calls.push({url, method: options.method});
+    if (options.method === 'DELETE') return response({removed: false, cleanup_pending: false});
+    const u = new URL(url, 'https://fixture.test');
+    return response({cases: u.searchParams.get('removed') === 'true' ? [id] : [], can_delete: true});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(root, n => n.textContent === 'Removed records / retry cleanup').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(root).includes(id));
+  await findNode(root, n => n.textContent === 'Retry cleanup').listeners.click();
+  assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/cases/' + id)));
 });

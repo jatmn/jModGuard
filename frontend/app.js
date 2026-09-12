@@ -1246,11 +1246,40 @@ function tabCases() {
   const table = el("table", {}, el("thead", {}, el("tr", {},
     ...["Case", "Action", "Outcome", "Subject", "When"].map((text) => el("th", { text })))), body);
   let request = 0;
+  let detailRequest = 0;
+  let after = "";
+  let removed = false;
+  let nextAfter = "";
+  const pageSize = 50;
+  const next = el("button", { class: "btn", text: "Next page", disabled: true, onclick: () => {
+    if (!nextAfter) return;
+    after = nextAfter;
+    run();
+  } });
+  const first = el("button", { class: "btn", text: "First page", onclick: () => { after = ""; run(); } });
+  const recovery = el("button", { class: "btn", text: "Removed records / retry cleanup", style: "display:none", onclick: () => {
+    removed = !removed;
+    after = "";
+    recovery.textContent = removed ? "Back to cases" : "Removed records / retry cleanup";
+    run();
+  } });
   const openCase = async (id) => {
+    const currentDetail = ++detailRequest;
     try {
       const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
-      const history = await api(`/api/guilds/${guildId}/cases/${id}/history`);
+      const history = { history: [] };
+      let sequence = "0";
+      // The existing history contract admits at most 64 entries. Consume both
+      // bounded pages so successful notes beyond the first 32 remain visible.
+      for (let page = 0; page < 2; page++) {
+        const result = await api(`/api/guilds/${guildId}/cases/${id}/history?limit=32&after=${sequence}`);
+        const entries = result.history || [];
+        history.history.push(...entries);
+        if (entries.length < 32) break;
+        sequence = entries[entries.length - 1].sequence;
+      }
       const evidence = await api(`/api/guilds/${guildId}/cases/${id}/evidence`);
+      if (currentDetail !== detailRequest || state.guildId !== guildId) return;
       const c = payload.case || {};
       const note = el("textarea", { rows: "3", placeholder: "Add a note. This does not change Discord." });
       detail.replaceChildren(
@@ -1263,7 +1292,7 @@ function tabCases() {
           try {
             const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
             toast(result?.cleanup_pending
-              ? "Case record removed. Private file cleanup is still in progress."
+              ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
               : "Case record removed", "success");
             renderTab();
           } catch (e) { toast(e.message || String(e), "error"); }
@@ -1279,6 +1308,9 @@ function tabCases() {
             } catch (e) { toast(e.message || String(e), "error"); }
           } })),
         el("h3", { text: "Private evidence" }),
+        ...(Array.isArray(c.evidence?.text) ? c.evidence.text : []).map((item) => el("div", {},
+          el("p", { class: "muted", text: `Message ${item.message_id} · channel ${item.channel_id} · author ${item.author_id}` }),
+          el("pre", { text: item.text }))),
         ...(evidence.evidence || []).map((item) => el("p", {},
           el("button", { class: "btn small", type: "button", text: `Download ${item.id}`, onclick: async () => {
             try { await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id); }
@@ -1286,24 +1318,44 @@ function tabCases() {
           } }))),
       );
     } catch (e) {
+      if (currentDetail !== detailRequest || state.guildId !== guildId) return;
       detail.replaceChildren(el("p", { class: "err", text: e.message || String(e) }));
     }
   };
   const run = async () => {
     const current = ++request;
+    ++detailRequest;
+    detail.replaceChildren();
+    next.disabled = true;
     body.replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
     try {
-      const payload = await api(`/api/guilds/${guildId}/cases`);
-      if (current !== request) return;
+      const query = new URLSearchParams({ limit: String(pageSize), removed: String(removed) });
+      if (after) query.set("after", after);
+      const payload = await api(`/api/guilds/${guildId}/cases?${query}`);
+      if (current !== request || state.guildId !== guildId) return;
+      recovery.style.display = payload.can_delete ? "" : "none";
       const ids = payload.cases || [];
+      nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
+      next.disabled = !nextAfter;
+      first.disabled = !after;
       if (!ids.length) {
-        body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No selected cases for this membership." })));
+        body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "muted", text: removed ? "No more removed records." : "No selected cases on this page." })));
         return;
       }
       const rows = [];
       for (const id of ids) {
+        if (removed) {
+          rows.push(el("tr", {}, el("td", { text: id }), el("td", { colspan: 4 },
+            el("button", { class: "btn small", text: "Retry cleanup", onclick: async () => {
+              try {
+                const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
+                toast(result.cleanup_pending ? "Cleanup is pending. Retry when storage is available." : "Live record cleanup complete. This does not delete backup copies.", "success");
+              } catch (e) { toast(e.message || String(e), "error"); }
+            } }))));
+          continue;
+        }
         const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
-        if (current !== request) return;
+        if (current !== request || state.guildId !== guildId) return;
         const c = payload.case || {};
         rows.push(el("tr", {},
           el("td", {}, el("button", { class: "btn small", text: id.slice(0, 8), onclick: () => openCase(id) })),
@@ -1315,7 +1367,7 @@ function tabCases() {
       }
       body.replaceChildren(...rows);
     } catch (e) {
-      if (current !== request) return;
+      if (current !== request || state.guildId !== guildId) return;
       body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load cases: " + (e.message || String(e)) })));
     }
   };
@@ -1323,7 +1375,8 @@ function tabCases() {
   return el("div", {},
     el("h2", { text: "Cases" }),
     el("p", { class: "muted", text: "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord." }),
-    el("button", { class: "btn", text: "Refresh", onclick: run }), table, detail);
+    el("p", { class: "muted", text: "Use removed records to retry cleanup. Their private content stays deleted, and retrying does not undo Discord actions." }),
+    el("button", { class: "btn", text: "Refresh", onclick: run }), first, next, recovery, table, detail);
 }
 
 function tabSettings() {

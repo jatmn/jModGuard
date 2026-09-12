@@ -193,11 +193,7 @@ pub async fn observe_gateway_membership(
             tenant.activate(enrollment).await?;
         }
     } else {
-        let current = db::guild_enrollment(db, guild).await?;
         db::retire_guild_enrollment(db, guild, joined).await?;
-        if let Some(enrollment) = current.filter(|enrollment| enrollment.joined_at_ns == joined) {
-            tenant.schedule_erasure(enrollment).await?;
-        }
     }
     Ok(())
 }

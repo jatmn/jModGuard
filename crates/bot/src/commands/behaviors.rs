@@ -14,6 +14,18 @@ use crate::{db, logging};
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
+    let enrollment = if matches!(
+        env.cmd.behavior,
+        Behavior::Ban { .. }
+            | Behavior::Unban { .. }
+            | Behavior::Kick { .. }
+            | Behavior::Timeout { .. }
+            | Behavior::Warn { .. }
+    ) {
+        crate::cases::capture(env.app, env.guild_id.get()).await
+    } else {
+        None
+    };
 
     match &env.cmd.behavior {
         Behavior::Ban {
@@ -50,7 +62,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             }
             crate::cases::record(
                 env.app,
-                env.guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
                 outcome.clone(),
                 target.get(),
@@ -113,7 +125,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             }
             crate::cases::record(
                 env.app,
-                env.guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Unban,
                 outcome,
                 target.get(),
@@ -156,7 +168,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
             crate::cases::record(
                 env.app,
-                env.guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
                 outcome,
                 target.get(),
@@ -217,7 +229,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
             crate::cases::record(
                 env.app,
-                env.guild_id.get(),
+                enrollment.clone(),
                 if minutes == 0 {
                     crate::db::guild_data::CaseAction::TimeoutRemoval
                 } else {
@@ -273,7 +285,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await?;
             crate::cases::record(
                 env.app,
-                env.guild_id.get(),
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Warning,
                 crate::db::guild_data::CaseOutcome::Succeeded,
                 target.get(),

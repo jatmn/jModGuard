@@ -464,3 +464,232 @@ async fn empty_implicit_shared_store_id_stays_stable_across_runtime_reopen() {
         .unwrap();
     assert_eq!(catalog, 1);
 }
+
+#[tokio::test]
+async fn erasure_resumes_after_core_failure_and_reopen() {
+    for (operation, table) in [
+        ("INSERT", "backup_cleanup_intents"),
+        ("DELETE", "guild_settings"),
+        ("DELETE", "guild_store_placements"),
+        ("DELETE", "guild_erasure_jobs"),
+    ] {
+        let f = Fixture::new();
+        let e = enroll(&f, 10, 100).await;
+        db::patch_settings(&f.db, 10, Some(Some("old!".into())), None, None)
+            .await
+            .unwrap();
+        db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+        f.tenant.schedule_erasure(e).await.unwrap();
+        f.db.with_conn(move |c| { c.execute_batch(&format!("CREATE TRIGGER review_fail BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'injected core failure'); END"))?; Ok(()) }).await.unwrap();
+        let first = f.tenant.drive_erasure().await.unwrap_err();
+        f.db.with_conn(|c| {
+            c.execute_batch("DROP TRIGGER review_fail")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(first.to_string().contains("injected core failure"));
+        assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        let db_cfg = DbConfig {
+            path: f.path.clone(),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let reopened = TenantRuntime::open(
+            &f.db,
+            &db_cfg,
+            &GuildStoresConfig::default(),
+            &EvidenceConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.drive_erasure().await.unwrap());
+        assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        assert!(!reopened.drive_erasure().await.unwrap());
+        let next = db::enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+        assert!(reopened.activate(next).await.unwrap().is_some());
+    }
+}
+#[tokio::test]
+async fn disabled_backend_keeps_owned_cleanup_pending() {
+    use crate::db::guild_data::{EvidenceCapture, EvidenceOrigin, EvidenceRequest, EvidenceState};
+    let f = Fixture::new();
+    let e = enroll(&f, 10, 100).await;
+    let (s, scope) = f.tenant.live(e).await.unwrap();
+    let c = CaseId::new();
+    let id = CaseId::new();
+    s.record_case(scope.clone(), c.clone(), case_data(1), case_limits())
+        .await
+        .unwrap();
+    s.reserve_case_evidence(
+        scope.clone(),
+        c.clone(),
+        id.clone(),
+        EvidenceRequest {
+            storage_id: CaseId::new(),
+            bytes: 3,
+            origin: EvidenceOrigin {
+                channel_id: 1,
+                message_id: 2,
+                attachment_id: 3,
+            },
+        },
+        evidence_limits(),
+    )
+    .await
+    .unwrap();
+    s.settle_evidence_capture(
+        scope.clone(),
+        c.clone(),
+        id.clone(),
+        EvidenceCapture::Stored {
+            bytes: 3,
+            sha256: "a".repeat(64),
+        },
+    )
+    .await
+    .unwrap();
+    s.remove_case(scope.clone(), c.clone()).await.unwrap();
+    assert!(f.tenant.cleanup_owned_evidence(&s, &scope).await.is_err());
+    let job = s.evidence_transfer_job(scope, c, id).await.unwrap();
+    assert_ne!(job.state, EvidenceState::Erased);
+}
+
+#[tokio::test]
+async fn directory_wipe_advances_config_observation() {
+    let f = Fixture::new();
+    let e = enroll(&f, 10, 100).await;
+    db::patch_settings(&f.db, 10, Some(Some("old!".into())), None, None)
+        .await
+        .unwrap();
+    let command = db::list_commands(&f.db, 0).await.unwrap().remove(0).1;
+    db::upsert_command(&f.db, 10, "removed-command", &command)
+        .await
+        .unwrap();
+    let before = db::get_primary_versions_sync(&f.db).unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.tenant.schedule_erasure(e).await.unwrap();
+    f.tenant.drive_erasure().await.unwrap();
+    let after = db::get_primary_versions_sync(&f.db).unwrap();
+    assert!(after.config > before.config);
+    assert_ne!(before.config_revision, after.config_revision);
+    assert!(after.slash > before.slash);
+    assert_ne!(after.slash_revision, before.slash_revision);
+    let (version, revision, commands) = db::load_slash_commands_with_version_primary(&f.db, 10)
+        .await
+        .unwrap();
+    assert_eq!(version, after.slash);
+    assert_eq!(revision, after.slash_revision);
+    assert!(!commands.contains_key("removed-command"));
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+}
+
+#[tokio::test]
+async fn retirement_and_erasure_admission_rollback_together() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    f.db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fail_queue BEFORE INSERT ON guild_erasure_jobs BEGIN SELECT RAISE(ABORT,'queue unavailable'); END")?; Ok(()) }).await.unwrap();
+    assert!(db::retire_guild_enrollment(&f.db, 10, 100).await.is_err());
+    assert_eq!(
+        db::guild_enrollment(&f.db, 10).await.unwrap(),
+        Some(enrollment.clone())
+    );
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    f.db.with_conn(|c| {
+        c.execute_batch("DROP TRIGGER fail_queue")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    assert_eq!(
+        db::next_guild_erasure(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrollment,
+        enrollment
+    );
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+}
+
+#[tokio::test]
+async fn directory_wipe_preserves_active_guard_and_moderation_only_versions() {
+    let f = Fixture::new();
+    enroll(&f, 10, 100).await;
+    db::patch_settings(&f.db, 10, Some(Some("keep!".into())), None, None)
+        .await
+        .unwrap();
+    let before = db::get_primary_versions_sync(&f.db).unwrap();
+    assert!(
+        !db::wipe_departed_directory_guild_data(&f.db, 10)
+            .await
+            .unwrap()
+    );
+    let after = db::get_primary_versions_sync(&f.db).unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "keep!");
+    db::record_ban(&f.db, 20, 99, None, "test").await.unwrap();
+    assert!(
+        db::wipe_departed_directory_guild_data(&f.db, 20)
+            .await
+            .unwrap()
+    );
+    let after = db::get_primary_versions_sync(&f.db).unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
+    assert_eq!(before.slash_revision, after.slash_revision);
+}
+
+#[tokio::test]
+async fn departure_recovers_activation_before_membership_binding() {
+    for bind in [false, true] {
+        let f = Fixture::new();
+        let enrollment = db::enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+        let placement = assign_initial_placement(&f.db, 10, f.tenant.store_for_guild(10).unwrap())
+            .await
+            .unwrap();
+        let handle = f.tenant.handle(placement.store_id()).await.unwrap();
+        if bind {
+            handle.bind_initial_placement(placement).await.unwrap();
+        }
+        db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+        assert_eq!(
+            db::next_guild_erasure(&f.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .enrollment,
+            enrollment
+        );
+        assert!(f.tenant.drive_erasure().await.unwrap());
+        assert!(
+            db::guild_stores::guild_placement(&f.db, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let next = db::enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+        assert!(f.tenant.activate(next).await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn newer_departure_preserves_cleanup_of_last_known_membership() {
+    let f = Fixture::new();
+    let old = enroll(&f, 10, 100).await;
+    // A newer membership was not observed before its confirmed departure.
+    db::retire_guild_enrollment(&f.db, 10, 101).await.unwrap();
+    assert_eq!(
+        db::next_guild_erasure(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrollment,
+        old
+    );
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
