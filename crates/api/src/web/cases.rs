@@ -204,12 +204,32 @@ pub async fn delete_case(
     let (store, scope) = live(&app, enrollment).await?;
     let id = parse_case_id(&case_id)?;
     let removed = store.remove_case(scope.clone(), id.clone()).await?;
-    app.tenant.cleanup_owned_evidence(&store, &scope).await?;
+    // Journal removal is the user-visible delete. Object-backend cleanup is a
+    // separate worker step; pending jobs remain retryable. Do not map worker I/O
+    // failure onto the administrator-facing delete outcome.
+    let cleanup_pending = match app.tenant.cleanup_owned_evidence(&store, &scope).await {
+        Ok(()) => false,
+        Err(error) => {
+            tracing::warn!(
+                guild_id,
+                case_id = %id.as_str(),
+                "case record removed; private evidence cleanup is still pending: {error:#}"
+            );
+            true
+        }
+    };
     if removed {
-        app.tenant.record_case_cleanup(&scope, &id).await?;
+        if let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await {
+            tracing::warn!(
+                guild_id,
+                case_id = %id.as_str(),
+                "backup cleanup intent not recorded after case removal: {error:#}"
+            );
+        }
     }
     Ok(Json(serde_json::json!({
         "removed": removed,
+        "cleanup_pending": cleanup_pending,
         "discord_action_reversed": false,
     })))
 }

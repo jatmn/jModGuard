@@ -1263,6 +1263,7 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
         .await;
     assert_eq!(status, StatusCode::OK, "{deleted}");
     assert_eq!(deleted["removed"], true);
+    assert_eq!(deleted["cleanup_pending"], false);
     assert_eq!(deleted["discord_action_reversed"], false);
     let (status, missing) = f
         .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
@@ -1293,4 +1294,124 @@ async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
         stats.get("cases").is_none(),
         "offline tenant stats omit only their unavailable case count: {stats}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
+    use crate::db::SqlExecutor;
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, EvidenceCapture,
+        EvidenceOrigin, EvidenceRequest,
+    };
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    f.app
+        .tenant
+        .record_selected_case(
+            enrollment.clone(),
+            CaseData {
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Kick,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 2,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: Some("private-reason".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["cases"][0].as_str().unwrap().to_owned();
+    let case = CaseId::try_from(id.clone()).unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    let storage = CaseId::try_from(db::evidence_storage_id(&f.app.db, "").await.unwrap()).unwrap();
+    let evidence_id = CaseId::new();
+    store
+        .reserve_case_evidence(
+            scope.clone(),
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceRequest {
+                storage_id: storage,
+                bytes: 3,
+                origin: EvidenceOrigin {
+                    channel_id: 11,
+                    message_id: 12,
+                    attachment_id: 13,
+                },
+            },
+            crate::tenant::evidence_limits(),
+        )
+        .await
+        .unwrap();
+    store
+        .settle_evidence_capture(
+            scope,
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceCapture::Stored {
+                bytes: 3,
+                sha256: "a".repeat(64),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut root = f.path.as_os_str().to_owned();
+    root.push(".evidence");
+    let object = std::path::PathBuf::from(root)
+        .join("evidence")
+        .join("10")
+        .join(&enrollment.id)
+        .join(case.as_str())
+        .join(format!("{}.data", evidence_id.as_str()));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(object.parent().unwrap())
+        .unwrap();
+    std::fs::write(&object, b"bad").unwrap();
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    f.discord.guilds.lock().unwrap()[0].owner = true;
+    f.app.guild_cache.clear();
+    let (status, deleted) = f
+        .request("DELETE", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["removed"], true);
+    assert_eq!(deleted["cleanup_pending"], true);
+    assert_eq!(deleted["discord_action_reversed"], false);
+
+    let (status, listed) = f.request("GET", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(listed["cases"].as_array().unwrap().is_empty());
+    let intents: i64 = f
+        .app
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM backup_cleanup_intents WHERE kind='case'",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(intents, 1);
 }

@@ -1261,8 +1261,10 @@ function tabCases() {
         payload.can_delete ? el("button", { class: "btn small", text: "Remove case record", onclick: async () => {
           if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
           try {
-            await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
-            toast("Case record removed", "success");
+            const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
+            toast(result?.cleanup_pending
+              ? "Case record removed. Private file cleanup is still in progress."
+              : "Case record removed", "success");
             renderTab();
           } catch (e) { toast(e.message || String(e), "error"); }
         } }) : null,

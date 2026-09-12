@@ -39,10 +39,13 @@ source association; trusted durable Discord-audit association remains pending. O
 messages are not archived in SQL.
 
 The dashboard Cases tab lists the current membership's records, notes, and authorized
-private evidence downloads. Case removal clears retained private facts. It does not
-reverse a Discord action. Server owners and Administrators may delete. Delegated
-case-removal role IDs can be stored, but current Discord OAuth (`identify guilds`) does
-not supply member roles, so those IDs are not applied yet.
+private evidence downloads. Case removal clears retained private facts in the guild-store
+journal immediately. It does not reverse a Discord action. The delete HTTP response reports
+`removed` for that journal step; `cleanup_pending` is true when object-backend cleanup could
+not finish in the same request (pending delete jobs remain retryable). Server owners and
+Administrators may delete. Delegated case-removal role IDs can be stored, but current
+Discord OAuth (`identify guilds`) does not supply member roles, so those IDs are not applied
+yet.
 
 Local Unix evidence serving reads verified private objects after the journal confirms
 they are available. Bunny serving is opt-in and proxies a GET after the same journal
