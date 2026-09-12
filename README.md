@@ -20,7 +20,7 @@ from a private GitHub Actions repo. You do not need Bunny to run it
 ([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider path.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
-  attachment floods (crypto scams), links in the first minutes after joining,
+  [log-only exact-image spam tests](docs/IMAGE-SPAM.md), links in the first minutes after joining,
   bypass-resistant badword filtering, invite links, message floods, and
   brand-new accounts — each rule with its own parameters, whitelists, and an
   **action escalation table** (delete → warn → timeout → kick → ban) plus

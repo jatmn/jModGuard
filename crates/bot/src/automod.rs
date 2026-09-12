@@ -39,8 +39,6 @@ struct RuleState {
 #[derive(Clone, Copy)]
 struct WindowEvent {
     at: Instant,
-    channel: u64,
-    attachments: usize,
 }
 
 /// Everything the engine needs to know about an incoming message.
@@ -156,7 +154,8 @@ impl AutomodEngine {
 
             let triggered = match rule_id {
                 "mention_spam" => self.trigger_mention_spam(rule, ctx, now),
-                "attachment_flood" => self.trigger_attachment_flood(rule, ctx, now),
+                // Exact-image observations have a separate bounded log-only path.
+                "attachment_flood" => false,
                 "new_member_url" => {
                     ctx.joined_secs_ago
                         .map(|s| s <= param_u64(rule, "grace_secs", 120))
@@ -188,11 +187,7 @@ impl AutomodEngine {
             let state = bucket.entry(rule_id).or_default();
             state.strikes += 1;
             state.last_event = Some(now);
-            state.events.push_back(WindowEvent {
-                at: now,
-                channel: ctx.channel_id,
-                attachments: ctx.attachment_count,
-            });
+            state.events.push_back(WindowEvent { at: now });
 
             let strikes = state.strikes;
             let fire = rule
@@ -239,31 +234,6 @@ impl AutomodEngine {
             }
         }
         total > max_total
-    }
-
-    fn trigger_attachment_flood(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
-        let min_messages = param_u64(rule, "min_messages", 2) as usize;
-        let min_attachments = param_u64(rule, "min_attachments", 2) as usize;
-        let min_channels = param_u64(rule, "min_channels", 2) as usize;
-        let window = Duration::from_secs(param_u64(rule, "window_secs", 60));
-
-        let mut channels = HashSet::new();
-        let mut count = 0usize;
-        if ctx.attachment_count >= min_attachments {
-            count += 1;
-            channels.insert(ctx.channel_id);
-        }
-        if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
-            for s in bucket.values() {
-                for e in s.events.iter() {
-                    if now.duration_since(e.at) < window && e.attachments >= min_attachments {
-                        count += 1;
-                        channels.insert(e.channel);
-                    }
-                }
-            }
-        }
-        count >= min_messages && channels.len() >= min_channels
     }
 
     fn trigger_velocity(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {

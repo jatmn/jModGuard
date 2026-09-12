@@ -12,6 +12,7 @@ pub mod defaults;
 pub mod evidence_transfer;
 pub use jmodguard_runtime::health;
 pub mod ids;
+pub mod image_spam;
 pub mod normalize;
 mod remote_https;
 pub mod templates;

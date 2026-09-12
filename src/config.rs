@@ -13,6 +13,7 @@ struct Config {
     pub actions: crate::bot_actions::Limits,
     pub action_worker: ActionWorkerConfig,
     pub enrollment: EnrollmentConfig,
+    pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub web: WebConfig,
@@ -194,6 +195,7 @@ pub struct BotProcessConfig {
     pub actions: crate::bot_actions::Limits,
     pub action_worker: ActionWorkerConfig,
     pub enrollment: EnrollmentConfig,
+    pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub bot: BotConfig,
@@ -220,6 +222,7 @@ impl From<Config> for BotProcessConfig {
             actions: c.actions,
             action_worker: c.action_worker,
             enrollment: c.enrollment,
+            image_spam: c.image_spam,
             discord: c.discord,
             db: c.db,
             bot: c.bot,
@@ -244,6 +247,7 @@ impl From<BotProcessConfig> for Config {
             actions: c.actions,
             action_worker: c.action_worker,
             enrollment: c.enrollment,
+            image_spam: c.image_spam,
             discord: c.discord,
             db: c.db,
             web: WebConfig::default(),
@@ -258,6 +262,7 @@ impl From<ApiProcessConfig> for Config {
             actions: c.actions,
             action_worker: ActionWorkerConfig::default(),
             enrollment: EnrollmentConfig::default(),
+            image_spam: crate::image_spam::Limits::default(),
             discord: DiscordConfig::default(),
             db: c.db,
             web: c.web,
@@ -325,6 +330,7 @@ impl Config {
         cfg.actions.validate()?;
         if !api {
             cfg.enrollment.validate()?;
+            cfg.image_spam.validate()?;
             cfg.action_worker.validate()?;
         }
         Ok(cfg)
@@ -412,6 +418,11 @@ impl Config {
 
     fn apply_env_for(&mut self, api: bool) -> Result<()> {
         if !api {
+            if let Ok(raw) = env::var("JMODGUARD_IMAGE_SPAM_LIMITS") {
+                self.image_spam = serde_json::from_str(&raw)
+                    .context("invalid JMODGUARD_IMAGE_SPAM_LIMITS JSON")?;
+                self.image_spam.validate()?;
+            }
             self.enrollment.apply_env()?;
             self.action_worker.apply_env()?;
             if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
@@ -679,6 +690,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn image_work_controls_are_bot_only_and_validate_env() {
+        let bot = Config::parse_file("[image_spam]\nconcurrency=1\nmetadata_bytes=8388608", false)
+            .unwrap();
+        assert_eq!(bot.image_spam.concurrency, 1);
+        assert_eq!(bot.image_spam.metadata_bytes, 8388608);
+        assert!(Config::parse_file("[image_spam]\nconcurrency='bad'", true).is_ok());
+        assert!(Config::parse_file("[image_spam]\nconcurrency='bad'", false).is_err());
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_IMAGE_SPAM_LIMITS"]);
+        unsafe {
+            std::env::set_var("JMODGUARD_IMAGE_SPAM_LIMITS", "invalid");
+        }
+        assert!(Config::default().apply_env_for(false).is_err());
+        // API ignores this bot-only environment variable.
+        let mut api = Config::default();
+        api.image_spam.concurrency = 7;
+        let _ = api.apply_env_for(true);
+        assert_eq!(api.image_spam.concurrency, 7);
+        unsafe {
+            std::env::set_var("JMODGUARD_IMAGE_SPAM_LIMITS", r#"{"concurrency":1}"#);
+        }
+        let mut bot = Config::default();
+        bot.apply_env_for(false).unwrap();
+        assert_eq!(bot.image_spam.concurrency, 1);
+        unsafe {
+            std::env::set_var("JMODGUARD_IMAGE_SPAM_LIMITS", r#"{"concurrency":0}"#);
+        }
+        assert!(Config::default().apply_env_for(false).is_err());
     }
 
     #[test]

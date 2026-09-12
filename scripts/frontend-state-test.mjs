@@ -34,7 +34,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
     fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -623,4 +623,36 @@ test('individual configuration GETs retain loaded membership without rebinding g
   await h.app.api(`/api/guilds/${h.app.state.guildId}/commands`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
   assert.equal(calls.length, routes.length + 3);
+});
+
+
+test('image rule UI requires explicit test mode and cannot save punishment actions', async () => {
+  const calls=[];
+  const h=harness(async (url, options) => {
+    if (options.method === 'PUT') calls.push(JSON.parse(options.body));
+    return response({ settings:{}, rules:[], commands:[], log_channels:[], badwords:[] });
+  });
+  const legacy={ name:'Images', rule_id:'attachment_flood', effective:{ enabled:true, dry_run:false, params:{min_channels:2,min_attachments:2,window_secs:60,min_messages:2}, actions:[{at:1,action:'ban'}] } };
+  assert.match(textOf(h.app.ruleCard(legacy)), /inactive/);
+  const modal=h.app.editRule(legacy);
+  assert.doesNotMatch(textOf(modal), /Action escalation/);
+  assert.match(textOf(modal), /delete and ban are not available/);
+  const save=findNode(modal,n=>n.textContent === 'Save');
+  await save.listeners.click({});
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].data.dry_run,true);
+  assert.deepEqual(calls[0].data.params,{mode:'exact_image_test',min_channels:2,min_attachments:2,window_secs:60});
+  assert.deepEqual(calls[0].data.actions.map(a=>a.action),['log']);
+  assert.equal(h.app.imageTestConfigured(calls[0].data),true);
+  calls[0].data.params.min_channels=1;
+  assert.equal(h.app.imageTestConfigured(calls[0].data),false);
+});
+
+test('image test UI rejects invalid thresholds before the API request', async () => {
+  let sent=0;
+  const h=harness(async()=>{sent++;return response({});});
+  const modal=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,params:{min_channels:1},actions:[]}});
+  await findNode(modal,n=>n.textContent === 'Save').listeners.click({});
+  assert.equal(sent,0);
+  assert.match(h.nodes.get('#toast').textContent,/Channels must be/);
 });

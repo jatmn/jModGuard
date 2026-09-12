@@ -2550,3 +2550,42 @@ mod moderation_enrollments;
 mod configuration_reads;
 
 mod guild_stores;
+
+#[test]
+fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
+    let path = tmp_db_path("image_test_rule_validation");
+    let db = Db::open(&path, 2).unwrap();
+    tokio_test_block_on(async {
+        let mut rule = crate::defaults::default_rules().remove(1);
+        let before = get_primary_versions(&db).await.unwrap();
+        rule.dry_run = false;
+        assert!(
+            upsert_rule(&db, 0, "attachment_flood", &rule)
+                .await
+                .is_err()
+        );
+        let scope =
+            ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+                .unwrap();
+        assert!(
+            upsert_enrolled_rule(&db, scope, "attachment_flood", &rule)
+                .await
+                .is_err()
+        );
+        let after = get_primary_versions(&db).await.unwrap();
+        assert_eq!(before.config_revision, after.config_revision);
+        rule.dry_run = true;
+        upsert_rule(&db, 0, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        assert!(
+            get_rule(&db, 0, "attachment_flood")
+                .await
+                .unwrap()
+                .unwrap()
+                .dry_run
+        );
+    });
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
