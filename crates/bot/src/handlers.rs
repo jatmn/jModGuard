@@ -112,6 +112,7 @@ impl EventHandler for Handler {
         let gid = guild.id;
         if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
             &app.db,
+            &app.tenant,
             gid.get(),
             guild.joined_at.timestamp_nanos_opt(),
             guild.unavailable,
@@ -141,6 +142,7 @@ impl EventHandler for Handler {
             .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
         if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
             &self.app().db,
+            &self.app().tenant,
             incomplete.id.get(),
             joined,
             incomplete.unavailable,
@@ -203,6 +205,18 @@ impl EventHandler for Handler {
             "banned (audit)",
         )
         .await;
+        crate::cases::record(
+            &app,
+            guild_id.get(),
+            crate::db::guild_data::CaseAction::Ban,
+            crate::db::guild_data::CaseOutcome::Succeeded,
+            banned_user.id.get(),
+            None,
+            Some("banned".into()),
+            crate::db::guild_data::CaseEvidence::Unavailable,
+            crate::cases::application_source(),
+        )
+        .await;
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "banned".into());
         logging::emit_member_event(&app, &ctx, guild_id, "member_ban", &banned_user, extra).await;
@@ -214,6 +228,18 @@ impl EventHandler for Handler {
             &app.db,
             guild_id.get() as i64,
             unbanned_user.id.get() as i64,
+        )
+        .await;
+        crate::cases::record(
+            &app,
+            guild_id.get(),
+            crate::db::guild_data::CaseAction::Unban,
+            crate::db::guild_data::CaseOutcome::Succeeded,
+            unbanned_user.id.get(),
+            None,
+            Some("unbanned".into()),
+            crate::db::guild_data::CaseEvidence::Unavailable,
+            crate::cases::application_source(),
         )
         .await;
         let mut extra = BTreeMap::new();
@@ -260,7 +286,15 @@ impl EventHandler for Handler {
             cfg.templates.len()
         );
 
-        crate::image_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, image_revision);
+        crate::image_spam::observe(
+            &app,
+            &ctx,
+            &cfg,
+            &msg,
+            received,
+            received_at,
+            image_revision,
+        );
         // Generic rules and prefix commands retain their existing bot exemption.
         if msg.author.bot {
             return;

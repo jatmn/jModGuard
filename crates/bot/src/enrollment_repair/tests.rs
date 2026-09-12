@@ -2,6 +2,7 @@ use super::*;
 use std::{collections::HashMap, sync::Mutex};
 struct Fixture {
     db: Db,
+    tenant: crate::tenant::TenantRuntime,
     path: std::path::PathBuf,
 }
 impl Fixture {
@@ -12,6 +13,12 @@ impl Fixture {
         ));
         Self {
             db: Db::open(&path, 2).unwrap(),
+            tenant: {
+                let db = Db::open(&path, 2).unwrap();
+                let cfg = crate::config::BotProcessConfig::default();
+                crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)
+                    .unwrap()
+            },
             path,
         }
     }
@@ -21,6 +28,7 @@ impl Drop for Fixture {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
+        crate::tenant::remove_sidecars(&self.path);
     }
 }
 struct Source {
@@ -74,17 +82,27 @@ async fn bounded_pages_repair_missing_joins_and_wait_between_sweeps() {
     let f = Fixture::new();
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     let source = Source::new(vec![20, 10]);
-    let report = repair.step(&f.db, &source).await.unwrap().unwrap();
+    let report = repair
+        .step(&f.db, &f.tenant, &source)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(report.checked, 2);
     assert_eq!(report.confirmed, 2);
     assert!(!report.sweep_complete);
     assert_eq!(*source.calls.lock().unwrap(), vec![(None, 2)]);
     assert_eq!(*source.member_calls.lock().unwrap(), vec![10, 20]);
     assert_eq!(repair.after, Some(20));
-    assert!(repair.step(&f.db, &source).await.unwrap().is_none());
+    assert!(
+        repair
+            .step(&f.db, &f.tenant, &source)
+            .await
+            .unwrap()
+            .is_none()
+    );
     repair.next = Instant::now();
     let last = Source::new(vec![30]);
-    let report = repair.step(&f.db, &last).await.unwrap().unwrap();
+    let report = repair.step(&f.db, &f.tenant, &last).await.unwrap().unwrap();
     assert_eq!(*last.calls.lock().unwrap(), vec![(Some(20), 2)]);
     assert!(report.sweep_complete);
     assert_eq!(repair.after, None);
@@ -102,7 +120,11 @@ async fn omitted_and_unreadable_memberships_are_never_retired() {
     let mut source = Source::new(vec![10, 20]);
     source.joins.remove(&10);
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
-    let report = repair.step(&f.db, &source).await.unwrap().unwrap();
+    let report = repair
+        .step(&f.db, &f.tenant, &source)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(report.failed, 1);
     assert_eq!(report.confirmed, 1);
     assert_eq!(db::guild_enrollment(&f.db, 10).await.unwrap(), first);
@@ -110,7 +132,7 @@ async fn omitted_and_unreadable_memberships_are_never_retired() {
     repair.next = Instant::now();
     assert!(
         repair
-            .step(&f.db, &Source::new(vec![]))
+            .step(&f.db, &f.tenant, &Source::new(vec![]))
             .await
             .unwrap()
             .unwrap()
@@ -132,10 +154,16 @@ async fn invalid_pages_fail_before_any_observation_and_back_off() {
         let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
         repair.after = Some(5);
         let source = Source::new(page);
-        assert!(repair.step(&f.db, &source).await.is_err());
+        assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
         assert!(source.member_calls.lock().unwrap().is_empty());
         assert_eq!(repair.after, Some(5));
-        assert!(repair.step(&f.db, &source).await.unwrap().is_none());
+        assert!(
+            repair
+                .step(&f.db, &f.tenant, &source)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(source.calls.lock().unwrap().len(), 1);
     }
 }
@@ -147,7 +175,12 @@ async fn rest_repair_cannot_resurrect_retired_membership_but_recovers_new_join()
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     let mut source = Source::new(vec![10]);
     assert_eq!(
-        repair.step(&f.db, &source).await.unwrap().unwrap().refused,
+        repair
+            .step(&f.db, &f.tenant, &source)
+            .await
+            .unwrap()
+            .unwrap()
+            .refused,
         1
     );
     assert!(db::guild_enrollment(&f.db, 10).await.unwrap().is_none());
@@ -155,7 +188,7 @@ async fn rest_repair_cannot_resurrect_retired_membership_but_recovers_new_join()
     repair.next = Instant::now();
     assert_eq!(
         repair
-            .step(&f.db, &source)
+            .step(&f.db, &f.tenant, &source)
             .await
             .unwrap()
             .unwrap()
@@ -186,7 +219,7 @@ async fn healthy_repair_does_not_write_enrollment_or_nickname_state() {
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     assert_eq!(
         repair
-            .step(&f.db, &Source::new(vec![10]))
+            .step(&f.db, &f.tenant, &Source::new(vec![10]))
             .await
             .unwrap()
             .unwrap()
@@ -202,17 +235,20 @@ async fn timeouts_and_listing_failures_are_bounded_and_non_destructive() {
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     let mut source = Source::new(vec![10]);
     source.fail_page = true;
-    assert!(repair.step(&f.db, &source).await.is_err());
+    assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
     assert_eq!(repair.after, None);
     assert!(source.member_calls.lock().unwrap().is_empty());
     source.fail_page = false;
     source.stall_member = true;
     repair.next = Instant::now();
-    let report = tokio::time::timeout(Duration::from_secs(3), repair.step(&f.db, &source))
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(3),
+        repair.step(&f.db, &f.tenant, &source),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     assert_eq!(report.failed, 1);
     assert!(db::guild_enrollment(&f.db, 10).await.unwrap().is_none());
 }
@@ -230,7 +266,7 @@ async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() 
     .unwrap();
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     let source = Source::new(vec![10, 20]);
-    assert!(repair.step(&f.db, &source).await.is_err());
+    assert!(repair.step(&f.db, &f.tenant, &source).await.is_err());
     assert_eq!(repair.after, None);
     assert_eq!(source.member_calls.lock().unwrap().as_slice(), &[10]);
     assert!(repair.next > Instant::now() + Duration::from_secs(50));
@@ -240,7 +276,7 @@ async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() 
     repair.next = Instant::now();
     assert_eq!(
         repair
-            .step(&f.db, &source)
+            .step(&f.db, &f.tenant, &source)
             .await
             .unwrap()
             .unwrap()
@@ -252,39 +288,39 @@ async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() 
 #[tokio::test]
 async fn gateway_observations_need_context_and_never_retire_on_unavailability() {
     let f = Fixture::new();
-    observe_gateway_membership(&f.db, 10, Some(100), false, true)
+    observe_gateway_membership(&f.db, &f.tenant, 10, Some(100), false, true)
         .await
         .unwrap();
     let initial = db::guild_enrollment(&f.db, 10).await.unwrap();
     for present in [true, false] {
-        observe_gateway_membership(&f.db, 10, None, true, present)
+        observe_gateway_membership(&f.db, &f.tenant, 10, None, true, present)
             .await
             .unwrap();
         assert!(
-            observe_gateway_membership(&f.db, 10, None, false, present)
+            observe_gateway_membership(&f.db, &f.tenant, 10, None, false, present)
                 .await
                 .is_err()
         );
         assert!(
-            observe_gateway_membership(&f.db, 10, Some(0), false, present)
+            observe_gateway_membership(&f.db, &f.tenant, 10, Some(0), false, present)
                 .await
                 .is_err()
         );
         assert!(
-            observe_gateway_membership(&f.db, u64::MAX, Some(100), false, present)
+            observe_gateway_membership(&f.db, &f.tenant, u64::MAX, Some(100), false, present)
                 .await
                 .is_err()
         );
     }
     assert_eq!(db::guild_enrollment(&f.db, 10).await.unwrap(), initial);
-    observe_gateway_membership(&f.db, 10, Some(100), false, false)
+    observe_gateway_membership(&f.db, &f.tenant, 10, Some(100), false, false)
         .await
         .unwrap();
-    observe_gateway_membership(&f.db, 10, Some(100), false, true)
+    observe_gateway_membership(&f.db, &f.tenant, 10, Some(100), false, true)
         .await
         .unwrap();
     assert!(db::guild_enrollment(&f.db, 10).await.unwrap().is_none());
-    observe_gateway_membership(&f.db, 10, Some(101), false, true)
+    observe_gateway_membership(&f.db, &f.tenant, 10, Some(101), false, true)
         .await
         .unwrap();
     assert_ne!(db::guild_enrollment(&f.db, 10).await.unwrap(), initial);

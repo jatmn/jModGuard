@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 /// ```
 pub struct ApiState {
     pub db: Db,
+    pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<ApiProcessConfig>,
     pub oauth: OAuthClient,
     /// Display caches only. Authorization must refresh the guild list.
@@ -42,8 +43,11 @@ impl ApiState {
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;
         db.require_config_version(primed.config);
+        let tenant =
+            crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
         Ok(Arc::new(Self {
             db,
+            tenant,
             cfg: Arc::new(cfg),
             oauth,
             guild_cache: DashMap::new(),
@@ -118,6 +122,7 @@ mod tests {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
             }
+            crate::tenant::remove_sidecars(&self.path);
         }
     }
     async fn prefix(db: &Db, value: &str) {

@@ -65,11 +65,12 @@ test('dashboard moderation counts stay with their requested server', async () =>
   assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/stats`);
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
   const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
-  pending[1].resolve(response({ events: 7, warns: 2, bans: 1 }));
+  pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(second, 'Moderation records'), '7');
   assert.equal(value(second, 'Warns'), '2');
   assert.equal(value(second, 'Bans'), '1');
+  assert.equal(value(second, 'Cases'), '4');
   pending[0].resolve(response({ events: 900, warns: 8, bans: 3 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(first, 'Moderation records'), '900');
@@ -81,7 +82,7 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
   const dashboard = app.tabDashboard();
   await new Promise(resolve => setImmediate(resolve));
-  for (const label of ['Moderation records', 'Warns', 'Bans']) {
+  for (const label of ['Moderation records', 'Warns', 'Bans', 'Cases']) {
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
     assert.equal(card.children[0].textContent, 'Unavailable');
   }
@@ -215,8 +216,9 @@ test('settings patches send only changed fields to the selected server', async (
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '?';
   await save.listeners.click({});
-  assert.deepEqual(calls[0], { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
-  assert.equal(calls[1].method, 'GET');
+  const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
+  assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
+  assert.ok(calls.some((c) => c.method === 'GET' && c.url.endsWith('/case-delete-roles')));
 });
 
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
@@ -224,7 +226,8 @@ test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   inputs[0].value = '';
   inputs[1].value = '';
   await save.listeners.click({});
-  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '' });
+  const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
+  assert.deepEqual(put.body, { prefix: null, bot_name: '' });
 });
 
 test('settings do not expose historical chat-retention controls', () => {
@@ -445,7 +448,7 @@ test('configuration mutations retain the loaded membership without refreshing or
     return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Membership changed' }) };
   });
   app.state.config = { enrollment_id: 'old-membership' };
-  for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy']]) {
+  for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy'], ['PUT', 'case-delete-roles'], ['DELETE', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']]) {
     const count = calls.length;
     await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, {}), /Membership changed/);
     assert.equal(calls.length, count + 1);
@@ -501,9 +504,9 @@ test('copy captures source membership on selection and sends both page scopes', 
   source.value = app.state.guilds[1].id;
   source.selectedOptions = [{ textContent: 'Second' }];
   await copy.listeners.click({});
-  assert.equal(calls.length, 0, 'copy waits for an explicitly loaded source');
+  assert.equal(calls.filter((c) => c.opts.method === 'POST').length, 0, 'copy waits for an explicitly loaded source');
   await source.listeners.change({});
-  assert.equal(calls.length, 1);
+  assert.equal(calls.filter((c) => c.url.includes(app.state.guilds[1].id)).length, 1);
   await copy.listeners.click({});
   const sent = calls.find(c => c.opts.method === 'POST');
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
@@ -594,7 +597,7 @@ test('moderation reads send the loaded page membership including query-string ro
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -603,7 +606,7 @@ test('moderation reads send the loaded page membership including query-string ro
   h.app.state.config = null;
   await h.app.api(`/api/guilds/${h.app.state.guildId}/stats`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
-  assert.equal(calls.length, 5, 'reads must not silently load a new membership');
+  assert.equal(calls.length, 8, 'reads must not silently load a new membership');
 });
 
 test('individual configuration GETs retain loaded membership without rebinding global or foreign scopes', async () => {

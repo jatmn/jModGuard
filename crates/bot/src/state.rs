@@ -47,6 +47,7 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
+    pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<BotProcessConfig>,
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
@@ -90,6 +91,8 @@ impl BotState {
             "log.discord_timeout_secs must be positive"
         );
         let image_spam = crate::image_spam::Detector::new(cfg.image_spam.clone())?;
+        let tenant =
+            crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
         let log_delivery_slots = tokio::sync::Semaphore::new(cfg.log.discord_concurrency);
         // Prime from DB at construction — never leave an "unobserved" sentinel.
         // Cache population is independent of the poll task; skipping the first
@@ -100,6 +103,7 @@ impl BotState {
         db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
+            tenant,
             cfg: Arc::new(cfg),
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
@@ -623,6 +627,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -683,6 +688,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -758,6 +764,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -797,6 +804,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -862,6 +870,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -919,6 +928,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -1008,5 +1018,6 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 }

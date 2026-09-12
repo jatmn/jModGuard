@@ -78,7 +78,7 @@ current membership at the primary; it does not perform Discord validation or a m
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
-bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage remains steps 0001–0010.
+bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage remains steps 0001–0011.
 
 ## Dispatch library
 

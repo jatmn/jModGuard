@@ -86,9 +86,7 @@ backup cleanup, external evidence ownership and distributed writer exclusion rem
 Guild migration0004 adds only the history table, constraints and parent/child triggers.
 Version5 additionally tracks [explicit case sources](CASE-SOURCES.md). `initialize` verifies
 and extends matching version1–5 stores to6, preserving cases, history, replay markers and
-settings. `open` requires6; old guild-store binaries reject6.
-Rollback needs matching pre-upgrade backup and binary. Core stays0010 and current bot/API
-continues using core moderation records.
+settings. Open now requires 8; see [tenant runtime](TENANT-RUNTIME.md).
 
 Local tests cover original-fact preservation, scope isolation, sequence pages, concurrent
 retries, conflicts, count/byte/read limits, removal/append races, child-deletion rollback,

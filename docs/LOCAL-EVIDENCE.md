@@ -2,9 +2,9 @@
 
 The opt-in Unix `evidence_transfer::LocalEvidenceStore` implements real file capture,
 verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.md).
-It is a library backend for a dedicated local filesystem. Current bot/API/conductor
-services do not call it. There is no new scheduler, serving route or configuration default.
-Core remains0010; the current guild schema is7.
+It is a library backend for a dedicated local filesystem. Bot and API now serve available
+objects through [tenant runtime](TENANT-RUNTIME.md). There is no Discord attachment capture
+worker in this change. Core is at migration 0011; the current guild schema is 8.
 
 ## Resource contract
 

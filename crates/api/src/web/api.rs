@@ -958,8 +958,12 @@ pub async fn stats(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     // Guild-scoped only — never expose cross-guild aggregates to a guild admin.
-    let s = db::enrolled_guild_stats(&app.db, enrollment).await?;
-    Ok(Json(serde_json::json!(s)))
+    let s = db::enrolled_guild_stats(&app.db, enrollment.clone()).await?;
+    let mut value = serde_json::json!(s);
+    if let Some(cases) = super::cases::case_count(&app, enrollment).await? {
+        value["cases"] = serde_json::json!(cases);
+    }
+    Ok(Json(value))
 }
 
 #[cfg(test)]

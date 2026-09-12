@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0010. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0011. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -91,21 +91,23 @@ Migration0010 adds empty `guild_store_catalog` and `guild_store_placements` tabl
 SQL constraints/triggers for valid shared/dedicated ownership. It does not infer placements
 from existing configuration, membership or data and does not move any records. Current
 bot/API operation continues against the configured database. Deploy matched builds, bot
-first; version9 binaries reject version10. Rollback requires matching pre-upgrade backup
+first; version10 binaries reject version11. Rollback requires matching pre-upgrade backup
 and binaries. See [catalog scope and limits](GUILD-STORES.md).
+
+Migration 0011 adds `guild_erasure_jobs` and `backup_cleanup_intents`. These are
+application-owned lifecycle rows, not a departed-guild membership ledger. Backup-copy
+workers are not activated.
 
 ## Separate guild-store family
 
-The inactive `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version7,
-using `migrations/guild/0001_identity.sql`, `0002_tenant_log_channels.sql`,
-`0003_cases.sql`, `0004_case_history.sql`, `0005_case_sources.sql`, `0006_case_evidence.sql` and `0007_bunny_evidence.sql`. This separate database holds identity, placement bindings, receipts,
-membership/log-channel settings and selected cases with bounded inline evidence, owned append-only history, source mappings and an inactive evidence ownership journal with Bunny transfer progress.
-Initialize verifies and upgrades a matching version1–6 store atomically; open requires7. No membership is inferred during upgrade.
-Older guild-store binaries reject version7: use matching pre-upgrade backups/binaries
-for rollback. See [tenant storage behavior](TENANT-LOG-CHANNELS.md). Core remains at
-migration0010; bot/API startup never creates this family. Each opener refuses the other family, even though
-version numbers may overlap. No records are moved and no runtime routing is enabled.
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version8,
+using `migrations/guild/0001_identity.sql` through `0008_erasure.sql`. This separate
+database holds identity, placement bindings, receipts, membership/log-channel
+settings, selected cases, history, sources, evidence ownership, Bunny transfer
+progress and tenant settings. Initialize verifies and upgrades a matching version1–7
+store atomically; open requires 8. See [tenant runtime](TENANT-RUNTIME.md). Core is at
+migration 0011. Each opener refuses the other family. No records are moved by startup.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
-Selected case payload removal and replay-key cleanup are described in
-[tenant case storage](TENANT-CASES.md); they do not activate current service recorders or full guild erasure.
+Selected case payload removal, replay-key cleanup and live guild erasure are described in
+[tenant case storage](TENANT-CASES.md) and [tenant runtime](TENANT-RUNTIME.md).

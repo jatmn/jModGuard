@@ -87,29 +87,28 @@ guild/global layers together, badword inheritance and guild-only log-channel map
 global context remains owner-only. Targeted rule/command/template reads must not load the
 entire configuration bundle. Complete tenant isolation and replica coordination remain separate work.
 
-The guild-store catalog is an inactive data-layer foundation; see `docs/GUILD-STORES.md`.
-Migration0010 adds empty nonsecret store/placement tables. Do not infer initial placement
-from settings/enrollments or connect these helpers to runtime routing/UI yet. Store ownership
-is immutable; initial assignment refuses changing a placement. Matching retries are receipt-
-free; real writes use existing recovery receipts and never bump config/slash versions.
-No URLs/credentials belong in the catalog. Placement revisions do not fence data writers.
-The separate inactive `db::guild_data` handle verifies `jmodguard-guild-1` identity and
-initial bindings. Keep its raw pool private; reuse the existing transport/recovery code.
-Never run core migrations/defaults on a guild store or adopt a foreign/unmarked schema.
-Version2 adds inactive captured membership/log-channel operations; see
-`docs/TENANT-LOG-CHANNELS.md`. Identity/placement/membership checks must share the data
-transaction, including empty/no-op paths. Keep per-membership edit revisions and closure
-atomic with mappings; never rebind or reopen a closed scope automatically. Initial binding
-is trusted lifecycle work, not permission checking. No current runtime routing/queue/version
-integration or full erasure is enabled. A successful snapshot check never authorizes a later write. Cloned backups can retain
-the same identity/revision. Routing, lifecycle erasure and writer exclusion remain pending.
+The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
+bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
+nonsecret. Credentials stay in process configuration. Initial placement cannot be changed
+here; populated-guild moves are later work. Never run core migrations/defaults on a guild
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 8. Identity,
+placement and membership checks share the data transaction. A successful snapshot check
+never authorizes a later write. The conductor still has no tenant routing.
+Library contracts for membership, cases, history, sources and evidence remain as
+documented in their TENANT/CASE pages. Runtime routing, selected-case recording,
+authorized serving and live guild erasure are described in `docs/TENANT-RUNTIME.md`.
+Identity/placement/membership checks must share the data transaction, including empty/no-op
+paths. Keep per-membership edit revisions and closure atomic with mappings; never rebind or
+reopen a closed scope automatically. Initial binding is trusted lifecycle work, not
+permission checking. A successful snapshot check never authorizes a later write. Cloned
+backups can retain the same identity/revision. Writer exclusion for moves remains pending.
 
 Version3 adds inactive selected cases/text evidence; see `docs/TENANT-CASES.md`. Reuse
 captured scope checks with data; preserve immutable source/payload retry semantics, bounded
 record/page inputs and payload-free replay markers after explicit removal. Closed-scope
 cleanup must stay bounded and refuse active memberships. Never infer success, fetch arbitrary
-evidence URLs, expire cases by age or expose removal without its backend permission and
-owned-evidence/backup lifecycle. Current services still use core moderation records.
+evidence URLs, expire cases by age or expose removal without its backend permission. Selected
+moderation outcomes now also write guild-store cases; core warn/ban mirrors remain.
 
 Version4 adds owned append-only case history; see `docs/CASE-HISTORY.md`. Preserve original
 facts, stable entry retries and per-case sequence order. Count/byte admission must share the
@@ -126,8 +125,9 @@ Version6 adds the inactive evidence ownership journal; see `docs/CASE-EVIDENCE.m
 Reserve before object writes, preserve stable identity/byte admission, and never acknowledge
 capture settlement while a write can still arrive. Removal cancels/hides metadata immediately;
 closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jobs are snapshots,
-not leases or provider proof. No object worker, Storage adapter, serving route or backup-copy
-lifecycle is activated. Private evidence and backups-only resources must remain separate.
+not leases or provider proof. Authorized serving of available objects is now
+implemented; Discord attachment capture and backup-copy cleanup remain later work.
+Private evidence and backups-only resources must remain separate.
 
 The opt-in Unix local evidence backend uses real bounded streaming and durable receipts;
 see `docs/LOCAL-EVIDENCE.md`. Hold its stable OS resource lock through I/O and SQL settlement,
@@ -373,7 +373,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0010_guild_store_catalog
+migrations/             0001_init through 0011_tenant_runtime
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

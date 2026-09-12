@@ -89,6 +89,7 @@ impl Drop for Fixture {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
+        crate::tenant::remove_sidecars(&self.path);
     }
 }
 #[derive(Default)]

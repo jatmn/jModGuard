@@ -1,6 +1,7 @@
 //! WebUI: Discord OAuth2 login, session handling, and the REST API.
 
 pub mod api;
+pub mod cases;
 pub mod oauth;
 pub mod state;
 
@@ -47,6 +48,24 @@ impl IntoResponse for ApiError {
                 Json(serde_json::json!({
                     "error": error.to_string(), "code": "guild_enrollment_changed"
                 })),
+            )
+                .into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<crate::tenant::TenantError>() {
+            let (status, code) = match error {
+                crate::tenant::TenantError::Unplaced => {
+                    (StatusCode::CONFLICT, "guild_store_unplaced")
+                }
+                crate::tenant::TenantError::Offline => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "guild_store_offline")
+                }
+                crate::tenant::TenantError::Membership => {
+                    (StatusCode::CONFLICT, "guild_store_membership")
+                }
+            };
+            return (
+                status,
+                Json(serde_json::json!({"error": error.to_string(), "code": code})),
             )
                 .into_response();
         }
@@ -797,6 +816,27 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             axum::routing::delete(api::cancel_action),
         )
         .route("/api/guilds/{guild_id}/stats", get(api::stats))
+        .route("/api/guilds/{guild_id}/cases", get(cases::list_cases))
+        .route(
+            "/api/guilds/{guild_id}/cases/{case_id}",
+            get(cases::get_case).delete(cases::delete_case),
+        )
+        .route(
+            "/api/guilds/{guild_id}/cases/{case_id}/history",
+            get(cases::list_history).post(cases::add_note),
+        )
+        .route(
+            "/api/guilds/{guild_id}/cases/{case_id}/evidence",
+            get(cases::list_evidence),
+        )
+        .route(
+            "/api/guilds/{guild_id}/cases/{case_id}/evidence/{evidence_id}",
+            get(cases::get_evidence),
+        )
+        .route(
+            "/api/guilds/{guild_id}/case-delete-roles",
+            get(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
+        )
         .layer(session_layer)
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,
@@ -890,7 +930,10 @@ fn configuration_scope(
     )?))
 }
 
-fn authorized_enrollment(auth: &AuthCtx, guild: u64) -> ApiResult<crate::db::GuildEnrollment> {
+pub(super) fn authorized_enrollment(
+    auth: &AuthCtx,
+    guild: u64,
+) -> ApiResult<crate::db::GuildEnrollment> {
     match &auth.enrollment {
         Some(enrollment) if guild > 0 && u64::try_from(enrollment.guild_id).ok() == Some(guild) => {
             Ok(enrollment.clone())
@@ -923,7 +966,11 @@ fn check_enrollment_token(auth: &AuthCtx, guild: u64, token: Option<&str>) -> Ap
     }
     Ok(())
 }
-fn check_page_enrollment(auth: &AuthCtx, guild: u64, headers: &HeaderMap) -> ApiResult<()> {
+pub(super) fn check_page_enrollment(
+    auth: &AuthCtx,
+    guild: u64,
+    headers: &HeaderMap,
+) -> ApiResult<()> {
     check_enrollment_token(
         auth,
         guild,
@@ -1020,6 +1067,7 @@ mod tests {
         let db = crate::db::Db::open(&tmp, 2).unwrap();
         let app = crate::web::state::ApiState::new(Default::default(), db).unwrap();
         std::fs::remove_file(&tmp).ok();
+        crate::tenant::remove_sidecars(&tmp);
         router(app)
     }
 
@@ -1178,6 +1226,7 @@ mod tests {
         cfg.web.cors_origins = vec!["https://admin.example.com".into()];
         let app = router(crate::web::state::ApiState::new(cfg, db).unwrap());
         std::fs::remove_file(&tmp).ok();
+        crate::tenant::remove_sidecars(&tmp);
         let res = app
             .oneshot(
                 Request::builder()
@@ -1473,6 +1522,7 @@ mod tests {
         cfg.bot.owner_id = owner_id;
         let app = ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
+        crate::tenant::remove_sidecars(&tmp);
         app
     }
 

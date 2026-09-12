@@ -25,6 +25,12 @@ impl GuildDataScope {
     pub fn guild_id(&self) -> i64 {
         self.placement.guild_id()
     }
+    pub fn placement(&self) -> &GuildPlacement {
+        &self.placement
+    }
+    pub fn enrollment(&self) -> &GuildEnrollment {
+        &self.enrollment
+    }
 }
 
 /// A bounded list (one entry per supported event), with its optimistic edit token.
@@ -102,6 +108,32 @@ impl GuildDataStore {
             tx.execute("INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?1,?2,?3,1,?4)", params![scope.guild_id(), scope.enrollment.id.as_str(), scope.enrollment.joined_at_ns, new_revision()])?;
             tx.commit()
         }).await
+    }
+
+    pub async fn stored_membership(
+        &self,
+        placement: GuildPlacement,
+    ) -> Result<Option<(GuildEnrollment, bool)>> {
+        self.check_target(&placement)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                verify_bound_placement(&tx, &expected, &placement)?;
+                let row = membership(&tx, placement.guild_id())?;
+                tx.finish_read()?;
+                Ok(row.map(|(id, joined_at_ns, active, _)| {
+                    (
+                        GuildEnrollment {
+                            guild_id: placement.guild_id(),
+                            id,
+                            joined_at_ns,
+                        },
+                        active,
+                    )
+                }))
+            })
+            .await
     }
 
     /// Close this exact membership and remove its log mappings atomically. Keep a

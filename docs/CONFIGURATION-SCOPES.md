@@ -54,9 +54,9 @@ the primary transaction lock. Existing lost-commit reconciliation still applies.
 mutations retain their existing receipt and no-op version behavior.
 
 No new dependency, connection pool, cache or per-message work is added. These checks are
-not a transaction spanning Discord and SQL. Shared/dedicated routing, guild erasure, owner
-recovery and runtime queue activation are not implemented by this boundary. The current
-schema remains `jmodguard-core-1`, migrations 0001–0010.
+not a transaction spanning Discord and SQL. Shared/dedicated routing, selected cases and
+live guild erasure now run through [tenant runtime](TENANT-RUNTIME.md). The current
+schema remains `jmodguard-core-1`, migrations 0001–0011.
 
 Local tests cover stale scopes before and after rejoin, empty patches, nickname re-sync,
 source/destination copy checks, global writes from a stale guild context, modified identity,
@@ -98,12 +98,13 @@ not grant access. No installation-owner bypass or automatic enrollment adoption 
 
 [Moderation event, ban and statistics reads](MODERATION-READS.md) also require the page token
 and verify membership with their data. Individual configuration reads now follow the same
-captured membership contract described below. Unban and log-channel operations
+captured membership contract described below. Case, evidence and case-removal-role routes
+use the same page token against the live guild store. Unban and log-channel operations
 use the page token and a stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
 retain captured membership and current action permissions.
-A missed Discord departure may leave an observation stale until reconciled. This wave does
-not provide full tenant isolation, erasure, distributed worker ownership or atomicity across
-Discord and SQL. The API no longer retains or needs a bot token.
+A missed Discord departure may leave an observation stale until reconciled. Live tenant
+isolation and guild erasure are described in [tenant runtime](TENANT-RUNTIME.md). The API
+no longer retains or needs a bot token.
 
 ## Individual configuration reads
 

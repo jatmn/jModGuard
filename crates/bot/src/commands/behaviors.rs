@@ -27,23 +27,46 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
-            if let Some(m) = member {
-                let _ = m
-                    .ban_with_reason(&env.ctx.http, *delete_days, &reason)
-                    .await;
+            let discord = if let Some(m) = member {
+                m.ban_with_reason(&env.ctx.http, *delete_days, &reason)
+                    .await
             } else {
                 env.guild_id
                     .ban_with_reason(&env.ctx.http, target, *delete_days, &reason)
-                    .await?;
-            }
-            db::record_ban(
-                &env.app.db,
-                env.guild_id.get() as i64,
-                target.get() as i64,
-                Some(env.actor.get() as i64),
-                &reason,
+                    .await
+            };
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                env.guild_id.get(),
+                crate::db::guild_data::CaseAction::Ban,
+                outcome.clone(),
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
             )
-            .await?;
+            .await;
+            match outcome {
+                crate::db::guild_data::CaseOutcome::Succeeded => {
+                    db::record_ban(
+                        &env.app.db,
+                        env.guild_id.get() as i64,
+                        target.get() as i64,
+                        Some(env.actor.get() as i64),
+                        &reason,
+                    )
+                    .await?;
+                }
+                crate::db::guild_data::CaseOutcome::Failed => {
+                    return Err(discord
+                        .err()
+                        .map(|error| anyhow!("{error}"))
+                        .unwrap_or_else(|| anyhow!("ban failed")));
+                }
+                _ => return Err(anyhow!("ban outcome is uncertain; verify it in Discord")),
+            }
             log_mod(env, "ban", target, &target_user.name, &reason).await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
@@ -58,10 +81,25 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let target_user = user_lookup(env, target).await?;
             // Discord is authoritative; local bans table is a mirror healed by
             // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
-            env.ctx
+            let discord = env
+                .ctx
                 .http
                 .remove_ban(env.guild_id, target, Some(&reason))
-                .await?;
+                .await;
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                env.guild_id.get(),
+                crate::db::guild_data::CaseAction::Unban,
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
             if let Err(e) =
                 db::mark_unbanned(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await
             {
@@ -90,7 +128,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
-            member.kick_with_reason(&env.ctx.http, &reason).await?;
+            let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                env.guild_id.get(),
+                crate::db::guild_data::CaseAction::Kick,
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
             log_mod(env, "kick", target, &target_user.name, &reason).await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
@@ -121,20 +173,47 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
+            let until = if minutes == 0 {
+                None
+            } else {
+                Some(
+                    Timestamp::from_unix_timestamp(
+                        chrono::Utc::now().timestamp() + (minutes as i64) * 60,
+                    )
+                    .map_err(|e| anyhow!("invalid timeout: {e}"))?,
+                )
+            };
+            let discord = if let Some(until) = until {
+                member
+                    .disable_communication_until_datetime(&env.ctx.http, until)
+                    .await
+            } else {
+                member.enable_communication(&env.ctx.http).await
+            };
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                env.guild_id.get(),
+                if minutes == 0 {
+                    crate::db::guild_data::CaseAction::TimeoutRemoval
+                } else {
+                    crate::db::guild_data::CaseAction::Timeout
+                },
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
             if minutes == 0 {
-                member.enable_communication(&env.ctx.http).await?;
                 let mut v = vars.clone();
                 v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
-                let until = Timestamp::from_unix_timestamp(
-                    chrono::Utc::now().timestamp() + (minutes as i64) * 60,
-                )
-                .map_err(|e| anyhow!("invalid timeout: {e}"))?;
-                member
-                    .disable_communication_until_datetime(&env.ctx.http, until)
-                    .await?;
                 let mut v = vars.clone();
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
@@ -168,6 +247,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 &reason,
             )
             .await?;
+            crate::cases::record(
+                env.app,
+                env.guild_id.get(),
+                crate::db::guild_data::CaseAction::Warning,
+                crate::db::guild_data::CaseOutcome::Succeeded,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
             log_mod(env, "warn", target, &target_user.name, &reason).await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("reason".into(), reason);

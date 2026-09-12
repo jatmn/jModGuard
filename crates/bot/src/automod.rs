@@ -359,53 +359,144 @@ pub async fn execute_pending(
             }
         }
         "warn" => {
-            let _ = db::add_warn(
+            let warn_ok = db::add_warn(
                 &app.db,
                 guild_id.get() as i64,
                 target.id.get() as i64,
                 0,
                 &format!("[automod:{}] {}", pending.rule_id, reason),
             )
+            .await
+            .is_ok();
+            crate::cases::record(
+                app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Warning,
+                if warn_ok {
+                    crate::db::guild_data::CaseOutcome::Succeeded
+                } else {
+                    crate::db::guild_data::CaseOutcome::Failed
+                },
+                target.id.get(),
+                None,
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
+            )
             .await;
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
-            if let Some(mut member) = ctx
+            let member = ctx
                 .cache
                 .guild(guild_id)
-                .and_then(|g| g.members.get(&target.id).cloned())
-            {
+                .and_then(|g| g.members.get(&target.id).cloned());
+            let outcome = if let Some(mut member) = member {
                 let until =
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
                         .ok();
                 if let Some(until) = until {
-                    let _ = member
-                        .disable_communication_until_datetime(&ctx.http, until)
-                        .await;
+                    crate::cases::classify_discord(
+                        member
+                            .disable_communication_until_datetime(&ctx.http, until)
+                            .await
+                            .err()
+                            .as_ref(),
+                    )
+                } else {
+                    crate::db::guild_data::CaseOutcome::Failed
                 }
             } else {
                 tracing::warn!("automod timeout: member {} not cached", target.id);
-            }
+                crate::db::guild_data::CaseOutcome::Failed
+            };
+            crate::cases::record(
+                app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Timeout,
+                outcome,
+                target.id.get(),
+                None,
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
+            )
+            .await;
         }
         "kick" => {
-            if let Some(member) = ctx
+            let member = ctx
                 .cache
                 .guild(guild_id)
-                .and_then(|g| g.members.get(&target.id).cloned())
-            {
-                let _ = member.kick_with_reason(&ctx.http, &reason).await;
-            }
+                .and_then(|g| g.members.get(&target.id).cloned());
+            let outcome = if let Some(member) = member {
+                crate::cases::classify_discord(
+                    member
+                        .kick_with_reason(&ctx.http, &reason)
+                        .await
+                        .err()
+                        .as_ref(),
+                )
+            } else {
+                crate::db::guild_data::CaseOutcome::Failed
+            };
+            crate::cases::record(
+                app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Kick,
+                outcome,
+                target.id.get(),
+                None,
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
+            )
+            .await;
         }
         "ban" => {
-            let _ = guild_id
+            let discord = guild_id
                 .ban_with_reason(&ctx.http, target.id, rule.delete_days, &reason)
                 .await;
-            let _ = db::record_ban(
-                &app.db,
-                guild_id.get() as i64,
-                target.id.get() as i64,
+            let outcome = crate::cases::classify_discord(discord.err().as_ref());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
+                let _ = db::record_ban(
+                    &app.db,
+                    guild_id.get() as i64,
+                    target.id.get() as i64,
+                    None,
+                    &format!("[automod:{}] {}", pending.rule_id, reason),
+                )
+                .await;
+            }
+            crate::cases::record(
+                app,
+                guild_id.get(),
+                crate::db::guild_data::CaseAction::Ban,
+                outcome,
+                target.id.get(),
                 None,
-                &format!("[automod:{}] {}", pending.rule_id, reason),
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
             )
             .await;
         }

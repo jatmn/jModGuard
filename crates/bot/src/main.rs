@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
                 };
                 let result = tokio::select! {
                     _ = shutdown_signal() => break,
-                    result = repair.step(&app.db, &source) => result,
+                    result = repair.step(&app.db, &app.tenant, &source) => result,
                 };
                 match result {
                     Ok(Some(report)) if report.failed > 0 => tracing::warn!(
@@ -224,6 +224,31 @@ async fn main() -> Result<()> {
                     _ = cleanup.tick() => {
                         if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await {
                             tracing::warn!("bot action history cleanup failed: {error:#}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(5));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal() => break,
+                    _ = poll.tick() => {
+                        loop {
+                            match app.tenant.drive_erasure().await {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(error) => {
+                                    tracing::warn!("guild erasure deferred: {error:#}");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

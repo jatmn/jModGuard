@@ -252,6 +252,41 @@ impl BunnyEvidenceStore {
         })
         .await
     }
+
+    pub async fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
+        ensure!(
+            job.storage_id == self.storage_id,
+            "evidence storage alias mismatch"
+        );
+        self.timed(async {
+            let mut response = self
+                .send(self.request(Method::GET, &job.object_key, Body::empty())?)
+                .await?;
+            ensure!(
+                response.status() == StatusCode::OK,
+                "stored evidence unavailable"
+            );
+            let mut received = Vec::new();
+            let mut digest = Digest::new(&SHA256);
+            while let Some(chunk) = response.body_mut().data().await {
+                let chunk = chunk.map_err(|_| anyhow::anyhow!("evidence read interrupted"))?;
+                ensure!(
+                    received.len() as u64 + chunk.len() as u64 <= job.reserved_bytes,
+                    "stored evidence exceeds reservation"
+                );
+                digest.update(&chunk);
+                received.extend_from_slice(&chunk);
+            }
+            ensure!(
+                received.len() as u64 == job.reserved_bytes
+                    && digest_hex(digest.finish()) == expected_sha,
+                "stored evidence checksum or size mismatch"
+            );
+            Ok(received)
+        })
+        .await
+    }
+
     pub async fn capture<R: AsyncRead + AsyncSeek + Unpin + Send + 'static>(
         &self,
         store: GuildDataStore,

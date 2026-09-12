@@ -58,6 +58,9 @@ impl StoreRegistration {
     pub fn policy(&self) -> StorePolicy {
         self.policy
     }
+    pub(crate) fn from_parts(id: StoreId, policy: StorePolicy) -> Self {
+        Self { id, policy }
+    }
 }
 
 /// Initial placement identity. A revision is not a distributed writer lease.
@@ -76,6 +79,15 @@ impl GuildPlacement {
     }
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+    pub(crate) fn from_parts(guild_id: i64, store_id: StoreId, revision: String) -> Result<Self> {
+        StoreId::parse(&revision)?;
+        anyhow::ensure!(guild_id > 0, "invalid guild id");
+        Ok(Self {
+            guild_id,
+            store_id,
+            revision,
+        })
     }
 }
 
@@ -209,6 +221,64 @@ pub async fn assign_initial_placement(
             guild_id: guild,
             store_id,
             revision,
+        })
+    })
+    .await
+}
+
+/// Remove a placement after owned live data is erased. This is not a guild move.
+pub async fn clear_erased_placement(
+    db: &Db,
+    guild: i64,
+    expected: &GuildPlacement,
+) -> Result<bool> {
+    anyhow::ensure!(
+        guild > 0 && expected.guild_id() == guild,
+        "invalid guild id"
+    );
+    let store_id = expected.store_id().as_str().to_owned();
+    let revision = expected.revision().to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        match placement_conn(&tx, guild)? {
+            Some(current)
+                if current.store_id.as_str() == store_id && current.revision == revision =>
+            {
+                tx.ensure_mutation_receipt()?;
+                tx.execute(
+                    "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
+                    params![guild, store_id.as_str(), revision.as_str()],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            None => {
+                tx.finish_read()?;
+                Ok(false)
+            }
+            Some(_) => Err(CatalogConflict::Placement.into()),
+        }
+    })
+    .await
+}
+
+pub async fn shared_store_registration(db: &Db) -> Result<Option<StoreRegistration>> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction_primary_read()?;
+        let row = tx
+            .query_row(
+                "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id IS NULL ORDER BY store_id LIMIT 1",
+                (),
+                |r| Ok(r.get::<String>(0)?),
+            )
+            .optional()?;
+        tx.finish_read()?;
+        Ok(match row {
+            Some(id) => Some(StoreRegistration {
+                id: StoreId::parse(&id)?,
+                policy: StorePolicy::Shared,
+            }),
+            None => None,
         })
     })
     .await

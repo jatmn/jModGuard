@@ -196,6 +196,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
+        crate::tenant::remove_sidecars(&self.path);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
@@ -227,6 +228,8 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
                 "events",
                 "bans",
                 "stats",
+                "cases",
+                "case-delete-roles",
             ] {
                 let (status, body) = f
                     .request("GET", &format!("/api/guilds/{guild}/{suffix}"), "")
@@ -256,6 +259,12 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
                 "POST",
                 "unban",
                 r#"{"request_id":"1000_unban","user_id":"99"}"#,
+            ),
+            ("DELETE", "cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ""),
+            (
+                "PUT",
+                "case-delete-roles",
+                r#"{"roles":[],"revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
             ),
         ] {
             let (status, value) = f
@@ -1147,4 +1156,121 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
             && patterns.contains(&"global")
             && !patterns.contains(&"foreign")
     );
+}
+
+#[tokio::test]
+async fn cases_are_isolated_and_deletion_requires_administrator() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let left = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let right = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    f.app.tenant.activate(left.clone()).await.unwrap().unwrap();
+    f.app.tenant.activate(right.clone()).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .record_selected_case(
+            left.clone(),
+            CaseData {
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Warning,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 1,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: Some("secret".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids = body["cases"].as_array().unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(body["can_delete"], false);
+    let (status, other) = f.request("GET", "/api/guilds/20/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    assert!(other["cases"].as_array().unwrap().is_empty());
+    let id = ids[0].as_str().unwrap();
+    let (status, leaked) = f
+        .request("GET", &format!("/api/guilds/20/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{leaked}");
+    assert!(!leaked.to_string().contains("secret"));
+    let (status, denied) = f
+        .request("DELETE", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+}
+
+#[tokio::test]
+async fn administrator_can_delete_cases_and_offline_stores_fail_closed() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    use crate::db::guild_stores::{StoreId, StorePolicy, assign_initial_placement, register_store};
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    f.app
+        .tenant
+        .record_selected_case(
+            enrollment.clone(),
+            CaseData {
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Kick,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 2,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: Some("private-reason".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["cases"][0].as_str().unwrap().to_owned();
+    f.discord.guilds.lock().unwrap()[0].owner = true;
+    f.app.guild_cache.clear();
+    let (status, deleted) = f
+        .request("DELETE", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["removed"], true);
+    assert_eq!(deleted["discord_action_reversed"], false);
+    let (status, missing) = f
+        .request("GET", &format!("/api/guilds/10/cases/{id}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{missing}");
+    assert!(!missing.to_string().contains("private-reason"));
+
+    let ghost = Fixture::new(false).await;
+    ghost.enroll(10).await;
+    let store = StoreId::new();
+    register_store(&ghost.app.db, store.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    assign_initial_placement(&ghost.app.db, 10, store)
+        .await
+        .unwrap();
+    let (status, offline) = ghost.request("GET", "/api/guilds/10/cases", "").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{offline}");
+    assert_eq!(offline["code"], "guild_store_offline");
+    assert!(!offline.to_string().contains("private-reason"));
 }

@@ -329,3 +329,45 @@ async fn catalog_migration_keeps_version_nine_data_and_starts_empty() {
     drop(db);
     cleanup_db(&path);
 }
+
+#[tokio::test]
+async fn tenant_runtime_migration_keeps_version_ten_catalog_and_starts_empty() {
+    let path = tmp_db_path("catalog_v10");
+    {
+        let c = Connection::open(&path).unwrap();
+        for (index, sql) in MIGRATIONS[..10].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", (index + 1) as i64)
+                .unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')",
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path, 2).unwrap();
+    assert_eq!(
+        query_events(&db, 10, None, None, 50).await.unwrap().len(),
+        1
+    );
+    let jobs: i64 = db
+        .with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM guild_erasure_jobs", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    let intents: i64 = db
+        .with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM backup_cleanup_intents", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+    assert_eq!(intents, 0);
+    drop(db);
+    cleanup_db(&path);
+}

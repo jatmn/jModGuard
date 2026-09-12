@@ -84,6 +84,16 @@ impl DiscordGuild {
             .unwrap_or(false)
     }
 
+    pub fn administrator_permission(&self) -> bool {
+        const ADMINISTRATOR: u64 = 1 << 3;
+        self.owner
+            || self
+                .permissions
+                .as_ref()
+                .map(|p| p.as_u64() & ADMINISTRATOR != 0)
+                .unwrap_or(false)
+    }
+
     /// WebUI configuration rights do not imply authority to remove bans.
     pub fn ban_members_permission(&self) -> bool {
         const ADMINISTRATOR: u64 = 1 << 3;
@@ -277,11 +287,23 @@ mod tests {
         )
         .unwrap();
         assert!(!g.manage_permission(), "no MANAGE_GUILD");
-        let g: DiscordGuild = serde_json::from_str(
+        let owner: DiscordGuild = serde_json::from_str(
             r#"{"id":"1","name":"x","icon":null,"owner":true,"permissions":0}"#,
         )
         .unwrap();
-        assert!(g.manage_permission(), "owner bypass");
+        assert!(owner.manage_permission(), "owner bypass");
+        assert!(owner.administrator_permission());
+        let admin: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":8}"#,
+        )
+        .unwrap();
+        assert!(admin.administrator_permission());
+        let manage_only: DiscordGuild = serde_json::from_str(
+            r#"{"id":"1","name":"x","icon":null,"owner":false,"permissions":32}"#,
+        )
+        .unwrap();
+        assert!(manage_only.manage_permission());
+        assert!(!manage_only.administrator_permission());
     }
 
     #[test]

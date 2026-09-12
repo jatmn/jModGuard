@@ -26,6 +26,7 @@ fn cleanup_db(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    jmodguard::tenant::remove_sidecars(path);
 }
 
 fn open_dual(path: &PathBuf) -> (Db, Db) {
@@ -136,6 +137,14 @@ async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_n
     use jmodguard_bot::enrollment_repair::observe_gateway_membership;
     let path = tmp_db_path("gateway_nickname");
     let database = Db::open(&path, 2).unwrap();
+    let cfg = BotProcessConfig::default();
+    let tenant = jmodguard::tenant::TenantRuntime::open(
+        &database,
+        &cfg.db,
+        &cfg.guild_stores,
+        &cfg.evidence,
+    )
+    .unwrap();
     enroll_guild(&database, 10, 101).await.unwrap();
     patch_settings(&database, 10, None, Some(Some("new name".into())), None)
         .await
@@ -145,14 +154,14 @@ async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_n
         .unwrap()
         .remove(0);
     assert!(
-        observe_gateway_membership(&database, 10, None, false, false)
+        observe_gateway_membership(&database, &tenant, 10, None, false, false)
             .await
             .is_err()
     );
-    observe_gateway_membership(&database, 10, Some(101), true, false)
+    observe_gateway_membership(&database, &tenant, 10, Some(101), true, false)
         .await
         .unwrap();
-    observe_gateway_membership(&database, 10, Some(100), false, false)
+    observe_gateway_membership(&database, &tenant, 10, Some(100), false, false)
         .await
         .unwrap();
     assert!(
@@ -160,7 +169,7 @@ async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_n
             .await
             .unwrap()
     );
-    observe_gateway_membership(&database, 10, Some(101), false, false)
+    observe_gateway_membership(&database, &tenant, 10, Some(101), false, false)
         .await
         .unwrap();
     assert!(

@@ -1,9 +1,9 @@
 # Selected moderation cases in guild stores
 
 The inactive guild-store library now records selected moderation facts and bounded text
-evidence under captured store, placement and membership scope. Current bot/API handlers
-still use their existing core moderation records. No new route, case recorder, cleanup
-worker or provider call is activated, and no routine event/message archive is introduced.
+evidence under captured store, placement and membership scope. Bot and API handlers now
+record selected action outcomes and expose private case administration; see
+[tenant runtime](TENANT-RUNTIME.md). No routine event/message archive is introduced.
 
 ## Identity and facts
 
@@ -94,13 +94,14 @@ Guild migration0003 adds only `guild_cases` and its indexes/guards within `jmodg
 it to6, preserving placement, settings and cases. Version4 adds owned history; version5 adds
 source mappings with original-key backfill. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
 applies all six steps.
-`open` requires6. Old guild-store binaries reject6; rollback needs matching pre-upgrade
-backups and binaries. Core remains0010 and current services never open these guild stores.
+`open` requires 8. Old guild-store binaries reject 8; rollback needs matching pre-upgrade
+backups and binaries. Core is at migration 0011. Bot and API open these stores through
+[tenant runtime](TENANT-RUNTIME.md).
 
 Local regressions cover scoped persistence/paging, source conflicts/concurrent retries,
 removed-source replay, payload/ID validation and budgets, SQL guards, removal rollback,
 closed-scope denial, bounded cleanup and preservation through version2 upgrade. Disposable
 libSQL tests cover lost responses for record/removal/purge and cross-handle visibility.
-No live Bunny/Discord tests, measured resource use, external-file deletion or full tenant
-isolation guarantee is supplied. Runtime routing, permissions, lifecycle, distributed writer
-exclusion and cases/evidence UI remain separate implementation work.
+No live Bunny/Discord tests or measured RSS/billing is supplied. Runtime routing, selected
+case recording, authorized serving and live guild erasure are described in
+[tenant runtime](TENANT-RUNTIME.md).

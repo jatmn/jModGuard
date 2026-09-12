@@ -18,7 +18,8 @@ mod remote_https;
 pub mod templates;
 pub mod types;
 
-use crate::config::LogConfig;
+pub mod tenant;
+pub use crate::config::LogConfig;
 pub use jmodguard_runtime::shutdown_signal;
 
 /// Initializes tracing from config (console or rolling files under `log.directory`).

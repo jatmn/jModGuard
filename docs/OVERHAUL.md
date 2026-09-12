@@ -371,22 +371,16 @@ and cleanup verifies object absence before SQL acknowledgment. See [Bunny eviden
 
 Regional endpoints are allowlisted and authenticated resource markers checked; redirects,
 proxies and automatic request retries are absent. Existing HTTP/TLS/hash dependencies are
-reused. Current services/core0010 remain unchanged. Installer privacy checks, uncertain-upload
-operator resolution, live provider validation, runtime scheduling/authorization/serving and
-backup-copy lifecycle remain prerequisites to adoption.
+reused. Installer privacy checks, uncertain-upload operator resolution, live provider
+validation and backup-copy lifecycle remain later work. Serving of available objects is
+now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Extend the captured tenant log-channel pattern across the fresh data model/tenant
-   routing: shared/dedicated guild placement,
-   scoped case/evidence identities, selected durable audit records and bounded transient
-   message context. Correct exact repeated-image matching in the actual event pipeline.
-2. Add durable sessions, owner/guild authorization surfaces and effective settings with
-   revision handling. Backend authority must enforce every UI permission.
-3. Build release manifests/artifacts, the conductor control store and provider adapter,
-   then authenticated updates and portable backup/restore using the validated contracts.
-4. Complete guild/operator UI, backup scheduling/download/upload/restore, system metrics,
-   setup and provider documentation. Replace the old private-ops workflow before launch.
+1. Complete image and independent text spam rules with truthful cases/evidence and
+   selected Discord logging (R2).
+2. Usable conductor and owner administration (R3).
+3. Backup/restore, guild moves, releases and public installation (R4–R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish

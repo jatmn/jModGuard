@@ -306,6 +306,25 @@ impl GuildDataStore {
         }).await
     }
 
+    pub async fn case_count(&self, scope: GuildDataScope, limits: CaseLimits) -> Result<i64> {
+        self.check_target(&scope.placement)?;
+        limits.validate()?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |r| Ok(r.get(0)?),
+                )?;
+                tx.finish_read()?;
+                Ok(count)
+            })
+            .await
+    }
+
     /// Remove retained text/reason/actor/subject/outcome atomically. Keep only replay
     /// identities until closed-membership cleanup. No Discord side effect is performed.
     pub async fn remove_case(&self, scope: GuildDataScope, id: CaseId) -> Result<bool> {
