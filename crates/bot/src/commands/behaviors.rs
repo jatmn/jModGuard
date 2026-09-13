@@ -289,19 +289,20 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 args.rest()
             };
             let target_user = user_lookup(env, target).await?;
-            db::add_enrolled_warn(
+            let warn_result = db::add_enrolled_warn(
                 &env.app.db,
                 enrollment.clone(),
                 target.get() as i64,
                 env.actor.get() as i64,
                 &reason,
             )
-            .await?;
+            .await;
+            let outcome = crate::cases::classify_db_commit(&warn_result);
             crate::cases::record(
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Warning,
-                crate::db::guild_data::CaseOutcome::Succeeded,
+                outcome.clone(),
                 target.get(),
                 Some(env.actor.get()),
                 Some(reason.clone()),
@@ -309,6 +310,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::cases::application_source(),
             )
             .await;
+            match outcome {
+                crate::db::guild_data::CaseOutcome::Succeeded => {}
+                crate::db::guild_data::CaseOutcome::Failed => {
+                    return Err(warn_result.unwrap_err());
+                }
+                _ => {
+                    return Err(anyhow!("warn outcome is uncertain; verify it in the database"));
+                }
+            }
             log_mod(
                 env,
                 enrollment.clone(),

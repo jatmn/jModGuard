@@ -1278,3 +1278,111 @@ async fn missing_owned_store_cannot_be_recreated_as_erasure_proof() {
     assert!(reopened.drive_erasure().await.unwrap());
     assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_owned_evidence_cannot_be_reopened_as_cleanup_proof() {
+    use crate::db::guild_data::{EvidenceOrigin, EvidenceRequest, EvidenceState};
+    use crate::evidence_transfer::EvidenceUpload;
+    use std::io::Cursor;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::Path;
+
+    let f = Fixture::with_stores(
+        Default::default(),
+        EvidenceConfig {
+            backend: "local".into(),
+            ..Default::default()
+        },
+    );
+    let e = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(e.clone()).await.unwrap();
+    let case = CaseId::new();
+    let evidence_id = CaseId::new();
+    store
+        .record_case(scope.clone(), case.clone(), case_data(99), case_limits())
+        .await
+        .unwrap();
+    let storage =
+        CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+    let local = f.tenant.local_evidence().expect("local evidence backend");
+    let upload = EvidenceUpload {
+        target: crate::evidence_transfer::EvidenceTarget {
+            scope: scope.clone(),
+            case_id: case.clone(),
+            evidence_id: evidence_id.clone(),
+        },
+        request: EvidenceRequest {
+            storage_id: storage,
+            bytes: 3,
+            origin: EvidenceOrigin {
+                channel_id: 1,
+                message_id: 2,
+                attachment_id: 3,
+            },
+        },
+        limits: evidence_limits(),
+    };
+    assert_eq!(
+        local
+            .capture(store.clone(), upload, Cursor::new(b"abc".to_vec()))
+            .await
+            .unwrap(),
+        EvidenceState::Available
+    );
+    let visible = store
+        .available_case_evidence(scope.clone(), case.clone(), evidence_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.read_available(&visible.job, &visible.sha256).unwrap(),
+        b"abc"
+    );
+    let data_relative = Path::new(&visible.job.object_key).with_extension("data");
+
+    let evidence_root = PathBuf::from(format!("{}.evidence", f.path.display()));
+    let saved = evidence_root.with_extension("saved");
+    f.tenant.inner.handles.lock().await.map.clear();
+    std::fs::rename(&evidence_root, &saved).unwrap();
+
+    let cfg = DbConfig {
+        path: f.path.clone(),
+        pool_size: 2,
+        ..Default::default()
+    };
+    let evidence_cfg = EvidenceConfig {
+        backend: "local".into(),
+        ..Default::default()
+    };
+    assert!(
+        TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence_cfg).is_err(),
+        "missing owned evidence must fail closed"
+    );
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&evidence_root)
+        .unwrap();
+    assert!(
+        TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence_cfg).is_err(),
+        "an empty replacement is not cleanup proof"
+    );
+    std::fs::remove_dir_all(&evidence_root).unwrap();
+
+    assert_eq!(std::fs::read(saved.join(data_relative)).unwrap(), b"abc");
+
+    std::fs::rename(&saved, &evidence_root).unwrap();
+    let reopened = TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence_cfg).unwrap();
+    let (store, scope) = reopened.live(e).await.unwrap();
+    store.remove_case(scope.clone(), case.clone()).await.unwrap();
+    assert!(reopened.cleanup_owned_evidence(&store, &scope).await.is_ok());
+    assert_eq!(
+        store
+            .evidence_transfer_job(scope, case, evidence_id)
+            .await
+            .unwrap()
+            .state,
+        EvidenceState::Erased
+    );
+}

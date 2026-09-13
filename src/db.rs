@@ -127,6 +127,12 @@ pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
     crate::db_compat::is_database_commit_indeterminate(err)
 }
 
+/// Hidden helper for unit tests in dependent crates.
+#[doc(hidden)]
+pub fn test_database_commit_indeterminate_error() -> anyhow::Error {
+    crate::db_compat::test_database_commit_indeterminate_error()
+}
+
 /// Local SQLite can be temporarily locked while the bot is applying migrations.
 /// That is an expected API-startup race, unlike other SQLite failures.
 fn is_sqlite_startup_lock(err: &anyhow::Error) -> bool {

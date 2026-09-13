@@ -216,6 +216,27 @@ pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) 
     Ok(())
 }
 
+/// Read the persisted evidence storage identity without minting a new one.
+pub async fn existing_evidence_storage_id(db: &Db, configured: &str) -> Result<Option<String>> {
+    if !configured.is_empty() {
+        crate::db::guild_data::CaseId::try_from(configured.to_owned())?;
+        return Ok(Some(configured.to_owned()));
+    }
+    db.with_conn(|conn| {
+        let tx = conn.transaction_primary_read()?;
+        let existing = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='evidence_storage_id'",
+                (),
+                |r| Ok(r.get::<String>(0)?),
+            )
+            .optional()?;
+        tx.finish_read()?;
+        Ok(existing)
+    })
+    .await
+}
+
 pub async fn evidence_storage_id(db: &Db, configured: &str) -> Result<String> {
     if !configured.is_empty() {
         crate::db::guild_data::CaseId::try_from(configured.to_owned())?;

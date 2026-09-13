@@ -666,21 +666,28 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
             #[cfg(unix)]
             {
                 let root = evidence_root(core, evidence)?;
+                let first_install = db::existing_evidence_storage_id(core, &evidence.storage_id)
+                    .await?
+                    .is_none();
                 let id = crate::db::guild_data::CaseId::try_from(
                     db::evidence_storage_id(core, &evidence.storage_id).await?,
                 )?;
-                let store = crate::evidence_transfer::LocalEvidenceStore::initialize(
-                    root.clone(),
-                    id.clone(),
-                    evidence.buffer_bytes,
-                )
-                .or_else(|_| {
+                let store = if first_install {
+                    crate::evidence_transfer::LocalEvidenceStore::initialize(
+                        root,
+                        id,
+                        evidence.buffer_bytes,
+                    )?
+                } else {
                     crate::evidence_transfer::LocalEvidenceStore::open(
                         root,
                         id,
                         evidence.buffer_bytes,
                     )
-                })?;
+                    .context(
+                        "owned local evidence resource is missing or unavailable; restore the original evidence root before retrying",
+                    )?
+                };
                 Ok(EvidenceBackend::Local(store))
             }
             #[cfg(not(unix))]

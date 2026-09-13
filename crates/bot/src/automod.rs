@@ -360,24 +360,20 @@ pub async fn execute_pending(
             }
         }
         "warn" => {
-            let warn_ok = db::add_enrolled_warn(
+            let warn_result = db::add_enrolled_warn(
                 &app.db,
                 enrollment.clone(),
                 target.id.get() as i64,
                 0,
                 &format!("[automod:{}] {}", pending.rule_id, reason),
             )
-            .await
-            .is_ok();
+            .await;
+            let outcome = crate::cases::classify_db_commit(&warn_result);
             crate::cases::record(
                 app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Warning,
-                if warn_ok {
-                    crate::db::guild_data::CaseOutcome::Succeeded
-                } else {
-                    crate::db::guild_data::CaseOutcome::Failed
-                },
+                outcome,
                 target.id.get(),
                 None,
                 Some(reason.clone()),

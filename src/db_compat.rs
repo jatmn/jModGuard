@@ -47,6 +47,12 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Hidden helper for unit tests in dependent crates.
+#[doc(hidden)]
+pub fn test_database_commit_indeterminate_error() -> anyhow::Error {
+    DatabaseCommitIndeterminate(anyhow::anyhow!("lost commit")).into()
+}
+
 pub(crate) fn database_operation_timed_out(
     operation: &'static str,
     timeout: Duration,

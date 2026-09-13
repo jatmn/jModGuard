@@ -20,6 +20,14 @@ pub fn classify_discord(error: Option<&serenity::Error>) -> CaseOutcome {
     }
 }
 
+pub fn classify_db_commit<T>(result: &Result<T, anyhow::Error>) -> CaseOutcome {
+    match result {
+        Ok(_) => CaseOutcome::Succeeded,
+        Err(error) if db::is_database_commit_indeterminate(error) => CaseOutcome::Uncertain,
+        Err(_) => CaseOutcome::Failed,
+    }
+}
+
 pub fn application_source() -> CaseSource {
     CaseSource::Application {
         operation_id: CaseId::new(),
@@ -94,6 +102,19 @@ pub async fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn classify_db_commit_maps_indeterminate_errors() {
+        let ok: Result<(), anyhow::Error> = Ok(());
+        assert_eq!(classify_db_commit(&ok), CaseOutcome::Succeeded);
+
+        let failed: Result<(), anyhow::Error> = Err(anyhow::anyhow!("write failed"));
+        assert_eq!(classify_db_commit(&failed), CaseOutcome::Failed);
+
+        let uncertain: Result<(), anyhow::Error> =
+            Err(db::test_database_commit_indeterminate_error());
+        assert_eq!(classify_db_commit(&uncertain), CaseOutcome::Uncertain);
+    }
+
     #[tokio::test]
     async fn delayed_record_keeps_original_membership() {
         let path =
