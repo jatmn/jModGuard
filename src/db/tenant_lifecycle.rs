@@ -171,43 +171,49 @@ pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<b
             return Ok(false);
         }
         tx.ensure_mutation_receipt()?;
-        let mut config_changed = false;
-        let mut commands_changed = false;
-        let mut settings_changed = false;
-        for (index, sql) in [
-            "DELETE FROM rules WHERE guild_id=?1",
-            "DELETE FROM commands WHERE guild_id=?1",
-            "DELETE FROM templates WHERE guild_id=?1",
-            "DELETE FROM log_channels WHERE guild_id=?1",
-            "DELETE FROM badwords WHERE guild_id=?1",
-            "DELETE FROM guild_settings WHERE guild_id=?1",
-            "DELETE FROM events WHERE guild_id=?1",
-            "DELETE FROM warns WHERE guild_id=?1",
-            "DELETE FROM bans WHERE guild_id=?1",
-            "DELETE FROM nickname_reconcile WHERE guild_id=?1",
-            "DELETE FROM bot_actions WHERE guild_id=?1",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let changed = tx.execute(sql, params![guild])? > 0;
-            config_changed |= index < 6 && changed;
-            commands_changed |= index == 1 && changed;
-            settings_changed |= index == 5 && changed;
-        }
-        if config_changed {
-            bump_config_version_conn(&tx)?;
-        }
-        if commands_changed {
-            bump_slash_registry_version_conn(&tx)?;
-        }
-        if settings_changed {
-            invalidate_settings_heal_checksum_conn(&tx)?;
-        }
+        wipe_directory_guild_data_conn(&tx, guild)?;
         tx.commit()?;
         Ok(true)
     })
     .await
+}
+
+/// Caller holds the primary write transaction and has proved departure.
+pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) -> Result<()> {
+    let mut config_changed = false;
+    let mut commands_changed = false;
+    let mut settings_changed = false;
+    for (index, sql) in [
+        "DELETE FROM rules WHERE guild_id=?1",
+        "DELETE FROM commands WHERE guild_id=?1",
+        "DELETE FROM templates WHERE guild_id=?1",
+        "DELETE FROM log_channels WHERE guild_id=?1",
+        "DELETE FROM badwords WHERE guild_id=?1",
+        "DELETE FROM guild_settings WHERE guild_id=?1",
+        "DELETE FROM events WHERE guild_id=?1",
+        "DELETE FROM warns WHERE guild_id=?1",
+        "DELETE FROM bans WHERE guild_id=?1",
+        "DELETE FROM nickname_reconcile WHERE guild_id=?1",
+        "DELETE FROM bot_actions WHERE guild_id=?1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let changed = tx.execute(sql, params![guild])? > 0;
+        config_changed |= index < 6 && changed;
+        commands_changed |= index == 1 && changed;
+        settings_changed |= index == 5 && changed;
+    }
+    if config_changed {
+        bump_config_version_conn(tx)?;
+    }
+    if commands_changed {
+        bump_slash_registry_version_conn(tx)?;
+    }
+    if settings_changed {
+        invalidate_settings_heal_checksum_conn(tx)?;
+    }
+    Ok(())
 }
 
 pub async fn evidence_storage_id(db: &Db, configured: &str) -> Result<String> {

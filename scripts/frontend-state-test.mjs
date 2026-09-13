@@ -754,3 +754,37 @@ test('removed case recovery survives opening a new dashboard view and retries th
   await findNode(root, n => n.textContent === 'Retry cleanup').listeners.click();
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/cases/' + id)));
 });
+
+test('note retry retains intent after a lost response and blocks overlapping submits', async () => {
+  const id = 'a'.repeat(32), posts = [];
+  let resolveFirst;
+  const h = harness(async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push(JSON.parse(options.body));
+      if (posts.length === 1) return await new Promise((resolve, reject) => { resolveFirst = () => reject(new Error('response lost')); });
+      throw new Error('response lost');
+    }
+    if (url.includes('/history')) return response({history: []});
+    if (url.includes('/evidence')) return response({evidence: []});
+    if (url.endsWith('/cases?limit=50')) return response({cases: [id]});
+    if (url.includes('/cases?')) return response({cases: [id]});
+    return response({case: {action: 'warning', evidence: {}}, can_delete: true});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(root, n => n.tag === 'button' && n.textContent === id.slice(0,8)).listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const note = findNode(root, n => n.tag === 'textarea');
+  const submit = findNode(root, n => n.tag === 'button' && n.textContent === 'Add note');
+  assert.ok(note, textOf(root));
+  note.value = 'same note';
+  const first = submit.listeners.click();
+  await submit.listeners.click();
+  assert.equal(posts.length,1);
+  resolveFirst(); await first;
+  await submit.listeners.click();
+  assert.deepEqual(posts[1],posts[0]);
+  note.value = 'different note';
+  await submit.listeners.click();
+  assert.notEqual(posts[2].entry_id,posts[0].entry_id);
+});

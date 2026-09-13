@@ -208,6 +208,13 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
     for operator in [false, true] {
         let f = Fixture::new(operator).await;
         f.enroll(10).await;
+        // Verify denial while placed-guild payload awaits asynchronous erasure.
+        f.app
+            .tenant
+            .activate(db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         db::patch_settings(&f.app.db, 10, Some(Some("private".into())), None, None)
             .await
             .unwrap();
@@ -1208,6 +1215,21 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(status, StatusCode::OK, "{other}");
     assert!(other["cases"].as_array().unwrap().is_empty());
     let id = ids[0].as_str().unwrap();
+    let note_url = format!("/api/guilds/10/cases/{id}/history");
+    let note = serde_json::json!({"entry_id":"a".repeat(32),"text":"one intent"}).to_string();
+    let (status, first) = f.request("POST", &note_url, &note).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    // Discard the successful response, as a client with a lost response would.
+    let (status, replay) = f.request("POST", &note_url, &note).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    let (_, entries) = f.request("GET", &note_url, "").await;
+    assert_eq!(entries["history"].as_array().unwrap().len(), 1);
+    let conflict = serde_json::json!({"entry_id":"a".repeat(32),"text":"changed"}).to_string();
+    assert_eq!(
+        f.request("POST", &note_url, &conflict).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
     let (status, leaked) = f
         .request("GET", &format!("/api/guilds/20/cases/{id}"), "")
         .await;

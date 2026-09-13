@@ -360,9 +360,9 @@ pub async fn execute_pending(
             }
         }
         "warn" => {
-            let warn_ok = db::add_warn(
+            let warn_ok = db::add_enrolled_warn(
                 &app.db,
-                guild_id.get() as i64,
+                enrollment.clone(),
                 target.id.get() as i64,
                 0,
                 &format!("[automod:{}] {}", pending.rule_id, reason),
@@ -469,7 +469,7 @@ pub async fn execute_pending(
             .await;
         }
         "ban" => {
-            app.suppress_next_gateway_case(
+            let suppression = app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 guild_id.get(),
                 target.id.get(),
@@ -479,16 +479,12 @@ pub async fn execute_pending(
                 .await;
             let outcome = crate::cases::classify_discord(discord.err().as_ref());
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
-                app.release_gateway_case_suppression(
-                    crate::state::GatewayCaseAction::Ban,
-                    guild_id.get(),
-                    target.id.get(),
-                );
+                app.release_gateway_case_suppression(suppression);
             }
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
-                let _ = db::record_ban(
+                let _ = db::record_enrolled_ban(
                     &app.db,
-                    guild_id.get() as i64,
+                    enrollment.clone(),
                     target.id.get() as i64,
                     None,
                     &format!("[automod:{}] {}", pending.rule_id, reason),
@@ -525,9 +521,9 @@ pub async fn execute_pending(
             "rule": pending.rule_id, "action": rule.action,
             "reason": reason, "evidence": pending.evidence,
         });
-        let _ = db::insert_event(
+        let _ = db::insert_enrolled_event(
             &app.db,
-            guild_id.get() as i64,
+            enrollment.clone(),
             "automod",
             Some(target.id.get() as i64),
             None,

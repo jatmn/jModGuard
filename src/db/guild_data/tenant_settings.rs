@@ -32,16 +32,16 @@ impl GuildDataStore {
                 let (_, revision) = verify_scope(&tx, &expected, &scope, true)?;
                 let row = tx
                     .query_row(
-                        "SELECT case_delete_roles,revision FROM guild_tenant_settings WHERE guild_id=?1 AND enrollment_id=?2",
+                        "SELECT case_delete_roles FROM guild_tenant_settings WHERE guild_id=?1 AND enrollment_id=?2",
                         params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+                        |r| Ok(r.get::<String>(0)?),
                     )
                     .optional()?;
                 tx.finish_read()?;
                 Ok(match row {
-                    Some((raw, stored)) => TenantSettings {
+                    Some(raw) => TenantSettings {
                         case_delete_roles: parse_roles(&raw)?,
-                        revision: stored,
+                        revision,
                     },
                     None => TenantSettings {
                         case_delete_roles: Vec::new(),

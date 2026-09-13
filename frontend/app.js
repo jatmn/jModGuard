@@ -1281,6 +1281,8 @@ function tabCases() {
       const evidence = await api(`/api/guilds/${guildId}/cases/${id}/evidence`);
       if (currentDetail !== detailRequest || state.guildId !== guildId) return;
       const c = payload.case || {};
+      let noteIntent = null;
+      let notePending = false;
       const note = el("textarea", { rows: "3", placeholder: "Add a note. This does not change Discord." });
       detail.replaceChildren(
         el("h3", { text: "Case " + id }),
@@ -1301,11 +1303,19 @@ function tabCases() {
         ...(history.history || []).map((entry) => el("p", { class: "muted", text: JSON.stringify(entry.entry.body) })),
         el("div", { class: "field" }, el("label", { text: "Note" }), note,
           el("button", { class: "btn small", type: "button", text: "Add note", onclick: async () => {
+            if (notePending) return;
             try {
-              await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", { text: note.value });
+              const text = note.value.trim();
+              if (!noteIntent || noteIntent.text !== text) {
+                noteIntent = { entry_id: crypto.randomUUID().replaceAll("-", ""), text };
+              }
+              notePending = true;
+              await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent);
+              noteIntent = null;
               toast("Note added", "success");
-              openCase(id);
+              await openCase(id);
             } catch (e) { toast(e.message || String(e), "error"); }
+            finally { notePending = false; }
           } })),
         el("h3", { text: "Private evidence" }),
         ...(Array.isArray(c.evidence?.text) ? c.evidence.text : []).map((item) => el("div", {},

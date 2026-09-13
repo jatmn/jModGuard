@@ -12,6 +12,7 @@ use crate::types::PlanStep;
 use crate::{db, logging};
 
 pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome> {
+    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
     let mut vars = super::behaviors::behaviors_base_vars(env);
     // A plan's first argument is a target only when one of its steps can act
     // on another user. Reply/log-only plans must remain free to accept normal
@@ -48,7 +49,15 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
     let mut responses: Vec<String> = Vec::new();
 
     for (idx, step) in steps.iter().enumerate() {
-        let res = run_step(env, step, target, &mut vars, &mut responses).await;
+        let res = run_step(
+            env,
+            enrollment.clone(),
+            step,
+            target,
+            &mut vars,
+            &mut responses,
+        )
+        .await;
         if let Err(e) = res {
             tracing::warn!("plan step {idx} of `{}` failed: {e:#}", env.cmd.name);
         }
@@ -63,7 +72,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
 
     let _ = record_moderation_plan(
         &env.app.db,
-        env.guild_id.get() as i64,
+        enrollment,
         env.actor.get() as i64,
         &env.cmd.name,
         steps,
@@ -90,7 +99,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
 
 async fn record_moderation_plan(
     db: &db::Db,
-    guild_id: i64,
+    enrollment: Option<db::GuildEnrollment>,
     actor: i64,
     command: &str,
     steps: &[PlanStep],
@@ -98,9 +107,9 @@ async fn record_moderation_plan(
     if plan_requires_target(steps) {
         // Preserve the existing summary, not a claim that every step succeeded.
         // Per-step outcomes and evidence belong to the later case model.
-        db::insert_event(
+        db::insert_enrolled_event(
             db,
-            guild_id,
+            enrollment,
             "plan_executed",
             Some(actor),
             Some(actor),
@@ -183,9 +192,15 @@ mod tests {
                 template: "hello".into(),
             }],
         ] {
-            record_moderation_plan(&db, 10, 20, "routine", &steps)
-                .await
-                .unwrap();
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "routine",
+                &steps,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             db::query_events(&db, 10, None, None, 10)
@@ -198,9 +213,15 @@ mod tests {
             PlanStep::Kick,
             PlanStep::Ban { delete_days: 0 },
         ] {
-            record_moderation_plan(&db, 10, 20, "moderate", &[step])
-                .await
-                .unwrap();
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "moderate",
+                &[step],
+            )
+            .await
+            .unwrap();
         }
         let rows = db::query_events(&db, 10, Some("plan_executed"), None, 10)
             .await
@@ -254,6 +275,7 @@ mod tests {
 
 async fn run_step(
     env: &CmdEnv<'_>,
+    enrollment: Option<db::GuildEnrollment>,
     step: &PlanStep,
     target: Option<UserId>,
     vars: &mut std::collections::BTreeMap<String, String>,
@@ -322,9 +344,9 @@ async fn run_step(
             env.guild_id
                 .ban_with_reason(&env.ctx.http, target, *delete_days, "custom command")
                 .await?;
-            db::record_ban(
+            db::record_enrolled_ban(
                 &env.app.db,
-                guild_id.get() as i64,
+                enrollment.clone(),
                 target.get() as i64,
                 Some(env.actor.get() as i64),
                 "custom command",

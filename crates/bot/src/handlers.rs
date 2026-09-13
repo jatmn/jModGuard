@@ -198,9 +198,9 @@ impl EventHandler for Handler {
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let _ = db::record_ban(
+        let _ = db::record_enrolled_ban(
             &app.db,
-            guild_id.get() as i64,
+            enrollment.clone(),
             banned_user.id.get() as i64,
             None,
             "banned (audit)",
@@ -232,12 +232,9 @@ impl EventHandler for Handler {
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let _ = db::mark_unbanned(
-            &app.db,
-            guild_id.get() as i64,
-            unbanned_user.id.get() as i64,
-        )
-        .await;
+        let _ =
+            db::mark_enrolled_unbanned(&app.db, enrollment.clone(), unbanned_user.id.get() as i64)
+                .await;
         if !app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Unban,
             guild_id.get(),
@@ -440,15 +437,16 @@ impl EventHandler for Handler {
         let old_to = old_if_available.and_then(|o| o.communication_disabled_until);
         let new_to = new.communication_disabled_until;
         if old_to != new_to {
+            let enrollment = crate::cases::capture(&app, guild_id.get()).await;
             let mut vars =
                 templates::user_vars(new.user.id.get(), &new.user.name, new.display_name());
             if new_to.is_some() {
                 vars.insert("duration".into(), "timed out".into());
                 vars.insert("reason".into(), "moderation action".into());
                 logging::emit(&app, &ctx, guild_id, "timeout_add", vars).await;
-                let _ = db::insert_event(
+                let _ = db::insert_enrolled_event(
                     &app.db,
-                    guild_id.get() as i64,
+                    enrollment.clone(),
                     "timeout_add",
                     Some(new.user.id.get() as i64),
                     None,
@@ -458,9 +456,9 @@ impl EventHandler for Handler {
             } else {
                 vars.insert("reason".into(), "timeout expired or removed".into());
                 logging::emit(&app, &ctx, guild_id, "timeout_remove", vars).await;
-                let _ = db::insert_event(
+                let _ = db::insert_enrolled_event(
                     &app.db,
-                    guild_id.get() as i64,
+                    enrollment.clone(),
                     "timeout_remove",
                     Some(new.user.id.get() as i64),
                     None,

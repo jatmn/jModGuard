@@ -42,6 +42,7 @@ fn unban() -> Action {
 #[tokio::test]
 async fn unregistered_and_retired_guilds_cannot_admit_or_observe_queue_work() {
     let f = Fixture::new();
+    placed_before_erasure(&f.db, 10).await;
     assert!(
         enqueue_bot_action(
             &f.db,
@@ -259,6 +260,7 @@ async fn captured_admission_never_rebinds_new_or_retried_intents_after_membershi
     ] {
         for rejoin in [false, true] {
             let f = Fixture::new();
+            placed_before_erasure(&f.db, 10).await;
             let old = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
             let job = enqueue_enrolled_bot_action(
                 &f.db,

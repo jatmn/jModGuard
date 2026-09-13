@@ -76,6 +76,7 @@ async fn reordered_and_concurrent_membership_observations_do_not_resurrect_depar
 #[tokio::test]
 async fn observations_preserve_settings_audits_and_unbound_work_without_noop_writes() {
     let f = Fixture::new();
+    placed_before_erasure(&f.db, 10).await;
     patch_settings(
         &f.db,
         10,

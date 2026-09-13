@@ -960,6 +960,18 @@ async fn rejected_completion_reports_outcome_without_overwriting_or_resending() 
         log.0.lock().unwrap().clear();
         let f = Fixture::new();
         let remote = matches!(action, Action::Unban { .. });
+        // Keep the retired receipt until the placed-guild erasure worker runs.
+        let store = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &f.db,
+            store.clone(),
+            db::guild_stores::StorePolicy::Shared,
+        )
+        .await
+        .unwrap();
+        db::guild_stores::assign_initial_placement(&f.db, 10, store)
+            .await
+            .unwrap();
         let job = f.enqueue(10, "rejected_receipt", action).await;
         let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
         let discord = SupersedeDuringDispatch {

@@ -211,6 +211,7 @@ pub(crate) fn message_delete_report(
 #[allow(clippy::too_many_arguments)]
 pub async fn emit_mod_action(
     app: &Arc<BotState>,
+    enrollment: Option<db::GuildEnrollment>,
     ctx: &Context,
     guild_id: GuildId,
     action: &str,
@@ -227,9 +228,9 @@ pub async fn emit_mod_action(
     vars.insert("reason".into(), reason.to_string());
     emit(app, ctx, guild_id, "mod_action", vars).await;
 
-    let _ = db::insert_event(
+    let _ = db::insert_enrolled_event(
         &app.db,
-        guild_id.get() as i64,
+        enrollment.clone(),
         "mod_action",
         Some(target_id as i64),
         Some(actor_id as i64),

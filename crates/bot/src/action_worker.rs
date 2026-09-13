@@ -176,23 +176,19 @@ async fn execute_inner(
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
                 }
-                if let Some(app) = app {
+                let suppression = app.map(|app| {
                     app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Unban,
                         job.guild_id as u64,
                         *user_id as u64,
-                    );
-                }
+                    )
+                });
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 let outcome = discord.unban(job.guild_id, *user_id, reason).await;
                 if outcome.state == "failed"
-                    && let Some(app) = app
+                    && let (Some(app), Some(suppression)) = (app, suppression)
                 {
-                    app.release_gateway_case_suppression(
-                        crate::state::GatewayCaseAction::Unban,
-                        job.guild_id as u64,
-                        *user_id as u64,
-                    );
+                    app.release_gateway_case_suppression(suppression);
                 }
                 outcome
             }

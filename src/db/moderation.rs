@@ -394,3 +394,135 @@ pub async fn list_enrolled_bans(
 pub async fn enrolled_guild_stats(db: &Db, enrollment: GuildEnrollment) -> Result<Stats> {
     enrolled_moderation_read(db, enrollment, guild_stats_conn).await
 }
+
+// Runtime producers retain their admission identity through asynchronous effects.
+pub async fn insert_enrolled_event(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    event_type: &str,
+    user_id: Option<i64>,
+    actor_id: Option<i64>,
+    data: &serde_json::Value,
+) -> Result<i64> {
+    let (now, event_type) = (now_str(), event_type.to_string());
+    // Persist WebUI-safe JSON: snowflakes above JS MAX_SAFE_INTEGER as strings.
+    let data = if data.is_null() {
+        None
+    } else {
+        Some(crate::ids::stringify_js_unsafe_integers(data).to_string())
+    };
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        tx.ensure_mutation_receipt()?;
+        let id = tx.query_row(
+            "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             RETURNING id",
+            params![guild_id, event_type, user_id, actor_id, data, now],
+            |row| Ok(row.get::<i64>(0)?),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    })
+    .await
+}
+
+pub async fn add_enrolled_warn(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    moderator_id: i64,
+    reason: &str,
+) -> Result<i64> {
+    let (now, reason) = (now_str(), reason.to_string());
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        tx.ensure_mutation_receipt()?;
+        let id = tx.query_row(
+            "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             RETURNING id",
+            params![guild_id, user_id, moderator_id, reason, now],
+            |row| Ok(row.get::<i64>(0)?),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    })
+    .await
+}
+
+pub async fn record_enrolled_ban(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    moderator_id: Option<i64>,
+    reason: &str,
+) -> Result<()> {
+    let (now, reason) = (now_str(), reason.to_string());
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        tx.ensure_mutation_receipt()?;
+        tx.execute(
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![guild_id, user_id, moderator_id, reason, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn mark_enrolled_unbanned(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+) -> Result<()> {
+    // Mirror of Discord ban state. Callers that already succeeded at Discord
+    // `remove_ban` should treat errors here as non-fatal (log + continue);
+    // `GUILD_BAN_REMOVE` on the bot also calls this to heal drift.
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let guild_id = enrollment.guild_id;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        tx.ensure_mutation_receipt()?;
+        tx.execute(
+            "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1",
+            params![guild_id, user_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+/// Warning deletion uses the same captured runtime identity as other mirror mutations.
+pub async fn clear_enrolled_warns(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+) -> Result<usize> {
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        tx.ensure_mutation_receipt()?;
+        let count = tx.execute(
+            "DELETE FROM warns WHERE guild_id=?1 AND user_id=?2",
+            params![enrollment.guild_id, user_id],
+        )?;
+        tx.commit()?;
+        Ok(count)
+    })
+    .await
+}

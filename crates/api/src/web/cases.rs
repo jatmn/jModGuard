@@ -1,7 +1,7 @@
 //! Private selected-case and evidence administration for an enrolled guild.
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild};
-use crate::db::guild_data::{CaseHistoryBody, CaseHistoryData, CaseId};
+use crate::db::guild_data::CaseId;
 use crate::tenant::{self, TenantError};
 use axum::Json;
 use axum::body::Body;
@@ -22,6 +22,7 @@ pub struct CasePage {
 
 #[derive(Deserialize)]
 pub struct NoteBody {
+    entry_id: String,
     text: String,
 }
 
@@ -183,17 +184,12 @@ pub async fn add_note(
     }
     let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
     let recorded = store
-        .append_case_history(
+        .append_case_note(
             scope,
             parse_case_id(&case_id)?,
-            CaseId::new(),
-            CaseHistoryData {
-                actor_id: (actor > 0).then_some(actor),
-                recorded_at_ms: chrono::Utc::now().timestamp_millis().max(1),
-                body: CaseHistoryBody::Note {
-                    text: text.to_owned(),
-                },
-            },
+            parse_case_id(&body.entry_id)?,
+            (actor > 0).then_some(actor),
+            text.to_owned(),
             tenant::history_limits(),
         )
         .await?;

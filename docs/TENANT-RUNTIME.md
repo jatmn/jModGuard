@@ -99,3 +99,31 @@ Unfinished services stay inactive: the conductor has no operational API, image-s
 enforcement remains log-only test mode, and no move UI/API is registered. See
 [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md), [evidence](CASE-EVIDENCE.md)
 and [enrollments](ENROLLMENTS.md).
+
+## Continuation and retry boundaries
+
+Core moderation mirror and event writers carry the operation's captured enrollment
+through asynchronous effects and check it with each primary write. A delayed old
+completion cannot restore deleted core payload or change a replacement enrollment's
+mirror. Existing queued-action completion keeps its own transactional membership fence.
+Discord calls already dispatched cannot be recalled by these database checks.
+
+A newer positive join also admits cleanup of the displaced enrollment before replacing
+its core identity. Subsequent departure preserves that oldest outstanding store owner.
+A confirmed departure without placement settles directory-only cleanup and its backup
+reminder atomically with retirement, including configuration observation metadata; it
+does not create a store or infer a provider object's absence.
+
+Gateway suppression retains individual local dispatch tokens. A definitive failure
+releases only its own token; an echo consumes one outstanding token. The same bounded
+30-second in-process lifetime applies; this is not durable audit correlation.
+
+History note POSTs require a 32-hex `entry_id` retained for one note intent. The server
+supplies the authenticated actor and first committed timestamp; retries with the same
+actor/text return the existing entry. Changing the intent payload conflicts. A separate
+identical note uses a new ID. The dashboard retains the intent while retrying an ambiguous
+response and prevents simultaneous submission of the same form. Reloading or opening a
+new form starts a new intent; clients must retain IDs when retrying across reloads.
+
+Case-removal settings and tenant log mappings share the membership configuration
+revision. Settings reads return that authoritative revision, including after log edits.

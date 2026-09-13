@@ -860,3 +860,299 @@ async fn retirement_after_activation_admission_has_a_durable_obligation() {
     assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
     assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn departed_core_writers_cannot_restore_or_change_replacement_data() {
+    let f = Fixture::new();
+    let old = enroll(&f, 10, 100).await;
+    db::record_enrolled_ban(&f.db, Some(old.clone()), 99, Some(42), "private")
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    for enrollment in [Some(old.clone()), None] {
+        assert!(
+            db::record_enrolled_ban(&f.db, enrollment.clone(), 99, Some(42), "late")
+                .await
+                .is_err()
+        );
+        assert!(
+            db::add_enrolled_warn(&f.db, enrollment.clone(), 99, 42, "late")
+                .await
+                .is_err()
+        );
+        assert!(
+            db::insert_enrolled_event(
+                &f.db,
+                enrollment,
+                "mod_action",
+                Some(99),
+                Some(42),
+                &serde_json::json!({"reason":"late"})
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(db::list_bans(&f.db, 10, 10).await.unwrap().is_empty());
+    let current = enroll(&f, 10, 101).await;
+    db::record_enrolled_ban(&f.db, Some(current.clone()), 99, Some(42), "new")
+        .await
+        .unwrap();
+    assert!(
+        db::mark_enrolled_unbanned(&f.db, Some(old.clone()), 99)
+            .await
+            .is_err()
+    );
+    let bans = db::list_enrolled_bans(&f.db, current.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(bans.len(), 1);
+    assert!(bans[0].active);
+    db::add_enrolled_warn(&f.db, Some(current.clone()), 99, 42, "current")
+        .await
+        .unwrap();
+    assert!(
+        db::clear_enrolled_warns(&f.db, Some(old), 99)
+            .await
+            .is_err()
+    );
+    assert_eq!(db::list_warns(&f.db, 10, 99).await.unwrap().len(), 1);
+    db::insert_enrolled_event(
+        &f.db,
+        Some(current.clone()),
+        "mod_action",
+        Some(99),
+        Some(42),
+        &serde_json::json!({"reason":"current"}),
+    )
+    .await
+    .unwrap();
+    db::mark_enrolled_unbanned(&f.db, Some(current.clone()), 99)
+        .await
+        .unwrap();
+    assert!(!db::list_enrolled_bans(&f.db, current, 10).await.unwrap()[0].active);
+}
+
+#[tokio::test]
+async fn departure_without_placement_settles_directory_in_retirement() {
+    let f = Fixture::new();
+    let old = db::enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("old!".into())), None, None)
+        .await
+        .unwrap();
+    db::add_enrolled_warn(&f.db, Some(old.clone()), 99, 42, "private")
+        .await
+        .unwrap();
+    f.db.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER reject_empty_cleanup BEFORE DELETE ON warns BEGIN SELECT RAISE(ABORT,'fixture'); END;")?; Ok(()) }).await.unwrap();
+    assert!(db::retire_guild_enrollment(&f.db, 10, 100).await.is_err());
+    assert_eq!(
+        db::guild_enrollment(&f.db, 10).await.unwrap(),
+        Some(old.clone())
+    );
+    f.db.with_conn(|conn| {
+        conn.execute_batch("DROP TRIGGER reject_empty_cleanup;")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    assert!(db::list_warns(&f.db, 10, 99).await.unwrap().is_empty());
+    assert_ne!(db::get_settings(&f.db, 10).await.unwrap().prefix, "old!");
+    assert!(f.tenant.activate(old).await.unwrap().is_none());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    let reminders: i64 =
+        f.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM backup_cleanup_intents WHERE guild_id=10",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(reminders, 1);
+}
+
+#[tokio::test]
+async fn replacement_join_preserves_displaced_cleanup_before_activation() {
+    let f = Fixture::new();
+    let old = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(old.clone(), case_data(99))
+        .await
+        .unwrap();
+    let replacement = db::enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+    assert_eq!(
+        db::next_guild_erasure(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrollment,
+        old
+    );
+    db::retire_guild_enrollment(&f.db, 10, 101).await.unwrap();
+    assert_eq!(
+        db::next_guild_erasure(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrollment,
+        old
+    );
+    let reopened = TenantRuntime::open(
+        &f.db,
+        &DbConfig {
+            path: f.path.clone(),
+            pool_size: 2,
+            ..Default::default()
+        },
+        &Default::default(),
+        &EvidenceConfig {
+            backend: "none".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(reopened.drive_erasure().await.unwrap());
+    assert!(reopened.activate(replacement).await.unwrap().is_none());
+    let newest = db::enroll_guild(&f.db, 10, 102).await.unwrap().unwrap();
+    assert!(reopened.activate(newest).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn settings_revision_composes_with_log_edits() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment).await.unwrap();
+    let initial = store.tenant_settings(scope.clone()).await.unwrap();
+    let roles = store
+        .set_case_delete_roles(scope.clone(), &initial.revision, vec![1])
+        .await
+        .unwrap();
+    let logs = store
+        .set_log_channel(scope.clone(), &roles, "member_ban", Some(123))
+        .await
+        .unwrap();
+    let fetched = store.tenant_settings(scope.clone()).await.unwrap();
+    assert_eq!(fetched.revision, logs);
+    assert_eq!(fetched.case_delete_roles, vec![1]);
+    assert!(
+        store
+            .set_case_delete_roles(scope.clone(), &roles, vec![2])
+            .await
+            .is_err()
+    );
+    let next = store
+        .set_case_delete_roles(scope.clone(), &fetched.revision, vec![2])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .set_case_delete_roles(scope.clone(), &next, vec![2])
+            .await
+            .unwrap(),
+        next
+    );
+    assert!(
+        store
+            .set_log_channel(scope, &next, "member_ban", Some(124))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn note_intent_retries_keep_one_entry_and_original_timestamp() {
+    use crate::db::guild_data::AppendCaseHistory;
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment).await.unwrap();
+    let case = CaseId::new();
+    store
+        .record_case(scope.clone(), case.clone(), case_data(99), case_limits())
+        .await
+        .unwrap();
+    let id = CaseId::new();
+    let append = || {
+        store.append_case_note(
+            scope.clone(),
+            case.clone(),
+            id.clone(),
+            Some(42),
+            "note".into(),
+            history_limits(),
+        )
+    };
+    let (a, b) = tokio::join!(append(), append());
+    assert!(matches!(
+        (a.unwrap(), b.unwrap()),
+        (
+            AppendCaseHistory::Created(_),
+            AppendCaseHistory::Existing(_)
+        ) | (
+            AppendCaseHistory::Existing(_),
+            AppendCaseHistory::Created(_)
+        )
+    ));
+    let original = store
+        .case_history_entry(scope.clone(), case.clone(), id.clone(), history_limits())
+        .await
+        .unwrap();
+    assert!(matches!(
+        append().await.unwrap(),
+        AppendCaseHistory::Existing(_)
+    ));
+    assert_eq!(
+        store
+            .case_history_entry(scope.clone(), case.clone(), id.clone(), history_limits())
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(
+        store
+            .append_case_note(
+                scope.clone(),
+                case.clone(),
+                id.clone(),
+                Some(42),
+                "changed".into(),
+                history_limits()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .append_case_note(
+                scope.clone(),
+                case.clone(),
+                id,
+                Some(43),
+                "note".into(),
+                history_limits()
+            )
+            .await
+            .is_err()
+    );
+    store
+        .append_case_note(
+            scope.clone(),
+            case.clone(),
+            CaseId::new(),
+            Some(42),
+            "note".into(),
+            history_limits(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .case_history_ids(scope, case, 0, 32, history_limits())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
