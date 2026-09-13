@@ -34,7 +34,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -109,6 +109,17 @@ test('cases is a valid navigation and restored workspace tab', () => {
   const second = harness(undefined, first.storage);
   second.app.restoreWorkspace();
   assert.equal(second.app.state.tab, 'cases');
+});
+
+test('template help describes bounded delete snippets without claiming history', () => {
+  const { app } = harness();
+  app.state.config = { templates: [] };
+  const text = textOf(app.tabTemplates());
+  assert.match(text, /single-message delete may supply \{content\}/);
+  assert.match(text, /bounded recent in-process snippet/);
+  assert.match(text, /otherwise those values are unavailable/);
+  assert.match(text, /not persistent history or a Discord history lookup/);
+  assert.doesNotMatch(text, /deleted content are not retained/);
 });
 
 test('workspace validates membership, tab, user identity and malformed storage', () => {

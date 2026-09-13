@@ -1,5 +1,6 @@
 //! Bounded exact-image observations. Punishment uses `spam_actions`, not automod.
 use crate::state::{BotState, CachedGuildConfig};
+use jmodguard::db::guild_data::TextEvidence;
 use jmodguard::image_spam::{Attachment, Hash, Hasher, Limits, Policy};
 use parking_lot::Mutex;
 use serenity::{
@@ -241,6 +242,15 @@ enum Report {
     Verified(Vec<(u64, u64)>),
     Unverified,
 }
+
+pub(crate) struct MatchProof<'a> {
+    pub token: (u64, u64),
+    pub messages: &'a [(u64, u64)],
+    pub evidence: &'a [TextEvidence],
+    pub policy: &'a Policy,
+    pub now: Instant,
+}
+
 impl Detector {
     pub fn new(limits: Limits) -> anyhow::Result<Self> {
         limits.validate()?;
@@ -330,15 +340,12 @@ impl Detector {
     }
 
     /// True when every matched message is still indexed under this author with the
-    /// same config token and still represents a live image observation.
+    /// same config token and the current stored hashes still prove the exact-image match.
     pub(crate) fn match_still_proving(
         &self,
         guild: u64,
         author: u64,
-        token: (u64, u64),
-        messages: &[(u64, u64)],
-        policy: &Policy,
-        now: Instant,
+        proof: MatchProof<'_>,
     ) -> bool {
         let state = self.state.lock();
         let Some(b) = state
@@ -348,10 +355,11 @@ impl Detector {
         else {
             return false;
         };
-        if b.token != token {
+        if b.token != proof.token {
             return false;
         }
-        let posts: Vec<_> = messages
+        let posts: Vec<_> = proof
+            .messages
             .iter()
             .filter_map(|(channel, message)| {
                 if state.index.get(&(guild, *channel, *message)) != Some(&author) {
@@ -362,8 +370,34 @@ impl Detector {
                     .find(|p| p.channel == *channel && p.id == *message)
             })
             .collect();
-        posts.len() == messages.len()
-            && posts.iter().all(|p| live(p, policy, now))
+        if posts.len() != proof.messages.len()
+            || posts.iter().any(|p| !live(p, proof.policy, proof.now))
+        {
+            return false;
+        }
+        if posts.iter().any(|post| {
+            let expected = proof.evidence.iter().find(|item| {
+                item.channel_id == post.channel as i64
+                    && item.message_id == post.id as i64
+                    && item.author_id == author as i64
+            });
+            !matches!(
+                (post.hashes.as_deref(), expected),
+                (Some(hashes), Some(item)) if format_hashes(hashes) == item.text
+            )
+        }) {
+            return false;
+        }
+        let Ok(Some(proving)) =
+            common_images(&posts, proof.policy, self.limits.comparison_steps)
+        else {
+            return false;
+        };
+        proving.len() == proof.messages.len()
+            && proof
+                .messages
+                .iter()
+                .all(|message| proving.contains(message))
     }
 
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
@@ -695,17 +729,28 @@ fn replace_existing(
     if state.index.get(&key).copied() != Some(author) {
         return None;
     }
+    let old = state
+        .guilds
+        .get(&guild)?
+        .authors
+        .get(&author)?
+        .posts
+        .iter()
+        .find(|p| p.id == post.id && p.channel == post.channel)?;
+    if file_key(old) == file_key(post) || post.edited_ms < old.edited_ms {
+        return Some(ReplaceOutcome::Unchanged);
+    }
+    let serial = state.serial.checked_add(1)?;
+    state.serial = serial;
     let g = state.guilds.get_mut(&guild)?;
     let b = g.authors.get_mut(&author)?;
     let old = b
         .posts
         .iter_mut()
         .find(|p| p.id == post.id && p.channel == post.channel)?;
-    if file_key(old) == file_key(post) || post.edited_ms < old.edited_ms {
-        return Some(ReplaceOutcome::Unchanged);
-    }
     g.bytes = g.bytes.saturating_sub(old.cost);
     state.bytes = state.bytes.saturating_sub(old.cost);
+    old.serial = serial;
     old.files = post.files.clone();
     old.hashes = None;
     old.at = post.at;
@@ -1266,6 +1311,20 @@ mod tests {
         assert!(admit(d, 11, 101, at).is_none());
         admit(d, 12, 102, at).unwrap()
     }
+    fn evidence(messages: &[(u64, u64)], author: u64, values: &[u8]) -> Vec<TextEvidence> {
+        let hashes: BTreeSet<Hash> = values.iter().map(|value| [*value; 32]).collect();
+        let text = format_hashes(&hashes.into_iter().collect::<Vec<_>>());
+        messages
+            .iter()
+            .map(|(channel, message)| TextEvidence {
+                channel_id: *channel as i64,
+                message_id: *message as i64,
+                author_id: author as i64,
+                occurred_at_ms: 1,
+                text: text.clone(),
+            })
+            .collect()
+    }
     #[test]
     fn invalidation_during_config_load_prevents_late_admission() {
         let now = Instant::now();
@@ -1372,9 +1431,150 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(d.match_still_proving(1, 2, token, &matched, &p, now));
+        let evidence = evidence(&matched, 2, &[1, 2]);
+        assert!(d.match_still_proving(
+            1,
+            2,
+            MatchProof {
+                token,
+                messages: &matched,
+                evidence: &evidence,
+                policy: &p,
+                now,
+            }
+        ));
         d.invalidate(1, 101, 11);
-        assert!(!d.match_still_proving(1, 2, token, &matched, &p, now));
+        assert!(!d.match_still_proving(
+            1,
+            2,
+            MatchProof {
+                token,
+                messages: &matched,
+                evidence: &evidence,
+                policy: &p,
+                now,
+            }
+        ));
+    }
+
+    #[test]
+    fn match_still_proving_rejects_replaced_attachments() {
+        let d = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let p = policy();
+        let token = (0, 0);
+        let job = job(&d, now);
+        let matched = d
+            .complete(job, &p, false, now)
+            .and_then(|report| match report {
+                Report::Verified(messages) => Some(messages),
+                _ => None,
+            })
+            .unwrap();
+        let evidence = evidence(&matched, 2, &[1, 2]);
+        assert!(d.match_still_proving(
+            1,
+            2,
+            MatchProof {
+                token,
+                messages: &matched,
+                evidence: &evidence,
+                policy: &p,
+                now,
+            }
+        ));
+
+        let mut replacement = post(11, 101, now + Duration::from_secs(1), &[3, 4]);
+        replacement.revision = d.revision();
+        replacement.edited_ms = 1;
+        replacement.files = vec![
+            Attachment::new(
+                101,
+                50,
+                3,
+                "https://cdn.discordapp.com/attachments/101/50/a.png",
+                10,
+            )
+            .unwrap(),
+            Attachment::new(
+                101,
+                51,
+                3,
+                "https://cdn.discordapp.com/attachments/101/51/b.png",
+                10,
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            d.admit(
+                1,
+                2,
+                replacement,
+                token,
+                &p,
+                now + Duration::from_secs(1),
+                true
+            ),
+            AdmitOutcome::Admitted
+        ));
+        assert!(!d.match_still_proving(
+            1,
+            2,
+            MatchProof {
+                token,
+                messages: &matched,
+                evidence: &evidence,
+                policy: &p,
+                now: now + Duration::from_secs(1),
+            }
+        ));
+    }
+
+    #[test]
+    fn attachment_replacement_cancels_an_inflight_hash_job() {
+        let d = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let p = policy();
+        let token = (0, 0);
+        let old_job = job(&d, now);
+
+        let mut replacement = post(11, 101, now + Duration::from_secs(1), &[3, 4]);
+        replacement.revision = d.revision();
+        replacement.edited_ms = 1;
+        replacement.files = vec![
+            Attachment::new(
+                101,
+                50,
+                3,
+                "https://cdn.discordapp.com/attachments/101/50/a.png",
+                10,
+            )
+            .unwrap(),
+            Attachment::new(
+                101,
+                51,
+                3,
+                "https://cdn.discordapp.com/attachments/101/51/b.png",
+                10,
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            d.admit(
+                1,
+                2,
+                replacement,
+                token,
+                &p,
+                now + Duration::from_secs(1),
+                true
+            ),
+            AdmitOutcome::Admitted | AdmitOutcome::Matched(_)
+        ));
+        assert_eq!(
+            d.complete(old_job, &p, false, now + Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]

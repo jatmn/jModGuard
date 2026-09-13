@@ -16,6 +16,55 @@ pub enum Kind {
     Text,
 }
 
+enum MatchPolicy {
+    Image(jmodguard::image_spam::Policy),
+    Text(jmodguard::text_spam::Policy),
+}
+
+impl MatchPolicy {
+    fn parse(kind: Kind, rule: &crate::types::RuleDef) -> Option<Self> {
+        match kind {
+            Kind::Image => jmodguard::image_spam::Policy::parse(rule)
+                .ok()
+                .map(Self::Image),
+            Kind::Text => jmodguard::text_spam::Policy::parse(rule)
+                .ok()
+                .map(Self::Text),
+        }
+    }
+
+    fn enforce(&self) -> bool {
+        match self {
+            Self::Image(policy) => policy.enforce,
+            Self::Text(policy) => policy.enforce,
+        }
+    }
+
+    fn still_proving(&self, app: &BotState, found: &Match, now: Instant) -> bool {
+        match self {
+            Self::Image(policy) => app.image_spam.match_still_proving(
+                found.guild,
+                found.author,
+                crate::image_spam::MatchProof {
+                    token: found.token,
+                    messages: &found.messages,
+                    evidence: &found.excerpts,
+                    policy,
+                    now,
+                },
+            ),
+            Self::Text(policy) => app.text_spam.match_still_proving(
+                found.guild,
+                found.author,
+                found.token,
+                &found.messages,
+                policy,
+                now,
+            ),
+        }
+    }
+}
+
 pub struct Match {
     pub kind: Kind,
     pub guild: u64,
@@ -133,6 +182,12 @@ pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
         Kind::Text => ("repeat_text", "Repeated text"),
     };
     if !found.enforce {
+        let Some(policy) = current_policy(app, &found, rule).await else {
+            return;
+        };
+        if policy.enforce() || !policy.still_proving(app, &found, Instant::now()) {
+            return;
+        }
         let vars = BTreeMap::from([
             ("rule".into(), format!("{name} test")),
             ("mention".into(), format!("<@{}>", found.author)),
@@ -155,6 +210,19 @@ pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
     enforce(app, ctx, found, rule, name).await;
 }
 
+async fn current_policy(app: &Arc<BotState>, found: &Match, rule: &str) -> Option<MatchPolicy> {
+    app.poll_config_version().await.ok()?;
+    let cfg = app.configs.get(&app.db, found.guild).await.ok()?;
+    if (cfg.version, cfg.durable_version) != found.token {
+        return None;
+    }
+    let rule = cfg.rules.get(rule)?;
+    if !rule.enabled {
+        return None;
+    }
+    MatchPolicy::parse(found.kind, rule)
+}
+
 async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, name: &str) {
     if app.poll_config_version().await.is_err() {
         return;
@@ -165,13 +233,10 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
     let Some(rule_def) = cfg.rules.get(rule) else {
         return;
     };
-    let Ok(still_enforce) = (match found.kind {
-        Kind::Image => jmodguard::image_spam::Policy::parse(rule_def).map(|p| p.enforce),
-        Kind::Text => jmodguard::text_spam::Policy::parse(rule_def).map(|p| p.enforce),
-    }) else {
+    let Some(policy) = MatchPolicy::parse(found.kind, rule_def) else {
         return;
     };
-    if !still_enforce || !rule_def.enabled {
+    if !policy.enforce() || !rule_def.enabled {
         return;
     }
     let enrollment = crate::cases::capture(app, found.guild).await;
@@ -232,35 +297,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
     if token != found.token {
         return;
     }
-    let still_proving = match found.kind {
-        Kind::Image => {
-            let Ok(policy) = jmodguard::image_spam::Policy::parse(rule_def) else {
-                return;
-            };
-            app.image_spam.match_still_proving(
-                found.guild,
-                found.author,
-                token,
-                &found.messages,
-                &policy,
-                now,
-            )
-        }
-        Kind::Text => {
-            let Ok(policy) = jmodguard::text_spam::Policy::parse(rule_def) else {
-                return;
-            };
-            app.text_spam.match_still_proving(
-                found.guild,
-                found.author,
-                token,
-                &found.messages,
-                &policy,
-                now,
-            )
-        }
-    };
-    if !still_proving {
+    if !policy.still_proving(app, &found, now) {
         let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
