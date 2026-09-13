@@ -30,7 +30,21 @@ pub struct Match {
 struct Applied {
     until: Instant,
     banned: bool,
+    banning: bool,
     deleted: BTreeSet<(u64, u64)>,
+    deleting: BTreeSet<(u64, u64)>,
+}
+
+impl Applied {
+    fn new(now: Instant) -> Self {
+        Self {
+            until: now + KEEP,
+            banned: false,
+            banning: false,
+            deleted: BTreeSet::new(),
+            deleting: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -53,29 +67,62 @@ impl Gate {
     ) -> bool {
         self.prune(now);
         let mut inner = self.inner.lock();
-        let applied = inner.entry((guild, author)).or_insert_with(|| Applied {
-            until: now + KEEP,
-            banned: false,
-            deleted: BTreeSet::new(),
-        });
+        let applied = inner
+            .entry((guild, author))
+            .or_insert_with(|| Applied::new(now));
         applied.until = now + KEEP;
-        applied.deleted.insert((channel, message))
+        let key = (channel, message);
+        if applied.deleted.contains(&key) || applied.deleting.contains(&key) {
+            return false;
+        }
+        applied.deleting.insert(key);
+        true
+    }
+
+    fn finish_delete(
+        &self,
+        guild: u64,
+        author: u64,
+        channel: u64,
+        message: u64,
+        now: Instant,
+        success: bool,
+    ) {
+        let mut inner = self.inner.lock();
+        let Some(applied) = inner.get_mut(&(guild, author)) else {
+            return;
+        };
+        applied.deleting.remove(&(channel, message));
+        if success {
+            applied.deleted.insert((channel, message));
+        }
+        applied.until = now + KEEP;
     }
 
     fn claim_ban(&self, guild: u64, author: u64, now: Instant) -> bool {
         self.prune(now);
         let mut inner = self.inner.lock();
-        let applied = inner.entry((guild, author)).or_insert_with(|| Applied {
-            until: now + KEEP,
-            banned: false,
-            deleted: BTreeSet::new(),
-        });
+        let applied = inner
+            .entry((guild, author))
+            .or_insert_with(|| Applied::new(now));
         applied.until = now + KEEP;
-        if applied.banned {
+        if applied.banned || applied.banning {
             return false;
         }
-        applied.banned = true;
+        applied.banning = true;
         true
+    }
+
+    fn finish_ban(&self, guild: u64, author: u64, now: Instant, success: bool) {
+        let mut inner = self.inner.lock();
+        let Some(applied) = inner.get_mut(&(guild, author)) else {
+            return;
+        };
+        applied.banning = false;
+        if success {
+            applied.banned = true;
+        }
+        applied.until = now + KEEP;
     }
 }
 
@@ -141,15 +188,29 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
     .await
     .ok()
     .and_then(Result::ok);
+    if member.is_none() {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; membership could not be confirmed".into(),
+            ),
+            ("reason".into(), found.reason),
+            ("content".into(), "member lookup failed or timed out".into()),
+        ]);
+        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+        return;
+    }
     let roles: Vec<u64> = member
         .as_ref()
         .map(|m| m.roles.iter().map(|r| r.get()).collect())
         .unwrap_or_default();
-    if member.is_none()
-        || found
-            .messages
-            .iter()
-            .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
+    if found
+        .messages
+        .iter()
+        .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
     {
         return;
     }
@@ -161,7 +222,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             .spam_gate
             .claim_delete(found.guild, found.author, *channel, *message, now)
         {
-            delete_notes.push(format!("{channel}/{message} already deleted this window"));
+            delete_notes.push(format!("{channel}/{message} already handled this window"));
             continue;
         }
         let outcome = match tokio::time::timeout(
@@ -178,6 +239,14 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             Ok(Err(error)) => delete_outcome(&error),
             Err(_) => CaseOutcome::Uncertain,
         };
+        app.spam_gate.finish_delete(
+            found.guild,
+            found.author,
+            *channel,
+            *message,
+            now,
+            matches!(outcome, CaseOutcome::Succeeded),
+        );
         delete_notes.push(format!("{channel}/{message} {outcome:?}"));
     }
     let mut ban_outcome = None;
@@ -202,6 +271,12 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
             Err(_) => CaseOutcome::Uncertain,
         };
+        app.spam_gate.finish_ban(
+            found.guild,
+            found.author,
+            now,
+            matches!(outcome, CaseOutcome::Succeeded),
+        );
         if matches!(outcome, CaseOutcome::Failed) {
             app.release_gateway_case_suppression(suppression);
         }
@@ -279,5 +354,29 @@ fn evidence(excerpts: Vec<TextEvidence>) -> CaseEvidence {
         CaseEvidence::Unavailable
     } else {
         CaseEvidence::Text(excerpts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_delete_and_ban_claims_can_be_retried() {
+        let gate = Gate::default();
+        let now = Instant::now();
+        assert!(gate.claim_delete(1, 2, 10, 100, now));
+        assert!(!gate.claim_delete(1, 2, 10, 100, now));
+        gate.finish_delete(1, 2, 10, 100, now, false);
+        assert!(gate.claim_delete(1, 2, 10, 100, now));
+        gate.finish_delete(1, 2, 10, 100, now, true);
+        assert!(!gate.claim_delete(1, 2, 10, 100, now));
+
+        assert!(gate.claim_ban(1, 2, now));
+        assert!(!gate.claim_ban(1, 2, now));
+        gate.finish_ban(1, 2, now, false);
+        assert!(gate.claim_ban(1, 2, now));
+        gate.finish_ban(1, 2, now, true);
+        assert!(!gate.claim_ban(1, 2, now));
     }
 }

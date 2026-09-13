@@ -143,6 +143,38 @@ impl Detector {
             .get(&(guild, channel, message))
             .copied()
     }
+
+    pub fn excerpts(
+        &self,
+        guild: u64,
+        author: u64,
+        messages: &[(u64, u64)],
+    ) -> Vec<TextEvidence> {
+        let state = self.state.lock();
+        let Some(bucket) = state
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+        else {
+            return Vec::new();
+        };
+        messages
+            .iter()
+            .filter_map(|(channel, id)| {
+                bucket
+                    .posts
+                    .iter()
+                    .find(|p| p.channel == *channel && p.id == *id)
+                    .map(|p| TextEvidence {
+                        channel_id: *channel as i64,
+                        message_id: *id as i64,
+                        author_id: author as i64,
+                        occurred_at_ms: p.edited_ms.max(1),
+                        text: p.text.clone(),
+                    })
+            })
+            .collect()
+    }
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
     fn admit(
         &self,
@@ -390,11 +422,19 @@ fn drop_author_posts(
     }
 }
 
-fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
+fn may_admit(
+    rule: &crate::types::RuleDef,
+    author: u64,
+    channel: u64,
+    roles: Option<&[u64]>,
+) -> bool {
     rule.enabled
         && !rule.whitelist_users.contains(&author)
         && !rule.whitelist_channels.contains(&channel)
-        && !rule.whitelist_roles.iter().any(|r| roles.contains(r))
+        && match roles {
+            Some(roles) => !rule.whitelist_roles.iter().any(|r| roles.contains(r)),
+            None => rule.whitelist_roles.is_empty(),
+        }
 }
 
 pub fn observe(
@@ -507,15 +547,10 @@ fn consider(
     let Ok(policy) = Policy::parse(rule) else {
         return;
     };
-    if let Some(roles) = roles
-        && !eligible(rule, author, channel, roles)
-    {
+    if !may_admit(rule, author, channel, roles) {
         if replace {
             app.text_spam.invalidate(guild, channel, message);
         }
-        return;
-    }
-    if roles.is_none() && !replace {
         return;
     }
     let Some(raw) = content else { return };
@@ -558,13 +593,19 @@ fn consider(
     };
     let app = Arc::clone(app);
     let ctx = ctx.clone();
-    let excerpts = vec![TextEvidence {
-        channel_id: channel as i64,
-        message_id: message as i64,
-        author_id: author as i64,
-        occurred_at_ms: edited_ms.max(1),
-        text,
-    }];
+    let excerpts = {
+        let mut excerpts = app.text_spam.excerpts(guild, author, &messages);
+        if excerpts.is_empty() {
+            excerpts.push(TextEvidence {
+                channel_id: channel as i64,
+                message_id: message as i64,
+                author_id: author as i64,
+                occurred_at_ms: edited_ms.max(1),
+                text,
+            });
+        }
+        excerpts
+    };
     tokio::spawn(async move {
         if app.poll_config_version().await.is_err() {
             return;
@@ -715,5 +756,49 @@ mod tests {
                 .is_none()
         );
         assert!(d.state.lock().index.is_empty());
+    }
+
+    #[test]
+    fn omitted_roles_still_apply_user_and_channel_exemptions() {
+        let mut rule = crate::defaults::default_rules().remove(2);
+        assert!(may_admit(&rule, 1, 2, None));
+        rule.whitelist_users.push(1);
+        assert!(!may_admit(&rule, 1, 2, None));
+        rule.whitelist_users.clear();
+        rule.whitelist_channels.push(2);
+        assert!(!may_admit(&rule, 1, 2, None));
+        rule.whitelist_channels.clear();
+        rule.whitelist_roles.push(3);
+        assert!(!may_admit(&rule, 1, 2, None));
+        assert!(!may_admit(&rule, 1, 2, Some(&[3])));
+        assert!(may_admit(&rule, 1, 2, Some(&[4])));
+    }
+
+    #[test]
+    fn match_excerpts_cover_every_matched_post() {
+        let d = Detector::default();
+        let now = Instant::now();
+        let p = policy();
+        assert!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
+                .is_none()
+        );
+        assert!(
+            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false)
+                .is_none()
+        );
+        let hit = d
+            .admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false)
+            .unwrap();
+        let excerpts = d.excerpts(1, 2, &hit);
+        assert_eq!(excerpts.len(), 3);
+        assert!(excerpts.iter().all(|e| e.text == "spam"));
+        assert_eq!(
+            excerpts
+                .iter()
+                .map(|e| (e.channel_id, e.message_id))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (11, 2), (12, 3)]
+        );
     }
 }

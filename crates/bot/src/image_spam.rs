@@ -757,10 +757,22 @@ fn common_images(
     Ok(None)
 }
 fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
+    may_admit(rule, author, channel, Some(roles))
+}
+
+fn may_admit(
+    rule: &crate::types::RuleDef,
+    author: u64,
+    channel: u64,
+    roles: Option<&[u64]>,
+) -> bool {
     rule.enabled
         && !rule.whitelist_users.contains(&author)
         && !rule.whitelist_channels.contains(&channel)
-        && !rule.whitelist_roles.iter().any(|r| roles.contains(r))
+        && match roles {
+            Some(roles) => !rule.whitelist_roles.iter().any(|r| roles.contains(r)),
+            None => rule.whitelist_roles.is_empty(),
+        }
 }
 
 /// Called before the generic automod bot-author exemption. Unknown membership and
@@ -913,9 +925,7 @@ pub fn observe_update(
         .as_ref()
         .and_then(|m| m.as_ref())
         .map(|m| m.roles.iter().map(|r| r.get()).collect::<Vec<_>>());
-    if let Some(roles) = roles.as_deref()
-        && !eligible(rule, author, event.channel_id.get(), roles)
-    {
+    if !may_admit(rule, author, event.channel_id.get(), roles.as_deref()) {
         app.image_spam
             .invalidate(guild.get(), event.channel_id.get(), event.id.get());
         return;
@@ -1575,5 +1585,10 @@ mod tests {
         rule.whitelist_channels.clear();
         rule.whitelist_users.push(1);
         assert!(!eligible(&rule, 1, 2, &[]));
+        assert!(!may_admit(&rule, 1, 2, None));
+        rule.whitelist_users.clear();
+        rule.whitelist_roles.push(9);
+        assert!(!may_admit(&rule, 1, 2, None));
+        assert!(may_admit(&rule, 1, 2, Some(&[])));
     }
 }

@@ -24,7 +24,13 @@ the dedicated spam path. Legacy count-rule rows without a mode stay **inactive**
 
 Role, channel and user whitelists are per-rule. Own-bot messages are ignored. Other
 bots and privileged roles are not implicitly exempt. Exemptions apply at admission
-and are rechecked with a fresh member read before enforcement.
+and are rechecked with a fresh member read before enforcement. User and channel
+exemptions still apply when an update omits member roles. A configured role
+whitelist cannot be evaluated without roles, so that update is not admitted.
+Delete and ban claims are reserved while Discord work is in flight and committed
+only after success, so a failed or timed-out attempt can be retried in the same
+window. If membership cannot be confirmed at enforcement time, the bot logs the
+skip and does not punish.
 
 ## Matching
 
