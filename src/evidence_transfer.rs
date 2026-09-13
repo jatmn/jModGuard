@@ -323,6 +323,8 @@ impl LocalEvidenceStore {
 
     /// Verified private object bytes for an authorized dashboard/API reader.
     pub fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
+        let _lock = self.lock()?;
+        self.verify()?;
         let digest = self
             .verified_digest(job)?
             .context("evidence is not available")?;

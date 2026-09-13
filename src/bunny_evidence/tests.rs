@@ -784,3 +784,47 @@ async fn independent_captures_of_one_identity_send_only_one_put() {
     assert_eq!(f.remote.lock().unwrap().puts, 1);
     assert_eq!(f.job(&t).await.state, EvidenceState::Available);
 }
+
+#[tokio::test]
+async fn downloads_require_original_binding_marker_and_live_available_job() {
+    let f = Fixture::new().await;
+    let upload = f.upload();
+    let target = upload.target.clone();
+    f.backend
+        .capture(f.db.clone(), upload, Cursor::new(b"abc".to_vec()))
+        .await
+        .unwrap();
+    let available =
+        f.db.available_case_evidence(f.scope.clone(), f.case.clone(), target.evidence_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+    let read = || {
+        f.backend
+            .read_available(&f.db, &target, &available.job, &available.sha256)
+    };
+    assert_eq!(read().await.unwrap(), b"abc");
+    let marker = f.remote.lock().unwrap().marker.clone();
+    f.remote.lock().unwrap().marker = "wrong resource".into();
+    assert!(read().await.is_err());
+    f.remote.lock().unwrap().marker = marker;
+    let mut moved = f.backend.clone();
+    moved.base.push_str("different/");
+    let before = f.remote.lock().unwrap().requests;
+    assert!(
+        moved
+            .read_available(&f.db, &target, &available.job, &available.sha256)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.remote.lock().unwrap().requests,
+        before,
+        "wrong binding rejected before HTTP"
+    );
+    f.remove().await;
+    assert!(
+        read().await.is_err(),
+        "a previously available snapshot does not revive a removed object"
+    );
+}

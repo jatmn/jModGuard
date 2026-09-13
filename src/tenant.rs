@@ -138,7 +138,7 @@ impl TenantRuntime {
                 registered == store.registration,
                 "configured guild store ownership conflicts with the catalog"
             );
-            GuildDataStore::initialize(store.options.clone(), store.registration.clone())?;
+            open_runtime_store(core, store).await?;
             if matches!(store.registration.policy(), StorePolicy::Shared) {
                 default_shared.get_or_insert_with(|| store.registration.id().clone());
             }
@@ -352,7 +352,7 @@ impl TenantRuntime {
             let jobs = handle
                 .evidence_jobs(
                     scope.clone(),
-                    EvidenceWork::Delete,
+                    EvidenceWork::Cleanup,
                     after.clone(),
                     limits.max_page_size,
                     limits,
@@ -444,10 +444,7 @@ impl TenantRuntime {
             .iter()
             .find(|store| store.registration.id() == id)
             .ok_or(TenantError::Offline)?;
-        let handle = GuildDataStore::open(resolved.options.clone(), resolved.registration.clone())
-            .or_else(|_| {
-                GuildDataStore::initialize(resolved.options.clone(), resolved.registration.clone())
-            })?;
+        let handle = open_runtime_store(&self.core, resolved).await?;
         cache.order.retain(|stored| stored != id.as_str());
         cache.order.push_back(id.as_str().to_owned());
         cache.map.insert(id.as_str().to_owned(), handle.clone());
@@ -495,6 +492,12 @@ impl TenantRuntime {
         evidence: crate::db::guild_data::CaseId,
     ) -> Result<Option<(crate::db::guild_data::AvailableEvidence, Vec<u8>)>> {
         let (store, scope) = self.live(enrollment).await?;
+        #[cfg(unix)]
+        let target = crate::evidence_transfer::EvidenceTarget {
+            scope: scope.clone(),
+            case_id: case.clone(),
+            evidence_id: evidence.clone(),
+        };
         let Some(available) = store.available_case_evidence(scope, case, evidence).await? else {
             return Ok(None);
         };
@@ -512,12 +515,33 @@ impl TenantRuntime {
             #[cfg(unix)]
             EvidenceBackend::Bunny(backend) => {
                 backend
-                    .read_available(&available.job, &available.sha256)
+                    .read_available(&store, &target, &available.job, &available.sha256)
                     .await?
             }
         };
         Ok(Some((available, bytes)))
     }
+}
+
+async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDataStore> {
+    if GuildDataStore::existing_registration(store.options.clone())?.is_none() {
+        use crate::db::SqlExecutor;
+        let id = store.registration.id().as_str().to_owned();
+        let owned: bool = core.with_conn(move |conn| {
+            let tx = conn.transaction_primary_read()?;
+            let owned = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM guild_store_placements WHERE store_id=?1) OR EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE store_id=?1)",
+                crate::db::params![id], |row| Ok(row.get(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(owned)
+        }).await?;
+        anyhow::ensure!(
+            !owned,
+            "owned guild store is missing or empty; restore its original database before retrying"
+        );
+    }
+    GuildDataStore::initialize(store.options.clone(), store.registration.clone())
 }
 
 async fn resolve_configured(
@@ -561,7 +585,7 @@ async fn default_shared(
 ) -> Result<ResolvedStore> {
     anyhow::ensure!(
         db.url.trim().is_empty(),
-        "remote core databases require an explicit shared [[guild_stores.stores]] entry"
+        "remote core databases require shared guild-store configuration (TOML or JMODGUARD_GUILD_STORE_URL/TOKEN)"
     );
     let path = core
         .sqlite_path()

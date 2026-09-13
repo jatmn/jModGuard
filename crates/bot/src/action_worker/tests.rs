@@ -1045,3 +1045,36 @@ async fn rejected_completion_reports_outcome_without_overwriting_or_resending() 
         );
     }
 }
+
+#[tokio::test]
+async fn known_noop_unban_does_not_consume_a_future_external_echo() {
+    for (outcome, expect_echo) in [
+        (Outcome::succeeded("already_unbanned"), false),
+        (Outcome::succeeded("unbanned"), true),
+        (Outcome::failed("discord_rejected"), false),
+        (Outcome::uncertain("discord_outcome_unknown"), true),
+    ] {
+        let f = Fixture::new();
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        let job = f.enqueue(10, "echo", unban(99)).await;
+        let e = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        app.tenant.activate(e).await.unwrap();
+        let mock = MockDiscord {
+            outcome,
+            ..Default::default()
+        };
+        drain_with_state(&app, &mock, &WorkerLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(f.status(&job).await.state, outcome.state);
+        assert_eq!(
+            app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Unban, 10, 99),
+            expect_echo
+        );
+        assert!(!app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Unban,
+            10,
+            99
+        ));
+    }
+}

@@ -185,7 +185,7 @@ async fn execute_inner(
                 });
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 let outcome = discord.unban(job.guild_id, *user_id, reason).await;
-                if outcome.state == "failed"
+                if (outcome.state == "failed" || outcome.code == "already_unbanned")
                     && let (Some(app), Some(suppression)) = (app, suppression)
                 {
                     app.release_gateway_case_suppression(suppression);

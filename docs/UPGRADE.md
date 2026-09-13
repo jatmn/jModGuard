@@ -19,6 +19,14 @@ upgrades **within a supported family/version**, subject to each release's compat
 notes. Both bot and API must match the selected release. The bot initializes the database;
 the API waits for completed bootstrap. See [DATABASE-BASELINE.md](DATABASE-BASELINE.md).
 
+Tenant-runtime releases also require a separate shared guild database for a remote
+core. Before rollout, configure both services with the shared-store URL/token pair
+and an explicit evidence backend from [the Bunny runbook](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).
+Local installs use `{core-path}.guild.db` and, on Unix, `{core-path}.evidence` by default.
+Keep these stores and evidence resources with their core catalog during recovery;
+a missing owned guild database fails closed. Guild schema version 8 requires matching
+binaries; rollback needs the corresponding pre-upgrade stores, not just the core file.
+
 ## 1. Pick a version
 
 Prefer a **git tag** or release (`vX.Y.Z`) over an arbitrary `main` commit.
@@ -36,7 +44,8 @@ Both `jmodguard-bot` and `jmodguard-api` can hold the shared DB open.
 
 1. Stop **both** processes.
 2. Copy `jmodguard.db` plus `jmodguard.db-wal` / `jmodguard.db-shm` if present.
-3. Keep the previous binaries or container image tags until you verify the upgrade.
+3. Copy every configured local guild database and its WAL/SHM files, plus the private evidence roots, while both processes remain stopped.
+4. Keep the previous binaries or container image tags until you verify the upgrade.
 
 **Hot copy:** use SQLite online backup or
 `sqlite3 jmodguard.db "VACUUM INTO 'jmodguard-backup.db'"` — do not file-copy

@@ -253,11 +253,25 @@ impl BunnyEvidenceStore {
         .await
     }
 
-    pub async fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
+    pub async fn read_available(
+        &self,
+        store: &GuildDataStore,
+        target: &EvidenceTarget,
+        job: &EvidenceJob,
+        expected_sha: &str,
+    ) -> Result<Vec<u8>> {
         ensure!(
             job.storage_id == self.storage_id,
             "evidence storage alias mismatch"
         );
+        ensure!(
+            self.job(store, target).await? == *job
+                && job.state == EvidenceState::Available
+                && !job.cancelled,
+            "evidence is not available in this scope"
+        );
+        self.progress(store, target).await?;
+        self.verify_resource().await?;
         self.timed(async {
             let mut response = self
                 .send(self.request(Method::GET, &job.object_key, Body::empty())?)

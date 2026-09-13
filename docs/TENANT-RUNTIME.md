@@ -4,7 +4,8 @@ Bot and API processes now open a bounded `TenantRuntime` against the core direct
 database. A local dual-process install creates one shared guild store beside the core
 file (`jmodguard.db.guild.db`) and, on Unix, a private local evidence directory
 (`jmodguard.db.evidence`). Remote core databases require an explicit shared
-`[[guild_stores.stores]]` entry. Catalog rows store only opaque IDs and shared/dedicated
+`[[guild_stores.stores]]` entry or the atomic `JMODGUARD_GUILD_STORE_URL` /
+`JMODGUARD_GUILD_STORE_TOKEN` environment pair. Catalog rows store only opaque IDs and shared/dedicated
 policy; URLs and tokens stay in process configuration.
 
 This is not a guild move. Populated-guild shared/dedicated moves remain a later feature
@@ -127,3 +128,24 @@ new form starts a new intent; clients must retain IDs when retrying across reloa
 
 Case-removal settings and tenant log mappings share the membership configuration
 revision. Settings reads return that authoritative revision, including after log edits.
+
+## Runtime recovery and producer coverage
+
+Custom-command Timeout, Kick and Ban plan steps record the same selected application
+outcomes as built-in moderation commands, including the actor and failed/uncertain
+Discord result. Ban steps own their Gateway echo. Plans retain sequential execution,
+continue after a step error, and keep the existing core summary; routine plan steps
+still create no case. A queued unban that reports `already_unbanned` releases its echo
+token because Discord made no mutation.
+
+Cleanup pages include cancelled captures as well as settled deletion jobs. The existing
+backend decides whether all writes have settled: local cleanup holds the resource lock;
+an unresolved Bunny PUT remains blocked. A disabled backend reports pending cleanup.
+Missing or empty guild databases with retained placements or erasure jobs are refused,
+not recreated under the old identity. Restore the original store and retry; absence of
+a newly created binding cannot prove that separately stored objects were removed.
+
+Downloads recheck resource authority as well as journal availability and content hashes.
+Local reads hold the stable resource lock and verify its marker; Bunny reads require the
+original persisted binding and accepted transfer plus the configured resource marker.
+Matching bytes do not authorize switching to an unmarked or backup resource.

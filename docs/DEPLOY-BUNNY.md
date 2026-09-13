@@ -46,7 +46,7 @@ is Discord OAuth, guild listing, and unban.
 Local `cargo run` still embeds `frontend/` in the API for SETUP.md. That
 is a laptop / self-host convenience. It is not the Bunny deploy.
 
-## 1. Create the database
+## 1. Create the core and guild databases
 
 Create a Bunny Database. In **Access**, generate full-access credentials
 for each container. Both need write access: the bot writes moderation
@@ -63,6 +63,34 @@ jModGuard reads those names. Portable aliases `JMODGUARD_DB_URL` and
 `JMODGUARD_DB_TOKEN` take precedence when both are non-empty. URL and
 token are an atomic pair. Blank values count as unset. Never commit an
 access token.
+
+Create a **separate** Bunny Database for the shared guild store. Configure both
+containers with credentials for that same guild database, in addition to the core
+credentials above. Never point the guild store at the core database or the frontend
+Storage Zone. The guild database must be empty on first initialization or already have
+the matching `jmodguard-guild-1` identity; runtime upgrades it to version 8.
+
+```dotenv
+JMODGUARD_GUILD_STORE_URL=libsql://GUILD_DATABASE_ID.lite.bunnydb.net
+JMODGUARD_GUILD_STORE_TOKEN=SECRET_FOR_GUILD_DATABASE
+JMODGUARD_EVIDENCE_BACKEND=none
+```
+
+The shared-store URL/token must be set together. No TOML file is needed for this
+single shared-store install. An optional `JMODGUARD_GUILD_STORE_ID` selects an existing
+32-hex identity; normally leave it unset so both processes rediscover the same stamped
+identity. Start the bot first and wait for Gateway startup before starting the API.
+Dedicated stores and additional shared stores use protected `[[guild_stores.stores]]`
+configuration at `JMODGUARD_CONFIG` (the images default to `/data/config.toml`).
+
+`none` is appropriate for a fresh install without private objects: selected inline text
+and cases still work, and no attachment capture worker is enabled. It cannot erase
+existing objects. An installation with private evidence must retain its owning backend,
+resource identity and credentials; see [tenant runtime](TENANT-RUNTIME.md) and
+[Bunny evidence](BUNNY-EVIDENCE.md). The local evidence default requires a durable,
+explicit filesystem root when the core is remote, so do not leave that default implicit
+in these containers. Never use the public frontend zone or a backup-only zone as the
+private evidence resource.
 
 ## 2. Publish the admin UI to Storage + CDN
 
@@ -288,7 +316,7 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
-Optional when you have no `config.toml` on the API container (typical):
+With the shared-store/evidence environment above, no `config.toml` is required. Optional:
 `JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix
 and bot status are bot-owned — set those on the bot app.
 

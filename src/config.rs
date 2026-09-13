@@ -601,6 +601,42 @@ impl Config {
     }
 
     fn apply_env_for(&mut self, api: bool) -> Result<()> {
+        match (
+            nonempty_env("JMODGUARD_GUILD_STORE_URL"),
+            nonempty_env("JMODGUARD_GUILD_STORE_TOKEN"),
+        ) {
+            (Some(url), Some(token)) => {
+                let shared = match self
+                    .guild_stores
+                    .stores
+                    .iter()
+                    .position(|store| store.dedicated_guild_id == 0)
+                {
+                    Some(index) => &mut self.guild_stores.stores[index],
+                    None => {
+                        self.guild_stores.stores.push(GuildStoreConfig::default());
+                        self.guild_stores
+                            .stores
+                            .last_mut()
+                            .expect("shared entry was inserted")
+                    }
+                };
+                shared.url = url;
+                shared.token = token;
+                if let Some(id) = nonempty_env("JMODGUARD_GUILD_STORE_ID") {
+                    shared.id = id;
+                }
+            }
+            (None, None) => {
+                anyhow::ensure!(
+                    nonempty_env("JMODGUARD_GUILD_STORE_ID").is_none(),
+                    "JMODGUARD_GUILD_STORE_ID requires the shared store URL/token pair"
+                );
+            }
+            _ => anyhow::bail!(
+                "JMODGUARD_GUILD_STORE_URL and JMODGUARD_GUILD_STORE_TOKEN must be set together and non-empty"
+            ),
+        }
         if !api {
             if let Ok(raw) = env::var("JMODGUARD_IMAGE_SPAM_LIMITS") {
                 self.image_spam = serde_json::from_str(&raw)
@@ -886,6 +922,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_store_environment_is_atomic_and_preserves_other_store_entries() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let names = [
+            "JMODGUARD_GUILD_STORE_URL",
+            "JMODGUARD_GUILD_STORE_TOKEN",
+            "JMODGUARD_GUILD_STORE_ID",
+        ];
+        let _saved = SavedEnv::capture(&names);
+        for name in names {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        unsafe {
+            std::env::set_var(names[0], "libsql://guild.example");
+        }
+        assert!(Config::default().apply_env_for(false).is_err());
+        unsafe {
+            std::env::set_var(names[1], "guild-token");
+        }
+        for api in [false, true] {
+            let mut cfg = Config::parse_file("", api).unwrap();
+            cfg.apply_env_for(api).unwrap();
+            assert_eq!(cfg.guild_stores.stores.len(), 1);
+            assert_eq!(cfg.guild_stores.stores[0].url, "libsql://guild.example");
+            assert_eq!(cfg.guild_stores.stores[0].token, "guild-token");
+            cfg.guild_stores.validate().unwrap();
+        }
+        let mut cfg = Config::default();
+        let shared_id = "a".repeat(32);
+        cfg.guild_stores.stores = vec![
+            super::GuildStoreConfig {
+                dedicated_guild_id: 10,
+                path: "dedicated.db".into(),
+                ..Default::default()
+            },
+            super::GuildStoreConfig {
+                id: shared_id.clone(),
+                path: "shared.db".into(),
+                ..Default::default()
+            },
+            super::GuildStoreConfig {
+                id: "b".repeat(32),
+                path: "other-shared.db".into(),
+                ..Default::default()
+            },
+        ];
+        cfg.apply_env_for(true).unwrap();
+        assert_eq!(cfg.guild_stores.stores.len(), 3);
+        assert_eq!(
+            cfg.guild_stores.stores[0].path,
+            std::path::PathBuf::from("dedicated.db")
+        );
+        assert!(cfg.guild_stores.stores[0].url.is_empty());
+        assert_eq!(cfg.guild_stores.stores[1].id, shared_id);
+        assert_eq!(cfg.guild_stores.stores[1].url, "libsql://guild.example");
+        assert!(cfg.guild_stores.stores[2].url.is_empty());
+        unsafe {
+            std::env::set_var(names[2], "invalid");
+        }
+        cfg.apply_env_for(true).unwrap();
+        assert!(cfg.guild_stores.validate().is_err());
+        unsafe {
+            std::env::remove_var(names[0]);
+            std::env::remove_var(names[1]);
+        }
+        assert!(Config::default().apply_env_for(true).is_err());
     }
 
     #[test]

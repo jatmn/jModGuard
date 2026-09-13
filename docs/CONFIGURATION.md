@@ -160,3 +160,18 @@ New data-layer operations check the request's captured membership within configu
 transactions, preserving existing inheritance, nickname and version semantics. Current API
 and bot callers retain their existing paths; this is groundwork for complete admission and
 browser scope handling. See [configuration scopes](CONFIGURATION-SCOPES.md).
+
+## Environment-only tenant stores
+
+Set `JMODGUARD_GUILD_STORE_URL` and `JMODGUARD_GUILD_STORE_TOKEN` together to configure
+the default shared guild database in both services. These override the first shared
+TOML entry's connection pair, preserving its ID and every other store entry. If no
+shared entry exists, one is added. Optional `JMODGUARD_GUILD_STORE_ID` requires the pair
+and must match the durable identity; leaving it unset preserves discovery. This never
+permits using the core database as a guild store. Dedicated/additional stores retain
+the TOML configuration described above.
+
+Remote cores also require an explicit evidence choice: `JMODGUARD_EVIDENCE_BACKEND=none`
+for a fresh installation without objects, or the existing owning backend and its
+configuration. Local evidence with a remote core needs `JMODGUARD_EVIDENCE_ROOT` on
+persistent private storage. See [the complete container setup](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).

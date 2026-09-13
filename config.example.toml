@@ -34,6 +34,9 @@ pool_size = 8
 
 # Optional extra guild stores. A local core file also creates a default shared
 # store at `{db.path}.guild.db`. Remote cores need an explicit shared store.
+# Env pair: JMODGUARD_GUILD_STORE_URL + JMODGUARD_GUILD_STORE_TOKEN.
+# Optional JMODGUARD_GUILD_STORE_ID; otherwise preserve/discover the store identity.
+# Overrides the first shared entry; other shared/dedicated entries stay unchanged.
 # [guild_stores]
 # max_handles = 8
 # [[guild_stores.stores]]

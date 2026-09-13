@@ -1156,3 +1156,125 @@ async fn note_intent_retries_keep_one_entry_and_original_timestamp() {
         2
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_capture_cleanup_uses_backend_settlement_and_survives_restart() {
+    use crate::db::guild_data::{EvidenceOrigin, EvidenceRequest, EvidenceState};
+    for backend in ["local", "none"] {
+        let f = Fixture::with_stores(
+            Default::default(),
+            EvidenceConfig {
+                backend: backend.into(),
+                ..Default::default()
+            },
+        );
+        let e = enroll(&f, 10, 100).await;
+        let (store, scope) = f.tenant.live(e).await.unwrap();
+        let case = CaseId::new();
+        let id = CaseId::new();
+        store
+            .record_case(scope.clone(), case.clone(), case_data(99), case_limits())
+            .await
+            .unwrap();
+        let storage_id =
+            CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+        store
+            .reserve_case_evidence(
+                scope.clone(),
+                case.clone(),
+                id.clone(),
+                EvidenceRequest {
+                    storage_id,
+                    bytes: 3,
+                    origin: EvidenceOrigin {
+                        channel_id: 1,
+                        message_id: 2,
+                        attachment_id: 3,
+                    },
+                },
+                evidence_limits(),
+            )
+            .await
+            .unwrap();
+        store
+            .remove_case(scope.clone(), case.clone())
+            .await
+            .unwrap();
+        let cleanup = f.tenant.cleanup_owned_evidence(&store, &scope).await;
+        let job = store
+            .evidence_transfer_job(scope.clone(), case, id)
+            .await
+            .unwrap();
+        if backend == "local" {
+            cleanup.unwrap();
+            assert_eq!(job.state, EvidenceState::Erased);
+        } else {
+            assert!(cleanup.is_err());
+            assert_eq!(job.state, EvidenceState::Capturing);
+        }
+        db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+        let reopened = TenantRuntime::open(
+            &f.db,
+            &DbConfig {
+                path: f.path.clone(),
+                pool_size: 2,
+                ..Default::default()
+            },
+            &Default::default(),
+            &EvidenceConfig {
+                backend: backend.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if backend == "local" {
+            assert!(reopened.drive_erasure().await.unwrap());
+            assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        } else {
+            assert!(reopened.drive_erasure().await.is_err());
+            assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_owned_store_cannot_be_recreated_as_erasure_proof() {
+    let f = Fixture::new();
+    let e = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(e, case_data(99))
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let guild = PathBuf::from(format!("{}.guild.db", f.path.display()));
+    f.tenant.inner.handles.lock().await.map.clear();
+    let saved = guild.with_extension("saved");
+    std::fs::rename(&guild, &saved).unwrap();
+    let cfg = DbConfig {
+        path: f.path.clone(),
+        pool_size: 2,
+        ..Default::default()
+    };
+    let evidence = EvidenceConfig {
+        backend: "none".into(),
+        ..Default::default()
+    };
+    assert!(TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence).is_err());
+    assert!(!guild.exists(), "missing database must stay missing");
+    std::fs::File::create(&guild).unwrap();
+    assert!(
+        TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence).is_err(),
+        "an empty replacement is not cleanup proof either"
+    );
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", guild.display()));
+    }
+
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_some());
+    std::fs::rename(&saved, &guild).unwrap();
+    let reopened = TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence).unwrap();
+    assert!(reopened.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
