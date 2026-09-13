@@ -422,6 +422,18 @@ fn drop_author_posts(
     }
 }
 
+fn drop_stale_update(
+    detector: &Detector,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    replace: bool,
+) {
+    if replace {
+        detector.invalidate(guild, channel, message);
+    }
+}
+
 fn may_admit(
     rule: &crate::types::RuleDef,
     author: u64,
@@ -542,33 +554,37 @@ fn consider(
     replace: bool,
 ) {
     let Some(rule) = cfg.rules.get("repeat_text") else {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     };
     let Ok(policy) = Policy::parse(rule) else {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     };
     if !may_admit(rule, author, channel, roles) {
-        if replace {
-            app.text_spam.invalidate(guild, channel, message);
-        }
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     }
-    let Some(raw) = content else { return };
+    let Some(raw) = content else {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
+        return;
+    };
     if raw.len() > MAX_TEXT {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     }
     let text = text_spam::normalize(raw);
     if !text_spam::long_enough(&text, policy.min_length) {
-        if replace {
-            app.text_spam.invalidate(guild, channel, message);
-        }
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     }
     let age_ms = received_at.timestamp_millis().saturating_sub(edited_ms);
     if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     }
     let Some(at) = received.checked_sub(Duration::from_millis(age_ms as u64)) else {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     };
     let token = (cfg.version, cfg.durable_version);
@@ -589,6 +605,7 @@ fn consider(
         received,
         replace,
     ) else {
+        drop_stale_update(&app.text_spam, guild, channel, message, replace);
         return;
     };
     let app = Arc::clone(app);
@@ -772,6 +789,24 @@ mod tests {
         assert!(!may_admit(&rule, 1, 2, None));
         assert!(!may_admit(&rule, 1, 2, Some(&[3])));
         assert!(may_admit(&rule, 1, 2, Some(&[4])));
+    }
+
+    #[test]
+    fn rejected_update_drops_indexed_post() {
+        let d = Detector::default();
+        let now = Instant::now();
+        let p = policy();
+        let mut first = post(1, 10, now, "spam");
+        first.revision = d.revision();
+        assert!(
+            d.admit(1, 2, first, (0, 0), &p, now, false)
+                .is_none()
+        );
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
+        super::drop_stale_update(&d, 1, 10, 1, true);
+        assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
+        super::drop_stale_update(&d, 1, 10, 1, false);
+        assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
     }
 
     #[test]

@@ -901,15 +901,19 @@ pub fn observe_update(
     let Some(attachments) = event.attachments.as_ref() else {
         return;
     };
+    let channel = event.channel_id.get();
+    let message = event.id.get();
+    let guild_id = guild.get();
     let Some(rule) = cfg.rules.get("attachment_flood") else {
+        app.image_spam.invalidate(guild_id, channel, message);
         return;
     };
     let Ok(policy) = Policy::parse(rule) else {
+        app.image_spam.invalidate(guild_id, channel, message);
         return;
     };
     let author = event.author.as_ref().map(|u| u.id.get()).or_else(|| {
-        app.image_spam
-            .author_of(guild.get(), event.channel_id.get(), event.id.get())
+        app.image_spam.author_of(guild_id, channel, message)
     });
     let Some(author) = author else { return };
     if author == ctx.cache.current_user().id.get() {
@@ -920,9 +924,8 @@ pub fn observe_update(
         .as_ref()
         .and_then(|m| m.as_ref())
         .map(|m| m.roles.iter().map(|r| r.get()).collect::<Vec<_>>());
-    if !may_admit(rule, author, event.channel_id.get(), roles.as_deref()) {
-        app.image_spam
-            .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+    if !may_admit(rule, author, channel, roles.as_deref()) {
+        app.image_spam.invalidate(guild_id, channel, message);
         return;
     }
     let images: Vec<_> = attachments
@@ -936,12 +939,12 @@ pub fn observe_update(
         })
         .collect();
     if images.len() < policy.min_attachments {
-        app.image_spam
-            .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+        app.image_spam.invalidate(guild_id, channel, message);
         return;
     }
     let detector = &app.image_spam;
     if images.len() > detector.limits.max_files_per_post {
+        detector.invalidate(guild_id, channel, message);
         detector.capacity_drop();
         return;
     }
@@ -954,6 +957,7 @@ pub fn observe_update(
             &a.url,
             detector.limits.max_file_bytes,
         ) else {
+            detector.invalidate(guild_id, channel, message);
             detector.capacity_drop();
             return;
         };
@@ -967,9 +971,11 @@ pub fn observe_update(
         .unwrap_or_else(|| received_at.timestamp_millis());
     let age_ms = received_at.timestamp_millis().saturating_sub(edited_ms);
     if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 {
+        detector.invalidate(guild_id, channel, message);
         return;
     }
     let Some(at) = received.checked_sub(Duration::from_millis(age_ms as u64)) else {
+        detector.invalidate(guild_id, channel, message);
         return;
     };
     let token = (cfg.version, cfg.durable_version);
@@ -993,6 +999,7 @@ pub fn observe_update(
         received,
         true,
     ) else {
+        detector.invalidate(guild_id, channel, message);
         return;
     };
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
