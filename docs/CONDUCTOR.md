@@ -47,14 +47,19 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
-database. Logout revokes that row; a restart keeps unrevoked sessions. Administration
+database. Its browser lifetime follows the applied absolute-session setting; server-side
+idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
+unrevoked sessions. Administration
 pages: System Status, Installation, Notifications. Updates and Backups are shown as
 not available yet, with no working action buttons.
 
 Owner Discord notifications use an incoming webhook stored write-only on the
 conductor. Payloads never include tokens, chat, or evidence. Delivery health is listed
-on the Notifications page. A test send queues a bounded job that can fail and be
-replayed.
+on the Notifications page. Mention parsing remains disabled by default and follows the
+explicit Allow mention parsing setting when enabled. A test send queues a bounded job
+that can fail and be replayed with a fresh retry budget. Jobs interrupted by a conductor
+restart fail with an unknown-outcome message for deliberate operator replay instead of
+being automatically redelivered.
 
 Telemetry samples at the background interval unless an authorized operator holds a
 dashboard lease (Status page visible). History is bounded by the configured hours and

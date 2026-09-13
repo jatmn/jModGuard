@@ -149,7 +149,7 @@ impl Conductor {
         Ok((user.id, user.username))
     }
 
-    pub async fn complete_login(&self, code: &str) -> Result<String> {
+    pub async fn complete_login(&self, code: &str) -> Result<(String, u64)> {
         let token = self.exchange_code(code).await?;
         let (user_id, username) = self.fetch_user(&token).await?;
         let expected = self.cfg.owner_id.to_string();
@@ -163,11 +163,12 @@ impl Conductor {
         } else {
             store.stamp_setup_identity(&user_id).await?;
         }
+        let absolute_secs = self.settings().await?.session_absolute_secs;
         let session_id = store.create_session(&user_id).await?;
         store
             .audit(&user_id, "login", &format!("username={username}"))
             .await?;
-        Ok(session_id)
+        Ok((session_id, absolute_secs))
     }
 
     pub async fn require_operator(&self, cookie_header: Option<&str>) -> Result<Operator> {

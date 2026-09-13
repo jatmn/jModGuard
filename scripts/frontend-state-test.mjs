@@ -10,9 +10,15 @@ const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), '
 // production el() sends to the browser, without duplicating its implementation.
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
+  const location = {
+    search: '', pathname: '/', hash: '', replaced: null,
+    replace(value) { this.replaced = value; },
+  };
+  const opened = [];
+  const historyUrls = [];
   const node = (tag) => ({
     tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
-    classList: { toggle() {} },
+    classList: { toggle() {}, add() {}, remove() {} },
     focus() {},
     replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
     append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
@@ -24,23 +30,23 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     querySelectorAll() { return []; },
     querySelector() { return null; },
   });
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status'].map((key) => [key, node('div')]));
+  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools'].map((key) => [key, node('div')]));
   const context = vm.createContext({
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location: { search: '', pathname: '/', hash: '' }, open() {} },
-    location: { search: '', pathname: '/', hash: '' },
-    history: { replaceState() {} },
+    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } },
+    location,
+    history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -832,4 +838,51 @@ test('preview token is sent on API requests from this tab', async () => {
   session.set('jmodguard_preview', 'preview-token');
   await app.api('/api/me');
   assert.equal(headers['x-jmodguard-preview'], 'preview-token');
+});
+
+test('preview fragment remains fail-closed when session storage is blocked', async () => {
+  let headers;
+  const blocked = {
+    get() { throw new Error('blocked'); },
+    set() { throw new Error('blocked'); },
+    delete() { throw new Error('blocked'); },
+  };
+  const h = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), blocked);
+  h.location.hash = '#preview=fragment-token';
+  h.app.capturePreviewToken();
+  assert.equal(h.app.currentPreviewToken(), 'fragment-token');
+  await h.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'fragment-token');
+  assert.equal(h.historyUrls.at(-1), '/');
+});
+
+test('expired preview clears the bearer and leaves the preview tab', async () => {
+  const h = harness(async () => ({
+    ok: false,
+    status: 410,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'preview expired', code: 'preview_expired' }),
+  }));
+  h.session.set('jmodguard_preview', 'expired-token');
+  await assert.rejects(h.app.api('/api/me'), /preview expired/);
+  assert.equal(h.session.has('jmodguard_preview'), false);
+  assert.equal(h.location.replaced, '/');
+});
+
+test('View as hands the preview bearer through a URL fragment', async () => {
+  const h = harness(async () => ({
+    ok: true,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ token: 'new-preview-token' }),
+  }));
+  h.app.state.me.is_bot_owner = true;
+  h.app.bindOwnerTools();
+  const button = findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'View as…');
+  await button.listeners.click();
+  assert.equal(h.opened[0][0], '/#preview=new-preview-token');
+  assert.equal(h.opened[0][1], '_blank');
+  assert.equal(h.opened[0][2], 'noopener');
 });

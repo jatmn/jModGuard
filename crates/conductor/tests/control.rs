@@ -1,7 +1,7 @@
 //! Control-store login, sessions, jobs and isolation. Local HTTP fixtures only.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jmodguard_conductor::{Conductor, config::Config, router_for};
+use jmodguard_conductor::{Conductor, config::Config, router_for, store::ControlStore};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -117,7 +117,7 @@ async fn call(
     )
 }
 
-async fn login(control: &Control) -> String {
+async fn login_set_cookie(control: &Control) -> String {
     let (status, _, _) = call(&control.router, "GET", "/login", None, None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let login = control
@@ -152,7 +152,16 @@ async fn login(control: &Control) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "login failed");
-    session.unwrap().split(';').next().unwrap().to_string()
+    session.unwrap()
+}
+
+async fn login(control: &Control) -> String {
+    login_set_cookie(control)
+        .await
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -240,46 +249,84 @@ async fn session_revocation_and_restart_reuse_durable_store() {
 }
 
 #[tokio::test]
-async fn failed_notification_job_can_be_replayed() {
+async fn session_cookie_uses_the_applied_absolute_lifetime() {
     let control = setup(42).await;
     let cookie = login(&control).await;
-    let (status, _, _) = call(
+    let (status, patched, _) = call(
         &control.router,
         "PATCH",
         "/api/settings",
         Some(&cookie),
-        Some(r#"{"revision":1,"notify_enabled":true,"notify_webhook_url":"http://127.0.0.1:1/nope"}"#),
+        Some(r#"{"revision":1,"session_absolute_secs":172800}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, queued, _) = call(
-        &control.router,
-        "POST",
-        "/api/notifications/test",
-        Some(&cookie),
-        Some("{}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{queued}");
-    let id = serde_json::from_str::<serde_json::Value>(&queued).unwrap()["id"]
-        .as_str()
+    assert_eq!(status, StatusCode::OK, "{patched}");
+
+    let issued = login_set_cookie(&control).await;
+    assert!(issued.contains("Max-Age=172800"), "{issued}");
+}
+
+#[tokio::test]
+async fn failed_notification_job_can_be_replayed() {
+    let control = setup(42).await;
+    let store = control.conductor.store().unwrap();
+    let id = store
+        .insert_job("notify_test", &serde_json::json!({}), 1)
+        .await
+        .unwrap();
+    let claimed = store.claim_job().await.unwrap().unwrap();
+    assert_eq!(claimed.attempts, 1);
+    store
+        .finish_job(&id, false, Some("delivery failed"))
+        .await
+        .unwrap();
+    assert!(store.replay_job(&id).await.unwrap());
+    let replayed = store
+        .list_jobs(8)
+        .await
         .unwrap()
-        .to_string();
-    for _ in 0..8 {
-        control.conductor.tick_job().await.unwrap();
-    }
-    let (status, jobs, _) = call(&control.router, "GET", "/api/jobs", Some(&cookie), None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(jobs.contains("failed") || jobs.contains("queued"), "{jobs}");
-    let (status, _, _) = call(
-        &control.router,
-        "POST",
-        &format!("/api/jobs/{id}/retry"),
-        Some(&cookie),
-        Some("{}"),
-    )
-    .await;
-    assert!(status == StatusCode::OK || status == StatusCode::BAD_REQUEST);
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    assert_eq!(replayed.status, "queued");
+    assert_eq!(replayed.attempts, 0);
+    assert!(replayed.last_error.is_none());
+}
+
+#[tokio::test]
+async fn interrupted_running_job_fails_closed_for_manual_replay() {
+    let db = std::env::temp_dir().join(format!(
+        "jmodguard-conductor-recovery-{}-{}.db",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let store = ControlStore::open(&db).await.unwrap();
+    let id = store
+        .insert_job("notify_test", &serde_json::json!({}), 3)
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().status, "running");
+    drop(store);
+
+    let reopened = ControlStore::open(&db).await.unwrap();
+    let recovered = reopened
+        .list_jobs(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id == id)
+        .unwrap();
+    assert_eq!(recovered.status, "failed");
+    assert!(
+        recovered
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outcome unknown"))
+    );
+    drop(reopened);
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(format!("{}-wal", db.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db.display()));
 }
 
 #[tokio::test]

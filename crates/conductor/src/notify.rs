@@ -49,10 +49,7 @@ pub async fn deliver(conductor: &Conductor, kind: &str, payload_json: &str) -> R
         !message.contains("token") && !message.contains("secret"),
         "notification payload rejected"
     );
-    let body = serde_json::json!({
-        "content": message,
-        "allowed_mentions": { "parse": [] },
-    });
+    let body = notification_body(message, settings.notify_mentions);
     let response = conductor
         .http
         .post(&settings.notify_webhook_url)
@@ -73,5 +70,34 @@ pub async fn deliver(conductor: &Conductor, kind: &str, payload_json: &str) -> R
             .insert_notify_receipt(category, "failed", Some(&detail))
             .await?;
         anyhow::bail!("owner notification delivery failed: {detail}");
+    }
+}
+
+fn notification_body(message: &str, allow_mentions: bool) -> serde_json::Value {
+    let parse: &[&str] = if allow_mentions {
+        &["users", "roles", "everyone"]
+    } else {
+        &[]
+    };
+    serde_json::json!({
+        "content": message,
+        "allowed_mentions": { "parse": parse },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notification_body;
+
+    #[test]
+    fn notification_mentions_follow_the_applied_setting() {
+        assert_eq!(
+            notification_body("hello <@42>", false)["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            notification_body("hello <@42>", true)["allowed_mentions"]["parse"],
+            serde_json::json!(["users", "roles", "everyone"])
+        );
     }
 }

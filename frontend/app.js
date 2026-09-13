@@ -116,21 +116,44 @@ function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
 }
 
+let previewTokenFallback = null;
+
 function capturePreviewToken() {
+  const query = new URLSearchParams(location.search);
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const token = fragment.get("preview") || query.get("preview");
+  if (!token) return;
+  // Keep an in-memory source of truth before touching browser storage. A
+  // blocked sessionStorage must never silently restore the owner's write access.
+  previewTokenFallback = token;
   try {
-    const params = new URLSearchParams(location.search);
-    const fromUrl = params.get("preview");
-    if (fromUrl) {
-      window.sessionStorage.setItem("jmodguard_preview", fromUrl);
-      params.delete("preview");
-      const qs = params.toString();
-      history.replaceState({}, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
-    }
-  } catch (_) { /* Preview token stays in the URL if storage is blocked. */ }
+    window.sessionStorage.setItem("jmodguard_preview", token);
+  } catch (_) { /* The in-memory fallback remains active for this tab. */ }
+  query.delete("preview");
+  fragment.delete("preview");
+  const qs = query.toString();
+  const hash = fragment.toString();
+  try {
+    history.replaceState({}, "", location.pathname + (qs ? `?${qs}` : "") + (hash ? `#${hash}` : ""));
+  } catch (_) { /* Header attachment still uses the in-memory token. */ }
 }
 
 function currentPreviewToken() {
-  try { return window.sessionStorage.getItem("jmodguard_preview"); } catch (_) { return null; }
+  try { return window.sessionStorage.getItem("jmodguard_preview") || previewTokenFallback; }
+  catch (_) { return previewTokenFallback; }
+}
+
+function clearPreviewToken() {
+  previewTokenFallback = null;
+  try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+}
+
+function leaveExpiredPreview() {
+  clearPreviewToken();
+  if (typeof window !== "undefined" && window.location) {
+    if (typeof window.location.replace === "function") window.location.replace("/");
+    else window.location.href = "/";
+  }
 }
 
 function isPreview() {
@@ -253,6 +276,7 @@ async function api(path, method = "GET", body = null, signal) {
       const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
       const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
       error.code = data && data.code;
+      if (error.code === "preview_expired") leaveExpiredPreview();
       throw error;
     }
     return data;
@@ -273,11 +297,16 @@ async function downloadPrivate(path, filename) {
   const res = await fetch(apiUrl(path), opts);
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
+    let code = null;
     try {
       const data = JSON.parse(await res.text());
       if (data && data.error) message = data.error;
+      code = data && data.code;
     } catch (_) {}
-    throw apiError(message, res.status);
+    const error = apiError(message, res.status);
+    error.code = code;
+    if (code === "preview_expired") leaveExpiredPreview();
+    throw error;
   }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -540,7 +569,7 @@ function bindOwnerTools() {
     tools.classList.remove("hidden");
     tools.replaceChildren(el("button", { class: "btn small", text: "Exit preview", onclick: async () => {
       try { await api("/api/preview", "DELETE"); } catch (_) {}
-      try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+      clearPreviewToken();
       window.location = "/";
     } }));
     return;
@@ -559,7 +588,8 @@ function bindOwnerTools() {
     el("button", { class: "btn small", text: "View as…", onclick: async () => {
       if (!state.guildId) { toast("Select a server first", "error"); return; }
       const launched = await api("/api/preview", "POST", { guild_id: String(state.guildId), profile: profile.value });
-      const url = `${location.pathname}?preview=${encodeURIComponent(launched.token)}`;
+      // Fragments are not sent in HTTP requests or Referer headers.
+      const url = `${location.pathname}#preview=${encodeURIComponent(launched.token)}`;
       window.open(url, "_blank", "noopener");
     } }),
     profile,
@@ -1782,10 +1812,11 @@ function bootUi() {
     dirty = false;
     if (isPreview()) {
       try { await api("/api/preview", "DELETE"); } catch (_) {}
-      try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+      clearPreviewToken();
       window.location = "/";
       return;
     }
+    clearPreviewToken();
     try {
       const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
       const data = await res.json();

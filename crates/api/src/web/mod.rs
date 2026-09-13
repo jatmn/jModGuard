@@ -632,16 +632,19 @@ async fn api_me(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = require_auth(&state, &session).await?;
+    let previewing = preview::current().is_some();
     let guilds: Vec<serde_json::Value> = auth
         .guilds
         .iter()
-        .filter(|g| g.manage_permission())
+        // A Member preview has no synthetic Manage Guild permission, but the
+        // owner still needs the selected guild in this read-only tab.
+        .filter(|g| previewing || g.manage_permission())
         .map(|g| {
             serde_json::json!({
                 "id": g.id,
                 "name": g.name,
                 "icon": g.icon,
-                "manage": true,
+                "manage": g.manage_permission(),
             })
         })
         .collect();
@@ -1034,7 +1037,9 @@ pub async fn authorize_manage_guild(
         )));
     }
     let mut auth = require_auth_fresh(app, session).await?;
-    if !auth.can_manage(guild_id) {
+    // apply_overlay already verified the real, freshly fetched Discord guild
+    // before replacing its permissions with the selected preview profile.
+    if !preview::authorizes_guild(guild_id) && !auth.can_manage(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));

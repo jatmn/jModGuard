@@ -1629,6 +1629,65 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
 }
 
 #[tokio::test]
+async fn preview_profiles_apply_distinct_permission_views() {
+    for (profile, manage, can_delete) in [
+        ("administrator", true, true),
+        ("moderator", true, false),
+        ("member", false, false),
+    ] {
+        let f = Fixture::new(true).await;
+        f.enroll(10).await;
+        let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+        f.app
+            .tenant
+            .activate(enrollment)
+            .await
+            .unwrap()
+            .expect("tenant store");
+        let (status, launched) = f
+            .request(
+                "POST",
+                "/api/preview",
+                &format!(r#"{{"guild_id":"10","profile":"{profile}"}}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{profile}: {launched}");
+        let token = launched["token"].as_str().expect("preview token");
+
+        let (status, me) = f.request_preview("GET", "/api/me", "", token).await;
+        assert_eq!(status, StatusCode::OK, "{profile}: {me}");
+        assert_eq!(me["guilds"][0]["manage"], manage, "{profile}: {me}");
+        assert_eq!(me["preview"]["profile"], profile);
+
+        let (status, cases) = f
+            .request_preview("GET", "/api/guilds/10/cases", "", token)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
+        assert_eq!(cases["can_delete"], can_delete, "{profile}: {cases}");
+    }
+}
+
+#[tokio::test]
+async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
+    let f = Fixture::new(true).await;
+    let token = "expired-preview".to_string();
+    f.app.preview.insert(
+        token.clone(),
+        preview::PreviewGrant {
+            token: token.clone(),
+            actor_id: 42,
+            guild_id: 10,
+            profile: preview::PreviewProfile::Member,
+            expires: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+    let (status, body) = f.request_preview("GET", "/api/me", "", &token).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "preview_expired");
+    assert!(!f.app.preview.contains_key(&token));
+}
+
+#[tokio::test]
 async fn guild_user_cannot_launch_preview() {
     let f = Fixture::new(false).await;
     let (status, body) = f

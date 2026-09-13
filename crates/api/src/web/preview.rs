@@ -5,11 +5,12 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_sessions::Session;
 
+use super::oauth::PermissionsField;
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild, is_bot_owner, require_auth};
 
@@ -20,12 +21,42 @@ tokio::task_local! {
     static PREVIEW: Option<PreviewGrant>;
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewProfile {
+    Administrator,
+    Moderator,
+    Member,
+}
+
+impl PreviewProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "administrator" => Some(Self::Administrator),
+            "moderator" => Some(Self::Moderator),
+            "member" => Some(Self::Member),
+            _ => None,
+        }
+    }
+
+    fn permissions(self) -> u64 {
+        const ADMINISTRATOR: u64 = 1 << 3;
+        const BAN_MEMBERS: u64 = 1 << 2;
+        const MANAGE_GUILD: u64 = 1 << 5;
+        match self {
+            Self::Administrator => ADMINISTRATOR | BAN_MEMBERS | MANAGE_GUILD,
+            Self::Moderator => BAN_MEMBERS | MANAGE_GUILD,
+            Self::Member => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreviewGrant {
     pub token: String,
     pub actor_id: u64,
     pub guild_id: u64,
-    pub profile: String,
+    pub profile: PreviewProfile,
     pub expires: Instant,
 }
 
@@ -67,12 +98,9 @@ pub async fn launch(
         .parse()
         .map_err(|_| anyhow!("invalid guild id"))?;
     authorize_manage_guild(&app, &session, guild_id).await?;
-    let profile = match body.profile.as_deref().unwrap_or("administrator") {
-        "administrator" | "moderator" | "member" => {
-            body.profile.unwrap_or_else(|| "administrator".into())
-        }
-        _ => return Err(ApiError(anyhow!("unsupported preview profile"))),
-    };
+    let profile = PreviewProfile::parse(body.profile.as_deref().unwrap_or("administrator"))
+        .ok_or_else(|| ApiError(anyhow!("unsupported preview profile")))?;
+    prune_expired(&app);
     let token = format!(
         "{:032x}{:032x}",
         rand::random::<u128>(),
@@ -84,10 +112,11 @@ pub async fn launch(
             token: token.clone(),
             actor_id: auth.discord_user_id(),
             guild_id,
-            profile: profile.clone(),
+            profile,
             expires: Instant::now() + PREVIEW_TTL,
         },
     );
+    schedule_expiration(&app, token.clone());
     Ok(Json(serde_json::json!({
         "token": token,
         "guild_id": guild_id.to_string(),
@@ -113,19 +142,16 @@ pub async fn middleware(
         .get(PREVIEW_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let grant = presented.as_ref().and_then(|token| {
-        app.preview.get(token).and_then(|entry| {
-            let grant = entry.clone();
-            grant
-                .expires
-                .checked_duration_since(Instant::now())
-                .map(|_| grant)
-        })
-    });
+    let grant = presented
+        .as_ref()
+        .and_then(|token| active_grant(&app, token));
     if presented.is_some() && grant.is_none() {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "preview expired" })),
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "error": "preview expired",
+                "code": "preview_expired",
+            })),
         )
             .into_response();
     }
@@ -140,6 +166,37 @@ pub async fn middleware(
             .into_response();
     }
     PREVIEW.scope(grant, next.run(request)).await
+}
+
+fn active_grant(app: &ApiState, token: &str) -> Option<PreviewGrant> {
+    let grant = app.preview.get(token).map(|entry| entry.clone())?;
+    if grant.expires > Instant::now() {
+        return Some(grant);
+    }
+    app.preview.remove(token);
+    None
+}
+
+fn prune_expired(app: &ApiState) {
+    let now = Instant::now();
+    app.preview.retain(|_, grant| grant.expires > now);
+}
+
+fn schedule_expiration(app: &Arc<ApiState>, token: String) {
+    let app = Arc::downgrade(app);
+    tokio::spawn(async move {
+        tokio::time::sleep(PREVIEW_TTL).await;
+        let Some(app) = app.upgrade() else {
+            return;
+        };
+        let expired = app
+            .preview
+            .get(&token)
+            .is_some_and(|grant| grant.expires <= Instant::now());
+        if expired {
+            app.preview.remove(&token);
+        }
+    });
 }
 
 fn is_preview_write(request: &Request<axum::body::Body>) -> bool {
@@ -160,11 +217,24 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
         return Err(ApiError(anyhow!("not authenticated")));
     }
     let selected = preview.guild_id.to_string();
-    auth.guilds.retain(|guild| guild.id == selected);
-    if auth.guilds.is_empty() {
-        return Err(ApiError(anyhow!(
-            "you cannot manage this server (needs MANAGE_GUILD permission)"
-        )));
-    }
+    let mut guild = auth
+        .guilds
+        .iter()
+        .find(|guild| guild.id == selected && guild.manage_permission())
+        .cloned()
+        .ok_or_else(|| {
+            ApiError(anyhow!(
+                "you cannot manage this server (needs MANAGE_GUILD permission)"
+            ))
+        })?;
+    // Route admission above is based on the live Discord guild. The synthetic
+    // mask below controls only what this read-only preview may observe.
+    guild.owner = false;
+    guild.permissions = Some(PermissionsField::Number(preview.profile.permissions()));
+    auth.guilds = vec![guild];
     Ok(())
+}
+
+pub fn authorizes_guild(guild_id: u64) -> bool {
+    current().is_some_and(|preview| preview.guild_id == guild_id)
 }

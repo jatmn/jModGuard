@@ -68,6 +68,7 @@ impl ControlStore {
             .context("failed to open conductor control database")?;
         let store = Self { db };
         store.migrate().await?;
+        store.recover_interrupted_jobs().await?;
         Ok(store)
     }
 
@@ -165,6 +166,20 @@ impl ControlStore {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn recover_interrupted_jobs(&self) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', last_error = ?, finished_ms = ? \
+             WHERE status = 'running'",
+            libsql::params![
+                "worker interrupted; delivery outcome unknown; retry manually",
+                now_ms()
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -472,7 +487,7 @@ impl ControlStore {
         let conn = self.connect().await?;
         let changed = conn
             .execute(
-                "UPDATE jobs SET status = 'queued', due_ms = ?, last_error = NULL, finished_ms = NULL \
+                "UPDATE jobs SET status = 'queued', attempts = 0, due_ms = ?, last_error = NULL, finished_ms = NULL \
                  WHERE id = ? AND status = 'failed'",
                 libsql::params![now_ms(), id],
             )

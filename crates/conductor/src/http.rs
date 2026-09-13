@@ -232,14 +232,14 @@ async fn callback(
         _ => return error_page("OAuth state expired"),
     }
     match state.complete_login(&code).await {
-        Ok(session_id) => {
+        Ok((session_id, absolute_secs)) => {
             let mut response = Redirect::to("/").into_response();
             append_cookie(
                 &mut response,
                 SESSION_COOKIE,
                 &session_id,
                 state.cfg.cookie_secure(),
-                86400,
+                i64::try_from(absolute_secs).unwrap_or(i64::MAX),
             );
             clear_cookie(&mut response, OAUTH_COOKIE, state.cfg.cookie_secure());
             response
