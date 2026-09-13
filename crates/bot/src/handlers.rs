@@ -184,6 +184,9 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .invalidate_author(guild_id.get(), user.id.get());
+        self.app
+            .text_spam
+            .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
         let mut extra = BTreeMap::new();
         extra.insert(
@@ -314,7 +317,7 @@ impl EventHandler for Handler {
             guild_id.get(),
             msg.channel_id.get(),
             msg.id.get(),
-            msg.author.id.get(),
+            Some(msg.author.id.get()),
             &msg.content,
         );
         // Generic rules and prefix commands retain their existing bot exemption.
@@ -412,7 +415,24 @@ impl EventHandler for Handler {
                 text_revision,
             );
             if let Some(content) = event.content.as_deref() {
-                let author = event.author.as_ref().map(|u| u.id.get()).unwrap_or(0);
+                let author = event
+                    .author
+                    .as_ref()
+                    .map(|u| u.id.get())
+                    .or_else(|| {
+                        self.app.text_spam.author_of(
+                            guild.get(),
+                            event.channel_id.get(),
+                            event.id.get(),
+                        )
+                    })
+                    .or_else(|| {
+                        self.app.image_spam.author_of(
+                            guild.get(),
+                            event.channel_id.get(),
+                            event.id.get(),
+                        )
+                    });
                 crate::logging::remember_message(
                     &self.app,
                     guild.get(),

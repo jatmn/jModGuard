@@ -61,7 +61,7 @@ fn basic_delete_reports_ids_and_unavailable_content() {
 fn observed_delete_reports_can_include_a_recent_snippet() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    remember_message(&app, 789, 456, 123, 1, "hello there");
+    remember_message(&app, 789, 456, 123, Some(1), "hello there");
     let report = message_delete_report(
         &app,
         GuildId::new(789),
@@ -76,6 +76,38 @@ fn observed_delete_reports_can_include_a_recent_snippet() {
         MessageId::new(123),
     );
     assert_eq!(missing.vars["content"], "not supplied to this process");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn partial_update_without_author_preserves_create_snippet_author() {
+    let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    remember_message(&app, 789, 456, 123, Some(42), "hello there");
+    remember_message(&app, 789, 456, 123, None, "edited text");
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "edited text");
+    assert_eq!(report.vars["user_id"], "42");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn unattributed_update_does_not_create_a_snippet() {
+    let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    remember_message(&app, 789, 456, 123, None, "orphan edit");
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "not supplied to this process");
     let _ = std::fs::remove_file(path);
 }
 

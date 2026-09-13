@@ -35,12 +35,21 @@ pub fn remember_message(
     guild: u64,
     channel: u64,
     message: u64,
-    author: u64,
+    author: Option<u64>,
     text: &str,
 ) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
+    let key = (guild, channel, message);
+    let author = author
+        .filter(|id| *id != 0)
+        .or_else(|| cache.get(&key).map(|s| s.author).filter(|id| *id != 0));
+    if author.is_none() {
+        return;
+    }
+    let author = author.unwrap();
     if cache.values().filter(|s| s.guild == guild).count() >= SNIPPETS_PER_GUILD
+        && !cache.contains_key(&key)
         && let Some(oldest) = cache
             .iter()
             .filter(|(_, s)| s.guild == guild)
@@ -50,7 +59,7 @@ pub fn remember_message(
         cache.remove(&oldest);
     }
     cache.insert(
-        (guild, channel, message),
+        key,
         Snippet {
             at: Instant::now(),
             guild,

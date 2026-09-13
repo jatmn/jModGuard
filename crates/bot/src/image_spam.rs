@@ -880,13 +880,8 @@ pub fn observe(
     let channel = msg.channel_id.get();
     tokio::spawn(async move {
         let _permit = permit;
-        let deadline = Duration::from_secs(app.image_spam.limits.timeout_secs + 15);
-        if tokio::time::timeout(deadline, run_job(&app, &ctx, job, policy, channel))
-            .await
-            .is_err()
-        {
-            app.image_spam.capacity_drop();
-        }
+        // Hashing is bounded inside run_job; report/enforce carry their own per-op deadlines.
+        run_job(&app, &ctx, job, policy, channel).await;
     });
 }
 
@@ -1009,13 +1004,7 @@ pub fn observe_update(
     let channel = event.channel_id.get();
     tokio::spawn(async move {
         let _permit = permit;
-        let deadline = Duration::from_secs(app.image_spam.limits.timeout_secs + 15);
-        if tokio::time::timeout(deadline, run_job(&app, &ctx, job, policy, channel))
-            .await
-            .is_err()
-        {
-            app.image_spam.capacity_drop();
-        }
+        run_job(&app, &ctx, job, policy, channel).await;
     });
 }
 
@@ -1047,8 +1036,8 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
             .await;
         failed = !matches!(outcome, Ok(Ok(())));
     }
-    // Reconcile the normal bot configuration observation before logging. This is
-    // best-effort test reporting, not an enforcement permission/freshness fence.
+    // Reconcile configuration before report/enforce. Hashing above is already bounded;
+    // delete/ban below rely on per-operation Discord timeouts in spam_actions.
     if app.poll_config_version().await.is_err() {
         return;
     }
