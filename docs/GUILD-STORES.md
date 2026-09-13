@@ -1,9 +1,9 @@
-# Guild-store identity and placement foundation
+# Guild-store identity and placement
 
-The data layer now stores nonsecret directory metadata for shared and dedicated guild
-stores. This is a library foundation: the bot/API still uses its single configured database.
-No service route, startup registration, automatic placement, provider provisioning or guild
-move is enabled. The service-boundary guard prevents accidental runtime adoption.
+The data layer stores nonsecret directory metadata for shared and dedicated guild
+stores. Bot and API processes now route live tenant data through `TenantRuntime`; see
+[tenant runtime](TENANT-RUNTIME.md). Catalog rows still never store URLs or tokens.
+Populated-guild moves are not implemented and must not be exposed.
 
 ## Stored identities
 
@@ -55,22 +55,23 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations0001–0006. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0008. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
 Version3 adds [selected cases and bounded text evidence](TENANT-CASES.md).
 Version4 adds [owned append-only case history](CASE-HISTORY.md).
 Version5 adds [explicit source associations](CASE-SOURCES.md).
-Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md), with current runtime capture still disabled.
+Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
-There are no core configuration/default/enrollment tables or general event archives.
-Core bootstrap never applies this schema; the existing core version remains10.
+Version8 allows closed-scope erasure after owned data is gone and stores delegated
+case-removal role IDs. There are no core configuration/default/enrollment tables or general
+event archives. Core bootstrap never applies this schema; the existing core version is 11.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching version1–6 store to version7, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version7 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching version1–7 store to version8, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version8 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

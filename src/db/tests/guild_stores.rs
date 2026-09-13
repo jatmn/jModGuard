@@ -129,6 +129,52 @@ async fn shared_and_dedicated_placements_persist_without_rerouting_or_rebinding(
 }
 
 #[tokio::test]
+async fn catalog_policy_lookups_return_matching_shared_or_dedicated_rows() {
+    let f = Fixture::new();
+    assert!(shared_store_registration(&f.db).await.unwrap().is_none());
+    assert!(
+        dedicated_store_registration(&f.db, 20)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let shared = StoreId::new();
+    let dedicated = StoreId::new();
+    register_store(&f.db, shared.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    register_store(
+        &f.db,
+        dedicated.clone(),
+        StorePolicy::Dedicated { guild_id: 20 },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shared_store_registration(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        &shared
+    );
+    assert_eq!(
+        dedicated_store_registration(&f.db, 20)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        &dedicated
+    );
+    assert!(
+        dedicated_store_registration(&f.db, 21)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn catalog_retries_and_reads_are_receipt_free_and_preserve_versions() {
     let f = Fixture::new();
     let id = StoreId::new();
@@ -326,6 +372,48 @@ async fn catalog_migration_keeps_version_nine_data_and_starts_empty() {
         1
     );
     assert!(guild_placement(&db, 10).await.unwrap().is_none());
+    drop(db);
+    cleanup_db(&path);
+}
+
+#[tokio::test]
+async fn tenant_runtime_migration_keeps_version_ten_catalog_and_starts_empty() {
+    let path = tmp_db_path("catalog_v10");
+    {
+        let c = Connection::open(&path).unwrap();
+        for (index, sql) in MIGRATIONS[..10].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", (index + 1) as i64)
+                .unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')",
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path, 2).unwrap();
+    assert_eq!(
+        query_events(&db, 10, None, None, 50).await.unwrap().len(),
+        1
+    );
+    let jobs: i64 = db
+        .with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM guild_erasure_jobs", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    let intents: i64 = db
+        .with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM backup_cleanup_intents", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+    assert_eq!(intents, 0);
     drop(db);
     cleanup_db(&path);
 }

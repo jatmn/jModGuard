@@ -1,9 +1,9 @@
-//! Separate guild-store identity and initial binding foundation; not live routing.
-use super::guild_stores::{GuildPlacement, StorePolicy, StoreRegistration};
+//! Separate guild-store identity, tenant data and coordinated live erasure.
+use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistration};
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 7;
+const VERSION: i64 = 8;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -12,6 +12,7 @@ const HISTORY_SCHEMA: &str = include_str!("../../migrations/guild/0004_case_hist
 const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sources.sql");
 const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evidence.sql");
 const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
+const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -23,11 +24,15 @@ mod case_history;
 pub use case_history::*;
 mod cases;
 pub use cases::*;
+mod erasure;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
+mod tenant_settings;
+pub use tenant_settings::TenantSettings;
 
 /// Trusted installation connection settings. Never accept these from a guild request.
 /// Deliberately has no Debug/Serialize implementation: token and URL may be sensitive.
+#[derive(Clone)]
 pub struct GuildStoreOptions {
     pub path: PathBuf,
     pub url: String,
@@ -61,6 +66,38 @@ fn owner(registration: &StoreRegistration) -> Option<i64> {
     }
 }
 
+fn read_existing_registration(conn: &impl SqlExecutor) -> Result<Option<StoreRegistration>> {
+    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+        (),
+        |r| Ok(r.get(0)?),
+    )?;
+    if version == 0 && objects == 0 {
+        return Ok(None);
+    }
+    let identity = conn
+        .query_row(
+            "SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<Option<i64>>(2)?)),
+        )
+        .optional();
+    let Some((family, id, dedicated)) = identity.ok().flatten() else {
+        return Err(StoreCheckError::Schema.into());
+    };
+    anyhow::ensure!(family == FAMILY, StoreCheckError::Schema);
+    let policy = match dedicated {
+        None => StorePolicy::Shared,
+        Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
+        Some(_) => return Err(StoreCheckError::Identity.into()),
+    };
+    Ok(Some(StoreRegistration::from_parts(
+        StoreId::parse(&id)?,
+        policy,
+    )))
+}
+
 fn verify_identity(conn: &impl SqlExecutor, expected: &StoreRegistration) -> Result<()> {
     verify_identity_version(conn, expected, VERSION)
 }
@@ -72,10 +109,28 @@ fn verify_identity_version(
 ) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     anyhow::ensure!(version == wanted, StoreCheckError::Schema);
-    let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('store_identity','guild_bindings','mutation_receipts')) OR (type='trigger' AND name IN ('store_identity_no_replace','store_identity_no_update','store_identity_no_delete','guild_binding_owner','guild_binding_no_replace','guild_binding_no_update','guild_binding_no_delete'))", (), |r| Ok(r.get(0)?))?;
+    let binding_delete = if wanted >= 8 {
+        "guild_binding_delete"
+    } else {
+        "guild_binding_no_delete"
+    };
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('store_identity','guild_bindings','mutation_receipts')) OR (type='trigger' AND name IN ('store_identity_no_replace','store_identity_no_update','store_identity_no_delete','guild_binding_owner','guild_binding_no_replace','guild_binding_no_update')) OR (type='trigger' AND name=?1)",
+        params![binding_delete],
+        |r| Ok(r.get(0)?),
+    )?;
     anyhow::ensure!(tables == 10, StoreCheckError::Schema);
     if wanted >= 2 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_memberships','guild_log_channels')) OR (type='trigger' AND name IN ('guild_membership_binding','guild_membership_no_replace','guild_membership_update','guild_membership_no_delete','guild_log_channel_insert','guild_log_channel_update'))", (), |r| Ok(r.get(0)?))?;
+        let membership_delete = if wanted >= 8 {
+            "guild_membership_delete"
+        } else {
+            "guild_membership_no_delete"
+        };
+        let objects: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_memberships','guild_log_channels')) OR (type='trigger' AND name IN ('guild_membership_binding','guild_membership_no_replace','guild_membership_update','guild_log_channel_insert','guild_log_channel_update')) OR (type='trigger' AND name=?1)",
+            params![membership_delete],
+            |r| Ok(r.get(0)?),
+        )?;
         anyhow::ensure!(objects == 8, StoreCheckError::Schema);
     }
     if wanted >= 3 {
@@ -97,6 +152,10 @@ fn verify_identity_version(
     if wanted >= 7 {
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_bunny_evidence') OR (type='index' AND name='guild_bunny_resource') OR (type='trigger' AND name IN ('guild_bunny_insert','guild_bunny_update','guild_bunny_delete','guild_bunny_settlement','guild_bunny_purge','guild_bunny_forget'))", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 8, StoreCheckError::Schema);
+    }
+    if wanted >= 8 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_tenant_settings') OR (type='trigger' AND name IN ('guild_binding_delete','guild_tenant_settings_insert','guild_tenant_settings_no_replace','guild_tenant_settings_update'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
     }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
@@ -141,7 +200,10 @@ fn initialize_store(
         if version < 6 {
             tx.execute_batch(EVIDENCE_SCHEMA)?;
         }
-        tx.execute_batch(BUNNY_SCHEMA)?;
+        if version < 7 {
+            tx.execute_batch(BUNNY_SCHEMA)?;
+        }
+        tx.execute_batch(ERASURE_SCHEMA)?;
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -157,6 +219,7 @@ fn initialize_store(
     tx.execute_batch(SOURCE_SCHEMA)?;
     tx.execute_batch(EVIDENCE_SCHEMA)?;
     tx.execute_batch(BUNNY_SCHEMA)?;
+    tx.execute_batch(ERASURE_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete
@@ -182,6 +245,33 @@ impl GuildDataStore {
     /// Verify an existing store without creating its schema or bindings.
     pub fn open(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {
         Self::connect(options, expected, false)
+    }
+
+    /// Read a stamped installation identity without creating or upgrading schema.
+    /// Missing local files and empty databases return `None`.
+    pub fn existing_registration(options: GuildStoreOptions) -> Result<Option<StoreRegistration>> {
+        if options.url.trim().is_empty() && !options.path.exists() {
+            return Ok(None);
+        }
+        let mut found = None;
+        let opts = DbOpenOptions {
+            path: options.path,
+            url: options.url,
+            token: options.token,
+            pool_size: options.pool_size,
+            migrate: false,
+            default_prefix: String::new(),
+            retention_days: 0,
+        };
+        let _db = Db::open_with_bootstrap(
+            &opts,
+            |conn| {
+                found = read_existing_registration(conn)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        Ok(found)
     }
     fn connect(
         options: GuildStoreOptions,

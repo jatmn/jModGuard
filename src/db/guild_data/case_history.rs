@@ -136,6 +136,40 @@ impl GuildDataStore {
         data: CaseHistoryData,
         limits: CaseHistoryLimits,
     ) -> Result<AppendCaseHistory> {
+        self.append_history(scope, case, id, data, limits, false)
+            .await
+    }
+
+    /// One authenticated note intent. Its first committed timestamp is retained
+    /// across retries; a changed actor or note conflicts with the original intent.
+    pub async fn append_case_note(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        id: CaseId,
+        actor_id: Option<i64>,
+        text: String,
+        limits: CaseHistoryLimits,
+    ) -> Result<AppendCaseHistory> {
+        let data = CaseHistoryData {
+            actor_id,
+            recorded_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+            body: CaseHistoryBody::Note { text },
+        };
+        self.append_history(scope, case, id, data, limits, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_history(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        id: CaseId,
+        data: CaseHistoryData,
+        limits: CaseHistoryLimits,
+        note_intent: bool,
+    ) -> Result<AppendCaseHistory> {
         self.check_target(&scope.placement)?;
         validate(&data, limits)?;
         let payload = serde_json::to_string(&data)?;
@@ -148,6 +182,20 @@ impl GuildDataStore {
             let mut tx=conn.transaction_primary_read()?;
             verify_scope(&tx,&expected,&scope,true)?;
             anyhow::ensure!(live_parent(&tx,&scope,&case)?, CaseError::Conflict);
+            if note_intent {
+                let existing = tx.query_row(
+                    "SELECT sequence,CASE WHEN length(CAST(payload AS BLOB))<=?5 THEN payload ELSE NULL END
+                     FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",
+                    params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),i64::from(limits.entry.max_record_bytes)],
+                    |r| Ok((r.get::<i64>(0)?,r.get::<Option<String>>(1)?)),
+                ).optional()?;
+                if let Some((sequence, payload)) = existing {
+                    let original: CaseHistoryData = serde_json::from_str(&payload.ok_or(CaseError::Limit)?)?;
+                    anyhow::ensure!(original.actor_id == data.actor_id && original.body == data.body, CaseError::Conflict);
+                    tx.finish_read()?;
+                    return Ok(AppendCaseHistory::Existing(CaseHistoryRef { id, sequence }));
+                }
+            }
             let existing=tx.query_row("SELECT sequence,payload=?5 FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),payload.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<bool>(1)?))).optional()?;
             if let Some((sequence,equal))=existing {
                 anyhow::ensure!(equal,CaseError::Conflict);

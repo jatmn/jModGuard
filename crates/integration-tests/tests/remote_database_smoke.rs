@@ -277,11 +277,28 @@ async fn exercise_membership_storage(bot: &Db, api: &Db) {
     retire_guild_enrollment(bot, 800, 100).await.unwrap();
     assert_eq!(guild_enrollment(api, 800).await.unwrap(), Some(next));
     assert_eq!(get_config_version(api).await.unwrap(), version);
+    // Unplaced directory cleanup and captured writers also use remote primary
+    // transactions, including recovery after a lost COMMIT response.
+    let unplaced = enroll_guild(bot, 801, 100).await.unwrap().unwrap();
+    patch_settings(bot, 801, Some(Some("private".into())), None, None)
+        .await
+        .unwrap();
+    add_warn(bot, 801, 99, 42, "private").await.unwrap();
+    test_drop_next_commit_response();
+    retire_guild_enrollment(bot, 801, 100).await.unwrap();
+    assert_eq!(get_settings_primary(api, 801).await.unwrap().prefix, "!");
+    assert!(list_warns(api, 801, 99).await.unwrap().is_empty());
+    assert!(
+        jmodguard::db::record_enrolled_ban(bot, Some(unplaced), 99, Some(42), "late")
+            .await
+            .is_err()
+    );
 }
 
 async fn exercise_captured_action_membership(bot: &Db, api: &Db) {
     use jmodguard::bot_actions::{Action, Limits};
     use jmodguard::db::*;
+    place_before_remote_erasure(bot, 700).await;
     let old = enroll_guild(bot, 700, 100).await.unwrap().unwrap();
     let first = enqueue_enrolled_bot_action(
         api,
@@ -612,6 +629,7 @@ async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
         EnrollmentChanged, enroll_guild, enrolled_guild_stats, list_enrolled_bans,
         query_enrolled_events, record_ban, retire_guild_enrollment,
     };
+    place_before_remote_erasure(bot, 450).await;
     let scope = enroll_guild(bot, 450, 100).await.unwrap().unwrap();
     insert_event(
         bot,
@@ -655,7 +673,7 @@ async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
     ] {
         assert!(error.is::<EnrollmentChanged>());
     }
-    // Historical guild rows remain; membership checks are not a purge mechanism.
+    // Placed-guild rows remain until its asynchronous erasure worker runs.
     assert_eq!(enrolled_guild_stats(api, current).await.unwrap().events, 1);
 }
 
@@ -813,4 +831,13 @@ async fn exercise_guild_store_catalog(bot: &Db, api: &Db) {
     }).await.unwrap();
     assert!(guild_placement(api, 472).await.unwrap().is_none());
     assert_eq!(get_config_version(api).await.unwrap(), version);
+}
+
+async fn place_before_remote_erasure(db: &Db, guild: i64) {
+    use jmodguard::db::guild_stores::*;
+    let store = StoreId::new();
+    register_store(db, store.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    assign_initial_placement(db, guild, store).await.unwrap();
 }

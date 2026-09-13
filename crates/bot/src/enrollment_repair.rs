@@ -85,12 +85,13 @@ impl EnrollmentRepair {
     pub async fn step(
         &mut self,
         db: &Db,
+        tenant: &crate::tenant::TenantRuntime,
         source: &impl MembershipSource,
     ) -> Result<Option<RepairReport>> {
         if Instant::now() < self.next {
             return Ok(None);
         }
-        match self.page(db, source).await {
+        match self.page(db, tenant, source).await {
             Ok(report) => Ok(Some(report)),
             Err(error) => {
                 self.next = Instant::now() + Duration::from_secs(u64::from(self.config.retry_secs));
@@ -98,7 +99,12 @@ impl EnrollmentRepair {
             }
         }
     }
-    async fn page(&mut self, db: &Db, source: &impl MembershipSource) -> Result<RepairReport> {
+    async fn page(
+        &mut self,
+        db: &Db,
+        tenant: &crate::tenant::TenantRuntime,
+        source: &impl MembershipSource,
+    ) -> Result<RepairReport> {
         let timeout = Duration::from_secs(u64::from(self.config.request_timeout_secs));
         let mut guilds = tokio::time::timeout(
             timeout,
@@ -135,7 +141,17 @@ impl EnrollmentRepair {
             // This same monotonic transition is used by gateway observations.
             // A late REST result cannot resurrect a retired join or replace a newer one.
             match db::enroll_guild(db, *guild as i64, joined).await {
-                Ok(Some(_)) => report.confirmed += 1,
+                Ok(Some(enrollment)) => {
+                    if let Err(error) = tenant.activate(enrollment).await {
+                        tracing::warn!(
+                            guild_id = *guild,
+                            "guild store activation deferred: {error:#}"
+                        );
+                        report.failed += 1;
+                    } else {
+                        report.confirmed += 1;
+                    }
+                }
                 Ok(None) => report.refused += 1,
                 Err(error) => return Err(error.context("membership repair database unavailable")),
             }
@@ -159,6 +175,7 @@ impl EnrollmentRepair {
 /// delete context cannot safely identify which enrollment ended.
 pub async fn observe_gateway_membership(
     db: &Db,
+    tenant: &crate::tenant::TenantRuntime,
     guild: u64,
     joined_at_ns: Option<i64>,
     unavailable: bool,
@@ -172,7 +189,9 @@ pub async fn observe_gateway_membership(
         .filter(|joined| *joined > 0)
         .context("guild event lacks supported membership context")?;
     if present {
-        db::enroll_guild(db, guild, joined).await?;
+        if let Some(enrollment) = db::enroll_guild(db, guild, joined).await? {
+            tenant.activate(enrollment).await?;
+        }
     } else {
         db::retire_guild_enrollment(db, guild, joined).await?;
     }

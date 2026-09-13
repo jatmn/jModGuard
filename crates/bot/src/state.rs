@@ -28,6 +28,72 @@ struct SlashSyncProgress {
     invalidated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GatewayCaseAction {
+    Ban,
+    Unban,
+}
+
+const GATEWAY_CASE_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
+const MAX_GATEWAY_CASE_SUPPRESSIONS: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GatewayCaseSuppression(u128);
+
+#[derive(Default)]
+struct GatewayCaseSuppressions {
+    next_token: u128,
+    entries: HashMap<GatewayCaseSuppression, ((GatewayCaseAction, u64, u64), Instant)>,
+}
+
+impl GatewayCaseSuppressions {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, (_, expires)| *expires > now);
+    }
+
+    fn insert(
+        &mut self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) -> GatewayCaseSuppression {
+        let now = Instant::now();
+        self.prune(now);
+        if self.entries.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        self.next_token += 1;
+        let token = GatewayCaseSuppression(self.next_token);
+        self.entries.insert(
+            token,
+            ((action, guild, user), now + GATEWAY_CASE_SUPPRESSION_TTL),
+        );
+        token
+    }
+
+    fn release(&mut self, token: GatewayCaseSuppression) {
+        self.prune(Instant::now());
+        self.entries.remove(&token);
+    }
+
+    fn remove(&mut self, action: GatewayCaseAction, guild: u64, user: u64) -> bool {
+        self.prune(Instant::now());
+        let token = self
+            .entries
+            .iter()
+            .filter(|(_, (key, _))| *key == (action, guild, user))
+            .min_by_key(|(_, (_, expires))| *expires)
+            .map(|(token, _)| *token);
+        token.is_some_and(|token| self.entries.remove(&token).is_some())
+    }
+}
+
 /// Plan for one poll tick of slash re-sync work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashResyncPlan {
@@ -47,6 +113,7 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
+    pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<BotProcessConfig>,
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
@@ -73,6 +140,7 @@ pub struct BotState {
     version_reconcile_lock: tokio::sync::Mutex<()>,
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
+    gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
 }
 
 impl BotState {
@@ -90,6 +158,8 @@ impl BotState {
             "log.discord_timeout_secs must be positive"
         );
         let image_spam = crate::image_spam::Detector::new(cfg.image_spam.clone())?;
+        let tenant =
+            crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
         let log_delivery_slots = tokio::sync::Semaphore::new(cfg.log.discord_concurrency);
         // Prime from DB at construction — never leave an "unobserved" sentinel.
         // Cache population is independent of the poll task; skipping the first
@@ -100,6 +170,7 @@ impl BotState {
         db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
+            tenant,
             cfg: Arc::new(cfg),
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
@@ -116,7 +187,34 @@ impl BotState {
             force_slash_registry_retry: AtomicBool::new(false),
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
+            gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
         }))
+    }
+
+    pub(crate) fn suppress_next_gateway_case(
+        &self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) -> GatewayCaseSuppression {
+        self.gateway_case_suppressions
+            .lock()
+            .insert(action, guild, user)
+    }
+
+    pub(crate) fn release_gateway_case_suppression(&self, token: GatewayCaseSuppression) {
+        self.gateway_case_suppressions.lock().release(token);
+    }
+
+    pub(crate) fn consume_gateway_case_suppression(
+        &self,
+        action: GatewayCaseAction,
+        guild: u64,
+        user: u64,
+    ) -> bool {
+        self.gateway_case_suppressions
+            .lock()
+            .remove(action, guild, user)
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -570,6 +668,56 @@ mod tests {
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
 
+    #[test]
+    fn gateway_case_suppressions_are_scoped_consumed_and_bounded() {
+        let mut suppressions = GatewayCaseSuppressions::default();
+        suppressions.insert(GatewayCaseAction::Ban, 10, 20);
+        assert!(!suppressions.remove(GatewayCaseAction::Unban, 10, 20));
+        assert!(suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(!suppressions.remove(GatewayCaseAction::Ban, 10, 20));
+
+        suppressions.entries.insert(
+            GatewayCaseSuppression(0),
+            (
+                (GatewayCaseAction::Ban, 30, 40),
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        suppressions.insert(GatewayCaseAction::Unban, 30, 40);
+        assert!(!suppressions.remove(GatewayCaseAction::Ban, 30, 40));
+        assert!(suppressions.remove(GatewayCaseAction::Unban, 30, 40));
+
+        for user in 1..=(MAX_GATEWAY_CASE_SUPPRESSIONS as u64 + 1) {
+            suppressions.insert(GatewayCaseAction::Ban, 50, user);
+        }
+        assert_eq!(suppressions.entries.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
+    }
+
+    #[test]
+    fn overlapping_gateway_dispatches_keep_individual_ownership() {
+        let mut s = GatewayCaseSuppressions::default();
+        let a = s.insert(GatewayCaseAction::Ban, 10, 20);
+        let b = s.insert(GatewayCaseAction::Ban, 10, 20);
+        s.release(b);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
+        s.release(a); // Already consumed; cannot release a future marker.
+        let a = s.insert(GatewayCaseAction::Ban, 10, 20);
+        let _b = s.insert(GatewayCaseAction::Ban, 10, 20);
+        s.release(a);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        let a = s.insert(GatewayCaseAction::Unban, 10, 20);
+        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
+        s.insert(GatewayCaseAction::Unban, 10, 20);
+        s.release(a);
+        assert!(s.remove(GatewayCaseAction::Unban, 10, 20));
+        s.insert(GatewayCaseAction::Ban, 10, 20);
+        s.insert(GatewayCaseAction::Ban, 10, 20);
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
+        assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
+    }
+
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -623,6 +771,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -683,6 +832,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -758,6 +908,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -797,6 +948,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -862,6 +1014,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -919,6 +1072,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 
     #[test]
@@ -1008,5 +1162,6 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
     }
 }

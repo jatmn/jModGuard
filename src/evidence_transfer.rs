@@ -321,6 +321,24 @@ impl LocalEvidenceStore {
         Ok(Some(actual))
     }
 
+    /// Verified private object bytes for an authorized dashboard/API reader.
+    pub fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
+        let _lock = self.lock()?;
+        self.verify()?;
+        let digest = self
+            .verified_digest(job)?
+            .context("evidence is not available")?;
+        ensure!(digest == expected_sha, "stored evidence checksum mismatch");
+        let [data, _, _] = self.paths(job, false)?;
+        let mut buf = Vec::new();
+        File::open(data)?.read_to_end(&mut buf)?;
+        ensure!(
+            buf.len() as u64 == job.reserved_bytes,
+            "stored evidence size mismatch"
+        );
+        Ok(buf)
+    }
+
     pub async fn capture<R: Read + Send + 'static>(
         &self,
         store: GuildDataStore,

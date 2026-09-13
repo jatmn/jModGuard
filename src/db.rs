@@ -39,6 +39,8 @@ mod moderation;
 pub use moderation::*;
 pub mod guild_data;
 pub mod guild_stores;
+mod tenant_lifecycle;
+pub use tenant_lifecycle::*;
 mod settings;
 pub use settings::*;
 
@@ -53,6 +55,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_action_enrollments.sql"),
     include_str!("../migrations/0009_nickname_enrollments.sql"),
     include_str!("../migrations/0010_guild_store_catalog.sql"),
+    include_str!("../migrations/0011_tenant_runtime.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.
@@ -122,6 +125,12 @@ pub fn is_database_operation_timeout(err: &anyhow::Error) -> bool {
 
 pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
     crate::db_compat::is_database_commit_indeterminate(err)
+}
+
+/// Hidden helper for unit tests in dependent crates.
+#[doc(hidden)]
+pub fn test_database_commit_indeterminate_error() -> anyhow::Error {
+    crate::db_compat::test_database_commit_indeterminate_error()
 }
 
 /// Local SQLite can be temporarily locked while the bot is applying migrations.
@@ -243,6 +252,8 @@ pub struct DbOpenOptions {
 
 #[derive(Clone)]
 pub struct Db {
+    path: PathBuf,
+    remote: bool,
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
     connections: Arc<ConnectionPool>,
@@ -254,6 +265,15 @@ pub struct Db {
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
+}
+
+impl Db {
+    pub fn sqlite_path(&self) -> Option<&Path> {
+        (!self.remote).then_some(self.path.as_path())
+    }
+    pub fn is_remote(&self) -> bool {
+        self.remote
+    }
 }
 
 struct ConnectionPool {
@@ -483,6 +503,8 @@ impl Db {
             ready(&bootstrap)?;
 
             Ok(Self {
+                path: opts.path.clone(),
+                remote,
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
                 connections: Arc::new(ConnectionPool {

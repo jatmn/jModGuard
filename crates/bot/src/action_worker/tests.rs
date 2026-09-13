@@ -50,6 +50,7 @@ impl Drop for Fixture {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
+        crate::tenant::remove_sidecars(&self.path);
     }
 }
 fn now() -> i64 {
@@ -190,6 +191,77 @@ async fn copied_claim_can_dispatch_only_once_and_audit_is_atomic() {
         initial_version,
         db::get_config_version(&f.db).await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn production_drain_records_one_stable_truthful_case_for_a_queued_unban() {
+    for (label, outcome, expected) in [
+        (
+            "succeeded",
+            Outcome::succeeded("unbanned"),
+            crate::db::guild_data::CaseOutcome::Succeeded,
+        ),
+        (
+            "failed",
+            Outcome::failed("discord_rejected"),
+            crate::db::guild_data::CaseOutcome::Failed,
+        ),
+        (
+            "uncertain",
+            Outcome::uncertain("discord_outcome_unknown"),
+            crate::db::guild_data::CaseOutcome::Uncertain,
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, unban(99)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = crate::tenant::TenantRuntime::open(
+            &f.db,
+            &crate::config::DbConfig {
+                path: f.path.clone(),
+                pool_size: 2,
+                ..Default::default()
+            },
+            &crate::config::GuildStoresConfig::default(),
+            &crate::config::EvidenceConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+        let discord = MockDiscord {
+            outcome,
+            ..Default::default()
+        };
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "{label}");
+        let case = store
+            .case(scope, ids[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.source,
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(job.id).unwrap(),
+            },
+            "{label}"
+        );
+        assert_eq!(case.action, crate::db::guild_data::CaseAction::Unban);
+        assert_eq!(case.outcome, expected, "{label}");
+        assert_eq!(case.actor_id, Some(42));
+        assert_eq!(case.reason.as_deref(), Some("test reason"));
+    }
 }
 
 #[tokio::test]
@@ -888,6 +960,18 @@ async fn rejected_completion_reports_outcome_without_overwriting_or_resending() 
         log.0.lock().unwrap().clear();
         let f = Fixture::new();
         let remote = matches!(action, Action::Unban { .. });
+        // Keep the retired receipt until the placed-guild erasure worker runs.
+        let store = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &f.db,
+            store.clone(),
+            db::guild_stores::StorePolicy::Shared,
+        )
+        .await
+        .unwrap();
+        db::guild_stores::assign_initial_placement(&f.db, 10, store)
+            .await
+            .unwrap();
         let job = f.enqueue(10, "rejected_receipt", action).await;
         let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
         let discord = SupersedeDuringDispatch {
@@ -959,5 +1043,38 @@ async fn rejected_completion_reports_outcome_without_overwriting_or_resending() 
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[tokio::test]
+async fn known_noop_unban_does_not_consume_a_future_external_echo() {
+    for (outcome, expect_echo) in [
+        (Outcome::succeeded("already_unbanned"), false),
+        (Outcome::succeeded("unbanned"), true),
+        (Outcome::failed("discord_rejected"), false),
+        (Outcome::uncertain("discord_outcome_unknown"), true),
+    ] {
+        let f = Fixture::new();
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        let job = f.enqueue(10, "echo", unban(99)).await;
+        let e = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        app.tenant.activate(e).await.unwrap();
+        let mock = MockDiscord {
+            outcome,
+            ..Default::default()
+        };
+        drain_with_state(&app, &mock, &WorkerLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(f.status(&job).await.state, outcome.state);
+        assert_eq!(
+            app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Unban, 10, 99),
+            expect_echo
+        );
+        assert!(!app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Unban,
+            10,
+            99
+        ));
     }
 }

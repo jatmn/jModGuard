@@ -1,9 +1,8 @@
 # Captured guild-store log-channel settings
 
 The separate guild-store library now stores a guild's log-channel mappings with captured
-placement and bot membership. This is inactive source groundwork: bot/API still uses the
-core configuration helpers and action queue. No route, UI, worker, new pool or task is
-activated. It records routing settings only, never Discord event history or message content.
+placement and bot membership. Directory log-channel delivery still uses core helpers;
+see [tenant runtime](TENANT-RUNTIME.md) for live store routing and guild erasure.
 
 ## Scope and lifecycle
 

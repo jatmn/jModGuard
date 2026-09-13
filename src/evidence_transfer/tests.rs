@@ -512,3 +512,34 @@ async fn closed_membership_cancels_recovery_and_allows_final_owned_purge() {
     );
     assert!(!f.local.root.join("evidence").exists());
 }
+
+#[tokio::test]
+async fn available_download_rechecks_resource_identity() {
+    let f = Fixture::new().await;
+    let upload = f.upload(3);
+    let target = upload.target.clone();
+    f.local
+        .capture(f.db.clone(), upload, Cursor::new(b"abc".to_vec()))
+        .await
+        .unwrap();
+    let available =
+        f.db.available_case_evidence(f.scope.clone(), f.case.clone(), target.evidence_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        f.local
+            .read_available(&available.job, &available.sha256)
+            .unwrap(),
+        b"abc"
+    );
+    let marker = f.local.root.join("identity");
+    let original = fs::read(&marker).unwrap();
+    fs::write(&marker, b"wrong resource\n").unwrap();
+    assert!(
+        f.local
+            .read_available(&available.job, &available.sha256)
+            .is_err()
+    );
+    fs::write(marker, original).unwrap();
+}

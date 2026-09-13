@@ -58,6 +58,9 @@ impl StoreRegistration {
     pub fn policy(&self) -> StorePolicy {
         self.policy
     }
+    pub(crate) fn from_parts(id: StoreId, policy: StorePolicy) -> Self {
+        Self { id, policy }
+    }
 }
 
 /// Initial placement identity. A revision is not a distributed writer lease.
@@ -76,6 +79,15 @@ impl GuildPlacement {
     }
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+    pub(crate) fn from_parts(guild_id: i64, store_id: StoreId, revision: String) -> Result<Self> {
+        StoreId::parse(&revision)?;
+        anyhow::ensure!(guild_id > 0, "invalid guild id");
+        Ok(Self {
+            guild_id,
+            store_id,
+            revision,
+        })
     }
 }
 
@@ -190,25 +202,138 @@ pub async fn assign_initial_placement(
 ) -> Result<GuildPlacement> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let store = registration_conn(&tx, &store_id)?.ok_or(CatalogConflict::UnknownStore)?;
-        anyhow::ensure!(store.policy.permits(guild), CatalogConflict::DedicatedOwner);
-        if let Some(existing) = placement_conn(&tx, guild)? {
-            anyhow::ensure!(existing.store_id == store_id, CatalogConflict::Placement);
-            tx.finish_read()?;
-            return Ok(existing);
-        }
-        let revision = format!("{:032x}", rand::random::<u128>());
-        tx.ensure_mutation_receipt()?;
-        tx.execute(
-            "INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(?1,?2,?3)",
-            params![guild, store_id.as_str(), revision.as_str()],
+        assign_initial_placement_transaction(conn.transaction_primary_read()?, guild, store_id)
+    })
+    .await
+}
+
+/// Runtime admission: retirement either precedes this check or observes the
+/// placement in its own primary transaction and admits the cleanup obligation.
+pub(crate) async fn admit_tenant_placement(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    store_id: StoreId,
+) -> Result<Option<GuildPlacement>> {
+    anyhow::ensure!(enrollment.guild_id > 0, "invalid guild id");
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let current = super::enrollments::active_enrollment_conn(&tx, enrollment.guild_id)?;
+        let queued: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
+            params![enrollment.guild_id],
+            |r| Ok(r.get(0)?),
         )?;
-        tx.commit()?;
-        Ok(GuildPlacement {
-            guild_id: guild,
-            store_id,
-            revision,
+        if current.as_ref() != Some(&enrollment) || queued {
+            tx.finish_read()?;
+            return Ok(None);
+        }
+        assign_initial_placement_transaction(tx, enrollment.guild_id, store_id).map(Some)
+    })
+    .await
+}
+
+fn assign_initial_placement_transaction(
+    mut tx: crate::db_compat::Transaction,
+    guild: i64,
+    store_id: StoreId,
+) -> Result<GuildPlacement> {
+    let store = registration_conn(&tx, &store_id)?.ok_or(CatalogConflict::UnknownStore)?;
+    anyhow::ensure!(store.policy.permits(guild), CatalogConflict::DedicatedOwner);
+    if let Some(existing) = placement_conn(&tx, guild)? {
+        anyhow::ensure!(existing.store_id == store_id, CatalogConflict::Placement);
+        tx.finish_read()?;
+        return Ok(existing);
+    }
+    let revision = format!("{:032x}", rand::random::<u128>());
+    tx.ensure_mutation_receipt()?;
+    tx.execute(
+        "INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(?1,?2,?3)",
+        params![guild, store_id.as_str(), revision.as_str()],
+    )?;
+    tx.commit()?;
+    Ok(GuildPlacement {
+        guild_id: guild,
+        store_id,
+        revision,
+    })
+}
+
+/// Remove a placement after owned live data is erased. This is not a guild move.
+pub async fn clear_erased_placement(
+    db: &Db,
+    guild: i64,
+    expected: &GuildPlacement,
+) -> Result<bool> {
+    anyhow::ensure!(
+        guild > 0 && expected.guild_id() == guild,
+        "invalid guild id"
+    );
+    let store_id = expected.store_id().as_str().to_owned();
+    let revision = expected.revision().to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        match placement_conn(&tx, guild)? {
+            Some(current)
+                if current.store_id.as_str() == store_id && current.revision == revision =>
+            {
+                tx.ensure_mutation_receipt()?;
+                tx.execute(
+                    "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
+                    params![guild, store_id.as_str(), revision.as_str()],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            None => {
+                tx.finish_read()?;
+                Ok(false)
+            }
+            Some(_) => Err(CatalogConflict::Placement.into()),
+        }
+    })
+    .await
+}
+
+pub async fn shared_store_registration(db: &Db) -> Result<Option<StoreRegistration>> {
+    catalog_registration(db, None).await
+}
+
+pub async fn dedicated_store_registration(
+    db: &Db,
+    guild_id: i64,
+) -> Result<Option<StoreRegistration>> {
+    anyhow::ensure!(guild_id > 0, "invalid guild id");
+    catalog_registration(db, Some(guild_id)).await
+}
+
+async fn catalog_registration(db: &Db, owner: Option<i64>) -> Result<Option<StoreRegistration>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_read()?;
+        let row = match owner {
+            None => tx
+                .query_row(
+                    "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id IS NULL ORDER BY store_id LIMIT 1",
+                    (),
+                    |r| Ok(r.get::<String>(0)?),
+                )
+                .optional()?,
+            Some(guild_id) => tx
+                .query_row(
+                    "SELECT store_id FROM guild_store_catalog WHERE dedicated_guild_id=?1 ORDER BY store_id LIMIT 1",
+                    params![guild_id],
+                    |r| Ok(r.get::<String>(0)?),
+                )
+                .optional()?,
+        };
+        tx.finish_read()?;
+        Ok(match row {
+            Some(id) => Some(StoreRegistration {
+                id: StoreId::parse(&id)?,
+                policy: owner.map_or(StorePolicy::Shared, |guild_id| StorePolicy::Dedicated {
+                    guild_id,
+                }),
+            }),
+            None => None,
         })
     })
     .await

@@ -135,8 +135,10 @@ fn classify_unban_response(status: u16, code: isize) -> Outcome {
 
 /// Execute only an admitted claim. The final transaction checks the claim again;
 /// direct log configuration changes may supersede this operation while HTTP runs.
-pub async fn execute(
+async fn execute_inner(
     db: &Db,
+    tenant: Option<&crate::tenant::TenantRuntime>,
+    app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     job: &BotAction,
     limits: &WorkerLimits,
@@ -174,8 +176,21 @@ pub async fn execute(
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
                 }
+                let suppression = app.map(|app| {
+                    app.suppress_next_gateway_case(
+                        crate::state::GatewayCaseAction::Unban,
+                        job.guild_id as u64,
+                        *user_id as u64,
+                    )
+                });
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
-                discord.unban(job.guild_id, *user_id, reason).await
+                let outcome = discord.unban(job.guild_id, *user_id, reason).await;
+                if (outcome.state == "failed" || outcome.code == "already_unbanned")
+                    && let (Some(app), Some(suppression)) = (app, suppression)
+                {
+                    app.release_gateway_case_suppression(suppression);
+                }
+                outcome
             }
             Action::SetLogChannel {
                 channel_id: Some(channel),
@@ -205,6 +220,48 @@ pub async fn execute(
             Outcome::failed("validation_timed_out")
         }
     });
+    if mutation_started.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(tenant) = tenant
+        && let Action::Unban { user_id, reason } = &job.action
+    {
+        let enrollment = match (&job.enrollment_id, job.joined_at_ns) {
+            (Some(id), Some(joined_at_ns)) => Some(db::GuildEnrollment {
+                guild_id: job.guild_id,
+                id: id.clone(),
+                joined_at_ns,
+            }),
+            _ => None,
+        };
+        let operation_id = crate::db::guild_data::CaseId::try_from(job.id.clone()).ok();
+        if let (Some(enrollment), Some(operation_id)) = (enrollment, operation_id) {
+            let case_outcome = match outcome.state {
+                "succeeded" => crate::db::guild_data::CaseOutcome::Succeeded,
+                "failed" => crate::db::guild_data::CaseOutcome::Failed,
+                _ => crate::db::guild_data::CaseOutcome::Uncertain,
+            };
+            crate::cases::record_data(
+                tenant,
+                enrollment,
+                crate::db::guild_data::CaseData {
+                    source: crate::db::guild_data::CaseSource::Application { operation_id },
+                    action: crate::db::guild_data::CaseAction::Unban,
+                    outcome: case_outcome,
+                    subject_id: *user_id,
+                    actor_id: Some(job.actor_id),
+                    occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+                    reason: Some(reason.clone()),
+                    evidence: crate::db::guild_data::CaseEvidence::Unavailable,
+                },
+            )
+            .await;
+        } else {
+            tracing::warn!(
+                action_id = %job.id,
+                guild_id = job.guild_id,
+                "selected unban case not recorded: invalid captured action identity"
+            );
+        }
+    }
     if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
         tracing::warn!(
             action_id = %job.id,
@@ -216,14 +273,54 @@ pub async fn execute(
     }
     Ok(())
 }
+
+pub async fn execute(
+    db: &Db,
+    discord: &impl DiscordActions,
+    job: &BotAction,
+    limits: &WorkerLimits,
+) -> Result<()> {
+    execute_inner(db, None, None, discord, job, limits).await
+}
+
 /// Bounded sequential batch. No process restart or lease expiry replays a claim.
+#[cfg(test)]
 pub async fn drain(db: &Db, discord: &impl DiscordActions, limits: &WorkerLimits) -> Result<()> {
+    drain_inner(db, None, None, discord, limits).await
+}
+
+/// Production drain with tenant-case recording for attempted remote actions.
+pub async fn drain_with_tenant(
+    db: &Db,
+    tenant: &crate::tenant::TenantRuntime,
+    discord: &impl DiscordActions,
+    limits: &WorkerLimits,
+) -> Result<()> {
+    drain_inner(db, Some(tenant), None, discord, limits).await
+}
+
+/// Bot scheduler entry point: records tenant cases and correlates gateway echoes.
+pub async fn drain_with_state(
+    app: &crate::state::BotState,
+    discord: &impl DiscordActions,
+    limits: &WorkerLimits,
+) -> Result<()> {
+    drain_inner(&app.db, Some(&app.tenant), Some(app), discord, limits).await
+}
+
+async fn drain_inner(
+    db: &Db,
+    tenant: Option<&crate::tenant::TenantRuntime>,
+    app: Option<&crate::state::BotState>,
+    discord: &impl DiscordActions,
+    limits: &WorkerLimits,
+) -> Result<()> {
     limits.validate()?;
     for _ in 0..limits.batch_size {
         let Some(job) = db::claim_bot_action(db, chrono::Utc::now().timestamp()).await? else {
             break;
         };
-        if let Err(error) = execute(db, discord, &job, limits).await {
+        if let Err(error) = execute_inner(db, tenant, app, discord, &job, limits).await {
             tracing::error!(action_id=%job.id,"bot action receipt failed; action will not be resent: {error:#}");
         }
     }

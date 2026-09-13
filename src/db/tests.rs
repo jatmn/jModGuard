@@ -207,7 +207,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch("DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; DELETE FROM meta WHERE key='action_request_floor';")?;
+        conn.execute_batch("DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; DELETE FROM meta WHERE key='action_request_floor';")?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -2309,6 +2309,7 @@ fn nickname_reconcile_persists_retry_terminal_and_dormant_lifecycle() {
         "a first join needs no nickname mutation; Discord already starts without a nickname"
     );
 
+    tokio_test_block_on(placed_before_erasure(&db, 47));
     tokio_test_block_on(enroll_guild(&db, 47, 100)).unwrap();
     tokio_test_block_on(request_nickname_reconcile(&db, 47)).unwrap();
     let in_flight = tokio_test_block_on(pending_nickname_reconciles(&db, 20_000, 25))
@@ -2588,4 +2589,13 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
     });
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+async fn placed_before_erasure(db: &Db, guild: i64) {
+    use crate::db::guild_stores::{StoreId, StorePolicy, assign_initial_placement, register_store};
+    let store = StoreId::new();
+    register_store(db, store.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    assign_initial_placement(db, guild, store).await.unwrap();
 }

@@ -82,12 +82,34 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         .unwrap();
     store.db.with_conn(|c| {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
-        assert_eq!(count, 10, "store contains identity, bindings, receipts, membership, log routing selected cases and owned history and source associations plus evidence ownership and Bunny attempts only");
+        assert_eq!(count, 11, "store contains identity, bindings, receipts, membership, log routing selected cases and owned history and source associations plus evidence ownership, Bunny attempts and tenant settings");
         Ok(())
     }).await.unwrap();
     assert!(
         Db::open(&f.store_path, 2).is_err(),
         "core bootstrap must not adopt a guild store"
+    );
+}
+
+#[tokio::test]
+async fn existing_registration_reads_stamped_identity_without_creating() {
+    let f = Fixture::new();
+    assert!(
+        GuildDataStore::existing_registration(f.options())
+            .unwrap()
+            .is_none()
+    );
+    let reg = f
+        .registration(StoreId::new(), StorePolicy::Dedicated { guild_id: 20 })
+        .await;
+    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let stamped = GuildDataStore::existing_registration(f.options())
+        .unwrap()
+        .expect("stamped identity");
+    assert_eq!(stamped, reg);
+    assert!(
+        GuildDataStore::existing_registration(options(&f.catalog_path)).is_err(),
+        "core databases are not empty guild stores"
     );
 }
 
@@ -276,6 +298,20 @@ async fn store_sql_protects_identity_bindings_and_dedicated_ownership_without_fo
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
     let p = f.placement(&reg, 10).await;
     store.bind_initial_placement(p.clone()).await.unwrap();
+    store
+        .bind_initial_membership(
+            GuildDataScope::new(
+                p.clone(),
+                crate::db::GuildEnrollment {
+                    guild_id: 10,
+                    id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    joined_at_ns: 100,
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     store.db.with_conn(|c| {
         c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF")?;
         for sql in [
@@ -303,6 +339,59 @@ async fn remote_option_mistakes_never_fall_back_to_local() {
     opts.url = "https://invalid.example".into();
     assert!(GuildDataStore::initialize(opts, reg).is_err());
     assert!(!f.store_path.exists());
+}
+
+#[tokio::test]
+async fn version_seven_upgrade_adds_erasure_and_tenant_settings() {
+    use super::{
+        BUNNY_SCHEMA, CASE_SCHEMA, EVIDENCE_SCHEMA, FAMILY, HISTORY_SCHEMA, SCHEMA, SOURCE_SCHEMA,
+        TENANT_SCHEMA, VERSION,
+    };
+    use crate::db_compat::Connection;
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let p = f.placement(&reg, 10).await;
+    let raw = Connection::open(&f.store_path).unwrap();
+    for schema in [
+        SCHEMA,
+        TENANT_SCHEMA,
+        CASE_SCHEMA,
+        HISTORY_SCHEMA,
+        SOURCE_SCHEMA,
+        EVIDENCE_SCHEMA,
+        BUNNY_SCHEMA,
+    ] {
+        raw.execute_batch(schema).unwrap();
+    }
+    raw.execute(
+        "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
+        params![FAMILY, reg.id().as_str()],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO guild_bindings VALUES(10,?1)",
+        params![p.revision()],
+    )
+    .unwrap();
+    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
+    raw.pragma_update(None, "user_version", 7).unwrap();
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
+            .unwrap(),
+        VERSION
+    );
+    let scope = GuildDataScope::new(
+        p,
+        crate::db::GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    let settings = store.tenant_settings(scope).await.unwrap();
+    assert!(settings.case_delete_roles.is_empty());
 }
 
 mod tenant_logs;

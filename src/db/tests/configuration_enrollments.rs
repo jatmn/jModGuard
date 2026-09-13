@@ -25,6 +25,7 @@ impl Drop for Fixture {
 async fn stale_settings_and_empty_patches_cannot_write_or_read_after_departure_or_rejoin() {
     for rejoin in [false, true] {
         let f = Fixture::new();
+        placed_before_erasure(&f.db, 10).await;
         let scope = f.scope(10).await;
         patch_enrolled_settings(
             &f.db,
@@ -253,6 +254,7 @@ async fn stale_configuration_writes_preserve_rows_and_both_version_markers() {
     for global in [false, true] {
         for rejoin in [false, true] {
             let f = Fixture::new();
+            placed_before_erasure(&f.db, 10).await;
             let request = f.scope(10).await;
             let target = if global { 0 } else { 10 };
             let rule = crate::defaults::default_rules().remove(0);

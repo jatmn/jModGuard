@@ -16,6 +16,8 @@ struct Config {
     pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
     pub db: DbConfig,
+    pub guild_stores: GuildStoresConfig,
+    pub evidence: EvidenceConfig,
     pub web: WebConfig,
     pub bot: BotConfig,
     pub log: LogConfig,
@@ -80,6 +82,174 @@ impl Default for DbConfig {
             token: String::new(),
             pool_size: 8,
         }
+    }
+}
+
+/// Protected store connection details. Identities here must match the catalog; no URLs belong in SQL.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GuildStoresConfig {
+    pub max_handles: u32,
+    #[serde(default)]
+    pub stores: Vec<GuildStoreConfig>,
+}
+impl Default for GuildStoresConfig {
+    fn default() -> Self {
+        Self {
+            max_handles: 8,
+            stores: Vec::new(),
+        }
+    }
+}
+impl GuildStoresConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (2..=32).contains(&self.max_handles),
+            "guild_stores.max_handles must be 2..32"
+        );
+        let mut dedicated = std::collections::BTreeSet::new();
+        let mut ids = std::collections::BTreeSet::new();
+        for store in &self.stores {
+            store.validate()?;
+            if !store.id.is_empty() {
+                anyhow::ensure!(ids.insert(store.id.clone()), "duplicate guild store id");
+            }
+            if store.dedicated_guild_id > 0 {
+                anyhow::ensure!(
+                    dedicated.insert(store.dedicated_guild_id),
+                    "duplicate dedicated guild store"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct GuildStoreConfig {
+    pub id: String,
+    pub dedicated_guild_id: i64,
+    pub path: PathBuf,
+    pub url: String,
+    pub token: String,
+}
+impl Default for GuildStoreConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            dedicated_guild_id: 0,
+            path: PathBuf::new(),
+            url: String::new(),
+            token: String::new(),
+        }
+    }
+}
+impl std::fmt::Debug for GuildStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuildStoreConfig")
+            .field("id", &self.id)
+            .field("dedicated_guild_id", &self.dedicated_guild_id)
+            .field("path", &self.path)
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+impl GuildStoreConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.id.is_empty() {
+            crate::db::guild_stores::StoreId::parse(&self.id)?;
+        }
+        anyhow::ensure!(
+            self.dedicated_guild_id >= 0,
+            "dedicated_guild_id must be 0 or a positive snowflake"
+        );
+        if !self.url.trim().is_empty() {
+            anyhow::ensure!(
+                !self.token.trim().is_empty(),
+                "guild store token is required when url is set"
+            );
+        }
+        if !self.token.trim().is_empty() {
+            anyhow::ensure!(
+                !self.url.trim().is_empty(),
+                "guild store url is required when token is set"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EvidenceConfig {
+    pub backend: String,
+    pub root: PathBuf,
+    pub buffer_bytes: usize,
+    pub storage_id: String,
+    pub bunny: BunnyEvidenceConfig,
+}
+impl Default for EvidenceConfig {
+    fn default() -> Self {
+        Self {
+            backend: "local".into(),
+            root: PathBuf::new(),
+            buffer_bytes: 65536,
+            storage_id: String::new(),
+            bunny: BunnyEvidenceConfig::default(),
+        }
+    }
+}
+impl EvidenceConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.backend.as_str(), "local" | "bunny" | "none"),
+            "evidence.backend must be local, bunny, or none"
+        );
+        anyhow::ensure!(
+            self.buffer_bytes > 0,
+            "evidence.buffer_bytes must be positive"
+        );
+        if !self.storage_id.is_empty() {
+            crate::db::guild_data::CaseId::try_from(self.storage_id.clone())?;
+        }
+        if self.backend == "bunny" {
+            anyhow::ensure!(
+                !self.bunny.zone.is_empty() && !self.bunny.access_key.is_empty(),
+                "bunny evidence zone and access_key are required"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct BunnyEvidenceConfig {
+    pub hostname: String,
+    pub zone: String,
+    pub access_key: String,
+    pub timeout_secs: u64,
+}
+impl Default for BunnyEvidenceConfig {
+    fn default() -> Self {
+        Self {
+            hostname: "storage.bunnycdn.com".into(),
+            zone: String::new(),
+            access_key: String::new(),
+            timeout_secs: 30,
+        }
+    }
+}
+impl std::fmt::Debug for BunnyEvidenceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BunnyEvidenceConfig")
+            .field("hostname", &self.hostname)
+            .field("zone", &self.zone)
+            .field("access_key", &"<redacted>")
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
     }
 }
 
@@ -198,6 +368,8 @@ pub struct BotProcessConfig {
     pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
     pub db: DbConfig,
+    pub guild_stores: GuildStoresConfig,
+    pub evidence: EvidenceConfig,
     pub bot: BotConfig,
     pub log: LogConfig,
 }
@@ -211,6 +383,8 @@ pub struct BotProcessConfig {
 pub struct ApiProcessConfig {
     pub actions: crate::bot_actions::Limits,
     pub db: DbConfig,
+    pub guild_stores: GuildStoresConfig,
+    pub evidence: EvidenceConfig,
     pub web: WebConfig,
     pub bot: BotConfig,
     pub log: LogConfig,
@@ -225,6 +399,8 @@ impl From<Config> for BotProcessConfig {
             image_spam: c.image_spam,
             discord: c.discord,
             db: c.db,
+            guild_stores: c.guild_stores,
+            evidence: c.evidence,
             bot: c.bot,
             log: c.log,
         }
@@ -235,6 +411,8 @@ impl From<Config> for ApiProcessConfig {
         Self {
             actions: c.actions,
             db: c.db,
+            guild_stores: c.guild_stores,
+            evidence: c.evidence,
             web: c.web,
             bot: c.bot,
             log: c.log,
@@ -250,6 +428,8 @@ impl From<BotProcessConfig> for Config {
             image_spam: c.image_spam,
             discord: c.discord,
             db: c.db,
+            guild_stores: c.guild_stores,
+            evidence: c.evidence,
             web: WebConfig::default(),
             bot: c.bot,
             log: c.log,
@@ -265,6 +445,8 @@ impl From<ApiProcessConfig> for Config {
             image_spam: crate::image_spam::Limits::default(),
             discord: DiscordConfig::default(),
             db: c.db,
+            guild_stores: c.guild_stores,
+            evidence: c.evidence,
             web: c.web,
             bot: c.bot,
             log: c.log,
@@ -328,6 +510,8 @@ impl Config {
         };
         cfg.apply_env_for(api)?;
         cfg.actions.validate()?;
+        cfg.guild_stores.validate()?;
+        cfg.evidence.validate()?;
         if !api {
             cfg.enrollment.validate()?;
             cfg.image_spam.validate()?;
@@ -417,6 +601,42 @@ impl Config {
     }
 
     fn apply_env_for(&mut self, api: bool) -> Result<()> {
+        match (
+            nonempty_env("JMODGUARD_GUILD_STORE_URL"),
+            nonempty_env("JMODGUARD_GUILD_STORE_TOKEN"),
+        ) {
+            (Some(url), Some(token)) => {
+                let shared = match self
+                    .guild_stores
+                    .stores
+                    .iter()
+                    .position(|store| store.dedicated_guild_id == 0)
+                {
+                    Some(index) => &mut self.guild_stores.stores[index],
+                    None => {
+                        self.guild_stores.stores.push(GuildStoreConfig::default());
+                        self.guild_stores
+                            .stores
+                            .last_mut()
+                            .expect("shared entry was inserted")
+                    }
+                };
+                shared.url = url;
+                shared.token = token;
+                if let Some(id) = nonempty_env("JMODGUARD_GUILD_STORE_ID") {
+                    shared.id = id;
+                }
+            }
+            (None, None) => {
+                anyhow::ensure!(
+                    nonempty_env("JMODGUARD_GUILD_STORE_ID").is_none(),
+                    "JMODGUARD_GUILD_STORE_ID requires the shared store URL/token pair"
+                );
+            }
+            _ => anyhow::bail!(
+                "JMODGUARD_GUILD_STORE_URL and JMODGUARD_GUILD_STORE_TOKEN must be set together and non-empty"
+            ),
+        }
         if !api {
             if let Ok(raw) = env::var("JMODGUARD_IMAGE_SPAM_LIMITS") {
                 self.image_spam = serde_json::from_str(&raw)
@@ -428,6 +648,18 @@ impl Config {
             if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
                 self.discord.token = v.trim().to_string();
             }
+        }
+        if let Ok(v) = env::var("JMODGUARD_EVIDENCE_BACKEND") {
+            self.evidence.backend = v;
+        }
+        if let Ok(v) = env::var("JMODGUARD_EVIDENCE_ROOT") {
+            self.evidence.root = PathBuf::from(v);
+        }
+        if let Ok(v) = env::var("JMODGUARD_BUNNY_EVIDENCE_ZONE") {
+            self.evidence.bunny.zone = v;
+        }
+        if let Ok(v) = env::var("JMODGUARD_BUNNY_EVIDENCE_ACCESS_KEY") {
+            self.evidence.bunny.access_key = v;
         }
         for (name, target) in [
             (
@@ -690,6 +922,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_store_environment_is_atomic_and_preserves_other_store_entries() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let names = [
+            "JMODGUARD_GUILD_STORE_URL",
+            "JMODGUARD_GUILD_STORE_TOKEN",
+            "JMODGUARD_GUILD_STORE_ID",
+        ];
+        let _saved = SavedEnv::capture(&names);
+        for name in names {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        unsafe {
+            std::env::set_var(names[0], "libsql://guild.example");
+        }
+        assert!(Config::default().apply_env_for(false).is_err());
+        unsafe {
+            std::env::set_var(names[1], "guild-token");
+        }
+        for api in [false, true] {
+            let mut cfg = Config::parse_file("", api).unwrap();
+            cfg.apply_env_for(api).unwrap();
+            assert_eq!(cfg.guild_stores.stores.len(), 1);
+            assert_eq!(cfg.guild_stores.stores[0].url, "libsql://guild.example");
+            assert_eq!(cfg.guild_stores.stores[0].token, "guild-token");
+            cfg.guild_stores.validate().unwrap();
+        }
+        let mut cfg = Config::default();
+        let shared_id = "a".repeat(32);
+        cfg.guild_stores.stores = vec![
+            super::GuildStoreConfig {
+                dedicated_guild_id: 10,
+                path: "dedicated.db".into(),
+                ..Default::default()
+            },
+            super::GuildStoreConfig {
+                id: shared_id.clone(),
+                path: "shared.db".into(),
+                ..Default::default()
+            },
+            super::GuildStoreConfig {
+                id: "b".repeat(32),
+                path: "other-shared.db".into(),
+                ..Default::default()
+            },
+        ];
+        cfg.apply_env_for(true).unwrap();
+        assert_eq!(cfg.guild_stores.stores.len(), 3);
+        assert_eq!(
+            cfg.guild_stores.stores[0].path,
+            std::path::PathBuf::from("dedicated.db")
+        );
+        assert!(cfg.guild_stores.stores[0].url.is_empty());
+        assert_eq!(cfg.guild_stores.stores[1].id, shared_id);
+        assert_eq!(cfg.guild_stores.stores[1].url, "libsql://guild.example");
+        assert!(cfg.guild_stores.stores[2].url.is_empty());
+        unsafe {
+            std::env::set_var(names[2], "invalid");
+        }
+        cfg.apply_env_for(true).unwrap();
+        assert!(cfg.guild_stores.validate().is_err());
+        unsafe {
+            std::env::remove_var(names[0]);
+            std::env::remove_var(names[1]);
+        }
+        assert!(Config::default().apply_env_for(true).is_err());
     }
 
     #[test]

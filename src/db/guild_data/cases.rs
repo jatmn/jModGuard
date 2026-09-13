@@ -290,20 +290,63 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
+        self.case_ids_by_removal(scope, after, count, limits, false)
+            .await
+    }
+
+    /// Retained removal identities only, for scoped cleanup recovery. No payloads.
+    pub async fn removed_case_ids(
+        &self,
+        scope: GuildDataScope,
+        after: Option<CaseId>,
+        count: u32,
+        limits: CaseLimits,
+    ) -> Result<Vec<CaseId>> {
+        self.case_ids_by_removal(scope, after, count, limits, true)
+            .await
+    }
+
+    async fn case_ids_by_removal(
+        &self,
+        scope: GuildDataScope,
+        after: Option<CaseId>,
+        count: u32,
+        limits: CaseLimits,
+        removed: bool,
+    ) -> Result<Vec<CaseId>> {
         self.check_target(&scope.placement)?;
         limits.page(count)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_primary_read()?;
             verify_scope(&tx, &expected, &scope, true)?;
-            let mut stmt = tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64], |r| Ok(r.get::<String>(0)?))?;
+            let mut stmt = tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=?5 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed], |r| Ok(r.get::<String>(0)?))?;
             let mut ids = Vec::new();
             for row in rows { ids.push(CaseId::try_from(row?)?); }
             drop(stmt);
             tx.finish_read()?;
             Ok(ids)
         }).await
+    }
+
+    pub async fn case_count(&self, scope: GuildDataScope, limits: CaseLimits) -> Result<i64> {
+        self.check_target(&scope.placement)?;
+        limits.validate()?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |r| Ok(r.get(0)?),
+                )?;
+                tx.finish_read()?;
+                Ok(count)
+            })
+            .await
     }
 
     /// Remove retained text/reason/actor/subject/outcome atomically. Keep only replay
@@ -320,6 +363,23 @@ impl GuildDataStore {
             tx.execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()])?;
             tx.commit()?;
             Ok(true)
+        }).await
+    }
+
+    /// Prove a removal tombstone exists in this exact live membership. Used to
+    /// recover the cross-store backup intent, never to accept arbitrary case IDs.
+    pub async fn case_removed(&self, scope: GuildDataScope, id: CaseId) -> Result<bool> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_primary_read()?;
+            verify_scope(&tx, &expected, &scope, true)?;
+            let removed = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=1)",
+                params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(r.get(0)?),
+            )?;
+            tx.finish_read()?;
+            Ok(removed)
         }).await
     }
 

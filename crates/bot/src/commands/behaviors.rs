@@ -14,6 +14,7 @@ use crate::{db, logging};
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
+    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
 
     match &env.cmd.behavior {
         Behavior::Ban {
@@ -27,24 +28,63 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
-            if let Some(m) = member {
-                let _ = m
-                    .ban_with_reason(&env.ctx.http, *delete_days, &reason)
-                    .await;
+            let suppression = env.app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Ban,
+                env.guild_id.get(),
+                target.get(),
+            );
+            let discord = if let Some(m) = member {
+                m.ban_with_reason(&env.ctx.http, *delete_days, &reason)
+                    .await
             } else {
                 env.guild_id
                     .ban_with_reason(&env.ctx.http, target, *delete_days, &reason)
-                    .await?;
+                    .await
+            };
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                env.app.release_gateway_case_suppression(suppression);
             }
-            db::record_ban(
-                &env.app.db,
-                env.guild_id.get() as i64,
-                target.get() as i64,
-                Some(env.actor.get() as i64),
+            crate::cases::record(
+                env.app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Ban,
+                outcome.clone(),
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            match outcome {
+                crate::db::guild_data::CaseOutcome::Succeeded => {
+                    db::record_enrolled_ban(
+                        &env.app.db,
+                        enrollment.clone(),
+                        target.get() as i64,
+                        Some(env.actor.get() as i64),
+                        &reason,
+                    )
+                    .await?;
+                }
+                crate::db::guild_data::CaseOutcome::Failed => {
+                    return Err(discord
+                        .err()
+                        .map(|error| anyhow!("{error}"))
+                        .unwrap_or_else(|| anyhow!("ban failed")));
+                }
+                _ => return Err(anyhow!("ban outcome is uncertain; verify it in Discord")),
+            }
+            log_mod(
+                env,
+                enrollment.clone(),
+                "ban",
+                target,
+                &target_user.name,
                 &reason,
             )
-            .await?;
-            log_mod(env, "ban", target, &target_user.name, &reason).await;
+            .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
@@ -58,12 +98,36 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let target_user = user_lookup(env, target).await?;
             // Discord is authoritative; local bans table is a mirror healed by
             // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
-            env.ctx
+            let suppression = env.app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Unban,
+                env.guild_id.get(),
+                target.get(),
+            );
+            let discord = env
+                .ctx
                 .http
                 .remove_ban(env.guild_id, target, Some(&reason))
-                .await?;
+                .await;
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                env.app.release_gateway_case_suppression(suppression);
+            }
+            crate::cases::record(
+                env.app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Unban,
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
             if let Err(e) =
-                db::mark_unbanned(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await
+                db::mark_enrolled_unbanned(&env.app.db, enrollment.clone(), target.get() as i64)
+                    .await
             {
                 tracing::warn!(
                     "local ban mirror update failed after Discord unban \
@@ -72,7 +136,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     target
                 );
             }
-            log_mod(env, "unban", target, &target_user.name, &reason).await;
+            log_mod(
+                env,
+                enrollment.clone(),
+                "unban",
+                target,
+                &target_user.name,
+                &reason,
+            )
+            .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
@@ -90,8 +162,30 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
-            member.kick_with_reason(&env.ctx.http, &reason).await?;
-            log_mod(env, "kick", target, &target_user.name, &reason).await;
+            let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Kick,
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
+            log_mod(
+                env,
+                enrollment.clone(),
+                "kick",
+                target,
+                &target_user.name,
+                &reason,
+            )
+            .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
@@ -121,26 +215,61 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
+            let until = if minutes == 0 {
+                None
+            } else {
+                Some(
+                    Timestamp::from_unix_timestamp(
+                        chrono::Utc::now().timestamp() + (minutes as i64) * 60,
+                    )
+                    .map_err(|e| anyhow!("invalid timeout: {e}"))?,
+                )
+            };
+            let discord = if let Some(until) = until {
+                member
+                    .disable_communication_until_datetime(&env.ctx.http, until)
+                    .await
+            } else {
+                member.enable_communication(&env.ctx.http).await
+            };
+            let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            crate::cases::record(
+                env.app,
+                enrollment.clone(),
+                if minutes == 0 {
+                    crate::db::guild_data::CaseAction::TimeoutRemoval
+                } else {
+                    crate::db::guild_data::CaseAction::Timeout
+                },
+                outcome,
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            discord?;
             if minutes == 0 {
-                member.enable_communication(&env.ctx.http).await?;
                 let mut v = vars.clone();
                 v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
-                let until = Timestamp::from_unix_timestamp(
-                    chrono::Utc::now().timestamp() + (minutes as i64) * 60,
-                )
-                .map_err(|e| anyhow!("invalid timeout: {e}"))?;
-                member
-                    .disable_communication_until_datetime(&env.ctx.http, until)
-                    .await?;
                 let mut v = vars.clone();
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
             }
-            log_mod(env, "timeout", target, &target_user.name, &reason).await;
+            log_mod(
+                env,
+                enrollment.clone(),
+                "timeout",
+                target,
+                &target_user.name,
+                &reason,
+            )
+            .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("minutes".into(), minutes.to_string());
             vars.insert("reason".into(), reason);
@@ -160,15 +289,45 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 args.rest()
             };
             let target_user = user_lookup(env, target).await?;
-            db::add_warn(
+            let warn_result = db::add_enrolled_warn(
                 &env.app.db,
-                env.guild_id.get() as i64,
+                enrollment.clone(),
                 target.get() as i64,
                 env.actor.get() as i64,
                 &reason,
             )
-            .await?;
-            log_mod(env, "warn", target, &target_user.name, &reason).await;
+            .await;
+            let outcome = crate::cases::classify_db_commit(&warn_result);
+            crate::cases::record(
+                env.app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Warning,
+                outcome.clone(),
+                target.get(),
+                Some(env.actor.get()),
+                Some(reason.clone()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+            match outcome {
+                crate::db::guild_data::CaseOutcome::Succeeded => {}
+                crate::db::guild_data::CaseOutcome::Failed => {
+                    return Err(warn_result.unwrap_err());
+                }
+                _ => {
+                    return Err(anyhow!("warn outcome is uncertain; verify it in the database"));
+                }
+            }
+            log_mod(
+                env,
+                enrollment.clone(),
+                "warn",
+                target,
+                &target_user.name,
+                &reason,
+            )
+            .await;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
@@ -215,11 +374,19 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
-            let n = db::clear_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64)
+            let n = db::clear_enrolled_warns(&env.app.db, enrollment.clone(), target.get() as i64)
                 .await?;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("count".into(), n.to_string());
-            log_mod(env, "warnclear", target, &target_user.name, &n.to_string()).await;
+            log_mod(
+                env,
+                enrollment.clone(),
+                "warnclear",
+                target,
+                &target_user.name,
+                &n.to_string(),
+            )
+            .await;
             Ok(BehaviorOutcome {
                 response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
                 vars,
@@ -272,7 +439,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             } else if n == 1 {
                 let _ = env.channel_id.delete_message(&env.ctx.http, ids[0]).await;
             }
-            log_mod(env, "purge", env.actor, "messages", &format!("{n} deleted")).await;
+            log_mod(
+                env,
+                enrollment.clone(),
+                "purge",
+                env.actor,
+                "messages",
+                &format!("{n} deleted"),
+            )
+            .await;
             vars.insert("count".into(), n.to_string());
             Ok(BehaviorOutcome {
                 response: None,
@@ -316,6 +491,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             vars.insert("seconds".into(), seconds.to_string());
             log_mod(
                 env,
+                enrollment.clone(),
                 "slowmode",
                 env.actor,
                 "channel",
@@ -557,6 +733,7 @@ fn parse_channel_mention(token: &str) -> Option<ChannelId> {
 
 async fn log_mod(
     env: &CmdEnv<'_>,
+    enrollment: Option<db::GuildEnrollment>,
     action: &str,
     target: serenity::model::id::UserId,
     target_name: &str,
@@ -564,6 +741,7 @@ async fn log_mod(
 ) {
     logging::emit_mod_action(
         env.app,
+        enrollment,
         env.ctx,
         env.guild_id,
         action,

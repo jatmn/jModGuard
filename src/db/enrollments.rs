@@ -93,6 +93,20 @@ async fn observe_membership(
         // here preserves the comparison/write atomicity without no-op receipts.
         tx.ensure_mutation_receipt()?;
         // Membership transition and invalidation commit together. Never replay running work.
+        // Departure or a newer positive join ends the previous identity. Preserve
+        // its cleanup obligation before any replacement activation can be interrupted.
+        // Retirement replaces the active identity, so it must not precede admission.
+        // A newer departure can follow a missed join; clean the known old identity
+        // as well. The earlier timestamp guard already rejected stale departures.
+        if let Some((id, joined, true)) = &current
+        {
+            tx.execute(
+                "INSERT INTO guild_erasure_jobs(guild_id,enrollment_id,joined_at_ns,store_id,placement_revision,created_at)
+                 SELECT guild_id,?2,?3,store_id,revision,unixepoch() FROM guild_store_placements
+                 WHERE guild_id=?1 AND NOT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
+                params![guild, id.as_str(), *joined],
+            )?;
+        }
         tx.execute(
             "UPDATE bot_actions SET state='cancelled',outcome='enrollment_ended',finished_at=unixepoch()
              WHERE guild_id=?1 AND state IN ('pending','claimed')", params![guild],
@@ -114,6 +128,24 @@ async fn observe_membership(
              joined_at_ns=excluded.joined_at_ns,active=excluded.active",
             params![guild, id.as_str(), joined_at_ns, present],
         )?;
+        if !present {
+            let placed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM guild_store_placements WHERE guild_id=?1)",
+                params![guild], |r| Ok(r.get(0)?),
+            )?;
+            if !placed {
+                // No store exists to visit. Settle directory ownership in the same
+                // transaction as retirement, including its backup reminder.
+                super::tenant_lifecycle::wipe_directory_guild_data_conn(&tx, guild)?;
+                if let Some((old, _, true)) = &current {
+                    tx.execute(
+                        "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,created_at)
+                         VALUES(?1,'guild',?2,?3,unixepoch())",
+                        params![format!("{:032x}", rand::random::<u128>()), guild, old.as_str()],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(present.then_some(GuildEnrollment {
             guild_id: guild,

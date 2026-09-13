@@ -11,7 +11,7 @@ const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), '
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
   const node = (tag) => ({
-    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, listeners: {}, disabled: false,
+    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
     classList: { toggle() {} },
     focus() {},
     replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
@@ -32,9 +32,9 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
-    fetch: fetchImpl, console, AbortController, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
+    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -65,11 +65,12 @@ test('dashboard moderation counts stay with their requested server', async () =>
   assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/stats`);
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
   const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
-  pending[1].resolve(response({ events: 7, warns: 2, bans: 1 }));
+  pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(second, 'Moderation records'), '7');
   assert.equal(value(second, 'Warns'), '2');
   assert.equal(value(second, 'Bans'), '1');
+  assert.equal(value(second, 'Cases'), '4');
   pending[0].resolve(response({ events: 900, warns: 8, bans: 3 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(first, 'Moderation records'), '900');
@@ -81,7 +82,7 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
   const dashboard = app.tabDashboard();
   await new Promise(resolve => setImmediate(resolve));
-  for (const label of ['Moderation records', 'Warns', 'Bans']) {
+  for (const label of ['Moderation records', 'Warns', 'Bans', 'Cases']) {
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
     assert.equal(card.children[0].textContent, 'Unavailable');
   }
@@ -96,6 +97,18 @@ test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
   second.app.restoreWorkspace();
   assert.equal(second.app.state.guildId, '987654321098765433');
   assert.equal(second.app.state.tab, 'settings');
+});
+
+test('cases is a valid navigation and restored workspace tab', () => {
+  const first = harness();
+  first.app.state.config = null;
+  first.app.navigate('cases');
+  assert.equal(first.app.state.tab, 'cases');
+  first.app.persistWorkspace();
+
+  const second = harness(undefined, first.storage);
+  second.app.restoreWorkspace();
+  assert.equal(second.app.state.tab, 'cases');
 });
 
 test('workspace validates membership, tab, user identity and malformed storage', () => {
@@ -215,8 +228,42 @@ test('settings patches send only changed fields to the selected server', async (
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '?';
   await save.listeners.click({});
-  assert.deepEqual(calls[0], { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
-  assert.equal(calls[1].method, 'GET');
+  const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
+  assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
+  assert.ok(calls.some((c) => c.method === 'GET' && c.url.endsWith('/case-delete-roles')));
+});
+
+test('case-delete-role saves advance their revision token', async () => {
+  const calls = [];
+  let nextRevision = 2;
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const h = harness(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (url.endsWith('/case-delete-roles') && options.method === 'GET') {
+      return response({ roles: ['1'], revision: 'revision-1' });
+    }
+    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+      return response({ revision: `revision-${nextRevision++}` });
+    }
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const roleInput = h.elements.find(n => n.tag === 'input' && n.attrs.placeholder === 'Role IDs, comma-separated');
+  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  roleInput.value = '1, 2';
+  await saveRoles.listeners.click({});
+  roleInput.value = '2';
+  await saveRoles.listeners.click({});
+
+  const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
+  assert.equal(puts.length, 2);
+  assert.equal(puts[0].body.revision, 'revision-1');
+  assert.equal(puts[1].body.revision, 'revision-2');
 });
 
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
@@ -224,7 +271,8 @@ test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   inputs[0].value = '';
   inputs[1].value = '';
   await save.listeners.click({});
-  assert.deepEqual(calls[0].body, { prefix: null, bot_name: '' });
+  const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
+  assert.deepEqual(put.body, { prefix: null, bot_name: '' });
 });
 
 test('settings do not expose historical chat-retention controls', () => {
@@ -445,7 +493,7 @@ test('configuration mutations retain the loaded membership without refreshing or
     return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Membership changed' }) };
   });
   app.state.config = { enrollment_id: 'old-membership' };
-  for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy']]) {
+  for (const [method, suffix] of [['PUT', 'settings'], ['PUT', 'rules/flood'], ['DELETE', 'rules/flood'], ['POST', 'badwords'], ['DELETE', 'badwords/1'], ['POST', 'commands'], ['PUT', 'commands/test'], ['DELETE', 'commands/test'], ['PUT', 'templates/edit'], ['DELETE', 'templates/edit'], ['POST', 'copy'], ['PUT', 'case-delete-roles'], ['DELETE', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']]) {
     const count = calls.length;
     await assert.rejects(app.api(`/api/guilds/${app.state.guildId}/${suffix}`, method, {}), /Membership changed/);
     assert.equal(calls.length, count + 1);
@@ -501,9 +549,9 @@ test('copy captures source membership on selection and sends both page scopes', 
   source.value = app.state.guilds[1].id;
   source.selectedOptions = [{ textContent: 'Second' }];
   await copy.listeners.click({});
-  assert.equal(calls.length, 0, 'copy waits for an explicitly loaded source');
+  assert.equal(calls.filter((c) => c.opts.method === 'POST').length, 0, 'copy waits for an explicitly loaded source');
   await source.listeners.change({});
-  assert.equal(calls.length, 1);
+  assert.equal(calls.filter((c) => c.url.includes(app.state.guilds[1].id)).length, 1);
   await copy.listeners.click({});
   const sent = calls.find(c => c.opts.method === 'POST');
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
@@ -594,7 +642,7 @@ test('moderation reads send the loaded page membership including query-string ro
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -603,7 +651,7 @@ test('moderation reads send the loaded page membership including query-string ro
   h.app.state.config = null;
   await h.app.api(`/api/guilds/${h.app.state.guildId}/stats`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
-  assert.equal(calls.length, 5, 'reads must not silently load a new membership');
+  assert.equal(calls.length, 8, 'reads must not silently load a new membership');
 });
 
 test('individual configuration GETs retain loaded membership without rebinding global or foreign scopes', async () => {
@@ -655,4 +703,88 @@ test('image test UI rejects invalid thresholds before the API request', async ()
   await findNode(modal,n=>n.textContent === 'Save').listeners.click({});
   assert.equal(sent,0);
   assert.match(h.nodes.get('#toast').textContent,/Channels must be/);
+});
+
+
+test('case administration reaches later pages, all admitted history and inline evidence', async () => {
+  const ids = Array.from({length: 51}, (_, i) => (i + 1).toString(16).padStart(32, '0'));
+  const calls = [];
+  const h = harness(async (url) => {
+    calls.push(url);
+    const u = new URL(url, 'https://fixture.test');
+    if (u.pathname.endsWith('/history')) {
+      const start = Number(u.searchParams.get('after'));
+      return response({history: Array.from({length: 32}, (_, i) => ({sequence: String(start + i + 1), entry: {body: {text: `note ${start + i + 1}`}}}))});
+    }
+    if (u.pathname.endsWith('/evidence')) return response({evidence: []});
+    if (u.pathname.endsWith('/cases')) return response({cases: u.searchParams.has('after') ? ids.slice(50) : ids.slice(0, 50), can_delete: true});
+    return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  const next = findNode(root, n => n.tag === 'button' && n.textContent === 'Next page');
+  assert.equal(next.disabled, false);
+  next.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
+  const caseButton = findNode(root, n => n.tag === 'button' && n.textContent === ids[50].slice(0, 8));
+  caseButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(root).includes('note 33'));
+  assert.ok(textOf(root).includes('note 64'));
+  const excerpt = findNode(root, n => n.tag === 'pre');
+  assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
+  assert.equal(next.disabled, true);
+});
+
+test('removed case recovery survives opening a new dashboard view and retries the exact identity', async () => {
+  const id = 'a'.repeat(32);
+  const calls = [];
+  const h = harness(async (url, options) => {
+    calls.push({url, method: options.method});
+    if (options.method === 'DELETE') return response({removed: false, cleanup_pending: false});
+    const u = new URL(url, 'https://fixture.test');
+    return response({cases: u.searchParams.get('removed') === 'true' ? [id] : [], can_delete: true});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(root, n => n.textContent === 'Removed records / retry cleanup').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(textOf(root).includes(id));
+  await findNode(root, n => n.textContent === 'Retry cleanup').listeners.click();
+  assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/cases/' + id)));
+});
+
+test('note retry retains intent after a lost response and blocks overlapping submits', async () => {
+  const id = 'a'.repeat(32), posts = [];
+  let resolveFirst;
+  const h = harness(async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push(JSON.parse(options.body));
+      if (posts.length === 1) return await new Promise((resolve, reject) => { resolveFirst = () => reject(new Error('response lost')); });
+      throw new Error('response lost');
+    }
+    if (url.includes('/history')) return response({history: []});
+    if (url.includes('/evidence')) return response({evidence: []});
+    if (url.endsWith('/cases?limit=50')) return response({cases: [id]});
+    if (url.includes('/cases?')) return response({cases: [id]});
+    return response({case: {action: 'warning', evidence: {}}, can_delete: true});
+  });
+  const root = h.app.tabCases();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(root, n => n.tag === 'button' && n.textContent === id.slice(0,8)).listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const note = findNode(root, n => n.tag === 'textarea');
+  const submit = findNode(root, n => n.tag === 'button' && n.textContent === 'Add note');
+  assert.ok(note, textOf(root));
+  note.value = 'same note';
+  const first = submit.listeners.click();
+  await submit.listeners.click();
+  assert.equal(posts.length,1);
+  resolveFirst(); await first;
+  await submit.listeners.click();
+  assert.deepEqual(posts[1],posts[0]);
+  note.value = 'different note';
+  await submit.listeners.click();
+  assert.notEqual(posts[2].entry_id,posts[0].entry_id);
 });

@@ -31,6 +31,30 @@ token = ""
 # Container deploys typically have no config.toml, so set the env var when
 # you need something other than 8.
 pool_size = 8
+
+# Optional extra guild stores. A local core file also creates a default shared
+# store at `{db.path}.guild.db`. Remote cores need an explicit shared store.
+# Env pair: JMODGUARD_GUILD_STORE_URL + JMODGUARD_GUILD_STORE_TOKEN.
+# Optional JMODGUARD_GUILD_STORE_ID; otherwise preserve/discover the store identity.
+# Overrides the first shared entry; other shared/dedicated entries stay unchanged.
+# [guild_stores]
+# max_handles = 8
+# [[guild_stores.stores]]
+# id = ""  # empty rediscovers stamped/catalog identity; minted only on first start
+# dedicated_guild_id = 0
+# path = "guild.db"
+# url = ""
+# token = ""
+
+# Private case evidence. Default local Unix directory is `{db.path}.evidence`.
+# Env: JMODGUARD_EVIDENCE_BACKEND (local|bunny|none), JMODGUARD_EVIDENCE_ROOT,
+# JMODGUARD_BUNNY_EVIDENCE_ZONE, JMODGUARD_BUNNY_EVIDENCE_ACCESS_KEY.
+# [evidence]
+# backend = "local"
+# root = ""
+# buffer_bytes = 65536
+# storage_id = ""
+
 # Remote database calls and waits for a pooled connection have a fixed
 # 75-second per-request deadline (longer than Bunny's documented failover
 # window). Transaction rollback cleanup may use one additional deadline.

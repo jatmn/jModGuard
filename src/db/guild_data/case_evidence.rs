@@ -87,6 +87,8 @@ pub enum EvidenceCapture {
 pub enum EvidenceWork {
     Capture,
     Delete,
+    /// Cancelled captures and settled deletions. The backend still proves settlement.
+    Cleanup,
 }
 
 fn job(row: &Row, scope: &GuildDataScope) -> Result<EvidenceJob> {
@@ -305,6 +307,56 @@ impl GuildDataStore {
             .await
     }
 
+    pub async fn case_evidence_index(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        limits: EvidenceLimits,
+    ) -> Result<Vec<AvailableEvidence>> {
+        self.check_target(&scope.placement)?;
+        limits.validate()?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                if !live(&tx, &scope, &case)? {
+                    tx.finish_read()?;
+                    return Ok(Vec::new());
+                }
+                let mut stmt = tx.prepare(
+                    "SELECT evidence_id FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND state=1 AND cancelled=0 ORDER BY evidence_id LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        case.as_str(),
+                        limits.max_page_size as i64
+                    ],
+                    |r| Ok(r.get::<String>(0)?),
+                )?;
+                let mut items = Vec::new();
+                for row in rows {
+                    let id = CaseId::try_from(row?)?;
+                    if let Some(r) = record(&tx, &scope, &id)?
+                        && r.job.case_id == case
+                        && r.job.state == EvidenceState::Available
+                    {
+                        items.push(AvailableEvidence {
+                            job: r.job,
+                            origin: r.origin.ok_or(CaseError::Invalid)?,
+                            sha256: r.sha256.ok_or(CaseError::Invalid)?,
+                        });
+                    }
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(items)
+            })
+            .await
+    }
+
     /// Prepare closed-membership object cleanup in bounded batches. Closure itself
     /// denies content access immediately without scanning all retained evidence.
     pub async fn cancel_closed_evidence(
@@ -345,11 +397,12 @@ impl GuildDataStore {
         let state = match work {
             EvidenceWork::Capture => 0,
             EvidenceWork::Delete => 2,
+            EvidenceWork::Cleanup => -1,
         };
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
             let tx=conn.transaction_primary_read()?;let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
-            let mut stmt=tx.prepare("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND state=?3 AND evidence_id>?4 ORDER BY evidence_id LIMIT ?5")?;
+            let mut stmt=tx.prepare("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND (state=?3 OR (?3=-1 AND (state=2 OR (state=0 AND cancelled=1)))) AND evidence_id>?4 ORDER BY evidence_id LIMIT ?5")?;
             let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),state,after.as_ref().map_or("",CaseId::as_str),i64::from(count)],|r|{let mut job=job(r,&scope)?;job.cancelled|=!active;Ok(job)})?;
             let jobs=rows.collect::<Result<Vec<_>>>()?;drop(stmt);tx.finish_read()?;Ok(jobs)
         }).await

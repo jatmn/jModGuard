@@ -23,7 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "cases", "settings"];
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -202,15 +202,21 @@ function setStartupStatus(text) {
   if (node) node.textContent = text;
 }
 
+function pageEnrollment(path, method = "GET") {
+  // Bind edits and scoped reads to the membership this page loaded. Never
+  // fetch a new token or retry against a replacement installation.
+  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|unban|actions|events|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/);
+  if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "bans", "stats", "cases", "case-delete-roles"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
+    return state.config.enrollment_id;
+  }
+  return null;
+}
+
 async function api(path, method = "GET", body = null, signal) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
-  // Bind edits and scoped reads to the membership this page loaded. Never
-  // fetch a new token or retry against a replacement installation.
-  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|unban|actions|events|bans|stats)(?:\/|\?|$)/);
-  if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "bans", "stats"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
-    opts.headers["x-jmodguard-enrollment"] = state.config.enrollment_id;
-  }
+  const enrollment = pageEnrollment(path, method);
+  if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -233,6 +239,31 @@ async function api(path, method = "GET", body = null, signal) {
     }
     throw e;
   } finally { if (timeout !== null) clearTimeout(timeout); }
+}
+
+async function downloadPrivate(path, filename) {
+  const opts = { method: "GET", headers: {}, credentials: "include", cache: "no-store" };
+  const enrollment = pageEnrollment(path, "GET");
+  if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
+  const res = await fetch(apiUrl(path), opts);
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`;
+    try {
+      const data = JSON.parse(await res.text());
+      if (data && data.error) message = data.error;
+    } catch (_) {}
+    throw apiError(message, res.status);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "evidence";
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 // Persist an unacknowledged request in this browser tab so a lost response or
@@ -429,7 +460,7 @@ function renderTab() {
   const map = {
     dashboard: tabDashboard, rules: tabRules, badwords: tabBadwords, commands: tabCommands,
     templates: tabTemplates, logchannels: tabLogChannels,
-    events: tabEvents, bans: tabBans, actions: tabActions, settings: tabSettings,
+    events: tabEvents, bans: tabBans, actions: tabActions, cases: tabCases, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === state.tab);
@@ -483,7 +514,7 @@ function tabDashboard() {
   const rulesDry = cfg.rules.filter((r) => r.effective.dry_run).length;
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
-  const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans']]
+  const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans'], ['cases', 'Cases']]
     .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
   const guildId = state.guildId;
   api(`/api/guilds/${guildId}/stats`).then(counts => {
@@ -1208,6 +1239,156 @@ function tabActions() {
     el("button", { class: "btn", text: "Refresh", onclick: run }), table);
 }
 
+function tabCases() {
+  const guildId = state.guildId;
+  const body = el("tbody", {});
+  const detail = el("div", { class: "card", style: "margin-top:16px" });
+  const table = el("table", {}, el("thead", {}, el("tr", {},
+    ...["Case", "Action", "Outcome", "Subject", "When"].map((text) => el("th", { text })))), body);
+  let request = 0;
+  let detailRequest = 0;
+  let after = "";
+  let removed = false;
+  let nextAfter = "";
+  const pageSize = 50;
+  const next = el("button", { class: "btn", text: "Next page", disabled: true, onclick: () => {
+    if (!nextAfter) return;
+    after = nextAfter;
+    run();
+  } });
+  const first = el("button", { class: "btn", text: "First page", onclick: () => { after = ""; run(); } });
+  const recovery = el("button", { class: "btn", text: "Removed records / retry cleanup", style: "display:none", onclick: () => {
+    removed = !removed;
+    after = "";
+    recovery.textContent = removed ? "Back to cases" : "Removed records / retry cleanup";
+    run();
+  } });
+  const openCase = async (id) => {
+    const currentDetail = ++detailRequest;
+    try {
+      const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
+      const history = { history: [] };
+      let sequence = "0";
+      // The existing history contract admits at most 64 entries. Consume both
+      // bounded pages so successful notes beyond the first 32 remain visible.
+      for (let page = 0; page < 2; page++) {
+        const result = await api(`/api/guilds/${guildId}/cases/${id}/history?limit=32&after=${sequence}`);
+        const entries = result.history || [];
+        history.history.push(...entries);
+        if (entries.length < 32) break;
+        sequence = entries[entries.length - 1].sequence;
+      }
+      const evidence = await api(`/api/guilds/${guildId}/cases/${id}/evidence`);
+      if (currentDetail !== detailRequest || state.guildId !== guildId) return;
+      const c = payload.case || {};
+      let noteIntent = null;
+      let notePending = false;
+      const note = el("textarea", { rows: "3", placeholder: "Add a note. This does not change Discord." });
+      detail.replaceChildren(
+        el("h3", { text: "Case " + id }),
+        el("p", { text: `${c.action || "unknown"} · ${c.outcome || "unknown"} · subject ${c.subject_id || ""}` }),
+        el("p", { class: "muted", text: c.reason || "No reason recorded." }),
+        el("p", { class: "muted", text: "Removing a case deletes retained private records. It does not reverse a Discord ban, kick, timeout, or warning." }),
+        payload.can_delete ? el("button", { class: "btn small", text: "Remove case record", onclick: async () => {
+          if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
+          try {
+            const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
+            toast(result?.cleanup_pending
+              ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
+              : "Case record removed", "success");
+            renderTab();
+          } catch (e) { toast(e.message || String(e), "error"); }
+        } }) : null,
+        el("h3", { text: "History" }),
+        ...(history.history || []).map((entry) => el("p", { class: "muted", text: JSON.stringify(entry.entry.body) })),
+        el("div", { class: "field" }, el("label", { text: "Note" }), note,
+          el("button", { class: "btn small", type: "button", text: "Add note", onclick: async () => {
+            if (notePending) return;
+            try {
+              const text = note.value.trim();
+              if (!noteIntent || noteIntent.text !== text) {
+                noteIntent = { entry_id: crypto.randomUUID().replaceAll("-", ""), text };
+              }
+              notePending = true;
+              await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent);
+              noteIntent = null;
+              toast("Note added", "success");
+              await openCase(id);
+            } catch (e) { toast(e.message || String(e), "error"); }
+            finally { notePending = false; }
+          } })),
+        el("h3", { text: "Private evidence" }),
+        ...(Array.isArray(c.evidence?.text) ? c.evidence.text : []).map((item) => el("div", {},
+          el("p", { class: "muted", text: `Message ${item.message_id} · channel ${item.channel_id} · author ${item.author_id}` }),
+          el("pre", { text: item.text }))),
+        ...(evidence.evidence || []).map((item) => el("p", {},
+          el("button", { class: "btn small", type: "button", text: `Download ${item.id}`, onclick: async () => {
+            try { await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id); }
+            catch (e) { toast(e.message || String(e), "error"); }
+          } }))),
+      );
+    } catch (e) {
+      if (currentDetail !== detailRequest || state.guildId !== guildId) return;
+      detail.replaceChildren(el("p", { class: "err", text: e.message || String(e) }));
+    }
+  };
+  const run = async () => {
+    const current = ++request;
+    ++detailRequest;
+    detail.replaceChildren();
+    next.disabled = true;
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
+    try {
+      const query = new URLSearchParams({ limit: String(pageSize), removed: String(removed) });
+      if (after) query.set("after", after);
+      const payload = await api(`/api/guilds/${guildId}/cases?${query}`);
+      if (current !== request || state.guildId !== guildId) return;
+      recovery.style.display = payload.can_delete ? "" : "none";
+      const ids = payload.cases || [];
+      nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
+      next.disabled = !nextAfter;
+      first.disabled = !after;
+      if (!ids.length) {
+        body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "muted", text: removed ? "No more removed records." : "No selected cases on this page." })));
+        return;
+      }
+      const rows = [];
+      for (const id of ids) {
+        if (removed) {
+          rows.push(el("tr", {}, el("td", { text: id }), el("td", { colspan: 4 },
+            el("button", { class: "btn small", text: "Retry cleanup", onclick: async () => {
+              try {
+                const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
+                toast(result.cleanup_pending ? "Cleanup is pending. Retry when storage is available." : "Live record cleanup complete. This does not delete backup copies.", "success");
+              } catch (e) { toast(e.message || String(e), "error"); }
+            } }))));
+          continue;
+        }
+        const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
+        if (current !== request || state.guildId !== guildId) return;
+        const c = payload.case || {};
+        rows.push(el("tr", {},
+          el("td", {}, el("button", { class: "btn small", text: id.slice(0, 8), onclick: () => openCase(id) })),
+          el("td", { text: c.action || "" }),
+          el("td", { text: c.outcome || "" }),
+          el("td", { text: String(c.subject_id || "") }),
+          el("td", { class: "muted", text: c.occurred_at_ms ? new Date(Number(c.occurred_at_ms)).toLocaleString() : "" }),
+        ));
+      }
+      body.replaceChildren(...rows);
+    } catch (e) {
+      if (current !== request || state.guildId !== guildId) return;
+      body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load cases: " + (e.message || String(e)) })));
+    }
+  };
+  run();
+  return el("div", {},
+    el("h2", { text: "Cases" }),
+    el("p", { class: "muted", text: "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord." }),
+    el("p", { class: "muted", text: "Use removed records to retry cleanup. Their private content stays deleted, and retrying does not undo Discord actions." }),
+    el("button", { class: "btn", text: "Refresh", onclick: run }), first, next, recovery, table, detail);
+}
+
 function tabSettings() {
   const cfg = state.config;
   const ov = cfg.settings_override || {};
@@ -1335,6 +1516,26 @@ function tabSettings() {
       } }),
     ),
   ];
+
+  const roleInput = el("input", { type: "text", placeholder: "Role IDs, comma-separated" });
+  const roleRevision = { value: "" };
+  api(`/api/guilds/${state.guildId}/case-delete-roles`).then((roles) => {
+    roleInput.value = (roles.roles || []).join(", ");
+    roleRevision.value = roles.revision || "";
+  }).catch(() => {});
+  cards.push(el("div", { class: "card" },
+    el("h3", { text: "Case removal" }),
+    el("p", { class: "muted", text: "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action." }),
+    el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
+    el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
+      try {
+        const roles = roleInput.value.split(",").map((s) => s.trim()).filter(Boolean);
+        const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles, revision: roleRevision.value });
+        roleRevision.value = saved.revision;
+        toast("Case-removal roles saved", "success");
+      } catch (e) { toast(e.message || String(e), "error"); }
+    } }),
+  ));
 
   if (isBotOwner()) {
     cards.push(el("div", { class: "card" },

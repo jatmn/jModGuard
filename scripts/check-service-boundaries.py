@@ -73,13 +73,31 @@ def main():
             raise SystemExit(f"Captured configuration outside the DB/API boundary: {path}")
     print("Captured configuration is confined to DB/API code")
 
-    # Catalog storage is not yet runtime routing or a dashboard control surface.
-    catalog = re.compile(r"\b(?:guild_stores|guild_data|GuildDataStore|GuildDataScope|LogChannelSnapshot|CaseData|RecordCase|bunny_evidence|BunnyEvidenceStore|BunnyTransferLimits|evidence_transfer|LocalEvidenceStore|EvidenceUpload|EvidenceTarget|EvidenceRequest|EvidenceJob|EvidenceCapture|CaseSourceMatch|LinkCaseSource|CaseHistoryData|CaseHistoryBody|AppendCaseHistory|register_store|assign_initial_placement|guild_placement|store_registration)\b")
-    for service in ("bot", "api", "conductor"):
-        for path in (ROOT / f"crates/{service}/src").rglob("*.rs"):
-            if catalog.search(path.read_text()):
-                raise SystemExit(f"Premature guild-store catalog runtime activation: {path}")
-    print("Guild-store catalog remains inactive in service runtimes")
+    # Catalog writes stay in the shared data crate. Bot/API may route through
+    # TenantRuntime for live tenant data. The conductor still must not activate it.
+    catalog = re.compile(r"\b(?:register_store|assign_initial_placement|clear_erased_placement|GuildStoreOptions)\b")
+    for path in (ROOT / "crates/conductor/src").rglob("*.rs"):
+        if catalog.search(path.read_text()):
+            raise SystemExit(f"Guild-store catalog runtime activation: {path}")
+    runtime = re.compile(r"\b(?:TenantRuntime|GuildDataStore|GuildDataScope|LocalEvidenceStore|BunnyEvidenceStore)\b")
+    for path in (ROOT / "crates/conductor/src").rglob("*.rs"):
+        if runtime.search(path.read_text()):
+            raise SystemExit(f"Guild-store runtime in conductor: {path}")
+    print("Guild-store catalog remains inactive in the conductor")
+
+    # Bot-owned Discord mutations record their classified application case and
+    # suppress the matching gateway echo. Unmarked manual/external events remain cases.
+    handlers = (ROOT / "crates/bot/src/handlers.rs").read_text()
+    for event in ("guild_ban_addition", "guild_ban_removal"):
+        function = re.search(
+            rf"async fn {event}\b.*?(?=\n    async fn |\n\}})", handlers, re.DOTALL
+        )
+        if function is None:
+            raise SystemExit(f"Missing gateway handler: {event}")
+        if ("consume_gateway_case_suppression" not in function.group()
+                or "cases::record" not in function.group()):
+            raise SystemExit(f"Gateway {event} must suppress bot echoes and retain external cases")
+    print("Gateway ban events suppress bot echoes and retain external cases")
 
     check_tree("jmodguard", SERVICES | BOT_STACK | API_STACK)
     check_tree("jmodguard-bot", (SERVICES - {"jmodguard-bot"}) | API_STACK)

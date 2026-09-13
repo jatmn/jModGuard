@@ -27,9 +27,8 @@ nickname work atomically. There is no separate guild-only nickname departure/rea
 call that could affect a newer membership after stale or missing event context.
 
 The stored observation is not proof of current membership forever. Missed or contextless
-removals remain unresolved; cached delete context and reordered gateway/REST observations
-need live validation before relying on them for access revocation. This table must not
-be used alone to grant access, auto-purge data or authorize side effects.
+removals remain unresolved. Live guild departure now also queues tenant-store erasure;
+see [tenant runtime](TENANT-RUNTIME.md). Do not use this table alone to grant access.
 
 ## Bounded positive repair
 
@@ -125,17 +124,17 @@ Bot configuration callers retain their existing helpers. No schema change is int
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
 it does not infer membership from existing guild settings or old queue jobs. The current
-recognized lineage extends through migration0010. Version9 binaries reject version10;
+recognized lineage extends through migration 0011. Version 10 binaries reject version 11;
 rollback needs matching binaries and the pre-upgrade database backup.
-No previous deployment is imported and no guild data is purged.
+No previous deployment is imported. Live guild-store erasure is described in
+[tenant runtime](TENANT-RUNTIME.md).
 
 [Moderation event, ban and statistics reads](MODERATION-READS.md) now retain captured
 membership through their primary snapshot and require the loaded page token.
 Individual configuration GET reads now retain that same page membership with guild/global
-layers in one primary snapshot; explicit global context stays owner-only. Case/evidence isolation,
-shared/dedicated routing, complete guild erasure and missed-removal reconciliation remain
-separate work. Inactive membership rows are transitional lifecycle metadata awaiting that
-purge design. Local tests do not certify tenant isolation or Discord/Bunny behavior.
+layers in one primary snapshot; explicit global context stays owner-only. Selected cases
+and private evidence are isolated per captured membership. Inactive membership rows remain
+transitional fencing against older joins. Local tests do not certify Discord/Bunny behavior.
 
 ## Sources and validation
 

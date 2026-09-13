@@ -10,7 +10,8 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use serenity::client::Context;
-use serenity::model::id::GuildId;
+use serenity::model::guild::Member;
+use serenity::model::id::{GuildId, UserId};
 use serenity::model::prelude::Timestamp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -312,11 +313,13 @@ pub async fn execute_pending(
     ctx: &Context,
     guild_id: GuildId,
     target: &serenity::model::user::User,
+    provided_member: Option<Member>,
     display_name: &str,
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
 ) {
+    let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
     vars.insert("rule".into(), pending.rule_name.clone());
@@ -359,53 +362,158 @@ pub async fn execute_pending(
             }
         }
         "warn" => {
-            let _ = db::add_warn(
+            let warn_result = db::add_enrolled_warn(
                 &app.db,
-                guild_id.get() as i64,
+                enrollment.clone(),
                 target.id.get() as i64,
                 0,
                 &format!("[automod:{}] {}", pending.rule_id, reason),
             )
             .await;
+            let outcome = crate::cases::classify_db_commit(&warn_result);
+            crate::cases::record(
+                app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Warning,
+                outcome,
+                target.id.get(),
+                None,
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
+            )
+            .await;
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
-            if let Some(mut member) = ctx
-                .cache
-                .guild(guild_id)
-                .and_then(|g| g.members.get(&target.id).cloned())
-            {
-                let until =
+            let member = member_for_selected_action(
+                provided_member.clone(),
+                ctx.cache
+                    .guild(guild_id)
+                    .and_then(|g| g.members.get(&target.id).cloned()),
+                target.id,
+            );
+            let mut called = false;
+            let mut discord_err = None;
+            if let Some(mut member) = member {
+                if let Ok(until) =
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
-                        .ok();
-                if let Some(until) = until {
-                    let _ = member
+                {
+                    discord_err = member
                         .disable_communication_until_datetime(&ctx.http, until)
-                        .await;
+                        .await
+                        .err();
+                    called = true;
+                } else {
+                    tracing::warn!("automod timeout: could not build Discord timeout timestamp");
                 }
             } else {
-                tracing::warn!("automod timeout: member {} not cached", target.id);
+                tracing::warn!("automod timeout: no guild member for {}", target.id);
+            }
+            if let Some(outcome) =
+                crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
+            {
+                crate::cases::record(
+                    app,
+                    enrollment.clone(),
+                    crate::db::guild_data::CaseAction::Timeout,
+                    outcome,
+                    target.id.get(),
+                    None,
+                    Some(reason.clone()),
+                    crate::cases::text_excerpt(
+                        msg_channel.unwrap_or(0),
+                        msg_id.unwrap_or(0),
+                        target.id.get(),
+                        pending.evidence["content"].as_str().unwrap_or(""),
+                    ),
+                    crate::cases::application_source(),
+                )
+                .await;
             }
         }
         "kick" => {
-            if let Some(member) = ctx
-                .cache
-                .guild(guild_id)
-                .and_then(|g| g.members.get(&target.id).cloned())
+            let member = member_for_selected_action(
+                provided_member.clone(),
+                ctx.cache
+                    .guild(guild_id)
+                    .and_then(|g| g.members.get(&target.id).cloned()),
+                target.id,
+            );
+            let (called, discord_err) = if let Some(member) = member {
+                (
+                    true,
+                    member.kick_with_reason(&ctx.http, &reason).await.err(),
+                )
+            } else {
+                tracing::warn!("automod kick: no guild member for {}", target.id);
+                (false, None)
+            };
+            if let Some(outcome) =
+                crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
-                let _ = member.kick_with_reason(&ctx.http, &reason).await;
+                crate::cases::record(
+                    app,
+                    enrollment.clone(),
+                    crate::db::guild_data::CaseAction::Kick,
+                    outcome,
+                    target.id.get(),
+                    None,
+                    Some(reason.clone()),
+                    crate::cases::text_excerpt(
+                        msg_channel.unwrap_or(0),
+                        msg_id.unwrap_or(0),
+                        target.id.get(),
+                        pending.evidence["content"].as_str().unwrap_or(""),
+                    ),
+                    crate::cases::application_source(),
+                )
+                .await;
             }
         }
         "ban" => {
-            let _ = guild_id
+            let suppression = app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Ban,
+                guild_id.get(),
+                target.id.get(),
+            );
+            let discord = guild_id
                 .ban_with_reason(&ctx.http, target.id, rule.delete_days, &reason)
                 .await;
-            let _ = db::record_ban(
-                &app.db,
-                guild_id.get() as i64,
-                target.id.get() as i64,
+            let outcome = crate::cases::classify_discord(discord.err().as_ref());
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
+                app.release_gateway_case_suppression(suppression);
+            }
+            if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
+                let _ = db::record_enrolled_ban(
+                    &app.db,
+                    enrollment.clone(),
+                    target.id.get() as i64,
+                    None,
+                    &format!("[automod:{}] {}", pending.rule_id, reason),
+                )
+                .await;
+            }
+            crate::cases::record(
+                app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Ban,
+                outcome,
+                target.id.get(),
                 None,
-                &format!("[automod:{}] {}", pending.rule_id, reason),
+                Some(reason.clone()),
+                crate::cases::text_excerpt(
+                    msg_channel.unwrap_or(0),
+                    msg_id.unwrap_or(0),
+                    target.id.get(),
+                    pending.evidence["content"].as_str().unwrap_or(""),
+                ),
+                crate::cases::application_source(),
             )
             .await;
         }
@@ -421,9 +529,9 @@ pub async fn execute_pending(
             "rule": pending.rule_id, "action": rule.action,
             "reason": reason, "evidence": pending.evidence,
         });
-        let _ = db::insert_event(
+        let _ = db::insert_enrolled_event(
             &app.db,
-            guild_id.get() as i64,
+            enrollment.clone(),
             "automod",
             Some(target.id.get() as i64),
             None,
@@ -441,4 +549,29 @@ pub async fn execute_pending(
             .to_string(),
     );
     logging::emit(app, ctx, guild_id, "automod", v).await;
+}
+
+fn member_for_selected_action(
+    provided: Option<Member>,
+    cached: Option<Member>,
+    target: UserId,
+) -> Option<Member> {
+    provided
+        .filter(|member| member.user.id == target)
+        .or_else(|| cached.filter(|member| member.user.id == target))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cases::discord_attempt_outcome;
+    use crate::db::guild_data::CaseOutcome;
+
+    #[test]
+    fn selected_kick_timeout_cases_require_a_discord_attempt() {
+        assert_eq!(discord_attempt_outcome(false, None), None);
+        assert_eq!(
+            discord_attempt_outcome(true, None),
+            Some(CaseOutcome::Succeeded)
+        );
+    }
 }

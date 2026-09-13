@@ -17,6 +17,8 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `db.url` | — | Remote libSQL URL; empty = local path. Environment overrides are accepted only as a complete URL/token pair. |
 | `db.token` | — | Remote DB access token; required with `db.url`. Complete `JMODGUARD_DB_URL`/`JMODGUARD_DB_TOKEN` takes precedence over the complete Bunny-injected pair. |
 | `db.pool_size` | `8` | reusable connections and maximum concurrent database operations in each process (minimum 2) (env: `JMODGUARD_DB_POOL_SIZE`) |
+| `guild_stores.max_handles` | `8` | cached guild-store handles per process (2–32). A local core also creates `{db.path}.guild.db`. Remote cores need an explicit shared `[[guild_stores.stores]]`. Empty store `id` values rediscover stamped/catalog identity. |
+| `evidence.backend` | `local` | private evidence backend: `local`, `bunny`, or `none` (env: `JMODGUARD_EVIDENCE_BACKEND`) |
 | `web.bind` | `127.0.0.1:8080` | API/WebUI listen address (env: `JMODGUARD_WEB_BIND`) |
 | `web.base_url` | `http://localhost:8080` | public URL used for OAuth redirect (env: `JMODGUARD_WEB_BASE_URL`) |
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
@@ -43,7 +45,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0010_guild_store_catalog.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0011_tenant_runtime.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it
@@ -65,6 +67,9 @@ exits if that wait expires).
 | `badwords` | regex patterns (server + global) |
 | `events` | selected moderation records and classified moderation-plan summaries; routine channel reports do not append here |
 | `warns` / `bans` | warnings and ban history |
+| `guild_store_catalog` / `guild_store_placements` | nonsecret shared/dedicated store identities and initial placements |
+| `guild_erasure_jobs` | queued live guild-store erasure; not a departed-guild membership ledger |
+| `backup_cleanup_intents` | application-owned reminders for later backup-copy cleanup; no backup worker yet |
 
 Environment variables override `config.toml` values (see table).
 
@@ -155,3 +160,18 @@ New data-layer operations check the request's captured membership within configu
 transactions, preserving existing inheritance, nickname and version semantics. Current API
 and bot callers retain their existing paths; this is groundwork for complete admission and
 browser scope handling. See [configuration scopes](CONFIGURATION-SCOPES.md).
+
+## Environment-only tenant stores
+
+Set `JMODGUARD_GUILD_STORE_URL` and `JMODGUARD_GUILD_STORE_TOKEN` together to configure
+the default shared guild database in both services. These override the first shared
+TOML entry's connection pair, preserving its ID and every other store entry. If no
+shared entry exists, one is added. Optional `JMODGUARD_GUILD_STORE_ID` requires the pair
+and must match the durable identity; leaving it unset preserves discovery. This never
+permits using the core database as a guild store. Dedicated/additional stores retain
+the TOML configuration described above.
+
+Remote cores also require an explicit evidence choice: `JMODGUARD_EVIDENCE_BACKEND=none`
+for a fresh installation without objects, or the existing owning backend and its
+configuration. Local evidence with a remote core needs `JMODGUARD_EVIDENCE_ROOT` on
+persistent private storage. See [the complete container setup](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).

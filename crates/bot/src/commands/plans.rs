@@ -12,6 +12,7 @@ use crate::types::PlanStep;
 use crate::{db, logging};
 
 pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome> {
+    let enrollment = crate::cases::capture(env.app, env.guild_id.get()).await;
     let mut vars = super::behaviors::behaviors_base_vars(env);
     // A plan's first argument is a target only when one of its steps can act
     // on another user. Reply/log-only plans must remain free to accept normal
@@ -48,7 +49,15 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
     let mut responses: Vec<String> = Vec::new();
 
     for (idx, step) in steps.iter().enumerate() {
-        let res = run_step(env, step, target, &mut vars, &mut responses).await;
+        let res = run_step(
+            env,
+            enrollment.clone(),
+            step,
+            target,
+            &mut vars,
+            &mut responses,
+        )
+        .await;
         if let Err(e) = res {
             tracing::warn!("plan step {idx} of `{}` failed: {e:#}", env.cmd.name);
         }
@@ -63,7 +72,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
 
     let _ = record_moderation_plan(
         &env.app.db,
-        env.guild_id.get() as i64,
+        enrollment,
         env.actor.get() as i64,
         &env.cmd.name,
         steps,
@@ -90,17 +99,17 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
 
 async fn record_moderation_plan(
     db: &db::Db,
-    guild_id: i64,
+    enrollment: Option<db::GuildEnrollment>,
     actor: i64,
     command: &str,
     steps: &[PlanStep],
 ) -> Result<()> {
     if plan_requires_target(steps) {
         // Preserve the existing summary, not a claim that every step succeeded.
-        // Per-step outcomes and evidence belong to the later case model.
-        db::insert_event(
+        // Selected moderation steps record their own outcomes separately.
+        db::insert_enrolled_event(
             db,
-            guild_id,
+            enrollment,
             "plan_executed",
             Some(actor),
             Some(actor),
@@ -167,6 +176,87 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn selected_plan_results_keep_actor_outcome_and_original_membership() {
+        use crate::db::guild_data::{CaseAction, CaseOutcome, CaseSource};
+        let path =
+            std::env::temp_dir().join(format!("plan_cases_{:032x}.db", rand::random::<u128>()));
+        let app = crate::state::BotState::new(Default::default(), db::Db::open(&path, 2).unwrap())
+            .unwrap();
+        let old = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(old.clone()).await.unwrap();
+        for action in [CaseAction::Timeout, CaseAction::Kick, CaseAction::Ban] {
+            for success in [true, false] {
+                let result = if success {
+                    Ok(())
+                } else {
+                    Err(serenity::Error::Other("interrupted response"))
+                };
+                record_step_outcome(
+                    &app,
+                    UserId::new(42),
+                    Some(old.clone()),
+                    action.clone(),
+                    UserId::new(99),
+                    &result,
+                )
+                .await;
+            }
+        }
+        let (store, scope) = app.tenant.live(old.clone()).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 6);
+        let mut succeeded = 0;
+        let mut uncertain = 0;
+        for id in ids {
+            let data = store
+                .case(scope.clone(), id, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.actor_id, Some(42));
+            assert_eq!(data.subject_id, 99);
+            assert_eq!(data.reason.as_deref(), Some("custom command"));
+            assert!(matches!(data.source, CaseSource::Application { .. }));
+            match data.outcome {
+                CaseOutcome::Succeeded => succeeded += 1,
+                CaseOutcome::Uncertain => uncertain += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!((succeeded, uncertain), (3, 3));
+        db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
+        app.tenant.drive_erasure().await.unwrap();
+        let current = db::enroll_guild(&app.db, 10, 101).await.unwrap().unwrap();
+        app.tenant.activate(current.clone()).await.unwrap();
+        record_step_outcome(
+            &app,
+            UserId::new(42),
+            Some(old),
+            CaseAction::Ban,
+            UserId::new(99),
+            &Ok(()),
+        )
+        .await;
+        let (store, scope) = app.tenant.live(current).await.unwrap();
+        assert_eq!(
+            store
+                .case_count(scope, crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            0
+        );
+        drop(store);
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
     async fn routine_plans_leave_no_sql_summary_but_moderation_plans_keep_theirs() {
         let path = std::env::temp_dir().join(format!(
             "jmodguard_plan_audit_{:032x}.db",
@@ -183,9 +273,15 @@ mod tests {
                 template: "hello".into(),
             }],
         ] {
-            record_moderation_plan(&db, 10, 20, "routine", &steps)
-                .await
-                .unwrap();
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "routine",
+                &steps,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             db::query_events(&db, 10, None, None, 10)
@@ -198,9 +294,15 @@ mod tests {
             PlanStep::Kick,
             PlanStep::Ban { delete_days: 0 },
         ] {
-            record_moderation_plan(&db, 10, 20, "moderate", &[step])
-                .await
-                .unwrap();
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "moderate",
+                &[step],
+            )
+            .await
+            .unwrap();
         }
         let rows = db::query_events(&db, 10, Some("plan_executed"), None, 10)
             .await
@@ -254,6 +356,7 @@ mod tests {
 
 async fn run_step(
     env: &CmdEnv<'_>,
+    enrollment: Option<db::GuildEnrollment>,
     step: &PlanStep,
     target: Option<UserId>,
     vars: &mut std::collections::BTreeMap<String, String>,
@@ -294,37 +397,73 @@ async fn run_step(
                 .await?;
         }
         PlanStep::Timeout { minutes } => {
-            let mut member = target_member(
-                env,
-                target.expect("target-required plan steps are validated before execution"),
-            )
-            .await?;
+            let target = target.expect("target-required plan steps are validated before execution");
+            let mut member = target_member(env, target).await?;
             let until = serenity::model::Timestamp::from_unix_timestamp(
                 chrono::Utc::now().timestamp() + (*minutes as i64) * 60,
             )
             .map_err(|e| anyhow!("invalid timeout: {e}"))?;
-            member
+            let result = member
                 .disable_communication_until_datetime(&env.ctx.http, until)
-                .await?;
+                .await;
+            record_step_outcome(
+                env.app,
+                env.actor,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Timeout,
+                target,
+                &result,
+            )
+            .await;
+            result?;
         }
         PlanStep::Kick => {
-            let member = target_member(
-                env,
-                target.expect("target-required plan steps are validated before execution"),
-            )
-            .await?;
-            member
+            let target = target.expect("target-required plan steps are validated before execution");
+            let member = target_member(env, target).await?;
+            let result = member
                 .kick_with_reason(&env.ctx.http, "custom command")
-                .await?;
+                .await;
+            record_step_outcome(
+                env.app,
+                env.actor,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Kick,
+                target,
+                &result,
+            )
+            .await;
+            result?;
         }
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
-            env.guild_id
+            let suppression = env.app.suppress_next_gateway_case(
+                crate::state::GatewayCaseAction::Ban,
+                env.guild_id.get(),
+                target.get(),
+            );
+            let result = env
+                .guild_id
                 .ban_with_reason(&env.ctx.http, target, *delete_days, "custom command")
-                .await?;
-            db::record_ban(
+                .await;
+            if matches!(
+                crate::cases::classify_discord(result.as_ref().err()),
+                crate::db::guild_data::CaseOutcome::Failed
+            ) {
+                env.app.release_gateway_case_suppression(suppression);
+            }
+            record_step_outcome(
+                env.app,
+                env.actor,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Ban,
+                target,
+                &result,
+            )
+            .await;
+            result?;
+            db::record_enrolled_ban(
                 &env.app.db,
-                guild_id.get() as i64,
+                enrollment.clone(),
                 target.get() as i64,
                 Some(env.actor.get() as i64),
                 "custom command",
@@ -354,4 +493,26 @@ async fn run_step(
         }
     }
     Ok(())
+}
+
+async fn record_step_outcome(
+    app: &crate::state::BotState,
+    actor: UserId,
+    enrollment: Option<db::GuildEnrollment>,
+    action: crate::db::guild_data::CaseAction,
+    target: UserId,
+    result: &serenity::Result<()>,
+) {
+    crate::cases::record(
+        app,
+        enrollment,
+        action,
+        crate::cases::classify_discord(result.as_ref().err()),
+        target.get(),
+        Some(actor.get()),
+        Some("custom command".into()),
+        crate::db::guild_data::CaseEvidence::Unavailable,
+        crate::cases::application_source(),
+    )
+    .await;
 }

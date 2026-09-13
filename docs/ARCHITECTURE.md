@@ -161,34 +161,25 @@ must combine checks with tenant operations and coordinated writer exclusion.
 [Captured tenant log-channel operations](TENANT-LOG-CHANNELS.md) now demonstrate that
 same-transaction boundary in the separate store: exact membership and placement accompany
 reads/edits, revision checks reject stale edits, and closure removes mappings and denies
-later access. This remains inactive; it does not replace core log configuration or queued
-completion, implement full guild purge, or coordinate directory/Discord state.
+later access. Directory log delivery still uses core configuration. Live store routing
+and guild erasure are described in [tenant runtime](TENANT-RUNTIME.md).
 
 Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for immutable
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
-batch cleanup. It remains inactive: current moderation handlers still write core records.
-Its [append-only history](CASE-HISTORY.md) preserves original facts and is removed with its
-parent case. Runtime file capture, backup cleanup, permissions and full erasure remain pending.
-
-The inactive guild-store lineage supports [explicit case source association](CASE-SOURCES.md),
-including late links to removed parents. Runtime source matching and case adoption remain
-pending; current services continue to use core moderation records.
-Schema6 adds a [private evidence ownership journal](CASE-EVIDENCE.md) with bounded admission,
-settlement and cleanup acknowledgment. An opt-in [Unix local transfer backend](LOCAL-EVIDENCE.md)
-now streams/verifies real files and holds an OS resource lock through journal settlement.
-The opt-in [Bunny HTTP backend](BUNNY-EVIDENCE.md) adds bounded streaming and guild schema7
-progress receipts; unresolved PUTs block settlement/deletion. Runtime workers, installation
-privacy checks, serving permissions and backup-copy cleanup remain pending. Current services
-do not activate either backend.
+batch cleanup. Bot and API now record selected outcomes and serve authorized case/evidence
+administration; see [tenant runtime](TENANT-RUNTIME.md). Discord attachment capture and
+backup-copy cleanup remain later work.
 
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0010. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0011. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
-requests without adopting earlier work. Migration0010 adds the inactive guild-store catalog.
-Unban/log-channel WebUI operations now use API admission and bot dispatch.
+requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
+Migration 0011 adds live-erasure jobs and backup-copy cleanup intents. Bot/API startup
+opens [tenant runtime](TENANT-RUNTIME.md) against that catalog. Unban/log-channel WebUI
+operations now use API admission and bot dispatch.
 
 - Bot applies migrations, atomically seeds globals plus their config/command
   versions, heals settings, then publishes a
@@ -220,7 +211,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0010_guild_store_catalog
+migrations/                0001_init through 0011_tenant_runtime
 Dockerfile.bot
 Dockerfile.api
 ```
