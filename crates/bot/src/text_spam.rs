@@ -637,13 +637,12 @@ pub fn observe(
     );
 }
 
-pub fn observe_update(
+pub(crate) fn observe_update(
     app: &Arc<BotState>,
     ctx: &Context,
     cfg: &CachedGuildConfig,
     event: &MessageUpdateEvent,
-    received: Instant,
-    received_at: chrono::DateTime<chrono::Utc>,
+    update: &crate::handlers::UpdateObservation,
     revision: u64,
 ) {
     let Some(guild) = event.guild_id else { return };
@@ -658,18 +657,14 @@ pub fn observe_update(
         .as_ref()
         .and_then(|m| m.as_ref())
         .map(|m| m.roles.iter().map(|r| r.get()).collect::<Vec<_>>());
-    let author = event.author.as_ref().map(|u| u.id.get()).or_else(|| {
-        app.text_spam
-            .author_of(guild.get(), event.channel_id.get(), event.id.get())
-    });
-    let Some(author) = author else { return };
+    let Some(author) = update.author else { return };
     if author == ctx.cache.current_user().id.get() {
         return;
     }
     let edited_ms = event
         .edited_timestamp
         .map(|t| t.timestamp_millis())
-        .unwrap_or_else(|| received_at.timestamp_millis());
+        .unwrap_or_else(|| update.received_at.timestamp_millis());
     consider(
         app,
         ctx,
@@ -681,8 +676,8 @@ pub fn observe_update(
         roles.as_deref(),
         event.content.as_deref(),
         edited_ms,
-        received,
-        received_at,
+        update.received,
+        update.received_at,
         revision,
         true,
     );

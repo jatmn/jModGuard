@@ -242,6 +242,11 @@ enum Report {
     Verified(Vec<(u64, u64)>),
     Unverified,
 }
+#[derive(Clone, Copy, Debug)]
+struct ReportWindow {
+    token: (u64, u64),
+    until: Instant,
+}
 
 pub(crate) struct MatchProof<'a> {
     pub token: (u64, u64),
@@ -674,7 +679,39 @@ impl Detector {
         b.reported_until = now + Duration::from_secs(policy.window_secs);
         Some(report)
     }
+    fn abort_report_window(
+        &self,
+        guild: u64,
+        author: u64,
+        reservation: ReportWindow,
+        now: Instant,
+    ) {
+        let mut state = self.state.lock();
+        if let Some(bucket) = state
+            .guilds
+            .get_mut(&guild)
+            .and_then(|guild| guild.authors.get_mut(&author))
+            && bucket.token == reservation.token
+            && bucket.reported_until == reservation.until
+        {
+            bucket.reported_until = now;
+        }
+    }
 }
+
+fn finish_verified_report_window(
+    detector: &Detector,
+    guild: u64,
+    author: u64,
+    reservation: ReportWindow,
+    disposition: crate::spam_actions::ReportDisposition,
+    now: Instant,
+) {
+    if disposition == crate::spam_actions::ReportDisposition::Retryable {
+        detector.abort_report_window(guild, author, reservation, now);
+    }
+}
+
 fn file_key(post: &Post) -> Vec<(u64, u64)> {
     let mut keys: Vec<_> = post.files.iter().map(|f| (f.id, f.size)).collect();
     keys.sort_unstable();
@@ -993,13 +1030,12 @@ pub fn observe(
     }
 }
 
-pub fn observe_update(
+pub(crate) fn observe_update(
     app: &Arc<BotState>,
     ctx: &Context,
     cfg: &CachedGuildConfig,
     event: &MessageUpdateEvent,
-    received: Instant,
-    received_at: chrono::DateTime<chrono::Utc>,
+    update: &crate::handlers::UpdateObservation,
     revision: u64,
 ) {
     let Some(guild) = event.guild_id else { return };
@@ -1020,10 +1056,7 @@ pub fn observe_update(
         app.image_spam.invalidate(guild_id, channel, message);
         return;
     };
-    let author = event.author.as_ref().map(|u| u.id.get()).or_else(|| {
-        app.image_spam.author_of(guild_id, channel, message)
-    });
-    let Some(author) = author else { return };
+    let Some(author) = update.author else { return };
     if author == ctx.cache.current_user().id.get() {
         return;
     }
@@ -1076,13 +1109,16 @@ pub fn observe_update(
     let edited_ms = event
         .edited_timestamp
         .map(|t| t.timestamp_millis())
-        .unwrap_or_else(|| received_at.timestamp_millis());
-    let age_ms = received_at.timestamp_millis().saturating_sub(edited_ms);
+        .unwrap_or_else(|| update.received_at.timestamp_millis());
+    let age_ms = update.received_at.timestamp_millis().saturating_sub(edited_ms);
     if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 {
         detector.invalidate(guild_id, channel, message);
         return;
     }
-    let Some(at) = received.checked_sub(Duration::from_millis(age_ms as u64)) else {
+    let Some(at) = update
+        .received
+        .checked_sub(Duration::from_millis(age_ms as u64))
+    else {
         detector.invalidate(guild_id, channel, message);
         return;
     };
@@ -1104,7 +1140,7 @@ pub fn observe_update(
         },
         token,
         &policy,
-        received,
+        update.received,
         true,
     );
     if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
@@ -1176,8 +1212,13 @@ async fn run_job(
             )
         })
         .collect();
-    let Some(report) = detector.complete(job, &policy, failed, Instant::now()) else {
+    let completed_at = Instant::now();
+    let Some(report) = detector.complete(job, &policy, failed, completed_at) else {
         return;
+    };
+    let report_window = ReportWindow {
+        token,
+        until: completed_at + Duration::from_secs(policy.window_secs),
     };
     // The detector slot bounds hash/download and match verification only.
     // Discord logging and enforcement have their own concurrency/deadline controls.
@@ -1201,7 +1242,7 @@ async fn run_job(
                     }
                 })
                 .collect();
-            let _ = crate::spam_actions::report(
+            let disposition = crate::spam_actions::report(
                 app,
                 ctx,
                 crate::spam_actions::Match {
@@ -1220,6 +1261,14 @@ async fn run_job(
                 },
             )
             .await;
+            finish_verified_report_window(
+                detector,
+                guild,
+                author,
+                report_window,
+                disposition,
+                Instant::now(),
+            );
         }
     }
 }
@@ -1424,6 +1473,79 @@ mod tests {
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
+    }
+
+    fn complete_verified_window(d: &Detector, now: Instant) -> ReportWindow {
+        let policy = policy();
+        assert!(matches!(
+            d.complete(job(d, now), &policy, false, now),
+            Some(Report::Verified(_))
+        ));
+        ReportWindow {
+            token: (0, 0),
+            until: now + Duration::from_secs(policy.window_secs),
+        }
+    }
+
+    #[test]
+    fn only_retryable_verified_reports_release_the_exact_image_window() {
+        let now = Instant::now();
+
+        let consumed = Detector::new(Limits::default()).unwrap();
+        let consumed_window = complete_verified_window(&consumed, now);
+        finish_verified_report_window(
+            &consumed,
+            1,
+            2,
+            consumed_window,
+            crate::spam_actions::ReportDisposition::Consumed,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            consumed.state.lock().guilds[&1].authors[&2].reported_until,
+            consumed_window.until
+        );
+
+        let retryable = Detector::new(Limits::default()).unwrap();
+        let retryable_window = complete_verified_window(&retryable, now);
+        finish_verified_report_window(
+            &retryable,
+            1,
+            2,
+            retryable_window,
+            crate::spam_actions::ReportDisposition::Retryable,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            retryable.state.lock().guilds[&1].authors[&2].reported_until,
+            now + Duration::from_secs(1)
+        );
+
+        let stale = Detector::new(Limits::default()).unwrap();
+        let stale_window = complete_verified_window(&stale, now);
+        let newer_until = now + Duration::from_secs(120);
+        stale
+            .state
+            .lock()
+            .guilds
+            .get_mut(&1)
+            .unwrap()
+            .authors
+            .get_mut(&2)
+            .unwrap()
+            .reported_until = newer_until;
+        finish_verified_report_window(
+            &stale,
+            1,
+            2,
+            stale_window,
+            crate::spam_actions::ReportDisposition::Retryable,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            stale.state.lock().guilds[&1].authors[&2].reported_until,
+            newer_until
+        );
     }
 
     #[test]

@@ -34,6 +34,20 @@ fn user_display(member: &Member) -> String {
     member.display_name().to_string()
 }
 
+fn select_update_author(
+    event_author: Option<u64>,
+    text_author: Option<u64>,
+    image_author: Option<u64>,
+) -> Option<u64> {
+    event_author.or(text_author).or(image_author)
+}
+
+pub(crate) struct UpdateObservation {
+    pub author: Option<u64>,
+    pub received: std::time::Instant,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Throttle for the "message content is empty" warning (missing intent).
 static LAST_EMPTY_WARN: parking_lot::Mutex<Option<std::time::Instant>> =
     parking_lot::Mutex::new(None);
@@ -396,6 +410,19 @@ impl EventHandler for Handler {
         if let Some(guild) = event.guild_id {
             let channel = event.channel_id.get();
             let message = event.id.get();
+            let update = UpdateObservation {
+                author: select_update_author(
+                    event.author.as_ref().map(|user| user.id.get()),
+                    self.app
+                        .text_spam
+                        .author_of(guild.get(), channel, message),
+                    self.app
+                        .image_spam
+                        .author_of(guild.get(), channel, message),
+                ),
+                received,
+                received_at,
+            };
             match self.app.configs.get(&self.app.db, guild.get()).await {
                 Ok(cfg) => {
                     crate::image_spam::observe_update(
@@ -403,8 +430,7 @@ impl EventHandler for Handler {
                         &ctx,
                         &cfg,
                         &event,
-                        received,
-                        received_at,
+                        &update,
                         image_revision,
                     );
                     crate::text_spam::observe_update(
@@ -412,35 +438,16 @@ impl EventHandler for Handler {
                         &ctx,
                         &cfg,
                         &event,
-                        received,
-                        received_at,
+                        &update,
                         text_revision,
                     );
                     if let Some(content) = event.content.as_deref() {
-                        let author = event
-                            .author
-                            .as_ref()
-                            .map(|u| u.id.get())
-                            .or_else(|| {
-                                self.app.text_spam.author_of(
-                                    guild.get(),
-                                    event.channel_id.get(),
-                                    event.id.get(),
-                                )
-                            })
-                            .or_else(|| {
-                                self.app.image_spam.author_of(
-                                    guild.get(),
-                                    event.channel_id.get(),
-                                    event.id.get(),
-                                )
-                            });
                         crate::logging::remember_message(
                             &self.app,
                             guild.get(),
                             event.channel_id.get(),
                             event.id.get(),
-                            author,
+                            update.author,
                             content,
                         );
                     }
@@ -563,5 +570,18 @@ impl EventHandler for Handler {
     ) {
         let app = Arc::clone(self.app());
         commands::handle_interaction(&app, &ctx, interaction).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_update_author;
+
+    #[test]
+    fn update_author_prefers_event_then_text_then_image_observation() {
+        assert_eq!(select_update_author(Some(1), Some(2), Some(3)), Some(1));
+        assert_eq!(select_update_author(None, Some(2), Some(3)), Some(2));
+        assert_eq!(select_update_author(None, None, Some(3)), Some(3));
+        assert_eq!(select_update_author(None, None, None), None);
     }
 }
