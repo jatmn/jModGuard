@@ -16,6 +16,16 @@ pub enum Kind {
     Text,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportDisposition {
+    /// The match produced an operator-visible outcome or was deliberately
+    /// cancelled by a current policy/lifecycle gate.
+    Consumed,
+    /// No outcome was produced because transient state or a stale test proof
+    /// prevented delivery. Text detection may release its exact reservation.
+    Retryable,
+}
+
 pub enum MatchPolicy {
     Image(jmodguard::image_spam::Policy),
     Text(jmodguard::text_spam::Policy),
@@ -176,14 +186,18 @@ impl Gate {
     }
 }
 
-pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
+pub(crate) async fn report(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    found: Match,
+) -> ReportDisposition {
     let (rule, name) = match found.kind {
         Kind::Image => ("attachment_flood", "Exact image spam"),
         Kind::Text => ("repeat_text", "Repeated text"),
     };
     if !found.policy.enforce() {
         if !found.policy.still_proving(app, &found, Instant::now()) {
-            return;
+            return ReportDisposition::Retryable;
         }
         let vars = BTreeMap::from([
             ("rule".into(), format!("{name} test")),
@@ -202,33 +216,39 @@ pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
             ),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return;
+        return ReportDisposition::Consumed;
     }
-    enforce(app, ctx, found, rule, name).await;
+    enforce(app, ctx, found, rule, name).await
 }
 
-async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, name: &str) {
+async fn enforce(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    found: Match,
+    rule: &str,
+    name: &str,
+) -> ReportDisposition {
     if app.poll_config_version().await.is_err() {
-        return;
+        return ReportDisposition::Retryable;
     }
     let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
-        return;
+        return ReportDisposition::Retryable;
     };
     let Some(rule_def) = cfg.rules.get(rule) else {
-        return;
+        return ReportDisposition::Consumed;
     };
     let Some(policy) = MatchPolicy::parse(found.kind, rule_def) else {
-        return;
+        return ReportDisposition::Consumed;
     };
     if !policy.enforce() || !rule_def.enabled {
-        return;
+        return ReportDisposition::Consumed;
     }
     let enrollment = crate::cases::capture(app, found.guild).await;
     let Some(enrollment) = enrollment.clone() else {
-        return;
+        return ReportDisposition::Consumed;
     };
     if app.tenant.live(enrollment.clone()).await.is_err() {
-        return;
+        return ReportDisposition::Consumed;
     }
     let member = tokio::time::timeout(
         Duration::from_secs(10),
@@ -251,7 +271,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             ("content".into(), "member lookup failed or timed out".into()),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return;
+        return ReportDisposition::Consumed;
     }
     let roles: Vec<u64> = member
         .as_ref()
@@ -274,12 +294,12 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             ("content".into(), "matched channel/user/role is whitelisted".into()),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return;
+        return ReportDisposition::Consumed;
     }
     let now = Instant::now();
     let token = (cfg.version, cfg.durable_version);
     if token != found.token {
-        return;
+        return ReportDisposition::Consumed;
     }
     if !policy.still_proving(app, &found, now) {
         let vars = BTreeMap::from([
@@ -297,7 +317,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             ),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
-        return;
+        return ReportDisposition::Consumed;
     }
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();
@@ -413,6 +433,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
         ("content".into(), delete_notes.join("; ")),
     ]);
     crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+    ReportDisposition::Consumed
 }
 
 fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {

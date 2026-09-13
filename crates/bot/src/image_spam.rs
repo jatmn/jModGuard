@@ -805,8 +805,7 @@ fn spawn_image_job(
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let _permit = permit;
-        run_job(&app, &ctx, job, policy, channel).await;
+        run_job(&app, &ctx, job, policy, channel, permit).await;
     });
 }
 
@@ -1113,7 +1112,14 @@ pub fn observe_update(
     }
 }
 
-async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Policy, channel: u64) {
+async fn run_job(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    mut job: Job,
+    policy: Policy,
+    channel: u64,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
     let mut failed = !detector.reserve(&job, &policy, Instant::now());
@@ -1173,6 +1179,9 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
     let Some(report) = detector.complete(job, &policy, failed, Instant::now()) else {
         return;
     };
+    // The detector slot bounds hash/download and match verification only.
+    // Discord logging and enforcement have their own concurrency/deadline controls.
+    drop(permit);
     match report {
         Report::Unverified => {
             let vars = report_vars(Report::Unverified, author, channel, &policy);
@@ -1192,7 +1201,7 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
                     }
                 })
                 .collect();
-            crate::spam_actions::report(
+            let _ = crate::spam_actions::report(
                 app,
                 ctx,
                 crate::spam_actions::Match {

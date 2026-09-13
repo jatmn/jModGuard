@@ -55,6 +55,11 @@ struct Bucket {
     posts: Vec<Post>,
     reported_until: Instant,
 }
+#[derive(Clone, Copy, Debug)]
+struct ReportWindow {
+    token: (u64, u64),
+    until: Instant,
+}
 struct Guild {
     bytes: usize,
     authors: HashMap<u64, Bucket>,
@@ -189,34 +194,43 @@ impl Detector {
             })
             .collect()
     }
-    pub(crate) fn begin_report_window(
+    fn begin_report_window(
         &self,
         guild: u64,
         author: u64,
         window_secs: u64,
         now: Instant,
-    ) -> bool {
+    ) -> Option<ReportWindow> {
         let mut state = self.state.lock();
-        let Some(b) = state
+        let b = state
             .guilds
             .get_mut(&guild)
-            .and_then(|g| g.authors.get_mut(&author))
-        else {
-            return false;
-        };
+            .and_then(|g| g.authors.get_mut(&author))?;
         if now < b.reported_until {
-            return false;
+            return None;
         }
-        b.reported_until = now + Duration::from_secs(window_secs);
-        true
+        let reservation = ReportWindow {
+            token: b.token,
+            until: now + Duration::from_secs(window_secs),
+        };
+        b.reported_until = reservation.until;
+        Some(reservation)
     }
 
-    pub(crate) fn abort_report_window(&self, guild: u64, author: u64, now: Instant) {
+    fn abort_report_window(
+        &self,
+        guild: u64,
+        author: u64,
+        reservation: ReportWindow,
+        now: Instant,
+    ) {
         let mut state = self.state.lock();
         if let Some(b) = state
             .guilds
             .get_mut(&guild)
             .and_then(|g| g.authors.get_mut(&author))
+            && b.token == reservation.token
+            && b.reported_until == reservation.until
         {
             b.reported_until = now;
         }
@@ -559,6 +573,19 @@ fn apply_admit_outcome(
     }
 }
 
+fn finish_report_window(
+    detector: &Detector,
+    guild: u64,
+    author: u64,
+    reservation: ReportWindow,
+    disposition: spam_actions::ReportDisposition,
+    now: Instant,
+) {
+    if disposition == spam_actions::ReportDisposition::Retryable {
+        detector.abort_report_window(guild, author, reservation, now);
+    }
+}
+
 fn may_admit(
     rule: &crate::types::RuleDef,
     author: u64,
@@ -734,12 +761,12 @@ fn consider(
         Some(messages) => messages,
         None => return,
     };
-    if !app
+    let Some(report_window) = app
         .text_spam
         .begin_report_window(guild, author, policy.window_secs, received)
-    {
+    else {
         return;
-    }
+    };
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     let excerpts = {
@@ -756,21 +783,21 @@ fn consider(
         excerpts
     };
     tokio::spawn(async move {
-        let delivered = async {
+        let disposition = async {
             if app.poll_config_version().await.is_err() {
-                return false;
+                return spam_actions::ReportDisposition::Retryable;
             }
             let Ok(current) = app.configs.get(&app.db, guild).await else {
-                return false;
+                return spam_actions::ReportDisposition::Retryable;
             };
             if (current.version, current.durable_version) != token {
-                return false;
+                return spam_actions::ReportDisposition::Consumed;
             }
             let Some(rule) = current.rules.get("repeat_text") else {
-                return false;
+                return spam_actions::ReportDisposition::Consumed;
             };
             let Ok(policy) = Policy::parse(rule) else {
-                return false;
+                return spam_actions::ReportDisposition::Consumed;
             };
             spam_actions::report(
                 &app,
@@ -790,14 +817,17 @@ fn consider(
                     ),
                 },
             )
-            .await;
-            true
+            .await
         }
         .await;
-        if !delivered {
-            app.text_spam
-                .abort_report_window(guild, author, Instant::now());
-        }
+        finish_report_window(
+            &app.text_spam,
+            guild,
+            author,
+            report_window,
+            disposition,
+            Instant::now(),
+        );
     });
 }
 
@@ -916,6 +946,95 @@ mod tests {
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
+    }
+
+    fn reserve_report_window(d: &Detector, now: Instant) -> ReportWindow {
+        let p = policy();
+        let token = (1, 2);
+        for (id, channel) in [(10, 1), (11, 2)] {
+            let mut item = post(id, channel, now, "spam");
+            item.revision = d.revision();
+            assert_eq!(
+                d.admit(1, 2, item, token, &p, now, false),
+                AdmitOutcome::Admitted
+            );
+        }
+        let mut third = post(12, 3, now, "spam");
+        third.revision = d.revision();
+        assert!(matches!(
+            d.admit(1, 2, third, token, &p, now, false),
+            AdmitOutcome::Matched(_)
+        ));
+        d.begin_report_window(1, 2, p.window_secs, now)
+            .expect("matching report window")
+    }
+
+    #[test]
+    fn only_retryable_report_outcomes_release_the_exact_window() {
+        let now = Instant::now();
+
+        let consumed = Detector::default();
+        let consumed_window = reserve_report_window(&consumed, now);
+        finish_report_window(
+            &consumed,
+            1,
+            2,
+            consumed_window,
+            spam_actions::ReportDisposition::Consumed,
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            consumed
+                .begin_report_window(1, 2, 60, now + Duration::from_secs(1))
+                .is_none()
+        );
+
+        let retryable = Detector::default();
+        let retryable_window = reserve_report_window(&retryable, now);
+        finish_report_window(
+            &retryable,
+            1,
+            2,
+            retryable_window,
+            spam_actions::ReportDisposition::Retryable,
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            retryable
+                .begin_report_window(1, 2, 60, now + Duration::from_secs(1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_report_completion_cannot_release_a_newer_window() {
+        let now = Instant::now();
+        let d = Detector::default();
+        let stale = reserve_report_window(&d, now);
+        let newer_until = now + Duration::from_secs(120);
+        d.state
+            .lock()
+            .guilds
+            .get_mut(&1)
+            .unwrap()
+            .authors
+            .get_mut(&2)
+            .unwrap()
+            .reported_until = newer_until;
+
+        finish_report_window(
+            &d,
+            1,
+            2,
+            stale,
+            spam_actions::ReportDisposition::Retryable,
+            now + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2].reported_until,
+            newer_until
+        );
     }
 
     #[test]
