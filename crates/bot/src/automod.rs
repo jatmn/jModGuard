@@ -1,5 +1,5 @@
 //! Automod engine: sliding-window state per (guild, user) with per-rule
-//! strike buckets, 7 detection rules with per-rule action escalation,
+//! strike buckets, 6 generic detection rules with per-rule action escalation,
 //! whitelists, and dry-run mode.
 //!
 //! All state is bounded: buckets are pruned on a timer and every event has a
@@ -157,6 +157,7 @@ impl AutomodEngine {
                 "mention_spam" => self.trigger_mention_spam(rule, ctx, now),
                 // Exact-image observations have a separate bounded log-only path.
                 "attachment_flood" => false,
+                "repeat_text" => false,
                 "new_member_url" => {
                     ctx.joined_secs_ago
                         .map(|s| s <= param_u64(rule, "grace_secs", 120))

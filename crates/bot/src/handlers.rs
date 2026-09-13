@@ -137,6 +137,7 @@ impl EventHandler for Handler {
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
         self.app.image_spam.invalidate_guild(incomplete.id.get());
+        self.app.text_spam.invalidate_guild(incomplete.id.get());
         let joined = full
             .filter(|guild| guild.id == incomplete.id)
             .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
@@ -263,6 +264,7 @@ impl EventHandler for Handler {
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
+        let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
 
@@ -305,6 +307,15 @@ impl EventHandler for Handler {
             received,
             received_at,
             image_revision,
+        );
+        crate::text_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, text_revision);
+        crate::logging::remember_message(
+            &app,
+            guild_id.get(),
+            msg.channel_id.get(),
+            msg.id.get(),
+            msg.author.id.get(),
+            &msg.content,
         );
         // Generic rules and prefix commands retain their existing bot exemption.
         if msg.author.bot {
@@ -375,10 +386,42 @@ impl EventHandler for Handler {
         _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
-        if let Some(guild) = event.guild_id {
-            self.app
-                .image_spam
-                .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+        let received = std::time::Instant::now();
+        let received_at = chrono::Utc::now();
+        let image_revision = self.app.image_spam.revision();
+        let text_revision = self.app.text_spam.revision();
+        if let Some(guild) = event.guild_id
+            && let Ok(cfg) = self.app.configs.get(&self.app.db, guild.get()).await
+        {
+            crate::image_spam::observe_update(
+                &self.app,
+                &ctx,
+                &cfg,
+                &event,
+                received,
+                received_at,
+                image_revision,
+            );
+            crate::text_spam::observe_update(
+                &self.app,
+                &ctx,
+                &cfg,
+                &event,
+                received,
+                received_at,
+                text_revision,
+            );
+            if let Some(content) = event.content.as_deref() {
+                let author = event.author.as_ref().map(|u| u.id.get()).unwrap_or(0);
+                crate::logging::remember_message(
+                    &self.app,
+                    guild.get(),
+                    event.channel_id.get(),
+                    event.id.get(),
+                    author,
+                    content,
+                );
+            }
         }
         if let Some(report) = logging::message_update_report(&event) {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
@@ -396,7 +439,11 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        let report = logging::message_delete_report(guild_id, channel_id, deleted_message_id);
+        self.app
+            .text_spam
+            .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
+        let report =
+            logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
         logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
     }
 
@@ -411,6 +458,9 @@ impl EventHandler for Handler {
         for id in &multiple_deleted_messages_ids {
             self.app
                 .image_spam
+                .invalidate(guild_id.get(), channel_id.get(), id.get());
+            self.app
+                .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
         let mut vars = BTreeMap::new();
@@ -431,6 +481,9 @@ impl EventHandler for Handler {
     ) {
         self.app
             .image_spam
+            .invalidate_author(event.guild_id.get(), event.user.id.get());
+        self.app
+            .text_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
         let app = Arc::clone(self.app());
         let Some(new) = new_if_available else { return };

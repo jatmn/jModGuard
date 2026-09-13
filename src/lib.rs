@@ -16,6 +16,7 @@ pub mod image_spam;
 pub mod normalize;
 mod remote_https;
 pub mod templates;
+pub mod text_spam;
 pub mod types;
 
 pub mod tenant;

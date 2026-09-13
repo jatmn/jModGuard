@@ -1,7 +1,7 @@
 # Automod
 
-jModGuard ships 7 rule entries. The exact-image rule is currently log-only
-with the separate behavior below. The other rules support:
+jModGuard ships 8 rule entries. Exact-image and repeated-text spam use dedicated
+matchers with test or delete-and-ban mode. The other rules support:
 
 - **parameters** (rule-specific, JSON),
 - an **action escalation table** — `at` = strike count at which an action
@@ -22,20 +22,27 @@ escalation accurate without false positives.
 - Default escalation: `1 → ban` (deletes 1 day of messages).
 - The classic spam-bot pattern: message containing @everyone/@here.
 
-### 2. `attachment_flood` — exact-image test
-- Log-only detection of a common set of identical image bytes from one author
-  across distinct channels. Defaults: 3 channels, 2 common images, 60 seconds.
-- Counts alone never trigger. Legacy rows are inactive until explicitly converted
-  in the rule editor. No punishment/escalation in this phase; creates only, with
-  conservative invalidation on edits/deletes and bounded work.
-- See [exact-image settings, resource budgets and coverage](IMAGE-SPAM.md).
+### 2. `attachment_flood` — exact-image spam
+- Detection of a common set of identical image bytes from one author across
+  distinct channels. Defaults: 3 channels, 2 common images, 60 seconds.
+- Counts alone never trigger. Legacy rows are inactive until converted in the
+  rule editor. Test mode logs only; enforcement deletes matched messages and bans.
+  Creates and attachment-changing edits participate.
+- See [exact-image and repeated-text settings](IMAGE-SPAM.md).
 
-### 3. `new_member_url` — link right after joining
+### 3. `repeat_text` — exact trimmed text
+- The same author posts the same trimmed string across distinct channels.
+  Defaults: 3 channels, 60 seconds, 20 Unicode scalars after trim. Empty text
+  never matches. Case and internal whitespace are not folded.
+- Independent of the image rule. Test mode logs only; enforcement deletes matched
+  messages and bans. A dual match in a short window still attempts one ban.
+
+### 4. `new_member_url` — link right after joining
 - Params: `grace_secs` (120) — the window after joining.
 - Triggers when the member posts a URL or Discord invite inside that window.
 - Default escalation: `1 → kick`.
 
-### 4. `badword` — admin regex list, bypass-resistant
+### 5. `badword` — admin regex list, bypass-resistant
 - Patterns live in the Badwords tab. Each is tested against three forms:
   1. the **raw** message,
   2. the **normalized** form: lowercase → unicode NFD (accents decomposed) →
@@ -47,16 +54,16 @@ escalation accurate without false positives.
   `wor[il]d`.
 - Default escalation: `1 → delete`, `2 → warn`, `4 → timeout 60m`.
 
-### 5. `invite` — Discord invite links
+### 6. `invite` — Discord invite links
 - Params: `allowlist_codes` — invite codes (`discord.gg/<code>`) that are
   always allowed.
 - Default escalation: `1 → delete`, `2 → warn`, `4 → timeout 60m`.
 
-### 6. `velocity` — message flood
+### 7. `velocity` — message flood
 - Params: `window_secs` (10), `max_messages` (8).
 - Default escalation: `1 → delete`, `2 → timeout 30m`, `4 → kick`.
 
-### 7. `account_age` — brand-new accounts
+### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).
 - Triggers when the account is younger than the minimum. Report-only by
   default (`1 → log`) — use it to build evidence, then escalate if you want.
@@ -64,8 +71,10 @@ escalation accurate without false positives.
 ## Actions
 
 `log` · `delete` · `warn` · `timeout` (minutes) · `kick` · `ban` (delete_days
-0–7). When several rules fire on one message, the **most severe** action wins
-(ban > kick > timeout > warn > delete > log).
+0–7). When several generic rules fire on one message, the **most severe** action
+wins (ban > kick > timeout > warn > delete > log). Exact-image and repeated-text
+matches never use that generic executor; they log or delete-and-ban through their
+own path.
 
 ## Whitelists
 

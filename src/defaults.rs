@@ -22,10 +22,16 @@ fn rule(id: &str) -> RuleDef {
             vec![action(1, "ban", "Ping spam (@everyone/@here)", 0, 1)],
         ),
         "attachment_flood" => (
-            "Exact image spam (test)",
-            "Log-only: the same distinct image files posted by one author across channels. Creates only; edited messages are excluded. Configure an automod log channel.",
+            "Exact image spam",
+            "The same distinct image files posted by one author across channels. Test mode logs only; enforcement deletes the matched messages and bans. Extra images are allowed. Configure an automod log channel.",
             json!({"mode":"exact_image_test", "window_secs": 60, "min_attachments": 2, "min_channels": 3}),
             vec![action(1, "log", "Exact image spam test", 0, 0)],
+        ),
+        "repeat_text" => (
+            "Repeated text",
+            "The same trimmed text posted by one author across channels. Matching is exact after leading/trailing whitespace only. Test mode logs only; enforcement deletes the matched messages and bans.",
+            json!({"mode":"exact_text", "window_secs": 60, "min_channels": 3, "min_length": 20}),
+            vec![action(1, "log", "Repeated text test", 0, 0)],
         ),
         "new_member_url" => (
             "New-member URL",
@@ -81,7 +87,7 @@ fn rule(id: &str) -> RuleDef {
         name: name.into(),
         description: description.into(),
         enabled: true,
-        dry_run: id == "attachment_flood",
+        dry_run: id == "attachment_flood" || id == "repeat_text",
         params,
         actions,
         whitelist_roles: vec![],
@@ -426,7 +432,7 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "message_delete",
-            "**:wastebasket: Message deleted in {channel}**\nMessage ID: `{message_id}`\nAuthor unavailable; content not retained.",
+            "**:wastebasket: Message deleted in {channel}**\nMessage: {message_url}\nAuthor: {mention}\nText: {content}",
         ),
         (
             "message_bulk_delete",

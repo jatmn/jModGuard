@@ -1,0 +1,283 @@
+//! Dedicated spam delete-and-ban path. Never uses the generic automod executor.
+use crate::db::guild_data::{CaseAction, CaseEvidence, CaseOutcome, TextEvidence};
+use crate::state::BotState;
+use parking_lot::Mutex;
+use serenity::client::Context;
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const KEEP: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Text,
+}
+
+pub struct Match {
+    pub kind: Kind,
+    pub guild: u64,
+    pub author: u64,
+    pub channel: u64,
+    pub enforce: bool,
+    pub messages: Vec<(u64, u64)>,
+    pub excerpts: Vec<TextEvidence>,
+    pub reason: String,
+}
+
+struct Applied {
+    until: Instant,
+    banned: bool,
+    deleted: BTreeSet<(u64, u64)>,
+}
+
+#[derive(Default)]
+pub struct Gate {
+    inner: Mutex<HashMap<(u64, u64), Applied>>,
+}
+
+impl Gate {
+    fn prune(&self, now: Instant) {
+        self.inner.lock().retain(|_, applied| applied.until > now);
+    }
+
+    fn claim_delete(
+        &self,
+        guild: u64,
+        author: u64,
+        channel: u64,
+        message: u64,
+        now: Instant,
+    ) -> bool {
+        self.prune(now);
+        let mut inner = self.inner.lock();
+        let applied = inner.entry((guild, author)).or_insert_with(|| Applied {
+            until: now + KEEP,
+            banned: false,
+            deleted: BTreeSet::new(),
+        });
+        applied.until = now + KEEP;
+        applied.deleted.insert((channel, message))
+    }
+
+    fn claim_ban(&self, guild: u64, author: u64, now: Instant) -> bool {
+        self.prune(now);
+        let mut inner = self.inner.lock();
+        let applied = inner.entry((guild, author)).or_insert_with(|| Applied {
+            until: now + KEEP,
+            banned: false,
+            deleted: BTreeSet::new(),
+        });
+        applied.until = now + KEEP;
+        if applied.banned {
+            return false;
+        }
+        applied.banned = true;
+        true
+    }
+}
+
+pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
+    let (rule, name) = match found.kind {
+        Kind::Image => ("attachment_flood", "Exact image spam"),
+        Kind::Text => ("repeat_text", "Repeated text"),
+    };
+    if !found.enforce {
+        let vars = BTreeMap::from([
+            ("rule".into(), format!("{name} test")),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            ("action".into(), "log only; no punishment".into()),
+            ("reason".into(), found.reason.clone()),
+            (
+                "content".into(),
+                found
+                    .messages
+                    .iter()
+                    .map(|(c, m)| format!("channel {c}, message {m}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        ]);
+        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+        return;
+    }
+    enforce(app, ctx, found, rule, name).await;
+}
+
+async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, name: &str) {
+    if app.poll_config_version().await.is_err() {
+        return;
+    }
+    let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
+        return;
+    };
+    let Some(rule_def) = cfg.rules.get(rule) else {
+        return;
+    };
+    let Ok(still_enforce) = (match found.kind {
+        Kind::Image => jmodguard::image_spam::Policy::parse(rule_def).map(|p| p.enforce),
+        Kind::Text => jmodguard::text_spam::Policy::parse(rule_def).map(|p| p.enforce),
+    }) else {
+        return;
+    };
+    if !still_enforce || !rule_def.enabled {
+        return;
+    }
+    let enrollment = crate::cases::capture(app, found.guild).await;
+    let Some(enrollment) = enrollment.clone() else {
+        return;
+    };
+    if app.tenant.live(enrollment.clone()).await.is_err() {
+        return;
+    }
+    let member = tokio::time::timeout(
+        Duration::from_secs(10),
+        ctx.http
+            .get_member(GuildId::new(found.guild), UserId::new(found.author)),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let roles: Vec<u64> = member
+        .as_ref()
+        .map(|m| m.roles.iter().map(|r| r.get()).collect())
+        .unwrap_or_default();
+    if member.is_none()
+        || found
+            .messages
+            .iter()
+            .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
+    {
+        return;
+    }
+    let now = Instant::now();
+    let http = ctx.http.as_ref();
+    let mut delete_notes = Vec::new();
+    for (channel, message) in &found.messages {
+        if !app
+            .spam_gate
+            .claim_delete(found.guild, found.author, *channel, *message, now)
+        {
+            delete_notes.push(format!("{channel}/{message} already deleted this window"));
+            continue;
+        }
+        let outcome = match tokio::time::timeout(
+            Duration::from_secs(10),
+            http.delete_message(
+                ChannelId::new(*channel),
+                MessageId::new(*message),
+                Some("spam match"),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => CaseOutcome::Succeeded,
+            Ok(Err(error)) => delete_outcome(&error),
+            Err(_) => CaseOutcome::Uncertain,
+        };
+        delete_notes.push(format!("{channel}/{message} {outcome:?}"));
+    }
+    let mut ban_outcome = None;
+    if app.spam_gate.claim_ban(found.guild, found.author, now) {
+        let suppression = app.suppress_next_gateway_case(
+            crate::state::GatewayCaseAction::Ban,
+            found.guild,
+            found.author,
+        );
+        let discord = tokio::time::timeout(
+            Duration::from_secs(10),
+            GuildId::new(found.guild).ban_with_reason(
+                http,
+                UserId::new(found.author),
+                0,
+                &found.reason,
+            ),
+        )
+        .await;
+        let outcome = match discord {
+            Ok(Ok(())) => CaseOutcome::Succeeded,
+            Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
+            Err(_) => CaseOutcome::Uncertain,
+        };
+        if matches!(outcome, CaseOutcome::Failed) {
+            app.release_gateway_case_suppression(suppression);
+        }
+        if matches!(outcome, CaseOutcome::Succeeded) {
+            let _ = crate::db::record_enrolled_ban(
+                &app.db,
+                Some(enrollment.clone()),
+                found.author as i64,
+                None,
+                &format!("[automod:{rule}] {}", found.reason),
+            )
+            .await;
+        }
+        ban_outcome = Some(outcome.clone());
+        crate::cases::record(
+            app,
+            Some(enrollment),
+            CaseAction::Ban,
+            outcome,
+            found.author,
+            None,
+            Some(format!(
+                "{}; deletes: {}",
+                found.reason,
+                delete_notes.join("; ")
+            )),
+            evidence(found.excerpts),
+            crate::cases::application_source(),
+        )
+        .await;
+    }
+    let action = match ban_outcome {
+        None => "delete remaining; ban already applied this window".into(),
+        Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
+    };
+    let vars = BTreeMap::from([
+        ("rule".into(), name.into()),
+        ("mention".into(), format!("<@{}>", found.author)),
+        ("channel".into(), format!("<#{}>", found.channel)),
+        ("action".into(), action),
+        ("reason".into(), found.reason),
+        ("content".into(), delete_notes.join("; ")),
+    ]);
+    crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+}
+
+fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
+    rule.enabled
+        && !rule.whitelist_users.contains(&author)
+        && !rule.whitelist_channels.contains(&channel)
+        && !rule.whitelist_roles.iter().any(|r| roles.contains(r))
+}
+
+fn delete_outcome(error: &serenity::Error) -> CaseOutcome {
+    if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error
+        && response.status_code.as_u16() == 404
+    {
+        return CaseOutcome::Succeeded;
+    }
+    crate::cases::classify_discord(Some(error))
+}
+
+fn evidence(excerpts: Vec<TextEvidence>) -> CaseEvidence {
+    let excerpts: Vec<_> = excerpts
+        .into_iter()
+        .filter(|item| {
+            item.channel_id > 0
+                && item.message_id > 0
+                && item.author_id > 0
+                && item.occurred_at_ms > 0
+                && !item.text.is_empty()
+        })
+        .collect();
+    if excerpts.is_empty() {
+        CaseEvidence::Unavailable
+    } else {
+        CaseEvidence::Text(excerpts)
+    }
+}

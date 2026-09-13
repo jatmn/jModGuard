@@ -20,11 +20,12 @@ from a private GitHub Actions repo. You do not need Bunny to run it
 ([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider path.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
-  [log-only exact-image spam tests](docs/IMAGE-SPAM.md), links in the first minutes after joining,
+  [exact-image and repeated-text spam](docs/IMAGE-SPAM.md) (test or delete-and-ban),
+  links in the first minutes after joining,
   bypass-resistant badword filtering, invite links, message floods, and
-  brand-new accounts — each rule with its own parameters, whitelists, and an
-  **action escalation table** (delete → warn → timeout → kick → ban) plus
-  **dry-run mode** to tune safely.
+  brand-new accounts — each rule with its own parameters and whitelists. Generic
+  rules keep an **action escalation table** (delete → warn → timeout → kick → ban)
+  plus **dry-run mode** to tune safely.
 - **Everything is config**: commands, rules, badwords, log events, and
   templates live in the database (not code) and are editable from the WebUI or in
   chat. Rename `!ban` to `!yeet`, write custom commands as **action plans**
@@ -89,7 +90,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |
 | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | Bunny: CDN admin UI, private bot/API containers, Database |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
-| [docs/AUTOMOD.md](docs/AUTOMOD.md) | the 7 rules, escalation, whitelists, dry-run, evidence |
+| [docs/AUTOMOD.md](docs/AUTOMOD.md) | the 8 rules, escalation, whitelists, dry-run, evidence |
 | [docs/TEMPLATES.md](docs/TEMPLATES.md) | event templates + variable reference |
 | [docs/WEBUI.md](docs/WEBUI.md) | admin UI files, how to host them, tabs, REST API |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | config.toml reference, database layout, backups |

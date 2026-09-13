@@ -20,9 +20,10 @@ Basic Discord log delivery is independent of those retired history tables.
   that summary is not a claim that every step succeeded.
 
 Serenity's general message cache remains disabled. The existing detector's independent
-working state still needs the planned bounded exact-text/image redesign. Optional rich
-before/deleted-content logging is not implemented. Routine reports are not retained for
-later recovery, and failed delivery is not reconstructed from Discord or SQL.
+working state implements bounded exact-text and exact-image matching. Optional rich
+delete reports may include a snippet this process recently observed; they do not
+reconstruct history from Discord or SQL. Routine reports are not retained for later
+recovery, and failed delivery is not reconstructed from Discord or SQL.
 
 Saved templates in a supported database keep their wording on restart. See
 [template customization](TEMPLATES.md#existing-saved-templates). Older installations

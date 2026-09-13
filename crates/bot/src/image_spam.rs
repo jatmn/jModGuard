@@ -1,10 +1,10 @@
-//! Bounded, create-only exact-image observations. This module cannot punish.
+//! Bounded exact-image observations. Punishment uses `spam_actions`, not automod.
 use crate::state::{BotState, CachedGuildConfig};
 use jmodguard::image_spam::{Attachment, Hash, Hasher, Limits, Policy};
 use parking_lot::Mutex;
 use serenity::{
     client::Context,
-    model::{channel::Message, id::GuildId},
+    model::{channel::Message, event::MessageUpdateEvent, id::GuildId},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -25,6 +25,7 @@ struct Post {
     valid: bool,
     cost: usize,
     revision: u64,
+    edited_ms: i64,
 }
 struct Bucket {
     retired_before: u64,
@@ -300,6 +301,13 @@ impl Detector {
                 || now.duration_since(g.budget.start) < Duration::from_secs(60)
         });
     }
+    pub fn author_of(&self, guild: u64, channel: u64, message: u64) -> Option<u64> {
+        self.state
+            .lock()
+            .index
+            .get(&(guild, channel, message))
+            .copied()
+    }
     /// Retain only a short tombstone: a duplicate create must not resurrect an edit/delete.
     pub fn revision(&self) -> u64 {
         self.state.lock().revision
@@ -360,6 +368,7 @@ impl Detector {
         token: (u64, u64),
         policy: &Policy,
         now: Instant,
+        replace: bool,
     ) -> Option<Job> {
         let mut state = self.state.lock();
         if post.revision != state.revision {
@@ -405,6 +414,12 @@ impl Detector {
                 .map(|b| b.retired_before)
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
+        if replace
+            && let Some(job) =
+                replace_existing(&mut state, guild, author, &post, token, policy, now)
+        {
+            return job;
+        }
         if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
             return None;
         }
@@ -562,7 +577,7 @@ impl Detector {
         if b.token != job.token || now < b.reported_until {
             return None;
         }
-        // Every participating observation must still be the same, live create.
+        // Every participating observation must still be the same live post.
         if job.posts.iter().any(|old| {
             !b.posts
                 .iter()
@@ -589,6 +604,90 @@ impl Detector {
         Some(report)
     }
 }
+fn file_key(post: &Post) -> Vec<(u64, u64)> {
+    let mut keys: Vec<_> = post.files.iter().map(|f| (f.id, f.size)).collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn candidate_job(
+    guild: u64,
+    author: u64,
+    token: (u64, u64),
+    bucket: &Bucket,
+    policy: &Policy,
+    now: Instant,
+) -> Option<Job> {
+    if now < bucket.reported_until {
+        return None;
+    }
+    let posts: Vec<_> = bucket
+        .posts
+        .iter()
+        .filter(|p| live(p, policy, now))
+        .cloned()
+        .collect();
+    if posts
+        .iter()
+        .map(|p| p.channel)
+        .collect::<BTreeSet<_>>()
+        .len()
+        < policy.min_channels
+        || !size_candidate(&posts, policy.min_attachments)
+    {
+        return None;
+    }
+    Some(Job {
+        guild,
+        author,
+        token,
+        posts,
+    })
+}
+
+fn replace_existing(
+    state: &mut State,
+    guild: u64,
+    author: u64,
+    post: &Post,
+    token: (u64, u64),
+    policy: &Policy,
+    now: Instant,
+) -> Option<Option<Job>> {
+    let key = (guild, post.channel, post.id);
+    if state.index.get(&key).copied() != Some(author) {
+        return None;
+    }
+    let g = state.guilds.get_mut(&guild)?;
+    let b = g.authors.get_mut(&author)?;
+    let old = b
+        .posts
+        .iter_mut()
+        .find(|p| p.id == post.id && p.channel == post.channel)?;
+    if file_key(old) == file_key(post) || post.edited_ms < old.edited_ms {
+        return Some(None);
+    }
+    g.bytes = g.bytes.saturating_sub(old.cost);
+    state.bytes = state.bytes.saturating_sub(old.cost);
+    old.files = post.files.clone();
+    old.hashes = None;
+    old.at = post.at;
+    old.edited_ms = post.edited_ms;
+    old.revision = post.revision;
+    old.valid = true;
+    old.cost = 256
+        + post
+            .files
+            .iter()
+            .map(Attachment::retained_bytes)
+            .sum::<usize>();
+    g.bytes += old.cost;
+    state.bytes += old.cost;
+    b.token = token;
+    b.last_seen = now;
+    Some(candidate_job(guild, author, token, b, policy, now))
+}
+
 fn live(p: &Post, policy: &Policy, now: Instant) -> bool {
     p.valid && now.duration_since(p.at) < Duration::from_secs(policy.window_secs)
 }
@@ -749,10 +848,12 @@ pub fn observe(
             valid: true,
             cost: 0,
             revision,
+            edited_ms: msg.timestamp.timestamp_millis(),
         },
         token,
         &policy,
         received,
+        false,
     ) else {
         return;
     };
@@ -776,6 +877,138 @@ pub fn observe(
         }
     });
 }
+
+pub fn observe_update(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    cfg: &CachedGuildConfig,
+    event: &MessageUpdateEvent,
+    received: Instant,
+    received_at: chrono::DateTime<chrono::Utc>,
+    revision: u64,
+) {
+    let Some(guild) = event.guild_id else { return };
+    if matches!(event.webhook_id, Some(Some(_))) {
+        return;
+    }
+    let Some(attachments) = event.attachments.as_ref() else {
+        return;
+    };
+    let Some(rule) = cfg.rules.get("attachment_flood") else {
+        return;
+    };
+    let Ok(policy) = Policy::parse(rule) else {
+        return;
+    };
+    let author = event.author.as_ref().map(|u| u.id.get()).or_else(|| {
+        app.image_spam
+            .author_of(guild.get(), event.channel_id.get(), event.id.get())
+    });
+    let Some(author) = author else { return };
+    if author == ctx.cache.current_user().id.get() {
+        return;
+    }
+    let roles = event
+        .member
+        .as_ref()
+        .and_then(|m| m.as_ref())
+        .map(|m| m.roles.iter().map(|r| r.get()).collect::<Vec<_>>());
+    if let Some(roles) = roles.as_deref()
+        && !eligible(rule, author, event.channel_id.get(), roles)
+    {
+        app.image_spam
+            .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+        return;
+    }
+    let images: Vec<_> = attachments
+        .iter()
+        .filter(|a| {
+            a.width.is_some()
+                && a.height.is_some()
+                && a.content_type
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("image/"))
+        })
+        .collect();
+    if images.len() < policy.min_attachments {
+        app.image_spam
+            .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+        return;
+    }
+    let detector = &app.image_spam;
+    if images.len() > detector.limits.max_files_per_post {
+        detector.capacity_drop();
+        return;
+    }
+    let mut files = vec![];
+    for a in images {
+        let Ok(file) = Attachment::new(
+            event.channel_id.get(),
+            a.id.get(),
+            a.size as u64,
+            &a.url,
+            detector.limits.max_file_bytes,
+        ) else {
+            detector.capacity_drop();
+            return;
+        };
+        if !files.iter().any(|f: &Attachment| f.id == file.id) {
+            files.push(file);
+        }
+    }
+    let edited_ms = event
+        .edited_timestamp
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|| received_at.timestamp_millis());
+    let age_ms = received_at.timestamp_millis().saturating_sub(edited_ms);
+    if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 {
+        return;
+    }
+    let Some(at) = received.checked_sub(Duration::from_millis(age_ms as u64)) else {
+        return;
+    };
+    let token = (cfg.version, cfg.durable_version);
+    let Some(job) = detector.admit(
+        guild.get(),
+        author,
+        Post {
+            id: event.id.get(),
+            channel: event.channel_id.get(),
+            serial: 0,
+            at,
+            files,
+            hashes: None,
+            valid: true,
+            cost: 0,
+            revision,
+            edited_ms,
+        },
+        token,
+        &policy,
+        received,
+        true,
+    ) else {
+        return;
+    };
+    let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
+        detector.capacity_drop();
+        return;
+    };
+    let app = Arc::clone(app);
+    let ctx = ctx.clone();
+    let channel = event.channel_id.get();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let deadline = Duration::from_secs(app.image_spam.limits.timeout_secs + 15);
+        if tokio::time::timeout(deadline, run_job(&app, &ctx, job, policy, channel))
+            .await
+            .is_err()
+        {
+            app.image_spam.capacity_drop();
+        }
+    });
+}
+
 async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Policy, channel: u64) {
     let detector = &app.image_spam;
     let (guild, author, token) = (job.guild, job.author, job.token);
@@ -815,11 +1048,73 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
     if (current.version, current.durable_version) != token {
         return;
     }
+    let Some(rule) = current.rules.get("attachment_flood") else {
+        return;
+    };
+    let Ok(current_policy) = Policy::parse(rule) else {
+        return;
+    };
+    let excerpts: Vec<_> = job
+        .posts
+        .iter()
+        .map(|p| {
+            (
+                p.channel,
+                p.id,
+                p.edited_ms,
+                p.hashes.as_deref().map(format_hashes).unwrap_or_default(),
+            )
+        })
+        .collect();
     let Some(report) = detector.complete(job, &policy, failed, Instant::now()) else {
         return;
     };
-    let vars = report_vars(report, author, channel, &policy);
-    crate::logging::emit(app, ctx, GuildId::new(guild), "automod", vars).await;
+    match report {
+        Report::Unverified => {
+            let vars = report_vars(Report::Unverified, author, channel, &policy);
+            crate::logging::emit(app, ctx, GuildId::new(guild), "automod", vars).await;
+        }
+        Report::Verified(messages) => {
+            let excerpts = excerpts
+                .into_iter()
+                .filter(|(c, m, _, _)| messages.iter().any(|found| found == &(*c, *m)))
+                .map(|(channel_id, message_id, occurred_at_ms, text)| {
+                    jmodguard::db::guild_data::TextEvidence {
+                        channel_id: channel_id as i64,
+                        message_id: message_id as i64,
+                        author_id: author as i64,
+                        occurred_at_ms: occurred_at_ms.max(1),
+                        text,
+                    }
+                })
+                .collect();
+            crate::spam_actions::report(
+                app,
+                ctx,
+                crate::spam_actions::Match {
+                    kind: crate::spam_actions::Kind::Image,
+                    guild,
+                    author,
+                    channel,
+                    enforce: current_policy.enforce,
+                    messages,
+                    excerpts,
+                    reason: format!(
+                        "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
+                        policy.min_attachments, policy.min_channels, policy.window_secs
+                    ),
+                },
+            )
+            .await;
+        }
+    }
+}
+fn format_hashes(hashes: &[Hash]) -> String {
+    hashes
+        .iter()
+        .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 fn report_vars(
     report: Report,
@@ -864,6 +1159,7 @@ mod tests {
             window_secs: 60,
             min_channels: 3,
             min_attachments: 2,
+            enforce: false,
         }
     }
     fn post(id: u64, channel: u64, at: Instant, values: &[u8]) -> Post {
@@ -894,12 +1190,13 @@ mod tests {
                 })
                 .collect(),
             hashes: Some(hashes.into_iter().collect()),
+            edited_ms: 0,
         }
     }
     fn admit(d: &Detector, id: u64, channel: u64, at: Instant) -> Option<Job> {
         let mut p = post(id, channel, at, &[1, 2]);
         p.revision = d.revision();
-        d.admit(1, 2, p, (0, 0), &policy(), at)
+        d.admit(1, 2, p, (0, 0), &policy(), at, false)
     }
     fn job(d: &Detector, at: Instant) -> Job {
         assert!(admit(d, 10, 100, at).is_none());
@@ -913,8 +1210,58 @@ mod tests {
         let mut p = post(1, 1, now, &[1, 2]);
         p.revision = d.revision();
         d.invalidate(1, 1, 1); // The create callback has not reached admission yet.
-        assert!(d.admit(1, 2, p, (0, 0), &policy(), now).is_none());
+        assert!(d.admit(1, 2, p, (0, 0), &policy(), now, false).is_none());
         assert!(d.state.lock().index.is_empty());
+    }
+
+    #[test]
+    fn unchanged_files_do_not_refresh_and_changed_files_replace() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut first = post(1, 10, now, &[1, 2]);
+        first.revision = d.revision();
+        first.edited_ms = 1;
+        assert!(
+            d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false)
+                .is_none()
+        );
+        let mut same = first.clone();
+        same.edited_ms = 5;
+        same.at = now + Duration::from_secs(1);
+        same.revision = d.revision();
+        assert!(d.admit(1, 2, same, (0, 0), &policy(), now, true).is_none());
+        assert_eq!(d.state.lock().guilds[&1].authors[&2].posts[0].at, now);
+        let mut changed = first;
+        changed.at = now + Duration::from_secs(2);
+        changed.edited_ms = 9;
+        changed.revision = d.revision();
+        changed.hashes = None;
+        changed.files = vec![
+            Attachment::new(
+                10,
+                50,
+                3,
+                "https://cdn.discordapp.com/attachments/10/50/a.png",
+                10,
+            )
+            .unwrap(),
+            Attachment::new(
+                10,
+                51,
+                3,
+                "https://cdn.discordapp.com/attachments/10/51/a.png",
+                10,
+            )
+            .unwrap(),
+        ];
+        assert!(
+            d.admit(1, 2, changed, (0, 0), &policy(), now, true)
+                .is_none()
+        );
+        let stored = &d.state.lock().guilds[&1].authors[&2].posts[0];
+        assert_eq!(file_key(stored), vec![(50, 3), (51, 3)]);
+        assert!(stored.hashes.is_none());
+        assert_eq!(stored.at, now + Duration::from_secs(2));
     }
 
     #[test]
@@ -965,12 +1312,28 @@ mod tests {
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(admit(&d, 2, 10, now).is_none());
         assert!(
-            d.admit(2, 2, post(3, 11, now, &[1, 2]), (0, 0), &policy(), now)
-                .is_none()
+            d.admit(
+                2,
+                2,
+                post(3, 11, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            )
+            .is_none()
         );
         assert!(
-            d.admit(1, 3, post(4, 12, now, &[1, 2]), (0, 0), &policy(), now)
-                .is_none()
+            d.admit(
+                1,
+                3,
+                post(4, 12, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            )
+            .is_none()
         );
         assert!(admit(&d, 5, 11, now).is_none());
         let mut j = admit(&d, 6, 12, now).unwrap();
@@ -1074,8 +1437,16 @@ mod tests {
         let d = Detector::new(Limits::default()).unwrap();
         let j = job(&d, now);
         assert!(
-            d.admit(1, 2, post(13, 103, now, &[1, 2]), (1, 1), &policy(), now)
-                .is_none()
+            d.admit(
+                1,
+                2,
+                post(13, 103, now, &[1, 2]),
+                (1, 1),
+                &policy(),
+                now,
+                false
+            )
+            .is_none()
         );
         assert_eq!(d.complete(j, &policy(), false, now), None);
         let s = d.state.lock();
@@ -1116,8 +1487,16 @@ mod tests {
         }
         assert!(!d.reserve(&j, &policy(), now)); // six files, five request budget
         assert!(
-            d.admit(2, 2, post(13, 103, now, &[1, 2]), (0, 0), &policy(), now)
-                .is_none()
+            d.admit(
+                2,
+                2,
+                post(13, 103, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            )
+            .is_none()
         );
         assert_eq!(d.state.lock().authors, 1);
         let mut b = Budget::new(now);
@@ -1143,14 +1522,22 @@ mod tests {
         .unwrap();
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(
-            d.admit(1, 3, post(2, 11, now, &[1, 2]), (0, 0), &policy(), now)
-                .is_none()
+            d.admit(
+                1,
+                3,
+                post(2, 11, now, &[1, 2]),
+                (0, 0),
+                &policy(),
+                now,
+                false
+            )
+            .is_none()
         );
         d.invalidate_author(1, 2);
         assert_eq!(d.state.lock().authors, 0);
         let mut p = post(3, 12, now, &[1, 2]);
         p.revision = d.revision();
-        assert!(d.admit(1, 3, p, (0, 0), &policy(), now).is_none());
+        assert!(d.admit(1, 3, p, (0, 0), &policy(), now, false).is_none());
         {
             let s = d.state.lock();
             assert!(s.guilds[&1].authors.contains_key(&3));

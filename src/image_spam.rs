@@ -5,7 +5,9 @@ use hyper::{Body, Client, body::HttpBody};
 use serde::Deserialize;
 use std::time::Duration;
 
-pub const MODE: &str = "exact_image_test";
+pub const TEST_MODE: &str = "exact_image_test";
+pub const ENFORCE_MODE: &str = "exact_image";
+pub const MODE: &str = TEST_MODE;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,18 +16,12 @@ pub struct Policy {
     pub window_secs: u64,
     pub min_channels: usize,
     pub min_attachments: usize,
+    #[serde(default, skip_deserializing)]
+    pub enforce: bool,
 }
 impl Policy {
     pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {
-        let value: Self = serde_json::from_value(rule.params.clone())?;
-        ensure!(
-            value.mode == MODE && rule.dry_run,
-            "exact-image detection currently requires log-only test mode"
-        );
-        ensure!(
-            rule.actions.iter().all(|a| a.action == "log"),
-            "exact-image test mode cannot configure punitive actions"
-        );
+        let mut value: Self = serde_json::from_value(rule.params.clone())?;
         ensure!(
             (1..=600).contains(&value.window_secs),
             "image window must be 1–600 seconds"
@@ -38,14 +34,53 @@ impl Policy {
             (1..=10).contains(&value.min_attachments),
             "common distinct images must be 1–10"
         );
+        match value.mode.as_str() {
+            TEST_MODE => {
+                ensure!(
+                    rule.dry_run && rule.actions.iter().all(|a| a.action == "log"),
+                    "exact-image test mode requires log-only actions"
+                );
+                value.enforce = false;
+            }
+            ENFORCE_MODE if rule.dry_run => {
+                ensure!(
+                    rule.actions.iter().all(|a| a.action == "log"),
+                    "exact-image test mode cannot configure punitive actions"
+                );
+                value.enforce = false;
+            }
+            ENFORCE_MODE => {
+                ensure!(!rule.dry_run, "image enforcement cannot be dry-run");
+                let actions: std::collections::BTreeSet<_> =
+                    rule.actions.iter().map(|a| a.action.as_str()).collect();
+                ensure!(
+                    actions.contains("delete") && actions.contains("ban"),
+                    "image enforcement requires delete and ban"
+                );
+                ensure!(
+                    actions
+                        .iter()
+                        .all(|a| matches!(*a, "delete" | "ban" | "log")),
+                    "image enforcement cannot use the generic punishment table"
+                );
+                value.enforce = true;
+            }
+            _ => anyhow::bail!("unsupported exact-image mode"),
+        }
         Ok(value)
     }
 }
 
 /// Legacy attachment-count configurations stay inert until explicitly converted.
 pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
-    if id == "attachment_flood" && rule.params.get("mode").is_some() {
-        Policy::parse(rule)?;
+    match id {
+        "attachment_flood" if rule.params.get("mode").is_some() => {
+            Policy::parse(rule)?;
+        }
+        "repeat_text" => {
+            crate::text_spam::Policy::parse(rule)?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -365,8 +400,11 @@ mod tests {
     }
 
     #[test]
-    fn policy_requires_explicit_test_mode_and_valid_thresholds() {
-        let mut r = crate::defaults::default_rules().remove(1);
+    fn policy_requires_explicit_mode_and_valid_thresholds() {
+        let mut r = crate::defaults::default_rules()
+            .into_iter()
+            .find(|rule| rule.name.contains("image"))
+            .unwrap();
         assert!(Policy::parse(&r).is_ok());
         r.dry_run = false;
         assert!(Policy::parse(&r).is_err());
@@ -379,5 +417,29 @@ mod tests {
         r.params = serde_json::json!({"min_attachments":2});
         assert!(Policy::parse(&r).is_err());
         assert!(validate_rule("attachment_flood", &r).is_ok()); // inert legacy row
+        r.params = serde_json::json!({
+            "mode":"exact_image","window_secs":60,"min_channels":3,"min_attachments":2
+        });
+        r.dry_run = false;
+        r.actions = vec![
+            crate::types::ActionDef {
+                at: 1,
+                action: "delete".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "image spam".into(),
+            },
+            crate::types::ActionDef {
+                at: 1,
+                action: "ban".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "image spam".into(),
+            },
+        ];
+        let parsed = Policy::parse(&r).unwrap();
+        assert!(parsed.enforce);
+        r.actions[0].action = "timeout".into();
+        assert!(Policy::parse(&r).is_err());
     }
 }
