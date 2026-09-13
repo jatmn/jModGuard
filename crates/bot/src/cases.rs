@@ -20,6 +20,14 @@ pub fn classify_discord(error: Option<&serenity::Error>) -> CaseOutcome {
     }
 }
 
+/// Selected Discord cases exist only after Discord was invoked.
+pub fn discord_attempt_outcome(
+    called: bool,
+    error: Option<&serenity::Error>,
+) -> Option<CaseOutcome> {
+    called.then(|| classify_discord(error))
+}
+
 pub fn classify_db_commit<T>(result: &Result<T, anyhow::Error>) -> CaseOutcome {
     match result {
         Ok(_) => CaseOutcome::Succeeded,
@@ -113,6 +121,15 @@ mod tests {
         let uncertain: Result<(), anyhow::Error> =
             Err(db::test_database_commit_indeterminate_error());
         assert_eq!(classify_db_commit(&uncertain), CaseOutcome::Uncertain);
+    }
+
+    #[test]
+    fn discord_attempt_outcome_is_absent_until_discord_is_invoked() {
+        assert_eq!(discord_attempt_outcome(false, None), None);
+        assert_eq!(
+            discord_attempt_outcome(true, None),
+            Some(CaseOutcome::Succeeded)
+        );
     }
 
     #[tokio::test]

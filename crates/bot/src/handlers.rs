@@ -352,6 +352,7 @@ impl EventHandler for Handler {
                 &ctx,
                 guild_id,
                 &msg.author,
+                member.clone(),
                 &display,
                 Some(msg.id.get()),
                 Some(msg.channel_id.get()),

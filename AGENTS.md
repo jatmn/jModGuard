@@ -135,14 +135,15 @@ even if the async waiter is cancelled. Reload exact journal identity, never acce
 keys or retry an existing reservation's source. Keep the evidence root private/dedicated;
 only verified file absence can acknowledge cleanup. Local advisory locks require cooperating
 writers and trusted parents; they do not establish remote PUT completion or restore fencing.
-Current services must not activate this backend until lifecycle/permissions/routing land.
+Bot and API open this backend through tenant runtime for authorized serving of available
+objects. Discord attachment capture and backup-copy cleanup remain later work.
 
 The opt-in Bunny evidence adapter uses guild schema7 single-use attempts and durable201
 acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve immutable scoped
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core stays0010. Local HTTP/SQL fixtures
+and backup-copy lifecycle remain before activation. Core is at migration 0011. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment rule now uses a bounded Gateway create-only exact-image **test** path;

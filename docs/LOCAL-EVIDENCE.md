@@ -87,6 +87,7 @@ process exclusion, identity/path guards, removal retries, preservation of unrela
 and closed-membership purge. Disposable libSQL also exercises real local files alongside
 lost reservation and deletion-acknowledgment responses.
 
-Live Bunny validation, durable worker scheduling, serving permissions, portable backup-copy cleanup,
-runtime routing and UI remain separate work. Local filesystem tests establish neither
+Live Bunny validation, durable worker scheduling, and portable backup-copy cleanup
+remain separate work. Authorized serving, runtime routing and Cases UI for this backend
+are implemented; see [tenant runtime](TENANT-RUNTIME.md). Local filesystem tests establish neither
 provider behavior nor billed CPU/memory use.
