@@ -158,7 +158,7 @@ fn seeds_globals_in_memory() {
     assert_eq!(
         parts.0,
         crate::types::RULE_IDS.len() as i64,
-        "all 7 rules seeded"
+        "all 8 rules seeded"
     );
     assert!(parts.1 >= 20, "built-in commands seeded");
     assert_eq!(
@@ -2581,6 +2581,41 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
             .unwrap();
         assert!(
             get_rule(&db, 0, "attachment_flood")
+                .await
+                .unwrap()
+                .unwrap()
+                .dry_run
+        );
+        rule.params["mode"] = serde_json::json!("exact_image");
+        rule.dry_run = false;
+        rule.actions = vec![
+            crate::types::ActionDef {
+                at: 1,
+                action: "delete".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "spam match".into(),
+            },
+            crate::types::ActionDef {
+                at: 1,
+                action: "ban".into(),
+                duration_minutes: 0,
+                delete_days: 0,
+                reason: "spam match".into(),
+            },
+        ];
+        upsert_rule(&db, 0, "attachment_flood", &rule)
+            .await
+            .unwrap();
+        let stored = get_rule(&db, 0, "attachment_flood").await.unwrap().unwrap();
+        assert!(!stored.dry_run);
+        assert_eq!(stored.params["mode"], "exact_image");
+        let mut text = crate::defaults::default_rules().remove(2);
+        text.dry_run = false;
+        text.actions = rule.actions.clone();
+        upsert_rule(&db, 0, "repeat_text", &text).await.unwrap();
+        assert!(
+            !get_rule(&db, 0, "repeat_text")
                 .await
                 .unwrap()
                 .unwrap()

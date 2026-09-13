@@ -11,6 +11,71 @@ use std::sync::Arc;
 
 use crate::state::BotState;
 use crate::{db, templates};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+const SNIPPET_KEEP: Duration = Duration::from_secs(600);
+const SNIPPETS_PER_GUILD: usize = 64;
+const SNIPPET_CHARS: usize = 1000;
+
+#[derive(Default)]
+pub struct SnippetCache {
+    inner: Mutex<HashMap<(u64, u64, u64), Snippet>>,
+}
+struct Snippet {
+    at: Instant,
+    guild: u64,
+    author: u64,
+    text: String,
+}
+
+pub fn remember_message(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
+    text: &str,
+) {
+    let mut cache = app.log_snippets.inner.lock();
+    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
+    let key = (guild, channel, message);
+    let author = author
+        .filter(|id| *id != 0)
+        .or_else(|| cache.get(&key).map(|s| s.author).filter(|id| *id != 0));
+    if author.is_none() {
+        return;
+    }
+    let author = author.unwrap();
+    if cache.values().filter(|s| s.guild == guild).count() >= SNIPPETS_PER_GUILD
+        && !cache.contains_key(&key)
+        && let Some(oldest) = cache
+            .iter()
+            .filter(|(_, s)| s.guild == guild)
+            .min_by_key(|(_, s)| s.at)
+            .map(|(k, _)| *k)
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        key,
+        Snippet {
+            at: Instant::now(),
+            guild,
+            author,
+            text: text.chars().take(SNIPPET_CHARS).collect(),
+        },
+    );
+}
+
+fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<(u64, String)> {
+    let mut cache = app.log_snippets.inner.lock();
+    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
+    cache
+        .remove(&(guild, channel, message))
+        .map(|s| (s.author, s.text))
+}
 
 /// Resolves the log channel for an event type from the cached config.
 fn channel_for(
@@ -196,14 +261,33 @@ pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<Messag
 }
 
 pub(crate) fn message_delete_report(
+    app: &BotState,
     guild_id: GuildId,
     channel: ChannelId,
     id: MessageId,
 ) -> MessageReport {
+    let mut vars = message_vars(guild_id, channel, id);
+    if let Some((author, text)) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
+        vars.extend(templates::user_vars(
+            author,
+            &author.to_string(),
+            &author.to_string(),
+        ));
+        vars.insert(
+            "content".into(),
+            if text.is_empty() {
+                "empty".into()
+            } else {
+                clip(&text, 1000)
+            },
+        );
+    } else {
+        vars.insert("content".into(), "not supplied to this process".into());
+    }
     MessageReport {
         guild_id,
         event: "message_delete",
-        vars: message_vars(guild_id, channel, id),
+        vars,
     }
 }
 

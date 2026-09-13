@@ -7,9 +7,10 @@ use std::marker::PhantomData;
 pub const GLOBAL_SCOPE: i64 = 0;
 
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
-pub const RULE_IDS: [&str; 7] = [
+pub const RULE_IDS: [&str; 8] = [
     "mention_spam",
     "attachment_flood",
+    "repeat_text",
     "new_member_url",
     "badword",
     "invite",

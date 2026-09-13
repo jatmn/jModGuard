@@ -566,6 +566,7 @@ function tabRules() {
     el("p", { class: "muted", style: "margin-bottom:14px" },
       "Each rule has its own parameters, whitelists, and an escalation table " +
       "(`at` = strike count at which the action fires; the highest-severity fired action is executed). " +
+      "Exact image and repeated-text rules have a separate matcher with test or delete-and-ban mode. " +
       "Dry-run logs what would have happened without acting — use it while tuning."),
     ...rules.map((r) => ruleCard(r)),
   );
@@ -573,10 +574,10 @@ function tabRules() {
 
 function ruleCard(r) {
   const rule = r.effective;
-  const image = r.rule_id === "attachment_flood";
-  const supported = !image || imageTestConfigured(rule);
+  const spam = spamRule(r.rule_id);
+  const supported = !spam || spamConfigured(r.rule_id, rule);
   const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
-  const label = !rule.enabled ? "disabled" : !supported ? "inactive — select image test mode" : image ? "log-only image test" : rule.dry_run ? "dry-run" : "enabled";
+  const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : spam && rule.dry_run ? "log-only test" : spam ? "delete and ban" : rule.dry_run ? "dry-run" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
       el("div", {},
@@ -591,21 +592,60 @@ function ruleCard(r) {
   );
 }
 
+function spamRule(id) {
+  return id === "attachment_flood" || id === "repeat_text";
+}
+
 function imageTestConfigured(rule) {
-  const p = rule.params || {};
-  return p.mode === "exact_image_test" && rule.dry_run === true &&
+  return spamConfigured("attachment_flood", Object.assign({}, rule, { dry_run: true, params: Object.assign({ mode: "exact_image_test" }, rule.params || {}), actions: [{ action: "log" }] })) ||
+    (rule.params || {}).mode === "exact_image_test" && rule.dry_run === true &&
     (rule.actions || []).every(a => a.action === "log") &&
-    Object.keys(p).every(k => ["mode", "window_secs", "min_channels", "min_attachments"].includes(k)) &&
-    [[p.window_secs, 1, 600], [p.min_channels, 2, 10], [p.min_attachments, 1, 10]]
-      .every(([n, min, max]) => Number.isInteger(n) && n >= min && n <= max);
+    spamThresholds(rule.params, "attachment_flood");
+}
+
+function spamConfigured(id, rule) {
+  const p = rule.params || {};
+  if (id === "attachment_flood") {
+    const test = (p.mode === "exact_image_test" || (p.mode === "exact_image" && rule.dry_run === true)) &&
+      (rule.actions || []).every(a => a.action === "log") && rule.dry_run === true;
+    const enforce = p.mode === "exact_image" && rule.dry_run === false &&
+      (rule.actions || []).some(a => a.action === "delete") &&
+      (rule.actions || []).some(a => a.action === "ban") &&
+      (rule.actions || []).every(a => ["delete", "ban", "log"].includes(a.action));
+    return (test || enforce) && spamThresholds(p, id);
+  }
+  if (id === "repeat_text") {
+    const test = p.mode === "exact_text" && rule.dry_run === true && (rule.actions || []).every(a => a.action === "log");
+    const enforce = p.mode === "exact_text" && rule.dry_run === false &&
+      (rule.actions || []).some(a => a.action === "delete") &&
+      (rule.actions || []).some(a => a.action === "ban") &&
+      (rule.actions || []).every(a => ["delete", "ban", "log"].includes(a.action));
+    return (test || enforce) && spamThresholds(p, id);
+  }
+  return false;
+}
+
+function spamThresholds(p, id) {
+  const keys = id === "repeat_text"
+    ? ["mode", "window_secs", "min_channels", "min_length"]
+    : ["mode", "window_secs", "min_channels", "min_attachments"];
+  if (!Object.keys(p).every(k => keys.includes(k))) return false;
+  const ranges = id === "repeat_text"
+    ? [[p.window_secs, 1, 600], [p.min_channels, 2, 10], [p.min_length, 1, 2000]]
+    : [[p.window_secs, 1, 600], [p.min_channels, 2, 10], [p.min_attachments, 1, 10]];
+  return ranges.every(([n, min, max]) => Number.isInteger(n) && n >= min && n <= max);
 }
 
 function editRule(r) {
   const rule = JSON.parse(JSON.stringify(r.effective));
+  const spam = spamRule(r.rule_id);
+  const textRule = r.rule_id === "repeat_text";
   const image = r.rule_id === "attachment_flood";
   const imageChannels = el("input", { type: "number", min: 2, max: 10, value: rule.params?.min_channels ?? 3 });
   const imageCount = el("input", { type: "number", min: 1, max: 10, value: rule.params?.min_attachments ?? 2 });
   const imageWindow = el("input", { type: "number", min: 1, max: 600, value: rule.params?.window_secs ?? 60 });
+  const textLength = el("input", { type: "number", min: 1, max: 2000, value: rule.params?.min_length ?? 20 });
+  const enforce = el("input", { type: "checkbox", checked: spamConfigured(r.rule_id, rule) && rule.dry_run === false });
   const modal = overlay();
   const paramsText = el("textarea", { class: "mono" });
   paramsText.value = JSON.stringify(rule.params ?? {}, null, 2);
@@ -636,25 +676,28 @@ function editRule(r) {
       reason.onchange = () => (rule.actions[i].reason = reason.value);
     });
   };
-  if (!image) renderActions();
+  if (!spam) renderActions();
 
   const box = el("div", { class: "modal-box" },
     el("h3", { text: `Edit rule: ${r.name}` }),
     el("div", { class: "field" },
       el("label", { text: "Enabled" }),
       el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }),
-      image ? el("span", { text: " Log-only test mode; delete and ban are not available yet." }) :
+      spam ? el("label", {}, " Delete matched messages and ban", enforce) :
         el("label", {}, " Dry-run (log only)", el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) })),
     ),
-    image ? el("div", {},
-      el("p", { text: "Save to select exact-image test mode. Reports go to this server’s automod log channel. Only new messages with image metadata are tested; edited messages are excluded. Work limits can reduce coverage." }),
+    spam ? el("div", {},
+      el("p", { text: textRule
+        ? "Exact text after trimming ends only. No case folding. Empty text never matches. Default minimum length is 20 Unicode scalars."
+        : "Exact common image bytes across channels. Extra images are allowed. Creates and relevant attachment edits participate. Work limits can reduce coverage." }),
       el("div", { class: "field" }, el("label", { text: "Distinct channels" }), imageChannels),
-      el("div", { class: "field" }, el("label", { text: "Common distinct images per message" }), imageCount),
+      image ? el("div", { class: "field" }, el("label", { text: "Common distinct images per message" }), imageCount) : null,
+      textRule ? el("div", { class: "field" }, el("label", { text: "Minimum length (Unicode scalars after trim)" }), textLength) : null,
       el("div", { class: "field" }, el("label", { text: "Window (seconds)" }), imageWindow),
     ) : el("div", { class: "field" },
       el("label", { text: "Parameters (JSON)" }), paramsText,
     ),
-    image ? null : el("div", { class: "field" },
+    spam ? null : el("div", { class: "field" },
       el("label", { text: "Action escalation" }), actionsRows,
       el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
@@ -667,11 +710,18 @@ function editRule(r) {
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
-          if (image) {
-            rule.params = { mode: "exact_image_test", min_channels: Number(imageChannels.value), min_attachments: Number(imageCount.value), window_secs: Number(imageWindow.value) };
-            rule.dry_run = true;
-            rule.actions = [{ at: 1, action: "log", reason: "Exact image spam test", duration_minutes: 0, delete_days: 0 }];
-            if (!imageTestConfigured(rule)) throw new Error("Channels must be 2–10, images 1–10, and window 1–600 seconds, all whole numbers.");
+          if (spam) {
+            const punish = enforce.checked;
+            if (textRule) {
+              rule.params = { mode: "exact_text", min_channels: Number(imageChannels.value), window_secs: Number(imageWindow.value), min_length: Number(textLength.value) };
+            } else {
+              rule.params = { mode: punish ? "exact_image" : "exact_image_test", min_channels: Number(imageChannels.value), min_attachments: Number(imageCount.value), window_secs: Number(imageWindow.value) };
+            }
+            rule.dry_run = !punish;
+            rule.actions = punish
+              ? [{ at: 1, action: "delete", reason: "spam match", duration_minutes: 0, delete_days: 0 }, { at: 1, action: "ban", reason: "spam match", duration_minutes: 0, delete_days: 0 }]
+              : [{ at: 1, action: "log", reason: textRule ? "Repeated text test" : "Exact image spam test", duration_minutes: 0, delete_days: 0 }];
+            if (!spamConfigured(r.rule_id, rule)) throw new Error("Channels must be 2–10 and window 1–600 seconds, all whole numbers. Images 1–10. Text length 1–2000.");
           } else {
             rule.params = JSON.parse(paramsText.value || "{}");
           }
@@ -1029,7 +1079,7 @@ function tabTemplates() {
   return el("div", {},
     el("h2", { text: "Event templates" }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. Earlier text and deleted content are not retained. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed."),
+      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed."),
     ...state.config.templates.map((t) => templateCard(t)),
   );
 }

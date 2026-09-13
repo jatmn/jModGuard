@@ -34,6 +34,20 @@ fn user_display(member: &Member) -> String {
     member.display_name().to_string()
 }
 
+fn select_update_author(
+    event_author: Option<u64>,
+    text_author: Option<u64>,
+    image_author: Option<u64>,
+) -> Option<u64> {
+    event_author.or(text_author).or(image_author)
+}
+
+pub(crate) struct UpdateObservation {
+    pub author: Option<u64>,
+    pub received: std::time::Instant,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Throttle for the "message content is empty" warning (missing intent).
 static LAST_EMPTY_WARN: parking_lot::Mutex<Option<std::time::Instant>> =
     parking_lot::Mutex::new(None);
@@ -137,6 +151,7 @@ impl EventHandler for Handler {
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
         self.app.image_spam.invalidate_guild(incomplete.id.get());
+        self.app.text_spam.invalidate_guild(incomplete.id.get());
         let joined = full
             .filter(|guild| guild.id == incomplete.id)
             .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
@@ -182,6 +197,9 @@ impl EventHandler for Handler {
     ) {
         self.app
             .image_spam
+            .invalidate_author(guild_id.get(), user.id.get());
+        self.app
+            .text_spam
             .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
         let mut extra = BTreeMap::new();
@@ -263,6 +281,7 @@ impl EventHandler for Handler {
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
+        let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
 
@@ -305,6 +324,15 @@ impl EventHandler for Handler {
             received,
             received_at,
             image_revision,
+        );
+        crate::text_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, text_revision);
+        crate::logging::remember_message(
+            &app,
+            guild_id.get(),
+            msg.channel_id.get(),
+            msg.id.get(),
+            Some(msg.author.id.get()),
+            &msg.content,
         );
         // Generic rules and prefix commands retain their existing bot exemption.
         if msg.author.bot {
@@ -375,10 +403,65 @@ impl EventHandler for Handler {
         _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
+        let received = std::time::Instant::now();
+        let received_at = chrono::Utc::now();
+        let image_revision = self.app.image_spam.revision();
+        let text_revision = self.app.text_spam.revision();
         if let Some(guild) = event.guild_id {
-            self.app
-                .image_spam
-                .invalidate(guild.get(), event.channel_id.get(), event.id.get());
+            let channel = event.channel_id.get();
+            let message = event.id.get();
+            let update = UpdateObservation {
+                author: select_update_author(
+                    event.author.as_ref().map(|user| user.id.get()),
+                    self.app
+                        .text_spam
+                        .author_of(guild.get(), channel, message),
+                    self.app
+                        .image_spam
+                        .author_of(guild.get(), channel, message),
+                ),
+                received,
+                received_at,
+            };
+            match self.app.configs.get(&self.app.db, guild.get()).await {
+                Ok(cfg) => {
+                    crate::image_spam::observe_update(
+                        &self.app,
+                        &ctx,
+                        &cfg,
+                        &event,
+                        &update,
+                        image_revision,
+                    );
+                    crate::text_spam::observe_update(
+                        &self.app,
+                        &ctx,
+                        &cfg,
+                        &event,
+                        &update,
+                        text_revision,
+                    );
+                    if let Some(content) = event.content.as_deref() {
+                        crate::logging::remember_message(
+                            &self.app,
+                            guild.get(),
+                            event.channel_id.get(),
+                            event.id.get(),
+                            update.author,
+                            content,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("message_update: config load failed: {e:#}");
+                    self.app
+                        .image_spam
+                        .invalidate(guild.get(), channel, message);
+                    self.app
+                        .text_spam
+                        .invalidate(guild.get(), channel, message);
+                }
+            }
         }
         if let Some(report) = logging::message_update_report(&event) {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
@@ -396,7 +479,11 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        let report = logging::message_delete_report(guild_id, channel_id, deleted_message_id);
+        self.app
+            .text_spam
+            .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
+        let report =
+            logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
         logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
     }
 
@@ -411,6 +498,9 @@ impl EventHandler for Handler {
         for id in &multiple_deleted_messages_ids {
             self.app
                 .image_spam
+                .invalidate(guild_id.get(), channel_id.get(), id.get());
+            self.app
+                .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
         let mut vars = BTreeMap::new();
@@ -431,6 +521,9 @@ impl EventHandler for Handler {
     ) {
         self.app
             .image_spam
+            .invalidate_author(event.guild_id.get(), event.user.id.get());
+        self.app
+            .text_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
         let app = Arc::clone(self.app());
         let Some(new) = new_if_available else { return };
@@ -477,5 +570,18 @@ impl EventHandler for Handler {
     ) {
         let app = Arc::clone(self.app());
         commands::handle_interaction(&app, &ctx, interaction).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_update_author;
+
+    #[test]
+    fn update_author_prefers_event_then_text_then_image_observation() {
+        assert_eq!(select_update_author(Some(1), Some(2), Some(3)), Some(1));
+        assert_eq!(select_update_author(None, Some(2), Some(3)), Some(2));
+        assert_eq!(select_update_author(None, None, Some(3)), Some(3));
+        assert_eq!(select_update_author(None, None, None), None);
     }
 }

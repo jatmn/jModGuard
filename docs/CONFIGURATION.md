@@ -106,7 +106,7 @@ workflow have provider-specific tests and documentation.
 
 ## Behavior on first boot
 
-If the database is new, global defaults are seeded: 7 rules, ~20 commands,
+If the database is new, global defaults are seeded: 8 rules, ~20 commands,
 and default templates. Servers inherit these until you override them.
 
 ## Backups

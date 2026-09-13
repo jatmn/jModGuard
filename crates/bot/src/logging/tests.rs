@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::BotProcessConfig;
 use crate::db::Db;
+use crate::state::BotState;
 use std::sync::Mutex;
 
 fn update(fields: serde_json::Value) -> MessageUpdateEvent {
@@ -38,14 +39,76 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
 
 #[test]
 fn basic_delete_reports_ids_and_unavailable_content() {
-    let report = message_delete_report(GuildId::new(789), ChannelId::new(456), MessageId::new(123));
+    let path = std::env::temp_dir().join(format!("log_del_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
     assert_eq!(report.vars["message_id"], "123");
     assert_eq!(report.vars["mention"], "unavailable");
-    assert_eq!(report.vars["content"], "not retained");
+    assert_eq!(report.vars["content"], "not supplied to this process");
     let rendered = templates::render(default_template(report.event), &report.vars);
     assert!(rendered.contains("123"));
-    assert!(rendered.contains("not retained"));
+    assert!(rendered.contains("not supplied to this process"));
     assert!(!rendered.contains("{mention}"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn observed_delete_reports_can_include_a_recent_snippet() {
+    let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    remember_message(&app, 789, 456, 123, Some(1), "hello there");
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "hello there");
+    let missing = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(missing.vars["content"], "not supplied to this process");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn partial_update_without_author_preserves_create_snippet_author() {
+    let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    remember_message(&app, 789, 456, 123, Some(42), "hello there");
+    remember_message(&app, 789, 456, 123, None, "edited text");
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "edited text");
+    assert_eq!(report.vars["user_id"], "42");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn unattributed_update_does_not_create_a_snippet() {
+    let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    remember_message(&app, 789, 456, 123, None, "orphan edit");
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "not supplied to this process");
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

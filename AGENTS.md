@@ -146,13 +146,16 @@ markers do not prove zone privacy; installation checks, provider resolution, run
 and backup-copy lifecycle remain before activation. Core is at migration 0011. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
-The attachment rule now uses a bounded Gateway create-only exact-image **test** path;
-see `docs/IMAGE-SPAM.md`. Never restore the count-only trigger or route matches into
-the generic punishment executor. Require an exact common distinct-hash set across
-channels, preserve original observation time and invalidation/replay guards, and keep
-work/metadata bounds with no background task queue. Test reports are best-effort Discord
-logs only, no SQL cases/evidence. Edits currently invalidate; punishment and selected
-evidence integration remain future work. Process budgets belong only to bot config.
+The attachment and repeated-text rules now use bounded Gateway exact-image and
+exact-trimmed-text paths, in test or delete-and-ban mode; see `docs/IMAGE-SPAM.md`.
+Never restore the count-only trigger or route matches into the generic punishment
+executor. Require an exact common distinct-hash set or exact trimmed text across
+channels, preserve original observation time and invalidation/replay guards, and
+keep work/metadata bounds with no background task queue. Test reports are Discord
+logs only, with no SQL cases. Enforcement rechecks membership/exemptions, deletes
+matched messages and bans with truthful separate outcomes, and records selected
+case text (hashes/message IDs/trimmed excerpts). Discord attachment object capture
+remains later work. Process image budgets belong only to bot config.
 
 ## Commands
 
