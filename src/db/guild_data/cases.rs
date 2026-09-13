@@ -68,6 +68,7 @@ impl CaseSource {
 #[serde(rename_all = "snake_case")]
 pub enum CaseAction {
     Ban,
+    Delete,
     Kick,
     Warning,
     Timeout,

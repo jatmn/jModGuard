@@ -222,6 +222,60 @@ impl Detector {
         }
     }
 
+    /// True when every matched message is still indexed under this author with the
+    /// same config token and still forms a live cross-channel exact-text match.
+    pub(crate) fn match_still_proving(
+        &self,
+        guild: u64,
+        author: u64,
+        token: (u64, u64),
+        messages: &[(u64, u64)],
+        policy: &Policy,
+        now: Instant,
+    ) -> bool {
+        let state = self.state.lock();
+        let Some(b) = state
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+        else {
+            return false;
+        };
+        if b.token != token {
+            return false;
+        }
+        let window = Duration::from_secs(policy.window_secs);
+        let posts: Vec<_> = messages
+            .iter()
+            .filter_map(|(channel, message)| {
+                if state.index.get(&(guild, *channel, *message)) != Some(&author) {
+                    return None;
+                }
+                b.posts
+                    .iter()
+                    .find(|p| p.channel == *channel && p.id == *message)
+            })
+            .collect();
+        if posts.len() != messages.len() {
+            return false;
+        }
+        if posts
+            .iter()
+            .any(|p| now.duration_since(p.at) >= window)
+        {
+            return false;
+        }
+        let text = &posts[0].text;
+        if !posts.iter().all(|p| p.text == *text) {
+            return false;
+        }
+        posts
+            .iter()
+            .map(|p| p.channel)
+            .collect::<BTreeSet<_>>()
+            .len() >= policy.min_channels
+    }
+
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
     fn admit(
         &self,
@@ -727,6 +781,7 @@ fn consider(
                     author,
                     channel,
                     enforce: policy.enforce,
+                    token,
                     messages,
                     excerpts,
                     reason: format!(
@@ -861,6 +916,49 @@ mod tests {
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
+    }
+
+    #[test]
+    fn match_still_proving_rejects_invalidated_or_stale_messages() {
+        let d = Detector::default();
+        let now = Instant::now();
+        let p = policy();
+        let token = (1, 2);
+        for (id, channel) in [(10, 1), (11, 2)] {
+            let mut item = post(id, channel, now, "spam");
+            item.revision = d.revision();
+            assert_eq!(
+                d.admit(1, 2, item, token, &p, now, false),
+                AdmitOutcome::Admitted
+            );
+        }
+        let mut third = post(12, 3, now, "spam");
+        third.revision = d.revision();
+        let matched_messages = matched(d.admit(1, 2, third, token, &p, now, false)).unwrap();
+        assert!(d.match_still_proving(1, 2, token, &matched_messages, &p, now));
+        d.invalidate(1, 2, 11);
+        assert!(!d.match_still_proving(1, 2, token, &matched_messages, &p, now));
+
+        let fresh = Detector::default();
+        for (id, channel) in [(10, 1), (11, 2)] {
+            let mut item = post(id, channel, now, "spam");
+            item.revision = fresh.revision();
+            assert_eq!(
+                fresh.admit(1, 2, item, token, &p, now, false),
+                AdmitOutcome::Admitted
+            );
+        }
+        let mut third = post(12, 3, now, "spam");
+        third.revision = fresh.revision();
+        let matched_messages = matched(fresh.admit(1, 2, third, token, &p, now, false)).unwrap();
+        let mut changed = post(11, 2, now + Duration::from_secs(1), "other");
+        changed.edited_ms = 9;
+        changed.revision = fresh.revision();
+        assert_eq!(
+            fresh.admit(1, 2, changed, token, &p, now, true),
+            AdmitOutcome::Admitted
+        );
+        assert!(!fresh.match_still_proving(1, 2, token, &matched_messages, &p, now));
     }
 
     #[test]

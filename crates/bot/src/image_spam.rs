@@ -329,6 +329,43 @@ impl Detector {
         self.state.lock().revision
     }
 
+    /// True when every matched message is still indexed under this author with the
+    /// same config token and still represents a live image observation.
+    pub(crate) fn match_still_proving(
+        &self,
+        guild: u64,
+        author: u64,
+        token: (u64, u64),
+        messages: &[(u64, u64)],
+        policy: &Policy,
+        now: Instant,
+    ) -> bool {
+        let state = self.state.lock();
+        let Some(b) = state
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+        else {
+            return false;
+        };
+        if b.token != token {
+            return false;
+        }
+        let posts: Vec<_> = messages
+            .iter()
+            .filter_map(|(channel, message)| {
+                if state.index.get(&(guild, *channel, *message)) != Some(&author) {
+                    return None;
+                }
+                b.posts
+                    .iter()
+                    .find(|p| p.channel == *channel && p.id == *message)
+            })
+            .collect();
+        posts.len() == messages.len()
+            && posts.iter().all(|p| live(p, policy, now))
+    }
+
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
@@ -1119,6 +1156,7 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
                     author,
                     channel,
                     enforce: current_policy.enforce,
+                    token,
                     messages,
                     excerpts,
                     reason: format!(
@@ -1318,6 +1356,25 @@ mod tests {
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
+    }
+
+    #[test]
+    fn match_still_proving_rejects_invalidated_messages() {
+        let d = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let p = policy();
+        let token = (0, 0);
+        let job = job(&d, now);
+        let matched = d
+            .complete(job, &p, false, now)
+            .and_then(|report| match report {
+                Report::Verified(messages) => Some(messages),
+                _ => None,
+            })
+            .unwrap();
+        assert!(d.match_still_proving(1, 2, token, &matched, &p, now));
+        d.invalidate(1, 101, 11);
+        assert!(!d.match_still_proving(1, 2, token, &matched, &p, now));
     }
 
     #[test]

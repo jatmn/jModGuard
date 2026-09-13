@@ -22,6 +22,7 @@ pub struct Match {
     pub author: u64,
     pub channel: u64,
     pub enforce: bool,
+    pub token: (u64, u64),
     pub messages: Vec<(u64, u64)>,
     pub excerpts: Vec<TextEvidence>,
     pub reason: String,
@@ -227,6 +228,56 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
         return;
     }
     let now = Instant::now();
+    let token = (cfg.version, cfg.durable_version);
+    if token != found.token {
+        return;
+    }
+    let still_proving = match found.kind {
+        Kind::Image => {
+            let Ok(policy) = jmodguard::image_spam::Policy::parse(rule_def) else {
+                return;
+            };
+            app.image_spam.match_still_proving(
+                found.guild,
+                found.author,
+                token,
+                &found.messages,
+                &policy,
+                now,
+            )
+        }
+        Kind::Text => {
+            let Ok(policy) = jmodguard::text_spam::Policy::parse(rule_def) else {
+                return;
+            };
+            app.text_spam.match_still_proving(
+                found.guild,
+                found.author,
+                token,
+                &found.messages,
+                &policy,
+                now,
+            )
+        }
+    };
+    if !still_proving {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; matched observations were invalidated".into(),
+            ),
+            ("reason".into(), found.reason.clone()),
+            (
+                "content".into(),
+                "one or more proving messages were edited, deleted, or expired".into(),
+            ),
+        ]);
+        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
+        return;
+    }
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();
     for (channel, message) in &found.messages {
@@ -260,6 +311,18 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             matches!(outcome, CaseOutcome::Succeeded),
         );
         delete_notes.push(format!("{channel}/{message} {outcome:?}"));
+        crate::cases::record(
+            app,
+            Some(enrollment.clone()),
+            CaseAction::Delete,
+            outcome,
+            found.author,
+            None,
+            Some(found.reason.clone()),
+            message_evidence(&found.excerpts, *channel, *message, found.author),
+            crate::cases::application_source(),
+        )
+        .await;
     }
     let mut ban_outcome = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
@@ -289,7 +352,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             now,
             matches!(outcome, CaseOutcome::Succeeded),
         );
-        if matches!(outcome, CaseOutcome::Failed) {
+        if matches!(outcome, CaseOutcome::Failed | CaseOutcome::Uncertain) {
             app.release_gateway_case_suppression(suppression);
         }
         if matches!(outcome, CaseOutcome::Succeeded) {
@@ -310,11 +373,7 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
             outcome,
             found.author,
             None,
-            Some(format!(
-                "{}; deletes: {}",
-                found.reason,
-                delete_notes.join("; ")
-            )),
+            Some(found.reason.clone()),
             evidence(found.excerpts),
             crate::cases::application_source(),
         )
@@ -349,6 +408,20 @@ fn delete_outcome(error: &serenity::Error) -> CaseOutcome {
         return CaseOutcome::Succeeded;
     }
     crate::cases::classify_discord(Some(error))
+}
+
+fn message_evidence(
+    excerpts: &[TextEvidence],
+    channel: u64,
+    message: u64,
+    author: u64,
+) -> CaseEvidence {
+    if let Some(item) = excerpts.iter().find(|item| {
+        item.channel_id == channel as i64 && item.message_id == message as i64
+    }) {
+        return CaseEvidence::Text(vec![item.clone()]);
+    }
+    crate::cases::text_excerpt(channel, message, author, "")
 }
 
 fn evidence(excerpts: Vec<TextEvidence>) -> CaseEvidence {
