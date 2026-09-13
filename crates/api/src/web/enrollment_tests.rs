@@ -1630,10 +1630,10 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
 
 #[tokio::test]
 async fn preview_profiles_apply_distinct_permission_views() {
-    for (profile, manage, can_delete) in [
-        ("administrator", true, true),
-        ("moderator", true, false),
-        ("member", false, false),
+    for (profile, can_delete) in [
+        ("administrator", true),
+        ("moderator", false),
+        ("member", false),
     ] {
         let f = Fixture::new(true).await;
         f.enroll(10).await;
@@ -1656,14 +1656,26 @@ async fn preview_profiles_apply_distinct_permission_views() {
 
         let (status, me) = f.request_preview("GET", "/api/me", "", token).await;
         assert_eq!(status, StatusCode::OK, "{profile}: {me}");
-        assert_eq!(me["guilds"][0]["manage"], manage, "{profile}: {me}");
         assert_eq!(me["preview"]["profile"], profile);
 
         let (status, cases) = f
             .request_preview("GET", "/api/guilds/10/cases", "", token)
             .await;
-        assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
-        assert_eq!(cases["can_delete"], can_delete, "{profile}: {cases}");
+        if profile == "member" {
+            assert!(me["guilds"].as_array().unwrap().is_empty(), "{me}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{cases}");
+            assert!(
+                cases["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("MANAGE_GUILD"),
+                "{cases}"
+            );
+        } else {
+            assert_eq!(me["guilds"][0]["manage"], true, "{profile}: {me}");
+            assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
+            assert_eq!(cases["can_delete"], can_delete, "{profile}: {cases}");
+        }
     }
 }
 

@@ -856,7 +856,30 @@ test('preview fragment remains fail-closed when session storage is blocked', asy
   assert.equal(h.app.currentPreviewToken(), 'fragment-token');
   await h.app.api('/api/me');
   assert.equal(headers['x-jmodguard-preview'], 'fragment-token');
-  assert.equal(h.historyUrls.at(-1), '/');
+  assert.equal(h.historyUrls.length, 0);
+
+  let reloadHeaders;
+  const reloaded = harness(async (_url, options) => {
+    reloadHeaders = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), blocked);
+  reloaded.location.hash = h.location.hash;
+  reloaded.app.capturePreviewToken();
+  await reloaded.app.api('/api/me');
+  assert.equal(reloadHeaders['x-jmodguard-preview'], 'fragment-token');
+});
+
+test('preview bearer is not accepted from a query string', async () => {
+  let headers;
+  const h = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  });
+  h.location.search = '?preview=query-token';
+  h.app.capturePreviewToken();
+  assert.equal(h.app.currentPreviewToken(), null);
+  await h.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], undefined);
 });
 
 test('expired preview clears the bearer and leaves the preview tab', async () => {

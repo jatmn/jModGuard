@@ -119,22 +119,23 @@ function isBotOwner() {
 let previewTokenFallback = null;
 
 function capturePreviewToken() {
-  const query = new URLSearchParams(location.search);
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
-  const token = fragment.get("preview") || query.get("preview");
+  const token = fragment.get("preview");
   if (!token) return;
   // Keep an in-memory source of truth before touching browser storage. A
   // blocked sessionStorage must never silently restore the owner's write access.
   previewTokenFallback = token;
+  let persisted = false;
   try {
     window.sessionStorage.setItem("jmodguard_preview", token);
+    persisted = window.sessionStorage.getItem("jmodguard_preview") === token;
   } catch (_) { /* The in-memory fallback remains active for this tab. */ }
-  query.delete("preview");
+  // Keep the fragment as a reload-safe source when storage cannot be read back.
+  if (!persisted) return;
   fragment.delete("preview");
-  const qs = query.toString();
   const hash = fragment.toString();
   try {
-    history.replaceState({}, "", location.pathname + (qs ? `?${qs}` : "") + (hash ? `#${hash}` : ""));
+    history.replaceState({}, "", location.pathname + location.search + (hash ? `#${hash}` : ""));
   } catch (_) { /* Header attachment still uses the in-memory token. */ }
 }
 

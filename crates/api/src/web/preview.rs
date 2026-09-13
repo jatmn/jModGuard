@@ -234,7 +234,3 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
     auth.guilds = vec![guild];
     Ok(())
 }
-
-pub fn authorizes_guild(guild_id: u64) -> bool {
-    current().is_some_and(|preview| preview.guild_id == guild_id)
-}
