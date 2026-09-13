@@ -144,10 +144,17 @@ to match `bot.owner_id` (non-zero) for:
 - request body `"scope": "global"`;
 - deleting a global badword row.
 
-`/api/me` includes `is_bot_owner`. The SPA hides Global scope controls and the
+`/api/me` includes `is_bot_owner`, optional `conductor_url`, and `preview` when this
+tab is a read-only permission preview. The SPA hides Global scope controls and the
 global-prefix card when that flag is false. Guild admins still see global
 badwords (read-only) because the bot enforces them. Badword list entries include
 `valid` / `error` — patterns that fail compile limits are shown as **not enforced**.
+
+The configured bot owner can open **View as…** for a guild they can manage. That new
+tab sends `x-jmodguard-preview` and shows **Preview — changes disabled**. The original
+owner tab keeps write access. Preview never makes `is_bot_owner` true. An
+Administration link appears only when `web.conductor_url` / `JMODGUARD_CONDUCTOR_URL`
+is set; that origin uses a separate conductor login.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / settings) from
@@ -168,7 +175,9 @@ The UI talks to a JSON API under `/api/...`; every guild endpoint checks the
 session can manage that guild (or bot ownership for global scope):
 
 ```
-GET    /api/me                         # includes is_bot_owner
+GET    /api/me                         # includes is_bot_owner, conductor_url, preview
+POST   /api/preview                    # owner-only; returns a tab-scoped preview token
+DELETE /api/preview                    # exit preview; owner session is unchanged
 GET    /api/guilds/{id}/config
 PUT    /api/guilds/{id}/settings
 GET    /api/guilds/{id}/rules/{rule}          PUT/DELETE …

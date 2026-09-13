@@ -3,6 +3,7 @@
 pub mod api;
 pub mod cases;
 pub mod oauth;
+pub mod preview;
 pub mod state;
 
 use axum::extract::Query;
@@ -83,6 +84,17 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        if self.0.is::<preview::PreviewDenied>() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "preview is read-only",
+                    "code": "preview_read_only"
+                })),
+            )
+                .into_response();
+        }
+
         if let Some(key_error) = self.0.downcast_ref::<crate::bot_actions::RequestKeyError>() {
             let (status, code) = match key_error {
                 crate::bot_actions::RequestKeyError::EnrollmentChanged => {
@@ -157,7 +169,11 @@ impl AuthCtx {
 }
 
 /// True when the session user is the configured bot owner (`bot.owner_id` ≠ 0).
+/// Preview sessions never inherit owner authority.
 pub fn is_bot_owner(app: &ApiState, auth: &AuthCtx) -> bool {
+    if preview::current().is_some() {
+        return false;
+    }
     let owner = app.cfg.bot.owner_id;
     owner != 0 && auth.discord_user_id() == owner
 }
@@ -223,11 +239,13 @@ async fn require_auth_with(
             Some(u) => u,
             None => app.oauth.me(&token).await.map_err(ApiError)?,
         };
-        return Ok(AuthCtx {
+        let mut auth = AuthCtx {
             user,
             guilds,
             enrollment: None,
-        });
+        };
+        preview::apply_overlay(&mut auth)?;
+        return Ok(auth);
     }
 
     // Authorization / cold display: always re-fetch guilds from Discord.
@@ -269,11 +287,13 @@ async fn require_auth_with(
 
     app.guild_cache.insert(user_id, (now, guilds.clone()));
     app.user_cache.insert(user_id, (now, user.clone()));
-    Ok(AuthCtx {
+    let mut auth = AuthCtx {
         user,
         guilds,
         enrollment: None,
-    })
+    };
+    preview::apply_overlay(&mut auth)?;
+    Ok(auth)
 }
 
 fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
@@ -634,6 +654,15 @@ async fn api_me(
         },
         "guilds": guilds,
         "is_bot_owner": is_bot_owner(&state, &auth),
+        "conductor_url": if state.cfg.web.conductor_url.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(state.cfg.web.conductor_url.clone())
+        },
+        "preview": preview::current().map(|preview| serde_json::json!({
+            "guild_id": preview.guild_id.to_string(),
+            "profile": preview.profile,
+        })),
     })))
 }
 
@@ -750,6 +779,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/logout", axum::routing::post(logout))
         .route("/oauth/callback", get(callback))
         .route("/api/me", get(api_me))
+        .route(
+            "/api/preview",
+            axum::routing::post(preview::launch).delete(preview::exit),
+        )
         .route("/api/guilds/{guild_id}/config", get(api::guild_config))
         .route(
             "/api/guilds/{guild_id}/settings",
@@ -838,6 +871,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             get(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
         )
         .layer(session_layer)
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            preview::middleware,
+        ))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,
             NO_STORE,
@@ -863,6 +900,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
                 axum::http::header::ACCEPT,
                 axum::http::header::COOKIE,
                 axum::http::HeaderName::from_static("x-jmodguard-enrollment"),
+                axum::http::HeaderName::from_static("x-jmodguard-preview"),
             ])
             .allow_credentials(true);
         sessioned.layer(cors)

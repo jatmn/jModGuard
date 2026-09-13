@@ -116,6 +116,27 @@ function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
 }
 
+function capturePreviewToken() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const fromUrl = params.get("preview");
+    if (fromUrl) {
+      window.sessionStorage.setItem("jmodguard_preview", fromUrl);
+      params.delete("preview");
+      const qs = params.toString();
+      history.replaceState({}, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
+    }
+  } catch (_) { /* Preview token stays in the URL if storage is blocked. */ }
+}
+
+function currentPreviewToken() {
+  try { return window.sessionStorage.getItem("jmodguard_preview"); } catch (_) { return null; }
+}
+
+function isPreview() {
+  return !!(state.me && state.me.preview);
+}
+
 /** Scope <select> options — Global only for the configured bot owner. */
 function scopeSelect(guildLabel = "This server only", globalLabel = "Global (all servers)", allowGlobal = true) {
   const opts = [el("option", { value: "guild", text: guildLabel })];
@@ -217,6 +238,8 @@ async function api(path, method = "GET", body = null, signal) {
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
   const enrollment = pageEnrollment(path, method);
   if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
+  const preview = currentPreviewToken();
+  if (preview) opts.headers["x-jmodguard-preview"] = preview;
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -245,6 +268,8 @@ async function downloadPrivate(path, filename) {
   const opts = { method: "GET", headers: {}, credentials: "include", cache: "no-store" };
   const enrollment = pageEnrollment(path, "GET");
   if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
+  const preview = currentPreviewToken();
+  if (preview) opts.headers["x-jmodguard-preview"] = preview;
   const res = await fetch(apiUrl(path), opts);
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
@@ -407,6 +432,7 @@ async function init() {
     });
     if (!await loadConfig()) return;
     renderTab();
+    bindOwnerTools();
   } catch (e) {
     if (isUnauthenticated(e)) {
       showView("login-view");
@@ -499,6 +525,49 @@ function renderTab() {
   }
   restoreDrafts();
   updateWorkspaceStatus();
+  const banner = $("#preview-banner");
+  if (banner) banner.classList.toggle("hidden", !isPreview());
+  if (isPreview()) {
+    const status = $("#workspace-status");
+    if (status) status.textContent = "Preview — changes disabled";
+  }
+}
+
+function bindOwnerTools() {
+  const tools = $("#owner-tools");
+  if (!tools) return;
+  if (isPreview()) {
+    tools.classList.remove("hidden");
+    tools.replaceChildren(el("button", { class: "btn small", text: "Exit preview", onclick: async () => {
+      try { await api("/api/preview", "DELETE"); } catch (_) {}
+      try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+      window.location = "/";
+    } }));
+    return;
+  }
+  if (!isBotOwner()) {
+    tools.classList.add("hidden");
+    return;
+  }
+  tools.classList.remove("hidden");
+  const profile = el("select", { "aria-label": "Preview profile" },
+    el("option", { value: "administrator", text: "Administrator" }),
+    el("option", { value: "moderator", text: "Moderator" }),
+    el("option", { value: "member", text: "Member" }),
+  );
+  const children = [
+    el("button", { class: "btn small", text: "View as…", onclick: async () => {
+      if (!state.guildId) { toast("Select a server first", "error"); return; }
+      const launched = await api("/api/preview", "POST", { guild_id: String(state.guildId), profile: profile.value });
+      const url = `${location.pathname}?preview=${encodeURIComponent(launched.token)}`;
+      window.open(url, "_blank", "noopener");
+    } }),
+    profile,
+  ];
+  if (state.me.conductor_url) {
+    children.unshift(el("a", { class: "btn small", href: state.me.conductor_url, target: "_blank", rel: "noopener noreferrer", text: "Administration" }));
+  }
+  tools.replaceChildren(...children);
 }
 
 function bindTabButtons() {
@@ -1696,6 +1765,7 @@ function initTheme() {
 }
 
 function bootUi() {
+  capturePreviewToken();
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
@@ -1710,6 +1780,12 @@ function bootUi() {
   if (logoutBtn) logoutBtn.addEventListener("click", async () => {
     if (!canLeave()) return;
     dirty = false;
+    if (isPreview()) {
+      try { await api("/api/preview", "DELETE"); } catch (_) {}
+      try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+      window.location = "/";
+      return;
+    }
     try {
       const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
       const data = await res.json();

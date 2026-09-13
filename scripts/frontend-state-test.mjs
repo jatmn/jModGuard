@@ -31,10 +31,12 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
+    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location: { search: '', pathname: '/', hash: '' }, open() {} },
+    location: { search: '', pathname: '/', hash: '' },
+    history: { replaceState() {} },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -819,4 +821,15 @@ test('note retry retains intent after a lost response and blocks overlapping sub
   note.value = 'different note';
   await submit.listeners.click();
   assert.notEqual(posts[2].entry_id,posts[0].entry_id);
+});
+
+test('preview token is sent on API requests from this tab', async () => {
+  let headers;
+  const { app, session } = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  });
+  session.set('jmodguard_preview', 'preview-token');
+  await app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'preview-token');
 });

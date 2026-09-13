@@ -18,8 +18,9 @@ and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
 - Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
   deployment approval flow remain in place; the conductor is not auto-published or
   required for startup.
-- The conductor has no operational API and must not be deployed as an update/recovery
-  service. Its addition does not establish production tenant isolation or resource usage.
+- The conductor can serve owner Administration when configured. It is not a backup
+  or update service and must not be deployed as one. Guild credentials and tenant
+  routing stay out of this process.
 
 The target has three Rust services (Discord bot, guild API and installation conductor)
 and a static WebUI. Generic setup, releases and recovery tooling will live in this
@@ -36,8 +37,10 @@ does not import old databases. The fuller tenant/case model remains a later chan
   module paths. Their startup, health and shutdown behavior remains covered by tests.
 - The conductor has separate process configuration, a single-thread async runtime,
   stdout logging, liveness/version endpoints and a configurable shutdown grace.
-  Operational readiness remains unavailable until the control system is configured
-  and implemented. No update, backup, restore or login endpoint is enabled yet.
+  When a control store, conductor OAuth client and operator identity are configured,
+  `/ready` becomes 200 and owner Administration (settings, status, telemetry,
+  notifications) is available. Backup, update and guild-move controls stay inactive.
+  The conductor still does not import the application crate, Serenity or tenant routing.
 - CI checks that the conductor/runtime dependency trees do not include the application
   crate, bot/API service crates or Serenity. It tests the actual conductor process with
   local HTTP and process signals. Existing frontend and application checks remain.
@@ -377,10 +380,8 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Complete image and independent text spam rules with truthful cases/evidence and
-   selected Discord logging (R2).
-2. Usable conductor and owner administration (R3).
-3. Backup/restore, guild moves, releases and public installation (R4–R8).
+1. Backup/restore (R4).
+2. Guild moves, releases and public installation (R5–R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
@@ -400,5 +401,15 @@ message IDs, trimmed excerpts). The WebUI exposes those choices. No new dependen
 versions, schema changes or SQL message archival.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md) for limits and coverage.
 
-Discord attachment object capture into the evidence backend, conductor administration
-and populated-guild moves remain later work.
+Discord attachment object capture into the evidence backend and populated-guild
+moves remain later work.
+
+## Implemented: conductor owner administration
+
+The conductor can open a local control store and verify the installation operator
+through a Discord OAuth client independent of the guild API. Sessions are durable
+and revocable. Administration covers applied conductor settings, service health
+probes, bounded telemetry and owner webhook notifications. Backup and update buttons
+are not exposed. The guild WebUI offers owner-only View as… preview in a separate
+tab; preview requests cannot write and never inherit owner authority.
+See [CONDUCTOR.md](CONDUCTOR.md).

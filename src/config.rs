@@ -52,6 +52,9 @@ pub struct WebConfig {
     /// Empty = same-origin only (no CORS layer). Env: `JMODGUARD_CORS_ORIGINS`
     /// (comma-separated).
     pub cors_origins: Vec<String>,
+    /// Public conductor origin for the owner Administration link. Empty = hidden.
+    /// Env: `JMODGUARD_CONDUCTOR_URL`. This is not a conductor session or secret.
+    pub conductor_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,6 +264,7 @@ impl Default for WebConfig {
             oauth_client_id: String::new(),
             oauth_client_secret: String::new(),
             cors_origins: Vec::new(),
+            conductor_url: String::new(),
         }
     }
 }
@@ -746,6 +750,21 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            if let Ok(v) = env::var("JMODGUARD_CONDUCTOR_URL") {
+                let v = v.trim().trim_end_matches('/').to_string();
+                if !v.is_empty() {
+                    let url = url::Url::parse(&v).context("JMODGUARD_CONDUCTOR_URL")?;
+                    anyhow::ensure!(
+                        url.scheme() == "http" || url.scheme() == "https",
+                        "JMODGUARD_CONDUCTOR_URL must be http or https"
+                    );
+                    anyhow::ensure!(
+                        url.username().is_empty() && url.password().is_none(),
+                        "JMODGUARD_CONDUCTOR_URL must not contain credentials"
+                    );
+                    self.web.conductor_url = v;
+                }
+            }
         }
         if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
             let v = v.trim();
@@ -1161,6 +1180,7 @@ mod tests {
             "JMODGUARD_OAUTH_CLIENT_SECRET",
             "JMODGUARD_WEB_BASE_URL",
             "JMODGUARD_DISCORD_TOKEN",
+            "JMODGUARD_CONDUCTOR_URL",
         ];
         let _saved = SavedEnv::capture(NAMES);
         unsafe {
@@ -1168,6 +1188,7 @@ mod tests {
             std::env::set_var("JMODGUARD_OAUTH_CLIENT_SECRET", "oauth-secret");
             std::env::set_var("JMODGUARD_WEB_BASE_URL", "https://dashboard.invalid/");
             std::env::set_var("JMODGUARD_DISCORD_TOKEN", " bot-secret ");
+            std::env::set_var("JMODGUARD_CONDUCTOR_URL", "http://127.0.0.1:8081");
         }
         let mut bot = Config::default();
         bot.apply_env_for(false).unwrap();
@@ -1175,9 +1196,11 @@ mod tests {
         api.apply_env_for(true).unwrap();
         assert!(bot.web.oauth_client_id.is_empty());
         assert!(bot.web.oauth_client_secret.is_empty());
+        assert!(bot.web.conductor_url.is_empty());
         assert_eq!(api.web.oauth_client_id, "oauth-id");
         assert_eq!(api.web.oauth_client_secret, "oauth-secret");
         assert_eq!(api.web.base_url, "https://dashboard.invalid");
+        assert_eq!(api.web.conductor_url, "http://127.0.0.1:8081");
         assert_eq!(bot.discord.token, "bot-secret");
         assert!(api.discord.token.is_empty());
     }

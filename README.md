@@ -6,8 +6,8 @@
 `jmodguard-core-1` family. Earlier databases/backups require their matching old release;
 they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
 
-An optional conductor foundation is available for local development; operational
-updates and backups are still pending. The existing bot/API installation does not
+An optional conductor can serve owner Administration locally when configured;
+backups and updates are still pending. The existing bot/API installation does not
 require it. See [implementation status](docs/OVERHAUL.md).
 
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
@@ -137,7 +137,7 @@ crates/api/src/            HTTP/OAuth API and dashboard state
 crates/api/tests/          actual API startup regression
 crates/integration-tests/  shared-DB, cross-service and optional remote-libSQL regressions
 crates/runtime/            shared process health/shutdown utilities
-crates/conductor/          independent control-service foundation (operational API pending)
+crates/conductor/          independent control service (owner Administration; backups pending)
 frontend/                  static dashboard (Bunny Storage/CDN or local API embed)
 migrations/                jmodguard-core-1, steps 0001–0009
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor

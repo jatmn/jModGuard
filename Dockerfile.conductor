@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for jmodguard-conductor.
-# Development control-service image. /health is liveness; /ready remains 503
-# until authenticated control operations and installation setup are implemented.
+# Development control-service image. /health is liveness; /ready is 200 only
+# when the control store, OAuth client and operator identity are configured.
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app
