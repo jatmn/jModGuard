@@ -1200,7 +1200,7 @@ async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Polic
                     guild,
                     author,
                     channel,
-                    enforce: current_policy.enforce,
+                    policy: crate::spam_actions::MatchPolicy::Image(current_policy),
                     token,
                     messages,
                     excerpts,

@@ -1,5 +1,5 @@
 //! Bounded exact-text observations. Punishment uses `spam_actions`, not automod.
-use crate::spam_actions::{self, Kind};
+use crate::spam_actions::{self, Kind, MatchPolicy};
 use crate::state::{BotState, CachedGuildConfig};
 use jmodguard::db::guild_data::TextEvidence;
 use jmodguard::text_spam::{self, Policy};
@@ -780,7 +780,7 @@ fn consider(
                     guild,
                     author,
                     channel,
-                    enforce: policy.enforce,
+                    policy: MatchPolicy::Text(policy.clone()),
                     token,
                     messages,
                     excerpts,

@@ -16,7 +16,7 @@ pub enum Kind {
     Text,
 }
 
-enum MatchPolicy {
+pub enum MatchPolicy {
     Image(jmodguard::image_spam::Policy),
     Text(jmodguard::text_spam::Policy),
 }
@@ -70,7 +70,7 @@ pub struct Match {
     pub guild: u64,
     pub author: u64,
     pub channel: u64,
-    pub enforce: bool,
+    pub policy: MatchPolicy,
     pub token: (u64, u64),
     pub messages: Vec<(u64, u64)>,
     pub excerpts: Vec<TextEvidence>,
@@ -181,11 +181,8 @@ pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
         Kind::Image => ("attachment_flood", "Exact image spam"),
         Kind::Text => ("repeat_text", "Repeated text"),
     };
-    if !found.enforce {
-        let Some(policy) = current_policy(app, &found, rule).await else {
-            return;
-        };
-        if policy.enforce() || !policy.still_proving(app, &found, Instant::now()) {
+    if !found.policy.enforce() {
+        if !found.policy.still_proving(app, &found, Instant::now()) {
             return;
         }
         let vars = BTreeMap::from([
@@ -208,19 +205,6 @@ pub async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) {
         return;
     }
     enforce(app, ctx, found, rule, name).await;
-}
-
-async fn current_policy(app: &Arc<BotState>, found: &Match, rule: &str) -> Option<MatchPolicy> {
-    app.poll_config_version().await.ok()?;
-    let cfg = app.configs.get(&app.db, found.guild).await.ok()?;
-    if (cfg.version, cfg.durable_version) != found.token {
-        return None;
-    }
-    let rule = cfg.rules.get(rule)?;
-    if !rule.enabled {
-        return None;
-    }
-    MatchPolicy::parse(found.kind, rule)
 }
 
 async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, name: &str) {
