@@ -14,6 +14,21 @@ use std::{
 
 const KEEP: Duration = Duration::from_secs(660);
 type Key = (u64, u64, u64); // guild/channel/message
+
+#[derive(Clone)]
+enum AdmitOutcome {
+    Unchanged,
+    Admitted,
+    Matched(Job),
+    Rejected,
+}
+
+#[derive(Clone)]
+enum ReplaceOutcome {
+    Unchanged,
+    Updated(Option<Job>),
+}
+
 #[derive(Clone)]
 struct Post {
     id: u64,
@@ -214,6 +229,7 @@ pub struct Detector {
     slots: Arc<tokio::sync::Semaphore>,
     dropped: std::sync::atomic::AtomicU64,
 }
+#[derive(Clone)]
 struct Job {
     guild: u64,
     author: u64,
@@ -369,10 +385,10 @@ impl Detector {
         policy: &Policy,
         now: Instant,
         replace: bool,
-    ) -> Option<Job> {
+    ) -> AdmitOutcome {
         let mut state = self.state.lock();
         if post.revision != state.revision {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let key = (guild, post.channel, post.id);
         // Expire this author in O(posts), keeping a bounded ID watermark
@@ -414,14 +430,17 @@ impl Detector {
                 .map(|b| b.retired_before)
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
-        if replace
-            && let Some(job) =
-                replace_existing(&mut state, guild, author, &post, token, policy, now)
+        if replace && let Some(outcome) =
+            replace_existing(&mut state, guild, author, &post, token, policy, now)
         {
-            return job;
+            return match outcome {
+                ReplaceOutcome::Unchanged => AdmitOutcome::Unchanged,
+                ReplaceOutcome::Updated(None) => AdmitOutcome::Admitted,
+                ReplaceOutcome::Updated(Some(job)) => AdmitOutcome::Matched(job),
+            };
         }
         if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let exists = state
             .guilds
@@ -435,7 +454,7 @@ impl Detector {
                     .is_some_and(|g| g.authors.len() >= self.limits.max_authors_per_guild))
         {
             self.capacity_drop();
-            return None;
+            return AdmitOutcome::Rejected;
         }
         post.cost = 256
             + post
@@ -451,10 +470,13 @@ impl Detector {
             || post.cost > self.limits.metadata_bytes_per_guild
         {
             self.capacity_drop();
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let cost = post.cost;
-        let serial = state.serial.checked_add(1)?;
+        let serial = match state.serial.checked_add(1) {
+            Some(serial) => serial,
+            None => return AdmitOutcome::Rejected,
+        };
         state.serial = serial;
         post.serial = serial;
         let g = state.guilds.entry(guild).or_insert_with(|| Guild {
@@ -479,7 +501,7 @@ impl Detector {
         b.token = token;
         if b.posts.len() >= self.limits.max_posts_per_author {
             self.capacity_drop();
-            return None;
+            return AdmitOutcome::Rejected;
         }
         b.window = Duration::from_secs(policy.window_secs);
         b.last_seen = now;
@@ -491,32 +513,10 @@ impl Detector {
         }
         state.index.insert(key, author);
         let b = &state.guilds[&guild].authors[&author];
-        if now < b.reported_until {
-            return None;
+        match candidate_job(guild, author, token, b, policy, now) {
+            Some(job) => AdmitOutcome::Matched(job),
+            None => AdmitOutcome::Admitted,
         }
-        let posts: Vec<_> = b
-            .posts
-            .iter()
-            .filter(|p| live(p, policy, now))
-            .cloned()
-            .collect();
-        // Metadata is only a cheap gate. It can never produce a verified report.
-        if posts
-            .iter()
-            .map(|p| p.channel)
-            .collect::<BTreeSet<_>>()
-            .len()
-            < policy.min_channels
-            || !size_candidate(&posts, policy.min_attachments)
-        {
-            return None;
-        }
-        Some(Job {
-            guild,
-            author,
-            token,
-            posts,
-        })
     }
     fn reserve(&self, job: &Job, policy: &Policy, now: Instant) -> bool {
         let files = job
@@ -653,7 +653,7 @@ fn replace_existing(
     token: (u64, u64),
     policy: &Policy,
     now: Instant,
-) -> Option<Option<Job>> {
+) -> Option<ReplaceOutcome> {
     let key = (guild, post.channel, post.id);
     if state.index.get(&key).copied() != Some(author) {
         return None;
@@ -665,7 +665,7 @@ fn replace_existing(
         .iter_mut()
         .find(|p| p.id == post.id && p.channel == post.channel)?;
     if file_key(old) == file_key(post) || post.edited_ms < old.edited_ms {
-        return Some(None);
+        return Some(ReplaceOutcome::Unchanged);
     }
     g.bytes = g.bytes.saturating_sub(old.cost);
     state.bytes = state.bytes.saturating_sub(old.cost);
@@ -685,7 +685,47 @@ fn replace_existing(
     state.bytes += old.cost;
     b.token = token;
     b.last_seen = now;
-    Some(candidate_job(guild, author, token, b, policy, now))
+    Some(ReplaceOutcome::Updated(candidate_job(guild, author, token, b, policy, now)))
+}
+
+fn apply_admit_outcome(
+    detector: &Detector,
+    outcome: AdmitOutcome,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    replace: bool,
+) -> Option<Job> {
+    match outcome {
+        AdmitOutcome::Unchanged | AdmitOutcome::Admitted => None,
+        AdmitOutcome::Rejected => {
+            if replace {
+                detector.invalidate(guild, channel, message);
+            }
+            None
+        }
+        AdmitOutcome::Matched(job) => Some(job),
+    }
+}
+
+fn spawn_image_job(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    detector: &Detector,
+    job: Job,
+    policy: Policy,
+    channel: u64,
+) {
+    let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
+        detector.capacity_drop();
+        return;
+    };
+    let app = Arc::clone(app);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_job(&app, &ctx, job, policy, channel).await;
+    });
 }
 
 fn live(p: &Post, policy: &Policy, now: Instant) -> bool {
@@ -847,7 +887,7 @@ pub fn observe(
         }
     }
     let token = (cfg.version, cfg.durable_version);
-    let Some(job) = detector.admit(
+    let outcome = detector.admit(
         guild.get(),
         msg.author.id.get(),
         Post {
@@ -866,23 +906,10 @@ pub fn observe(
         &policy,
         received,
         false,
-    ) else {
-        return;
-    };
-    // No wait queue and no task retaining Message/content. Capacity is acquired
-    // before spawning; the permit bounds hashing, reconciliation and log delivery.
-    let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
-        detector.capacity_drop();
-        return;
-    };
-    let app = Arc::clone(app);
-    let ctx = ctx.clone();
-    let channel = msg.channel_id.get();
-    tokio::spawn(async move {
-        let _permit = permit;
-        // Hashing is bounded inside run_job; report/enforce carry their own per-op deadlines.
-        run_job(&app, &ctx, job, policy, channel).await;
-    });
+    );
+    if let Some(job) = apply_admit_outcome(detector, outcome, guild.get(), msg.channel_id.get(), msg.id.get(), false) {
+        spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
+    }
 }
 
 pub fn observe_update(
@@ -979,7 +1006,7 @@ pub fn observe_update(
         return;
     };
     let token = (cfg.version, cfg.durable_version);
-    let Some(job) = detector.admit(
+    let outcome = detector.admit(
         guild.get(),
         author,
         Post {
@@ -998,21 +1025,10 @@ pub fn observe_update(
         &policy,
         received,
         true,
-    ) else {
-        detector.invalidate(guild_id, channel, message);
-        return;
-    };
-    let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
-        detector.capacity_drop();
-        return;
-    };
-    let app = Arc::clone(app);
-    let ctx = ctx.clone();
-    let channel = event.channel_id.get();
-    tokio::spawn(async move {
-        let _permit = permit;
-        run_job(&app, &ctx, job, policy, channel).await;
-    });
+    );
+    if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
+        spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get());
+    }
 }
 
 async fn run_job(app: &Arc<BotState>, ctx: &Context, mut job: Job, policy: Policy, channel: u64) {
@@ -1202,7 +1218,10 @@ mod tests {
     fn admit(d: &Detector, id: u64, channel: u64, at: Instant) -> Option<Job> {
         let mut p = post(id, channel, at, &[1, 2]);
         p.revision = d.revision();
-        d.admit(1, 2, p, (0, 0), &policy(), at, false)
+        match d.admit(1, 2, p, (0, 0), &policy(), at, false) {
+            AdmitOutcome::Matched(job) => Some(job),
+            _ => None,
+        }
     }
     fn job(d: &Detector, at: Instant) -> Job {
         assert!(admit(d, 10, 100, at).is_none());
@@ -1216,7 +1235,10 @@ mod tests {
         let mut p = post(1, 1, now, &[1, 2]);
         p.revision = d.revision();
         d.invalidate(1, 1, 1); // The create callback has not reached admission yet.
-        assert!(d.admit(1, 2, p, (0, 0), &policy(), now, false).is_none());
+        assert!(matches!(
+            d.admit(1, 2, p, (0, 0), &policy(), now, false),
+            AdmitOutcome::Rejected
+        ));
         assert!(d.state.lock().index.is_empty());
     }
 
@@ -1227,16 +1249,20 @@ mod tests {
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         first.edited_ms = 1;
-        assert!(
-            d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false)
-                .is_none()
-        );
+        assert!(matches!(
+            d.admit(1, 2, first.clone(), (0, 0), &policy(), now, false),
+            AdmitOutcome::Admitted
+        ));
         let mut same = first.clone();
         same.edited_ms = 5;
         same.at = now + Duration::from_secs(1);
         same.revision = d.revision();
-        assert!(d.admit(1, 2, same, (0, 0), &policy(), now, true).is_none());
+        assert!(matches!(
+            d.admit(1, 2, same, (0, 0), &policy(), now, true),
+            AdmitOutcome::Unchanged
+        ));
         assert_eq!(d.state.lock().guilds[&1].authors[&2].posts[0].at, now);
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         let mut changed = first;
         changed.at = now + Duration::from_secs(2);
         changed.edited_ms = 9;
@@ -1260,14 +1286,38 @@ mod tests {
             )
             .unwrap(),
         ];
-        assert!(
-            d.admit(1, 2, changed, (0, 0), &policy(), now, true)
-                .is_none()
-        );
+        assert!(matches!(
+            d.admit(1, 2, changed, (0, 0), &policy(), now, true),
+            AdmitOutcome::Admitted
+        ));
         let stored = &d.state.lock().guilds[&1].authors[&2].posts[0];
         assert_eq!(file_key(stored), vec![(50, 3), (51, 3)]);
         assert!(stored.hashes.is_none());
         assert_eq!(stored.at, now + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn apply_admit_outcome_preserves_unchanged_and_rejects_stale() {
+        let d = Detector::new(Limits::default()).unwrap();
+        let now = Instant::now();
+        let mut first = post(1, 10, now, &[1, 2]);
+        first.revision = d.revision();
+        assert!(matches!(
+            d.admit(1, 2, first, (0, 0), &policy(), now, false),
+            AdmitOutcome::Admitted
+        ));
+        assert!(apply_admit_outcome(
+            &d,
+            AdmitOutcome::Unchanged,
+            1,
+            10,
+            1,
+            true
+        )
+        .is_none());
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
+        assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
+        assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
     }
 
     #[test]
@@ -1317,7 +1367,7 @@ mod tests {
         let d = Detector::new(Limits::default()).unwrap();
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(admit(&d, 2, 10, now).is_none());
-        assert!(
+        assert!(matches!(
             d.admit(
                 2,
                 2,
@@ -1326,10 +1376,10 @@ mod tests {
                 &policy(),
                 now,
                 false
-            )
-            .is_none()
-        );
-        assert!(
+            ),
+            AdmitOutcome::Admitted
+        ));
+        assert!(matches!(
             d.admit(
                 1,
                 3,
@@ -1338,9 +1388,9 @@ mod tests {
                 &policy(),
                 now,
                 false
-            )
-            .is_none()
-        );
+            ),
+            AdmitOutcome::Admitted
+        ));
         assert!(admit(&d, 5, 11, now).is_none());
         let mut j = admit(&d, 6, 12, now).unwrap();
         for (i, p) in j.posts.iter_mut().enumerate() {
@@ -1442,7 +1492,7 @@ mod tests {
         let now = Instant::now();
         let d = Detector::new(Limits::default()).unwrap();
         let j = job(&d, now);
-        assert!(
+        assert!(matches!(
             d.admit(
                 1,
                 2,
@@ -1451,9 +1501,9 @@ mod tests {
                 &policy(),
                 now,
                 false
-            )
-            .is_none()
-        );
+            ),
+            AdmitOutcome::Admitted
+        ));
         assert_eq!(d.complete(j, &policy(), false, now), None);
         let s = d.state.lock();
         let b = &s.guilds[&1].authors[&2];
@@ -1492,7 +1542,7 @@ mod tests {
             p.hashes = None;
         }
         assert!(!d.reserve(&j, &policy(), now)); // six files, five request budget
-        assert!(
+        assert!(matches!(
             d.admit(
                 2,
                 2,
@@ -1501,9 +1551,9 @@ mod tests {
                 &policy(),
                 now,
                 false
-            )
-            .is_none()
-        );
+            ),
+            AdmitOutcome::Rejected
+        ));
         assert_eq!(d.state.lock().authors, 1);
         let mut b = Budget::new(now);
         assert!(b.fits(now, 3, 10, 3, 10));
@@ -1527,7 +1577,7 @@ mod tests {
         })
         .unwrap();
         assert!(admit(&d, 1, 10, now).is_none());
-        assert!(
+        assert!(matches!(
             d.admit(
                 1,
                 3,
@@ -1536,14 +1586,17 @@ mod tests {
                 &policy(),
                 now,
                 false
-            )
-            .is_none()
-        );
+            ),
+            AdmitOutcome::Rejected
+        ));
         d.invalidate_author(1, 2);
         assert_eq!(d.state.lock().authors, 0);
         let mut p = post(3, 12, now, &[1, 2]);
         p.revision = d.revision();
-        assert!(d.admit(1, 3, p, (0, 0), &policy(), now, false).is_none());
+        assert!(matches!(
+            d.admit(1, 3, p, (0, 0), &policy(), now, false),
+            AdmitOutcome::Admitted
+        ));
         {
             let s = d.state.lock();
             assert!(s.guilds[&1].authors.contains_key(&3));

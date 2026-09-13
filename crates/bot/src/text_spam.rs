@@ -23,6 +23,20 @@ const MAX_BYTES_GUILD: usize = 1024 * 1024;
 const MAX_TEXT: usize = 4000;
 type Key = (u64, u64, u64);
 
+/// Admission result for a single observe/consider call. Wrappers map this to
+/// invalidate / report / no-op; do not overload `Option` for multiple meanings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AdmitOutcome {
+    /// Replace path saw the same trimmed text; keep the indexed observation.
+    Unchanged,
+    /// Observation stored or updated; no cross-channel match yet.
+    Admitted,
+    /// Cross-channel threshold met.
+    Matched(Vec<(u64, u64)>),
+    /// Update could not be stored (capacity, stale revision, etc.).
+    Rejected,
+}
+
 #[derive(Clone)]
 struct Post {
     id: u64,
@@ -175,6 +189,39 @@ impl Detector {
             })
             .collect()
     }
+    pub(crate) fn begin_report_window(
+        &self,
+        guild: u64,
+        author: u64,
+        window_secs: u64,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let Some(b) = state
+            .guilds
+            .get_mut(&guild)
+            .and_then(|g| g.authors.get_mut(&author))
+        else {
+            return false;
+        };
+        if now < b.reported_until {
+            return false;
+        }
+        b.reported_until = now + Duration::from_secs(window_secs);
+        true
+    }
+
+    pub(crate) fn abort_report_window(&self, guild: u64, author: u64, now: Instant) {
+        let mut state = self.state.lock();
+        if let Some(b) = state
+            .guilds
+            .get_mut(&guild)
+            .and_then(|g| g.authors.get_mut(&author))
+        {
+            b.reported_until = now;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
     fn admit(
         &self,
@@ -185,10 +232,10 @@ impl Detector {
         policy: &Policy,
         now: Instant,
         replace: bool,
-    ) -> Option<Vec<(u64, u64)>> {
+    ) -> AdmitOutcome {
         let mut state = self.state.lock();
         if post.revision != state.revision {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let key = (guild, post.channel, post.id);
         let window = state
@@ -228,7 +275,7 @@ impl Detector {
                     .position(|p| p.id == post.id && p.channel == post.channel)
             {
                 if b.posts[idx].text == post.text || post.edited_ms < b.posts[idx].edited_ms {
-                    return None;
+                    return AdmitOutcome::Unchanged;
                 }
                 g.bytes = g.bytes.saturating_sub(b.posts[idx].cost);
                 *bytes = bytes.saturating_sub(b.posts[idx].cost);
@@ -240,7 +287,10 @@ impl Detector {
                 g.bytes += b.posts[idx].cost;
                 *bytes += b.posts[idx].cost;
                 b.last_seen = now;
-                return finish_match(b, policy, now);
+                return match detect_match(b, policy, now) {
+                    Some(matched) => AdmitOutcome::Matched(matched),
+                    None => AdmitOutcome::Admitted,
+                };
             }
         }
         let retired_before = state.guilds.get(&guild).and_then(|g| {
@@ -250,7 +300,7 @@ impl Detector {
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
         if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let exists = state
             .guilds
@@ -263,7 +313,7 @@ impl Detector {
                     .get(&guild)
                     .is_some_and(|g| g.authors.len() >= MAX_AUTHORS_PER_GUILD))
         {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         if state.bytes + post.cost > MAX_BYTES
             || state
@@ -271,7 +321,7 @@ impl Detector {
                 .get(&guild)
                 .is_some_and(|g| g.bytes + post.cost > MAX_BYTES_GUILD)
         {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         let State {
             guilds,
@@ -295,7 +345,7 @@ impl Detector {
             reported_until: now,
         });
         if b.posts.len() >= MAX_POSTS {
-            return None;
+            return AdmitOutcome::Rejected;
         }
         b.token = token;
         b.window = Duration::from_secs(policy.window_secs);
@@ -308,17 +358,18 @@ impl Detector {
             *authors += 1;
         }
         index.insert(key, author);
-        finish_match(b, policy, now)
+        match detect_match(b, policy, now) {
+            Some(matched) => AdmitOutcome::Matched(matched),
+            None => AdmitOutcome::Admitted,
+        }
     }
 }
 
-fn finish_match(b: &mut Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
+fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
     if now < b.reported_until {
         return None;
     }
-    let matched = match_posts(b, policy, now)?;
-    b.reported_until = now + Duration::from_secs(policy.window_secs);
-    Some(matched)
+    match_posts(b, policy, now)
 }
 
 fn match_posts(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
@@ -431,6 +482,26 @@ fn drop_stale_update(
 ) {
     if replace {
         detector.invalidate(guild, channel, message);
+    }
+}
+
+fn apply_admit_outcome(
+    detector: &Detector,
+    outcome: AdmitOutcome,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    replace: bool,
+) -> Option<Vec<(u64, u64)>> {
+    match outcome {
+        AdmitOutcome::Unchanged | AdmitOutcome::Admitted => None,
+        AdmitOutcome::Rejected => {
+            if replace {
+                detector.invalidate(guild, channel, message);
+            }
+            None
+        }
+        AdmitOutcome::Matched(messages) => Some(messages),
     }
 }
 
@@ -588,7 +659,7 @@ fn consider(
         return;
     };
     let token = (cfg.version, cfg.durable_version);
-    let Some(messages) = app.text_spam.admit(
+    let outcome = app.text_spam.admit(
         guild,
         author,
         Post {
@@ -604,10 +675,17 @@ fn consider(
         &policy,
         received,
         replace,
-    ) else {
-        drop_stale_update(&app.text_spam, guild, channel, message, replace);
-        return;
+    );
+    let messages = match apply_admit_outcome(&app.text_spam, outcome, guild, channel, message, replace) {
+        Some(messages) => messages,
+        None => return,
     };
+    if !app
+        .text_spam
+        .begin_report_window(guild, author, policy.window_secs, received)
+    {
+        return;
+    }
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     let excerpts = {
@@ -624,39 +702,47 @@ fn consider(
         excerpts
     };
     tokio::spawn(async move {
-        if app.poll_config_version().await.is_err() {
-            return;
+        let delivered = async {
+            if app.poll_config_version().await.is_err() {
+                return false;
+            }
+            let Ok(current) = app.configs.get(&app.db, guild).await else {
+                return false;
+            };
+            if (current.version, current.durable_version) != token {
+                return false;
+            }
+            let Some(rule) = current.rules.get("repeat_text") else {
+                return false;
+            };
+            let Ok(policy) = Policy::parse(rule) else {
+                return false;
+            };
+            spam_actions::report(
+                &app,
+                &ctx,
+                spam_actions::Match {
+                    kind: Kind::Text,
+                    guild,
+                    author,
+                    channel,
+                    enforce: policy.enforce,
+                    messages,
+                    excerpts,
+                    reason: format!(
+                        "Exact trimmed text across {} channels in {} seconds (minimum {} scalars)",
+                        policy.min_channels, policy.window_secs, policy.min_length
+                    ),
+                },
+            )
+            .await;
+            true
         }
-        let Ok(current) = app.configs.get(&app.db, guild).await else {
-            return;
-        };
-        if (current.version, current.durable_version) != token {
-            return;
-        }
-        let Some(rule) = current.rules.get("repeat_text") else {
-            return;
-        };
-        let Ok(policy) = Policy::parse(rule) else {
-            return;
-        };
-        spam_actions::report(
-            &app,
-            &ctx,
-            spam_actions::Match {
-                kind: Kind::Text,
-                guild,
-                author,
-                channel,
-                enforce: policy.enforce,
-                messages,
-                excerpts,
-                reason: format!(
-                    "Exact trimmed text across {} channels in {} seconds (minimum {} scalars)",
-                    policy.min_channels, policy.window_secs, policy.min_length
-                ),
-            },
-        )
         .await;
+        if !delivered {
+            app.text_spam
+                .abort_report_window(guild, author, Instant::now());
+        }
     });
 }
 
@@ -683,33 +769,42 @@ mod tests {
             revision: 0,
         }
     }
+    fn matched(outcome: AdmitOutcome) -> Option<Vec<(u64, u64)>> {
+        match outcome {
+            AdmitOutcome::Matched(messages) => Some(messages),
+            _ => None,
+        }
+    }
+
     #[test]
     fn three_channels_match_and_same_channel_does_not() {
         let d = Detector::default();
         let now = Instant::now();
         let p = policy();
-        assert!(
-            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        let hit = d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false);
+        let hit = matched(
+            d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false),
+        );
         assert_eq!(hit.unwrap().len(), 3);
         let d = Detector::default();
-        assert!(
-            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(2, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(2, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(3, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(3, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
     }
     #[test]
@@ -719,20 +814,53 @@ mod tests {
         let p = policy();
         let mut first = post(1, 10, now, "spam");
         first.revision = d.revision();
-        assert!(
-            d.admit(1, 2, first.clone(), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, first.clone(), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
         let mut same = first.clone();
         same.edited_ms = 5;
         same.at = now + Duration::from_secs(1);
-        assert!(d.admit(1, 2, same, (0, 0), &p, now, true).is_none());
+        assert_eq!(
+            d.admit(1, 2, same, (0, 0), &p, now, true),
+            AdmitOutcome::Unchanged
+        );
         assert_eq!(d.state.lock().guilds[&1].authors[&2].posts[0].at, now);
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         let mut changed = post(1, 10, now + Duration::from_secs(2), "else");
         changed.edited_ms = 9;
         changed.revision = d.revision();
-        assert!(d.admit(1, 2, changed, (0, 0), &p, now, true).is_none());
+        assert_eq!(
+            d.admit(1, 2, changed, (0, 0), &p, now, true),
+            AdmitOutcome::Admitted
+        );
         assert_eq!(d.state.lock().guilds[&1].authors[&2].posts[0].text, "else");
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
+    }
+
+    #[test]
+    fn apply_admit_outcome_preserves_unchanged_and_rejects_stale() {
+        let d = Detector::default();
+        let now = Instant::now();
+        let p = policy();
+        let mut first = post(1, 10, now, "spam");
+        first.revision = d.revision();
+        assert_eq!(
+            d.admit(1, 2, first, (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
+        );
+        assert!(apply_admit_outcome(
+            &d,
+            AdmitOutcome::Unchanged,
+            1,
+            10,
+            1,
+            true
+        )
+        .is_none());
+        assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
+        assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
+        assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
     }
 
     #[test]
@@ -740,19 +868,21 @@ mod tests {
         let d = Detector::default();
         let now = Instant::now();
         let p = policy();
-        assert!(
-            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(3, 12, now, "hello"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(3, 12, now, "hello"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        let hit = d.admit(1, 2, post(4, 13, now, "spam"), (0, 0), &p, now, false);
+        let hit = matched(
+            d.admit(1, 2, post(4, 13, now, "spam"), (0, 0), &p, now, false),
+        );
         assert_eq!(hit.unwrap().len(), 3);
     }
 
@@ -763,14 +893,14 @@ mod tests {
         let mut p = policy();
         p.window_secs = 1;
         let early = now - Duration::from_secs(2);
-        assert!(
-            d.admit(1, 2, post(1, 10, early, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, early, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
         d.prune();
-        assert!(
-            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Rejected
         );
         assert!(d.state.lock().index.is_empty());
     }
@@ -798,9 +928,9 @@ mod tests {
         let p = policy();
         let mut first = post(1, 10, now, "spam");
         first.revision = d.revision();
-        assert!(
-            d.admit(1, 2, first, (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, first, (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         super::drop_stale_update(&d, 1, 10, 1, true);
@@ -814,17 +944,18 @@ mod tests {
         let d = Detector::default();
         let now = Instant::now();
         let p = policy();
-        assert!(
-            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        assert!(
-            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false)
-                .is_none()
+        assert_eq!(
+            d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false),
+            AdmitOutcome::Admitted
         );
-        let hit = d
-            .admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false)
-            .unwrap();
+        let hit = matched(
+            d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false),
+        )
+        .unwrap();
         let excerpts = d.excerpts(1, 2, &hit);
         assert_eq!(excerpts.len(), 3);
         assert!(excerpts.iter().all(|e| e.text == "spam"));

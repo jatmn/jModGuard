@@ -393,54 +393,67 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
-        if let Some(guild) = event.guild_id
-            && let Ok(cfg) = self.app.configs.get(&self.app.db, guild.get()).await
-        {
-            crate::image_spam::observe_update(
-                &self.app,
-                &ctx,
-                &cfg,
-                &event,
-                received,
-                received_at,
-                image_revision,
-            );
-            crate::text_spam::observe_update(
-                &self.app,
-                &ctx,
-                &cfg,
-                &event,
-                received,
-                received_at,
-                text_revision,
-            );
-            if let Some(content) = event.content.as_deref() {
-                let author = event
-                    .author
-                    .as_ref()
-                    .map(|u| u.id.get())
-                    .or_else(|| {
-                        self.app.text_spam.author_of(
+        if let Some(guild) = event.guild_id {
+            let channel = event.channel_id.get();
+            let message = event.id.get();
+            match self.app.configs.get(&self.app.db, guild.get()).await {
+                Ok(cfg) => {
+                    crate::image_spam::observe_update(
+                        &self.app,
+                        &ctx,
+                        &cfg,
+                        &event,
+                        received,
+                        received_at,
+                        image_revision,
+                    );
+                    crate::text_spam::observe_update(
+                        &self.app,
+                        &ctx,
+                        &cfg,
+                        &event,
+                        received,
+                        received_at,
+                        text_revision,
+                    );
+                    if let Some(content) = event.content.as_deref() {
+                        let author = event
+                            .author
+                            .as_ref()
+                            .map(|u| u.id.get())
+                            .or_else(|| {
+                                self.app.text_spam.author_of(
+                                    guild.get(),
+                                    event.channel_id.get(),
+                                    event.id.get(),
+                                )
+                            })
+                            .or_else(|| {
+                                self.app.image_spam.author_of(
+                                    guild.get(),
+                                    event.channel_id.get(),
+                                    event.id.get(),
+                                )
+                            });
+                        crate::logging::remember_message(
+                            &self.app,
                             guild.get(),
                             event.channel_id.get(),
                             event.id.get(),
-                        )
-                    })
-                    .or_else(|| {
-                        self.app.image_spam.author_of(
-                            guild.get(),
-                            event.channel_id.get(),
-                            event.id.get(),
-                        )
-                    });
-                crate::logging::remember_message(
-                    &self.app,
-                    guild.get(),
-                    event.channel_id.get(),
-                    event.id.get(),
-                    author,
-                    content,
-                );
+                            author,
+                            content,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("message_update: config load failed: {e:#}");
+                    self.app
+                        .image_spam
+                        .invalidate(guild.get(), channel, message);
+                    self.app
+                        .text_spam
+                        .invalidate(guild.get(), channel, message);
+                }
             }
         }
         if let Some(report) = logging::message_update_report(&event) {

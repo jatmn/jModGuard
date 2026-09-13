@@ -212,6 +212,18 @@ async fn enforce(app: &Arc<BotState>, ctx: &Context, found: Match, rule: &str, n
         .iter()
         .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
     {
+        let vars = BTreeMap::from([
+            ("rule".into(), name.into()),
+            ("mention".into(), format!("<@{}>", found.author)),
+            ("channel".into(), format!("<#{}>", found.channel)),
+            (
+                "action".into(),
+                "enforce skipped; exemption recheck failed".into(),
+            ),
+            ("reason".into(), found.reason),
+            ("content".into(), "matched channel/user/role is whitelisted".into()),
+        ]);
+        crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return;
     }
     let now = Instant::now();
