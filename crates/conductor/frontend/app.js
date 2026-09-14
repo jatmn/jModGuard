@@ -257,10 +257,21 @@ function tabBackups() {
       failedJobs.forEach((job) => failures.append(el("div", { class: "card" },
         el("strong", { text: `${job.kind} failed` }),
         el("p", { class: "muted", text: job.last_error || "No error detail" }),
-        el("button", { class: "btn", text: "Retry failed job", onclick: async () => {
+        el("button", { class: "btn", text: job.kind === "backup_restore" ? "Submit restore again" : "Retry failed job", onclick: async () => {
           try {
-            await api(`/api/jobs/${job.id}/retry`, "POST", {});
-            toast("Backup job queued for retry", "success");
+            if (job.kind === "backup_restore") {
+              const payload = JSON.parse(job.payload_json || "{}");
+              if (!payload.id) throw new Error("failed restore has no archive id");
+              if (payload.password_required && !password.value) throw new Error("enter the portable restore password");
+              await api(`/api/backups/${payload.id}/restore`, "POST", {
+                password: password.value || null,
+                acknowledge_historical: ack.checked,
+              });
+              toast("Restore submitted again", "success");
+            } else {
+              await api(`/api/jobs/${job.id}/retry`, "POST", {});
+              toast("Backup job queued for retry", "success");
+            }
             render();
           } catch (e) { toast(e.message, "error"); }
         } }),

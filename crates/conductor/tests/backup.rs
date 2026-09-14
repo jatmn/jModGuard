@@ -366,6 +366,7 @@ async fn historical_restore_requires_acknowledgment_and_rejects_corrupt_uploads(
     tick_until_idle(&h).await;
     let id = complete_archive_id(&h, &cookie).await;
     std::fs::remove_file(h.root.join("core.db")).unwrap();
+    std::fs::File::create(h.root.join("core.db")).unwrap();
     let (status, _, _) = call(
         &h.router,
         "POST",
@@ -606,7 +607,7 @@ async fn portable_restore_password_is_ephemeral_and_plaintext_scratch_is_removed
         "POST",
         &format!("/api/backups/{upload_id}/restore"),
         Some(&cookie),
-        Some(format!(r#"{{"password":"{password}"}}"#).as_bytes()),
+        Some(br#"{"password":"wrong-password"}"#),
         Some("application/json"),
     )
     .await;
@@ -621,9 +622,49 @@ async fn portable_restore_password_is_ephemeral_and_plaintext_scratch_is_removed
         .into_iter()
         .find(|job| job.kind == "backup_restore" && job.status == "queued")
         .expect("queued restore");
-    assert!(!queued.payload_json.contains(password), "{queued:?}");
+    assert!(
+        !queued.payload_json.contains(password) && !queued.payload_json.contains("wrong-password"),
+        "{queued:?}"
+    );
     assert!(queued.payload_json.contains("\"password_required\":true"));
 
+    tick_until_idle(&h).await;
+    assert!(
+        h.conductor
+            .store()
+            .unwrap()
+            .replay_job(&queued.id)
+            .await
+            .unwrap()
+    );
+    tick_until_idle(&h).await;
+    let replayed = h
+        .conductor
+        .store()
+        .unwrap()
+        .list_jobs(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id == queued.id)
+        .unwrap();
+    assert!(
+        replayed
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("password is no longer available")),
+        "{replayed:?}"
+    );
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/backups/{upload_id}/restore"),
+        Some(&cookie),
+        Some(format!(r#"{{"password":"{password}"}}"#).as_bytes()),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     tick_until_idle(&h).await;
     assert!(h.root.join("restore-target").join("COMPLETE").exists());
 }
@@ -810,4 +851,203 @@ async fn backup_catalog_surfaces_failed_jobs_for_retry() {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["failed_jobs"][0]["id"], id);
     assert_eq!(body["failed_jobs"][0]["status"], "failed");
+}
+
+#[tokio::test]
+async fn backup_job_admission_is_atomic() {
+    let h = setup(false).await;
+    let store = h.conductor.store().unwrap();
+    let first_payload = serde_json::json!({"kind":"manual"});
+    let second_payload = serde_json::json!({"kind":"manual"});
+    let first = store.insert_backup_job_if_idle("backup_capture", &first_payload, 3);
+    let second = store.insert_backup_job_if_idle("backup_capture", &second_payload, 3);
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(
+        usize::from(first.unwrap().is_some()) + usize::from(second.unwrap().is_some()),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_capture_does_not_block_pending_backup_sanitization() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(br#"{"kind":"manual"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+
+    let store = h.conductor.store().unwrap();
+    let failed = store
+        .insert_job("backup_capture", &serde_json::json!({"kind":"manual"}), 1)
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().id, failed);
+    store
+        .finish_job(&failed, false, Some("old capture failure"))
+        .await
+        .unwrap();
+    let db = libsql::Builder::new_local(h.root.join("core.db"))
+        .build()
+        .await
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, created_at)
+             VALUES('44444444444444444444444444444444','guild',10,1)",
+            (),
+        )
+        .await
+        .unwrap();
+    tick_until_idle(&h).await;
+
+    let db = libsql::Builder::new_local(h.root.join("core.db"))
+        .build()
+        .await
+        .unwrap();
+    let mut rows = db
+        .connect()
+        .unwrap()
+        .query("SELECT COUNT(*) FROM backup_cleanup_intents", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+    assert!(
+        store
+            .list_jobs(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.id == failed && job.status == "failed")
+    );
+}
+
+#[tokio::test]
+async fn capture_preflights_sqlite_size_before_snapshotting() {
+    let h = setup(false).await;
+    let oversized = h.root.join("oversized-core.db");
+    let db = libsql::Builder::new_local(&oversized)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("CREATE TABLE payload(value BLOB);")
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO payload VALUES(zeroblob(2097152))", ())
+        .await
+        .unwrap();
+    drop(conn);
+    drop(db);
+
+    let mut cfg = h.conductor.cfg.clone();
+    cfg.capture_stores[0].path = oversized;
+    let mut settings = h.conductor.settings().await.unwrap();
+    settings.backup_max_archive_bytes = 1_048_576;
+    let error = jmodguard_conductor::backup::capture(
+        &cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .expect_err("oversized logical database must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("backup payload exceeds configured byte budget"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_backup_notifications_do_not_create_failed_notify_jobs() {
+    let h = setup(false).await;
+    std::fs::remove_file(h.root.join("core.db")).unwrap();
+    h.conductor
+        .store()
+        .unwrap()
+        .insert_job("backup_capture", &serde_json::json!({"kind":"manual"}), 1)
+        .await
+        .unwrap();
+    h.conductor.tick_job().await.unwrap();
+    let jobs = h.conductor.store().unwrap().list_jobs(20).await.unwrap();
+    assert!(
+        jobs.iter().all(|job| job.kind != "notify_event"),
+        "{jobs:?}"
+    );
+}
+
+#[tokio::test]
+async fn startup_recovers_archive_catalog_and_untracked_complete_files() {
+    let h = setup(false).await;
+    let store = h.conductor.store().unwrap();
+    store
+        .insert_archive(&jmodguard_conductor::store::ArchiveRow {
+            id: "stale-staging".into(),
+            kind: "manual".into(),
+            status: "staging".into(),
+            created_ms: 1,
+            captured_ms: None,
+            scope_json: "{}".into(),
+            object_key: None,
+            sha256: None,
+            bytes: None,
+            family: "jmodguard-core-1".into(),
+            last_error: None,
+        })
+        .await
+        .unwrap();
+    let orphan = h.root.join("backups").join("complete").join("orphan.jmb");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    let restarted = Conductor::start(h.conductor.cfg.clone(), false)
+        .await
+        .unwrap();
+    let stale = restarted
+        .store()
+        .unwrap()
+        .get_archive("stale-staging")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.status, "failed");
+    assert!(!orphan.exists());
+}
+
+#[tokio::test]
+async fn complete_archive_enumeration_is_not_limited_by_catalog_history() {
+    let h = setup(false).await;
+    let store = h.conductor.store().unwrap();
+    for index in 0..205 {
+        store
+            .insert_archive(&jmodguard_conductor::store::ArchiveRow {
+                id: format!("complete-{index:03}"),
+                kind: "manual".into(),
+                status: "complete".into(),
+                created_ms: index,
+                captured_ms: Some(index),
+                scope_json: "{}".into(),
+                object_key: None,
+                sha256: None,
+                bytes: Some(1),
+                family: "jmodguard-core-1".into(),
+                last_error: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.list_complete_archives().await.unwrap().len(), 205);
 }

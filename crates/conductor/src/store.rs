@@ -84,6 +84,7 @@ impl ControlStore {
         let store = Self { db };
         store.migrate().await?;
         store.recover_interrupted_jobs().await?;
+        store.recover_interrupted_archives().await?;
         Ok(store)
     }
 
@@ -207,6 +208,17 @@ impl ControlStore {
                 "worker interrupted; delivery outcome unknown; retry manually",
                 now_ms()
             ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn recover_interrupted_archives(&self) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE archives SET status = 'failed', last_error = ?
+             WHERE status = 'staging'",
+            libsql::params!["archive creation was interrupted"],
         )
         .await?;
         Ok(())
@@ -436,6 +448,69 @@ impl ControlStore {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn insert_backup_job_if_idle(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: i64,
+    ) -> Result<Option<String>> {
+        let id = random_token();
+        self.insert_backup_job_with_id_if_idle(&id, kind, payload, max_attempts)
+            .await
+            .map(|inserted| inserted.then_some(id))
+    }
+
+    pub async fn insert_backup_job_with_id_if_idle(
+        &self,
+        id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: i64,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                kind,
+                "backup_capture" | "backup_restore" | "backup_sanitize"
+            ),
+            "not a backup job"
+        );
+        let conn = self.connect().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<bool> = async {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM jobs
+                     WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize')
+                       AND status IN ('queued', 'running')
+                     LIMIT 1",
+                    (),
+                )
+                .await?;
+            if rows.next().await?.is_some() {
+                return Ok(false);
+            }
+            let now = now_ms();
+            conn.execute(
+                "INSERT INTO jobs(id, kind, status, payload_json, attempts, max_attempts, due_ms, created_ms)
+                 VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+                libsql::params![id, kind, payload.to_string(), max_attempts, now, now],
+            )
+            .await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(inserted)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn claim_job(&self) -> Result<Option<JobRow>> {
@@ -726,6 +801,50 @@ impl ControlStore {
         Ok(())
     }
 
+    pub async fn replace_archive(&self, old_id: &str, replacement: &ArchiveRow) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<()> = async {
+            conn.execute(
+                "INSERT INTO archives(id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    replacement.id.clone(),
+                    replacement.kind.clone(),
+                    replacement.status.clone(),
+                    replacement.created_ms,
+                    replacement.captured_ms,
+                    replacement.scope_json.clone(),
+                    replacement.object_key.clone(),
+                    replacement.sha256.clone(),
+                    replacement.bytes,
+                    replacement.family.clone(),
+                    replacement.last_error.clone()
+                ],
+            )
+            .await?;
+            let changed = conn
+                .execute(
+                    "UPDATE archives SET status = 'replaced' WHERE id = ? AND status = 'complete'",
+                    libsql::params![old_id],
+                )
+                .await?;
+            anyhow::ensure!(changed == 1, "source archive is no longer complete");
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn get_archive(&self, id: &str) -> Result<Option<ArchiveRow>> {
         let conn = self.connect().await?;
         let mut rows = conn
@@ -750,6 +869,31 @@ impl ControlStore {
             out.push(archive_from_row(&row));
         }
         Ok(out)
+    }
+
+    pub async fn list_complete_archives(&self) -> Result<Vec<ArchiveRow>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error
+                 FROM archives WHERE status = 'complete' ORDER BY created_ms DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(archive_from_row(&row));
+        }
+        Ok(out)
+    }
+
+    pub async fn complete_archive_ids(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self
+            .list_complete_archives()
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect())
     }
 
     pub async fn last_complete_ms(&self) -> Result<Option<i64>> {
@@ -779,6 +923,18 @@ impl ControlStore {
         let mut rows = conn
             .query(
                 "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running', 'failed') LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn has_failed_backup_sanitize_job(&self) -> Result<bool> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM jobs
+                 WHERE kind = 'backup_sanitize' AND status = 'failed' LIMIT 1",
                 (),
             )
             .await?;

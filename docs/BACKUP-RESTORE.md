@@ -24,7 +24,8 @@ encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
 - Defaults (editable in Installation): every six hours, 24 scheduled points,
   seven daily points and three release checkpoints. Scheduled failures retry
   and alert; they never pause writes. Failed backup jobs are visible and
-  retryable from the Backups page.
+  retryable from the Backups page; failed restores collect a fresh password
+  when they are resubmitted.
 - Restore writes into an absent `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. It does not
   overwrite the live database in place. After total loss of current policy state,
   the operator must acknowledge that later deletions cannot be verified. Surviving

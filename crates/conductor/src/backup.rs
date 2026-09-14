@@ -112,6 +112,23 @@ impl BackupZone {
         let _ = fs::remove_file(self.quarantine_path(id));
     }
 
+    pub fn prune_untracked_complete(&self, keep: &BTreeSet<String>) -> Result<()> {
+        for entry in fs::read_dir(self.root.join("complete"))? {
+            let path = entry?.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("jmb") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("invalid complete archive name")?;
+            if !keep.contains(id) {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn prune_incomplete(&self) -> Result<()> {
         for dir in ["staging", "scratch"] {
             let root = self.root.join(dir);
@@ -226,24 +243,32 @@ async fn capture_inner(
             "capture store {} is missing",
             capture.role
         );
+        let record_name = format!("store-{}", safe_name(&capture.role));
+        let logical_bytes = sqlite_logical_bytes(&capture.path).await?;
+        ensure_record_fits(
+            &writer,
+            &record_name,
+            logical_bytes,
+            settings.backup_max_archive_bytes,
+        )?;
         let snapshot = scratch.join(format!("{}.sqlite", safe_name(&capture.role)));
         snapshot_sqlite(&capture.path, &snapshot).await?;
-        append_file(
-            &mut writer,
-            &format!("store-{}", safe_name(&capture.role)),
-            &snapshot,
+        ensure_record_fits(
+            &writer,
+            &record_name,
+            fs::metadata(&snapshot)?.len(),
+            settings.backup_max_archive_bytes,
         )?;
+        append_file(&mut writer, &record_name, &snapshot)?;
         roles.push(capture.role.clone());
     }
     let mut evidence_names = Vec::new();
     if let Some(root) = &cfg.evidence_root {
         let skipped = live_removed_keys(cfg).await?;
-        copy_evidence(
-            root,
-            &scratch.join("evidence"),
-            &skipped,
-            settings.backup_max_archive_bytes,
-        )?;
+        let remaining = settings
+            .backup_max_archive_bytes
+            .saturating_sub(writer.metadata()?.len());
+        copy_evidence(root, &scratch.join("evidence"), &skipped, remaining)?;
         if scratch.join("evidence").exists() {
             for entry in fs::read_dir(scratch.join("evidence"))? {
                 let path = entry?.path();
@@ -252,7 +277,14 @@ async fn capture_inner(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .context("evidence name")?;
-                    append_file(&mut writer, &format!("evidence-{name}"), &path)?;
+                    let record_name = format!("evidence-{name}");
+                    ensure_record_fits(
+                        &writer,
+                        &record_name,
+                        fs::metadata(&path)?.len(),
+                        settings.backup_max_archive_bytes,
+                    )?;
+                    append_file(&mut writer, &record_name, &path)?;
                     evidence_names.push(name.to_string());
                 }
             }
@@ -266,6 +298,12 @@ async fn capture_inner(
             "oauth", "discord_token", "webhook", "backup_key", "sessions", "pending_actions"
         ],
     }))?;
+    ensure_record_fits(
+        &writer,
+        "control.json",
+        control.len() as u64,
+        settings.backup_max_archive_bytes,
+    )?;
     append_bytes(&mut writer, "control.json", &control)?;
     writer.sync_all()?;
     drop(writer);
@@ -466,13 +504,9 @@ pub async fn sanitize_complete_archives(
     {
         return Ok(0);
     }
+    zone.prune_untracked_complete(&store.complete_archive_ids().await?)?;
     let mut rewritten = 0usize;
-    for row in store
-        .list_archives(200)
-        .await?
-        .into_iter()
-        .filter(|row| row.status == "complete")
-    {
+    for row in store.list_complete_archives().await? {
         let master = load_or_create_key(cfg, store).await?;
         let scratch = zone.scratch(&format!("sanitize-{}", row.id));
         private_dir(&scratch, true)?;
@@ -520,29 +554,59 @@ pub async fn sanitize_complete_archives(
         fs::rename(zone.staging_path(&new_id), zone.complete_path(&new_id))?;
         let dest = zone.complete_path(&new_id);
         let bytes = i64::try_from(fs::metadata(&dest)?.len()).unwrap_or(i64::MAX);
-        store
-            .insert_archive(&ArchiveRow {
-                id: new_id.clone(),
-                kind: row.kind.clone(),
-                status: "complete".into(),
-                created_ms: now_ms(),
-                captured_ms: row.captured_ms,
-                scope_json: serde_json::json!({ "sanitized_from": row.id }).to_string(),
-                object_key: Some(format!("complete/{new_id}.jmb")),
-                sha256: Some(sha256_file(&dest)?),
-                bytes: Some(bytes),
-                family: row.family.clone(),
-                last_error: None,
-            })
-            .await?;
-        let _ = fs::remove_file(zone.complete_path(&row.id));
-        let mut old = row;
-        old.status = "replaced".into();
-        store.update_archive(&old).await?;
-        zone.cleanup_scratch(&format!("sanitize-{}", old.id));
+        let replacement = ArchiveRow {
+            id: new_id.clone(),
+            kind: row.kind.clone(),
+            status: "complete".into(),
+            created_ms: now_ms(),
+            captured_ms: row.captured_ms,
+            scope_json: serde_json::json!({ "sanitized_from": row.id }).to_string(),
+            object_key: Some(format!("complete/{new_id}.jmb")),
+            sha256: Some(sha256_file(&dest)?),
+            bytes: Some(bytes),
+            family: row.family.clone(),
+            last_error: None,
+        };
+        if let Err(error) = store.replace_archive(&row.id, &replacement).await {
+            let _ = fs::remove_file(&dest);
+            zone.cleanup_scratch(&format!("sanitize-{}", row.id));
+            return Err(error);
+        }
+        fs::remove_file(zone.complete_path(&row.id))?;
+        zone.cleanup_scratch(&format!("sanitize-{}", row.id));
         rewritten += 1;
     }
     Ok(rewritten)
+}
+
+pub async fn current_policy_state_available(cfg: &Config) -> Result<bool> {
+    let Some(core) = cfg.capture_stores.iter().find(|store| store.role == "core") else {
+        return Ok(false);
+    };
+    if !core.path.exists() {
+        return Ok(false);
+    }
+    let db = libsql::Builder::new_local(&core.path).build().await?;
+    let conn = db.connect()?;
+    let mut rows = match conn
+        .query(
+            "SELECT
+               EXISTS(SELECT 1 FROM meta
+                      WHERE key = 'schema_family' AND value = 'jmodguard-core-1'),
+               EXISTS(SELECT 1 FROM sqlite_master
+                      WHERE type = 'table' AND name = 'backup_cleanup_intents')",
+            (),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if error.to_string().contains("no such table") => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(row) = rows.next().await? else {
+        return Ok(false);
+    };
+    Ok(row.get::<i64>(0)? == 1 && row.get::<i64>(1)? == 1)
 }
 
 pub async fn load_cleanup_intents(cfg: &Config) -> Result<CleanupIntents> {
@@ -653,6 +717,47 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
             .execute(&format!("DROP TABLE IF EXISTS {table}"), ())
             .await;
     }
+    Ok(())
+}
+
+async fn sqlite_logical_bytes(path: &Path) -> Result<u64> {
+    let db = libsql::Builder::new_local(path).build().await?;
+    let conn = db.connect()?;
+    let mut rows = conn.query("PRAGMA page_count", ()).await?;
+    let page_count = rows
+        .next()
+        .await?
+        .context("sqlite page count is unavailable")?
+        .get::<i64>(0)?;
+    let mut rows = conn.query("PRAGMA page_size", ()).await?;
+    let page_size = rows
+        .next()
+        .await?
+        .context("sqlite page size is unavailable")?
+        .get::<i64>(0)?;
+    let page_count = u64::try_from(page_count).context("invalid sqlite page count")?;
+    let page_size = u64::try_from(page_size).context("invalid sqlite page size")?;
+    page_count
+        .checked_mul(page_size)
+        .context("sqlite logical size overflow")
+}
+
+fn ensure_record_fits(writer: &File, name: &str, size: u64, max_bytes: u64) -> Result<()> {
+    let name_bytes = u64::try_from(safe_name(name).len()).unwrap_or(u64::MAX);
+    let record_bytes = 4_u64
+        .checked_add(name_bytes)
+        .and_then(|value| value.checked_add(8))
+        .and_then(|value| value.checked_add(size))
+        .context("backup payload size overflow")?;
+    let next = writer
+        .metadata()?
+        .len()
+        .checked_add(record_bytes)
+        .context("backup payload size overflow")?;
+    ensure!(
+        next <= max_bytes,
+        "backup payload exceeds configured byte budget"
+    );
     Ok(())
 }
 

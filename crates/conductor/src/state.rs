@@ -55,6 +55,9 @@ impl Conductor {
         let backup = if let Some(path) = &cfg.backup_root {
             let zone = BackupZone::open(path)?;
             zone.prune_incomplete()?;
+            if let Some(store) = &store {
+                zone.prune_untracked_complete(&store.complete_archive_ids().await?)?;
+            }
             Some(zone)
         } else {
             None
@@ -336,18 +339,30 @@ impl Conductor {
             Err(error) => {
                 let message = format!("{error:#}");
                 store.finish_job(&job.id, false, Some(&message)).await?;
+                if job.kind == "backup_restore" && job.attempts >= job.max_attempts {
+                    self.forget_restore_password(&job.id);
+                }
                 if job.kind.starts_with("backup_") {
-                    let _ = store
-                        .insert_job(
-                            "notify_event",
-                            &serde_json::json!({
-                                "category": "backup",
-                                "message": format!("Backup job failed: {message}"),
-                                "severity": "error",
-                            }),
-                            3,
-                        )
-                        .await;
+                    let notifications_enabled = self.settings().await.is_ok_and(|settings| {
+                        settings.notify_enabled
+                            && settings
+                                .notify_categories
+                                .iter()
+                                .any(|category| category == "backup")
+                    });
+                    if notifications_enabled {
+                        let _ = store
+                            .insert_job(
+                                "notify_event",
+                                &serde_json::json!({
+                                    "category": "backup",
+                                    "message": format!("Backup job failed: {message}"),
+                                    "severity": "error",
+                                }),
+                                3,
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -369,8 +384,8 @@ impl Conductor {
         if !crate::backup::overdue(&settings, store.last_complete_ms().await?) {
             return Ok(());
         }
-        store
-            .insert_job(
+        let _ = store
+            .insert_backup_job_if_idle(
                 "backup_capture",
                 &serde_json::json!({ "kind": "scheduled" }),
                 BACKUP_CAPTURE_MAX_ATTEMPTS,
@@ -384,15 +399,15 @@ impl Conductor {
             return Ok(());
         }
         let store = self.store()?;
-        if store.has_unresolved_backup_job().await? {
+        if store.has_active_backup_job().await? || store.has_failed_backup_sanitize_job().await? {
             return Ok(());
         }
         let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
         if intents.ids.is_empty() {
             return Ok(());
         }
-        store
-            .insert_job("backup_sanitize", &serde_json::json!({}), 3)
+        let _ = store
+            .insert_backup_job_if_idle("backup_sanitize", &serde_json::json!({}), 3)
             .await?;
         Ok(())
     }
@@ -515,11 +530,8 @@ impl Conductor {
             .get("acknowledge_historical")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let current_state_available = self
-            .cfg
-            .capture_stores
-            .iter()
-            .any(|s| s.role == "core" && s.path.exists());
+        let current_state_available =
+            crate::backup::current_policy_state_available(&self.cfg).await?;
         let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
         let request = crate::backup::RestoreRequest {
             acknowledge_historical: acknowledge,

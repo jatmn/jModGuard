@@ -593,14 +593,11 @@ async fn enqueue_backup(
     operator: &Operator,
     kind: &str,
 ) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        !state.store()?.has_active_backup_job().await?,
-        "a backup or restore job is already running"
-    );
     let id = state
         .store()?
-        .insert_job("backup_capture", &serde_json::json!({ "kind": kind }), 3)
-        .await?;
+        .insert_backup_job_if_idle("backup_capture", &serde_json::json!({ "kind": kind }), 3)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a backup or restore job is already running"))?;
     state
         .store()?
         .audit(&operator.operator_id, "backup_create", &id)
@@ -728,16 +725,12 @@ async fn enqueue_restore(
     id: &str,
     body: RestoreBody,
 ) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        !state.store()?.has_active_backup_job().await?,
-        "a backup or restore job is already running"
-    );
     let job = random_token();
     let password_required = body.password.is_some();
     state.remember_restore_password(&job, body.password)?;
-    if let Err(error) = state
+    let inserted = match state
         .store()?
-        .insert_job_with_id(
+        .insert_backup_job_with_id_if_idle(
             &job,
             "backup_restore",
             &serde_json::json!({
@@ -749,8 +742,15 @@ async fn enqueue_restore(
         )
         .await
     {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            state.forget_restore_password(&job);
+            return Err(error);
+        }
+    };
+    if !inserted {
         state.forget_restore_password(&job);
-        return Err(error);
+        anyhow::bail!("a backup or restore job is already running");
     }
     state
         .store()?
@@ -858,8 +858,10 @@ async fn stream_file(
 ) -> Response {
     match tokio::fs::File::open(&path).await {
         Ok(file) => {
-            if let Some(cleanup) = cleanup {
-                let _ = tokio::fs::remove_dir_all(cleanup).await;
+            if let Some(cleanup) = cleanup
+                && let Err(error) = tokio::fs::remove_dir_all(cleanup).await
+            {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.into());
             }
             let body = Body::from_stream(ReaderStream::new(file));
             let disposition = format!("attachment; filename=\"{filename}\"");
@@ -881,8 +883,15 @@ async fn stream_file(
                 .into_response()
         }
         Err(error) => {
-            if let Some(cleanup) = cleanup {
-                let _ = tokio::fs::remove_dir_all(cleanup).await;
+            if let Some(cleanup) = cleanup
+                && let Err(cleanup_error) = tokio::fs::remove_dir_all(cleanup).await
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    anyhow::anyhow!(
+                        "portable archive open failed: {error}; scratch cleanup failed: {cleanup_error}"
+                    ),
+                );
             }
             error_response(StatusCode::NOT_FOUND, error.into())
         }

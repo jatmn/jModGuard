@@ -67,6 +67,8 @@ retries/alerts on failure, and never pauses application writes. Maintenance
 capture is an explicit owner action. Portable download wraps the archive with
 an export password that is kept only in conductor memory while a queued restore
 needs it. Failed backup jobs are listed on the Backups page for explicit retry.
+Failed restores are resubmitted with a fresh password instead of replaying a
+stored secret.
 Uploads land in quarantine after a magic-header check; password authentication
 and archive-family validation occur during restore. Restore writes into
 `JMODGUARD_CONDUCTOR_RESTORE_TARGET` only; it does not overwrite the live
