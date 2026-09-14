@@ -735,6 +735,20 @@ async fn api_backup_restore(
     }
 }
 
+fn restore_password_for_enqueue(password: Option<String>) -> anyhow::Result<Option<String>> {
+    match password {
+        None => Ok(None),
+        Some(value) => {
+            let trimmed = value.trim();
+            anyhow::ensure!(
+                !trimmed.is_empty(),
+                "export password must not be empty"
+            );
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
 async fn enqueue_restore(
     state: &Conductor,
     operator: &Operator,
@@ -742,8 +756,9 @@ async fn enqueue_restore(
     body: RestoreBody,
 ) -> anyhow::Result<String> {
     let job = random_token();
-    let password_required = body.password.is_some();
-    state.remember_restore_password(&job, body.password)?;
+    let password = restore_password_for_enqueue(body.password)?;
+    let password_required = password.is_some();
+    state.remember_restore_password(&job, password)?;
     let inserted = match state
         .store()?
         .insert_backup_job_with_id_if_idle(

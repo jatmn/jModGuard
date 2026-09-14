@@ -221,7 +221,15 @@ pub async fn capture(
     match capture_inner(cfg, store, zone, settings, kind, &id, created).await {
         Ok(row) => {
             store.update_archive(&row).await?;
-            promote_staging_archive(zone, &id)?;
+            if let Err(error) = promote_staging_archive(zone, &id) {
+                if let Ok(Some(mut failed)) = store.get_archive(&id).await {
+                    failed.status = "failed".into();
+                    failed.last_error = Some(format!("{error:#}"));
+                    failed.object_key = Some(format!("staging/{id}.jmb"));
+                    let _ = store.update_archive(&failed).await;
+                }
+                return Err(error);
+            }
             Ok(row)
         }
         Err(error) => {
@@ -564,9 +572,10 @@ pub async fn sanitize_complete_archives(
         writer.sync_all()?;
         drop(writer);
         let new_id = random_token();
+        let staging = zone.staging_path(&new_id);
         encrypt_payload(
             &rebuilt,
-            &zone.staging_path(&new_id),
+            &staging,
             &master,
             ArchiveHeader {
                 format: 1,
@@ -580,9 +589,7 @@ pub async fn sanitize_complete_archives(
             },
             None,
         )?;
-        fs::rename(zone.staging_path(&new_id), zone.complete_path(&new_id))?;
-        let dest = zone.complete_path(&new_id);
-        let bytes = i64::try_from(fs::metadata(&dest)?.len()).unwrap_or(i64::MAX);
+        let bytes = i64::try_from(fs::metadata(&staging)?.len()).unwrap_or(i64::MAX);
         let replacement = ArchiveRow {
             id: new_id.clone(),
             kind: row.kind.clone(),
@@ -591,16 +598,18 @@ pub async fn sanitize_complete_archives(
             captured_ms: row.captured_ms,
             scope_json: serde_json::json!({ "sanitized_from": row.id }).to_string(),
             object_key: Some(format!("complete/{new_id}.jmb")),
-            sha256: Some(sha256_file(&dest)?),
+            sha256: Some(sha256_file(&staging)?),
             bytes: Some(bytes),
             family: row.family.clone(),
             last_error: None,
         };
         if let Err(error) = store.replace_archive(&row.id, &replacement).await {
-            let _ = fs::remove_file(&dest);
+            let _ = fs::remove_file(&staging);
             zone.cleanup_scratch(&format!("sanitize-{}", row.id));
             return Err(error);
         }
+        let complete = zone.complete_path(&new_id);
+        fs::rename(&staging, &complete)?;
         fs::remove_file(zone.complete_path(&row.id))?;
         zone.cleanup_scratch(&format!("sanitize-{}", row.id));
         rewritten += 1;

@@ -20,9 +20,12 @@ encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
 - Capture snapshots each configured local SQLite store with `VACUUM INTO`, then
   drops `bot_actions`, `mutation_receipts` and `nickname_reconcile` so restore
   cannot replay Discord. The distinct live evidence root is copied recursively
-  with relative paths preserved. Departed-enrollment, case, evidence and
-  object-key entries in `backup_cleanup_intents` are omitted from capture,
-  sanitization and restore without affecting a newer guild enrollment.
+  with relative paths preserved. Evidence for departed enrollments, cases and
+  object keys listed in `backup_cleanup_intents` is omitted at capture time.
+  SQLite snapshots are still full until a queued `backup_sanitize` job rewrites
+  complete archives when intents are present; restore applies surviving intents
+  again when writing the restore target. Sanitization does not affect a newer
+  guild enrollment rejoin.
 - Defaults (editable in Installation): every six hours, 24 scheduled points,
   seven daily points and three release checkpoints. Scheduled failures retry
   and alert; they never pause writes. Failed backup jobs are visible and

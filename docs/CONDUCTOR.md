@@ -61,9 +61,10 @@ not available yet, with no working update buttons.
 Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
 takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending
 Discord action tables, recursively copies evidence with its relative paths while
-omitting departed enrollments, cases and objects covered by
-`backup_cleanup_intents` without affecting a newer rejoin, and writes a
-versioned authenticated encrypted archive (`JMODGUARD-BACKUP-1`).
+omitting intent-scoped evidence at capture time, queues `backup_sanitize` to
+rewrite complete archives when `backup_cleanup_intents` rows exist (see
+[BACKUP-RESTORE.md](BACKUP-RESTORE.md)), and writes a versioned authenticated
+encrypted archive (`JMODGUARD-BACKUP-1`).
 Scheduled work defaults to every six hours,
 retries/alerts on failure, and never pauses application writes. Maintenance
 capture is an explicit owner action. Portable download wraps the archive with

@@ -1688,6 +1688,32 @@ async fn capture_requires_a_reachable_core_store() {
 }
 
 #[tokio::test]
+async fn restore_rejects_empty_export_password_at_enqueue() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let bodies: &[&[u8]] = &[b"{\"password\":\"\"}", b"{\"password\":\"   \"}"];
+    for body in bodies {
+        let (status, response, _) = call(
+            &h.router,
+            "POST",
+            "/api/backups/any-id/restore",
+            Some(&cookie),
+            Some(body),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response:?}");
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("export password must not be empty")),
+            "{response}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn backup_job_replay_honors_the_idle_mutex() {
     let h = setup(false).await;
     let cookie = login(&h).await;
