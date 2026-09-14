@@ -26,6 +26,18 @@ pub struct ControlSettings {
     pub notify_dedup_secs: u64,
     pub bot_health_url: String,
     pub api_health_url: String,
+    #[serde(default)]
+    pub backup_enabled: bool,
+    #[serde(default = "default_backup_interval")]
+    pub backup_interval_hours: u64,
+    #[serde(default = "default_backup_retain_scheduled")]
+    pub backup_retain_scheduled: u64,
+    #[serde(default = "default_backup_retain_daily")]
+    pub backup_retain_daily: u64,
+    #[serde(default = "default_backup_retain_checkpoints")]
+    pub backup_retain_checkpoints: u64,
+    #[serde(default = "default_backup_max_bytes")]
+    pub backup_max_archive_bytes: u64,
 }
 
 impl Default for ControlSettings {
@@ -41,12 +53,23 @@ impl Default for ControlSettings {
             notify_enabled: false,
             notify_webhook_url: String::new(),
             notify_webhook_configured: false,
-            notify_categories: vec!["health".into(), "jobs".into(), "login".into()],
+            notify_categories: vec![
+                "health".into(),
+                "jobs".into(),
+                "login".into(),
+                "backup".into(),
+            ],
             notify_mentions: false,
             notify_verbosity: "errors".into(),
             notify_dedup_secs: 300,
             bot_health_url: String::new(),
             api_health_url: String::new(),
+            backup_enabled: false,
+            backup_interval_hours: 6,
+            backup_retain_scheduled: 24,
+            backup_retain_daily: 7,
+            backup_retain_checkpoints: 3,
+            backup_max_archive_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -96,6 +119,26 @@ impl ControlSettings {
         if !self.api_health_url.is_empty() {
             self.api_health_url = parse_http_url(&self.api_health_url).context("api_health_url")?;
         }
+        ensure_range("backup_interval_hours", self.backup_interval_hours, 1, 24)?;
+        ensure_range(
+            "backup_retain_scheduled",
+            self.backup_retain_scheduled,
+            1,
+            168,
+        )?;
+        ensure_range("backup_retain_daily", self.backup_retain_daily, 1, 30)?;
+        ensure_range(
+            "backup_retain_checkpoints",
+            self.backup_retain_checkpoints,
+            1,
+            10,
+        )?;
+        ensure_range(
+            "backup_max_archive_bytes",
+            self.backup_max_archive_bytes,
+            1_048_576,
+            2 * 1024 * 1024 * 1024,
+        )?;
         Ok(())
     }
 
@@ -116,12 +159,18 @@ impl ControlSettings {
             "notify_dedup_secs": { "value": self.notify_dedup_secs, "applied": true, "unit": "seconds" },
             "bot_health_url": { "value": self.bot_health_url, "applied": true },
             "api_health_url": { "value": self.api_health_url, "applied": true },
+            "backup_enabled": { "value": self.backup_enabled, "applied": true },
+            "backup_interval_hours": { "value": self.backup_interval_hours, "applied": true, "unit": "hours" },
+            "backup_retain_scheduled": { "value": self.backup_retain_scheduled, "applied": true, "unit": "points" },
+            "backup_retain_daily": { "value": self.backup_retain_daily, "applied": true, "unit": "points" },
+            "backup_retain_checkpoints": { "value": self.backup_retain_checkpoints, "applied": true, "unit": "releases" },
+            "backup_max_archive_bytes": { "value": self.backup_max_archive_bytes, "applied": true, "unit": "bytes" },
             "process_owned": {
                 "image_spam": "Bot process configuration. Not applied by the conductor.",
                 "log_discord_concurrency": "Bot process configuration. Not applied by the conductor.",
                 "enrollment_repair": "Bot process configuration. Not applied by the conductor.",
             },
-            "unavailable": ["backups", "updates", "guild_moves"],
+            "unavailable": ["updates", "guild_moves"],
         })
     }
 }
@@ -143,6 +192,12 @@ pub struct SettingsPatch {
     pub notify_dedup_secs: Option<u64>,
     pub bot_health_url: Option<String>,
     pub api_health_url: Option<String>,
+    pub backup_enabled: Option<bool>,
+    pub backup_interval_hours: Option<u64>,
+    pub backup_retain_scheduled: Option<u64>,
+    pub backup_retain_daily: Option<u64>,
+    pub backup_retain_checkpoints: Option<u64>,
+    pub backup_max_archive_bytes: Option<u64>,
     pub revision: Option<i64>,
 }
 
@@ -199,6 +254,24 @@ impl ControlSettings {
         if let Some(v) = patch.api_health_url {
             self.api_health_url = v.trim().to_string();
         }
+        if let Some(v) = patch.backup_enabled {
+            self.backup_enabled = v;
+        }
+        if let Some(v) = patch.backup_interval_hours {
+            self.backup_interval_hours = v;
+        }
+        if let Some(v) = patch.backup_retain_scheduled {
+            self.backup_retain_scheduled = v;
+        }
+        if let Some(v) = patch.backup_retain_daily {
+            self.backup_retain_daily = v;
+        }
+        if let Some(v) = patch.backup_retain_checkpoints {
+            self.backup_retain_checkpoints = v;
+        }
+        if let Some(v) = patch.backup_max_archive_bytes {
+            self.backup_max_archive_bytes = v;
+        }
         self.validate()?;
         Ok(patch.revision.unwrap_or(0))
     }
@@ -209,8 +282,24 @@ fn ensure_range(name: &str, value: u64, min: u64, max: u64) -> Result<()> {
     Ok(())
 }
 
+fn default_backup_interval() -> u64 {
+    6
+}
+fn default_backup_retain_scheduled() -> u64 {
+    24
+}
+fn default_backup_retain_daily() -> u64 {
+    7
+}
+fn default_backup_retain_checkpoints() -> u64 {
+    3
+}
+fn default_backup_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
 fn unique_categories(values: &[String]) -> Result<Vec<String>> {
-    const ALLOWED: &[&str] = &["health", "jobs", "login", "settings"];
+    const ALLOWED: &[&str] = &["health", "jobs", "login", "settings", "backup"];
     let mut out = Vec::new();
     for value in values {
         let trimmed = value.trim();

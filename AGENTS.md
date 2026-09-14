@@ -17,8 +17,10 @@ slice is implemented, with corresponding regression coverage.
 
 The conductor reports liveness/version always. Readiness is 503 until the control
 store, conductor OAuth and operator identity are configured; then owner Administration
-is available on the conductor origin. Do not route guild credentials, tenant data or
-backup/update actions through it. Guild dashboard View as… is a read-only preview
+is available on the conductor origin. Do not route guild Discord credentials or
+tenant routing through it. Backup and restore jobs are conductor-owned and use a
+dedicated backups-only root plus configured local capture paths; they must not import
+`TenantRuntime`. Guild dashboard View as… is a read-only preview
 tab on the API. No live provider testing or deployment is part of the current local
 implementation.
 Bot/API configuration remains available. The current baseline requires a fresh database

@@ -1,5 +1,6 @@
 //! Independent conductor entry point. Owner administration uses this process's
 //! control store and Discord login. Guild credentials and tenant routing stay out.
+pub mod backup;
 pub mod config;
 pub mod http;
 pub mod notify;

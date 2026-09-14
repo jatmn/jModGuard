@@ -18,8 +18,9 @@ and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
 - Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
   deployment approval flow remain in place; the conductor is not auto-published or
   required for startup.
-- The conductor can serve owner Administration when configured. It is not a backup
-  or update service and must not be deployed as one. Guild credentials and tenant
+- The conductor can serve owner Administration when configured, including local
+  backup and restore when a dedicated backup root is set. It is not an update
+  service and must not be deployed as one. Guild credentials and tenant
   routing stay out of this process.
 
 The target has three Rust services (Discord bot, guild API and installation conductor)
@@ -39,7 +40,8 @@ does not import old databases. The fuller tenant/case model remains a later chan
   stdout logging, liveness/version endpoints and a configurable shutdown grace.
   When a control store, conductor OAuth client and operator identity are configured,
   `/ready` becomes 200 and owner Administration (settings, status, telemetry,
-  notifications) is available. Backup, update and guild-move controls stay inactive.
+  notifications) is available. Backup controls become available when a dedicated
+  backup root is configured. Update and guild-move controls stay inactive.
   The conductor still does not import the application crate, Serenity or tenant routing.
 - CI checks that the conductor/runtime dependency trees do not include the application
   crate, bot/API service crates or Serenity. It tests the actual conductor process with
@@ -380,14 +382,13 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Backup/restore (R4).
-2. Guild moves, releases and public installation (R5–R8).
+1. Guild moves (R5).
+2. Releases, point-and-click updates and public installation (R6–R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
 provider durability, distributed writer exclusion, access policy or billed resource use.
-Database credential separation and operational conductor features
-remain pending. Logging changes are described above; they do not establish full guild erasure.
+Guild moves, point-and-click updates and database credential separation remain pending. Logging changes are described above; they do not establish full guild erasure.
 
 ## Implemented: exact-image and repeated-text spam
 
@@ -409,7 +410,23 @@ moves remain later work.
 The conductor can open a local control store and verify the installation operator
 through a Discord OAuth client independent of the guild API. Sessions are durable
 and revocable. Administration covers applied conductor settings, service health
-probes, bounded telemetry and owner webhook notifications. Backup and update buttons
-are not exposed. The guild WebUI offers owner-only View as… preview in a separate
-tab; preview requests cannot write and never inherit owner authority.
+probes, bounded telemetry, owner webhook notifications and local backups. Update
+buttons are not exposed. The guild WebUI offers owner-only View as… preview in a
+separate tab; preview requests cannot write and never inherit owner authority.
 See [CONDUCTOR.md](CONDUCTOR.md).
+
+## Implemented: local backup and recovery
+
+Owners can schedule, create, download, upload and restore authenticated encrypted
+archives from conductor Administration. Defaults are a six-hour cadence, 24
+scheduled points, seven daily points and three release checkpoints. Scheduled
+failures retry and alert, remain visible for explicit retry, and do not pause writes.
+Capture uses SQLite `VACUUM INTO` on configured
+local stores, excludes pending Discord actions, and recursively preserves
+evidence paths in a backups-only directory distinct from the live evidence root.
+Portable downloads use an export password. Restore builds in a marked sibling
+stage, atomically publishes to the configured absent target, applies surviving
+cleanup intents, and requires an explicit acknowledgment after total policy-state
+loss. Interrupted restore staging is recovered on retry. Live
+Bunny consistency/durability remains a separate gate.
+See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).

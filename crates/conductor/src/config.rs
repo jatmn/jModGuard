@@ -1,6 +1,13 @@
 //! Process configuration only. Guild/bot/API credentials are never loaded here.
 use anyhow::{Context as _, Result};
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use serde::Deserialize;
+use std::{net::SocketAddr, path::{Path, PathBuf}, time::Duration};
+
+#[derive(Clone, Debug)]
+pub struct CaptureStore {
+    pub role: String,
+    pub path: PathBuf,
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -16,6 +23,11 @@ pub struct Config {
     pub api_health_url: String,
     pub oauth_token_url: String,
     pub oauth_me_url: String,
+    pub backup_root: Option<PathBuf>,
+    pub backup_key: Option<[u8; 32]>,
+    pub capture_stores: Vec<CaptureStore>,
+    pub evidence_root: Option<PathBuf>,
+    pub restore_target: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Config {
@@ -33,6 +45,14 @@ impl std::fmt::Debug for Config {
             .field("api_health_url", &self.api_health_url)
             .field("oauth_token_url", &self.oauth_token_url)
             .field("oauth_me_url", &self.oauth_me_url)
+            .field("backup_root", &self.backup_root)
+            .field(
+                "backup_key",
+                &self.backup_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("capture_stores", &self.capture_stores)
+            .field("evidence_root", &self.evidence_root)
+            .field("restore_target", &self.restore_target)
             .finish()
     }
 }
@@ -100,6 +120,58 @@ impl Config {
             lookup("JMODGUARD_CONDUCTOR_API_HEALTH_URL")?.unwrap_or_default(),
             "JMODGUARD_CONDUCTOR_API_HEALTH_URL",
         )?;
+        let backup_root = optional_path(lookup("JMODGUARD_CONDUCTOR_BACKUP_ROOT")?)?;
+        let backup_key =
+            parse_backup_key(lookup("JMODGUARD_CONDUCTOR_BACKUP_KEY")?.unwrap_or_default())?;
+        let capture_stores = parse_capture_stores(
+            lookup("JMODGUARD_CONDUCTOR_CAPTURE_STORES")?.unwrap_or_default(),
+        )?;
+        let evidence_root = optional_path(lookup("JMODGUARD_CONDUCTOR_EVIDENCE_ROOT")?)?;
+        let restore_target = optional_path(lookup("JMODGUARD_CONDUCTOR_RESTORE_TARGET")?)?;
+        if let (Some(backup), Some(evidence)) = (&backup_root, &evidence_root) {
+            ensure_disjoint_roots(
+                backup,
+                evidence,
+                "backup and evidence roots must be distinct dedicated directories",
+            )?;
+        }
+        if let (Some(backup), Some(restore)) = (&backup_root, &restore_target) {
+            ensure_disjoint_roots(
+                backup,
+                restore,
+                "backup root and restore target must be distinct dedicated directories",
+            )?;
+        }
+        if let (Some(evidence), Some(restore)) = (&evidence_root, &restore_target) {
+            ensure_disjoint_roots(
+                evidence,
+                restore,
+                "evidence root and restore target must be distinct dedicated directories",
+            )?;
+        }
+        for capture in &capture_stores {
+            if let Some(backup) = &backup_root {
+                ensure_disjoint_roots(
+                    backup,
+                    &capture.path,
+                    "capture stores must not overlap the backup root",
+                )?;
+            }
+            if let Some(evidence) = &evidence_root {
+                ensure_disjoint_roots(
+                    evidence,
+                    &capture.path,
+                    "capture stores must not overlap the evidence root",
+                )?;
+            }
+            if let Some(restore) = &restore_target {
+                ensure_disjoint_roots(
+                    restore,
+                    &capture.path,
+                    "capture stores must not overlap the restore target",
+                )?;
+            }
+        }
         Ok(Self {
             bind,
             log_filter,
@@ -113,6 +185,11 @@ impl Config {
             api_health_url,
             oauth_token_url: String::new(),
             oauth_me_url: String::new(),
+            backup_root,
+            backup_key,
+            capture_stores,
+            evidence_root,
+            restore_target,
         })
     }
 
@@ -122,6 +199,18 @@ impl Config {
             && self.owner_id != 0
             && !self.oauth_client_id.is_empty()
             && !self.oauth_client_secret.is_empty()
+    }
+
+    pub fn backup_configured(&self) -> bool {
+        self.operations_configured() && self.backup_root.is_some()
+    }
+
+    /// Capture/sanitize can run only when a reachable `core` store is configured.
+    /// Restore/upload still use the backups-only zone independently.
+    pub fn capture_core_ready(&self) -> bool {
+        self.capture_stores
+            .iter()
+            .any(|store| store.role == "core" && store.path.exists())
     }
 
     pub fn redirect_uri(&self) -> String {
@@ -152,6 +241,73 @@ pub(crate) fn parse_http_origin(raw: &str) -> Result<String> {
         "must not contain a query or fragment"
     );
     Ok(raw.trim_end_matches('/').to_string())
+}
+
+fn ensure_disjoint_roots(left: &Path, right: &Path, message: &str) -> Result<()> {
+    anyhow::ensure!(
+        left != right && !left.starts_with(right) && !right.starts_with(left),
+        "{message}"
+    );
+    Ok(())
+}
+
+fn optional_path(raw: Option<String>) -> Result<Option<PathBuf>> {
+    let Some(value) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(&value);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "backup/evidence/restore paths must be absolute"
+    );
+    Ok(Some(path))
+}
+
+fn parse_backup_key(raw: String) -> Result<Option<[u8; 32]>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()),
+        "JMODGUARD_CONDUCTOR_BACKUP_KEY must be 64 hex characters"
+    );
+    let mut key = [0u8; 32];
+    for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
+        key[i] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
+    }
+    Ok(Some(key))
+}
+
+#[derive(Deserialize)]
+struct CaptureStoreJson {
+    role: String,
+    path: String,
+}
+
+fn parse_capture_stores(raw: String) -> Result<Vec<CaptureStore>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<CaptureStoreJson> =
+        serde_json::from_str(trimmed).context("JMODGUARD_CONDUCTOR_CAPTURE_STORES")?;
+    let mut out = Vec::new();
+    for store in parsed {
+        let role = store.role.trim().to_string();
+        anyhow::ensure!(
+            !role.is_empty()
+                && role.len() <= 64
+                && role
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':'),
+            "capture store role is invalid"
+        );
+        let path = PathBuf::from(store.path.trim());
+        anyhow::ensure!(path.is_absolute(), "capture store paths must be absolute");
+        out.push(CaptureStore { role, path });
+    }
+    Ok(out)
 }
 
 fn optional_health_url(raw: String, name: &str) -> Result<String> {
@@ -190,6 +346,70 @@ mod tests {
         assert_eq!(cfg.bind.port(), 8081);
         assert!(keys.iter().all(|k| k.starts_with("JMODGUARD_CONDUCTOR_")));
         assert!(!cfg.operations_configured());
+        assert!(cfg.backup_root.is_none());
+        assert!(cfg.backup_key.is_none());
+        assert!(!cfg.capture_core_ready());
+    }
+    #[test]
+    fn backup_paths_must_be_absolute_and_distinct() {
+        assert!(
+            Config::from_lookup(|k| Ok(
+                (k == "JMODGUARD_CONDUCTOR_BACKUP_ROOT").then(|| "relative-backups".into())
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(|k| Ok(
+                (k == "JMODGUARD_CONDUCTOR_BACKUP_KEY").then(|| "not-hex".into())
+            ))
+            .is_err()
+        );
+        let nested = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                    "JMODGUARD_CONDUCTOR_EVIDENCE_ROOT" => "/tmp/jmodguard-backups/evidence",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested.is_err());
+        let nested_restore = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                    "JMODGUARD_CONDUCTOR_RESTORE_TARGET" => "/tmp/jmodguard-backups/restore",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_restore.is_err());
+        let nested_capture = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                    "JMODGUARD_CONDUCTOR_CAPTURE_STORES" => {
+                        r#"[{"role":"core","path":"/tmp/jmodguard-backups/core.db"}]"#
+                    }
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_capture.is_err());
+        let nested_evidence_restore = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_EVIDENCE_ROOT" => "/tmp/jmodguard-evidence",
+                    "JMODGUARD_CONDUCTOR_RESTORE_TARGET" => "/tmp/jmodguard-evidence/restore",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_evidence_restore.is_err());
     }
     #[test]
     fn process_overrides_are_validated_without_environment_mutation() {

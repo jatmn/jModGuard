@@ -1,18 +1,25 @@
 //! Conductor runtime state: control store, HTTP client and worker handles.
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::backup::BackupZone;
 use crate::config::Config;
 use crate::settings::ControlSettings;
 use crate::store::{ControlStore, SessionRow, now_ms};
 
+const BACKUP_CAPTURE_MAX_ATTEMPTS: i64 = 3;
+
 pub struct Conductor {
     pub cfg: Config,
     pub store: Option<ControlStore>,
+    pub backup: Option<BackupZone>,
     pub http: reqwest::Client,
     pub started: Instant,
+    pub(crate) restore_passwords: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -45,11 +52,51 @@ impl Conductor {
         } else {
             None
         };
+        let backup = if let Some(path) = &cfg.backup_root {
+            let zone = BackupZone::open(path)?;
+            if let Some(store) = &store {
+                if let Err(error) = crate::backup::recover_catalog_archive_bytes(&zone, store).await
+                {
+                    tracing::warn!("could not recover staged backups: {error:#}");
+                }
+                zone.prune_untracked_complete(&store.complete_archive_ids().await?)?;
+                if let Ok((settings, _, _)) = store.load_settings().await {
+                    let keep =
+                        i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
+                    if let Ok(removed) = store.prune_quarantined_archives(keep).await {
+                        for id in removed {
+                            zone.remove_quarantine(&id);
+                        }
+                    }
+                }
+            }
+            zone.prune_incomplete()?;
+            Some(zone)
+        } else {
+            None
+        };
+        if backup.is_none()
+            && let Some(store) = &store
+            && let Err(error) = store.fail_remaining_staging_archives().await
+        {
+            tracing::warn!("could not finalize interrupted archive catalog rows: {error:#}");
+        }
+        if let Some(core) = cfg.capture_stores.iter().find(|s| s.role == "core")
+            && core.path.exists()
+        {
+            // Interrupted restore jobs fail closed; a leftover fence must not
+            // keep the live database write-blocked after restart.
+            if let Err(error) = crate::backup::set_restore_fence(&core.path, false).await {
+                tracing::warn!("could not clear restore fence: {error:#}");
+            }
+        }
         let conductor = Arc::new(Self {
             cfg,
             store,
+            backup,
             http,
             started: Instant::now(),
+            restore_passwords: Mutex::new(HashMap::new()),
         });
         if spawn_workers && conductor.store.is_some() {
             let worker = Arc::clone(&conductor);
@@ -64,10 +111,54 @@ impl Conductor {
         self.cfg.operations_configured() && self.store.is_some()
     }
 
+    pub fn backup_available(&self) -> bool {
+        self.operations_available() && self.backup.is_some()
+    }
+
+    pub fn capture_available(&self) -> bool {
+        self.backup_available() && self.cfg.capture_core_ready()
+    }
+
+    pub fn backup_zone(&self) -> Result<&BackupZone> {
+        self.backup
+            .as_ref()
+            .context("backup zone is not configured")
+    }
+
     pub fn store(&self) -> Result<&ControlStore> {
         self.store
             .as_ref()
             .context("control store is not configured")
+    }
+
+    pub fn remember_restore_password(&self, job_id: &str, password: Option<String>) -> Result<()> {
+        if let Some(password) = password {
+            self.restore_passwords
+                .lock()
+                .map_err(|_| anyhow::anyhow!("restore password store is unavailable"))?
+                .insert(job_id.to_string(), password);
+        }
+        Ok(())
+    }
+
+    pub fn forget_restore_password(&self, job_id: &str) {
+        if let Ok(mut passwords) = self.restore_passwords.lock() {
+            passwords.remove(job_id);
+        }
+    }
+
+    fn restore_password(&self, job_id: &str, required: bool) -> Result<Option<String>> {
+        let password = self
+            .restore_passwords
+            .lock()
+            .map_err(|_| anyhow::anyhow!("restore password store is unavailable"))?
+            .get(job_id)
+            .cloned();
+        anyhow::ensure!(
+            !required || password.is_some(),
+            "restore password is no longer available; submit the restore again"
+        );
+        Ok(password)
     }
 
     pub async fn settings(&self) -> Result<ControlSettings> {
@@ -255,21 +346,126 @@ impl Conductor {
         let Some(store) = &self.store else {
             return Ok(());
         };
+        if let Err(error) = self.maybe_reconcile_restore_fence().await {
+            tracing::warn!("restore fence reconciliation: {error:#}");
+        }
+        self.maybe_schedule_backup().await?;
+        self.maybe_sanitize_backups().await?;
         let Some(job) = store.claim_job().await? else {
             return Ok(());
         };
-        let result = self.run_job(&job.kind, &job.payload_json).await;
+        let result = self.run_job(&job.id, &job.kind, &job.payload_json).await;
         match result {
-            Ok(()) => store.finish_job(&job.id, true, None).await?,
+            Ok(()) => {
+                store.finish_job(&job.id, true, None).await?;
+                if job.kind == "backup_restore" {
+                    self.forget_restore_password(&job.id);
+                }
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 store.finish_job(&job.id, false, Some(&message)).await?;
+                if job.kind == "backup_restore" && job.attempts >= job.max_attempts {
+                    self.forget_restore_password(&job.id);
+                }
+                if job.kind.starts_with("backup_") {
+                    let notifications_enabled = self.settings().await.is_ok_and(|settings| {
+                        settings.notify_enabled
+                            && settings
+                                .notify_categories
+                                .iter()
+                                .any(|category| category == "backup")
+                    });
+                    if notifications_enabled {
+                        let _ = store
+                            .insert_job(
+                                "notify_event",
+                                &serde_json::json!({
+                                    "category": "backup",
+                                    "message": format!("Backup job failed: {message}"),
+                                    "severity": "error",
+                                }),
+                                3,
+                            )
+                            .await;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    async fn run_job(&self, kind: &str, payload_json: &str) -> Result<()> {
+    async fn maybe_reconcile_restore_fence(&self) -> Result<()> {
+        if !self.backup_available() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        if store.has_active_backup_job().await? {
+            return Ok(());
+        }
+        let core = self
+            .cfg
+            .capture_stores
+            .iter()
+            .find(|store| store.role == "core" && store.path.exists());
+        let Some(core) = core else {
+            return Ok(());
+        };
+        if !crate::backup::restore_fence_active(&core.path).await? {
+            return Ok(());
+        }
+        crate::backup::clear_restore_fence(&core.path).await?;
+        Ok(())
+    }
+
+    async fn maybe_schedule_backup(&self) -> Result<()> {
+        if !self.capture_available() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        let settings = self.settings().await?;
+        if !settings.backup_enabled {
+            return Ok(());
+        }
+        if store.has_active_backup_job().await? {
+            return Ok(());
+        }
+        let last_attempt_ms = store.last_backup_schedule_activity_ms().await?;
+        if !crate::backup::overdue(&settings, last_attempt_ms) {
+            return Ok(());
+        }
+        let _ = store
+            .insert_backup_job_if_idle(
+                "backup_capture",
+                &serde_json::json!({ "kind": "scheduled" }),
+                BACKUP_CAPTURE_MAX_ATTEMPTS,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn maybe_sanitize_backups(&self) -> Result<()> {
+        if !self.backup_available() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        if store.has_active_backup_job().await? || store.has_failed_backup_sanitize_job().await? {
+            return Ok(());
+        }
+        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
+        if intents.ids.is_empty() {
+            return Ok(());
+        }
+        if store.list_complete_archives().await?.is_empty() {
+            return Ok(());
+        }
+        let _ = store
+            .insert_backup_job_if_idle("backup_sanitize", &serde_json::json!({}), 3)
+            .await?;
+        Ok(())
+    }
+
+    async fn run_job(&self, job_id: &str, kind: &str, payload_json: &str) -> Result<()> {
         match kind {
             "notify_test" | "notify_event" => {
                 crate::notify::deliver(self, kind, payload_json).await
@@ -286,6 +482,9 @@ impl Conductor {
                     )
                     .await
             }
+            "backup_capture" => self.run_backup_capture(payload_json).await,
+            "backup_restore" => self.run_backup_restore(job_id, payload_json).await,
+            "backup_sanitize" => self.run_backup_sanitize().await,
             other => anyhow::bail!("unsupported job kind {other}"),
         }
     }
@@ -334,6 +533,154 @@ impl Conductor {
                 i64::try_from(settings.telemetry_max_rows).unwrap_or(4096),
             )
             .await?;
+        Ok(())
+    }
+
+    async fn run_backup_capture(&self, payload_json: &str) -> Result<()> {
+        let payload: serde_json::Value = serde_json::from_str(payload_json).unwrap_or_default();
+        let kind = payload
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("scheduled");
+        let settings = self.settings().await?;
+        let row = crate::backup::capture(
+            &self.cfg,
+            self.store()?,
+            self.backup_zone()?,
+            kind,
+            &settings,
+        )
+        .await?;
+        let scheduled_keep = i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
+        let removed = self
+            .store()?
+            .prune_old_archives(
+                scheduled_keep,
+                i64::try_from(settings.backup_retain_daily).unwrap_or(7),
+                i64::try_from(settings.backup_retain_checkpoints).unwrap_or(3),
+            )
+            .await?;
+        let removed_quarantine = self
+            .store()?
+            .prune_quarantined_archives(scheduled_keep)
+            .await?;
+        if let Ok(zone) = self.backup_zone() {
+            for id in removed {
+                let _ = std::fs::remove_file(zone.complete_path(&id));
+            }
+            for id in removed_quarantine {
+                zone.remove_quarantine(&id);
+            }
+        }
+        let _ = row;
+        Ok(())
+    }
+
+    async fn run_backup_restore(&self, job_id: &str, payload_json: &str) -> Result<()> {
+        let payload: serde_json::Value = serde_json::from_str(payload_json)?;
+        let id = payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .context("restore job missing archive id")?;
+        let password_required = payload
+            .get("password_required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let password = self.restore_password(job_id, password_required)?;
+        let acknowledge = payload
+            .get("acknowledge_historical")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let current_state_available =
+            crate::backup::current_policy_state_available(&self.cfg).await?;
+        let core = if current_state_available {
+            self.cfg.capture_stores.iter().find(|s| s.role == "core")
+        } else {
+            None
+        };
+        if let Some(core) = core {
+            crate::backup::set_restore_fence(&core.path, true)
+                .await
+                .context("failed to raise restore fence")?;
+        }
+        // Load removal policy only after the fence commits. Its write takes the
+        // SQLite primary writer lock, so all older application mutations have
+        // completed and newer ones will observe the fence before this snapshot.
+        let result: Result<()> = async {
+            let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
+            let request = crate::backup::RestoreRequest {
+                acknowledge_historical: acknowledge,
+                current_state_available,
+                removed_guilds: intents.guilds,
+                removed_cases: intents.cases,
+                removed_evidence: intents.evidence,
+                removed_object_keys: intents.object_keys,
+            };
+            crate::backup::restore_archive(
+                &self.cfg,
+                self.store()?,
+                self.backup_zone()?,
+                id,
+                password.as_deref(),
+                request,
+                &self.settings().await?,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        let restore_ok = result.is_ok();
+        let clear = match core {
+            Some(core) => crate::backup::clear_restore_fence(&core.path).await,
+            None => Ok(()),
+        };
+        if restore_ok && let Err(error) = &clear {
+            let message = format!("Restore completed; restore fence was not cleared: {error:#}");
+            let notifications_enabled = self.settings().await.is_ok_and(|settings| {
+                settings.notify_enabled
+                    && settings
+                        .notify_categories
+                        .iter()
+                        .any(|category| category == "backup")
+            });
+            if notifications_enabled && let Ok(store) = self.store() {
+                let _ = store
+                    .insert_job(
+                        "notify_event",
+                        &serde_json::json!({
+                            "category": "backup",
+                            "message": message,
+                            "severity": "error",
+                        }),
+                        3,
+                    )
+                    .await;
+            }
+        }
+        crate::backup::restore_job_result(result, clear)
+    }
+
+    async fn run_backup_sanitize(&self) -> Result<()> {
+        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
+        let request = crate::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            removed_guilds: intents.guilds,
+            removed_cases: intents.cases,
+            removed_evidence: intents.evidence,
+            removed_object_keys: intents.object_keys,
+        };
+        let rewritten = crate::backup::sanitize_complete_archives(
+            &self.cfg,
+            self.store()?,
+            self.backup_zone()?,
+            &self.settings().await?,
+            &request,
+        )
+        .await?;
+        if rewritten > 0 {
+            crate::backup::clear_cleanup_intents(&self.cfg, &intents.ids).await?;
+        }
         Ok(())
     }
 }

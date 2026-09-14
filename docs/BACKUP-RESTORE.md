@@ -8,6 +8,47 @@ This document separates a provider's internal durability from an
 operator-controlled backup that can be exported, retained independently, and
 restored into a different database.
 
+## Conductor Administration
+
+The conductor can create, list, download, upload and restore authenticated
+encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
+[CONDUCTOR.md](CONDUCTOR.md) for the environment keys.
+
+- Format `JMODGUARD-BACKUP-1` with ChaCha20-Poly1305 frames and HKDF/PBKDF2 key
+  wrapping. Scheduled archives use the process/control master key. Portable
+  downloads wrap the same payload with an export password that is never stored.
+- Capture snapshots each configured local SQLite store with `VACUUM INTO`, then
+  drops `bot_actions`, `mutation_receipts` and `nickname_reconcile` so restore
+  cannot replay Discord. The distinct live evidence root is copied recursively
+  with relative paths preserved. Evidence for departed enrollments, cases and
+  object keys listed in `backup_cleanup_intents` is omitted at capture time.
+  SQLite snapshots are still full until a queued `backup_sanitize` job rewrites
+  complete archives when intents are present; that job does not acknowledge
+  intent rows until at least one complete archive is rewritten. Restore applies
+  surviving intents again when writing the restore target. Sanitization does
+  not affect a newer guild enrollment rejoin.
+- Defaults (editable in Installation): every six hours, 24 scheduled points,
+  seven daily points and three release checkpoints. Scheduled failures retry
+  and alert; they never pause writes. Failed backup jobs are visible and
+  retryable from the Backups page when no other backup job is queued or running.
+  Catalog `overdue` uses the same last scheduled-or-complete timestamp as the
+  scheduler and is false while capture is unavailable. Capture stays off
+  (`capture_available` false) until a reachable
+  `core` store is configured; upload, download and restore still use the backup
+  zone. Restore enqueue requires `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. A failed restore does not stop later scheduled captures, and failed
+  restores collect a fresh password when resubmitted.
+- Restore writes into an absent `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. It does not
+  overwrite the live database in place. Restore is assembled in a marked sibling
+  staging directory and published only after completion, so an interrupted attempt
+  does not block a retry. After total loss of current policy state,
+  the operator must acknowledge that later deletions cannot be verified. Surviving
+  cleanup intents still remove those guilds/objects.
+- Local tests do not prove Bunny session/durability, distributed writer exclusion
+  or billed resource use.
+
+Manual SQLite copies below remain valid for operators who are not using the
+conductor.
+
 ## Local SQLite
 
 For a cold backup, stop both `jmodguard-bot` and `jmodguard-api`, then copy

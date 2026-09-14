@@ -54,7 +54,7 @@ function render() {
   });
   const content = $("#content");
   content.replaceChildren();
-  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabLater, backups: tabLater };
+  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabLater, backups: tabBackups };
   content.append((tabs[state.tab] || tabStatus)());
   if (state.tab === "status" && !document.hidden) startLease();
   else stopLease();
@@ -101,6 +101,13 @@ function tabInstallation() {
   const lease = num("lease_secs", 30);
   const bot = el("input", { type: "url", value: s.bot_health_url?.value || "", placeholder: "http://127.0.0.1:8080/health" });
   const apiUrl = el("input", { type: "url", value: s.api_health_url?.value || "", placeholder: "http://127.0.0.1:8080/health" });
+  const backupEnabled = el("input", { type: "checkbox" });
+  backupEnabled.checked = !!s.backup_enabled?.value;
+  const interval = num("backup_interval_hours", 6);
+  const retain = num("backup_retain_scheduled", 24);
+  const daily = num("backup_retain_daily", 7);
+  const checkpoints = num("backup_retain_checkpoints", 3);
+  const maxBytes = num("backup_max_archive_bytes", 268435456);
   return el("div", {},
     el("h2", { text: "Installation settings" }),
     el("p", { class: "muted", text: "These values apply in the conductor immediately. Bot process limits stay in bot configuration until a later credential-delivery feature." }),
@@ -115,6 +122,13 @@ function tabInstallation() {
       field("Dashboard lease (seconds, applied)", lease),
       field("Bot /health URL", bot),
       field("API /health URL", apiUrl),
+      el("h3", { text: "Backup policy (applied)" }),
+      field("Enable scheduled backups", backupEnabled),
+      field("Schedule interval (hours)", interval),
+      field("Retain scheduled points", retain),
+      field("Retain daily points", daily),
+      field("Retain release checkpoints", checkpoints),
+      field("Archive byte budget", maxBytes),
       el("button", { class: "btn primary", text: "Save applied settings", onclick: async () => {
         try {
           const saved = await api("/api/settings", "PATCH", {
@@ -128,6 +142,12 @@ function tabInstallation() {
             lease_secs: Number(lease.value),
             bot_health_url: bot.value,
             api_health_url: apiUrl.value,
+            backup_enabled: backupEnabled.checked,
+            backup_interval_hours: Number(interval.value),
+            backup_retain_scheduled: Number(retain.value),
+            backup_retain_daily: Number(daily.value),
+            backup_retain_checkpoints: Number(checkpoints.value),
+            backup_max_archive_bytes: Number(maxBytes.value),
           });
           state.settings = saved;
           toast("Settings applied", "success");
@@ -196,13 +216,164 @@ function tabNotifications() {
 }
 
 function tabLater() {
-  const title = state.tab === "updates" ? "Updates" : "Backups";
   return el("div", {},
-    el("h2", { text: title }),
+    el("h2", { text: "Updates" }),
     el("div", { class: "card unavailable" },
       el("h3", { text: "Not available yet" }),
       el("p", { text: "This control is intentionally inactive. A later change will add a working action here; this page does not expose a non-functional button." }),
     ),
+  );
+}
+
+function tabBackups() {
+  const password = el("input", { type: "password", placeholder: "Portable export/restore password" });
+  const ack = el("input", { type: "checkbox" });
+  const list = el("pre", { class: "muted", text: "Loading backups…" });
+  const upload = el("input", { type: "file" });
+  const archiveSelect = el("select", {}, el("option", { value: "", text: "Loading archives…" }));
+  const failures = el("div", {}, el("p", { class: "muted", text: "Loading failed jobs…" }));
+  const captureNote = el("p", { class: "muted", text: "" });
+  const selectedArchive = async (statuses) => {
+    if (!archiveSelect.value) throw new Error("select an archive");
+    const data = await api("/api/backups");
+    const row = (data.archives || []).find((item) => item.id === archiveSelect.value);
+    if (!row || !statuses.includes(row.status)) throw new Error(`selected archive must be ${statuses.join(" or ")}`);
+    return row;
+  };
+  api("/api/backups").then((data) => {
+    const archives = data.archives || [];
+    archiveSelect.replaceChildren(...archives.map((row) => {
+      const when = row.captured_ms || row.created_ms;
+      const date = when ? new Date(when).toISOString() : "unknown date";
+      return el("option", { value: row.id, text: `${row.status} · ${row.kind} · ${date} · ${row.id}` });
+    }));
+    const preferred = archives.find((row) => row.status === "complete") || archives[0];
+    archiveSelect.value = preferred?.id || "";
+
+    failures.replaceChildren();
+    const failedJobs = data.failed_jobs || [];
+    if (!failedJobs.length) {
+      failures.append(el("p", { class: "muted", text: "No failed backup jobs." }));
+    } else {
+      failedJobs.forEach((job) => failures.append(el("div", { class: "card" },
+        el("strong", { text: `${job.kind} failed` }),
+        el("p", { class: "muted", text: job.last_error || "No error detail" }),
+        el("button", { class: "btn", text: job.kind === "backup_restore" ? "Submit restore again" : "Retry failed job", onclick: async () => {
+          try {
+            if (job.kind === "backup_restore") {
+              const payload = JSON.parse(job.payload_json || "{}");
+              if (!payload.id) throw new Error("failed restore has no archive id");
+              if (payload.password_required && !password.value) throw new Error("enter the portable restore password");
+              await api(`/api/backups/${payload.id}/restore`, "POST", {
+                password: password.value || null,
+                acknowledge_historical: ack.checked,
+              });
+              toast("Restore submitted again", "success");
+            } else {
+              await api(`/api/jobs/${job.id}/retry`, "POST", {});
+              toast("Backup job queued for retry", "success");
+            }
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+      )));
+    }
+    list.textContent = JSON.stringify({
+      last_complete_ms: data.last_complete_ms,
+      overdue: data.overdue,
+      capture_available: data.capture_available,
+      archives,
+    }, null, 2);
+    captureNote.textContent = data.capture_available === false
+      ? "Capture is unavailable until a core capture store is configured. Upload, download and restore still use the backup zone."
+      : "";
+  }).catch((e) => { list.textContent = e.message; });
+  return el("div", {},
+    el("section", { class: "hero" },
+      el("span", { class: "eyebrow", text: "BACKUPS" }),
+      el("h2", { text: "Backup and recovery" }),
+      el("p", { text: "Scheduled captures retry and alert; they never pause writes. Maintenance capture and restore are explicit. Live Bunny durability is not claimed by local tests." }),
+    ),
+    el("div", { class: "card" },
+      el("h3", { text: "Create and download" }),
+      el("p", { class: "muted", text: "A portable download is wrapped with the password you type here. The password is not stored. Destroying the old environment requires this file plus Discord/provider credentials supplied on the new install." }),
+      captureNote,
+      el("button", { class: "btn primary", text: "Create backup now", onclick: async () => {
+        try {
+          await api("/api/backups", "POST", { kind: "manual" });
+          toast("Backup queued", "success");
+          render();
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+      field("Archive", archiveSelect),
+      field("Portable password", password),
+      el("button", { class: "btn", text: "Download selected complete backup", onclick: async () => {
+        try {
+          const complete = await selectedArchive(["complete"]);
+          const res = await fetch(`/api/backups/${complete.id}/download`, { credentials: "include" });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `jmodguard-${complete.id}.jmb`;
+          a.click();
+          URL.revokeObjectURL(url);
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+      el("button", { class: "btn", text: "Download selected complete backup (portable)", onclick: async () => {
+        try {
+          const complete = await selectedArchive(["complete"]);
+          const res = await fetch(`/api/backups/${complete.id}/portable`, {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ password: password.value }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `jmodguard-${complete.id}-portable.jmb`;
+          a.click();
+          URL.revokeObjectURL(url);
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+    ),
+    el("div", { class: "card" },
+      el("h3", { text: "Upload and restore" }),
+      el("p", { class: "muted", text: "Uploads are quarantined after a format-prefix check and authenticated during restore. Select the exact archive above before restoring. Restoring after total loss can return later-deleted records; that requires the archive date/scope warning and this acknowledgment. Known remaining removals stay enforced. Pending Discord jobs are not replayed." }),
+      field("Archive file", upload),
+      field("I acknowledge this historical snapshot may restore later-deleted data", ack),
+      el("button", { class: "btn", text: "Upload archive", onclick: async () => {
+        try {
+          const file = upload.files && upload.files[0];
+          if (!file) throw new Error("choose a file");
+          const res = await fetch("/api/backups/upload", {
+            method: "POST",
+            credentials: "include",
+            body: file,
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          toast(`Quarantined ${data.id}`, "success");
+          render();
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+      el("button", { class: "btn primary", text: "Restore selected archive", onclick: async () => {
+        try {
+          const row = await selectedArchive(["complete", "quarantined"]);
+          await api(`/api/backups/${row.id}/restore`, "POST", {
+            password: password.value || null,
+            acknowledge_historical: ack.checked,
+          });
+          toast("Restore queued into the configured restore target", "success");
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+    ),
+    el("div", { class: "card" }, el("h3", { text: "Failed backup jobs" }), failures),
+    el("div", { class: "card" }, el("h3", { text: "Catalog" }), list),
   );
 }
 

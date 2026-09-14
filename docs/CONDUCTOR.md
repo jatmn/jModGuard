@@ -2,8 +2,8 @@
 
 The conductor is an optional independent installation-control process. When its
 control store, Discord OAuth client and operator identity are configured, it serves
-an owner-only Administration UI for settings, service status, telemetry and
-notifications. Guild credentials, tenant routing, backups and updates are not
+an owner-only Administration UI for settings, service status, telemetry,
+notifications and backups. Guild credentials, tenant routing and updates are not
 available on this service.
 
 ## Build and run locally
@@ -28,6 +28,11 @@ It defaults to `127.0.0.1:8081`. It does not read `config.toml`,
 | `JMODGUARD_CONDUCTOR_OWNER_ID` | `0` | Discord user allowed to operate this installation. |
 | `JMODGUARD_CONDUCTOR_OAUTH_CLIENT_ID` / `_SECRET` | empty | Conductor-only Discord OAuth client (`identify` only). |
 | `JMODGUARD_CONDUCTOR_BOT_HEALTH_URL` / `_API_HEALTH_URL` | empty | Optional unauthenticated `/health` probes. |
+| `JMODGUARD_CONDUCTOR_BACKUP_ROOT` | unset | Dedicated backups-only directory. Required for `backup_available`. |
+| `JMODGUARD_CONDUCTOR_BACKUP_KEY` | unset | Optional 64-hex master key. If unset, the conductor stores a generated key in the control database. |
+| `JMODGUARD_CONDUCTOR_CAPTURE_STORES` | empty | JSON array of `{role,path}` local SQLite files to snapshot. `core` is the application directory database. Required for `capture_available` (scheduled/manual capture). Paths must be distinct from the backup root, evidence root and restore target. |
+| `JMODGUARD_CONDUCTOR_EVIDENCE_ROOT` | unset | Optional live evidence directory copied into backups. Must be distinct from the backup root and restore target. |
+| `JMODGUARD_CONDUCTOR_RESTORE_TARGET` | unset | Absent directory that restore writes into. Required to enqueue restore. |
 
 These are process/bootstrap controls. Durable session, notification and monitoring
 options are stored in the conductor control database after owner login. No provider
@@ -43,15 +48,45 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 |---|---|---|
 | `GET` / `HEAD /health` (also `/health/`) | `200`, process liveness only. | Same. |
 | `GET` / `HEAD /ready` | `503`, JSON code `control_not_configured`. | `200`. |
-| `GET` / `HEAD /version` | `operations_available: false`. | `true`; `backup_available` and `update_available` stay false. |
+| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `update_available` stays false. |
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
 database. Its browser lifetime follows the applied absolute-session setting; server-side
 idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
 unrevoked sessions. Administration
-pages: System Status, Installation, Notifications. Updates and Backups are shown as
-not available yet, with no working action buttons.
+pages: System Status, Installation, Notifications, Backups. Updates remain
+not available yet, with no working update buttons.
+
+Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
+takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending
+Discord action tables, recursively copies evidence with its relative paths while
+omitting intent-scoped evidence at capture time, queues `backup_sanitize` to
+rewrite complete archives when `backup_cleanup_intents` rows exist (see
+[BACKUP-RESTORE.md](BACKUP-RESTORE.md)), and writes a versioned authenticated
+encrypted archive (`JMODGUARD-BACKUP-1`). Sanitize acknowledges those intent
+rows only after at least one complete archive is rewritten.
+Scheduled work defaults to every six hours,
+retries/alerts on failure, and never pauses application writes. Maintenance
+capture is an explicit owner action. Portable download wraps the archive with
+an export password that is kept only in conductor memory while a queued restore
+needs it. Failed backup jobs are listed on the Backups page for explicit retry
+when no other backup job is already queued or running, without blocking later
+scheduled capture attempts. Catalog overdue status uses the same last
+scheduled-or-complete timestamp as the scheduler, and stays false while
+`capture_available` is false.
+Failed restores are resubmitted with a fresh password instead of replaying a
+stored secret.
+Uploads land in quarantine after a magic-header check; password authentication
+and archive-family validation occur during restore. Restore writes into
+`JMODGUARD_CONDUCTOR_RESTORE_TARGET` only; it does not overwrite the live
+database in place. A marked sibling staging directory makes publication atomic
+and permits retry after interruption. After total loss of current policy state,
+restore requires an explicit historical acknowledgment. Surviving cleanup
+intents still remove those guilds/objects. Discord tokens, OAuth secrets,
+sessions and pending
+`bot_actions` are not restored. Live Bunny export/durability is not claimed by
+these local tests.
 
 Owner Discord notifications use an incoming webhook stored write-only on the
 conductor. Payloads never include tokens, chat, or evidence. Delivery health is listed
@@ -86,5 +121,6 @@ operator identity are configured in the container environment.
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 ```
 
-The image is not automatically published or deployed. Guild database moves, backups and
-point-and-click updates remain later work. See [overhaul status](OVERHAUL.md).
+The image is not automatically published or deployed. Guild database moves and
+point-and-click updates remain later work. See [overhaul status](OVERHAUL.md)
+and [backup and restore](BACKUP-RESTORE.md).

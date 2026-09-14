@@ -324,7 +324,11 @@ impl Connection {
 
 impl SqlExecutor for Connection {
     fn execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
-        if self.runtime.is_remote() && self.inner.is_autocommit() {
+        // Route every autocommit write through the same immediate transaction.
+        // Remote connections additionally gain commit receipts; local connections
+        // need this boundary so the restore fence check and write share one
+        // primary snapshot instead of racing a conductor restore.
+        if self.inner.is_autocommit() {
             let transaction = self.transaction_immediate()?;
             let changed = transaction.execute(sql, params)?;
             transaction.commit()?;
@@ -411,6 +415,18 @@ impl Transaction {
     /// Enable remote commit recovery only once a primary snapshot needs a write.
     /// Call before executing mutations; read-only exits need no receipt or pruning.
     pub(crate) fn ensure_mutation_receipt(&mut self) -> Result<()> {
+        match self.query_row(
+            "SELECT value FROM meta WHERE key = 'restore_fence'",
+            (),
+            |r| Ok(r.get::<String>(0)?),
+        ) {
+            Ok(value) if value == "1" => anyhow::bail!("restore is in progress"),
+            Ok(_) => {}
+            Err(error)
+                if error.downcast_ref::<QueryReturnedNoRows>().is_some()
+                    || error.to_string().contains("no such table: meta") => {}
+            Err(error) => return Err(error),
+        }
         if !self.runtime.is_remote() || self.mutation_receipt.is_some() {
             return Ok(());
         }
