@@ -15,9 +15,12 @@ API dependency graphs must remain independent. Cross-service tests live in
 The existing bot/API state/config invariants below describe current code; replace them deliberately as their overhaul
 slice is implemented, with corresponding regression coverage.
 
-The conductor currently reports liveness/version but readiness remains 503. Do not
-expose operational routes until owner authorization and durable control state exist.
-No live provider testing or deployment is part of the current local implementation.
+The conductor reports liveness/version always. Readiness is 503 until the control
+store, conductor OAuth and operator identity are configured; then owner Administration
+is available on the conductor origin. Do not route guild credentials, tenant data or
+backup/update actions through it. Guild dashboard View as… is a read-only preview
+tab on the API. No live provider testing or deployment is part of the current local
+implementation.
 Bot/API configuration remains available. The current baseline requires a fresh database
 or the recognized `jmodguard-core-1` family; see `docs/DATABASE-BASELINE.md`. Preserve
 family/version checks before bootstrap writes. Never adopt an unmarked old database.

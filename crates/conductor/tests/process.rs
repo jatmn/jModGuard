@@ -116,6 +116,89 @@ fn standalone_process_reports_liveness_but_not_operational_readiness() {
     }
     assert!(!p.root.join("jmodguard.db").exists());
     assert!(!p.root.join("logs").exists());
+    assert!(!p.root.join("conductor.db").exists());
+}
+
+#[test]
+fn configured_process_exposes_owner_login_without_guild_credentials() {
+    let root = std::env::temp_dir().join(format!(
+        "jmodguard-conductor-ready-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let output = std::fs::File::create(root.join("process.log")).unwrap();
+    let mut child = command()
+        .current_dir(&root)
+        .env("JMODGUARD_CONDUCTOR_BIND", "127.0.0.1:0")
+        .env("JMODGUARD_CONDUCTOR_LOG", "info")
+        .env("JMODGUARD_CONDUCTOR_SHUTDOWN_SECS", "1")
+        .env("JMODGUARD_CONDUCTOR_DB", root.join("control.db"))
+        .env("JMODGUARD_CONDUCTOR_PUBLIC_URL", "http://127.0.0.1:8081")
+        .env("JMODGUARD_CONDUCTOR_OWNER_ID", "42")
+        .env("JMODGUARD_CONDUCTOR_OAUTH_CLIENT_ID", "cid")
+        .env("JMODGUARD_CONDUCTOR_OAUTH_CLIENT_SECRET", "csecret")
+        .env("JMODGUARD_CONFIG", root.join("config.toml"))
+        .env("JMODGUARD_DISCORD_TOKEN", "synthetic-do-not-expose")
+        .stdout(output)
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let addr = loop {
+        let log = std::fs::read_to_string(root.join("process.log")).unwrap();
+        if let Some((address, _)) = log
+            .split_once("conductor listening on ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            && let Ok(addr) = address.parse::<SocketAddr>()
+            && TcpStream::connect(addr).is_ok()
+        {
+            break addr;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "configured conductor exited"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "configured conductor did not listen"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut ready = String::new();
+    stream.read_to_string(&mut ready).unwrap();
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut login = String::new();
+    stream.read_to_string(&mut login).unwrap();
+    assert!(
+        login.starts_with("HTTP/1.1 303") || login.starts_with("HTTP/1.1 302"),
+        "{login}"
+    );
+    assert!(!login.contains("synthetic-do-not-expose"));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
 }
 #[test]
 fn invalid_process_settings_and_occupied_ports_fail_startup() {

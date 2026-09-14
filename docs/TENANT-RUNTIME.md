@@ -96,10 +96,10 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: the conductor has no operational API, image-spam
-enforcement remains log-only test mode, and no move UI/API is registered. See
-[guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md), [evidence](CASE-EVIDENCE.md)
-and [enrollments](ENROLLMENTS.md).
+Unfinished services stay inactive: conductor backup, update and guild-move controls
+are not registered. Image and text spam enforcement is implemented separately; see
+[IMAGE-SPAM.md](IMAGE-SPAM.md). See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
+[evidence](CASE-EVIDENCE.md) and [enrollments](ENROLLMENTS.md).
 
 ## Continuation and retry boundaries
 

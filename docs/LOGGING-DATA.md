@@ -33,7 +33,9 @@ require the [fresh database baseline](DATABASE-BASELINE.md); their databases are
 
 The bot admits up to `log.discord_concurrency` reports (default 8), with a total deadline
 of `log.discord_timeout_secs` (default 10). Both have environment overrides documented
-in `config.example.toml`; Administration controls remain pending. Admission never waits,
+in `config.example.toml`. Conductor Administration can store owner-notification and
+monitoring budgets after operator login; bot Discord report concurrency remains a bot
+process setting until a later credential-delivery feature. Admission never waits,
 so overload drops reports rather than building a content backlog. There is no application
 retry or replay queue; Serenity retains its normal request/rate-limit behavior within
 the deadline. The current shared limit does not establish per-guild fairness.

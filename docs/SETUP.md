@@ -110,7 +110,7 @@ Binaries:
 There are **no system dependencies** — SQLite is compiled in, TLS is rustls.
 Start the bot once before the API so the schema is migrated. Select each production
 service with `-p` as above. Bare `cargo build --bins` builds all workspace binaries,
-including the unfinished conductor. For a Bunny API without embedded pages, use
+including the conductor. For a Bunny API without embedded pages, use
 `cargo build --locked --release -p jmodguard-api --no-default-features`.
 
 ## 6. Configure

@@ -152,6 +152,54 @@ impl Fixture {
         self.request_token(method, path, &owned, token.as_deref())
             .await
     }
+    async fn request_preview(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        preview: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let guild = path
+            .split('/')
+            .nth(3)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let token = if guild > 0 {
+            db::guild_enrollment(&self.app.db, guild)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.id)
+        } else {
+            None
+        };
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("cookie", &self.cookie)
+                    .header("content-type", "application/json")
+                    .header("x-jmodguard-enrollment", token.as_deref().unwrap_or(""))
+                    .header("x-jmodguard-preview", preview)
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8(bytes.to_vec()).unwrap())
+            }),
+        )
+    }
     async fn request_token(
         &self,
         method: &str,
@@ -1537,4 +1585,130 @@ async fn removed_case_retry_recovers_backup_intent() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let (status, launched) = f
+        .request(
+            "POST",
+            "/api/preview",
+            r#"{"guild_id":"10","profile":"administrator"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{launched}");
+    let token = launched["token"].as_str().expect("preview token");
+    let (status, me) = f.request_preview("GET", "/api/me", "", token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["is_bot_owner"], false);
+    assert_eq!(me["preview"]["guild_id"], "10");
+    let (status, denied) = f
+        .request_preview(
+            "PUT",
+            "/api/guilds/10/settings",
+            r#"{"prefix":"preview"}"#,
+            token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["code"], "preview_read_only");
+    let (status, _global) = f
+        .request_preview("PUT", "/api/guilds/0/settings", r#"{"prefix":"!"}"#, token)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, saved) = f
+        .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"owner"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, config) = f
+        .request_preview("GET", "/api/guilds/10/config", "", token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+}
+
+#[tokio::test]
+async fn preview_profiles_apply_distinct_permission_views() {
+    for (profile, can_delete) in [
+        ("administrator", true),
+        ("moderator", false),
+        ("member", false),
+    ] {
+        let f = Fixture::new(true).await;
+        f.enroll(10).await;
+        let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+        f.app
+            .tenant
+            .activate(enrollment)
+            .await
+            .unwrap()
+            .expect("tenant store");
+        let (status, launched) = f
+            .request(
+                "POST",
+                "/api/preview",
+                &format!(r#"{{"guild_id":"10","profile":"{profile}"}}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{profile}: {launched}");
+        let token = launched["token"].as_str().expect("preview token");
+
+        let (status, me) = f.request_preview("GET", "/api/me", "", token).await;
+        assert_eq!(status, StatusCode::OK, "{profile}: {me}");
+        assert_eq!(me["preview"]["profile"], profile);
+
+        let (status, cases) = f
+            .request_preview("GET", "/api/guilds/10/cases", "", token)
+            .await;
+        if profile == "member" {
+            assert!(me["guilds"].as_array().unwrap().is_empty(), "{me}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{cases}");
+            assert!(
+                cases["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("MANAGE_GUILD"),
+                "{cases}"
+            );
+        } else {
+            assert_eq!(me["guilds"][0]["manage"], true, "{profile}: {me}");
+            assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
+            assert_eq!(cases["can_delete"], can_delete, "{profile}: {cases}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
+    let f = Fixture::new(true).await;
+    let token = "expired-preview".to_string();
+    f.app.preview.insert(
+        token.clone(),
+        preview::PreviewGrant {
+            token: token.clone(),
+            actor_id: 42,
+            guild_id: 10,
+            profile: preview::PreviewProfile::Member,
+            expires: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+    let (status, body) = f.request_preview("GET", "/api/me", "", &token).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "preview_expired");
+    assert!(!f.app.preview.contains_key(&token));
+}
+
+#[tokio::test]
+async fn guild_user_cannot_launch_preview() {
+    let f = Fixture::new(false).await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/api/preview",
+            r#"{"guild_id":"10","profile":"administrator"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap_or("").contains("bot owner"));
 }

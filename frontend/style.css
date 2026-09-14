@@ -156,3 +156,5 @@ pre.code { background: var(--panel2); border: 1px solid var(--border); border-ra
 .theme-picker { display: flex; align-items: center; gap: 10px; color: var(--side-muted); font-size: 12px; padding: 0 10px 10px; }
 .theme-picker select { min-height: 34px; padding: 5px 8px; flex: 1; background: var(--side-panel); color: var(--side-text); border-color: var(--side-border); }
 .welcome-view > .theme-picker { position: absolute; top: 20px; right: 20px; padding: 0; }
+.preview-banner { position: sticky; top: 0; z-index: 30; padding: 12px 20px; background: var(--warn-bg); color: var(--warn); border-bottom: 1px solid var(--warn-border); text-align: center; font-weight: 700; }
+.owner-tools { display: flex; flex-direction: column; gap: 8px; margin: 12px 8px 0; }

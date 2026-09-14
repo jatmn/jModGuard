@@ -116,6 +116,52 @@ function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
 }
 
+let previewTokenFallback = null;
+
+function capturePreviewToken() {
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const token = fragment.get("preview");
+  if (!token) return;
+  // Keep an in-memory source of truth before touching browser storage. A
+  // blocked sessionStorage must never silently restore the owner's write access.
+  previewTokenFallback = token;
+  try {
+    window.sessionStorage.setItem("jmodguard_preview", token);
+  } catch (_) { /* The in-memory fallback remains active for this tab. */ }
+  // The tab-bound fragment remains the reload-safe source if storage later
+  // disappears. Fragments are not sent in HTTP requests or Referer headers.
+}
+
+function currentPreviewToken() {
+  try { return window.sessionStorage.getItem("jmodguard_preview") || previewTokenFallback; }
+  catch (_) { return previewTokenFallback; }
+}
+
+function clearPreviewToken() {
+  previewTokenFallback = null;
+  try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+  if (fragment.has("preview")) {
+    fragment.delete("preview");
+    const hash = fragment.toString();
+    try {
+      history.replaceState({}, "", location.pathname + location.search + (hash ? `#${hash}` : ""));
+    } catch (_) { /* The following explicit navigation still drops the fragment. */ }
+  }
+}
+
+function leaveExpiredPreview() {
+  clearPreviewToken();
+  if (typeof window !== "undefined" && window.location) {
+    if (typeof window.location.replace === "function") window.location.replace("/");
+    else window.location.href = "/";
+  }
+}
+
+function isPreview() {
+  return !!(state.me && state.me.preview);
+}
+
 /** Scope <select> options — Global only for the configured bot owner. */
 function scopeSelect(guildLabel = "This server only", globalLabel = "Global (all servers)", allowGlobal = true) {
   const opts = [el("option", { value: "guild", text: guildLabel })];
@@ -155,7 +201,7 @@ function parseRetryAfterMs(header) {
 
 function isUnauthenticated(err) {
   const msg = String(err && err.message);
-  return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
+  return err.status === 401 || msg.includes("not authenticated") || msg === "session expired" || msg.includes("401");
 }
 
 /** Pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
@@ -202,6 +248,22 @@ function setStartupStatus(text) {
   if (node) node.textContent = text;
 }
 
+function showPreviewUnavailable() {
+  showView("startup-view");
+  setStartupStatus("This preview is no longer signed in. Return to the owner dashboard and launch a new preview.");
+  const link = $("#preview-return-link");
+  if (link) link.classList.remove("hidden");
+}
+
+function returnFromPreview() {
+  clearPreviewToken();
+}
+
+function handlePreviewError(error) {
+  if (error.code === "preview_expired") leaveExpiredPreview();
+  else if (isUnauthenticated(error) && currentPreviewToken()) showPreviewUnavailable();
+}
+
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
@@ -217,6 +279,8 @@ async function api(path, method = "GET", body = null, signal) {
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
   const enrollment = pageEnrollment(path, method);
   if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
+  const preview = currentPreviewToken();
+  if (preview) opts.headers["x-jmodguard-preview"] = preview;
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -230,6 +294,7 @@ async function api(path, method = "GET", body = null, signal) {
       const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
       const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
       error.code = data && data.code;
+      handlePreviewError(error);
       throw error;
     }
     return data;
@@ -245,14 +310,21 @@ async function downloadPrivate(path, filename) {
   const opts = { method: "GET", headers: {}, credentials: "include", cache: "no-store" };
   const enrollment = pageEnrollment(path, "GET");
   if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
+  const preview = currentPreviewToken();
+  if (preview) opts.headers["x-jmodguard-preview"] = preview;
   const res = await fetch(apiUrl(path), opts);
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
+    let code = null;
     try {
       const data = JSON.parse(await res.text());
       if (data && data.error) message = data.error;
+      code = data && data.code;
     } catch (_) {}
-    throw apiError(message, res.status);
+    const error = apiError(message, res.status);
+    error.code = code;
+    handlePreviewError(error);
+    throw error;
   }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -407,9 +479,11 @@ async function init() {
     });
     if (!await loadConfig()) return;
     renderTab();
+    bindOwnerTools();
   } catch (e) {
     if (isUnauthenticated(e)) {
-      showView("login-view");
+      if (currentPreviewToken()) showPreviewUnavailable();
+      else showView("login-view");
     } else {
       showView("startup-view");
       setStartupStatus("Failed to load: " + (e.message || String(e)));
@@ -499,6 +573,50 @@ function renderTab() {
   }
   restoreDrafts();
   updateWorkspaceStatus();
+  const banner = $("#preview-banner");
+  if (banner) banner.classList.toggle("hidden", !isPreview());
+  if (isPreview()) {
+    const status = $("#workspace-status");
+    if (status) status.textContent = "Preview — changes disabled";
+  }
+}
+
+function bindOwnerTools() {
+  const tools = $("#owner-tools");
+  if (!tools) return;
+  if (isPreview()) {
+    tools.classList.remove("hidden");
+    tools.replaceChildren(el("button", { class: "btn small", text: "Exit preview", onclick: async () => {
+      try { await api("/api/preview", "DELETE"); } catch (_) {}
+      clearPreviewToken();
+      window.location = "/";
+    } }));
+    return;
+  }
+  if (!isBotOwner()) {
+    tools.classList.add("hidden");
+    return;
+  }
+  tools.classList.remove("hidden");
+  const profile = el("select", { "aria-label": "Preview profile" },
+    el("option", { value: "administrator", text: "Administrator" }),
+    el("option", { value: "moderator", text: "Moderator" }),
+    el("option", { value: "member", text: "Member" }),
+  );
+  const children = [
+    el("button", { class: "btn small", text: "View as…", onclick: async () => {
+      if (!state.guildId) { toast("Select a server first", "error"); return; }
+      const launched = await api("/api/preview", "POST", { guild_id: String(state.guildId), profile: profile.value });
+      // Fragments are not sent in HTTP requests or Referer headers.
+      const url = `${location.pathname}#preview=${encodeURIComponent(launched.token)}`;
+      window.open(url, "_blank", "noopener");
+    } }),
+    profile,
+  ];
+  if (state.me.conductor_url) {
+    children.unshift(el("a", { class: "btn small", href: state.me.conductor_url, target: "_blank", rel: "noopener noreferrer", text: "Administration" }));
+  }
+  tools.replaceChildren(...children);
 }
 
 function bindTabButtons() {
@@ -1696,6 +1814,7 @@ function initTheme() {
 }
 
 function bootUi() {
+  capturePreviewToken();
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
@@ -1706,10 +1825,19 @@ function bootUi() {
   });
   const loginLink = $("#login-link");
   if (loginLink) loginLink.href = authUrl("/login");
+  const previewReturnLink = $("#preview-return-link");
+  if (previewReturnLink) previewReturnLink.addEventListener("click", returnFromPreview);
   const logoutBtn = $("#logout-btn");
   if (logoutBtn) logoutBtn.addEventListener("click", async () => {
     if (!canLeave()) return;
     dirty = false;
+    if (isPreview()) {
+      try { await api("/api/preview", "DELETE"); } catch (_) {}
+      clearPreviewToken();
+      window.location = "/";
+      return;
+    }
+    clearPreviewToken();
     try {
       const res = await fetch(authUrl("/logout"), { method: "POST", credentials: "include" });
       const data = await res.json();

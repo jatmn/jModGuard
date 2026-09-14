@@ -10,35 +10,58 @@ const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), '
 // production el() sends to the browser, without duplicating its implementation.
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
-  const node = (tag) => ({
-    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
-    classList: { toggle() {} },
-    focus() {},
-    replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
-    append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
-    set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
-    remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
-    setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
-    removeAttribute(k) { delete this.attrs[k]; },
-    addEventListener(k, v) { this.listeners[k] = v; },
-    querySelectorAll() { return []; },
-    querySelector() { return null; },
-  });
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status'].map((key) => [key, node('div')]));
+  const location = {
+    search: '', pathname: '/', hash: '', replaced: null,
+    replace(value) { this.replaced = value; },
+  };
+  const opened = [];
+  const historyUrls = [];
+  const node = (tag) => {
+    const classes = new Set();
+    return {
+      tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      classList: {
+        toggle(name, force) {
+          const enabled = force === undefined ? !classes.has(name) : !!force;
+          if (enabled) classes.add(name); else classes.delete(name);
+          return enabled;
+        },
+        add(name) { classes.add(name); },
+        remove(name) { classes.delete(name); },
+        contains(name) { return classes.has(name); },
+      },
+      focus() {},
+      replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
+      append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
+      set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
+      remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
+      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
+      removeAttribute(k) { delete this.attrs[k]; },
+      addEventListener(k, v) { this.listeners[k] = v; },
+      querySelectorAll() { return []; },
+      querySelector() { return null; },
+    };
+  };
+  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link'].map((key) => [key, node('div')]));
+  for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
+    nodes.get(key).classList.add('hidden');
+  }
   const context = vm.createContext({
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) } },
+    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } },
+    location,
+    history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -819,4 +842,189 @@ test('note retry retains intent after a lost response and blocks overlapping sub
   note.value = 'different note';
   await submit.listeners.click();
   assert.notEqual(posts[2].entry_id,posts[0].entry_id);
+});
+
+test('preview token is sent on API requests from this tab', async () => {
+  let headers;
+  const { app, session } = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  });
+  session.set('jmodguard_preview', 'preview-token');
+  await app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'preview-token');
+});
+
+test('preview fragment remains fail-closed when session storage is blocked', async () => {
+  let headers;
+  const blocked = {
+    get() { throw new Error('blocked'); },
+    set() { throw new Error('blocked'); },
+    delete() { throw new Error('blocked'); },
+  };
+  const h = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), blocked);
+  h.location.hash = '#preview=fragment-token';
+  h.app.capturePreviewToken();
+  assert.equal(h.app.currentPreviewToken(), 'fragment-token');
+  await h.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'fragment-token');
+  assert.equal(h.historyUrls.length, 0);
+
+  let reloadHeaders;
+  const reloaded = harness(async (_url, options) => {
+    reloadHeaders = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), blocked);
+  reloaded.location.hash = h.location.hash;
+  reloaded.app.capturePreviewToken();
+  await reloaded.app.api('/api/me');
+  assert.equal(reloadHeaders['x-jmodguard-preview'], 'fragment-token');
+});
+
+test('preview fragment survives later storage loss and is removed on explicit return', async () => {
+  const session = new Map();
+  const first = harness(async () => ({
+    ok: true,
+    headers: { get: () => null },
+    text: async () => '{}',
+  }), new Map(), session);
+  first.location.hash = '#preview=durable-token&tab=cases';
+  first.app.capturePreviewToken();
+  assert.equal(session.get('jmodguard_preview'), 'durable-token');
+  assert.equal(first.historyUrls.length, 0);
+
+  session.clear();
+  let headers;
+  const reloaded = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), session);
+  reloaded.location.hash = first.location.hash;
+  reloaded.app.capturePreviewToken();
+  await reloaded.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'durable-token');
+
+  reloaded.app.returnFromPreview();
+  assert.equal(reloaded.app.currentPreviewToken(), null);
+  assert.deepEqual(reloaded.historyUrls, ['/#tab=cases']);
+});
+
+test('preview bearer is not accepted from a query string', async () => {
+  let headers;
+  const h = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  });
+  h.location.search = '?preview=query-token';
+  h.app.capturePreviewToken();
+  assert.equal(h.app.currentPreviewToken(), null);
+  await h.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], undefined);
+});
+
+test('expired preview clears the bearer and leaves the preview tab', async () => {
+  const h = harness(async () => ({
+    ok: false,
+    status: 410,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'preview expired', code: 'preview_expired' }),
+  }));
+  h.session.set('jmodguard_preview', 'expired-token');
+  await assert.rejects(h.app.api('/api/me'), /preview expired/);
+  assert.equal(h.session.has('jmodguard_preview'), false);
+  assert.equal(h.location.replaced, '/');
+});
+
+test('View as hands the preview bearer through a URL fragment', async () => {
+  const h = harness(async () => ({
+    ok: true,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ token: 'new-preview-token' }),
+  }));
+  h.app.state.me.is_bot_owner = true;
+  h.app.bindOwnerTools();
+  const button = findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'View as…');
+  await button.listeners.click();
+  assert.equal(h.opened[0][0], '/#preview=new-preview-token');
+  assert.equal(h.opened[0][1], '_blank');
+  assert.equal(h.opened[0][2], 'noopener');
+});
+
+test('unauthenticated blocked-storage preview never exposes owner login', async () => {
+  const blocked = {
+    get() { throw new Error('blocked'); },
+    set() { throw new Error('blocked'); },
+    delete() { throw new Error('blocked'); },
+  };
+  const h = harness(async () => ({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }), new Map(), blocked);
+  h.location.hash = '#preview=still-read-only';
+  h.app.capturePreviewToken();
+
+  await h.app.init();
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+  assert.match(h.nodes.get('#startup-status').textContent, /preview is no longer signed in/i);
+  assert.equal(h.app.currentPreviewToken(), 'still-read-only');
+
+  h.app.returnFromPreview();
+  assert.equal(h.app.currentPreviewToken(), null);
+});
+
+test('post-boot preview authentication loss enters the unavailable state', async () => {
+  const session = new Map([['jmodguard_preview', 'preview-token']]);
+  const h = harness(async () => ({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }), new Map(), session);
+
+  await assert.rejects(h.app.api('/api/guilds/10/cases'), /not authenticated/);
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+});
+
+test('production session-expired response enters preview unavailable state', async () => {
+  const session = new Map([['jmodguard_preview', 'preview-token']]);
+  const h = harness(async () => ({
+    ok: false,
+    status: 400,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'session expired' }),
+  }), new Map(), session);
+
+  await h.app.init();
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+});
+
+test('private downloads share preview authentication-loss handling', async () => {
+  for (const [status, message] of [[401, 'not authenticated'], [400, 'session expired']]) {
+    const session = new Map([['jmodguard_preview', 'preview-token']]);
+    const h = harness(async () => ({
+      ok: false,
+      status,
+      text: async () => JSON.stringify({ error: message }),
+    }), new Map(), session);
+
+    await assert.rejects(h.app.downloadPrivate('/api/guilds/10/cases/1/evidence/2'), new RegExp(message));
+
+    assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+    assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+    assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+  }
 });

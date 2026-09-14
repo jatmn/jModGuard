@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#e0eeff">
+<meta name="description" content="jModGuard installation administration.">
+<title>jModGuard · Administration</title>
+<script>
+try {
+  const theme = localStorage.getItem("jmodguard.theme");
+  document.documentElement.dataset.theme = theme === "dark" ||
+    (theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+} catch (_) {
+  document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to administration</a>
+<div id="app">
+  <div id="login-view" class="hidden welcome-view">
+    <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+    <div class="login-card">
+      <span class="brand-mark" aria-hidden="true">jG</span>
+      <p class="eyebrow">JMODGUARD / ADMINISTRATION</p>
+      <h1>Installation control.</h1>
+      <p>Owner-only settings, service status, and notifications. This login is independent of the guild dashboard.</p>
+      <a id="login-link" class="btn primary" href="/login">Continue with Discord <span aria-hidden="true">↗</span></a>
+      <small>Requires the configured conductor operator identity.</small>
+    </div>
+  </div>
+  <div id="main-view" class="hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>ADMINISTRATION</small></span></div>
+      <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <nav id="tabs" aria-label="Administration navigation">
+        <span class="nav-label">CONTROL</span>
+        <button data-tab="status" class="active"><span aria-hidden="true">◈</span> System Status</button>
+        <button data-tab="installation"><span aria-hidden="true">⚙</span> Installation</button>
+        <button data-tab="notifications"><span aria-hidden="true">#</span> Notifications</button>
+        <span class="nav-label">LATER</span>
+        <button data-tab="updates"><span aria-hidden="true">↑</span> Updates</button>
+        <button data-tab="backups"><span aria-hidden="true">▣</span> Backups</button>
+      </nav>
+      <div class="sidebar-footer"><span id="user-chip"></span><button id="logout-btn" class="btn small">Sign out</button></div>
+    </aside>
+    <div class="workspace">
+      <header class="workspace-header"><div><span class="eyebrow">INSTALLATION</span><strong id="workspace-name">Administration</strong></div><span id="workspace-status">Owner control store</span></header>
+      <main id="content" tabindex="-1"></main>
+      <footer class="workspace-footer">jModGuard conductor <span>Guild credentials are not stored here.</span></footer>
+    </div>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

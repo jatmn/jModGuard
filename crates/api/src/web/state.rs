@@ -22,6 +22,7 @@ pub struct ApiState {
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
+    pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     config_observation: tokio::sync::Mutex<(u64, String)>,
 }
 
@@ -52,6 +53,7 @@ impl ApiState {
             oauth,
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
+            preview: DashMap::new(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
         }))
     }

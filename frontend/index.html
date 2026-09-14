@@ -19,6 +19,7 @@ try {
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+<div id="preview-banner" class="preview-banner hidden" role="status">Preview — changes disabled</div>
 <a class="skip-link" href="#content">Skip to workspace</a>
 <div id="app">
   <div id="startup-view" class="hidden welcome-view">
@@ -28,6 +29,7 @@ try {
       <p class="eyebrow">YOUR COMMUNITY, IN GOOD HANDS</p>
       <h1>Getting things ready.</h1>
       <p id="startup-status" role="status">Waiting for the API to finish starting…</p>
+      <a id="preview-return-link" class="btn primary hidden" href="/">Return to owner dashboard</a>
     </div>
   </div>
   <div id="login-view" class="hidden welcome-view">
@@ -61,6 +63,7 @@ try {
         <button data-tab="cases"><span aria-hidden="true">▣</span> Cases</button>
         <button data-tab="settings"><span aria-hidden="true">⚙</span> Settings</button>
       </nav>
+      <div id="owner-tools" class="owner-tools hidden"></div>
       <div class="sidebar-footer"><span id="user-chip"></span><button id="logout-btn" class="btn small">Sign out</button></div>
     </aside>
     <div class="workspace">
