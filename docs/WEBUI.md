@@ -153,7 +153,8 @@ badwords (read-only) because the bot enforces them. Badword list entries include
 The configured bot owner can open **View as…** for a guild they can manage. That new
 tab sends `x-jmodguard-preview` and shows **Preview — changes disabled**. The original
 owner tab keeps write access. The bearer is handed to the new tab in a URL fragment
-(not a query parameter) and expires after one hour. Administrator, Moderator, and
+(not a query parameter), remains there as a reload-safe tab marker until explicit exit,
+and expires after one hour. Administrator, Moderator, and
 Member apply distinct synthetic permission masks to permission-dependent responses;
 the owner's live Manage Server permission is still rechecked before every guild read.
 Preview never makes `is_bot_owner` true. An

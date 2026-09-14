@@ -125,18 +125,11 @@ function capturePreviewToken() {
   // Keep an in-memory source of truth before touching browser storage. A
   // blocked sessionStorage must never silently restore the owner's write access.
   previewTokenFallback = token;
-  let persisted = false;
   try {
     window.sessionStorage.setItem("jmodguard_preview", token);
-    persisted = window.sessionStorage.getItem("jmodguard_preview") === token;
   } catch (_) { /* The in-memory fallback remains active for this tab. */ }
-  // Keep the fragment as a reload-safe source when storage cannot be read back.
-  if (!persisted) return;
-  fragment.delete("preview");
-  const hash = fragment.toString();
-  try {
-    history.replaceState({}, "", location.pathname + location.search + (hash ? `#${hash}` : ""));
-  } catch (_) { /* Header attachment still uses the in-memory token. */ }
+  // The tab-bound fragment remains the reload-safe source if storage later
+  // disappears. Fragments are not sent in HTTP requests or Referer headers.
 }
 
 function currentPreviewToken() {
@@ -147,6 +140,14 @@ function currentPreviewToken() {
 function clearPreviewToken() {
   previewTokenFallback = null;
   try { window.sessionStorage.removeItem("jmodguard_preview"); } catch (_) {}
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+  if (fragment.has("preview")) {
+    fragment.delete("preview");
+    const hash = fragment.toString();
+    try {
+      history.replaceState({}, "", location.pathname + location.search + (hash ? `#${hash}` : ""));
+    } catch (_) { /* The following explicit navigation still drops the fragment. */ }
+  }
 }
 
 function leaveExpiredPreview() {
@@ -289,6 +290,7 @@ async function api(path, method = "GET", body = null, signal) {
       const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
       error.code = data && data.code;
       if (error.code === "preview_expired") leaveExpiredPreview();
+      else if (isUnauthenticated(error) && currentPreviewToken()) showPreviewUnavailable();
       throw error;
     }
     return data;

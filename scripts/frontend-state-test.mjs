@@ -884,6 +884,34 @@ test('preview fragment remains fail-closed when session storage is blocked', asy
   assert.equal(reloadHeaders['x-jmodguard-preview'], 'fragment-token');
 });
 
+test('preview fragment survives later storage loss and is removed on explicit return', async () => {
+  const session = new Map();
+  const first = harness(async () => ({
+    ok: true,
+    headers: { get: () => null },
+    text: async () => '{}',
+  }), new Map(), session);
+  first.location.hash = '#preview=durable-token&tab=cases';
+  first.app.capturePreviewToken();
+  assert.equal(session.get('jmodguard_preview'), 'durable-token');
+  assert.equal(first.historyUrls.length, 0);
+
+  session.clear();
+  let headers;
+  const reloaded = harness(async (_url, options) => {
+    headers = options.headers;
+    return { ok: true, headers: { get: () => null }, text: async () => '{}' };
+  }, new Map(), session);
+  reloaded.location.hash = first.location.hash;
+  reloaded.app.capturePreviewToken();
+  await reloaded.app.api('/api/me');
+  assert.equal(headers['x-jmodguard-preview'], 'durable-token');
+
+  reloaded.app.returnFromPreview();
+  assert.equal(reloaded.app.currentPreviewToken(), null);
+  assert.deepEqual(reloaded.historyUrls, ['/#tab=cases']);
+});
+
 test('preview bearer is not accepted from a query string', async () => {
   let headers;
   const h = harness(async (_url, options) => {
@@ -950,4 +978,20 @@ test('unauthenticated blocked-storage preview never exposes owner login', async 
 
   h.app.returnFromPreview();
   assert.equal(h.app.currentPreviewToken(), null);
+});
+
+test('post-boot preview authentication loss enters the unavailable state', async () => {
+  const session = new Map([['jmodguard_preview', 'preview-token']]);
+  const h = harness(async () => ({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }), new Map(), session);
+
+  await assert.rejects(h.app.api('/api/guilds/10/cases'), /not authenticated/);
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
 });
