@@ -1,7 +1,9 @@
 //! Conductor runtime state: control store, HTTP client and worker handles.
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::backup::BackupZone;
@@ -9,12 +11,15 @@ use crate::config::Config;
 use crate::settings::ControlSettings;
 use crate::store::{ControlStore, SessionRow, now_ms};
 
+const BACKUP_CAPTURE_MAX_ATTEMPTS: i64 = 3;
+
 pub struct Conductor {
     pub cfg: Config,
     pub store: Option<ControlStore>,
     pub backup: Option<BackupZone>,
     pub http: reqwest::Client,
     pub started: Instant,
+    pub(crate) restore_passwords: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +74,7 @@ impl Conductor {
             backup,
             http,
             started: Instant::now(),
+            restore_passwords: Mutex::new(HashMap::new()),
         });
         if spawn_workers && conductor.store.is_some() {
             let worker = Arc::clone(&conductor);
@@ -97,6 +103,36 @@ impl Conductor {
         self.store
             .as_ref()
             .context("control store is not configured")
+    }
+
+    pub fn remember_restore_password(&self, job_id: &str, password: Option<String>) -> Result<()> {
+        if let Some(password) = password {
+            self.restore_passwords
+                .lock()
+                .map_err(|_| anyhow::anyhow!("restore password store is unavailable"))?
+                .insert(job_id.to_string(), password);
+        }
+        Ok(())
+    }
+
+    pub fn forget_restore_password(&self, job_id: &str) {
+        if let Ok(mut passwords) = self.restore_passwords.lock() {
+            passwords.remove(job_id);
+        }
+    }
+
+    fn restore_password(&self, job_id: &str, required: bool) -> Result<Option<String>> {
+        let password = self
+            .restore_passwords
+            .lock()
+            .map_err(|_| anyhow::anyhow!("restore password store is unavailable"))?
+            .get(job_id)
+            .cloned();
+        anyhow::ensure!(
+            !required || password.is_some(),
+            "restore password is no longer available; submit the restore again"
+        );
+        Ok(password)
     }
 
     pub async fn settings(&self) -> Result<ControlSettings> {
@@ -289,9 +325,14 @@ impl Conductor {
         let Some(job) = store.claim_job().await? else {
             return Ok(());
         };
-        let result = self.run_job(&job.kind, &job.payload_json).await;
+        let result = self.run_job(&job.id, &job.kind, &job.payload_json).await;
         match result {
-            Ok(()) => store.finish_job(&job.id, true, None).await?,
+            Ok(()) => {
+                store.finish_job(&job.id, true, None).await?;
+                if job.kind == "backup_restore" {
+                    self.forget_restore_password(&job.id);
+                }
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 store.finish_job(&job.id, false, Some(&message)).await?;
@@ -332,7 +373,7 @@ impl Conductor {
             .insert_job(
                 "backup_capture",
                 &serde_json::json!({ "kind": "scheduled" }),
-                i64::try_from(settings.backup_retry_alert_after).unwrap_or(2),
+                BACKUP_CAPTURE_MAX_ATTEMPTS,
             )
             .await?;
         Ok(())
@@ -346,8 +387,8 @@ impl Conductor {
         if store.has_unresolved_backup_job().await? {
             return Ok(());
         }
-        let (_, _, ids) = crate::backup::load_cleanup_intents(&self.cfg).await?;
-        if ids.is_empty() {
+        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
+        if intents.ids.is_empty() {
             return Ok(());
         }
         store
@@ -356,7 +397,7 @@ impl Conductor {
         Ok(())
     }
 
-    async fn run_job(&self, kind: &str, payload_json: &str) -> Result<()> {
+    async fn run_job(&self, job_id: &str, kind: &str, payload_json: &str) -> Result<()> {
         match kind {
             "notify_test" | "notify_event" => {
                 crate::notify::deliver(self, kind, payload_json).await
@@ -374,7 +415,7 @@ impl Conductor {
                     .await
             }
             "backup_capture" => self.run_backup_capture(payload_json).await,
-            "backup_restore" => self.run_backup_restore(payload_json).await,
+            "backup_restore" => self.run_backup_restore(job_id, payload_json).await,
             "backup_sanitize" => self.run_backup_sanitize().await,
             other => anyhow::bail!("unsupported job kind {other}"),
         }
@@ -459,13 +500,17 @@ impl Conductor {
         Ok(())
     }
 
-    async fn run_backup_restore(&self, payload_json: &str) -> Result<()> {
+    async fn run_backup_restore(&self, job_id: &str, payload_json: &str) -> Result<()> {
         let payload: serde_json::Value = serde_json::from_str(payload_json)?;
         let id = payload
             .get("id")
             .and_then(|v| v.as_str())
             .context("restore job missing archive id")?;
-        let password = payload.get("password").and_then(|v| v.as_str());
+        let password_required = payload
+            .get("password_required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let password = self.restore_password(job_id, password_required)?;
         let acknowledge = payload
             .get("acknowledge_historical")
             .and_then(|v| v.as_bool())
@@ -475,13 +520,14 @@ impl Conductor {
             .capture_stores
             .iter()
             .any(|s| s.role == "core" && s.path.exists());
-        let (removed_guilds, removed_object_keys, _) =
-            crate::backup::load_cleanup_intents(&self.cfg).await?;
+        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
         let request = crate::backup::RestoreRequest {
             acknowledge_historical: acknowledge,
             current_state_available,
-            removed_guilds,
-            removed_object_keys,
+            removed_guilds: intents.guilds,
+            removed_cases: intents.cases,
+            removed_evidence: intents.evidence,
+            removed_object_keys: intents.object_keys,
         };
         if let Some(core) = self.cfg.capture_stores.iter().find(|s| s.role == "core") {
             let _ = crate::backup::set_restore_fence(&core.path, true).await;
@@ -491,7 +537,7 @@ impl Conductor {
             self.store()?,
             self.backup_zone()?,
             id,
-            password,
+            password.as_deref(),
             request,
             &self.settings().await?,
         )
@@ -503,13 +549,14 @@ impl Conductor {
     }
 
     async fn run_backup_sanitize(&self) -> Result<()> {
-        let (removed_guilds, removed_object_keys, ids) =
-            crate::backup::load_cleanup_intents(&self.cfg).await?;
+        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
         let request = crate::backup::RestoreRequest {
             acknowledge_historical: true,
             current_state_available: true,
-            removed_guilds,
-            removed_object_keys,
+            removed_guilds: intents.guilds,
+            removed_cases: intents.cases,
+            removed_evidence: intents.evidence,
+            removed_object_keys: intents.object_keys,
         };
         crate::backup::sanitize_complete_archives(
             &self.cfg,
@@ -519,7 +566,7 @@ impl Conductor {
             &request,
         )
         .await?;
-        crate::backup::clear_cleanup_intents(&self.cfg, &ids).await
+        crate::backup::clear_cleanup_intents(&self.cfg, &intents.ids).await
     }
 }
 

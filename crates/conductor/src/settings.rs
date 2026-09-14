@@ -36,16 +36,8 @@ pub struct ControlSettings {
     pub backup_retain_daily: u64,
     #[serde(default = "default_backup_retain_checkpoints")]
     pub backup_retain_checkpoints: u64,
-    #[serde(default = "default_backup_preop")]
-    pub backup_preop_policy: String,
-    #[serde(default = "default_backup_recent_hours")]
-    pub backup_recent_max_hours: u64,
-    #[serde(default = "default_backup_retry")]
-    pub backup_retry_alert_after: u64,
     #[serde(default = "default_backup_max_bytes")]
     pub backup_max_archive_bytes: u64,
-    #[serde(default = "default_backup_drill_days")]
-    pub backup_drill_interval_days: u64,
 }
 
 impl Default for ControlSettings {
@@ -77,11 +69,7 @@ impl Default for ControlSettings {
             backup_retain_scheduled: 24,
             backup_retain_daily: 7,
             backup_retain_checkpoints: 3,
-            backup_preop_policy: "fresh".into(),
-            backup_recent_max_hours: 6,
-            backup_retry_alert_after: 2,
             backup_max_archive_bytes: 256 * 1024 * 1024,
-            backup_drill_interval_days: 30,
         }
     }
 }
@@ -146,35 +134,11 @@ impl ControlSettings {
             10,
         )?;
         ensure_range(
-            "backup_recent_max_hours",
-            self.backup_recent_max_hours,
-            1,
-            72,
-        )?;
-        ensure_range(
-            "backup_retry_alert_after",
-            self.backup_retry_alert_after,
-            1,
-            24,
-        )?;
-        ensure_range(
             "backup_max_archive_bytes",
             self.backup_max_archive_bytes,
             1_048_576,
             2 * 1024 * 1024 * 1024,
         )?;
-        ensure_range(
-            "backup_drill_interval_days",
-            self.backup_drill_interval_days,
-            1,
-            90,
-        )?;
-        anyhow::ensure!(
-            self.backup_preop_policy == "fresh"
-                || self.backup_preop_policy == "recent"
-                || self.backup_preop_policy == "skip",
-            "backup_preop_policy must be fresh, recent or skip"
-        );
         Ok(())
     }
 
@@ -200,11 +164,7 @@ impl ControlSettings {
             "backup_retain_scheduled": { "value": self.backup_retain_scheduled, "applied": true, "unit": "points" },
             "backup_retain_daily": { "value": self.backup_retain_daily, "applied": true, "unit": "points" },
             "backup_retain_checkpoints": { "value": self.backup_retain_checkpoints, "applied": true, "unit": "releases" },
-            "backup_preop_policy": { "value": self.backup_preop_policy, "applied": true },
-            "backup_recent_max_hours": { "value": self.backup_recent_max_hours, "applied": true, "unit": "hours" },
-            "backup_retry_alert_after": { "value": self.backup_retry_alert_after, "applied": true, "unit": "failures" },
             "backup_max_archive_bytes": { "value": self.backup_max_archive_bytes, "applied": true, "unit": "bytes" },
-            "backup_drill_interval_days": { "value": self.backup_drill_interval_days, "applied": true, "unit": "days" },
             "process_owned": {
                 "image_spam": "Bot process configuration. Not applied by the conductor.",
                 "log_discord_concurrency": "Bot process configuration. Not applied by the conductor.",
@@ -237,11 +197,7 @@ pub struct SettingsPatch {
     pub backup_retain_scheduled: Option<u64>,
     pub backup_retain_daily: Option<u64>,
     pub backup_retain_checkpoints: Option<u64>,
-    pub backup_preop_policy: Option<String>,
-    pub backup_recent_max_hours: Option<u64>,
-    pub backup_retry_alert_after: Option<u64>,
     pub backup_max_archive_bytes: Option<u64>,
-    pub backup_drill_interval_days: Option<u64>,
     pub revision: Option<i64>,
 }
 
@@ -313,20 +269,8 @@ impl ControlSettings {
         if let Some(v) = patch.backup_retain_checkpoints {
             self.backup_retain_checkpoints = v;
         }
-        if let Some(v) = patch.backup_preop_policy {
-            self.backup_preop_policy = v;
-        }
-        if let Some(v) = patch.backup_recent_max_hours {
-            self.backup_recent_max_hours = v;
-        }
-        if let Some(v) = patch.backup_retry_alert_after {
-            self.backup_retry_alert_after = v;
-        }
         if let Some(v) = patch.backup_max_archive_bytes {
             self.backup_max_archive_bytes = v;
-        }
-        if let Some(v) = patch.backup_drill_interval_days {
-            self.backup_drill_interval_days = v;
         }
         self.validate()?;
         Ok(patch.revision.unwrap_or(0))
@@ -350,20 +294,8 @@ fn default_backup_retain_daily() -> u64 {
 fn default_backup_retain_checkpoints() -> u64 {
     3
 }
-fn default_backup_preop() -> String {
-    "fresh".into()
-}
-fn default_backup_recent_hours() -> u64 {
-    6
-}
-fn default_backup_retry() -> u64 {
-    2
-}
 fn default_backup_max_bytes() -> u64 {
     256 * 1024 * 1024
-}
-fn default_backup_drill_days() -> u64 {
-    30
 }
 
 fn unique_categories(values: &[String]) -> Result<Vec<String>> {

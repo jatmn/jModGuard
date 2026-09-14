@@ -10,6 +10,7 @@ description = "Independent jModGuard installation control service"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
+futures-util = { version = "0.3", default-features = false }
 jmodguard-runtime = { path = "../runtime" }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 percent-encoding = "2"

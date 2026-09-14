@@ -115,6 +115,18 @@ async fn write_core(path: &std::path::Path, with_actions: bool) {
          INSERT INTO meta(key,value) VALUES('schema_family','jmodguard-core-1');
          CREATE TABLE guild_settings(guild_id INTEGER, prefix TEXT);
          INSERT INTO guild_settings(guild_id, prefix) VALUES(10, '!');
+         CREATE TABLE guild_cases(
+           guild_id INTEGER NOT NULL,
+           enrollment_id TEXT NOT NULL,
+           case_id TEXT NOT NULL,
+           payload TEXT,
+           PRIMARY KEY(guild_id, enrollment_id, case_id)
+         );
+         INSERT INTO guild_cases VALUES
+           (10, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '11111111111111111111111111111111', 'remove'),
+           (10, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '22222222222222222222222222222222', 'keep');
+         CREATE TRIGGER protect_case_delete BEFORE DELETE ON guild_cases
+         BEGIN SELECT RAISE(ABORT, 'application lifecycle guard'); END;
          CREATE TABLE bot_actions(id INTEGER PRIMARY KEY, payload TEXT);
          CREATE TABLE backup_cleanup_intents(
            intent_id TEXT PRIMARY KEY,
@@ -539,4 +551,263 @@ async fn known_removal_is_applied_and_cleanup_intents_are_acked() {
             .any(|row| row.status == "replaced" || row.scope_json.contains("sanitized")),
         "{listed:?}"
     );
+}
+
+#[tokio::test]
+async fn portable_restore_password_is_ephemeral_and_plaintext_scratch_is_removed() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(br#"{"kind":"manual"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+    let id = complete_archive_id(&h, &cookie).await;
+    let password = "ephemeral-restore-secret";
+    let (status, portable, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/backups/{id}/portable"),
+        Some(&cookie),
+        Some(format!(r#"{{"password":"{password}"}}"#).as_bytes()),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !h.root
+            .join("backups")
+            .join("scratch")
+            .join(format!("portable-{id}"))
+            .exists(),
+        "portable plaintext scratch survived response creation"
+    );
+
+    let (status, uploaded, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups/upload",
+        Some(&cookie),
+        Some(&portable),
+        Some("application/octet-stream"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let uploaded: serde_json::Value = serde_json::from_slice(&uploaded).unwrap();
+    let upload_id = uploaded["id"].as_str().unwrap();
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/backups/{upload_id}/restore"),
+        Some(&cookie),
+        Some(format!(r#"{{"password":"{password}"}}"#).as_bytes()),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let queued = h
+        .conductor
+        .store()
+        .unwrap()
+        .list_jobs(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.kind == "backup_restore" && job.status == "queued")
+        .expect("queued restore");
+    assert!(!queued.payload_json.contains(password), "{queued:?}");
+    assert!(queued.payload_json.contains("\"password_required\":true"));
+
+    tick_until_idle(&h).await;
+    assert!(h.root.join("restore-target").join("COMPLETE").exists());
+}
+
+#[tokio::test]
+async fn upload_stream_enforces_the_configured_archive_budget() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let (status, patched, _) = call(
+        &h.router,
+        "PATCH",
+        "/api/settings",
+        Some(&cookie),
+        Some(br#"{"revision":1,"backup_max_archive_bytes":1048576}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&patched)
+    );
+    let mut oversized = jmodguard_conductor::backup::MAGIC.to_vec();
+    oversized.resize(1_048_577, 0);
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups/upload",
+        Some(&cookie),
+        Some(&oversized),
+        Some("application/octet-stream"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        std::fs::read_dir(h.root.join("backups").join("quarantine"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn capture_refuses_to_report_success_without_a_core_store() {
+    let h = setup(false).await;
+    let mut cfg = h.conductor.cfg.clone();
+    cfg.capture_stores.clear();
+    let error = jmodguard_conductor::backup::capture(
+        &cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &h.conductor.settings().await.unwrap(),
+    )
+    .await
+    .expect_err("capture without core store must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("capture requires a configured core store"),
+        "{error:#}"
+    );
+    assert!(
+        h.conductor
+            .store()
+            .unwrap()
+            .list_archives(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn case_cleanup_is_scoped_and_preserves_database_triggers() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(br#"{"kind":"manual"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO backup_cleanup_intents(
+           intent_id, kind, guild_id, enrollment_id, case_id, created_at
+         ) VALUES(
+           '33333333333333333333333333333333', 'case', 10,
+           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+           '11111111111111111111111111111111', 1
+         )",
+        (),
+    )
+    .await
+    .unwrap();
+    tick_until_idle(&h).await;
+    let sanitized_id = complete_archive_id(&h, &cookie).await;
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/backups/{sanitized_id}/restore"),
+        Some(&cookie),
+        Some(br#"{}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+
+    let restored = h.root.join("restore-target").join("core.sqlite");
+    let db = libsql::Builder::new_local(&restored).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let removed: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM guild_cases
+             WHERE case_id = '11111111111111111111111111111111'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let kept: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM guild_cases
+             WHERE case_id = '22222222222222222222222222222222'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let trigger: i64 = conn
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'protect_case_delete'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!((removed, kept, trigger), (0, 1, 1));
+}
+
+#[tokio::test]
+async fn backup_catalog_surfaces_failed_jobs_for_retry() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let store = h.conductor.store().unwrap();
+    let id = store
+        .insert_job("backup_capture", &serde_json::json!({"kind":"manual"}), 1)
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().id, id);
+    store
+        .finish_job(&id, false, Some("capture failed"))
+        .await
+        .unwrap();
+    let (status, body, _) = call(&h.router, "GET", "/api/backups", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["failed_jobs"][0]["id"], id);
+    assert_eq!(body["failed_jobs"][0]["status"], "failed");
 }

@@ -415,15 +415,27 @@ impl ControlStore {
         max_attempts: i64,
     ) -> Result<String> {
         let id = random_token();
+        self.insert_job_with_id(&id, kind, payload, max_attempts)
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn insert_job_with_id(
+        &self,
+        id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: i64,
+    ) -> Result<()> {
         let now = now_ms();
         let conn = self.connect().await?;
         conn.execute(
             "INSERT INTO jobs(id, kind, status, payload_json, attempts, max_attempts, due_ms, created_ms) \
              VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
-            libsql::params![id.clone(), kind, payload.to_string(), max_attempts, now, now],
+            libsql::params![id, kind, payload.to_string(), max_attempts, now, now],
         )
         .await?;
-        Ok(id)
+        Ok(())
     }
 
     pub async fn claim_job(&self) -> Result<Option<JobRow>> {

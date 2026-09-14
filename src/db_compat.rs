@@ -324,7 +324,11 @@ impl Connection {
 
 impl SqlExecutor for Connection {
     fn execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
-        if self.runtime.is_remote() && self.inner.is_autocommit() {
+        // Route every autocommit write through the same immediate transaction.
+        // Remote connections additionally gain commit receipts; local connections
+        // need this boundary so the restore fence check and write share one
+        // primary snapshot instead of racing a conductor restore.
+        if self.inner.is_autocommit() {
             let transaction = self.transaction_immediate()?;
             let changed = transaction.execute(sql, params)?;
             transaction.commit()?;

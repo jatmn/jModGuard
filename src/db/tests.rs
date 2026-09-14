@@ -49,6 +49,20 @@ fn restore_fence_blocks_primary_writes() {
             error.to_string().contains("restore is in progress"),
             "{error:#}"
         );
+        let error = db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE meta SET value = 'blocked' WHERE key = 'schema_family'",
+                    (),
+                )?;
+                Ok(())
+            })
+            .await
+            .expect_err("fenced autocommit writes must fail");
+        assert!(
+            error.to_string().contains("restore is in progress"),
+            "{error:#}"
+        );
     });
     cleanup_db(&tmp);
 }

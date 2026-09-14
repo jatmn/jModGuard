@@ -45,7 +45,32 @@ pub struct RestoreRequest {
     pub acknowledge_historical: bool,
     pub current_state_available: bool,
     pub removed_guilds: BTreeSet<i64>,
+    pub removed_cases: BTreeSet<RemovedCase>,
+    pub removed_evidence: BTreeSet<RemovedEvidence>,
     pub removed_object_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RemovedCase {
+    pub guild_id: i64,
+    pub enrollment_id: String,
+    pub case_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RemovedEvidence {
+    pub guild_id: i64,
+    pub enrollment_id: String,
+    pub evidence_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CleanupIntents {
+    pub guilds: BTreeSet<i64>,
+    pub cases: BTreeSet<RemovedCase>,
+    pub evidence: BTreeSet<RemovedEvidence>,
+    pub object_keys: BTreeSet<String>,
+    pub ids: Vec<String>,
 }
 
 impl BackupZone {
@@ -75,6 +100,16 @@ impl BackupZone {
     pub fn cleanup_scratch(&self, id: &str) {
         let _ = fs::remove_dir_all(self.scratch(id));
         let _ = fs::remove_file(self.staging_path(id));
+    }
+
+    pub fn begin_upload(&self) -> Result<(String, File)> {
+        let id = random_token();
+        let file = private_file(&self.quarantine_path(&id))?;
+        Ok((id, file))
+    }
+
+    pub fn remove_quarantine(&self, id: &str) {
+        let _ = fs::remove_file(self.quarantine_path(id));
     }
 
     pub fn prune_incomplete(&self) -> Result<()> {
@@ -129,6 +164,12 @@ pub async fn capture(
         kind == "scheduled" || kind == "manual" || kind == "checkpoint",
         "unsupported backup kind"
     );
+    let core = cfg
+        .capture_stores
+        .iter()
+        .find(|capture| capture.role == "core")
+        .context("capture requires a configured core store")?;
+    ensure!(core.path.exists(), "capture store core is missing");
     let id = random_token();
     let created = now_ms();
     let roles: Vec<String> = cfg.capture_stores.iter().map(|s| s.role.clone()).collect();
@@ -313,19 +354,6 @@ pub async fn wrap_portable_archive(
     Ok(dest)
 }
 
-pub fn ingest_upload(zone: &BackupZone, bytes: &[u8]) -> Result<String> {
-    ensure!(
-        bytes.len() >= MAGIC.len() && bytes.starts_with(MAGIC),
-        "unsupported archive format"
-    );
-    let id = random_token();
-    let path = zone.quarantine_path(&id);
-    let mut file = private_file(&path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(id)
-}
-
 pub async fn restore_archive(
     cfg: &Config,
     store: &ControlStore,
@@ -431,7 +459,11 @@ pub async fn sanitize_complete_archives(
     settings: &ControlSettings,
     request: &RestoreRequest,
 ) -> Result<usize> {
-    if request.removed_guilds.is_empty() && request.removed_object_keys.is_empty() {
+    if request.removed_guilds.is_empty()
+        && request.removed_cases.is_empty()
+        && request.removed_evidence.is_empty()
+        && request.removed_object_keys.is_empty()
+    {
         return Ok(0);
     }
     let mut rewritten = 0usize;
@@ -513,42 +545,64 @@ pub async fn sanitize_complete_archives(
     Ok(rewritten)
 }
 
-pub async fn load_cleanup_intents(
-    cfg: &Config,
-) -> Result<(BTreeSet<i64>, BTreeSet<String>, Vec<String>)> {
-    let mut guilds = BTreeSet::new();
-    let mut keys = BTreeSet::new();
-    let mut ids = Vec::new();
+pub async fn load_cleanup_intents(cfg: &Config) -> Result<CleanupIntents> {
+    let mut intents = CleanupIntents::default();
     let Some(core) = cfg.capture_stores.iter().find(|s| s.role == "core") else {
-        return Ok((guilds, keys, ids));
+        return Ok(intents);
     };
     if !core.path.exists() {
-        return Ok((guilds, keys, ids));
+        return Ok(intents);
     }
     let db = libsql::Builder::new_local(&core.path).build().await?;
     let conn = db.connect()?;
     let mut rows = match conn
         .query(
-            "SELECT intent_id, guild_id, object_key FROM backup_cleanup_intents",
+            "SELECT intent_id, kind, guild_id, enrollment_id, case_id, evidence_id, object_key
+             FROM backup_cleanup_intents",
             (),
         )
         .await
     {
         Ok(rows) => rows,
-        Err(_) => return Ok((guilds, keys, ids)),
+        Err(error) if error.to_string().contains("no such table") => return Ok(intents),
+        Err(error) => return Err(error.into()),
     };
     while let Some(row) = rows.next().await? {
-        ids.push(row.get::<String>(0).unwrap_or_default());
-        if let Ok(guild) = row.get::<i64>(1)
-            && guild > 0
-        {
-            guilds.insert(guild);
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let guild_id: i64 = row.get(2)?;
+        let enrollment_id = row.get::<String>(3).ok();
+        let case_id = row.get::<String>(4).ok();
+        let evidence_id = row.get::<String>(5).ok();
+        let object_key = row.get::<String>(6).ok();
+        intents.ids.push(id);
+        match kind.as_str() {
+            "guild" => {
+                intents.guilds.insert(guild_id);
+            }
+            "case" => {
+                intents.cases.insert(RemovedCase {
+                    guild_id,
+                    enrollment_id: enrollment_id
+                        .context("case cleanup intent missing enrollment")?,
+                    case_id: case_id.context("case cleanup intent missing case")?,
+                });
+            }
+            "evidence" => {
+                intents.evidence.insert(RemovedEvidence {
+                    guild_id,
+                    enrollment_id: enrollment_id
+                        .context("evidence cleanup intent missing enrollment")?,
+                    evidence_id: evidence_id.context("evidence cleanup intent missing evidence")?,
+                });
+            }
+            _ => anyhow::bail!("unsupported backup cleanup intent kind {kind}"),
         }
-        if let Ok(key) = row.get::<String>(2) {
-            keys.insert(key);
+        if let Some(key) = object_key.filter(|key| !key.is_empty()) {
+            intents.object_keys.insert(key);
         }
     }
-    Ok((guilds, keys, ids))
+    Ok(intents)
 }
 
 pub async fn clear_cleanup_intents(cfg: &Config, ids: &[String]) -> Result<()> {
@@ -558,12 +612,11 @@ pub async fn clear_cleanup_intents(cfg: &Config, ids: &[String]) -> Result<()> {
     let db = libsql::Builder::new_local(&core.path).build().await?;
     let conn = db.connect()?;
     for id in ids {
-        let _ = conn
-            .execute(
-                "DELETE FROM backup_cleanup_intents WHERE intent_id = ?",
-                libsql::params![id.clone()],
-            )
-            .await;
+        conn.execute(
+            "DELETE FROM backup_cleanup_intents WHERE intent_id = ?",
+            libsql::params![id.clone()],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -580,7 +633,7 @@ pub async fn set_restore_fence(path: &Path, on: bool) -> Result<()> {
 }
 
 async fn live_removed_keys(cfg: &Config) -> Result<BTreeSet<String>> {
-    Ok(load_cleanup_intents(cfg).await?.1)
+    Ok(load_cleanup_intents(cfg).await?.object_keys)
 }
 
 async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
@@ -604,32 +657,180 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
 }
 
 async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
-    if request.removed_guilds.is_empty() {
+    if request.removed_guilds.is_empty()
+        && request.removed_cases.is_empty()
+        && request.removed_evidence.is_empty()
+    {
         return Ok(());
     }
     let db = libsql::Builder::new_local(path).build().await?;
     let conn = db.connect()?;
-    for guild in &request.removed_guilds {
-        for sql in [
-            "DELETE FROM guild_settings WHERE guild_id = ?",
-            "DELETE FROM events WHERE guild_id = ?",
-            "DELETE FROM warns WHERE guild_id = ?",
-            "DELETE FROM bans WHERE guild_id = ?",
-            "DELETE FROM log_channels WHERE guild_id = ?",
-            "DELETE FROM badwords WHERE guild_id = ?",
-            "DELETE FROM rules WHERE guild_id = ?",
-            "DELETE FROM commands WHERE guild_id = ?",
-            "DELETE FROM templates WHERE guild_id = ?",
-            "DELETE FROM guild_enrollments WHERE guild_id = ?",
-            "DELETE FROM guild_store_placements WHERE guild_id = ?",
-            "DELETE FROM guild_erasure_jobs WHERE guild_id = ?",
-            "DELETE FROM guild_cases WHERE guild_id = ?",
-            "DELETE FROM guild_memberships WHERE guild_id = ?",
-        ] {
-            let _ = conn.execute(sql, libsql::params![*guild]).await;
-        }
+
+    let mut tables = BTreeSet::new();
+    let mut rows = conn
+        .query("SELECT name FROM sqlite_master WHERE type = 'table'", ())
+        .await?;
+    while let Some(row) = rows.next().await? {
+        tables.insert(row.get::<String>(0)?);
     }
+    let mut triggers = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'trigger' AND sql IS NOT NULL ORDER BY name",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        triggers.push((row.get::<String>(0)?, row.get::<String>(1)?));
+    }
+
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    let result: Result<()> = async {
+        // These are disposable copied databases. Temporarily removing their
+        // application lifecycle triggers lets a cleanup intent erase an entire
+        // owned scope, then restores the exact schema before commit.
+        for (name, _) in &triggers {
+            conn.execute_batch(&format!(
+                "DROP TRIGGER {}",
+                quote_identifier(name)
+            ))
+            .await?;
+        }
+
+        const GUILD_TABLES: &[&str] = &[
+            "guild_settings",
+            "events",
+            "warns",
+            "bans",
+            "log_channels",
+            "badwords",
+            "rules",
+            "commands",
+            "templates",
+            "guild_enrollments",
+            "guild_store_placements",
+            "guild_erasure_jobs",
+            "backup_cleanup_intents",
+            "guild_bunny_evidence",
+            "guild_case_evidence",
+            "guild_case_history",
+            "guild_case_sources",
+            "guild_cases",
+            "guild_log_channels",
+            "guild_tenant_settings",
+            "guild_memberships",
+            "guild_bindings",
+        ];
+        for guild in &request.removed_guilds {
+            for table in GUILD_TABLES {
+                if tables.contains(*table) {
+                    conn.execute(
+                        &format!("DELETE FROM {} WHERE guild_id = ?", quote_identifier(table)),
+                        libsql::params![*guild],
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        for removed in &request.removed_cases {
+            for table in [
+                "guild_bunny_evidence",
+                "guild_case_evidence",
+                "guild_case_history",
+                "guild_case_sources",
+                "guild_cases",
+            ] {
+                if tables.contains(table) {
+                    let sql = if table == "guild_bunny_evidence" {
+                        "DELETE FROM guild_bunny_evidence
+                         WHERE guild_id = ? AND enrollment_id = ? AND evidence_id IN (
+                           SELECT evidence_id FROM guild_case_evidence
+                           WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?
+                         )"
+                    } else {
+                        match table {
+                            "guild_case_evidence" => {
+                                "DELETE FROM guild_case_evidence
+                                 WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
+                            }
+                            "guild_case_history" => {
+                                "DELETE FROM guild_case_history
+                                 WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
+                            }
+                            "guild_case_sources" => {
+                                "DELETE FROM guild_case_sources
+                                 WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
+                            }
+                            _ => {
+                                "DELETE FROM guild_cases
+                                 WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
+                            }
+                        }
+                    };
+                    if table == "guild_bunny_evidence" {
+                        conn.execute(
+                            sql,
+                            libsql::params![
+                                removed.guild_id,
+                                removed.enrollment_id.clone(),
+                                removed.guild_id,
+                                removed.enrollment_id.clone(),
+                                removed.case_id.clone()
+                            ],
+                        )
+                        .await?;
+                    } else {
+                        conn.execute(
+                            sql,
+                            libsql::params![
+                                removed.guild_id,
+                                removed.enrollment_id.clone(),
+                                removed.case_id.clone()
+                            ],
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        for removed in &request.removed_evidence {
+            for table in ["guild_bunny_evidence", "guild_case_evidence"] {
+                if tables.contains(table) {
+                    conn.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE guild_id = ? AND enrollment_id = ? AND evidence_id = ?",
+                            quote_identifier(table)
+                        ),
+                        libsql::params![
+                            removed.guild_id,
+                            removed.enrollment_id.clone(),
+                            removed.evidence_id.clone()
+                        ],
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        for (_, sql) in &triggers {
+            conn.execute_batch(sql).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = conn.execute("ROLLBACK", ()).await;
+        return Err(error);
+    }
+    conn.execute("COMMIT", ()).await?;
     Ok(())
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn encrypt_payload(

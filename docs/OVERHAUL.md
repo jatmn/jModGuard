@@ -419,9 +419,9 @@ See [CONDUCTOR.md](CONDUCTOR.md).
 
 Owners can schedule, create, download, upload and restore authenticated encrypted
 archives from conductor Administration. Defaults are a six-hour cadence, 24
-scheduled points, seven daily points and three release checkpoints, with a
-configurable fresh/recent/skip pre-operation policy. Scheduled failures retry and
-alert; they do not pause writes. Capture uses SQLite `VACUUM INTO` on configured
+scheduled points, seven daily points and three release checkpoints. Scheduled
+failures retry and alert, remain visible for explicit retry, and do not pause writes.
+Capture uses SQLite `VACUUM INTO` on configured
 local stores, excludes pending Discord actions, and copies evidence into a
 backups-only directory that is distinct from the live evidence root. Portable
 downloads use an export password. Restore stages into a configured empty target,

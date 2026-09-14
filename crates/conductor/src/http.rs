@@ -1,13 +1,15 @@
 //! Conductor HTTP surface. Guild API cookies never authenticate this origin.
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::settings::SettingsPatch;
@@ -105,10 +107,7 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/notifications/test", post(api_notify_test))
         .route("/api/notifications/health", get(api_notify_health))
         .route("/api/backups", get(api_backups).post(api_backup_create))
-        .route(
-            "/api/backups/upload",
-            post(api_backup_upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
-        )
+        .route("/api/backups/upload", post(api_backup_upload))
         .route("/api/backups/{id}", get(api_backup_one))
         .route("/api/backups/{id}/download", get(api_backup_download))
         .route("/api/backups/{id}/portable", post(api_backup_portable))
@@ -147,6 +146,7 @@ fn placeholder_state() -> Conductor {
         backup: None,
         http: reqwest::Client::new(),
         started: std::time::Instant::now(),
+        restore_passwords: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -531,16 +531,23 @@ async fn api_backups(State(state): State<Arc<Conductor>>, headers: HeaderMap) ->
         Ok(settings) => settings,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
+    let failed_jobs = match store.list_jobs(50).await {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|job| job.kind.starts_with("backup_") && job.status == "failed")
+            .collect::<Vec<_>>(),
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
     match store.list_archives(100).await {
         Ok(archives) => {
             let last = store.last_complete_ms().await.ok().flatten();
             Json(serde_json::json!({
                 "archives": archives.into_iter().filter(|row| row.status == "complete" || row.status == "failed" || row.status == "quarantined").collect::<Vec<_>>(),
+                "failed_jobs": failed_jobs,
                 "last_complete_ms": last,
                 "overdue": crate::backup::overdue(&settings, last),
                 "backup_enabled": settings.backup_enabled,
                 "interval_hours": settings.backup_interval_hours,
-                "preop_policy": settings.backup_preop_policy,
                 "key_from_env": state.cfg.backup_key.is_some(),
             }))
             .into_response()
@@ -644,7 +651,12 @@ async fn api_backup_download(
         },
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };
-    stream_file(zone.complete_path(&row.id), &format!("jmodguard-{id}.jmb")).await
+    stream_file(
+        zone.complete_path(&row.id),
+        &format!("jmodguard-{id}.jmb"),
+        None,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -677,7 +689,10 @@ async fn api_backup_portable(
     )
     .await
     {
-        Ok(path) => stream_file(path, &format!("jmodguard-{id}-portable.jmb")).await,
+        Ok(path) => {
+            let cleanup = path.parent().map(std::path::Path::to_path_buf);
+            stream_file(path, &format!("jmodguard-{id}-portable.jmb"), cleanup).await
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -717,18 +732,26 @@ async fn enqueue_restore(
         !state.store()?.has_active_backup_job().await?,
         "a backup or restore job is already running"
     );
-    let job = state
+    let job = random_token();
+    let password_required = body.password.is_some();
+    state.remember_restore_password(&job, body.password)?;
+    if let Err(error) = state
         .store()?
-        .insert_job(
+        .insert_job_with_id(
+            &job,
             "backup_restore",
             &serde_json::json!({
                 "id": id,
-                "password": body.password,
+                "password_required": password_required,
                 "acknowledge_historical": body.acknowledge_historical.unwrap_or(false),
             }),
             1,
         )
-        .await?;
+        .await
+    {
+        state.forget_restore_password(&job);
+        return Err(error);
+    }
     state
         .store()?
         .audit(&operator.operator_id, "backup_restore", id)
@@ -739,7 +762,7 @@ async fn enqueue_restore(
 async fn api_backup_upload(
     State(state): State<Arc<Conductor>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if let Err(error) = operator(&state, &headers).await {
         return auth_error(error);
@@ -752,40 +775,92 @@ async fn api_backup_upload(
         Ok(settings) => settings,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
-    if body.len() as u64 > settings.backup_max_archive_bytes {
+    let (id, file) = match zone.begin_upload() {
+        Ok(upload) => upload,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut bytes = 0_u64;
+    let mut prefix = Vec::with_capacity(crate::backup::MAGIC.len());
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                zone.remove_quarantine(&id);
+                return error_response(StatusCode::BAD_REQUEST, error.into());
+            }
+        };
+        bytes = match bytes.checked_add(chunk.len() as u64) {
+            Some(bytes) if bytes <= settings.backup_max_archive_bytes => bytes,
+            _ => {
+                zone.remove_quarantine(&id);
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    anyhow::anyhow!("upload exceeds configured byte budget"),
+                );
+            }
+        };
+        if prefix.len() < crate::backup::MAGIC.len() {
+            let needed = crate::backup::MAGIC.len() - prefix.len();
+            prefix.extend_from_slice(&chunk[..chunk.len().min(needed)]);
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            zone.remove_quarantine(&id);
+            return error_response(StatusCode::BAD_REQUEST, error.into());
+        }
+    }
+    if prefix != crate::backup::MAGIC {
+        zone.remove_quarantine(&id);
         return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            anyhow::anyhow!("upload exceeds configured byte budget"),
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("unsupported archive format"),
         );
     }
-    match crate::backup::ingest_upload(zone, &body) {
-        Ok(id) => {
-            if let Ok(store) = state.store() {
-                let _ = store
-                    .insert_archive(&crate::store::ArchiveRow {
-                        id: id.clone(),
-                        kind: "upload".into(),
-                        status: "quarantined".into(),
-                        created_ms: crate::store::now_ms(),
-                        captured_ms: None,
-                        scope_json: "{}".into(),
-                        object_key: Some(format!("quarantine/{id}.jmb")),
-                        sha256: None,
-                        bytes: Some(body.len() as i64),
-                        family: "unknown".into(),
-                        last_error: None,
-                    })
-                    .await;
-            }
-            Json(serde_json::json!({ "id": id, "status": "quarantined" })).into_response()
-        }
-        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    if let Err(error) = file.sync_all().await {
+        zone.remove_quarantine(&id);
+        return error_response(StatusCode::BAD_REQUEST, error.into());
     }
+    drop(file);
+    let store = match state.store() {
+        Ok(store) => store,
+        Err(error) => {
+            zone.remove_quarantine(&id);
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+    };
+    if let Err(error) = store
+        .insert_archive(&crate::store::ArchiveRow {
+            id: id.clone(),
+            kind: "upload".into(),
+            status: "quarantined".into(),
+            created_ms: crate::store::now_ms(),
+            captured_ms: None,
+            scope_json: "{}".into(),
+            object_key: Some(format!("quarantine/{id}.jmb")),
+            sha256: None,
+            bytes: Some(i64::try_from(bytes).unwrap_or(i64::MAX)),
+            family: "unknown".into(),
+            last_error: None,
+        })
+        .await
+    {
+        zone.remove_quarantine(&id);
+        return error_response(StatusCode::BAD_REQUEST, error);
+    }
+    Json(serde_json::json!({ "id": id, "status": "quarantined" })).into_response()
 }
 
-async fn stream_file(path: std::path::PathBuf, filename: &str) -> Response {
+async fn stream_file(
+    path: std::path::PathBuf,
+    filename: &str,
+    cleanup: Option<std::path::PathBuf>,
+) -> Response {
     match tokio::fs::File::open(&path).await {
         Ok(file) => {
+            if let Some(cleanup) = cleanup {
+                let _ = tokio::fs::remove_dir_all(cleanup).await;
+            }
             let body = Body::from_stream(ReaderStream::new(file));
             let disposition = format!("attachment; filename=\"{filename}\"");
             (
@@ -805,7 +880,12 @@ async fn stream_file(path: std::path::PathBuf, filename: &str) -> Response {
             )
                 .into_response()
         }
-        Err(error) => error_response(StatusCode::NOT_FOUND, error.into()),
+        Err(error) => {
+            if let Some(cleanup) = cleanup {
+                let _ = tokio::fs::remove_dir_all(cleanup).await;
+            }
+            error_response(StatusCode::NOT_FOUND, error.into())
+        }
     }
 }
 

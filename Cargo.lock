@@ -1188,6 +1188,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "jmodguard-runtime",
  "libsql",
  "percent-encoding",
