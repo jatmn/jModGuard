@@ -75,6 +75,12 @@ impl Conductor {
         } else {
             None
         };
+        if backup.is_none()
+            && let Some(store) = &store
+            && let Err(error) = store.fail_remaining_staging_archives().await
+        {
+            tracing::warn!("could not finalize interrupted archive catalog rows: {error:#}");
+        }
         if let Some(core) = cfg.capture_stores.iter().find(|s| s.role == "core")
             && core.path.exists()
         {

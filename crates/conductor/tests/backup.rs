@@ -1477,6 +1477,94 @@ async fn startup_recovers_archive_catalog_and_untracked_complete_files() {
 }
 
 #[tokio::test]
+async fn startup_adopts_staging_catalog_row_when_encrypted_bytes_exist() {
+    let h = setup(false).await;
+    let settings = h.conductor.settings().await.unwrap();
+    let archive = jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let archive_id = archive.id.clone();
+    let zone = h.conductor.backup_zone().unwrap();
+    let complete = zone.complete_path(&archive_id);
+    let staging = zone.staging_path(&archive_id);
+    std::fs::copy(&complete, &staging).unwrap();
+    std::fs::remove_file(&complete).unwrap();
+    let mut row = archive;
+    row.status = "staging".into();
+    row.object_key = None;
+    row.sha256 = None;
+    row.bytes = None;
+    h.conductor
+        .store()
+        .unwrap()
+        .update_archive(&row)
+        .await
+        .unwrap();
+
+    let restarted = Conductor::start(h.conductor.cfg.clone(), false)
+        .await
+        .unwrap();
+    let recovered = restarted
+        .store()
+        .unwrap()
+        .get_archive(&archive_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, "complete");
+    assert!(zone.complete_path(&archive_id).exists());
+    assert!(!staging.exists());
+}
+
+#[tokio::test]
+async fn verified_restore_staging_promotes_without_redownload() {
+    let h = setup(false).await;
+    let settings = h.conductor.settings().await.unwrap();
+    let archive = jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let target = h.root.join("restore-target");
+    let stage = h.root.join(".restore-target.jmodguard-restore-staging");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(
+        stage.join(".jmodguard-restore-staging"),
+        b"jmodguard-restore-staging-1\n",
+    )
+    .unwrap();
+    std::fs::write(stage.join("COMPLETE"), b"jmodguard restore verified\n").unwrap();
+
+    jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+    assert!(target.join("COMPLETE").exists());
+    assert!(!stage.exists());
+}
+
+#[tokio::test]
 async fn complete_archive_enumeration_is_not_limited_by_catalog_history() {
     let h = setup(false).await;
     let store = h.conductor.store().unwrap();

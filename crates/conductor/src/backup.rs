@@ -438,7 +438,9 @@ pub async fn restore_file(
         "restore target must be an absent directory"
     );
     let restore_stage = restore_staging_path(&target)?;
-    recover_restore_stage(&restore_stage)?;
+    if recover_restore_stage(&restore_stage, &target)? {
+        return Ok(target);
+    }
     let restore_id = format!("restore-{}", random_token());
     let scratch = zone.scratch(&restore_id);
     private_dir(&scratch, true)?;
@@ -465,7 +467,7 @@ pub async fn restore_file(
         marker.sync_all()?;
         restore_files(&restore_stage, files, &request).await?;
         let mut complete = private_file(&restore_stage.join("COMPLETE"))?;
-        complete.write_all(b"jmodguard restore verified\n")?;
+        complete.write_all(RESTORE_COMPLETE_MARK)?;
         complete.sync_all()?;
         File::open(&restore_stage)?.sync_all()?;
         fs::rename(&restore_stage, &target)?;
@@ -740,6 +742,10 @@ pub async fn recover_catalog_archive_bytes(zone: &BackupZone, store: &ControlSto
             promote_staging_archive(zone, &row.id)?;
         }
     }
+    for row in store.list_staging_archives().await? {
+        adopt_staging_catalog_archive(zone, store, &row).await?;
+    }
+    store.fail_remaining_staging_archives().await?;
     Ok(())
 }
 
@@ -1511,9 +1517,24 @@ fn restore_staging_path(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{name}.jmodguard-restore-staging")))
 }
 
-fn recover_restore_stage(stage: &Path) -> Result<()> {
+const RESTORE_COMPLETE_MARK: &[u8] = b"jmodguard restore verified\n";
+
+fn restore_stage_marker_valid(marker: &Path) -> Result<()> {
+    let contents = fs::read_to_string(marker)?;
+    ensure!(
+        contents == RESTORE_STAGE_MARK,
+        "restore staging marker mismatch"
+    );
+    Ok(())
+}
+
+/// Reconcile leftover restore staging before a new attempt.
+///
+/// Returns `true` when a verified tree was promoted to `restore_target` and the
+/// caller can treat the restore as complete.
+fn recover_restore_stage(stage: &Path, restore_target: &Path) -> Result<bool> {
     if !stage.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let meta = fs::symlink_metadata(stage)?;
     ensure!(
@@ -1522,11 +1543,18 @@ fn recover_restore_stage(stage: &Path) -> Result<()> {
     );
     let marker = stage.join(".jmodguard-restore-staging");
     if marker.exists() {
-        let contents = fs::read_to_string(&marker)?;
-        ensure!(
-            RESTORE_STAGE_MARK.starts_with(&contents),
-            "restore staging marker mismatch"
-        );
+        restore_stage_marker_valid(&marker)?;
+        let complete = stage.join("COMPLETE");
+        if complete.exists() {
+            ensure!(
+                !restore_target.exists(),
+                "restore target must be an absent directory"
+            );
+            fs::rename(stage, restore_target)?;
+            File::open(restore_target.parent().context("restore target has no parent")?)?
+                .sync_all()?;
+            return Ok(true);
+        }
     } else {
         ensure!(
             fs::read_dir(stage)?.next().is_none(),
@@ -1534,6 +1562,48 @@ fn recover_restore_stage(stage: &Path) -> Result<()> {
         );
     }
     fs::remove_dir_all(stage)?;
+    Ok(false)
+}
+
+fn archive_file_has_magic(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    let mut prefix = vec![0u8; MAGIC.len()];
+    let read = file.read(&mut prefix)?;
+    Ok(read == MAGIC.len() && prefix == MAGIC)
+}
+
+async fn adopt_staging_catalog_archive(
+    zone: &BackupZone,
+    store: &ControlStore,
+    row: &ArchiveRow,
+) -> Result<()> {
+    let staging = zone.staging_path(&row.id);
+    if !archive_file_has_magic(&staging)? {
+        return Ok(());
+    }
+    promote_staging_archive(zone, &row.id)?;
+    let complete = zone.complete_path(&row.id);
+    let bytes = fs::metadata(&complete)?.len();
+    let sha = sha256_file(&complete)?;
+    let captured_ms = row.captured_ms.unwrap_or(row.created_ms);
+    store
+        .update_archive(&ArchiveRow {
+            id: row.id.clone(),
+            kind: row.kind.clone(),
+            status: "complete".into(),
+            created_ms: row.created_ms,
+            captured_ms: Some(captured_ms),
+            scope_json: row.scope_json.clone(),
+            object_key: Some(format!("complete/{}.jmb", row.id)),
+            sha256: Some(sha),
+            bytes: Some(i64::try_from(bytes).unwrap_or(i64::MAX)),
+            family: row.family.clone(),
+            last_error: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -1677,5 +1747,64 @@ mod restore_job_result_tests {
         let error = restore_job_result(Err(anyhow::anyhow!("corrupt archive")), Ok(()))
             .expect_err("restore failure must surface");
         assert!(error.to_string().contains("corrupt archive"));
+    }
+}
+
+#[cfg(test)]
+mod restore_stage_tests {
+    use super::{
+        RESTORE_COMPLETE_MARK, RESTORE_STAGE_MARK, recover_restore_stage, restore_staging_path,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("jmodguard-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn invalid_marker_leaves_staging_tree_in_place() {
+        let root = scratch_dir("invalid-marker");
+        let target = root.join("restore-target");
+        let stage = restore_staging_path(&target).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(".jmodguard-restore-staging"), b"").unwrap();
+        fs::write(stage.join("partial"), b"data").unwrap();
+        let error = recover_restore_stage(&stage, &target).expect_err("empty marker must fail");
+        assert!(error.to_string().contains("marker mismatch"));
+        assert!(stage.exists());
+        assert!(stage.join("partial").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_staging_promotes_to_restore_target() {
+        let root = scratch_dir("verified-promote");
+        let target = root.join("restore-target");
+        let stage = restore_staging_path(&target).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(".jmodguard-restore-staging"), RESTORE_STAGE_MARK).unwrap();
+        fs::write(stage.join("COMPLETE"), RESTORE_COMPLETE_MARK).unwrap();
+        assert!(recover_restore_stage(&stage, &target).unwrap());
+        assert!(target.join("COMPLETE").exists());
+        assert!(!stage.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_marker_clears_partial_staging() {
+        let root = scratch_dir("partial-clear");
+        let target = root.join("restore-target");
+        let stage = restore_staging_path(&target).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(".jmodguard-restore-staging"), RESTORE_STAGE_MARK).unwrap();
+        fs::write(stage.join("partial"), b"data").unwrap();
+        assert!(!recover_restore_stage(&stage, &target).unwrap());
+        assert!(!stage.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

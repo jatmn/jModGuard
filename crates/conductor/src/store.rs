@@ -84,7 +84,6 @@ impl ControlStore {
         let store = Self { db };
         store.migrate().await?;
         store.recover_interrupted_jobs().await?;
-        store.recover_interrupted_archives().await?;
         Ok(store)
     }
 
@@ -213,7 +212,8 @@ impl ControlStore {
         Ok(())
     }
 
-    async fn recover_interrupted_archives(&self) -> Result<()> {
+    /// Marks catalog rows still in `staging` after backup-zone reconciliation as failed.
+    pub async fn fail_remaining_staging_archives(&self) -> Result<()> {
         let conn = self.connect().await?;
         conn.execute(
             "UPDATE archives SET status = 'failed', last_error = ?
@@ -222,6 +222,22 @@ impl ControlStore {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn list_staging_archives(&self) -> Result<Vec<ArchiveRow>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error
+                 FROM archives WHERE status = 'staging' ORDER BY created_ms DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(archive_from_row(&row));
+        }
+        Ok(out)
     }
 
     pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
