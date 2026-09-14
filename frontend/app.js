@@ -247,6 +247,17 @@ function setStartupStatus(text) {
   if (node) node.textContent = text;
 }
 
+function showPreviewUnavailable() {
+  showView("startup-view");
+  setStartupStatus("This preview is no longer signed in. Return to the owner dashboard and launch a new preview.");
+  const link = $("#preview-return-link");
+  if (link) link.classList.remove("hidden");
+}
+
+function returnFromPreview() {
+  clearPreviewToken();
+}
+
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
@@ -465,7 +476,8 @@ async function init() {
     bindOwnerTools();
   } catch (e) {
     if (isUnauthenticated(e)) {
-      showView("login-view");
+      if (currentPreviewToken()) showPreviewUnavailable();
+      else showView("login-view");
     } else {
       showView("startup-view");
       setStartupStatus("Failed to load: " + (e.message || String(e)));
@@ -1807,6 +1819,8 @@ function bootUi() {
   });
   const loginLink = $("#login-link");
   if (loginLink) loginLink.href = authUrl("/login");
+  const previewReturnLink = $("#preview-return-link");
+  if (previewReturnLink) previewReturnLink.addEventListener("click", returnFromPreview);
   const logoutBtn = $("#logout-btn");
   if (logoutBtn) logoutBtn.addEventListener("click", async () => {
     if (!canLeave()) return;

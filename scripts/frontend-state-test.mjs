@@ -16,21 +16,36 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   };
   const opened = [];
   const historyUrls = [];
-  const node = (tag) => ({
-    tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
-    classList: { toggle() {}, add() {}, remove() {} },
-    focus() {},
-    replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
-    append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
-    set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
-    remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
-    setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
-    removeAttribute(k) { delete this.attrs[k]; },
-    addEventListener(k, v) { this.listeners[k] = v; },
-    querySelectorAll() { return []; },
-    querySelector() { return null; },
-  });
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools'].map((key) => [key, node('div')]));
+  const node = (tag) => {
+    const classes = new Set();
+    return {
+      tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      classList: {
+        toggle(name, force) {
+          const enabled = force === undefined ? !classes.has(name) : !!force;
+          if (enabled) classes.add(name); else classes.delete(name);
+          return enabled;
+        },
+        add(name) { classes.add(name); },
+        remove(name) { classes.delete(name); },
+        contains(name) { return classes.has(name); },
+      },
+      focus() {},
+      replaceChildren(...children) { this.innerHTML = ""; this.append(...children); },
+      append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
+      set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
+      remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
+      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
+      removeAttribute(k) { delete this.attrs[k]; },
+      addEventListener(k, v) { this.listeners[k] = v; },
+      querySelectorAll() { return []; },
+      querySelector() { return null; },
+    };
+  };
+  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link'].map((key) => [key, node('div')]));
+  for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
+    nodes.get(key).classList.add('hidden');
+  }
   const context = vm.createContext({
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
@@ -42,7 +57,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, init, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -908,4 +923,31 @@ test('View as hands the preview bearer through a URL fragment', async () => {
   assert.equal(h.opened[0][0], '/#preview=new-preview-token');
   assert.equal(h.opened[0][1], '_blank');
   assert.equal(h.opened[0][2], 'noopener');
+});
+
+test('unauthenticated blocked-storage preview never exposes owner login', async () => {
+  const blocked = {
+    get() { throw new Error('blocked'); },
+    set() { throw new Error('blocked'); },
+    delete() { throw new Error('blocked'); },
+  };
+  const h = harness(async () => ({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }), new Map(), blocked);
+  h.location.hash = '#preview=still-read-only';
+  h.app.capturePreviewToken();
+
+  await h.app.init();
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+  assert.match(h.nodes.get('#startup-status').textContent, /preview is no longer signed in/i);
+  assert.equal(h.app.currentPreviewToken(), 'still-read-only');
+
+  h.app.returnFromPreview();
+  assert.equal(h.app.currentPreviewToken(), null);
 });
