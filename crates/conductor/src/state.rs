@@ -378,10 +378,17 @@ impl Conductor {
         if !settings.backup_enabled {
             return Ok(());
         }
-        if store.has_unresolved_backup_job().await? {
+        if store.has_active_backup_job().await? {
             return Ok(());
         }
-        if !crate::backup::overdue(&settings, store.last_complete_ms().await?) {
+        let last_attempt_ms = match (
+            store.last_complete_ms().await?,
+            store.last_scheduled_backup_ms().await?,
+        ) {
+            (Some(complete), Some(scheduled)) => Some(complete.max(scheduled)),
+            (complete, scheduled) => complete.or(scheduled),
+        };
+        if !crate::backup::overdue(&settings, last_attempt_ms) {
             return Ok(());
         }
         let _ = store
@@ -532,32 +539,56 @@ impl Conductor {
             .unwrap_or(false);
         let current_state_available =
             crate::backup::current_policy_state_available(&self.cfg).await?;
-        let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
-        let request = crate::backup::RestoreRequest {
-            acknowledge_historical: acknowledge,
-            current_state_available,
-            removed_guilds: intents.guilds,
-            removed_cases: intents.cases,
-            removed_evidence: intents.evidence,
-            removed_object_keys: intents.object_keys,
+        let core = if current_state_available {
+            self.cfg.capture_stores.iter().find(|s| s.role == "core")
+        } else {
+            None
         };
-        if let Some(core) = self.cfg.capture_stores.iter().find(|s| s.role == "core") {
-            let _ = crate::backup::set_restore_fence(&core.path, true).await;
+        if let Some(core) = core {
+            crate::backup::set_restore_fence(&core.path, true)
+                .await
+                .context("failed to raise restore fence")?;
         }
-        let result = crate::backup::restore_archive(
-            &self.cfg,
-            self.store()?,
-            self.backup_zone()?,
-            id,
-            password.as_deref(),
-            request,
-            &self.settings().await?,
-        )
+        // Load removal policy only after the fence commits. Its write takes the
+        // SQLite primary writer lock, so all older application mutations have
+        // completed and newer ones will observe the fence before this snapshot.
+        let result: Result<()> = async {
+            let intents = crate::backup::load_cleanup_intents(&self.cfg).await?;
+            let request = crate::backup::RestoreRequest {
+                acknowledge_historical: acknowledge,
+                current_state_available,
+                removed_guilds: intents.guilds,
+                removed_cases: intents.cases,
+                removed_evidence: intents.evidence,
+                removed_object_keys: intents.object_keys,
+            };
+            crate::backup::restore_archive(
+                &self.cfg,
+                self.store()?,
+                self.backup_zone()?,
+                id,
+                password.as_deref(),
+                request,
+                &self.settings().await?,
+            )
+            .await?;
+            Ok(())
+        }
         .await;
-        if let Some(core) = self.cfg.capture_stores.iter().find(|s| s.role == "core") {
-            let _ = crate::backup::set_restore_fence(&core.path, false).await;
+        let clear = match core {
+            Some(core) => crate::backup::set_restore_fence(&core.path, false)
+                .await
+                .context("failed to clear restore fence"),
+            None => Ok(()),
+        };
+        match (result, clear) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(restore_error), Err(clear_error)) => Err(restore_error.context(format!(
+                "restore fence also failed to clear: {clear_error:#}"
+            ))),
         }
-        result.map(|_| ())
     }
 
     async fn run_backup_sanitize(&self) -> Result<()> {

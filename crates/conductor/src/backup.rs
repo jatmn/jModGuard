@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
 use crate::settings::ControlSettings;
@@ -20,8 +20,11 @@ use crate::store::{ArchiveRow, ControlStore, now_ms, random_token};
 pub const MAGIC: &[u8] = b"JMODGUARD-BACKUP-1\n";
 const ZONE_MARK: &str = "jmodguard-backup-1\n";
 const CHUNK: usize = 65_536;
+const MAX_RECORD_NAME_BYTES: usize = 16_384;
 const PASSWORD_ITERS: u32 = 100_000;
 const EXCLUDED_TABLES: &[&str] = &["bot_actions", "mutation_receipts", "nickname_reconcile"];
+const EVIDENCE_RECORD_PREFIX: &str = "evidence-v1-";
+const RESTORE_STAGE_MARK: &str = "jmodguard-restore-staging-1\n";
 
 #[derive(Clone)]
 pub struct BackupZone {
@@ -44,10 +47,16 @@ pub struct ArchiveHeader {
 pub struct RestoreRequest {
     pub acknowledge_historical: bool,
     pub current_state_available: bool,
-    pub removed_guilds: BTreeSet<i64>,
+    pub removed_guilds: BTreeSet<RemovedGuild>,
     pub removed_cases: BTreeSet<RemovedCase>,
     pub removed_evidence: BTreeSet<RemovedEvidence>,
     pub removed_object_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RemovedGuild {
+    pub guild_id: i64,
+    pub enrollment_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,7 +75,7 @@ pub struct RemovedEvidence {
 
 #[derive(Debug, Clone, Default)]
 pub struct CleanupIntents {
-    pub guilds: BTreeSet<i64>,
+    pub guilds: BTreeSet<RemovedGuild>,
     pub cases: BTreeSet<RemovedCase>,
     pub evidence: BTreeSet<RemovedEvidence>,
     pub object_keys: BTreeSet<String>,
@@ -264,30 +273,21 @@ async fn capture_inner(
     }
     let mut evidence_names = Vec::new();
     if let Some(root) = &cfg.evidence_root {
-        let skipped = live_removed_keys(cfg).await?;
+        let intents = load_cleanup_intents(cfg).await?;
         let remaining = settings
             .backup_max_archive_bytes
             .saturating_sub(writer.metadata()?.len());
-        copy_evidence(root, &scratch.join("evidence"), &skipped, remaining)?;
-        if scratch.join("evidence").exists() {
-            for entry in fs::read_dir(scratch.join("evidence"))? {
-                let path = entry?.path();
-                if path.is_file() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .context("evidence name")?;
-                    let record_name = format!("evidence-{name}");
-                    ensure_record_fits(
-                        &writer,
-                        &record_name,
-                        fs::metadata(&path)?.len(),
-                        settings.backup_max_archive_bytes,
-                    )?;
-                    append_file(&mut writer, &record_name, &path)?;
-                    evidence_names.push(name.to_string());
-                }
-            }
+        for (relative, path) in copy_evidence(root, &scratch.join("evidence"), &intents, remaining)?
+        {
+            let record_name = evidence_record_name(&relative);
+            ensure_record_fits(
+                &writer,
+                &record_name,
+                fs::metadata(&path)?.len(),
+                settings.backup_max_archive_bytes,
+            )?;
+            append_file(&mut writer, &record_name, &path)?;
+            evidence_names.push(relative);
         }
     }
     let control = serde_json::to_vec(&serde_json::json!({
@@ -401,6 +401,7 @@ pub async fn restore_archive(
     request: RestoreRequest,
     settings: &ControlSettings,
 ) -> Result<PathBuf> {
+    ensure_archive_id(id)?;
     if let Some(row) = store.get_archive(id).await? {
         let src = match row.status.as_str() {
             "complete" => zone.complete_path(id),
@@ -434,35 +435,47 @@ pub async fn restore_file(
         !target.exists(),
         "restore target must be an absent directory"
     );
+    let restore_stage = restore_staging_path(&target)?;
+    recover_restore_stage(&restore_stage)?;
     let restore_id = format!("restore-{}", random_token());
     let scratch = zone.scratch(&restore_id);
     private_dir(&scratch, true)?;
-    let payload = scratch.join("payload.bin");
-    let header = decrypt_payload(
-        src,
-        &payload,
-        &load_or_create_key(cfg, store).await?,
-        password,
-    )?;
-    ensure!(
-        header.family == "jmodguard-core-1",
-        "incompatible archive family"
-    );
-    let files = unpack_payload(
-        &payload,
-        &scratch.join("files"),
-        settings.backup_max_archive_bytes,
-    )?;
-    private_dir(&target, true)?;
-    let result = restore_files(&target, files, &request).await;
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&target);
-        zone.cleanup_scratch(&restore_id);
-        return result.map(|_| target);
+    let result: Result<()> = async {
+        let payload = scratch.join("payload.bin");
+        let header = decrypt_payload(
+            src,
+            &payload,
+            &load_or_create_key(cfg, store).await?,
+            password,
+        )?;
+        ensure!(
+            header.family == "jmodguard-core-1",
+            "incompatible archive family"
+        );
+        let files = unpack_payload(
+            &payload,
+            &scratch.join("files"),
+            settings.backup_max_archive_bytes,
+        )?;
+        private_dir(&restore_stage, true)?;
+        let mut marker = private_file(&restore_stage.join(".jmodguard-restore-staging"))?;
+        marker.write_all(RESTORE_STAGE_MARK.as_bytes())?;
+        marker.sync_all()?;
+        restore_files(&restore_stage, files, &request).await?;
+        let mut complete = private_file(&restore_stage.join("COMPLETE"))?;
+        complete.write_all(b"jmodguard restore verified\n")?;
+        complete.sync_all()?;
+        File::open(&restore_stage)?.sync_all()?;
+        fs::rename(&restore_stage, &target)?;
+        File::open(target.parent().context("restore target has no parent")?)?.sync_all()?;
+        Ok(())
     }
-    File::create(target.join("COMPLETE"))?.write_all(b"jmodguard restore verified\n")?;
-    File::open(&target)?.sync_all()?;
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&restore_stage);
+    }
     zone.cleanup_scratch(&restore_id);
+    result?;
     Ok(target)
 }
 
@@ -476,13 +489,19 @@ async fn restore_files(
             let dest = target.join(format!("{role}.sqlite"));
             fs::copy(&path, &dest)?;
             apply_removals(&dest, request).await?;
-        } else if let Some(file) = name.strip_prefix("evidence-") {
-            if request.removed_object_keys.contains(file) {
+        } else if let Some(relative) = evidence_relative_name(&name)? {
+            if evidence_is_removed(
+                &relative,
+                &request.removed_guilds,
+                &request.removed_cases,
+                &request.removed_evidence,
+                &request.removed_object_keys,
+            )? {
                 continue;
             }
-            let dest_dir = target.join("evidence");
-            private_dir(&dest_dir, true)?;
-            fs::copy(path, dest_dir.join(file))?;
+            let dest = target.join("evidence").join(&relative);
+            private_dir(dest.parent().context("evidence path has no parent")?, true)?;
+            fs::copy(path, dest)?;
         } else if name == "control.json" {
             fs::copy(path, target.join("control.json"))?;
         }
@@ -523,8 +542,14 @@ pub async fn sanitize_complete_archives(
             if name.starts_with("store-") {
                 apply_removals(&path, request).await?;
                 append_file(&mut writer, &name, &path)?;
-            } else if let Some(file) = name.strip_prefix("evidence-") {
-                if request.removed_object_keys.contains(file) {
+            } else if let Some(relative) = evidence_relative_name(&name)? {
+                if evidence_is_removed(
+                    &relative,
+                    &request.removed_guilds,
+                    &request.removed_cases,
+                    &request.removed_evidence,
+                    &request.removed_object_keys,
+                )? {
                     continue;
                 }
                 append_file(&mut writer, &name, &path)?;
@@ -642,7 +667,11 @@ pub async fn load_cleanup_intents(cfg: &Config) -> Result<CleanupIntents> {
         intents.ids.push(id);
         match kind.as_str() {
             "guild" => {
-                intents.guilds.insert(guild_id);
+                intents.guilds.insert(RemovedGuild {
+                    guild_id,
+                    enrollment_id: enrollment_id
+                        .context("guild cleanup intent missing enrollment")?,
+                });
             }
             "case" => {
                 intents.cases.insert(RemovedCase {
@@ -694,10 +723,6 @@ pub async fn set_restore_fence(path: &Path, on: bool) -> Result<()> {
     )
     .await?;
     Ok(())
-}
-
-async fn live_removed_keys(cfg: &Config) -> Result<BTreeSet<String>> {
-    Ok(load_cleanup_intents(cfg).await?.object_keys)
 }
 
 async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
@@ -813,8 +838,10 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
             "rules",
             "commands",
             "templates",
-            "guild_enrollments",
             "guild_store_placements",
+            "guild_bindings",
+        ];
+        const ENROLLMENT_TABLES: &[&str] = &[
             "guild_erasure_jobs",
             "backup_cleanup_intents",
             "guild_bunny_evidence",
@@ -825,16 +852,75 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
             "guild_log_channels",
             "guild_tenant_settings",
             "guild_memberships",
-            "guild_bindings",
         ];
-        for guild in &request.removed_guilds {
-            for table in GUILD_TABLES {
-                if tables.contains(*table) {
-                    conn.execute(
-                        &format!("DELETE FROM {} WHERE guild_id = ?", quote_identifier(table)),
-                        libsql::params![*guild],
+        for removed in &request.removed_guilds {
+            let directory_matches = if tables.contains("guild_enrollments") {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, active FROM guild_enrollments
+                         WHERE guild_id = ? LIMIT 1",
+                        libsql::params![removed.guild_id],
                     )
                     .await?;
+                match rows.next().await? {
+                    Some(row) if row.get::<String>(0)? == removed.enrollment_id => true,
+                    Some(row)
+                        if !row.get::<bool>(1)? && tables.contains("guild_erasure_jobs") =>
+                    {
+                        let mut erasures = conn
+                            .query(
+                                "SELECT 1 FROM guild_erasure_jobs
+                                 WHERE guild_id = ? AND enrollment_id = ? LIMIT 1",
+                                libsql::params![
+                                    removed.guild_id,
+                                    removed.enrollment_id.clone()
+                                ],
+                            )
+                            .await?;
+                        erasures.next().await?.is_some()
+                    }
+                    _ => false,
+                }
+            } else if tables.contains("guild_memberships") {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM guild_memberships
+                         WHERE guild_id = ? AND enrollment_id = ? LIMIT 1",
+                        libsql::params![removed.guild_id, removed.enrollment_id.clone()],
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            } else {
+                false
+            };
+            if tables.contains("guild_enrollments") {
+                conn.execute(
+                    "DELETE FROM guild_enrollments WHERE guild_id = ? AND id = ?",
+                    libsql::params![removed.guild_id, removed.enrollment_id.clone()],
+                )
+                .await?;
+            }
+            for table in ENROLLMENT_TABLES {
+                if tables.contains(*table) {
+                    conn.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE guild_id = ? AND enrollment_id = ?",
+                            quote_identifier(table)
+                        ),
+                        libsql::params![removed.guild_id, removed.enrollment_id.clone()],
+                    )
+                    .await?;
+                }
+            }
+            if directory_matches {
+                for table in GUILD_TABLES {
+                    if tables.contains(*table) {
+                        conn.execute(
+                            &format!("DELETE FROM {} WHERE guild_id = ?", quote_identifier(table)),
+                            libsql::params![removed.guild_id],
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -1115,7 +1201,10 @@ fn unpack_payload(payload: &Path, dest: &Path, max_bytes: u64) -> Result<Vec<(St
         if name_len == 0 {
             break;
         }
-        ensure!(name_len <= 256, "payload name too long");
+        ensure!(
+            name_len <= MAX_RECORD_NAME_BYTES,
+            "payload record name is too long"
+        );
         let mut name = vec![0u8; name_len];
         input.read_exact(&mut name)?;
         let name = String::from_utf8(name)?;
@@ -1175,37 +1264,215 @@ fn append_named<R: Read>(writer: &mut File, name: &str, size: u64, reader: &mut 
 fn copy_evidence(
     root: &Path,
     dest: &Path,
-    skipped: &BTreeSet<String>,
+    intents: &CleanupIntents,
     max_bytes: u64,
-) -> Result<()> {
+) -> Result<Vec<(String, PathBuf)>> {
     if !root.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let root_meta = fs::symlink_metadata(root)?;
+    ensure!(
+        root_meta.is_dir() && !root_meta.file_type().is_symlink(),
+        "evidence root must be a directory and not a symlink"
+    );
     private_dir(dest, true)?;
     let mut total = 0u64;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let meta = fs::symlink_metadata(entry.path())?;
+    let mut copied = Vec::new();
+    copy_evidence_tree(
+        root,
+        root,
+        dest,
+        intents,
+        &mut total,
+        max_bytes,
+        &mut copied,
+    )?;
+    Ok(copied)
+}
+
+fn copy_evidence_tree(
+    root: &Path,
+    current: &Path,
+    dest: &Path,
+    intents: &CleanupIntents,
+    total: &mut u64,
+    max_bytes: u64,
+    copied: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
         ensure!(
             !meta.file_type().is_symlink(),
             "evidence root must not contain symlinks"
         );
         if meta.is_dir() {
+            copy_evidence_tree(root, &path, dest, intents, total, max_bytes, copied)?;
             continue;
         }
         ensure!(meta.is_file(), "evidence object must be a regular file");
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if skipped.contains(&name) {
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("evidence path must be utf-8")?
+            .to_string();
+        ensure_relative_path(&relative)?;
+        if evidence_is_removed(
+            &relative,
+            &intents.guilds,
+            &intents.cases,
+            &intents.evidence,
+            &intents.object_keys,
+        )? {
             continue;
         }
-        total = total.saturating_add(meta.len());
+        *total = total
+            .checked_add(meta.len())
+            .context("evidence size overflow")?;
         ensure!(
-            total <= max_bytes,
+            *total <= max_bytes,
             "evidence exceeds configured byte budget"
         );
-        fs::copy(entry.path(), dest.join(safe_name(&name)))?;
+        let copied_path = dest.join(hex_encode(relative.as_bytes()));
+        fs::copy(&path, &copied_path)?;
+        copied.push((relative, copied_path));
     }
     Ok(())
+}
+
+fn evidence_record_name(relative: &str) -> String {
+    format!(
+        "{EVIDENCE_RECORD_PREFIX}{}",
+        hex_encode(relative.as_bytes())
+    )
+}
+
+fn evidence_relative_name(record: &str) -> Result<Option<String>> {
+    if let Some(encoded) = record.strip_prefix(EVIDENCE_RECORD_PREFIX) {
+        let relative = String::from_utf8(hex_decode(encoded)?)?;
+        ensure_relative_path(&relative)?;
+        return Ok(Some(relative));
+    }
+    let Some(relative) = record.strip_prefix("evidence-") else {
+        return Ok(None);
+    };
+    ensure_relative_path(relative)?;
+    Ok(Some(relative.to_string()))
+}
+
+fn evidence_is_removed(
+    relative: &str,
+    guilds: &BTreeSet<RemovedGuild>,
+    cases: &BTreeSet<RemovedCase>,
+    evidence: &BTreeSet<RemovedEvidence>,
+    object_keys: &BTreeSet<String>,
+) -> Result<bool> {
+    ensure_relative_path(relative)?;
+    let object_key = [".complete-tmp", ".complete", ".data"]
+        .iter()
+        .find_map(|suffix| relative.strip_suffix(suffix))
+        .unwrap_or(relative);
+    if object_keys.contains(relative) || object_keys.contains(object_key) {
+        return Ok(true);
+    }
+    let parts = object_key.split('/').collect::<Vec<_>>();
+    if parts.len() != 5 || parts[0] != "evidence" {
+        return Ok(false);
+    }
+    let Ok(guild_id) = parts[1].parse::<i64>() else {
+        return Ok(false);
+    };
+    Ok(guilds.contains(&RemovedGuild {
+        guild_id,
+        enrollment_id: parts[2].to_string(),
+    }) || cases.contains(&RemovedCase {
+        guild_id,
+        enrollment_id: parts[2].to_string(),
+        case_id: parts[3].to_string(),
+    }) || evidence.contains(&RemovedEvidence {
+        guild_id,
+        enrollment_id: parts[2].to_string(),
+        evidence_id: parts[4].to_string(),
+    }))
+}
+
+fn ensure_relative_path(path: &str) -> Result<()> {
+    ensure!(!path.is_empty(), "empty evidence path");
+    let normalized = Path::new(path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().context("evidence path must be utf-8"),
+            _ => anyhow::bail!("invalid evidence path"),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("/");
+    ensure!(normalized == path, "invalid evidence path");
+    Ok(())
+}
+
+fn ensure_archive_id(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid archive id"
+    );
+    Ok(())
+}
+
+fn restore_staging_path(target: &Path) -> Result<PathBuf> {
+    let parent = target.parent().context("restore target has no parent")?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("restore target must have a utf-8 name")?;
+    Ok(parent.join(format!(".{name}.jmodguard-restore-staging")))
+}
+
+fn recover_restore_stage(stage: &Path) -> Result<()> {
+    if !stage.exists() {
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(stage)?;
+    ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "restore staging path is not an owned directory"
+    );
+    let marker = stage.join(".jmodguard-restore-staging");
+    if marker.exists() {
+        let contents = fs::read_to_string(&marker)?;
+        ensure!(
+            RESTORE_STAGE_MARK.starts_with(&contents),
+            "restore staging marker mismatch"
+        );
+    } else {
+        ensure!(
+            fs::read_dir(stage)?.next().is_none(),
+            "restore staging marker is missing"
+        );
+    }
+    fs::remove_dir_all(stage)?;
+    Ok(())
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    ensure!(
+        value.len().is_multiple_of(2),
+        "invalid evidence path encoding"
+    );
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)?;
+            u8::from_str_radix(text, 16).context("invalid evidence path encoding")
+        })
+        .collect()
 }
 
 fn ensure_dedicated_root(path: &Path) -> Result<()> {

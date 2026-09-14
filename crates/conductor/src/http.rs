@@ -510,6 +510,7 @@ async fn api_notify_health(State(state): State<Arc<Conductor>>, headers: HeaderM
     }
 }
 
+#[allow(clippy::result_large_err)] // Keeps handler call sites on their native response type.
 async fn require_backup(state: &Conductor) -> Result<&crate::backup::BackupZone, Response> {
     state
         .backup_zone()

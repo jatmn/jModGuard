@@ -422,10 +422,11 @@ archives from conductor Administration. Defaults are a six-hour cadence, 24
 scheduled points, seven daily points and three release checkpoints. Scheduled
 failures retry and alert, remain visible for explicit retry, and do not pause writes.
 Capture uses SQLite `VACUUM INTO` on configured
-local stores, excludes pending Discord actions, and copies evidence into a
-backups-only directory that is distinct from the live evidence root. Portable
-downloads use an export password. Restore stages into a configured empty target,
-applies surviving cleanup intents, and requires an explicit acknowledgment after
-total policy-state loss. Interrupted staging is pruned on conductor start. Live
+local stores, excludes pending Discord actions, and recursively preserves
+evidence paths in a backups-only directory distinct from the live evidence root.
+Portable downloads use an export password. Restore builds in a marked sibling
+stage, atomically publishes to the configured absent target, applies surviving
+cleanup intents, and requires an explicit acknowledgment after total policy-state
+loss. Interrupted restore staging is recovered on retry. Live
 Bunny consistency/durability remains a separate gate.
 See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).

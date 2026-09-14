@@ -907,22 +907,26 @@ impl ControlStore {
         Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()))
     }
 
+    pub async fn last_scheduled_backup_ms(&self) -> Result<Option<i64>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT MAX(created_ms) FROM jobs
+                 WHERE kind = 'backup_capture'
+                   AND CASE WHEN json_valid(payload_json)
+                            THEN json_extract(payload_json, '$.kind') = 'scheduled'
+                            ELSE 0 END",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()))
+    }
+
     pub async fn has_active_backup_job(&self) -> Result<bool> {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
                 "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running') LIMIT 1",
-                (),
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
-    }
-
-    pub async fn has_unresolved_backup_job(&self) -> Result<bool> {
-        let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running', 'failed') LIMIT 1",
                 (),
             )
             .await?;

@@ -60,21 +60,26 @@ not available yet, with no working update buttons.
 
 Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
 takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending
-Discord action tables, copies evidence objects that are not listed in
-`backup_cleanup_intents`, and writes a versioned authenticated encrypted
-archive (`JMODGUARD-BACKUP-1`). Scheduled work defaults to every six hours,
+Discord action tables, recursively copies evidence with its relative paths while
+omitting departed enrollments, cases and objects covered by
+`backup_cleanup_intents` without affecting a newer rejoin, and writes a
+versioned authenticated encrypted archive (`JMODGUARD-BACKUP-1`).
+Scheduled work defaults to every six hours,
 retries/alerts on failure, and never pauses application writes. Maintenance
 capture is an explicit owner action. Portable download wraps the archive with
 an export password that is kept only in conductor memory while a queued restore
-needs it. Failed backup jobs are listed on the Backups page for explicit retry.
+needs it. Failed backup jobs are listed on the Backups page for explicit retry
+without blocking later scheduled capture attempts.
 Failed restores are resubmitted with a fresh password instead of replaying a
 stored secret.
 Uploads land in quarantine after a magic-header check; password authentication
 and archive-family validation occur during restore. Restore writes into
 `JMODGUARD_CONDUCTOR_RESTORE_TARGET` only; it does not overwrite the live
-database in place. After total loss of current policy state, restore requires
-an explicit historical acknowledgment. Surviving cleanup intents still remove
-those guilds/objects. Discord tokens, OAuth secrets, sessions and pending
+database in place. A marked sibling staging directory makes publication atomic
+and permits retry after interruption. After total loss of current policy state,
+restore requires an explicit historical acknowledgment. Surviving cleanup
+intents still remove those guilds/objects. Discord tokens, OAuth secrets,
+sessions and pending
 `bot_actions` are not restored. Live Bunny export/durability is not claimed by
 these local tests.
 

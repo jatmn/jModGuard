@@ -19,15 +19,19 @@ encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
   downloads wrap the same payload with an export password that is never stored.
 - Capture snapshots each configured local SQLite store with `VACUUM INTO`, then
   drops `bot_actions`, `mutation_receipts` and `nickname_reconcile` so restore
-  cannot replay Discord. Evidence files are copied from a distinct live evidence
-  root. Objects listed in `backup_cleanup_intents` are omitted.
+  cannot replay Discord. The distinct live evidence root is copied recursively
+  with relative paths preserved. Departed-enrollment, case, evidence and
+  object-key entries in `backup_cleanup_intents` are omitted from capture,
+  sanitization and restore without affecting a newer guild enrollment.
 - Defaults (editable in Installation): every six hours, 24 scheduled points,
   seven daily points and three release checkpoints. Scheduled failures retry
   and alert; they never pause writes. Failed backup jobs are visible and
-  retryable from the Backups page; failed restores collect a fresh password
-  when they are resubmitted.
+  retryable from the Backups page; a failed restore does not stop later scheduled
+  captures, and failed restores collect a fresh password when resubmitted.
 - Restore writes into an absent `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. It does not
-  overwrite the live database in place. After total loss of current policy state,
+  overwrite the live database in place. Restore is assembled in a marked sibling
+  staging directory and published only after completion, so an interrupted attempt
+  does not block a retry. After total loss of current policy state,
   the operator must acknowledge that later deletions cannot be verified. Surviving
   cleanup intents still remove those guilds/objects.
 - Local tests do not prove Bunny session/durability, distributed writer exclusion

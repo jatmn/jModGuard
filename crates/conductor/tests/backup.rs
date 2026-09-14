@@ -115,6 +115,14 @@ async fn write_core(path: &std::path::Path, with_actions: bool) {
          INSERT INTO meta(key,value) VALUES('schema_family','jmodguard-core-1');
          CREATE TABLE guild_settings(guild_id INTEGER, prefix TEXT);
          INSERT INTO guild_settings(guild_id, prefix) VALUES(10, '!');
+         CREATE TABLE guild_enrollments(
+           guild_id INTEGER PRIMARY KEY,
+           id TEXT NOT NULL,
+           joined_at_ns INTEGER NOT NULL,
+           active INTEGER NOT NULL
+         );
+         INSERT INTO guild_enrollments VALUES
+           (10, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, 1);
          CREATE TABLE guild_cases(
            guild_id INTEGER NOT NULL,
            enrollment_id TEXT NOT NULL,
@@ -350,6 +358,406 @@ async fn manual_backup_excludes_pending_actions_and_restores_without_replay() {
 }
 
 #[tokio::test]
+async fn nested_evidence_is_restored_at_its_original_relative_path() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let relative = "evidence/10/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/22222222222222222222222222222222/33333333333333333333333333333333";
+    let base = h.root.join("evidence").join(relative);
+    std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+    std::fs::write(base.with_extension("data"), b"nested evidence").unwrap();
+    std::fs::write(base.with_extension("complete"), b"15\nchecksum\n").unwrap();
+
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(br#"{"kind":"manual"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+    let id = complete_archive_id(&h, &cookie).await;
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/backups/{id}/restore"),
+        Some(&cookie),
+        Some(br#"{}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick_until_idle(&h).await;
+
+    let restored = h
+        .root
+        .join("restore-target")
+        .join("evidence")
+        .join(relative);
+    assert_eq!(
+        std::fs::read(restored.with_extension("data")).unwrap(),
+        b"nested evidence"
+    );
+    assert!(restored.with_extension("complete").exists());
+}
+
+#[tokio::test]
+async fn case_cleanup_intent_removes_nested_evidence_from_sanitized_archives() {
+    let h = setup(false).await;
+    let enrollment = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let removed_case = "11111111111111111111111111111111";
+    let kept_case = "22222222222222222222222222222222";
+    for (case, contents) in [
+        (removed_case, b"remove".as_slice()),
+        (kept_case, b"keep".as_slice()),
+    ] {
+        let base = h.root.join("evidence").join(format!(
+            "evidence/10/{enrollment}/{case}/44444444444444444444444444444444"
+        ));
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(base.with_extension("data"), contents).unwrap();
+        std::fs::write(base.with_extension("complete"), b"receipt").unwrap();
+    }
+    let settings = h.conductor.settings().await.unwrap();
+    jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, case_id, created_at)
+             VALUES('case-evidence-cleanup','case',10,?1,?2,1)",
+            libsql::params![enrollment, removed_case],
+        )
+        .await
+        .unwrap();
+    let intents = jmodguard_conductor::backup::load_cleanup_intents(&h.conductor.cfg)
+        .await
+        .unwrap();
+    let request = jmodguard_conductor::backup::RestoreRequest {
+        acknowledge_historical: true,
+        current_state_available: true,
+        removed_guilds: intents.guilds,
+        removed_cases: intents.cases,
+        removed_evidence: intents.evidence,
+        removed_object_keys: intents.object_keys,
+    };
+    jmodguard_conductor::backup::sanitize_complete_archives(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &settings,
+        &request,
+    )
+    .await
+    .unwrap();
+    let archive = h
+        .conductor
+        .store()
+        .unwrap()
+        .list_complete_archives()
+        .await
+        .unwrap()
+        .remove(0);
+    jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+
+    let evidence = h.root.join("restore-target").join("evidence");
+    assert!(
+        !evidence
+            .join(format!(
+                "evidence/10/{enrollment}/{removed_case}/44444444444444444444444444444444.data"
+            ))
+            .exists()
+    );
+    assert!(
+        evidence
+            .join(format!(
+                "evidence/10/{enrollment}/{kept_case}/44444444444444444444444444444444.data"
+            ))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn capture_omits_nested_evidence_covered_by_case_intents() {
+    let h = setup(false).await;
+    let enrollment = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let removed_case = "11111111111111111111111111111111";
+    let relative =
+        format!("evidence/10/{enrollment}/{removed_case}/55555555555555555555555555555555");
+    let base = h.root.join("evidence").join(&relative);
+    std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+    std::fs::write(base.with_extension("data"), b"removed evidence").unwrap();
+    std::fs::write(base.with_extension("complete"), b"receipt").unwrap();
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, case_id, created_at)
+             VALUES('capture-case-cleanup','case',10,?1,?2,1)",
+            libsql::params![enrollment, removed_case],
+        )
+        .await
+        .unwrap();
+    let settings = h.conductor.settings().await.unwrap();
+    let archive = jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !h.root
+            .join("restore-target")
+            .join("evidence")
+            .join(relative)
+            .with_extension("data")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn departed_guild_intent_preserves_a_newer_enrollment() {
+    let h = setup(false).await;
+    let old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let current = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let evidence_id = "66666666666666666666666666666666";
+    for (enrollment, contents) in [(old, b"old".as_slice()), (current, b"current".as_slice())] {
+        let base = h.root.join("evidence").join(format!(
+            "evidence/10/{enrollment}/22222222222222222222222222222222/{evidence_id}"
+        ));
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(base.with_extension("data"), contents).unwrap();
+        std::fs::write(base.with_extension("complete"), b"receipt").unwrap();
+    }
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_enrollments SET id = ?1 WHERE guild_id = 10",
+        libsql::params![current],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, created_at)
+         VALUES('old-guild-cleanup','guild',10,?1,1)",
+        libsql::params![old],
+    )
+    .await
+    .unwrap();
+    let settings = h.conductor.settings().await.unwrap();
+    jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let intents = jmodguard_conductor::backup::load_cleanup_intents(&h.conductor.cfg)
+        .await
+        .unwrap();
+    let request = jmodguard_conductor::backup::RestoreRequest {
+        acknowledge_historical: true,
+        current_state_available: true,
+        removed_guilds: intents.guilds,
+        removed_cases: intents.cases,
+        removed_evidence: intents.evidence,
+        removed_object_keys: intents.object_keys,
+    };
+    jmodguard_conductor::backup::sanitize_complete_archives(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &settings,
+        &request,
+    )
+    .await
+    .unwrap();
+    let archive = h
+        .conductor
+        .store()
+        .unwrap()
+        .list_complete_archives()
+        .await
+        .unwrap()
+        .remove(0);
+    jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+
+    let restored_core = h.root.join("restore-target").join("core.sqlite");
+    let db = libsql::Builder::new_local(&restored_core)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query("SELECT id FROM guild_enrollments WHERE guild_id = 10", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        current
+    );
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM guild_settings WHERE guild_id = 10",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+    let evidence = h.root.join("restore-target").join("evidence");
+    assert!(
+        !evidence
+            .join(format!(
+                "evidence/10/{old}/22222222222222222222222222222222/{evidence_id}.data"
+            ))
+            .exists()
+    );
+    assert!(
+        evidence
+            .join(format!(
+                "evidence/10/{current}/22222222222222222222222222222222/{evidence_id}.data"
+            ))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn interrupted_restore_staging_is_recovered_before_retry() {
+    let h = setup(false).await;
+    let settings = h.conductor.settings().await.unwrap();
+    let archive = jmodguard_conductor::backup::capture(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let stage = h.root.join(".restore-target.jmodguard-restore-staging");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(
+        stage.join(".jmodguard-restore-staging"),
+        b"jmodguard-restore-staging-1\n",
+    )
+    .unwrap();
+    std::fs::write(stage.join("partial"), b"partial restore").unwrap();
+
+    jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+    assert!(h.root.join("restore-target").join("COMPLETE").exists());
+    assert!(!stage.exists());
+}
+
+#[tokio::test]
+async fn restore_rejects_archive_ids_that_can_escape_the_backup_zone() {
+    let h = setup(false).await;
+    let settings = h.conductor.settings().await.unwrap();
+    let error = jmodguard_conductor::backup::restore_archive(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "../outside",
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .expect_err("path-like archive ids must be rejected");
+    assert!(
+        error.to_string().contains("invalid archive id"),
+        "{error:#}"
+    );
+    assert!(!h.root.join("restore-target").exists());
+}
+
+#[tokio::test]
 async fn historical_restore_requires_acknowledgment_and_rejects_corrupt_uploads() {
     let h = setup(false).await;
     let cookie = login(&h).await;
@@ -533,7 +941,8 @@ async fn known_removal_is_applied_and_cleanup_intents_are_acked() {
     let db = libsql::Builder::new_local(&core).build().await.unwrap();
     let conn = db.connect().unwrap();
     conn.execute(
-        "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, object_key, created_at) VALUES('intent-1','guild',10,'note.bin',1)",
+        "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, object_key, created_at)
+         VALUES('intent-1','guild',10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','note.bin',1)",
         (),
     )
         .await
@@ -901,8 +1310,8 @@ async fn failed_capture_does_not_block_pending_backup_sanitization() {
     db.connect()
         .unwrap()
         .execute(
-            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, created_at)
-             VALUES('44444444444444444444444444444444','guild',10,1)",
+            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, created_at)
+             VALUES('44444444444444444444444444444444','guild',10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1)",
             (),
         )
         .await
@@ -926,6 +1335,39 @@ async fn failed_capture_does_not_block_pending_backup_sanitization() {
     assert!(
         store
             .list_jobs(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.id == failed && job.status == "failed")
+    );
+}
+
+#[tokio::test]
+async fn failed_restore_does_not_block_scheduled_capture() {
+    let h = setup(false).await;
+    let store = h.conductor.store().unwrap();
+    let (mut settings, revision, _) = store.load_settings().await.unwrap();
+    settings.backup_enabled = true;
+    store.save_settings(&settings, revision).await.unwrap();
+    let failed = store
+        .insert_job(
+            "backup_restore",
+            &serde_json::json!({"id":"missing","password_required":false}),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().id, failed);
+    store
+        .finish_job(&failed, false, Some("old restore failure"))
+        .await
+        .unwrap();
+
+    h.conductor.tick_job().await.unwrap();
+    assert_eq!(store.list_complete_archives().await.unwrap().len(), 1);
+    assert!(
+        store
+            .list_jobs(20)
             .await
             .unwrap()
             .iter()
