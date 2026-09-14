@@ -554,7 +554,8 @@ async fn api_backups(State(state): State<Arc<Conductor>>, headers: HeaderMap) ->
                 "archives": archives.into_iter().filter(|row| row.status == "complete" || row.status == "failed" || row.status == "quarantined").collect::<Vec<_>>(),
                 "failed_jobs": failed_jobs,
                 "last_complete_ms": last,
-                "overdue": crate::backup::overdue(&settings, last_attempt),
+                "overdue": state.capture_available()
+                    && crate::backup::overdue(&settings, last_attempt),
                 "backup_enabled": settings.backup_enabled,
                 "interval_hours": settings.backup_interval_hours,
                 "key_from_env": state.cfg.backup_key.is_some(),
@@ -728,6 +729,12 @@ async fn api_backup_restore(
     };
     if let Err(error) = require_backup(&state).await {
         return error;
+    }
+    if state.cfg.restore_target.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow::anyhow!("JMODGUARD_CONDUCTOR_RESTORE_TARGET is required for restore"),
+        );
     }
     match enqueue_restore(&state, &operator, &id, body).await {
         Ok(job) => Json(serde_json::json!({ "id": job, "state": "queued" })).into_response(),

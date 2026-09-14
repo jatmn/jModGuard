@@ -142,6 +142,36 @@ impl Config {
                 "backup root and restore target must be distinct dedicated directories",
             )?;
         }
+        if let (Some(evidence), Some(restore)) = (&evidence_root, &restore_target) {
+            ensure_disjoint_roots(
+                evidence,
+                restore,
+                "evidence root and restore target must be distinct dedicated directories",
+            )?;
+        }
+        for capture in &capture_stores {
+            if let Some(backup) = &backup_root {
+                ensure_disjoint_roots(
+                    backup,
+                    &capture.path,
+                    "capture stores must not overlap the backup root",
+                )?;
+            }
+            if let Some(evidence) = &evidence_root {
+                ensure_disjoint_roots(
+                    evidence,
+                    &capture.path,
+                    "capture stores must not overlap the evidence root",
+                )?;
+            }
+            if let Some(restore) = &restore_target {
+                ensure_disjoint_roots(
+                    restore,
+                    &capture.path,
+                    "capture stores must not overlap the restore target",
+                )?;
+            }
+        }
         Ok(Self {
             bind,
             log_filter,
@@ -356,6 +386,30 @@ mod tests {
             ))
         });
         assert!(nested_restore.is_err());
+        let nested_capture = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                    "JMODGUARD_CONDUCTOR_CAPTURE_STORES" => {
+                        r#"[{"role":"core","path":"/tmp/jmodguard-backups/core.db"}]"#
+                    }
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_capture.is_err());
+        let nested_evidence_restore = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_EVIDENCE_ROOT" => "/tmp/jmodguard-evidence",
+                    "JMODGUARD_CONDUCTOR_RESTORE_TARGET" => "/tmp/jmodguard-evidence/restore",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_evidence_restore.is_err());
     }
     #[test]
     fn process_overrides_are_validated_without_environment_mutation() {

@@ -75,8 +75,9 @@ evidence, removes owned objects, purges cases, deletes remaining store identity,
 records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
 join cannot be resurrected. There is no permanent departed-guild ledger. The conductor
-backup worker sanitizes complete local archives against surviving intents and can
-acknowledge those rows; it does not import tenant routing. Live Bunny backup-copy
+backup worker sanitizes complete local archives against surviving intents and
+acknowledges those rows after at least one complete archive is rewritten; it
+does not import tenant routing. Live Bunny backup-copy
 deletion remains later work. The durable job can resume its
 core cleanup suffix after the store binding has already been erased: the exact store
 identity and absence of the guild binding are checked without weakening normal data-scope

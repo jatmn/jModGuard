@@ -23,17 +23,19 @@ encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
   with relative paths preserved. Evidence for departed enrollments, cases and
   object keys listed in `backup_cleanup_intents` is omitted at capture time.
   SQLite snapshots are still full until a queued `backup_sanitize` job rewrites
-  complete archives when intents are present; restore applies surviving intents
-  again when writing the restore target. Sanitization does not affect a newer
-  guild enrollment rejoin.
+  complete archives when intents are present; that job does not acknowledge
+  intent rows until at least one complete archive is rewritten. Restore applies
+  surviving intents again when writing the restore target. Sanitization does
+  not affect a newer guild enrollment rejoin.
 - Defaults (editable in Installation): every six hours, 24 scheduled points,
   seven daily points and three release checkpoints. Scheduled failures retry
   and alert; they never pause writes. Failed backup jobs are visible and
   retryable from the Backups page when no other backup job is queued or running.
   Catalog `overdue` uses the same last scheduled-or-complete timestamp as the
-  scheduler. Capture stays off (`capture_available` false) until a reachable
+  scheduler and is false while capture is unavailable. Capture stays off
+  (`capture_available` false) until a reachable
   `core` store is configured; upload, download and restore still use the backup
-  zone. A failed restore does not stop later scheduled captures, and failed
+  zone. Restore enqueue requires `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. A failed restore does not stop later scheduled captures, and failed
   restores collect a fresh password when resubmitted.
 - Restore writes into an absent `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. It does not
   overwrite the live database in place. Restore is assembled in a marked sibling

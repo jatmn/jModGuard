@@ -30,9 +30,9 @@ It defaults to `127.0.0.1:8081`. It does not read `config.toml`,
 | `JMODGUARD_CONDUCTOR_BOT_HEALTH_URL` / `_API_HEALTH_URL` | empty | Optional unauthenticated `/health` probes. |
 | `JMODGUARD_CONDUCTOR_BACKUP_ROOT` | unset | Dedicated backups-only directory. Required for `backup_available`. |
 | `JMODGUARD_CONDUCTOR_BACKUP_KEY` | unset | Optional 64-hex master key. If unset, the conductor stores a generated key in the control database. |
-| `JMODGUARD_CONDUCTOR_CAPTURE_STORES` | empty | JSON array of `{role,path}` local SQLite files to snapshot. `core` is the application directory database. Required for `capture_available` (scheduled/manual capture). |
-| `JMODGUARD_CONDUCTOR_EVIDENCE_ROOT` | unset | Optional live evidence directory copied into backups. Must be distinct from the backup root. |
-| `JMODGUARD_CONDUCTOR_RESTORE_TARGET` | unset | Absent directory that restore writes into. Required to run restore. |
+| `JMODGUARD_CONDUCTOR_CAPTURE_STORES` | empty | JSON array of `{role,path}` local SQLite files to snapshot. `core` is the application directory database. Required for `capture_available` (scheduled/manual capture). Paths must be distinct from the backup root, evidence root and restore target. |
+| `JMODGUARD_CONDUCTOR_EVIDENCE_ROOT` | unset | Optional live evidence directory copied into backups. Must be distinct from the backup root and restore target. |
+| `JMODGUARD_CONDUCTOR_RESTORE_TARGET` | unset | Absent directory that restore writes into. Required to enqueue restore. |
 
 These are process/bootstrap controls. Durable session, notification and monitoring
 options are stored in the conductor control database after owner login. No provider
@@ -64,7 +64,8 @@ Discord action tables, recursively copies evidence with its relative paths while
 omitting intent-scoped evidence at capture time, queues `backup_sanitize` to
 rewrite complete archives when `backup_cleanup_intents` rows exist (see
 [BACKUP-RESTORE.md](BACKUP-RESTORE.md)), and writes a versioned authenticated
-encrypted archive (`JMODGUARD-BACKUP-1`).
+encrypted archive (`JMODGUARD-BACKUP-1`). Sanitize acknowledges those intent
+rows only after at least one complete archive is rewritten.
 Scheduled work defaults to every six hours,
 retries/alerts on failure, and never pauses application writes. Maintenance
 capture is an explicit owner action. Portable download wraps the archive with
@@ -72,7 +73,8 @@ an export password that is kept only in conductor memory while a queued restore
 needs it. Failed backup jobs are listed on the Backups page for explicit retry
 when no other backup job is already queued or running, without blocking later
 scheduled capture attempts. Catalog overdue status uses the same last
-scheduled-or-complete timestamp as the scheduler.
+scheduled-or-complete timestamp as the scheduler, and stays false while
+`capture_available` is false.
 Failed restores are resubmitted with a fresh password instead of replaying a
 stored secret.
 Uploads land in quarantine after a magic-header check; password authentication

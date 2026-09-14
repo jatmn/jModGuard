@@ -69,7 +69,7 @@ exits if that wait expires).
 | `warns` / `bans` | warnings and ban history |
 | `guild_store_catalog` / `guild_store_placements` | nonsecret shared/dedicated store identities and initial placements |
 | `guild_erasure_jobs` | queued live guild-store erasure; not a departed-guild membership ledger |
-| `backup_cleanup_intents` | application-owned reminders; the conductor backup worker sanitizes controlled copies and can clear these rows |
+| `backup_cleanup_intents` | application-owned reminders; the conductor backup worker sanitizes complete local archives and clears these rows after at least one complete archive is rewritten |
 
 Environment variables override `config.toml` values (see table).
 

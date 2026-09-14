@@ -456,6 +456,9 @@ impl Conductor {
         if intents.ids.is_empty() {
             return Ok(());
         }
+        if store.list_complete_archives().await?.is_empty() {
+            return Ok(());
+        }
         let _ = store
             .insert_backup_job_if_idle("backup_sanitize", &serde_json::json!({}), 3)
             .await?;
@@ -667,7 +670,7 @@ impl Conductor {
             removed_evidence: intents.evidence,
             removed_object_keys: intents.object_keys,
         };
-        crate::backup::sanitize_complete_archives(
+        let rewritten = crate::backup::sanitize_complete_archives(
             &self.cfg,
             self.store()?,
             self.backup_zone()?,
@@ -675,7 +678,10 @@ impl Conductor {
             &request,
         )
         .await?;
-        crate::backup::clear_cleanup_intents(&self.cfg, &intents.ids).await
+        if rewritten > 0 {
+            crate::backup::clear_cleanup_intents(&self.cfg, &intents.ids).await?;
+        }
+        Ok(())
     }
 }
 

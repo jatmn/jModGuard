@@ -1350,6 +1350,48 @@ async fn failed_capture_does_not_block_pending_backup_sanitization() {
 }
 
 #[tokio::test]
+async fn cleanup_intents_wait_for_a_complete_archive_before_ack() {
+    let h = setup(false).await;
+    let _cookie = login(&h).await;
+    let db = libsql::Builder::new_local(h.root.join("core.db"))
+        .build()
+        .await
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO backup_cleanup_intents(intent_id, kind, guild_id, enrollment_id, created_at)
+             VALUES('55555555555555555555555555555555','guild',10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1)",
+            (),
+        )
+        .await
+        .unwrap();
+    tick_until_idle(&h).await;
+    let mut rows = db
+        .connect()
+        .unwrap()
+        .query("SELECT COUNT(*) FROM backup_cleanup_intents", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1,
+        "intents must remain until a complete archive can be rewritten"
+    );
+    assert!(
+        !h.conductor
+            .store()
+            .unwrap()
+            .list_jobs(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.kind == "backup_sanitize"),
+        "sanitize must not run with an empty complete catalog"
+    );
+}
+
+#[tokio::test]
 async fn failed_restore_does_not_block_scheduled_capture() {
     let h = setup(false).await;
     let store = h.conductor.store().unwrap();
@@ -1670,6 +1712,15 @@ async fn capture_requires_a_reachable_core_store() {
     assert_eq!(status, StatusCode::OK);
     let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
     assert_eq!(listed["capture_available"], false);
+    let store = h.conductor.store().unwrap();
+    let (mut settings, revision, _) = store.load_settings().await.unwrap();
+    settings.backup_enabled = true;
+    store.save_settings(&settings, revision).await.unwrap();
+    let (status, listed, _) =
+        call(&h.router, "GET", "/api/backups", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+    assert_eq!(listed["overdue"], false);
     let (status, create, _) = call(
         &h.router,
         "POST",
@@ -1684,6 +1735,67 @@ async fn capture_requires_a_reachable_core_store() {
         String::from_utf8_lossy(&create).contains("capture requires a configured core store"),
         "{}",
         String::from_utf8_lossy(&create)
+    );
+}
+
+#[tokio::test]
+async fn restore_requires_a_configured_restore_target_at_enqueue() {
+    let (discord, task) = discord_stub(42).await;
+    let root = unique_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: Some(root.join("control.db")),
+        public_url: "http://127.0.0.1:8081".into(),
+        owner_id: 42,
+        oauth_client_id: "cid".into(),
+        oauth_client_secret: "csecret".into(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: format!("{discord}/token"),
+        oauth_me_url: format!("{discord}/me"),
+        backup_root: Some(root.join("backups")),
+        backup_key: Some([7u8; 32]),
+        capture_stores: Vec::new(),
+        evidence_root: None,
+        restore_target: None,
+    };
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let h = Harness {
+        conductor,
+        router,
+        root,
+        _discord: task,
+    };
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups/any-id/restore",
+        Some(&cookie),
+        Some(br#"{}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        String::from_utf8_lossy(&body).contains("JMODGUARD_CONDUCTOR_RESTORE_TARGET is required"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        !h.conductor
+            .store()
+            .unwrap()
+            .list_jobs(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.kind == "backup_restore"),
+        "restore must not queue without a restore target"
     );
 }
 
