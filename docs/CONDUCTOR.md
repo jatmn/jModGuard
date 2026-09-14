@@ -30,7 +30,7 @@ It defaults to `127.0.0.1:8081`. It does not read `config.toml`,
 | `JMODGUARD_CONDUCTOR_BOT_HEALTH_URL` / `_API_HEALTH_URL` | empty | Optional unauthenticated `/health` probes. |
 | `JMODGUARD_CONDUCTOR_BACKUP_ROOT` | unset | Dedicated backups-only directory. Required for `backup_available`. |
 | `JMODGUARD_CONDUCTOR_BACKUP_KEY` | unset | Optional 64-hex master key. If unset, the conductor stores a generated key in the control database. |
-| `JMODGUARD_CONDUCTOR_CAPTURE_STORES` | empty | JSON array of `{role,path}` local SQLite files to snapshot. `core` is the application directory database. |
+| `JMODGUARD_CONDUCTOR_CAPTURE_STORES` | empty | JSON array of `{role,path}` local SQLite files to snapshot. `core` is the application directory database. Required for `capture_available` (scheduled/manual capture). |
 | `JMODGUARD_CONDUCTOR_EVIDENCE_ROOT` | unset | Optional live evidence directory copied into backups. Must be distinct from the backup root. |
 | `JMODGUARD_CONDUCTOR_RESTORE_TARGET` | unset | Absent directory that restore writes into. Required to run restore. |
 
@@ -48,7 +48,7 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 |---|---|---|
 | `GET` / `HEAD /health` (also `/health/`) | `200`, process liveness only. | Same. |
 | `GET` / `HEAD /ready` | `503`, JSON code `control_not_configured`. | `200`. |
-| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `update_available` stays false. |
+| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `update_available` stays false. |
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
@@ -69,7 +69,9 @@ retries/alerts on failure, and never pauses application writes. Maintenance
 capture is an explicit owner action. Portable download wraps the archive with
 an export password that is kept only in conductor memory while a queued restore
 needs it. Failed backup jobs are listed on the Backups page for explicit retry
-without blocking later scheduled capture attempts.
+when no other backup job is already queued or running, without blocking later
+scheduled capture attempts. Catalog overdue status uses the same last
+scheduled-or-complete timestamp as the scheduler.
 Failed restores are resubmitted with a fresh password instead of replaying a
 stored secret.
 Uploads land in quarantine after a magic-header check; password authentication

@@ -725,6 +725,36 @@ pub async fn set_restore_fence(path: &Path, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Restore target verification is independent of live-core fence cleanup.
+/// A verified restore must not be reported as failed solely because fence clear failed.
+pub fn restore_job_result(restore: Result<()>, fence_clear: Result<()>) -> Result<()> {
+    match (restore, fence_clear) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => {
+            tracing::error!("restore target verified; restore fence was not cleared: {error:#}");
+            Ok(())
+        }
+        (Err(restore_error), Err(clear_error)) => Err(restore_error.context(format!(
+            "restore fence also failed to clear: {clear_error:#}"
+        ))),
+    }
+}
+
+pub async fn clear_restore_fence(path: &Path) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match set_restore_fence(path, false).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to clear restore fence")))
+}
+
 async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
     if dest.exists() {
         fs::remove_file(dest)?;
@@ -1582,4 +1612,21 @@ pub fn overdue(settings: &ControlSettings, last_complete_ms: Option<i64>) -> boo
     let interval =
         i64::try_from(settings.backup_interval_hours.saturating_mul(3_600_000)).unwrap_or(i64::MAX);
     now_ms().saturating_sub(last) > interval
+}
+
+#[cfg(test)]
+mod restore_job_result_tests {
+    use super::restore_job_result;
+
+    #[test]
+    fn verified_restore_succeeds_when_fence_clear_fails() {
+        assert!(restore_job_result(Ok(()), Err(anyhow::anyhow!("meta locked"))).is_ok());
+    }
+
+    #[test]
+    fn restore_failure_is_preserved_when_fence_clears() {
+        let error = restore_job_result(Err(anyhow::anyhow!("corrupt archive")), Ok(()))
+            .expect_err("restore failure must surface");
+        assert!(error.to_string().contains("corrupt archive"));
+    }
 }

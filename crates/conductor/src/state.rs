@@ -96,6 +96,10 @@ impl Conductor {
         self.operations_available() && self.backup.is_some()
     }
 
+    pub fn capture_available(&self) -> bool {
+        self.backup_available() && self.cfg.capture_core_ready()
+    }
+
     pub fn backup_zone(&self) -> Result<&BackupZone> {
         self.backup
             .as_ref()
@@ -370,7 +374,7 @@ impl Conductor {
     }
 
     async fn maybe_schedule_backup(&self) -> Result<()> {
-        if !self.backup_available() {
+        if !self.capture_available() {
             return Ok(());
         }
         let store = self.store()?;
@@ -381,13 +385,7 @@ impl Conductor {
         if store.has_active_backup_job().await? {
             return Ok(());
         }
-        let last_attempt_ms = match (
-            store.last_complete_ms().await?,
-            store.last_scheduled_backup_ms().await?,
-        ) {
-            (Some(complete), Some(scheduled)) => Some(complete.max(scheduled)),
-            (complete, scheduled) => complete.or(scheduled),
-        };
+        let last_attempt_ms = store.last_backup_schedule_activity_ms().await?;
         if !crate::backup::overdue(&settings, last_attempt_ms) {
             return Ok(());
         }
@@ -575,20 +573,35 @@ impl Conductor {
             Ok(())
         }
         .await;
+        let restore_ok = result.is_ok();
         let clear = match core {
-            Some(core) => crate::backup::set_restore_fence(&core.path, false)
-                .await
-                .context("failed to clear restore fence"),
+            Some(core) => crate::backup::clear_restore_fence(&core.path).await,
             None => Ok(()),
         };
-        match (result, clear) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(restore_error), Err(clear_error)) => Err(restore_error.context(format!(
-                "restore fence also failed to clear: {clear_error:#}"
-            ))),
+        if restore_ok && let Err(error) = &clear {
+            let message = format!("Restore completed; restore fence was not cleared: {error:#}");
+            let notifications_enabled = self.settings().await.is_ok_and(|settings| {
+                settings.notify_enabled
+                    && settings
+                        .notify_categories
+                        .iter()
+                        .any(|category| category == "backup")
+            });
+            if notifications_enabled && let Ok(store) = self.store() {
+                let _ = store
+                    .insert_job(
+                        "notify_event",
+                        &serde_json::json!({
+                            "category": "backup",
+                            "message": message,
+                            "severity": "error",
+                        }),
+                        3,
+                    )
+                    .await;
+            }
         }
+        crate::backup::restore_job_result(result, clear)
     }
 
     async fn run_backup_sanitize(&self) -> Result<()> {

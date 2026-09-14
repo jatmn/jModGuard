@@ -232,6 +232,7 @@ function tabBackups() {
   const upload = el("input", { type: "file" });
   const archiveSelect = el("select", {}, el("option", { value: "", text: "Loading archives…" }));
   const failures = el("div", {}, el("p", { class: "muted", text: "Loading failed jobs…" }));
+  const captureNote = el("p", { class: "muted", text: "" });
   const selectedArchive = async (statuses) => {
     if (!archiveSelect.value) throw new Error("select an archive");
     const data = await api("/api/backups");
@@ -280,8 +281,12 @@ function tabBackups() {
     list.textContent = JSON.stringify({
       last_complete_ms: data.last_complete_ms,
       overdue: data.overdue,
+      capture_available: data.capture_available,
       archives,
     }, null, 2);
+    captureNote.textContent = data.capture_available === false
+      ? "Capture is unavailable until a core capture store is configured. Upload, download and restore still use the backup zone."
+      : "";
   }).catch((e) => { list.textContent = e.message; });
   return el("div", {},
     el("section", { class: "hero" },
@@ -292,6 +297,7 @@ function tabBackups() {
     el("div", { class: "card" },
       el("h3", { text: "Create and download" }),
       el("p", { class: "muted", text: "A portable download is wrapped with the password you type here. The password is not stored. Destroying the old environment requires this file plus Discord/provider credentials supplied on the new install." }),
+      captureNote,
       el("button", { class: "btn primary", text: "Create backup now", onclick: async () => {
         try {
           await api("/api/backups", "POST", { kind: "manual" });

@@ -267,6 +267,7 @@ async fn backups_require_owner_session_and_stay_off_unconfigured_version() {
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"backup_available\":false"));
+    assert!(text.contains("\"capture_available\":false"));
     let h = setup(false).await;
     let (status, _, _) = call(&h.router, "GET", "/api/backups", None, None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -284,6 +285,7 @@ async fn backups_require_owner_session_and_stay_off_unconfigured_version() {
     let (status, body, _) = call(&h.router, "GET", "/version", Some(&cookie), None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("\"backup_available\":true"));
+    assert!(String::from_utf8_lossy(&body).contains("\"capture_available\":true"));
 }
 
 #[tokio::test]
@@ -1492,4 +1494,156 @@ async fn complete_archive_enumeration_is_not_limited_by_catalog_history() {
             .unwrap();
     }
     assert_eq!(store.list_complete_archives().await.unwrap().len(), 205);
+}
+
+#[tokio::test]
+async fn catalog_overdue_matches_scheduled_backoff_after_failed_capture() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let store = h.conductor.store().unwrap();
+    let (mut settings, revision, _) = store.load_settings().await.unwrap();
+    settings.backup_enabled = true;
+    store.save_settings(&settings, revision).await.unwrap();
+    store
+        .insert_job(
+            "backup_capture",
+            &serde_json::json!({"kind":"scheduled"}),
+            1,
+        )
+        .await
+        .unwrap();
+    let claimed = store.claim_job().await.unwrap().unwrap();
+    store
+        .finish_job(&claimed.id, false, Some("scheduled capture failed"))
+        .await
+        .unwrap();
+
+    h.conductor.tick_job().await.unwrap();
+    let (status, body, _) = call(&h.router, "GET", "/api/backups", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["overdue"], false);
+    assert!(
+        !store
+            .list_jobs(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.kind == "backup_capture" && job.status == "queued"),
+        "scheduler must not enqueue another scheduled capture during backoff"
+    );
+}
+
+#[tokio::test]
+async fn capture_requires_a_reachable_core_store() {
+    let (discord, task) = discord_stub(42).await;
+    let root = unique_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: Some(root.join("control.db")),
+        public_url: "http://127.0.0.1:8081".into(),
+        owner_id: 42,
+        oauth_client_id: "cid".into(),
+        oauth_client_secret: "csecret".into(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: format!("{discord}/token"),
+        oauth_me_url: format!("{discord}/me"),
+        backup_root: Some(root.join("backups")),
+        backup_key: Some([7u8; 32]),
+        capture_stores: Vec::new(),
+        evidence_root: None,
+        restore_target: Some(root.join("restore-target")),
+    };
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let h = Harness {
+        conductor,
+        router,
+        root,
+        _discord: task,
+    };
+    let cookie = login(&h).await;
+    let (status, body, _) = call(&h.router, "GET", "/version", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"backup_available\":true"));
+    assert!(text.contains("\"capture_available\":false"));
+    let (status, listed, _) =
+        call(&h.router, "GET", "/api/backups", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+    assert_eq!(listed["capture_available"], false);
+    let (status, create, _) = call(
+        &h.router,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(br#"{"kind":"manual"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        String::from_utf8_lossy(&create).contains("capture requires a configured core store"),
+        "{}",
+        String::from_utf8_lossy(&create)
+    );
+}
+
+#[tokio::test]
+async fn backup_job_replay_honors_the_idle_mutex() {
+    let h = setup(false).await;
+    let cookie = login(&h).await;
+    let store = h.conductor.store().unwrap();
+    let restore = store
+        .insert_job(
+            "backup_restore",
+            &serde_json::json!({"id":"missing","password_required":false}),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().id, restore);
+    let failed = store
+        .insert_job("backup_capture", &serde_json::json!({"kind":"manual"}), 1)
+        .await
+        .unwrap();
+    assert_eq!(store.claim_job().await.unwrap().unwrap().id, failed);
+    store
+        .finish_job(&failed, false, Some("capture failed"))
+        .await
+        .unwrap();
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/jobs/{failed}/retry"),
+        Some(&cookie),
+        Some(br#"{}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("already running"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    store
+        .finish_job(&restore, false, Some("restore failed"))
+        .await
+        .unwrap();
+    let (status, _, _) = call(
+        &h.router,
+        "POST",
+        &format!("/api/jobs/{failed}/retry"),
+        Some(&cookie),
+        Some(br#"{}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -38,6 +38,7 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "version": env!("CARGO_PKG_VERSION"),
         "operations_available": available,
         "backup_available": false,
+        "capture_available": false,
         "update_available": false,
     });
     let ready_state = state.clone();
@@ -168,6 +169,7 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "version": env!("CARGO_PKG_VERSION"),
         "operations_available": state.operations_available(),
         "backup_available": state.backup_available(),
+        "capture_available": state.capture_available(),
         "update_available": false,
     }))
 }
@@ -371,6 +373,7 @@ async fn status_payload(state: &Conductor) -> anyhow::Result<serde_json::Value> 
         "api": state.probe(&settings.api_health_url).await,
         "jobs": state.store()?.list_jobs(12).await?,
         "backup_available": state.backup_available(),
+        "capture_available": state.capture_available(),
         "unavailable": ["updates"],
     }))
 }
@@ -542,14 +545,20 @@ async fn api_backups(State(state): State<Arc<Conductor>>, headers: HeaderMap) ->
     match store.list_archives(100).await {
         Ok(archives) => {
             let last = store.last_complete_ms().await.ok().flatten();
+            let last_attempt = store
+                .last_backup_schedule_activity_ms()
+                .await
+                .ok()
+                .flatten();
             Json(serde_json::json!({
                 "archives": archives.into_iter().filter(|row| row.status == "complete" || row.status == "failed" || row.status == "quarantined").collect::<Vec<_>>(),
                 "failed_jobs": failed_jobs,
                 "last_complete_ms": last,
-                "overdue": crate::backup::overdue(&settings, last),
+                "overdue": crate::backup::overdue(&settings, last_attempt),
                 "backup_enabled": settings.backup_enabled,
                 "interval_hours": settings.backup_interval_hours,
                 "key_from_env": state.cfg.backup_key.is_some(),
+                "capture_available": state.capture_available(),
             }))
             .into_response()
         }
@@ -573,6 +582,12 @@ async fn api_backup_create(
     };
     if let Err(error) = require_backup(&state).await {
         return error;
+    }
+    if !state.capture_available() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow::anyhow!("capture requires a configured core store"),
+        );
     }
     let kind = match body.kind.as_deref().unwrap_or("manual") {
         kind @ ("manual" | "checkpoint") => kind,

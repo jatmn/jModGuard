@@ -479,16 +479,7 @@ impl ControlStore {
         let conn = self.connect().await?;
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         let result: Result<bool> = async {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM jobs
-                     WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize')
-                       AND status IN ('queued', 'running')
-                     LIMIT 1",
-                    (),
-                )
-                .await?;
-            if rows.next().await?.is_some() {
+            if backup_job_is_active(&conn).await? {
                 return Ok(false);
             }
             let now = now_ms();
@@ -601,14 +592,45 @@ impl ControlStore {
 
     pub async fn replay_job(&self, id: &str) -> Result<bool> {
         let conn = self.connect().await?;
-        let changed = conn
-            .execute(
-                "UPDATE jobs SET status = 'queued', attempts = 0, due_ms = ?, last_error = NULL, finished_ms = NULL \
-                 WHERE id = ? AND status = 'failed'",
-                libsql::params![now_ms(), id],
-            )
-            .await?;
-        Ok(changed == 1)
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<bool> = async {
+            let mut rows = conn
+                .query(
+                    "SELECT kind, status FROM jobs WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(false);
+            };
+            let kind: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            if status != "failed" {
+                return Ok(false);
+            }
+            if is_backup_job_kind(&kind) && backup_job_is_active(&conn).await? {
+                anyhow::bail!("a backup or restore job is already running");
+            }
+            let changed = conn
+                .execute(
+                    "UPDATE jobs SET status = 'queued', attempts = 0, due_ms = ?, last_error = NULL, finished_ms = NULL \
+                     WHERE id = ? AND status = 'failed'",
+                    libsql::params![now_ms(), id],
+                )
+                .await?;
+            Ok(changed == 1)
+        }
+        .await;
+        match result {
+            Ok(replayed) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(replayed)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn list_jobs(&self, limit: i64) -> Result<Vec<JobRow>> {
@@ -922,15 +944,19 @@ impl ControlStore {
         Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()))
     }
 
+    pub async fn last_backup_schedule_activity_ms(&self) -> Result<Option<i64>> {
+        match (
+            self.last_complete_ms().await?,
+            self.last_scheduled_backup_ms().await?,
+        ) {
+            (Some(complete), Some(scheduled)) => Ok(Some(complete.max(scheduled))),
+            (complete, scheduled) => Ok(complete.or(scheduled)),
+        }
+    }
+
     pub async fn has_active_backup_job(&self) -> Result<bool> {
         let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running') LIMIT 1",
-                (),
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
+        backup_job_is_active(&conn).await
     }
 
     pub async fn has_failed_backup_sanitize_job(&self) -> Result<bool> {
@@ -1018,6 +1044,26 @@ fn newest_daily_ids(archives: &[(String, String, i64)], keep: i64) -> Vec<String
         }
     }
     ids
+}
+
+fn is_backup_job_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "backup_capture" | "backup_restore" | "backup_sanitize"
+    )
+}
+
+async fn backup_job_is_active(conn: &libsql::Connection) -> Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM jobs
+             WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize')
+               AND status IN ('queued', 'running')
+             LIMIT 1",
+            (),
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 fn archive_from_row(row: &libsql::Row) -> ArchiveRow {

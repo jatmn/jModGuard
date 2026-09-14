@@ -169,6 +169,14 @@ impl Config {
         self.operations_configured() && self.backup_root.is_some()
     }
 
+    /// Capture/sanitize can run only when a reachable `core` store is configured.
+    /// Restore/upload still use the backups-only zone independently.
+    pub fn capture_core_ready(&self) -> bool {
+        self.capture_stores
+            .iter()
+            .any(|store| store.role == "core" && store.path.exists())
+    }
+
     pub fn redirect_uri(&self) -> String {
         format!("{}/oauth/callback", self.public_url.trim_end_matches('/'))
     }
@@ -296,6 +304,7 @@ mod tests {
         assert!(!cfg.operations_configured());
         assert!(cfg.backup_root.is_none());
         assert!(cfg.backup_key.is_none());
+        assert!(!cfg.capture_core_ready());
     }
     #[test]
     fn backup_paths_must_be_absolute_and_distinct() {
