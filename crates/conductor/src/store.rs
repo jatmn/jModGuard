@@ -45,6 +45,21 @@ pub struct TelemetryRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ArchiveRow {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub created_ms: i64,
+    pub captured_ms: Option<i64>,
+    pub scope_json: String,
+    pub object_key: Option<String>,
+    pub sha256: Option<String>,
+    pub bytes: Option<i64>,
+    pub family: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NotifyReceipt {
     pub id: i64,
     pub sent_ms: i64,
@@ -142,6 +157,20 @@ impl ControlStore {
             );
             CREATE INDEX IF NOT EXISTS telemetry_collected ON telemetry(collected_ms);
             CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_ms);
+            CREATE TABLE IF NOT EXISTS archives (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_ms INTEGER NOT NULL,
+              captured_ms INTEGER,
+              scope_json TEXT NOT NULL,
+              object_key TEXT,
+              sha256 TEXT,
+              bytes INTEGER,
+              family TEXT NOT NULL,
+              last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS archives_created ON archives(created_ms);
             "#,
         )
         .await
@@ -639,6 +668,199 @@ impl ControlStore {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn insert_archive(&self, row: &ArchiveRow) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "INSERT INTO archives(id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                row.id.clone(),
+                row.kind.clone(),
+                row.status.clone(),
+                row.created_ms,
+                row.captured_ms,
+                row.scope_json.clone(),
+                row.object_key.clone(),
+                row.sha256.clone(),
+                row.bytes,
+                row.family.clone(),
+                row.last_error.clone()
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_archive(&self, row: &ArchiveRow) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE archives SET kind = ?, status = ?, captured_ms = ?, scope_json = ?, object_key = ?, sha256 = ?, bytes = ?, family = ?, last_error = ? WHERE id = ?",
+            libsql::params![
+                row.kind.clone(),
+                row.status.clone(),
+                row.captured_ms,
+                row.scope_json.clone(),
+                row.object_key.clone(),
+                row.sha256.clone(),
+                row.bytes,
+                row.family.clone(),
+                row.last_error.clone(),
+                row.id.clone()
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_archive(&self, id: &str) -> Result<Option<ArchiveRow>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error FROM archives WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(rows.next().await?.map(|row| archive_from_row(&row)))
+    }
+
+    pub async fn list_archives(&self, limit: i64) -> Result<Vec<ArchiveRow>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, created_ms, captured_ms, scope_json, object_key, sha256, bytes, family, last_error FROM archives ORDER BY created_ms DESC LIMIT ?",
+                libsql::params![limit],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(archive_from_row(&row));
+        }
+        Ok(out)
+    }
+
+    pub async fn last_complete_ms(&self) -> Result<Option<i64>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT captured_ms FROM archives WHERE status = 'complete' ORDER BY captured_ms DESC LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()))
+    }
+
+    pub async fn has_active_backup_job(&self) -> Result<bool> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running') LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn has_unresolved_backup_job(&self) -> Result<bool> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize') AND status IN ('queued', 'running', 'failed') LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn prune_old_archives(
+        &self,
+        scheduled_keep: i64,
+        daily_keep: i64,
+        checkpoint_keep: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, created_ms FROM archives WHERE status = 'complete'",
+                (),
+            )
+            .await?;
+        let mut archives = Vec::new();
+        while let Some(row) = rows.next().await? {
+            archives.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+            ));
+        }
+        let mut keep = std::collections::BTreeSet::new();
+        keep.extend(newest_ids(&archives, "scheduled", scheduled_keep));
+        keep.extend(newest_ids(&archives, "manual", scheduled_keep));
+        keep.extend(newest_ids(&archives, "checkpoint", checkpoint_keep));
+        keep.extend(newest_daily_ids(&archives, daily_keep));
+        let mut removed = Vec::new();
+        for (id, kind, _) in archives {
+            if !matches!(kind.as_str(), "scheduled" | "manual" | "checkpoint") {
+                continue;
+            }
+            if keep.contains(&id) {
+                continue;
+            }
+            conn.execute(
+                "DELETE FROM archives WHERE id = ?",
+                libsql::params![id.clone()],
+            )
+            .await?;
+            removed.push(id);
+        }
+        Ok(removed)
+    }
+}
+
+fn newest_ids(archives: &[(String, String, i64)], kind: &str, keep: i64) -> Vec<String> {
+    let mut rows: Vec<&(String, String, i64)> =
+        archives.iter().filter(|row| row.1 == kind).collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
+    rows.into_iter()
+        .take(keep.max(0) as usize)
+        .map(|row| row.0.clone())
+        .collect()
+}
+
+fn newest_daily_ids(archives: &[(String, String, i64)], keep: i64) -> Vec<String> {
+    let mut rows: Vec<&(String, String, i64)> = archives
+        .iter()
+        .filter(|row| row.1 == "scheduled" || row.1 == "manual")
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
+    let mut seen_days = std::collections::BTreeSet::new();
+    let mut ids = Vec::new();
+    for row in rows {
+        let day = row.2.div_euclid(86_400_000);
+        if seen_days.insert(day) {
+            ids.push(row.0.clone());
+            if ids.len() as i64 >= keep {
+                break;
+            }
+        }
+    }
+    ids
+}
+
+fn archive_from_row(row: &libsql::Row) -> ArchiveRow {
+    ArchiveRow {
+        id: row.get(0).unwrap_or_default(),
+        kind: row.get(1).unwrap_or_default(),
+        status: row.get(2).unwrap_or_default(),
+        created_ms: row.get(3).unwrap_or(0),
+        captured_ms: row.get(4).ok(),
+        scope_json: row.get(5).unwrap_or_else(|_| "{}".into()),
+        object_key: row.get(6).ok(),
+        sha256: row.get(7).ok(),
+        bytes: row.get(8).ok(),
+        family: row.get(9).unwrap_or_default(),
+        last_error: row.get(10).ok(),
     }
 }
 

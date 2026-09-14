@@ -159,7 +159,9 @@ Member apply distinct synthetic permission masks to permission-dependent respons
 the owner's live Manage Server permission is still rechecked before every guild read.
 Preview never makes `is_bot_owner` true. An
 Administration link appears only when `web.conductor_url` / `JMODGUARD_CONDUCTOR_URL`
-is set; that origin uses a separate conductor login.
+is set; that origin uses a separate conductor login. When the conductor has a
+backup root configured, that Administration UI can create, download, upload and
+restore local archives. Guild API sessions cannot authenticate it.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / settings) from

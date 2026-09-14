@@ -74,9 +74,10 @@ queue write leaves retirement uncommitted so the confirmed departure can be retr
 evidence, removes owned objects, purges cases, deletes remaining store identity,
 records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
-join cannot be resurrected. There is no permanent departed-guild ledger. Backup-copy
-cleanup is not implemented; the intent exists so a later backup feature can finish
-controlled-copy deletion without reconstructing live data. The durable job can resume its
+join cannot be resurrected. There is no permanent departed-guild ledger. The conductor
+backup worker sanitizes complete local archives against surviving intents and can
+acknowledge those rows; it does not import tenant routing. Live Bunny backup-copy
+deletion remains later work. The durable job can resume its
 core cleanup suffix after the store binding has already been erased: the exact store
 identity and absence of the guild binding are checked without weakening normal data-scope
 validation. If activation stopped after placement binding but before membership insertion,
@@ -96,8 +97,10 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: conductor backup, update and guild-move controls
-are not registered. Image and text spam enforcement is implemented separately; see
+Unfinished services stay inactive: conductor updates and guild-move controls
+are not registered. Local encrypted backup/restore is available on the conductor
+when a dedicated backup root is configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+Image and text spam enforcement is implemented separately; see
 [IMAGE-SPAM.md](IMAGE-SPAM.md). See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
 [evidence](CASE-EVIDENCE.md) and [enrollments](ENROLLMENTS.md).
 

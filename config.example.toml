@@ -79,7 +79,8 @@ oauth_client_secret = ""
 # cors_origins = ["https://admin.example.com"]
 # Public conductor origin for the owner Administration link in the guild WebUI.
 # Empty hides the link. Env: JMODGUARD_CONDUCTOR_URL. This is not a conductor
-# session cookie or OAuth secret.
+# session cookie or OAuth secret. Conductor backup/restore is configured with
+# JMODGUARD_CONDUCTOR_* keys, not this file; see docs/CONDUCTOR.md.
 # conductor_url = "http://127.0.0.1:8081"
 
 # Bot-only positive membership repair; the API ignores this section and its env vars.

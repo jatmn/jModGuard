@@ -70,6 +70,11 @@ async fn setup(owner: u64) -> Control {
         api_health_url: String::new(),
         oauth_token_url: format!("{discord}/token"),
         oauth_me_url: format!("{discord}/me"),
+        backup_root: None,
+        backup_key: None,
+        capture_stores: Vec::new(),
+        evidence_root: None,
+        restore_target: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -238,6 +243,11 @@ async fn session_revocation_and_restart_reuse_durable_store() {
             api_health_url: String::new(),
             oauth_token_url: String::new(),
             oauth_me_url: String::new(),
+            backup_root: None,
+            backup_key: None,
+            capture_stores: Vec::new(),
+            evidence_root: None,
+            restore_target: None,
         },
         false,
     )

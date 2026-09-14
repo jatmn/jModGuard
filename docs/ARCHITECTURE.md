@@ -168,7 +168,8 @@ Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for im
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
 batch cleanup. Bot and API now record selected outcomes and serve authorized case/evidence
 administration; see [tenant runtime](TENANT-RUNTIME.md). Discord attachment capture and
-backup-copy cleanup remain later work.
+live Bunny backup-copy cleanup remain later work. Local conductor archives can already
+be sanitized against surviving cleanup intents.
 
 ## Migrations
 

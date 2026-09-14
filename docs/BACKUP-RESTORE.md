@@ -8,6 +8,32 @@ This document separates a provider's internal durability from an
 operator-controlled backup that can be exported, retained independently, and
 restored into a different database.
 
+## Conductor Administration
+
+The conductor can create, list, download, upload and restore authenticated
+encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
+[CONDUCTOR.md](CONDUCTOR.md) for the environment keys.
+
+- Format `JMODGUARD-BACKUP-1` with ChaCha20-Poly1305 frames and HKDF/PBKDF2 key
+  wrapping. Scheduled archives use the process/control master key. Portable
+  downloads wrap the same payload with an export password that is never stored.
+- Capture snapshots each configured local SQLite store with `VACUUM INTO`, then
+  drops `bot_actions`, `mutation_receipts` and `nickname_reconcile` so restore
+  cannot replay Discord. Evidence files are copied from a distinct live evidence
+  root. Objects listed in `backup_cleanup_intents` are omitted.
+- Defaults (editable in Installation): every six hours, 24 scheduled points,
+  seven daily points, three release checkpoints, fresh pre-operation capture.
+  Scheduled failures retry and alert; they never pause writes.
+- Restore writes into an absent `JMODGUARD_CONDUCTOR_RESTORE_TARGET`. It does not
+  overwrite the live database in place. After total loss of current policy state,
+  the operator must acknowledge that later deletions cannot be verified. Surviving
+  cleanup intents still remove those guilds/objects.
+- Local tests do not prove Bunny session/durability, distributed writer exclusion
+  or billed resource use.
+
+Manual SQLite copies below remain valid for operators who are not using the
+conductor.
+
 ## Local SQLite
 
 For a cold backup, stop both `jmodguard-bot` and `jmodguard-api`, then copy

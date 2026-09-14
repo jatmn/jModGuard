@@ -25,6 +25,35 @@ fn remote_pool_admission_has_a_deadline() {
 }
 
 #[test]
+fn restore_fence_blocks_primary_writes() {
+    let tmp = tmp_db_path("restore_fence");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO meta(key, value) VALUES ('restore_fence', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (),
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .with_conn(|c| {
+                c.transaction_immediate()?;
+                Ok(())
+            })
+            .await
+            .expect_err("fenced writes must fail");
+        assert!(
+            error.to_string().contains("restore is in progress"),
+            "{error:#}"
+        );
+    });
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn timed_out_connection_is_discarded_before_pool_reuse() {
     let tmp = tmp_db_path("discard_timed_out_connection");
     let db = Db::open(&tmp, 2).unwrap();

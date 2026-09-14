@@ -1,12 +1,14 @@
 //! Conductor HTTP surface. Guild API cookies never authenticate this origin.
-use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio_util::io::ReaderStream;
 
 use crate::settings::SettingsPatch;
 use crate::state::{Conductor, Operator, parse_session_cookie};
@@ -33,6 +35,8 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "service": "conductor",
         "version": env!("CARGO_PKG_VERSION"),
         "operations_available": available,
+        "backup_available": false,
+        "update_available": false,
     });
     let ready_state = state.clone();
     let router = Router::new()
@@ -100,6 +104,15 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/jobs/{id}/retry", post(api_retry_job))
         .route("/api/notifications/test", post(api_notify_test))
         .route("/api/notifications/health", get(api_notify_health))
+        .route("/api/backups", get(api_backups).post(api_backup_create))
+        .route(
+            "/api/backups/upload",
+            post(api_backup_upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route("/api/backups/{id}", get(api_backup_one))
+        .route("/api/backups/{id}/download", get(api_backup_download))
+        .route("/api/backups/{id}/portable", post(api_backup_portable))
+        .route("/api/backups/{id}/restore", post(api_backup_restore))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
                 response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
@@ -124,8 +137,14 @@ fn placeholder_state() -> Conductor {
             api_health_url: String::new(),
             oauth_token_url: String::new(),
             oauth_me_url: String::new(),
+            backup_root: None,
+            backup_key: None,
+            capture_stores: Vec::new(),
+            evidence_root: None,
+            restore_target: None,
         },
         store: None,
+        backup: None,
         http: reqwest::Client::new(),
         started: std::time::Instant::now(),
     }
@@ -148,7 +167,7 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "service": "conductor",
         "version": env!("CARGO_PKG_VERSION"),
         "operations_available": state.operations_available(),
-        "backup_available": false,
+        "backup_available": state.backup_available(),
         "update_available": false,
     }))
 }
@@ -351,7 +370,8 @@ async fn status_payload(state: &Conductor) -> anyhow::Result<serde_json::Value> 
         "bot": state.probe(&settings.bot_health_url).await,
         "api": state.probe(&settings.api_health_url).await,
         "jobs": state.store()?.list_jobs(12).await?,
-        "unavailable": ["backups", "updates"],
+        "backup_available": state.backup_available(),
+        "unavailable": ["updates"],
     }))
 }
 
@@ -487,6 +507,305 @@ async fn api_notify_health(State(state): State<Arc<Conductor>>, headers: HeaderM
     match store.recent_notify_receipts(20).await {
         Ok(receipts) => Json(serde_json::json!({ "receipts": receipts })).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn require_backup(state: &Conductor) -> Result<&crate::backup::BackupZone, Response> {
+    state
+        .backup_zone()
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+}
+
+async fn api_backups(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    if let Err(error) = require_backup(&state).await {
+        return error;
+    }
+    let store = match state.store() {
+        Ok(store) => store,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    let settings = match state.settings().await {
+        Ok(settings) => settings,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    match store.list_archives(100).await {
+        Ok(archives) => {
+            let last = store.last_complete_ms().await.ok().flatten();
+            Json(serde_json::json!({
+                "archives": archives.into_iter().filter(|row| row.status == "complete" || row.status == "failed" || row.status == "quarantined").collect::<Vec<_>>(),
+                "last_complete_ms": last,
+                "overdue": crate::backup::overdue(&settings, last),
+                "backup_enabled": settings.backup_enabled,
+                "interval_hours": settings.backup_interval_hours,
+                "preop_policy": settings.backup_preop_policy,
+                "key_from_env": state.cfg.backup_key.is_some(),
+            }))
+            .into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct BackupCreate {
+    kind: Option<String>,
+}
+
+async fn api_backup_create(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Json(body): Json<BackupCreate>,
+) -> Response {
+    let operator = match operator(&state, &headers).await {
+        Ok(op) => op,
+        Err(error) => return auth_error(error),
+    };
+    if let Err(error) = require_backup(&state).await {
+        return error;
+    }
+    let kind = match body.kind.as_deref().unwrap_or("manual") {
+        kind @ ("manual" | "checkpoint") => kind,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!("unsupported backup kind"),
+            );
+        }
+    };
+    match enqueue_backup(&state, &operator, kind).await {
+        Ok(id) => Json(serde_json::json!({ "id": id, "state": "queued" })).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn enqueue_backup(
+    state: &Conductor,
+    operator: &Operator,
+    kind: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !state.store()?.has_active_backup_job().await?,
+        "a backup or restore job is already running"
+    );
+    let id = state
+        .store()?
+        .insert_job("backup_capture", &serde_json::json!({ "kind": kind }), 3)
+        .await?;
+    state
+        .store()?
+        .audit(&operator.operator_id, "backup_create", &id)
+        .await?;
+    Ok(id)
+}
+
+async fn api_backup_one(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    match state.store() {
+        Ok(store) => match store.get_archive(&id).await {
+            Ok(Some(row)) => Json(serde_json::json!({ "archive": row })).into_response(),
+            Ok(None) => error_response(StatusCode::NOT_FOUND, anyhow::anyhow!("backup not found")),
+            Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+        },
+        Err(error) => error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    }
+}
+
+async fn api_backup_download(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    let zone = match require_backup(&state).await {
+        Ok(zone) => zone,
+        Err(error) => return error,
+    };
+    let row = match state.store() {
+        Ok(store) => match store.get_archive(&id).await {
+            Ok(Some(row)) if row.status == "complete" => row,
+            Ok(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    anyhow::anyhow!("backup is not complete"),
+                );
+            }
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        },
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    stream_file(zone.complete_path(&row.id), &format!("jmodguard-{id}.jmb")).await
+}
+
+#[derive(Deserialize)]
+struct PortableBody {
+    password: String,
+}
+
+async fn api_backup_portable(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PortableBody>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    let zone = match require_backup(&state).await {
+        Ok(zone) => zone,
+        Err(error) => return error,
+    };
+    match crate::backup::wrap_portable_archive(
+        zone,
+        match state.store() {
+            Ok(store) => store,
+            Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+        },
+        &state.cfg,
+        &id,
+        &body.password,
+    )
+    .await
+    {
+        Ok(path) => stream_file(path, &format!("jmodguard-{id}-portable.jmb")).await,
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    password: Option<String>,
+    acknowledge_historical: Option<bool>,
+}
+
+async fn api_backup_restore(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<RestoreBody>,
+) -> Response {
+    let operator = match operator(&state, &headers).await {
+        Ok(op) => op,
+        Err(error) => return auth_error(error),
+    };
+    if let Err(error) = require_backup(&state).await {
+        return error;
+    }
+    match enqueue_restore(&state, &operator, &id, body).await {
+        Ok(job) => Json(serde_json::json!({ "id": job, "state": "queued" })).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn enqueue_restore(
+    state: &Conductor,
+    operator: &Operator,
+    id: &str,
+    body: RestoreBody,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !state.store()?.has_active_backup_job().await?,
+        "a backup or restore job is already running"
+    );
+    let job = state
+        .store()?
+        .insert_job(
+            "backup_restore",
+            &serde_json::json!({
+                "id": id,
+                "password": body.password,
+                "acknowledge_historical": body.acknowledge_historical.unwrap_or(false),
+            }),
+            1,
+        )
+        .await?;
+    state
+        .store()?
+        .audit(&operator.operator_id, "backup_restore", id)
+        .await?;
+    Ok(job)
+}
+
+async fn api_backup_upload(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    let zone = match require_backup(&state).await {
+        Ok(zone) => zone,
+        Err(error) => return error,
+    };
+    let settings = match state.settings().await {
+        Ok(settings) => settings,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    if body.len() as u64 > settings.backup_max_archive_bytes {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            anyhow::anyhow!("upload exceeds configured byte budget"),
+        );
+    }
+    match crate::backup::ingest_upload(zone, &body) {
+        Ok(id) => {
+            if let Ok(store) = state.store() {
+                let _ = store
+                    .insert_archive(&crate::store::ArchiveRow {
+                        id: id.clone(),
+                        kind: "upload".into(),
+                        status: "quarantined".into(),
+                        created_ms: crate::store::now_ms(),
+                        captured_ms: None,
+                        scope_json: "{}".into(),
+                        object_key: Some(format!("quarantine/{id}.jmb")),
+                        sha256: None,
+                        bytes: Some(body.len() as i64),
+                        family: "unknown".into(),
+                        last_error: None,
+                    })
+                    .await;
+            }
+            Json(serde_json::json!({ "id": id, "status": "quarantined" })).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn stream_file(path: std::path::PathBuf, filename: &str) -> Response {
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let body = Body::from_stream(ReaderStream::new(file));
+            let disposition = format!("attachment; filename=\"{filename}\"");
+            (
+                StatusCode::OK,
+                [
+                    (
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    ),
+                    (
+                        CONTENT_DISPOSITION,
+                        HeaderValue::from_str(&disposition)
+                            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Err(error) => error_response(StatusCode::NOT_FOUND, error.into()),
     }
 }
 

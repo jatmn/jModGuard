@@ -65,8 +65,9 @@ supported database, without this aggregate filter. Warns and bans retain their s
 table counts. The fresh schema omits `messages`, `members`, `users` and `mutes`; their
 archive helpers are removed. Old internal retention fields have no live collection
 effect. Databases from before this baseline are unsupported and are not adopted or
-erased. Publish matching frontend/API artifacts. Routing guilds across stores, full
-guild erasure and backup exclusions remain subsequent work.
+erased. Publish matching frontend/API artifacts. Routing guilds across stores remains
+subsequent work. Local conductor backup excludes pending Discord actions and can
+sanitize controlled copies against surviving cleanup intents.
 
 Local tests cover real report mapping, rendered payload flags/limits, guild routing,
 unavailable SQL history tables, overload, timeout/capacity recovery and API/UI removal.

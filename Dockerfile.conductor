@@ -2,6 +2,8 @@
 # Multi-stage build for jmodguard-conductor.
 # Development control-service image. /health is liveness; /ready is 200 only
 # when the control store, OAuth client and operator identity are configured.
+# Backup/restore additionally needs JMODGUARD_CONDUCTOR_BACKUP_ROOT (and
+# capture/restore paths). Updates are not available in this image.
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 FROM rust:1.96-bookworm AS builder
 WORKDIR /app

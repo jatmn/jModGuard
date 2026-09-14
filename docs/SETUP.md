@@ -113,6 +113,10 @@ service with `-p` as above. Bare `cargo build --bins` builds all workspace binar
 including the conductor. For a Bunny API without embedded pages, use
 `cargo build --locked --release -p jmodguard-api --no-default-features`.
 
+The optional conductor does not read `config.toml`. Local backup/restore uses
+`JMODGUARD_CONDUCTOR_BACKUP_ROOT` and the other conductor-only keys in
+[CONDUCTOR.md](CONDUCTOR.md). Guild API sessions cannot authenticate that origin.
+
 ## 6. Configure
 
 ```bash
