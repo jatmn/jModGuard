@@ -971,6 +971,31 @@ impl ControlStore {
         Ok(rows.next().await?.is_some())
     }
 
+    pub async fn prune_quarantined_archives(&self, keep: i64) -> Result<Vec<String>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, created_ms FROM archives WHERE status = 'quarantined' ORDER BY created_ms DESC",
+                (),
+            )
+            .await?;
+        let mut archives = Vec::new();
+        while let Some(row) = rows.next().await? {
+            archives.push((row.get::<String>(0)?, row.get::<i64>(1)?));
+        }
+        let keep = keep.max(0) as usize;
+        let mut removed = Vec::new();
+        for (id, _) in archives.into_iter().skip(keep) {
+            conn.execute(
+                "DELETE FROM archives WHERE id = ? AND status = 'quarantined'",
+                libsql::params![id.clone()],
+            )
+            .await?;
+            removed.push(id);
+        }
+        Ok(removed)
+    }
+
     pub async fn prune_old_archives(
         &self,
         scheduled_keep: i64,

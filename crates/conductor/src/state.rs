@@ -54,10 +54,23 @@ impl Conductor {
         };
         let backup = if let Some(path) = &cfg.backup_root {
             let zone = BackupZone::open(path)?;
-            zone.prune_incomplete()?;
             if let Some(store) = &store {
+                if let Err(error) = crate::backup::recover_catalog_archive_bytes(&zone, store).await
+                {
+                    tracing::warn!("could not recover staged backups: {error:#}");
+                }
                 zone.prune_untracked_complete(&store.complete_archive_ids().await?)?;
+                if let Ok((settings, _, _)) = store.load_settings().await {
+                    let keep =
+                        i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
+                    if let Ok(removed) = store.prune_quarantined_archives(keep).await {
+                        for id in removed {
+                            zone.remove_quarantine(&id);
+                        }
+                    }
+                }
             }
+            zone.prune_incomplete()?;
             Some(zone)
         } else {
             None
@@ -327,6 +340,9 @@ impl Conductor {
         let Some(store) = &self.store else {
             return Ok(());
         };
+        if let Err(error) = self.maybe_reconcile_restore_fence().await {
+            tracing::warn!("restore fence reconciliation: {error:#}");
+        }
         self.maybe_schedule_backup().await?;
         self.maybe_sanitize_backups().await?;
         let Some(job) = store.claim_job().await? else {
@@ -370,6 +386,29 @@ impl Conductor {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn maybe_reconcile_restore_fence(&self) -> Result<()> {
+        if !self.backup_available() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        if store.has_active_backup_job().await? {
+            return Ok(());
+        }
+        let core = self
+            .cfg
+            .capture_stores
+            .iter()
+            .find(|store| store.role == "core" && store.path.exists());
+        let Some(core) = core else {
+            return Ok(());
+        };
+        if !crate::backup::restore_fence_active(&core.path).await? {
+            return Ok(());
+        }
+        crate::backup::clear_restore_fence(&core.path).await?;
         Ok(())
     }
 
@@ -503,17 +542,25 @@ impl Conductor {
             &settings,
         )
         .await?;
+        let scheduled_keep = i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
         let removed = self
             .store()?
             .prune_old_archives(
-                i64::try_from(settings.backup_retain_scheduled).unwrap_or(24),
+                scheduled_keep,
                 i64::try_from(settings.backup_retain_daily).unwrap_or(7),
                 i64::try_from(settings.backup_retain_checkpoints).unwrap_or(3),
             )
             .await?;
+        let removed_quarantine = self
+            .store()?
+            .prune_quarantined_archives(scheduled_keep)
+            .await?;
         if let Ok(zone) = self.backup_zone() {
             for id in removed {
                 let _ = std::fs::remove_file(zone.complete_path(&id));
+            }
+            for id in removed_quarantine {
+                zone.remove_quarantine(&id);
             }
         }
         let _ = row;

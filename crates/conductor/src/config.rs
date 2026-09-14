@@ -1,7 +1,7 @@
 //! Process configuration only. Guild/bot/API credentials are never loaded here.
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::{Path, PathBuf}, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct CaptureStore {
@@ -129,12 +129,18 @@ impl Config {
         let evidence_root = optional_path(lookup("JMODGUARD_CONDUCTOR_EVIDENCE_ROOT")?)?;
         let restore_target = optional_path(lookup("JMODGUARD_CONDUCTOR_RESTORE_TARGET")?)?;
         if let (Some(backup), Some(evidence)) = (&backup_root, &evidence_root) {
-            anyhow::ensure!(
-                backup != evidence
-                    && !backup.starts_with(evidence)
-                    && !evidence.starts_with(backup),
-                "backup and evidence roots must be distinct dedicated directories"
-            );
+            ensure_disjoint_roots(
+                backup,
+                evidence,
+                "backup and evidence roots must be distinct dedicated directories",
+            )?;
+        }
+        if let (Some(backup), Some(restore)) = (&backup_root, &restore_target) {
+            ensure_disjoint_roots(
+                backup,
+                restore,
+                "backup root and restore target must be distinct dedicated directories",
+            )?;
         }
         Ok(Self {
             bind,
@@ -205,6 +211,14 @@ pub(crate) fn parse_http_origin(raw: &str) -> Result<String> {
         "must not contain a query or fragment"
     );
     Ok(raw.trim_end_matches('/').to_string())
+}
+
+fn ensure_disjoint_roots(left: &Path, right: &Path, message: &str) -> Result<()> {
+    anyhow::ensure!(
+        left != right && !left.starts_with(right) && !right.starts_with(left),
+        "{message}"
+    );
+    Ok(())
 }
 
 fn optional_path(raw: Option<String>) -> Result<Option<PathBuf>> {
@@ -331,6 +345,17 @@ mod tests {
             ))
         });
         assert!(nested.is_err());
+        let nested_restore = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                    "JMODGUARD_CONDUCTOR_RESTORE_TARGET" => "/tmp/jmodguard-backups/restore",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        });
+        assert!(nested_restore.is_err());
     }
     #[test]
     fn process_overrides_are_validated_without_environment_mutation() {

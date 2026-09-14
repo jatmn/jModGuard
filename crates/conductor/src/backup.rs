@@ -111,6 +111,10 @@ impl BackupZone {
         let _ = fs::remove_file(self.staging_path(id));
     }
 
+    pub fn cleanup_capture_workdir(&self, id: &str) {
+        let _ = fs::remove_dir_all(self.scratch(id));
+    }
+
     pub fn begin_upload(&self) -> Result<(String, File)> {
         let id = random_token();
         let file = private_file(&self.quarantine_path(&id))?;
@@ -217,6 +221,7 @@ pub async fn capture(
     match capture_inner(cfg, store, zone, settings, kind, &id, created).await {
         Ok(row) => {
             store.update_archive(&row).await?;
+            promote_staging_archive(zone, &id)?;
             Ok(row)
         }
         Err(error) => {
@@ -335,10 +340,7 @@ async fn capture_inner(
         "archive exceeds configured byte budget"
     );
     let sha = sha256_file(&dest)?;
-    let complete = zone.complete_path(id);
-    fs::rename(&dest, &complete)?;
-    File::open(complete.parent().context("complete dir")?)?.sync_all()?;
-    zone.cleanup_scratch(id);
+    zone.cleanup_capture_workdir(id);
     Ok(ArchiveRow {
         id: id.to_string(),
         kind: kind.into(),
@@ -712,6 +714,53 @@ pub async fn clear_cleanup_intents(cfg: &Config, ids: &[String]) -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+pub fn promote_staging_archive(zone: &BackupZone, id: &str) -> Result<()> {
+    let staging = zone.staging_path(id);
+    let complete = zone.complete_path(id);
+    if complete.exists() {
+        if staging.exists() {
+            fs::remove_file(staging)?;
+        }
+        return Ok(());
+    }
+    ensure!(
+        staging.exists(),
+        "staging archive is missing for published backup {id}"
+    );
+    fs::rename(&staging, &complete)?;
+    File::open(complete.parent().context("complete dir")?)?.sync_all()?;
+    Ok(())
+}
+
+pub async fn recover_catalog_archive_bytes(zone: &BackupZone, store: &ControlStore) -> Result<()> {
+    for row in store.list_complete_archives().await? {
+        if row.status == "complete" {
+            promote_staging_archive(zone, &row.id)?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn restore_fence_active(path: &Path) -> Result<bool> {
+    let db = libsql::Builder::new_local(path).build().await?;
+    let conn = db.connect()?;
+    let mut rows = match conn
+        .query(
+            "SELECT value FROM meta WHERE key = 'restore_fence'",
+            (),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if error.to_string().contains("no such table: meta") => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(matches!(
+        rows.next().await?.and_then(|row| row.get::<String>(0).ok()),
+        Some(value) if value == "1"
+    ))
 }
 
 pub async fn set_restore_fence(path: &Path, on: bool) -> Result<()> {

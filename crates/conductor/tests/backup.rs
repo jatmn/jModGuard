@@ -309,7 +309,7 @@ async fn manual_backup_excludes_pending_actions_and_restores_without_replay() {
     );
     tick_until_idle(&h).await;
     let id = complete_archive_id(&h, &cookie).await;
-    let (status, _, _) = call(
+    let (status, body, _) = call(
         &h.router,
         "POST",
         &format!("/api/backups/{id}/restore"),
@@ -318,7 +318,12 @@ async fn manual_backup_excludes_pending_actions_and_restores_without_replay() {
         Some("application/json"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     tick_until_idle(&h).await;
     let restored = h.root.join("restore-target").join("core.sqlite");
     assert!(restored.exists(), "restored store missing");
