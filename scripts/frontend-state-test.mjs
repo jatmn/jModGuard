@@ -57,7 +57,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, init, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -994,4 +994,37 @@ test('post-boot preview authentication loss enters the unavailable state', async
   assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
   assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+});
+
+test('production session-expired response enters preview unavailable state', async () => {
+  const session = new Map([['jmodguard_preview', 'preview-token']]);
+  const h = harness(async () => ({
+    ok: false,
+    status: 400,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'session expired' }),
+  }), new Map(), session);
+
+  await h.app.init();
+
+  assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+  assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+});
+
+test('private downloads share preview authentication-loss handling', async () => {
+  for (const [status, message] of [[401, 'not authenticated'], [400, 'session expired']]) {
+    const session = new Map([['jmodguard_preview', 'preview-token']]);
+    const h = harness(async () => ({
+      ok: false,
+      status,
+      text: async () => JSON.stringify({ error: message }),
+    }), new Map(), session);
+
+    await assert.rejects(h.app.downloadPrivate('/api/guilds/10/cases/1/evidence/2'), new RegExp(message));
+
+    assert.equal(h.nodes.get('#startup-view').classList.contains('hidden'), false);
+    assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
+    assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
+  }
 });

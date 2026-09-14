@@ -201,7 +201,7 @@ function parseRetryAfterMs(header) {
 
 function isUnauthenticated(err) {
   const msg = String(err && err.message);
-  return err.status === 401 || msg.includes("not authenticated") || msg.includes("401");
+  return err.status === 401 || msg.includes("not authenticated") || msg === "session expired" || msg.includes("401");
 }
 
 /** Pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
@@ -259,6 +259,11 @@ function returnFromPreview() {
   clearPreviewToken();
 }
 
+function handlePreviewError(error) {
+  if (error.code === "preview_expired") leaveExpiredPreview();
+  else if (isUnauthenticated(error) && currentPreviewToken()) showPreviewUnavailable();
+}
+
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
@@ -289,8 +294,7 @@ async function api(path, method = "GET", body = null, signal) {
       const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
       const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
       error.code = data && data.code;
-      if (error.code === "preview_expired") leaveExpiredPreview();
-      else if (isUnauthenticated(error) && currentPreviewToken()) showPreviewUnavailable();
+      handlePreviewError(error);
       throw error;
     }
     return data;
@@ -319,7 +323,7 @@ async function downloadPrivate(path, filename) {
     } catch (_) {}
     const error = apiError(message, res.status);
     error.code = code;
-    if (code === "preview_expired") leaveExpiredPreview();
+    handlePreviewError(error);
     throw error;
   }
   const blob = await res.blob();
