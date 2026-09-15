@@ -43,7 +43,7 @@ def main():
     print("Bot/API runtime state boundaries pass")
 
     # API may admit/read/cancel captured jobs; only the bot owns dispatch and cleanup.
-    forbidden_api = re.compile(r"\b(?:enqueue_bot_action|bot_action|recent_bot_actions|cancel_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|finish_dispatched_bot_action|bot_action_can_dispatch|prune_bot_action_history)\b")
+    forbidden_api = re.compile(r"\b(?:enqueue_bot_action|bot_action|recent_bot_actions|cancel_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|finish_dispatched_bot_action|bot_action_can_dispatch|bot_action_dispatch|prune_bot_action_history)\b")
     for path in api_paths:
         if path.name != "enrollment_tests.rs" and forbidden_api.search(path.read_text()):
             raise SystemExit(f"Unscoped queue access or worker operation in API: {path}")
@@ -83,7 +83,7 @@ def main():
     for path in (ROOT / "crates/conductor/src").rglob("*.rs"):
         if runtime.search(path.read_text()):
             raise SystemExit(f"Guild-store runtime in conductor: {path}")
-    print("Guild-store catalog remains inactive in the conductor")
+    print("Guild-store catalog writes stay out of the conductor")
 
     # Bot-owned Discord mutations record their classified application case and
     # suppress the matching gateway echo. Unmarked manual/external events remain cases.

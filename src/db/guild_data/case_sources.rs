@@ -62,6 +62,7 @@ impl GuildDataStore {
         source: CaseSource,
     ) -> Result<LinkCaseSource> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let anchor = anchor.key()?;
         let key = source.key()?;
         let kind = source.kind();

@@ -417,3 +417,111 @@ async fn tenant_runtime_migration_keeps_version_ten_catalog_and_starts_empty() {
     drop(db);
     cleanup_db(&path);
 }
+
+#[tokio::test]
+async fn guild_move_migration_starts_with_empty_fences() {
+    let path = tmp_db_path("catalog_v11");
+    {
+        let c = Connection::open(&path).unwrap();
+        for (index, sql) in MIGRATIONS[..11].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", (index + 1) as i64)
+                .unwrap();
+        }
+    }
+    let db = Db::open(&path, 2).unwrap();
+    let fences: i64 = db
+        .with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM guild_write_fences", (), |r| {
+                Ok(r.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(fences, 0);
+    drop(db);
+    cleanup_db(&path);
+}
+
+#[tokio::test]
+async fn fenced_rebind_moves_placement_and_blocks_unfenced_cutover() {
+    let f = Fixture::new();
+    let shared = StoreId::new();
+    let dedicated = StoreId::new();
+    register_store(&f.db, shared.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    register_store(
+        &f.db,
+        dedicated.clone(),
+        StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    let first = assign_initial_placement(&f.db, 10, shared.clone())
+        .await
+        .unwrap();
+    let dest_revision = format!("{:032x}", 7u128);
+    assert!(
+        rebind_placement(
+            &f.db,
+            first.clone(),
+            dedicated.clone(),
+            dest_revision.clone()
+        )
+        .await
+        .is_err()
+    );
+    let generation = set_guild_write_fence(
+        &f.db,
+        10,
+        dedicated.clone(),
+        dest_revision.clone(),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    assert!(guild_is_write_fenced(&f.db, 10).await.unwrap());
+    let moved = rebind_placement(
+        &f.db,
+        first.clone(),
+        dedicated.clone(),
+        dest_revision.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(moved.store_id(), &dedicated);
+    assert_eq!(moved.revision(), dest_revision);
+    let current = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    assert_eq!(current.store_id(), &dedicated);
+    clear_guild_write_fence(&f.db, 10, &generation)
+        .await
+        .unwrap();
+    assert!(!guild_is_write_fenced(&f.db, 10).await.unwrap());
+}
+
+#[tokio::test]
+async fn guild_configuration_writers_fail_inside_the_move_fence_transaction() {
+    let f = Fixture::new();
+    upsert_template(&f.db, 10, "ban", "before").await.unwrap();
+    upsert_log_channel(&f.db, 10, "automod", 55).await.unwrap();
+    let destination = StoreId::new();
+    register_store(
+        &f.db,
+        destination.clone(),
+        StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    set_guild_write_fence(&f.db, 10, destination, format!("{:032x}", 8u128), "freeze")
+        .await
+        .unwrap();
+
+    assert!(upsert_template(&f.db, 10, "ban", "blocked").await.is_err());
+    assert!(delete_template(&f.db, 10, "ban").await.is_err());
+    assert!(upsert_log_channel(&f.db, 10, "automod", 66).await.is_err());
+    assert!(delete_log_channel(&f.db, 10, "automod").await.is_err());
+    upsert_template(&f.db, 0, "ban", "global remains writable")
+        .await
+        .unwrap();
+}

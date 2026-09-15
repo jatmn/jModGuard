@@ -75,6 +75,7 @@ async fn setup(owner: u64) -> Control {
         capture_stores: Vec::new(),
         evidence_root: None,
         restore_target: None,
+        guild_stores: Vec::new(),
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -248,6 +249,7 @@ async fn session_revocation_and_restart_reuse_durable_store() {
             capture_stores: Vec::new(),
             evidence_root: None,
             restore_target: None,
+            guild_stores: Vec::new(),
         },
         false,
     )

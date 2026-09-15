@@ -502,3 +502,43 @@ async fn invalid_copy_replacement_rolls_back_settings_nickname_and_versions() {
     assert_eq!(after.config_revision, before.config_revision);
     assert_eq!(after.slash_revision, before.slash_revision);
 }
+
+#[tokio::test]
+async fn configuration_copy_cannot_write_a_fenced_destination() {
+    let f = Fixture::new();
+    let source = f.scope(10).await;
+    let destination = f.scope(20).await;
+    upsert_template(&f.db, 10, "notice", "source")
+        .await
+        .unwrap();
+    upsert_template(&f.db, 20, "notice", "destination")
+        .await
+        .unwrap();
+    let store = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        store.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 20 },
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        20,
+        store,
+        format!("{:032x}", 10u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        copy_enrolled_guild_config(&f.db, source, destination, vec!["templates".into()])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        get_template_row(&f.db, 20, "notice").await.unwrap(),
+        Some("destination".into())
+    );
+}

@@ -95,6 +95,7 @@ async fn setup(restore_exists: bool) -> Harness {
         }],
         evidence_root: Some(evidence),
         restore_target: Some(restore),
+        guild_stores: Vec::new(),
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -318,12 +319,7 @@ async fn manual_backup_excludes_pending_actions_and_restores_without_replay() {
         Some("application/json"),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     tick_until_idle(&h).await;
     let restored = h.root.join("restore-target").join("core.sqlite");
     assert!(restored.exists(), "restored store missing");
@@ -1692,6 +1688,7 @@ async fn capture_requires_a_reachable_core_store() {
         capture_stores: Vec::new(),
         evidence_root: None,
         restore_target: Some(root.join("restore-target")),
+        guild_stores: Vec::new(),
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -1761,6 +1758,7 @@ async fn restore_requires_a_configured_restore_target_at_enqueue() {
         capture_stores: Vec::new(),
         evidence_root: None,
         restore_target: None,
+        guild_stores: Vec::new(),
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));

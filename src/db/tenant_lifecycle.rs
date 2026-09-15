@@ -20,6 +20,7 @@ pub async fn queue_guild_erasure(
     );
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
             params![enrollment.guild_id],

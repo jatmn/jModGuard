@@ -41,7 +41,9 @@ does not import old databases. The fuller tenant/case model remains a later chan
   When a control store, conductor OAuth client and operator identity are configured,
   `/ready` becomes 200 and owner Administration (settings, status, telemetry,
   notifications) is available. Backup controls become available when a dedicated
-  backup root is configured. Update and guild-move controls stay inactive.
+  backup root is configured. Guild-store moves become available when a core
+  capture store and configured shared/dedicated guild-store paths are present.
+  Update controls stay inactive.
   The conductor still does not import the application crate, Serenity or tenant routing.
 - CI checks that the conductor/runtime dependency trees do not include the application
   crate, bot/API service crates or Serenity. It tests the actual conductor process with
@@ -382,13 +384,12 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Guild moves (R5).
-2. Releases, point-and-click updates and public installation (R6–R8).
+1. Releases, point-and-click updates and public installation (R6–R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
 provider durability, distributed writer exclusion, access policy or billed resource use.
-Guild moves, point-and-click updates and database credential separation remain pending. Logging changes are described above; they do not establish full guild erasure.
+Point-and-click updates and database credential hot-reload remain pending. Logging changes are described above; they do not establish full guild erasure.
 
 ## Implemented: exact-image and repeated-text spam
 
@@ -402,8 +403,7 @@ message IDs, trimmed excerpts). The WebUI exposes those choices. No new dependen
 versions, schema changes or SQL message archival.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md) for limits and coverage.
 
-Discord attachment object capture into the evidence backend and populated-guild
-moves remain later work.
+Discord attachment object capture into the evidence backend remains later work.
 
 ## Implemented: conductor owner administration
 
@@ -430,3 +430,14 @@ cleanup intents, and requires an explicit acknowledgment after total policy-stat
 loss. Interrupted restore staging is recovered on retry. Live
 Bunny consistency/durability remains a separate gate.
 See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+
+## Implemented: guild database moves
+
+Owners can move one enrolled guild between an already-configured shared store and
+its dedicated store. The conductor copies that guild's tenant rows, freezes its
+core writes, switches placement, and removes the source copy after verification.
+A neighboring guild on the shared database is left in place. Destination
+credentials stay in bot/API process configuration; adding a new store requires
+restarting those services first. Discord actions are not replayed. Rollback after
+cutover is restore from an R4 checkpoint, not a placement pointer flip.
+See [GUILD-MOVES.md](GUILD-MOVES.md).

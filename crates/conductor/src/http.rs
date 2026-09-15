@@ -39,6 +39,7 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "operations_available": available,
         "backup_available": false,
         "capture_available": false,
+        "moves_available": false,
         "update_available": false,
     });
     let ready_state = state.clone();
@@ -113,6 +114,8 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/backups/{id}/download", get(api_backup_download))
         .route("/api/backups/{id}/portable", post(api_backup_portable))
         .route("/api/backups/{id}/restore", post(api_backup_restore))
+        .route("/api/moves", get(api_moves).post(api_move_start))
+        .route("/api/moves/plan", get(api_move_plan))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
                 response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
@@ -142,6 +145,7 @@ fn placeholder_state() -> Conductor {
             capture_stores: Vec::new(),
             evidence_root: None,
             restore_target: None,
+            guild_stores: Vec::new(),
         },
         store: None,
         backup: None,
@@ -170,6 +174,7 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "operations_available": state.operations_available(),
         "backup_available": state.backup_available(),
         "capture_available": state.capture_available(),
+        "moves_available": crate::guild_move::moves_available(&state.cfg),
         "update_available": false,
     }))
 }
@@ -374,6 +379,7 @@ async fn status_payload(state: &Conductor) -> anyhow::Result<serde_json::Value> 
         "jobs": state.store()?.list_jobs(12).await?,
         "backup_available": state.backup_available(),
         "capture_available": state.capture_available(),
+        "moves_available": crate::guild_move::moves_available(&state.cfg),
         "unavailable": ["updates"],
     }))
 }
@@ -747,10 +753,7 @@ fn restore_password_for_enqueue(password: Option<String>) -> anyhow::Result<Opti
         None => Ok(None),
         Some(value) => {
             let trimmed = value.trim();
-            anyhow::ensure!(
-                !trimmed.is_empty(),
-                "export password must not be empty"
-            );
+            anyhow::ensure!(!trimmed.is_empty(), "export password must not be empty");
             Ok(Some(trimmed.to_string()))
         }
     }
@@ -933,6 +936,148 @@ async fn stream_file(
             }
             error_response(StatusCode::NOT_FOUND, error.into())
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct MovePlanQuery {
+    guild_id: String,
+    destination_store_id: String,
+}
+
+#[derive(Deserialize)]
+struct MoveBody {
+    guild_id: String,
+    destination_store_id: String,
+    #[serde(default)]
+    preop: String,
+    #[serde(default)]
+    confirm_shared_impact: bool,
+}
+
+async fn api_moves(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    let catalog = match crate::guild_move::catalog_view(&state.cfg).await {
+        Ok(body) if crate::guild_move::moves_available(&state.cfg) => body,
+        Ok(_) => serde_json::json!({ "available": false, "stores": [], "placements": [] }),
+        Err(error) if !crate::guild_move::moves_available(&state.cfg) => {
+            serde_json::json!({ "available": false, "error": format!("{error:#}") })
+        }
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    let store = match state.store() {
+        Ok(store) => store,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    let jobs = match store.list_jobs(50).await {
+        Ok(jobs) => jobs,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    let moves: Vec<_> = jobs
+        .into_iter()
+        .filter(|job| job.kind == "guild_move")
+        .collect();
+    let mut failed_moves = match store.list_failed_guild_move_jobs(50).await {
+        Ok(jobs) => jobs,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    let fenced_guilds = match crate::guild_move::active_move_fence_guilds(&state.cfg).await {
+        Ok(guilds) => guilds,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    for guild_id in fenced_guilds {
+        let job = match store.latest_failed_guild_move_for_guild(guild_id).await {
+            Ok(job) => job,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        };
+        if let Some(job) = job
+            && !failed_moves.iter().any(|known| known.id == job.id)
+        {
+            failed_moves.push(job);
+        }
+    }
+    Json(serde_json::json!({
+        "available": crate::guild_move::moves_available(&state.cfg),
+        "catalog": catalog,
+        "jobs": moves,
+        "failed_jobs": failed_moves,
+    }))
+    .into_response()
+}
+
+async fn api_move_plan(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Query(query): Query<MovePlanQuery>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    if !crate::guild_move::moves_available(&state.cfg) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            anyhow::anyhow!("guild moves are not configured"),
+        );
+    }
+    let guild_id: i64 = match query.guild_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!("guild id must be a Discord snowflake"),
+            );
+        }
+    };
+    match crate::guild_move::plan(&state.cfg, guild_id, &query.destination_store_id).await {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn api_move_start(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Json(body): Json<MoveBody>,
+) -> Response {
+    let operator = match operator(&state, &headers).await {
+        Ok(op) => op,
+        Err(error) => return auth_error(error),
+    };
+    let guild_id: i64 = match body.guild_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!("guild id must be a Discord snowflake"),
+            );
+        }
+    };
+    match crate::guild_move::enqueue(
+        &state,
+        crate::guild_move::MoveRequest {
+            guild_id,
+            destination_store_id: body.destination_store_id,
+            preop: body.preop,
+            confirm_shared_impact: body.confirm_shared_impact,
+        },
+    )
+    .await
+    {
+        Ok(id) => match state
+            .store()
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+        {
+            Ok(store) => {
+                if let Err(error) = store.audit(&operator.operator_id, "guild_move", &id).await {
+                    return error_response(StatusCode::BAD_REQUEST, error);
+                }
+                Json(serde_json::json!({ "id": id })).into_response()
+            }
+            Err(error) => error,
+        },
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
 

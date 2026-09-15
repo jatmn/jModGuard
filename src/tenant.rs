@@ -4,8 +4,9 @@ use crate::db::guild_data::{
     CaseLimits, EvidenceLimits, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
 };
 use crate::db::guild_stores::{
-    StoreId, StorePolicy, StoreRegistration, admit_tenant_placement, clear_erased_placement,
-    dedicated_store_registration, guild_placement, register_store, shared_store_registration,
+    GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
+    clear_erased_placement, dedicated_store_registration, guild_is_write_fenced, guild_placement,
+    register_store, shared_store_registration,
 };
 use crate::db::{
     self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure_after,
@@ -174,7 +175,12 @@ impl TenantRuntime {
     pub async fn activate(&self, enrollment: GuildEnrollment) -> Result<Option<GuildDataScope>> {
         let lock = self.lock(enrollment.guild_id);
         let _guard = lock.lock().await;
-        let store_id = self.store_for_guild(enrollment.guild_id)?;
+        // Catalog placement is the live assignment after a conductor move.
+        // Config (dedicated-wins) is only the initial-placement hint.
+        let store_id = match guild_placement(&self.core, enrollment.guild_id).await? {
+            Some(existing) => existing.store_id().clone(),
+            None => self.store_for_guild(enrollment.guild_id)?,
+        };
         let Some(placement) =
             admit_tenant_placement(&self.core, enrollment.clone(), store_id).await?
         else {
@@ -211,6 +217,9 @@ impl TenantRuntime {
         &self,
         enrollment: GuildEnrollment,
     ) -> Result<(GuildDataStore, GuildDataScope)> {
+        if guild_is_write_fenced(&self.core, enrollment.guild_id).await? {
+            return Err(GuildWriteFenced.into());
+        }
         let scope = self.scope(enrollment).await?;
         let store = self.store(&scope).await?;
         match store.stored_membership(scope.placement().clone()).await {
@@ -235,6 +244,9 @@ impl TenantRuntime {
                 if error.downcast_ref::<TenantError>().is_some()
                     || error
                         .downcast_ref::<crate::db::guild_data::TenantDataError>()
+                        .is_some()
+                    || error
+                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
                         .is_some() =>
             {
                 tracing::warn!(guild_id, "selected case not recorded: {error:#}");
@@ -249,6 +261,9 @@ impl TenantRuntime {
                 if error.downcast_ref::<TenantError>().is_some()
                     || error
                         .downcast_ref::<crate::db::guild_data::TenantDataError>()
+                        .is_some()
+                    || error
+                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
                         .is_some() =>
             {
                 tracing::warn!("selected case not recorded: {error:#}");
@@ -294,6 +309,9 @@ impl TenantRuntime {
     }
 
     async fn erase_job(&self, job: &GuildErasureJob) -> Result<()> {
+        if guild_is_write_fenced(&self.core, job.guild_id).await? {
+            return Ok(());
+        }
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
         if !handle.finish_empty_erasure(scope.clone()).await? {
@@ -541,7 +559,10 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
             "owned guild store is missing or empty; restore its original database before retrying"
         );
     }
-    GuildDataStore::initialize(store.options.clone(), store.registration.clone())
+    Ok(
+        GuildDataStore::initialize(store.options.clone(), store.registration.clone())?
+            .with_core_write_fence(core.clone()),
+    )
 }
 
 async fn resolve_configured(

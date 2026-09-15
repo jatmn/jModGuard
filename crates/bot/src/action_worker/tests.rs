@@ -44,6 +44,19 @@ impl Fixture {
             .unwrap()
             .unwrap()
     }
+    async fn persisted_status(&self, job: &BotAction) -> (String, Option<String>) {
+        let id = job.id.clone();
+        self.db
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT state,outcome FROM bot_actions WHERE id=?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -125,6 +138,180 @@ impl DiscordActions for MockDiscord {
         }
         self.outcome
     }
+}
+
+struct FenceDuringChannelValidation<'a> {
+    db: &'a Db,
+    destination: db::guild_stores::StoreId,
+}
+#[serenity::async_trait]
+impl DiscordActions for FenceDuringChannelValidation<'_> {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn valid_log_channel(&self, guild: i64, _: i64) -> Result<bool> {
+        db::guild_stores::set_guild_write_fence(
+            self.db,
+            guild,
+            self.destination.clone(),
+            format!("{:032x}", 9u128),
+            "freeze",
+        )
+        .await?;
+        Ok(true)
+    }
+    async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+        panic!("local log-channel action must not call unban")
+    }
+}
+
+struct FenceDuringUnban<'a> {
+    db: &'a Db,
+    destination: db::guild_stores::StoreId,
+}
+#[serenity::async_trait]
+impl DiscordActions for FenceDuringUnban<'_> {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+        panic!("unban action must not validate a log channel")
+    }
+    async fn unban(&self, guild: i64, _: i64, _: &str) -> Outcome {
+        db::guild_stores::set_guild_write_fence(
+            self.db,
+            guild,
+            self.destination.clone(),
+            format!("{:032x}", 10u128),
+            "freeze",
+        )
+        .await
+        .unwrap();
+        Outcome::succeeded("unbanned")
+    }
+}
+
+#[tokio::test]
+async fn move_fence_reports_its_own_pre_dispatch_outcome() {
+    let f = Fixture::new();
+    let job = f.enqueue(10, "fenced_unban", unban(99)).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    let destination = db::guild_stores::StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        destination,
+        format!("{:032x}", 9u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+
+    let discord = MockDiscord::default();
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("failed".into(), Some("guild_move_fenced".into()))
+    );
+}
+
+#[tokio::test]
+async fn move_fence_racing_local_completion_blocks_the_write_transaction() {
+    let f = Fixture::new();
+    let job = f.enqueue(10, "fenced_log", log_channel(Some(123))).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    let destination = db::guild_stores::StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    let discord = FenceDuringChannelValidation {
+        db: &f.db,
+        destination,
+    };
+
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("failed".into(), Some("guild_move_fenced".into()))
+    );
+    assert!(db::list_log_channels(&f.db, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn move_fence_racing_unban_completion_blocks_local_mirror_writes() {
+    let f = Fixture::new();
+    f.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now')",
+            (),
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let job = f.enqueue(10, "fenced_unban_completion", unban(99)).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    let destination = db::guild_stores::StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    let discord = FenceDuringUnban {
+        db: &f.db,
+        destination,
+    };
+
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("succeeded".into(), Some("unbanned".into()))
+    );
+    let (active, events): (i64, i64) =
+        f.db.with_conn(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT active FROM bans WHERE guild_id=10 AND user_id=99",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE guild_id=10 AND event_type='member_unban'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(active, 1);
+    assert_eq!(events, 0);
 }
 
 #[tokio::test]

@@ -1303,8 +1303,7 @@ async fn missing_owned_evidence_cannot_be_reopened_as_cleanup_proof() {
         .record_case(scope.clone(), case.clone(), case_data(99), case_limits())
         .await
         .unwrap();
-    let storage =
-        CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+    let storage = CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
     let local = f.tenant.local_evidence().expect("local evidence backend");
     let upload = EvidenceUpload {
         target: crate::evidence_transfer::EvidenceTarget {
@@ -1375,8 +1374,16 @@ async fn missing_owned_evidence_cannot_be_reopened_as_cleanup_proof() {
     std::fs::rename(&saved, &evidence_root).unwrap();
     let reopened = TenantRuntime::open(&f.db, &cfg, &Default::default(), &evidence_cfg).unwrap();
     let (store, scope) = reopened.live(e).await.unwrap();
-    store.remove_case(scope.clone(), case.clone()).await.unwrap();
-    assert!(reopened.cleanup_owned_evidence(&store, &scope).await.is_ok());
+    store
+        .remove_case(scope.clone(), case.clone())
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .cleanup_owned_evidence(&store, &scope)
+            .await
+            .is_ok()
+    );
     assert_eq!(
         store
             .evidence_transfer_job(scope, case, evidence_id)
@@ -1384,5 +1391,148 @@ async fn missing_owned_evidence_cannot_be_reopened_as_cleanup_proof() {
             .unwrap()
             .state,
         EvidenceState::Erased
+    );
+}
+
+#[tokio::test]
+async fn live_tenant_writes_fail_closed_while_the_guild_is_fenced() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(enrollment.clone(), case_data(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let dest = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        dest.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        dest,
+        format!("{:032x}", 9u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    let live = f.tenant.live(enrollment.clone()).await;
+    assert!(
+        live.err()
+            .and_then(|error| error
+                .downcast::<crate::db::guild_stores::GuildWriteFenced>()
+                .ok())
+            .is_some()
+    );
+    assert!(
+        f.tenant
+            .record_selected_case(enrollment, case_data(2))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn guild_store_writes_after_live_respect_move_fence() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    let dest = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        dest.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        dest,
+        format!("{:032x}", 9u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    let error = store
+        .record_case(
+            scope,
+            crate::db::guild_data::CaseId::new(),
+            case_data(3),
+            case_limits(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
+    let dedicated = std::env::temp_dir().join(format!(
+        "jmodguard_tenant_{:032x}.dedicated.db",
+        rand::random::<u128>()
+    ));
+    let f = Fixture::with_stores(
+        GuildStoresConfig {
+            max_handles: 4,
+            stores: vec![GuildStoreConfig {
+                dedicated_guild_id: 10,
+                path: dedicated,
+                ..GuildStoreConfig::default()
+            }],
+        },
+        EvidenceConfig {
+            backend: "none".into(),
+            ..EvidenceConfig::default()
+        },
+    );
+    let enrollment = enroll(&f, 10, 100).await;
+    let dedicated_id = f.tenant.store_for_guild(10).unwrap();
+    let shared_id = f.tenant.store_for_guild(11).unwrap();
+    assert_ne!(dedicated_id, shared_id);
+    let current = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    assert_eq!(current.store_id(), &dedicated_id);
+
+    let dest_revision = format!("{:032x}", 9u128);
+    let generation = crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        shared_id.clone(),
+        dest_revision.clone(),
+        "switch",
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::rebind_placement(&f.db, current, shared_id.clone(), dest_revision)
+        .await
+        .unwrap();
+    crate::db::guild_stores::clear_guild_write_fence(&f.db, 10, &generation)
+        .await
+        .unwrap();
+
+    let scope = f
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(scope.placement().store_id(), &shared_id);
+    assert_eq!(f.tenant.store_for_guild(10).unwrap(), dedicated_id);
+    assert_eq!(
+        guild_placement(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .store_id(),
+        &shared_id
     );
 }

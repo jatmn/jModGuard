@@ -3,7 +3,8 @@
 The data layer stores nonsecret directory metadata for shared and dedicated guild
 stores. Bot and API processes now route live tenant data through `TenantRuntime`; see
 [tenant runtime](TENANT-RUNTIME.md). Catalog rows still never store URLs or tokens.
-Populated-guild moves are not implemented and must not be exposed.
+Populated-guild shared/dedicated moves are operator-started from the conductor; see
+[guild moves](GUILD-MOVES.md).
 
 ## Stored identities
 
@@ -23,7 +24,7 @@ Membership/enrollment IDs remain a separate lifecycle concept.
 
 ## Library operations
 
-`jmodguard::db::guild_stores` exposes typed IDs, registrations, placements and four operations:
+`jmodguard::db::guild_stores` exposes typed IDs, registrations, placements and move helpers:
 
 | Operation | Contract |
 |---|---|
@@ -31,6 +32,8 @@ Membership/enrollment IDs remain a separate lifecycle concept.
 | `store_registration` | Primary lookup of a single ID; missing IDs return `None`. |
 | `assign_initial_placement` | Assign an unplaced guild to a registered, permitted store. Same guild/store retry returns the original revision. Any different placement conflicts. |
 | `guild_placement` | Primary lookup of one guild and validation of its referenced store/ownership. Missing placement returns `None`; invalid references fail. |
+| `set_guild_write_fence` / `clear_guild_write_fence` | Guild-scoped freeze for a populated move. Matching destination retries keep the generation. |
+| `rebind_placement` | Cut over an existing placement after a fence with the matching destination revision. |
 
 Generate a `StoreId` once and retain it across registration retries. Store/placement fields
 are private with read accessors; no deserializer can bypass ID construction checks. Invalid
@@ -66,7 +69,7 @@ Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 Version8 allows closed-scope erasure after owned data is gone and stores delegated
 case-removal role IDs. There are no core configuration/default/enrollment tables or general
-event archives. Core bootstrap never applies this schema; the existing core version is 11.
+event archives. Core bootstrap never applies this schema; the existing core version is 12.
 
 | Operation | Contract |
 |---|---|
@@ -97,8 +100,9 @@ move a guild or stop an older process from writing. Runtime adoption must includ
 the captured checks used by tenant log-channel operations across the remaining data model,
 bounded handle/transport reuse, shared/dedicated routing, global-policy separation and
 coordinated quiescing before moves. `verify_placement` alone is insufficient.
-There is deliberately no placement-update/delete or store-delete library operation yet.
-Raw SQL is not a supported move mechanism.
+There is deliberately no store-delete library operation. Conductor-owned
+populated moves update placement through a fenced rebind; see [guild moves](GUILD-MOVES.md).
+Raw SQL is not a supported move mechanism for operators.
 
 The catalog tables remain in the existing application database; identity and tenant
 tables belong to separate guild-store databases. The directory/global-policy database split remains future work. No core guild data,

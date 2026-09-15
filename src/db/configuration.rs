@@ -74,6 +74,10 @@ async fn upsert_row<T: Serialize + Send + 'static>(
     expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     let json = serde_json::to_string(&data)?;
+    let guild_id = match key_params.first() {
+        Some(Value::Integer(guild_id)) => *guild_id,
+        _ => GLOBAL_SCOPE,
+    };
     db.with_conn(move |conn| {
         let keys = key_params
             .iter()
@@ -83,9 +87,7 @@ async fn upsert_row<T: Serialize + Send + 'static>(
             .join(", ");
         let n = key_params.len() + 1;
         let tx = conn.transaction_immediate()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         tx.execute(
             &format!(
                 "INSERT INTO {table} ({key_cols}, data) VALUES ({keys}, ?{n})
@@ -111,6 +113,10 @@ async fn delete_row(
     bump_slash_registry: bool,
     expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
+    let guild_id = match key_params.first() {
+        Some(Value::Integer(guild_id)) => *guild_id,
+        _ => GLOBAL_SCOPE,
+    };
     db.with_conn(move |conn| {
         let keys = key_params
             .iter()
@@ -119,9 +125,7 @@ async fn delete_row(
             .collect::<Vec<_>>()
             .join(", ");
         let tx = conn.transaction_immediate()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let n = tx.execute(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
             params_from_iter(key_params),
@@ -138,6 +142,20 @@ async fn delete_row(
         Ok(())
     })
     .await
+}
+
+fn verify_configuration_write(
+    conn: &impl SqlExecutor,
+    expected: Option<&ConfigurationWriteScope>,
+    guild_id: i64,
+) -> Result<()> {
+    if let Some(scope) = expected {
+        scope.verify_conn(conn)
+    } else if guild_id > 0 {
+        super::guild_stores::refuse_fenced_write(conn, guild_id)
+    } else {
+        Ok(())
+    }
 }
 // rules
 // ---------------------------------------------------------------------------
@@ -253,9 +271,7 @@ async fn upsert_template_inner(
     let (event, template) = (event.to_string(), template.to_string());
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         tx.execute(
             "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET template = excluded.template",
@@ -359,6 +375,7 @@ pub async fn upsert_log_channel(
     let event = event.to_string();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        super::guild_stores::refuse_fenced_write(&tx, guild_id)?;
         write_log_channel_conn(&tx, guild_id, &event, Some(channel_id))?;
         supersede_log_action(&tx, guild_id, &event)?;
         tx.commit()?;
@@ -371,6 +388,7 @@ pub async fn delete_log_channel(db: &Db, guild_id: i64, event: &str) -> Result<(
     let event = event.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        super::guild_stores::refuse_fenced_write(&tx, guild_id)?;
         write_log_channel_conn(&tx, guild_id, &event, None)?;
         // A clear supersedes queued intent even when the mapping is absent.
         supersede_log_action(&tx, guild_id, &event)?;
@@ -471,9 +489,7 @@ async fn add_badword_inner(
     let (pattern, note) = (pattern.to_string(), note.map(|s| s.to_string()));
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         tx.execute(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
             params![guild_id, pattern, note],
@@ -526,9 +542,7 @@ async fn delete_badword_inner(
 ) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
+        verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let n = tx.execute(
             "DELETE FROM badwords WHERE id = ?1 AND guild_id = ?2",
             params![id, guild_id],
@@ -660,6 +674,7 @@ async fn copy_guild_config_inner(
             source.verify_conn(&tx)?;
             destination.verify_conn(&tx)?;
         }
+        verify_configuration_write(&tx, None, dst)?;
 
         let defaults = terminal_defaults_conn(&tx)?;
         // Always re-validate in the same primary snapshot as the write.

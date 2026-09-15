@@ -26,6 +26,14 @@ impl BotAction {
         self.state == "claimed" && self.claim.is_some()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotActionDispatch {
+    Ready,
+    EnrollmentEnded,
+    GuildMoveFenced,
+}
+
 const ACTIVE: &str =
     "EXISTS(SELECT 1 FROM guild_enrollments e WHERE e.guild_id=bot_actions.guild_id
     AND e.id=bot_actions.enrollment_id AND e.joined_at_ns=bot_actions.joined_at_ns AND e.active=1)";
@@ -77,6 +85,7 @@ impl ActionScope {
         if let Some(enrollment) = &self.expected {
             super::enrollments::verify_enrollment_conn(conn, enrollment)?;
         }
+        super::guild_stores::refuse_fenced_write(conn, self.guild)?;
         Ok(())
     }
 }
@@ -284,9 +293,16 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
+        // Housekeeping (expiry/uncertain) is independent of move fences. Claim
+        // selection still excludes fenced guilds in the UPDATE/SELECT below.
         let due: i64 = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE (state='pending'
-             OR (state IN ('claimed','running') AND expires_at<=?1)) AND {ACTIVE})"),
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND (
+             (state IN ('pending','claimed','running') AND expires_at<=?1)
+             OR (state='pending'
+                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))
+            ))"
+            ),
             params![now],
             |r| Ok(r.get(0)?),
         )?;
@@ -308,6 +324,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         )?;
         let job = tx.query_row(
             &format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
+                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
                       ORDER BY created_at,id LIMIT 1"),
             params![now],
             row_action,
@@ -403,6 +420,15 @@ async fn finish_bot_action_inner(
         } else {
             (state, outcome)
         };
+        let write_fenced = enforce_local_deadline
+            && state == "succeeded"
+            && super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
+        let (state, outcome) = if write_fenced && matches!(job.action, Action::SetLogChannel { .. })
+        {
+            ("failed".to_owned(), "guild_move_fenced".to_owned())
+        } else {
+            (state, outcome)
+        };
         let changed = tx.execute(
             &format!(
                 "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
@@ -421,7 +447,7 @@ async fn finish_bot_action_inner(
         }
         if state == "succeeded" {
             match &job.action {
-                Action::Unban { user_id, reason } => {
+                Action::Unban { user_id, reason } if !write_fenced => {
                     tx.execute(
                         "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2",
                         params![job.guild_id, user_id],
@@ -436,6 +462,7 @@ async fn finish_bot_action_inner(
                         params![job.guild_id, user_id, job.actor_id, data, now_str()],
                     )?;
                 }
+                Action::Unban { .. } => {}
                 Action::SetLogChannel { event, channel_id } => {
                     write_log_channel_conn(&tx, job.guild_id, event, *channel_id)?;
                 }
@@ -568,14 +595,25 @@ fn claimed_identity_matches(
     }))
 }
 
-/// Recheck committed membership after HTTP validation, immediately before dispatch.
-pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
+/// Recheck committed membership and move fencing immediately before dispatch.
+pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDispatch> {
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let valid = claimed_identity_matches(&tx, &job, Some("running"))?;
+        let status = if !claimed_identity_matches(&tx, &job, Some("running"))? {
+            BotActionDispatch::EnrollmentEnded
+        } else if super::guild_stores::guild_write_fenced(&tx, job.guild_id)? {
+            BotActionDispatch::GuildMoveFenced
+        } else {
+            BotActionDispatch::Ready
+        };
         tx.finish_read()?;
-        Ok(valid)
+        Ok(status)
     })
     .await
+}
+
+/// Compatibility boolean for callers that do not need the refusal reason.
+pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
+    Ok(bot_action_dispatch(db, job).await? == BotActionDispatch::Ready)
 }

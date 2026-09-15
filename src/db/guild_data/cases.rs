@@ -226,6 +226,7 @@ impl GuildDataStore {
         limits: CaseLimits,
     ) -> Result<RecordCase> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         validate_data(&data, limits)?;
         let source = data.source.key()?;
         let payload = serde_json::to_string(&data)?;
@@ -354,6 +355,7 @@ impl GuildDataStore {
     /// identities until closed-membership cleanup. No Discord side effect is performed.
     pub async fn remove_case(&self, scope: GuildDataScope, id: CaseId) -> Result<bool> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_read()?;
@@ -393,6 +395,7 @@ impl GuildDataStore {
         limits: CaseLimits,
     ) -> Result<usize> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         limits.page(count)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {

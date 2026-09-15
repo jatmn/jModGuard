@@ -4,7 +4,7 @@ The opt-in Unix `evidence_transfer::LocalEvidenceStore` implements real file cap
 verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.md).
 It is a library backend for a dedicated local filesystem. Bot and API now serve available
 objects through [tenant runtime](TENANT-RUNTIME.md). There is no Discord attachment capture
-worker in this change. Core is at migration 0011; the current guild schema is 8.
+worker in this change. Core is at migration 0012; the current guild schema is 8.
 
 ## Resource contract
 

@@ -61,8 +61,7 @@ impl Conductor {
                 }
                 zone.prune_untracked_complete(&store.complete_archive_ids().await?)?;
                 if let Ok((settings, _, _)) = store.load_settings().await {
-                    let keep =
-                        i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
+                    let keep = i64::try_from(settings.backup_retain_scheduled).unwrap_or(24);
                     if let Ok(removed) = store.prune_quarantined_archives(keep).await {
                         for id in removed {
                             zone.remove_quarantine(&id);
@@ -98,6 +97,11 @@ impl Conductor {
             started: Instant::now(),
             restore_passwords: Mutex::new(HashMap::new()),
         });
+        if let Some(store) = &conductor.store
+            && let Err(error) = crate::guild_move::clear_stale_fences(&conductor.cfg, store).await
+        {
+            tracing::warn!("could not clear leftover guild-move fences: {error:#}");
+        }
         if spawn_workers && conductor.store.is_some() {
             let worker = Arc::clone(&conductor);
             tokio::spawn(async move { worker.job_loop().await });
@@ -349,6 +353,9 @@ impl Conductor {
         if let Err(error) = self.maybe_reconcile_restore_fence().await {
             tracing::warn!("restore fence reconciliation: {error:#}");
         }
+        if let Err(error) = crate::guild_move::clear_stale_fences(&self.cfg, store).await {
+            tracing::warn!("guild-move fence reconciliation: {error:#}");
+        }
         self.maybe_schedule_backup().await?;
         self.maybe_sanitize_backups().await?;
         let Some(job) = store.claim_job().await? else {
@@ -368,21 +375,30 @@ impl Conductor {
                 if job.kind == "backup_restore" && job.attempts >= job.max_attempts {
                     self.forget_restore_password(&job.id);
                 }
-                if job.kind.starts_with("backup_") {
+                if job.kind.starts_with("backup_") || job.kind == "guild_move" {
+                    let category = if job.kind == "guild_move" {
+                        "jobs"
+                    } else {
+                        "backup"
+                    };
                     let notifications_enabled = self.settings().await.is_ok_and(|settings| {
                         settings.notify_enabled
                             && settings
                                 .notify_categories
                                 .iter()
-                                .any(|category| category == "backup")
+                                .any(|item| item == category)
                     });
                     if notifications_enabled {
                         let _ = store
                             .insert_job(
                                 "notify_event",
                                 &serde_json::json!({
-                                    "category": "backup",
-                                    "message": format!("Backup job failed: {message}"),
+                                    "category": category,
+                                    "message": if job.kind == "guild_move" {
+                                        format!("Guild move failed: {message}")
+                                    } else {
+                                        format!("Backup job failed: {message}")
+                                    },
                                     "severity": "error",
                                 }),
                                 3,
@@ -485,6 +501,7 @@ impl Conductor {
             "backup_capture" => self.run_backup_capture(payload_json).await,
             "backup_restore" => self.run_backup_restore(job_id, payload_json).await,
             "backup_sanitize" => self.run_backup_sanitize().await,
+            "guild_move" => crate::guild_move::run(self, payload_json).await,
             other => anyhow::bail!("unsupported job kind {other}"),
         }
     }

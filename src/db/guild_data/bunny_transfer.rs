@@ -19,6 +19,7 @@ impl GuildDataStore {
         sha256: String,
     ) -> Result<()> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_read()?;
@@ -54,6 +55,7 @@ impl GuildDataStore {
         id: CaseId,
     ) -> Result<()> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx=conn.transaction_primary_read()?;

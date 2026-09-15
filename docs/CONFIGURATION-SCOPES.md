@@ -56,7 +56,7 @@ mutations retain their existing receipt and no-op version behavior.
 No new dependency, connection pool, cache or per-message work is added. These checks are
 not a transaction spanning Discord and SQL. Shared/dedicated routing, selected cases and
 live guild erasure now run through [tenant runtime](TENANT-RUNTIME.md). The current
-schema remains `jmodguard-core-1`, migrations 0001–0011.
+schema remains `jmodguard-core-1`, migrations 0001–0012.
 
 Local tests cover stale scopes before and after rejoin, empty patches, nickname re-sync,
 source/destination copy checks, global writes from a stale guild context, modified identity,

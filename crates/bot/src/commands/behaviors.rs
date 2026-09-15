@@ -6,7 +6,7 @@ use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
-use super::{BehaviorOutcome, CmdEnv};
+use super::{BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
 use crate::types::Behavior;
 use crate::{db, logging};
 
@@ -28,6 +28,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .cache
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
+            refuse_fenced_discord_mutation(env).await?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 env.guild_id.get(),
@@ -98,6 +99,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let target_user = user_lookup(env, target).await?;
             // Discord is authoritative; local bans table is a mirror healed by
             // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
+            refuse_fenced_discord_mutation(env).await?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Unban,
                 env.guild_id.get(),
@@ -162,6 +164,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
+            refuse_fenced_discord_mutation(env).await?;
             let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
             crate::cases::record(
@@ -225,6 +228,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     .map_err(|e| anyhow!("invalid timeout: {e}"))?,
                 )
             };
+            refuse_fenced_discord_mutation(env).await?;
             let discord = if let Some(until) = until {
                 member
                     .disable_communication_until_datetime(&env.ctx.http, until)
@@ -316,7 +320,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     return Err(warn_result.unwrap_err());
                 }
                 _ => {
-                    return Err(anyhow!("warn outcome is uncertain; verify it in the database"));
+                    return Err(anyhow!(
+                        "warn outcome is uncertain; verify it in the database"
+                    ));
                 }
             }
             log_mod(
@@ -434,6 +440,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let ids: Vec<serenity::model::id::MessageId> =
                 msgs.iter().filter(|m| !m.pinned).map(|m| m.id).collect();
             let n = ids.len();
+            refuse_fenced_discord_mutation(env).await?;
             if n > 1 {
                 let _ = env.channel_id.delete_messages(&env.ctx.http, &ids).await;
             } else if n == 1 {
@@ -482,6 +489,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .peek()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(*default_seconds);
+            refuse_fenced_discord_mutation(env).await?;
             env.channel_id
                 .edit(
                     &env.ctx.http,

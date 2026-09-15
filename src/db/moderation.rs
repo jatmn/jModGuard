@@ -416,6 +416,7 @@ pub async fn insert_enrolled_event(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         let id = tx.query_row(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
@@ -443,6 +444,7 @@ pub async fn add_enrolled_warn(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         let id = tx.query_row(
             "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at)
@@ -470,6 +472,7 @@ pub async fn record_enrolled_ban(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         tx.execute(
             "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
@@ -495,6 +498,7 @@ pub async fn mark_enrolled_unbanned(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         tx.execute(
             "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1",
@@ -516,6 +520,7 @@ pub async fn clear_enrolled_warns(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         let count = tx.execute(
             "DELETE FROM warns WHERE guild_id=?1 AND user_id=?2",

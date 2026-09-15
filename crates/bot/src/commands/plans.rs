@@ -7,7 +7,7 @@
 use anyhow::{Result, anyhow};
 use serenity::model::id::{RoleId, UserId};
 
-use super::{BehaviorOutcome, CmdEnv, PermLevel};
+use super::{BehaviorOutcome, CmdEnv, PermLevel, refuse_fenced_discord_mutation};
 use crate::types::PlanStep;
 use crate::{db, logging};
 
@@ -369,6 +369,7 @@ async fn run_step(
             responses.push(text);
         }
         PlanStep::Dm { template } => {
+            refuse_fenced_discord_mutation(env).await?;
             let text = crate::templates::render(template, vars);
             let user_id = target.unwrap_or(env.actor);
             let channel = env
@@ -386,12 +387,14 @@ async fn run_step(
         }
         PlanStep::AddRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
+            refuse_fenced_discord_mutation(env).await?;
             member
                 .add_role(&env.ctx.http, RoleId::new(*role_id))
                 .await?;
         }
         PlanStep::RemoveRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
+            refuse_fenced_discord_mutation(env).await?;
             member
                 .remove_role(&env.ctx.http, RoleId::new(*role_id))
                 .await?;
@@ -403,6 +406,7 @@ async fn run_step(
                 chrono::Utc::now().timestamp() + (*minutes as i64) * 60,
             )
             .map_err(|e| anyhow!("invalid timeout: {e}"))?;
+            refuse_fenced_discord_mutation(env).await?;
             let result = member
                 .disable_communication_until_datetime(&env.ctx.http, until)
                 .await;
@@ -420,6 +424,7 @@ async fn run_step(
         PlanStep::Kick => {
             let target = target.expect("target-required plan steps are validated before execution");
             let member = target_member(env, target).await?;
+            refuse_fenced_discord_mutation(env).await?;
             let result = member
                 .kick_with_reason(&env.ctx.http, "custom command")
                 .await;
@@ -436,6 +441,7 @@ async fn run_step(
         }
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
+            refuse_fenced_discord_mutation(env).await?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 env.guild_id.get(),

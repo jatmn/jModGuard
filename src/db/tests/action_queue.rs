@@ -226,6 +226,59 @@ async fn expiry_never_retries_running_work_and_pending_cancellation_releases_tar
 }
 
 #[tokio::test]
+async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() {
+    let f = Fixture::new().await;
+    let job = f.enqueue(10, "fenced_expiry", unban(99)).await;
+    let destination = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        destination,
+        format!("{:032x}", 11u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    assert!(claim_bot_action(&f.db, 1001).await.unwrap().is_none());
+    let pending: String =
+        f.db.with_conn({
+            let id = job.id.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT state FROM bot_actions WHERE id=?1",
+                    params![id],
+                    |row| Ok(row.get(0)?),
+                )
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending, "pending");
+    assert!(claim_bot_action(&f.db, 1300).await.unwrap().is_none());
+    let expired: String =
+        f.db.with_conn({
+            let id = job.id.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT state FROM bot_actions WHERE id=?1",
+                    params![id],
+                    |row| Ok(row.get(0)?),
+                )
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(expired, "expired");
+}
+
+#[tokio::test]
 async fn modified_claim_identity_cannot_authorize_execution_or_completion() {
     let f = Fixture::new().await;
     f.enqueue(10, "identity", unban(99)).await;

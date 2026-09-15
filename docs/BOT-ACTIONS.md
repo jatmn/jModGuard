@@ -72,13 +72,20 @@ exposing database details. These values identify a scope; they grant no user per
 The existing guild-ID helpers remain trusted internal operations: they resolve current
 membership at the operation, without protecting an earlier authorization snapshot. They
 must not replace captured-scope helpers in dashboard routes. Status reads hide
-old/unbound memberships. `bot_action_can_dispatch` rechecks running claim identity and
-current membership at the primary; it does not perform Discord validation or a mutation.
+old/unbound memberships. `bot_action_dispatch` rechecks running claim identity,
+current membership and guild-move fencing at the primary, preserving whether dispatch
+was blocked by enrollment replacement or a move. It does not perform Discord validation
+or a mutation. Claim selection excludes fenced guilds; expiry of overdue `pending`/`claimed`
+work and `running`→`uncertain` still run when `expires_at` has passed, even if no other
+guild has claimable work. Local log-channel completion checks the move fence again in the same
+transaction as the setting write so a fence raised during Discord channel validation
+still fails closed. Unban completion preserves the Discord result but skips its local
+ban-mirror and event writes if a move fence was raised after dispatch.
 
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
-bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage remains steps 0001–0011.
+bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage remains steps 0001–0012.
 
 ## Dispatch library
 

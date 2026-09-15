@@ -186,11 +186,7 @@ impl Gate {
     }
 }
 
-pub(crate) async fn report(
-    app: &Arc<BotState>,
-    ctx: &Context,
-    found: Match,
-) -> ReportDisposition {
+pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> ReportDisposition {
     let (rule, name) = match found.kind {
         Kind::Image => ("attachment_flood", "Exact image spam"),
         Kind::Text => ("repeat_text", "Repeated text"),
@@ -243,6 +239,12 @@ async fn enforce(
     if !policy.enforce() || !rule_def.enabled {
         return ReportDisposition::Consumed;
     }
+    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
+        .await
+        .unwrap_or(true)
+    {
+        return ReportDisposition::Retryable;
+    }
     let enrollment = crate::cases::capture(app, found.guild).await;
     let Some(enrollment) = enrollment.clone() else {
         return ReportDisposition::Consumed;
@@ -291,7 +293,10 @@ async fn enforce(
                 "enforce skipped; exemption recheck failed".into(),
             ),
             ("reason".into(), found.reason),
-            ("content".into(), "matched channel/user/role is whitelisted".into()),
+            (
+                "content".into(),
+                "matched channel/user/role is whitelisted".into(),
+            ),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
@@ -318,6 +323,12 @@ async fn enforce(
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
+    }
+    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
+        .await
+        .unwrap_or(true)
+    {
+        return ReportDisposition::Retryable;
     }
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();
@@ -458,9 +469,10 @@ fn message_evidence(
     message: u64,
     author: u64,
 ) -> CaseEvidence {
-    if let Some(item) = excerpts.iter().find(|item| {
-        item.channel_id == channel as i64 && item.message_id == message as i64
-    }) {
+    if let Some(item) = excerpts
+        .iter()
+        .find(|item| item.channel_id == channel as i64 && item.message_id == message as i64)
+    {
         return CaseEvidence::Text(vec![item.clone()]);
     }
     crate::cases::text_excerpt(channel, message, author, "")
