@@ -2,7 +2,7 @@
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Config;
 use crate::config::parse_http_url;
@@ -113,13 +113,179 @@ pub fn verify_manifest(raw: &str, keys: &BTreeMap<String, String>) -> Result<Val
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "source commit must be a full lowercase SHA"
     );
-    for name in ["bot", "api", "conductor", "frontend"] {
-        ensure!(
-            parsed.components.get(name).is_some(),
-            "incomplete publication remains unavailable"
-        );
-    }
+    validate_publication_identity(&parsed.channel, &parsed.release_id)?;
+    validate_components(&parsed.components)?;
     Ok(body)
+}
+
+fn stable_release_id(release_id: &str) -> bool {
+    let Some(rest) = release_id.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn nightly_release_id(release_id: &str) -> bool {
+    let Some(rest) = release_id.strip_prefix("nightly-") else {
+        return false;
+    };
+    let Some((day, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    day.len() == 8
+        && day.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 12
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn validate_publication_identity(channel: &str, release_id: &str) -> Result<()> {
+    match channel {
+        "stable" => ensure!(
+            stable_release_id(release_id),
+            "stable release id must be a vMAJOR.MINOR.PATCH tag"
+        ),
+        "nightly" => ensure!(
+            nightly_release_id(release_id),
+            "nightly release id must be nightly-YYYYMMDD-<sha12>"
+        ),
+        _ => ensure!(false, "unknown release channel"),
+    }
+    Ok(())
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn validate_components(components: &Value) -> Result<()> {
+    let Some(map) = components.as_object() else {
+        anyhow::bail!("incomplete publication remains unavailable");
+    };
+    for name in ["bot", "api", "conductor", "frontend"] {
+        let Some(body) = map.get(name) else {
+            anyhow::bail!("incomplete publication remains unavailable");
+        };
+        let Some(obj) = body.as_object() else {
+            anyhow::bail!("incomplete publication remains unavailable");
+        };
+        if name == "frontend" {
+            let files = obj.get("files").and_then(Value::as_object);
+            ensure!(
+                files.is_some_and(|files| {
+                    files.contains_key("index.html")
+                        && files.contains_key("app.js")
+                        && files.contains_key("style.css")
+                        && files.len() == 3
+                }),
+                "frontend inventory is incomplete"
+            );
+            ensure!(
+                obj.get("sha256")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256_digest),
+                "frontend sha256 is required"
+            );
+        } else {
+            ensure!(
+                obj.get("digest")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256_digest),
+                "component digest is required"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn row_from_manifest(manifest: &Value, compatible: bool, blocked: Option<String>) -> DiscoveredRelease {
+    DiscoveredRelease {
+        release_id: manifest
+            .get("release_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        channel: manifest
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        version: manifest
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        source_commit: manifest
+            .get("source_commit")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        published_at: manifest
+            .get("published_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        notes: manifest
+            .get("notes")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        compatible,
+        blocked_reason: blocked,
+        components: ["bot", "api", "conductor", "frontend"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// Merge a poll snapshot with the prior catalog: index-listed releases stay visible
+/// when a transient fetch/verify fails; releases absent from the index are dropped.
+fn merge_discovered_catalog(
+    previous: &[DiscoveredRelease],
+    listed: &[Value],
+    verified: BTreeMap<String, DiscoveredRelease>,
+    retain_from_previous: &BTreeSet<String>,
+) -> Vec<DiscoveredRelease> {
+    let previous_by_id: BTreeMap<_, _> = previous
+        .iter()
+        .map(|row| (row.release_id.clone(), row.clone()))
+        .collect();
+    let mut listed_ids = BTreeSet::new();
+    for item in listed {
+        if let Some(id) = item.get("release_id").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            listed_ids.insert(id.to_string());
+        }
+    }
+    listed_ids.extend(verified.keys().cloned());
+    listed_ids.extend(retain_from_previous.iter().cloned());
+
+    let mut merged = BTreeMap::new();
+    for id in &listed_ids {
+        if let Some(row) = verified.get(id) {
+            merged.insert(id.clone(), row.clone());
+        } else if retain_from_previous.contains(id)
+            && let Some(row) = previous_by_id.get(id)
+        {
+            merged.insert(id.clone(), row.clone());
+        }
+    }
+    let mut out: Vec<_> = merged.into_values().collect();
+    out.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    out
 }
 
 pub fn sign_manifest(mut body: Value, key_id: &str, secret_hex: &str) -> Result<String> {
@@ -244,70 +410,67 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
         listed.len() <= MAX_RELEASES,
         "release index exceeds retention bound"
     );
-    let mut discovered = Vec::new();
-    for item in listed {
+    let mut verified = BTreeMap::new();
+    let mut retain_from_previous = BTreeSet::new();
+    for item in &listed {
+        let index_id = item
+            .get("release_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
         let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
         let url = match absolute(feed, path) {
             Ok(url) => url,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(id) = index_id {
+                    retain_from_previous.insert(id);
+                }
+                continue;
+            }
         };
         let raw = match fetch_text(&conductor.http, &url, MAX_MANIFEST_BYTES).await {
             Ok(raw) => raw,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(id) = index_id {
+                    retain_from_previous.insert(id);
+                }
+                continue;
+            }
         };
         let manifest = match verify_manifest(&raw, &cfg.release_keys) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(id) = index_id {
+                    retain_from_previous.insert(id);
+                }
+                continue;
+            }
         };
         let (compatible, blocked) = compatibility(&manifest, cfg)?;
-        let row = DiscoveredRelease {
-            release_id: manifest
-                .get("release_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            channel: manifest
-                .get("channel")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            version: manifest
-                .get("version")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            source_commit: manifest
-                .get("source_commit")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            published_at: manifest
-                .get("published_at")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            notes: manifest
-                .get("notes")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .into(),
-            compatible,
-            blocked_reason: blocked,
-            components: ["bot", "api", "conductor", "frontend"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        };
-        discovered.push(row);
+        let row = row_from_manifest(&manifest, compatible, blocked);
+        verified.insert(row.release_id.clone(), row);
     }
     if let Ok(store) = conductor.store() {
         let previous = store.list_discovered_releases().await.unwrap_or_default();
+        let discovered = merge_discovered_catalog(
+            &previous,
+            &listed,
+            verified,
+            &retain_from_previous,
+        );
         if discovered.is_empty() && !previous.is_empty() {
             anyhow::bail!("release feed contained no verified manifests");
         }
         store.replace_discovered_releases(&discovered).await?;
         notify_new_updates(conductor, store, &previous, &discovered).await?;
+        return Ok(discovered);
     }
+    let discovered = merge_discovered_catalog(
+        &[],
+        &listed,
+        verified,
+        &retain_from_previous,
+    );
     Ok(discovered)
 }
 
@@ -538,6 +701,82 @@ mod tests {
             mac,
             "2f0ff9b63fa84c2e748da90cad8114e3c802279a64d536cd323c75fed77f718a"
         );
+    }
+
+    #[test]
+    fn merge_discovered_catalog_retains_indexed_release_when_reverify_fails() {
+        let previous = vec![DiscoveredRelease {
+            release_id: "v0.2.0".into(),
+            channel: "stable".into(),
+            version: "0.2.0".into(),
+            source_commit: "b".repeat(40),
+            published_at: "2026-09-15T00:00:00Z".into(),
+            notes: String::new(),
+            compatible: true,
+            blocked_reason: None,
+            components: vec!["bot".into()],
+        }];
+        let listed = vec![
+            serde_json::json!({"release_id": "v0.2.0", "path": "v0.2.0.json"}),
+            serde_json::json!({"release_id": "nightly-20260915-aaaaaaaaaaaa", "path": "nightly.json"}),
+        ];
+        let mut verified = BTreeMap::new();
+        verified.insert(
+            "nightly-20260915-aaaaaaaaaaaa".into(),
+            DiscoveredRelease {
+                release_id: "nightly-20260915-aaaaaaaaaaaa".into(),
+                channel: "nightly".into(),
+                version: "n".into(),
+                source_commit: "c".repeat(40),
+                published_at: "2026-09-16T00:00:00Z".into(),
+                notes: String::new(),
+                compatible: true,
+                blocked_reason: None,
+                components: vec!["bot".into()],
+            },
+        );
+        let mut retain = BTreeSet::new();
+        retain.insert("v0.2.0".into());
+        let merged = merge_discovered_catalog(&previous, &listed, verified, &retain);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|row| row.release_id == "v0.2.0"));
+        assert!(merged
+            .iter()
+            .any(|row| row.release_id == "nightly-20260915-aaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn hollow_signed_manifest_is_refused() {
+        let body = serde_json::json!({
+            "format": FORMAT,
+            "release_id": "v0.2.0",
+            "channel": "stable",
+            "version": "0.2.0",
+            "source_commit": "a".repeat(40),
+            "published_at": "2026-09-15T00:00:00Z",
+            "components": {
+                "bot": {},
+                "api": {"digest": format!("sha256:{}", "2".repeat(64)), "platform": "linux/amd64", "size": 1},
+                "conductor": {"digest": format!("sha256:{}", "3".repeat(64)), "platform": "linux/amd64", "size": 1},
+                "frontend": {
+                    "sha256": format!("sha256:{}", "4".repeat(64)),
+                    "files": {"index.html": "a", "app.js": "b", "style.css": "c"}
+                }
+            },
+            "schema": {
+                "core_family": "jmodguard-core-1",
+                "core_version": 12,
+                "guild_family": "jmodguard-guild-1",
+                "guild_version": 8
+            },
+            "settings_schema": 1,
+            "backup_format": "JMODGUARD-BACKUP-1",
+            "compatibility": {"min_conductor": "0.1.0", "rollback": "matching-backup"},
+        });
+        let signed = sign_manifest(body, "rp1", &"a".repeat(64)).unwrap();
+        let mut keys = BTreeMap::new();
+        keys.insert("rp1".into(), "a".repeat(64));
+        assert!(verify_manifest(&signed, &keys).is_err());
     }
 
     #[test]

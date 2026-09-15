@@ -270,6 +270,16 @@ def inspect_digest(image, env):
     return digest, int(size)
 
 
+def installable_release_id(mode, label):
+    """Stable/Nightly identity for signed manifests, or None for images-only publication."""
+    channel = release.channel_for(mode, label)
+    if channel == "nightly":
+        return channel, label
+    if channel == "stable" and release.stable_tag(label):
+        return channel, label
+    return None, None
+
+
 def publish_manifest():
     env = os.environ.copy()
     selection = checked_request(env)
@@ -281,10 +291,13 @@ def publish_manifest():
         print("Main SHA publication is not an installable Stable/Nightly release")
         return
     sha, label = read_plan(selection)
-    channel = release.channel_for(mode, label)
-    release_id = label if channel == "nightly" or release.stable_tag(label) else None
+    channel, release_id = installable_release_id(mode, label)
     if not release_id:
-        raise ValueError("installable publication requires a stable or nightly identity")
+        print(
+            "Publication source has no installable Stable/Nightly release id; "
+            "images only (no signed manifest for discovery)"
+        )
+        return
     key_id = env.get("JMODGUARD_RELEASE_KEY_ID", "")
     secret = env.get("JMODGUARD_RELEASE_SIGNING_KEY", "")
     if not secret:

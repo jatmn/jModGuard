@@ -422,6 +422,28 @@ class GitSourceTests(unittest.TestCase):
             publisher.publish("manifest")
         self.assertFalse(any(call.args and call.args[0] == "docker" for call in run.call_args_list))
 
+    def test_manual_sha_skips_installable_manifest_without_failing(self):
+        env = MAIN | {
+            "GHCR_USERNAME": "jatmn",
+            "BUILDKITE_SOURCE": "ui",
+            "JMODGUARD_PUBLISH_SOURCE": HEAD,
+        }
+
+        def fake_git(*args):
+            if args[:1] == ("status",) or args[:2] == ("status", "--porcelain"):
+                return ""
+            if args[:2] == ("rev-parse", "FETCH_HEAD^{commit}"):
+                return HEAD
+            return HEAD
+
+        plan = {"mode": "manual", "ref": HEAD, "commit": HEAD, "sha": HEAD, "tag": ""}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(publisher, "git", side_effect=fake_git), \
+             patch.object(publisher, "read_plan", return_value=(HEAD, "")), \
+             patch.object(publisher, "run") as run:
+            publisher.publish("manifest")
+        self.assertFalse(run.called)
+
 
 if __name__ == "__main__":
     unittest.main()

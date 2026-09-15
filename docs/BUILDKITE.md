@@ -130,6 +130,8 @@ in your deployment. Publishing never grants public access or deploys containers.
   components use the one resolved SHA recorded by the preparation job. Tests
   validate the current pipeline checkout; the image builds compile the selected
   source. A plain branch name such as `main` is rejected as a publication source.
+  Manual publication by commit SHA publishes container images only; the manifest
+  job skips when the source has no installable Stable/Nightly release id.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in
   place of the retired Actions `CI failover`. No hosted fallback is automatic.
 

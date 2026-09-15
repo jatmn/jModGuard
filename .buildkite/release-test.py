@@ -85,6 +85,24 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse(list(Path(tmp).glob(".*.staging.json")))
             loaded = json.loads(path.read_text())
             self.assertEqual(loaded["release_id"], "v0.2.0")
+            release.finalize(
+                "stable",
+                "v0.2.0",
+                SHA,
+                {
+                    "bot": BOT,
+                    "api": API,
+                    "conductor": CONDUCTOR,
+                    "frontend": frontend(Path(tmp)),
+                },
+                "",
+                "rp1",
+                release.generate_hmac_key(),
+                tmp,
+            )
+            index = Path(tmp) / "index.json"
+            self.assertTrue(index.exists())
+            self.assertFalse(list(Path(tmp).glob(".index.staging.json")))
 
     def test_index_retention_keeps_channels_independent(self):
         rows = []

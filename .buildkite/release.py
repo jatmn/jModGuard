@@ -234,7 +234,7 @@ def finalize(channel, release_id, sha, components, notes, key_id, secret, out_di
         "published_at": signed["published_at"],
         "path": path.name,
     })
-    index_path.write_bytes(canonical(index_releases(rows)) + b"\n")
+    stage_write(out_dir, "index", index_releases(rows))
     return path
 
 
