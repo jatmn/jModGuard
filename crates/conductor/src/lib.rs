@@ -5,6 +5,7 @@ pub mod config;
 pub mod guild_move;
 pub mod http;
 pub mod notify;
+pub mod release;
 pub mod settings;
 pub mod state;
 pub mod store;

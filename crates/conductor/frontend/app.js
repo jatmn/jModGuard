@@ -54,7 +54,7 @@ function render() {
   });
   const content = $("#content");
   content.replaceChildren();
-  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabLater, backups: tabBackups, moves: tabMoves };
+  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabUpdates, backups: tabBackups, moves: tabMoves };
   content.append((tabs[state.tab] || tabStatus)());
   if (state.tab === "status" && !document.hidden) startLease();
   else stopLease();
@@ -176,6 +176,13 @@ function tabNotifications() {
     el("option", { value: "all", text: "All selected events" }),
   );
   verbosity.value = s.notify_verbosity?.value || "errors";
+  const allowed = ["health", "jobs", "login", "settings", "backup", "updates"];
+  const selectedCats = new Set(s.notify_categories?.value || []);
+  const categoryBoxes = allowed.map((name) => {
+    const box = el("input", { type: "checkbox" });
+    box.checked = selectedCats.has(name);
+    return { name, box };
+  });
   const health = el("pre", { class: "muted", text: "Loading delivery health…" });
   api("/api/notifications/health").then((data) => {
     health.textContent = JSON.stringify(data.receipts || [], null, 2);
@@ -190,6 +197,8 @@ function tabNotifications() {
       field("Webhook URL", webhook),
       field("Allow mention parsing", mentions),
       field("Verbosity", verbosity),
+      el("h3", { text: "Categories" }),
+      ...categoryBoxes.map(({ name, box }) => field(name, box)),
       el("button", { class: "btn primary", text: "Save notification settings", onclick: async () => {
         try {
           const body = {
@@ -197,6 +206,7 @@ function tabNotifications() {
             notify_enabled: enabled.checked,
             notify_mentions: mentions.checked,
             notify_verbosity: verbosity.value,
+            notify_categories: categoryBoxes.filter((item) => item.box.checked).map((item) => item.name),
           };
           if (webhook.value.trim()) body.notify_webhook_url = webhook.value.trim();
           state.settings = await api("/api/settings", "PATCH", body);
@@ -215,13 +225,71 @@ function tabNotifications() {
   );
 }
 
-function tabLater() {
+function tabUpdates() {
+  const s = state.settings?.settings || {};
+  const selected = new Set(s.discovery_channels?.value || ["stable"]);
+  const stable = el("input", { type: "checkbox" });
+  stable.checked = selected.has("stable");
+  const nightly = el("input", { type: "checkbox" });
+  nightly.checked = selected.has("nightly");
+  const interval = el("input", { type: "number", value: String(s.discovery_interval_secs?.value ?? 3600) });
+  const catalog = el("pre", { class: "muted", text: "Loading release catalog…" });
+  const list = el("div", {});
+  const renderCatalog = (data) => {
+    catalog.textContent = JSON.stringify({
+      available: data.available,
+      discovery_available: data.available,
+      update_available: data.update_available,
+      installed: data.installed,
+      available_count: data.available_count,
+      apply: data.apply,
+      poll_error: data.poll_error || null,
+    }, null, 2);
+    list.replaceChildren();
+    if (!data.available) {
+      list.append(el("p", { class: "muted", text: "Discovery needs JMODGUARD_CONDUCTOR_RELEASE_FEED and JMODGUARD_CONDUCTOR_RELEASE_KEYS. Browsing a build never deploys it." }));
+      return;
+    }
+    const rows = data.releases || [];
+    if (!rows.length) {
+      list.append(el("p", { class: "muted", text: "No complete signed releases in the selected channels." }));
+      return;
+    }
+    rows.forEach((row) => list.append(el("div", { class: "card" },
+      el("strong", { text: `${row.release_id} · ${row.channel}` }),
+      el("p", { class: "muted", text: row.compatible ? "Compatible with this installation's schema and backup format." : (row.blocked_reason || "Incompatible") }),
+      el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
+      el("p", { class: "muted", text: (row.components || []).join(", ") }),
+      el("p", { class: "muted", text: row.notes || "No notes." }),
+    )));
+  };
+  api("/api/updates").then(renderCatalog).catch((e) => { catalog.textContent = e.message; });
   return el("div", {},
     el("h2", { text: "Updates" }),
-    el("div", { class: "card unavailable" },
-      el("h3", { text: "Not available yet" }),
-      el("p", { text: "This control is intentionally inactive. A later change will add a working action here; this page does not expose a non-functional button." }),
+    el("p", { class: "muted", text: "Browse signed Stable and Nightly publications. This page never installs a build; point-and-click apply arrives later. There is no silent automatic update." }),
+    el("div", { class: "card" },
+      el("h3", { text: "Discovery" }),
+      field("Stable channel", stable),
+      field("Nightly channel", nightly),
+      field("Poll interval (seconds, applied)", interval),
+      el("button", { class: "btn primary", text: "Save discovery settings", onclick: async () => {
+        try {
+          const channels = [];
+          if (stable.checked) channels.push("stable");
+          if (nightly.checked) channels.push("nightly");
+          state.settings = await api("/api/settings", "PATCH", {
+            revision: state.settings.revision,
+            discovery_channels: channels,
+            discovery_interval_secs: Number(interval.value),
+          });
+          toast("Discovery settings saved", "success");
+          render();
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+      el("button", { class: "btn", text: "Refresh catalog", onclick: () => render() }),
     ),
+    el("div", { class: "card" }, el("h3", { text: "Installed and availability" }), catalog),
+    el("div", { class: "card" }, el("h3", { text: "Complete publications" }), list),
   );
 }
 

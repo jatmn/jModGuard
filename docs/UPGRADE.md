@@ -30,6 +30,9 @@ binaries; rollback needs the corresponding pre-upgrade stores, not just the core
 ## 1. Pick a version
 
 Prefer a **git tag** or release (`vX.Y.Z`) over an arbitrary `main` commit.
+Nightly identities (`nightly-YYYYMMDD-<sha12>`) are separate from that stable
+baseline. The conductor can list both; it does not install them. See
+[releases](RELEASES.md).
 Read the release notes for:
 
 - New or renamed `config.toml` / env keys

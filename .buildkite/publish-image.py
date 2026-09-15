@@ -2,12 +2,17 @@
 """Publish one GHCR image from a trusted Buildkite build, without a GHA runner."""
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+
+_release_spec = importlib.util.spec_from_file_location("release", Path(__file__).with_name("release.py"))
+release = importlib.util.module_from_spec(_release_spec)
+_release_spec.loader.exec_module(release)
 
 
 REPOSITORY = "https://github.com/jatmn/jModGuard"
@@ -55,6 +60,8 @@ def request(env):
         return ("manual", manual)
     if tag and source == "webhook":
         return ("tag", "refs/tags/" + tag)
+    if source == "schedule" and branch == "main" and not tag:
+        return ("nightly", "")
     if source == "webhook" and branch == "main" and not tag:
         # Older Buildkite integrations do not supply GITHUB_EVENT.
         if env.get("BUILDKITE_GITHUB_EVENT", "push") != "push":
@@ -121,7 +128,7 @@ def changed_since_publication(component, sha, image, env):
         return True
 
 
-def build_args(component, sha, label, context):
+def build_args(component, sha, label, context, channel=None):
     image = "ghcr.io/jatmn/jmodguard-" + component
     args = ["docker", "buildx", "build", "--builder", "default",
             "--file", str(Path(context) / ("Dockerfile." + component)),
@@ -133,7 +140,10 @@ def build_args(component, sha, label, context):
             "--label", "org.opencontainers.image.source=" + REPOSITORY,
             "--label", "org.opencontainers.image.revision=" + sha,
             "--label", "org.opencontainers.image.version=" + (label or sha),
-            "--tag", image + ":latest", "--tag", image + ":" + sha]
+            "--tag", image + ":" + sha]
+    # Nightly artifacts stay unique. They must not move latest or a stable tag.
+    if channel != "nightly":
+        args += ["--tag", image + ":latest"]
     if label and label not in {"latest", sha}:
         args += ["--tag", image + ":" + label]
     return args + [str(context)]
@@ -165,7 +175,9 @@ def prepare():
         return
     if exists.returncode != 100:
         raise ValueError("Could not check existing publication plan")
-    sha, label = resolve_source(mode, ref, head)
+    sha, label = resolve_source("main" if mode == "nightly" else mode, ref, head)
+    if mode == "nightly":
+        label = release.nightly_label(sha)
     # Resolve moving tags once for both components, even on different agents.
     plan = {"mode": mode, "ref": ref, "commit": head, "sha": sha, "tag": label}
     run("buildkite-agent", "meta-data", "set", "image-publication", json.dumps(plan))
@@ -188,12 +200,18 @@ def read_plan(selection):
 
 
 def publish(component):
+    if component == "manifest":
+        publish_manifest()
+        return
     env = os.environ.copy()
     selection = checked_request(env)
     if selection is None:
         print("Test-only build; no image publication")
         return
     mode, _, head = selection
+    if component == "conductor" and mode == "main":
+        print("conductor: installable control images are published on Stable/Nightly only")
+        return
     sha, label = read_plan(selection)
     if mode == "manual":
         # The prepare job may run on a different agent with a different clone.
@@ -235,15 +253,66 @@ def publish(component):
         context = Path(scratch) / "source"
         run("git", "worktree", "add", "--detach", str(context), sha, capture_output=True)
         try:
-            run(*build_args(component, sha, label, context), env=env)
+            run(*build_args(component, sha, label, context, release.channel_for(mode, label)), env=env)
         finally:
             run("git", "worktree", "remove", "--force", str(context), capture_output=True)
         print(f"Published {image}:{sha}")
 
 
+def inspect_digest(image, env):
+    raw = run("docker", "buildx", "imagetools", "inspect", image, "--format", "{{json .Manifest}}",
+              capture_output=True, env=env).stdout
+    data = json.loads(raw)
+    digest = data.get("digest") or data.get("Descriptor", {}).get("digest")
+    size = data.get("size") or data.get("Descriptor", {}).get("size") or 1
+    if not release.DIGEST.fullmatch(digest or ""):
+        raise ValueError("published image is missing a content digest")
+    return digest, int(size)
+
+
+def publish_manifest():
+    env = os.environ.copy()
+    selection = checked_request(env)
+    if selection is None:
+        print("Test-only build; no release manifest")
+        return
+    mode, _, head = selection
+    if mode == "main":
+        print("Main SHA publication is not an installable Stable/Nightly release")
+        return
+    sha, label = read_plan(selection)
+    channel = release.channel_for(mode, label)
+    release_id = label if channel == "nightly" or release.stable_tag(label) else None
+    if not release_id:
+        raise ValueError("installable publication requires a stable or nightly identity")
+    key_id = env.get("JMODGUARD_RELEASE_KEY_ID", "")
+    secret = env.get("JMODGUARD_RELEASE_SIGNING_KEY", "")
+    if not secret:
+        secret = run("buildkite-agent", "secret", "get", "JMODGUARD_RELEASE_SIGNING_KEY",
+                     capture_output=True).stdout.strip()
+    if not key_id or not secret:
+        raise ValueError("complete manifests require JMODGUARD_RELEASE_KEY_ID and signing key")
+    components = {}
+    for name in ("bot", "api", "conductor"):
+        image = f"ghcr.io/jatmn/jmodguard-{name}:{sha}"
+        digest, size = inspect_digest(image, env)
+        components[name] = release.component(name, digest, size, "ghcr.io/jatmn/jmodguard-" + name)
+    scratch_root = Path(env.get("TMPDIR") or ".tmp").resolve()
+    with tempfile.TemporaryDirectory(prefix="manifest-", dir=scratch_root) as scratch:
+        context = Path(scratch) / "source"
+        run("git", "worktree", "add", "--detach", str(context), sha, capture_output=True)
+        try:
+            components["frontend"] = release.frontend_inventory(context / "frontend")
+        finally:
+            run("git", "worktree", "remove", "--force", str(context), capture_output=True)
+        out = Path(env.get("JMODGUARD_RELEASE_OUT") or "dist/releases")
+        path = release.finalize(channel, release_id, sha, components, "", key_id, secret, out)
+        print(f"Published installable manifest {path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("component", choices=("prepare", "bot", "api"))
+    parser.add_argument("component", choices=("prepare", "bot", "api", "conductor", "manifest"))
     args = parser.parse_args()
     try:
         if args.component == "prepare":

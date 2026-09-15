@@ -100,7 +100,9 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: conductor updates are not registered. Local encrypted
+Unfinished services stay inactive: conductor apply/install is not registered.
+Signed Stable/Nightly discovery can list complete publications when a feed and
+trust keys are configured; see [RELEASES.md](RELEASES.md). Local encrypted
 backup/restore and guild-store moves are available on the conductor when their process
 paths are configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) and
 [GUILD-MOVES.md](GUILD-MOVES.md).

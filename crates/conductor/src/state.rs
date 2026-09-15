@@ -358,6 +358,9 @@ impl Conductor {
         }
         self.maybe_schedule_backup().await?;
         self.maybe_sanitize_backups().await?;
+        if let Err(error) = self.maybe_refresh_releases().await {
+            tracing::warn!("release discovery: {error:#}");
+        }
         let Some(job) = store.claim_job().await? else {
             return Ok(());
         };
@@ -478,6 +481,28 @@ impl Conductor {
         let _ = store
             .insert_backup_job_if_idle("backup_sanitize", &serde_json::json!({}), 3)
             .await?;
+        Ok(())
+    }
+
+    async fn maybe_refresh_releases(&self) -> Result<()> {
+        if !crate::release::discovery_available(&self.cfg) {
+            return Ok(());
+        }
+        let store = self.store()?;
+        let interval = self
+            .settings()
+            .await
+            .unwrap_or_default()
+            .discovery_interval_secs;
+        if let Some(last) = store.meta_get("release_last_poll_ms").await?
+            && let Ok(last_ms) = last.parse::<i64>()
+        {
+            let wait = i64::try_from(interval.saturating_mul(1000)).unwrap_or(i64::MAX);
+            if now_ms().saturating_sub(last_ms) < wait {
+                return Ok(());
+            }
+        }
+        crate::release::refresh(self).await?;
         Ok(())
     }
 

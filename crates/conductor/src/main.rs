@@ -3,8 +3,7 @@ use jmodguard_conductor::{Conductor, config::Config, router_for};
 use jmodguard_runtime::shutdown_signal;
 use std::future::IntoFuture;
 
-// Backup/update work is not enabled. Future provider jobs must use an
-// explicitly bounded blocking executor rather than this thread.
+// Apply/install remains inactive. Discovery polls a configured feed without deploying.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cfg = Config::load()?;

@@ -26,11 +26,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(publisher.request(MAIN | {"BUILDKITE_TAG": "v1", "BUILDKITE_BRANCH": "v1"}),
                          ("tag", "refs/tags/v1"))
         for changes in ({"BUILDKITE_PULL_REQUEST": "7"}, {"BUILDKITE_BRANCH": "feature"},
-                        {"BUILDKITE_SOURCE": "ui"}, {"BUILDKITE_SOURCE": "schedule"},
+                        {"BUILDKITE_SOURCE": "ui"},
                         {"BUILDKITE_GITHUB_EVENT": "pull_request"},
                         {"BUILDKITE_GITHUB_EVENT": "release"}):
             with self.subTest(changes=changes):
                 self.assertIsNone(publisher.request(MAIN | changes))
+        self.assertEqual(publisher.request(MAIN | {"BUILDKITE_SOURCE": "schedule"}), ("nightly", ""))
         with self.assertRaises(ValueError):
             publisher.request({})
         # Leftover manual source on a webhook must not block automatic publication.
@@ -395,6 +396,31 @@ class GitSourceTests(unittest.TestCase):
                     publisher.publish(component)
                 self.assertEqual(len(exports), 1)
                 self.assertIn(image + ":" + self.base, published)
+
+
+    def test_nightly_does_not_move_latest_or_stable_tags(self):
+        args = publisher.build_args("bot", HEAD, "nightly-20260915-" + HEAD[:12], ".", "nightly")
+        self.assertNotIn("ghcr.io/jatmn/jmodguard-bot:latest", args)
+        self.assertIn("ghcr.io/jatmn/jmodguard-bot:" + HEAD, args)
+        self.assertIn("ghcr.io/jatmn/jmodguard-bot:nightly-20260915-" + HEAD[:12], args)
+        stable = publisher.build_args("bot", HEAD, "v1.2.3", ".", "stable")
+        self.assertIn("ghcr.io/jatmn/jmodguard-bot:latest", stable)
+        self.assertIn("ghcr.io/jatmn/jmodguard-bot:v1.2.3", stable)
+
+    def test_main_does_not_publish_conductor_or_installable_manifests(self):
+        env = MAIN | {"GHCR_USERNAME": "jatmn"}
+
+        def fake_git(*args):
+            if args[:1] == ("status",) or args[:2] == ("status", "--porcelain"):
+                return ""
+            return HEAD
+
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(publisher, "git", side_effect=fake_git), \
+             patch.object(publisher, "run") as run:
+            publisher.publish("conductor")
+            publisher.publish("manifest")
+        self.assertFalse(any(call.args and call.args[0] == "docker" for call in run.call_args_list))
 
 
 if __name__ == "__main__":

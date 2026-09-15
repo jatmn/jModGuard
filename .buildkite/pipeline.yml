@@ -41,6 +41,7 @@ steps:
       esac
       cargo fetch --locked
       python3 .buildkite/publish-image-test.py
+      python3 .buildkite/release-test.py
       cargo test --locked --workspace
       cargo test --locked -p jmodguard-api --no-default-features --lib
       cargo clippy --locked --workspace --bins --lib -- -D warnings
@@ -127,7 +128,8 @@ steps:
         (build.source == "webhook" && build.branch == "main" && build.tag == null &&
           (build.env("BUILDKITE_GITHUB_EVENT") == null || build.env("BUILDKITE_GITHUB_EVENT") == "push")) ||
         ((build.source == "ui" || build.source == "api") &&
-          build.env("JMODGUARD_PUBLISH_SOURCE") != null && build.env("JMODGUARD_PUBLISH_SOURCE") != "")
+          build.env("JMODGUARD_PUBLISH_SOURCE") != null && build.env("JMODGUARD_PUBLISH_SOURCE") != "") ||
+        (build.source == "schedule" && build.branch == "main" && build.tag == null)
       )
     timeout_in_minutes: 5
     command: python3 .buildkite/publish-image.py prepare
@@ -149,3 +151,26 @@ steps:
     concurrency_group: jmodguard/ghcr-api
     timeout_in_minutes: 45
     command: python3 .buildkite/publish-image.py api
+
+  - label: "publish conductor image"
+    key: publish-conductor
+    depends_on: prepare-images
+    if: *publish_if
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-conductor
+    timeout_in_minutes: 45
+    command: python3 .buildkite/publish-image.py conductor
+
+  - label: "publish release manifest"
+    key: publish-manifest
+    depends_on: [publish-bot, publish-api, publish-conductor]
+    if: *publish_if
+    timeout_in_minutes: 10
+    command: python3 .buildkite/publish-image.py manifest
+
+  - label: "release please"
+    key: release-please
+    depends_on: [test, remote-database]
+    if: build.pull_request.id == null && build.source == "webhook" && build.branch == "main" && build.tag == null && (build.env("BUILDKITE_GITHUB_EVENT") == null || build.env("BUILDKITE_GITHUB_EVENT") == "push")
+    timeout_in_minutes: 10
+    command: python3 .buildkite/release-please.py

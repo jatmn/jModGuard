@@ -3,7 +3,7 @@
 The conductor is an optional independent installation-control process. When its
 control store, Discord OAuth client and operator identity are configured, it serves
 an owner-only Administration UI for settings, service status, telemetry,
-notifications, backups and guild-store moves. Guild Discord credentials and tenant
+notifications, backups, guild-store moves and signed release discovery. Guild Discord credentials and tenant
 routing are not available on this service.
 
 ## Build and run locally
@@ -34,6 +34,9 @@ It defaults to `127.0.0.1:8081`. It does not read `config.toml`,
 | `JMODGUARD_CONDUCTOR_EVIDENCE_ROOT` | unset | Optional live evidence directory copied into backups. Must be distinct from the backup root and restore target. |
 | `JMODGUARD_CONDUCTOR_RESTORE_TARGET` | unset | Absent directory that restore writes into. Required to enqueue restore. |
 | `JMODGUARD_CONDUCTOR_GUILD_STORES` | empty | JSON array of `{id,role,path}` local guild SQLite files (`role` is `shared` or `dedicated`). Required for `moves_available`. Paths must be distinct from the backup root, evidence root and restore target. |
+| `JMODGUARD_CONDUCTOR_RELEASE_FEED` | unset | Signed release index URL. Required with trust keys for `discovery_available`. |
+| `JMODGUARD_CONDUCTOR_RELEASE_KEYS` | empty | JSON object of HMAC `key_id` → 32-byte hex secrets. Not stored in git. |
+| `JMODGUARD_CONDUCTOR_INSTALLED_RELEASE` | unset | Optional installed release id shown in the Updates catalog. |
 
 These are process/bootstrap controls. Durable session, notification and monitoring
 options are stored in the conductor control database after owner login. No provider
@@ -49,15 +52,16 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 |---|---|---|
 | `GET` / `HEAD /health` (also `/health/`) | `200`, process liveness only. | Same. |
 | `GET` / `HEAD /ready` | `503`, JSON code `control_not_configured`. | `200`. |
-| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `update_available` stays false. |
+| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false; `discovery_available` false; `update_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `discovery_available` is true when a release feed and trust keys are also configured; `update_available` stays false. |
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
 database. Its browser lifetime follows the applied absolute-session setting; server-side
 idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
 unrevoked sessions. Administration
-pages: System Status, Installation, Notifications, Backups, Moves. Updates remain
-not available yet, with no working update buttons.
+pages: System Status, Installation, Notifications, Updates, Backups, Moves. The Updates
+page lists complete signed publications for selected channels. It never exposes an
+install button. `GET /api/updates` is discovery; apply POST routes return 404.
 
 Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
 takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending
@@ -94,6 +98,9 @@ SQLite files, freeze that guild's writes, switch directory placement, and remove
 the source copy. Neighboring shared-store guilds stay in place. Destination
 credentials stay in bot/API configuration. See [GUILD-MOVES.md](GUILD-MOVES.md).
 
+Signed release discovery is documented in [RELEASES.md](RELEASES.md). The
+conductor never installs a selected build.
+
 Owner Discord notifications use an incoming webhook stored write-only on the
 conductor. Payloads never include tokens, chat, or evidence. Delivery health is listed
 on the Notifications page. Mention parsing remains disabled by default and follows the
@@ -127,6 +134,8 @@ operator identity are configured in the container environment.
 docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 ```
 
-The image is not automatically published or deployed. Point-and-click updates
-remain later work. See [overhaul status](OVERHAUL.md),
+The image is not automatically published on ordinary main SHA builds. Stable
+and Nightly publication can include the conductor image plus a complete signed
+manifest. Point-and-click updates remain later work. See [overhaul status](OVERHAUL.md),
+[releases](RELEASES.md),
 [backup and restore](BACKUP-RESTORE.md) and [guild moves](GUILD-MOVES.md).
