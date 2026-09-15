@@ -102,6 +102,9 @@ impl Conductor {
         {
             tracing::warn!("could not clear leftover guild-move fences: {error:#}");
         }
+        if let Err(error) = crate::update::reconcile_installed_release_meta(&conductor).await {
+            tracing::warn!("installed release reconciliation: {error:#}");
+        }
         if spawn_workers && conductor.store.is_some() {
             let worker = Arc::clone(&conductor);
             tokio::spawn(async move { worker.job_loop().await });

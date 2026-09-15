@@ -2,7 +2,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jmodguard_conductor::release;
-use jmodguard_conductor::update_adapter::{Adapter, INVENTORY_FORMAT, Inventory};
+use jmodguard_conductor::update_adapter::{Adapter, DrainContext, INVENTORY_FORMAT, Inventory, RECOVER_FORMAT};
 use jmodguard_conductor::{Conductor, config::Config, router_for, update};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -213,7 +213,12 @@ async fn provider_stub() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}"), task)
 }
 
-fn place_process_artifact(cache: &std::path::Path, digest: &str, fail_ready: bool) {
+fn place_process_artifact(
+    cache: &std::path::Path,
+    digest: &str,
+    fail_ready: bool,
+    hold_drain: bool,
+) {
     let hex = digest.trim_start_matches("sha256:");
     let dest = cache.join(hex);
     std::fs::copy(STANDIN, &dest).unwrap();
@@ -224,8 +229,15 @@ fn place_process_artifact(cache: &std::path::Path, digest: &str, fail_ready: boo
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).unwrap();
     }
+    let mut env_lines = String::new();
     if fail_ready {
-        std::fs::write(cache.join(format!("{hex}.env")), "JMODGUARD_FAIL_READY=1\n").unwrap();
+        env_lines.push_str("JMODGUARD_FAIL_READY=1\n");
+    }
+    if hold_drain {
+        env_lines.push_str("JMODGUARD_HOLD_DRAIN=1\n");
+    }
+    if !env_lines.is_empty() {
+        std::fs::write(cache.join(format!("{hex}.env")), env_lines).unwrap();
     }
 }
 
@@ -251,9 +263,9 @@ async fn setup(seed_previous: bool) -> Env {
     let cache = update_root.join("cache");
     std::fs::create_dir_all(&cache).unwrap();
     for ch in ['a', 'b', 'c', '1', '2', '3'] {
-        place_process_artifact(&cache, &digest(ch), false);
+        place_process_artifact(&cache, &digest(ch), false, false);
     }
-    place_process_artifact(&cache, &digest('e'), true);
+    place_process_artifact(&cache, &digest('e'), true, false);
     place_frontend(&cache, &digest('d'), "old");
     place_frontend(&cache, &digest('4'), "new");
     let mut keys = BTreeMap::new();
@@ -639,7 +651,7 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
     let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
     let inventory = adapter.load_inventory().unwrap();
     let bot = inventory.components["bot"].clone();
-    adapter.drain("bot", &bot).await.unwrap();
+    adapter.drain("bot", &bot, DrainContext::Apply).await.unwrap();
     adapter.confirm_dead("bot", &bot).await.unwrap();
     let zombie = adapter
         .activate("bot", &digest('a'), Some(&bot))
@@ -731,7 +743,10 @@ async fn interrupted_job_fail_closed_and_conductor_recover_command() {
             status: "replacing".into(),
         })
         .unwrap();
-    adapter.drain("conductor", &conductor).await.unwrap();
+    adapter
+        .drain("conductor", &conductor, DrainContext::Apply)
+        .await
+        .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_jmodguard-conductor"))
         .arg("recover-update")
         .env_clear()
@@ -787,4 +802,185 @@ async fn update_shares_idle_mutex_and_refuses_incompatible() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("older schema"), "{body}");
+}
+
+#[tokio::test]
+async fn uncertain_recover_blocks_new_apply_and_job_retry() {
+    let env = setup(true).await;
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    adapter
+        .write_recover(&jmodguard_conductor::update_adapter::RecoverInventory {
+            format: RECOVER_FORMAT.into(),
+            job_id: "job-uncertain".into(),
+            release_id: "v0.2.0".into(),
+            previous_release_id: "v0.1.0".into(),
+            previous: BTreeMap::from([
+                ("bot".into(), digest('a')),
+                ("api".into(), digest('b')),
+            ]),
+            desired: BTreeMap::new(),
+            phase: "deploying".into(),
+            component: "bot".into(),
+            status: "uncertain".into(),
+        })
+        .unwrap();
+    let cookie = login(&env).await;
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.0","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("uncertain"), "{body}");
+    let payload = json!({
+        "release_id": "v0.2.0",
+        "preop": "skip",
+        "rollback": false,
+        "phase": "planned",
+        "plan": {
+            "desired": { "bot": digest('1') },
+            "previous": {},
+            "installed": "v0.1.0"
+        }
+    });
+    let job_id = env
+        .conductor
+        .store()
+        .unwrap()
+        .insert_job("release_update", &payload, 1)
+        .await
+        .unwrap();
+    let claimed = env
+        .conductor
+        .store()
+        .unwrap()
+        .claim_job()
+        .await
+        .unwrap()
+        .expect("job");
+    assert_eq!(claimed.id, job_id);
+    env.conductor
+        .store()
+        .unwrap()
+        .finish_job(&job_id, false, Some("failed"))
+        .await
+        .unwrap();
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        &format!("/api/jobs/{job_id}/retry"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("uncertain"), "{body}");
+}
+
+#[tokio::test]
+async fn recover_update_fails_when_confirm_dead_still_serving() {
+    let env = setup(true).await;
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    let live = adapter.load_inventory().unwrap().components["bot"].clone();
+    let mut inventory = adapter.load_inventory().unwrap();
+    inventory.components.insert(
+        "bot".into(),
+        jmodguard_conductor::update_adapter::ComponentRecord {
+            digest: live.digest.clone(),
+            kind: "process".into(),
+            pid: None,
+            port: live.port,
+            generation: live.generation,
+        },
+    );
+    adapter.save_inventory(&inventory).unwrap();
+    adapter
+        .write_recover(&jmodguard_conductor::update_adapter::RecoverInventory {
+            format: RECOVER_FORMAT.into(),
+            job_id: "job-drain".into(),
+            release_id: "v0.2.0".into(),
+            previous_release_id: "v0.1.0".into(),
+            previous: BTreeMap::from([("bot".into(), digest('a'))]),
+            desired: BTreeMap::from([("bot".into(), digest('1'))]),
+            phase: "deploying".into(),
+            component: "bot".into(),
+            status: "replacing".into(),
+        })
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_jmodguard-conductor"))
+        .arg("recover-update")
+        .env_clear()
+        .env("JMODGUARD_CONDUCTOR_UPDATE_ROOT", env.root.join("update"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("still serving health"), "{combined}");
+    adapter.wait_ready("bot", &live).await.unwrap();
+}
+
+#[tokio::test]
+async fn apply_requires_inventory_when_health_urls_configured() {
+    let env = setup(false).await;
+    let store = env.conductor.store().unwrap();
+    let (mut settings, revision, _) = store.load_settings().await.unwrap();
+    settings.bot_health_url = "http://127.0.0.1:9/health".into();
+    store.save_settings(&settings, revision).await.unwrap();
+    let cookie = login(&env).await;
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.0","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.conductor.tick_job().await.unwrap();
+    let job = store.get_job(&id).await.unwrap().unwrap();
+    assert_eq!(job.status, "failed");
+    assert!(
+        job.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("inventory has no bot"),
+        "{:?}",
+        job.last_error
+    );
+}
+
+#[tokio::test]
+async fn conductor_reconciles_installed_meta_from_inventory_on_start() {
+    let env = setup(true).await;
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    let mut inventory = adapter.load_inventory().unwrap();
+    inventory.release_id = "v0.1.0".into();
+    adapter.save_inventory(&inventory).unwrap();
+    env.conductor
+        .store()
+        .unwrap()
+        .meta_set("installed_release", "v0.2.0")
+        .await
+        .unwrap();
+    let restarted = Conductor::start(env.conductor.cfg.clone(), false)
+        .await
+        .unwrap();
+    let meta = restarted
+        .store()
+        .unwrap()
+        .meta_get("installed_release")
+        .await
+        .unwrap();
+    assert_eq!(meta.as_deref(), Some("v0.1.0"));
 }

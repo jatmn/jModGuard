@@ -475,6 +475,12 @@ async fn api_retry_job(
         Ok(store) => store,
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };
+    if let Ok(Some(job)) = store.get_job(&id).await
+        && job.kind == "release_update"
+        && let Err(error) = crate::update::ensure_retry_allowed(&state.cfg)
+    {
+        return error_response(StatusCode::BAD_REQUEST, error);
+    }
     match store.replay_job(&id).await {
         Ok(true) => {
             let _ = store.audit(&operator.operator_id, "job_retry", &id).await;
@@ -1165,7 +1171,7 @@ async fn api_updates_plan(
         )
             .into_response();
     }
-    match crate::update::plan(&state, &query.release_id).await {
+    match crate::update::plan(&state, &query.release_id, None).await {
         Ok(body) => Json(body).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }

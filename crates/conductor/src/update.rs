@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::release;
 use crate::state::Conductor;
 use crate::store::now_ms;
-use crate::update_adapter::{Adapter, COMPONENTS, RECOVER_FORMAT, RecoverInventory};
+use crate::update_adapter::{Adapter, COMPONENTS, DrainContext, RECOVER_FORMAT, RecoverInventory};
 
 #[derive(Debug, Deserialize)]
 pub struct ApplyRequest {
@@ -70,7 +70,98 @@ pub async fn current_installed_id(conductor: &Conductor) -> String {
         .to_string()
 }
 
-pub async fn plan(conductor: &Conductor, release_id: &str) -> Result<Value> {
+/// Align control-store `installed_release` with filesystem inventory after CLI recover.
+pub async fn reconcile_installed_release_meta(conductor: &Conductor) -> Result<()> {
+    if !updates_available(&conductor.cfg) {
+        return Ok(());
+    }
+    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    let inventory = adapter.load_inventory()?;
+    if inventory.release_id.is_empty() {
+        return Ok(());
+    }
+    let store = conductor.store()?;
+    let meta = store.meta_get("installed_release").await?;
+    if meta.as_deref() != Some(inventory.release_id.as_str()) {
+        store
+            .meta_set("installed_release", &inventory.release_id)
+            .await?;
+    }
+    Ok(())
+}
+
+fn ensure_new_update_allowed(cfg: &Config) -> Result<()> {
+    let Some(root) = &cfg.update_root else {
+        return Ok(());
+    };
+    let Some(recover) = Adapter::load_recover(root)? else {
+        return Ok(());
+    };
+    match recover.status.as_str() {
+        "committed" | "recovered" => Ok(()),
+        "uncertain" => anyhow::bail!(
+            "update ownership is uncertain; run jmodguard-conductor recover-update before queueing a new install or rollback"
+        ),
+        "replacing" | "running" => anyhow::bail!(
+            "recover inventory is still in progress (status={}); retry the failed update job or run recover-update before starting a new install",
+            recover.status
+        ),
+        other => anyhow::bail!(
+            "recover inventory status {other} must be resolved before a new update"
+        ),
+    }
+}
+
+pub fn ensure_retry_allowed(cfg: &Config) -> Result<()> {
+    let Some(root) = &cfg.update_root else {
+        return Ok(());
+    };
+    let Some(recover) = Adapter::load_recover(root)? else {
+        return Ok(());
+    };
+    if recover.status == "uncertain" {
+        anyhow::bail!(
+            "update ownership is uncertain; run jmodguard-conductor recover-update before retrying this job"
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_plan_summary(preop: &str) -> &'static str {
+    match preop {
+        "skip" => "No pre-update archive (preop=skip). Compatible rollback does not restore the previous database.",
+        "recent" => "Reuses any complete backup archive from the last six hours when one exists; otherwise captures a fresh R4 checkpoint when capture is configured (same rule as guild moves).",
+        _ => "Captures a fresh R4 checkpoint archive when capture is configured.",
+    }
+}
+
+async fn ensure_inventory_covers_incumbents(
+    conductor: &Conductor,
+    adapter: &Adapter,
+) -> Result<()> {
+    let settings = conductor.settings().await?;
+    let inventory = adapter.load_inventory()?;
+    for (name, url) in [
+        ("bot", settings.bot_health_url.as_str()),
+        ("api", settings.api_health_url.as_str()),
+    ] {
+        if url.is_empty() {
+            continue;
+        }
+        if !inventory.components.contains_key(name) {
+            anyhow::bail!(
+                "update inventory has no {name} record while {name} health is configured; seed conductor-managed inventory under the update root before the first exclusive install"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn plan(
+    conductor: &Conductor,
+    release_id: &str,
+    preop: Option<&str>,
+) -> Result<Value> {
     ensure!(
         updates_available(&conductor.cfg),
         "point-and-click install is not configured"
@@ -116,7 +207,7 @@ pub async fn plan(conductor: &Conductor, release_id: &str) -> Result<Value> {
             "bot": "Exclusive Gateway worker: drain and confirm the old process is dead before activate. Discord is not replayed.",
             "conductor": "Replaced last. Independent `jmodguard-conductor recover-update` reads update_root/recover.json and does not use the new conductor or private ops."
         },
-        "checkpoint": "Uses an R4 checkpoint archive when capture is configured. Compatible rollback switches retained binaries and does not restore the old database or rewind later settings or revocations.",
+        "checkpoint": checkpoint_plan_summary(preop.unwrap_or("fresh")),
         "database": "This operation does not migrate or restore application databases.",
         "confirm_interruption": true,
         "order": COMPONENTS,
@@ -146,7 +237,8 @@ pub async fn enqueue(conductor: &Conductor, request: ApplyRequest) -> Result<Str
     }
     let release_id = request.release_id.trim();
     ensure!(!release_id.is_empty(), "release_id is required");
-    let plan = plan(conductor, release_id).await?;
+    ensure_new_update_allowed(&conductor.cfg)?;
+    let plan = plan(conductor, release_id, Some(preop)).await?;
     let payload = json!({
         "release_id": release_id,
         "preop": preop,
@@ -190,6 +282,7 @@ pub async fn enqueue_rollback(
             || payload.get("phase").and_then(Value::as_str) == Some("committed"),
         "rollback requires a committed update; failed or uncertain jobs use recover-update or retry"
     );
+    ensure_new_update_allowed(&conductor.cfg)?;
     let previous_id = payload
         .get("plan")
         .and_then(|plan| plan.get("installed"))
@@ -225,12 +318,23 @@ pub async fn enqueue_rollback(
 pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Result<()> {
     let mut payload: Value = serde_json::from_str(payload_json)?;
     let rollback = payload.get("rollback").and_then(Value::as_bool) == Some(true);
+    ensure_retry_allowed(&conductor.cfg)?;
     if !rollback {
+        let release_id = payload
+            .get("release_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("release_id is required")?;
         let preop = payload
             .get("preop")
             .and_then(Value::as_str)
-            .unwrap_or("fresh");
-        checkpoint(conductor, preop).await?;
+            .unwrap_or("fresh")
+            .to_string();
+        let fresh_plan = plan(conductor, release_id, Some(preop.as_str())).await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("plan".into(), fresh_plan);
+        }
+        checkpoint(conductor, preop.as_str()).await?;
         set_phase(
             conductor,
             job_id,
@@ -242,6 +346,9 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         .await?;
     }
     let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    if !rollback {
+        ensure_inventory_covers_incumbents(conductor, &adapter).await?;
+    }
     let desired = payload
         .get("plan")
         .and_then(|plan| plan.get("desired"))
@@ -318,7 +425,7 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         let previous_record = inventory.components.get(*name).cloned();
         if let Some(record) = &previous_record {
             adapter
-                .drain(name, record)
+                .drain(name, record, DrainContext::Apply)
                 .await
                 .map_err(|error| mark_uncertain(&adapter, &recover, error))?;
             adapter
@@ -341,7 +448,9 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
                     && !previous_record.digest.is_empty()
                     && previous_record.digest != digest
                 {
-                    let _ = adapter.drain(name, &activated).await;
+                    let _ = adapter
+                        .drain(name, &activated, DrainContext::Apply)
+                        .await;
                     if adapter.stage(&previous_record.digest).is_ok()
                         && let Ok(restored) = adapter
                             .activate(name, &previous_record.digest, Some(&activated))
@@ -430,8 +539,14 @@ pub async fn recover_update(cfg: &Config) -> Result<Value> {
         adapter.stage(digest)?;
         let current = inventory.components.get(*name).cloned();
         if let Some(record) = &current {
-            let _ = adapter.drain(name, record).await;
-            let _ = adapter.confirm_dead(name, record).await;
+            adapter
+                .drain(name, record, DrainContext::Recover)
+                .await
+                .with_context(|| format!("recover-update drain for {name}"))?;
+            adapter
+                .confirm_dead(name, record)
+                .await
+                .with_context(|| format!("recover-update confirm_dead for {name}"))?;
         }
         let restored = adapter.activate(name, digest, current.as_ref()).await?;
         adapter.wait_ready(name, &restored).await?;
@@ -493,7 +608,9 @@ async fn set_phase(
         && let Ok(Some(mut recover)) = Adapter::load_recover(&adapter.root)
     {
         recover.phase = phase.to_string();
-        recover.status = recover_status.to_string();
+        if recover.status != "uncertain" {
+            recover.status = recover_status.to_string();
+        }
         if !component.is_empty() {
             recover.component = component.to_string();
         }

@@ -238,6 +238,7 @@ function tabUpdates() {
     el("option", { value: "recent", text: "Reuse a complete archive from the last 6 hours" }),
     el("option", { value: "skip", text: "Skip checkpoint (no pre-update archive)" }),
   );
+  const preopHint = el("p", { class: "muted", text: "" });
   const confirm = el("input", { type: "checkbox" });
   const catalog = el("pre", { class: "muted", text: "Loading release catalog…" });
   const list = el("div", {});
@@ -330,7 +331,24 @@ function tabUpdates() {
       });
     }
   };
-  api("/api/updates").then(renderCatalog).catch((e) => { catalog.textContent = e.message; });
+  const configurePreop = (captureAvailable) => {
+    if (captureAvailable) {
+      preopHint.textContent = "";
+      preop.querySelector('option[value="fresh"]').disabled = false;
+      preop.querySelector('option[value="recent"]').disabled = false;
+      return;
+    }
+    preop.value = "skip";
+    preopHint.textContent = "Capture is not configured; install requires preop=skip unless capture stores are configured.";
+    preop.querySelector('option[value="fresh"]').disabled = true;
+    preop.querySelector('option[value="recent"]').disabled = true;
+  };
+  Promise.all([api("/api/updates"), api("/api/status")])
+    .then(([data, status]) => {
+      configurePreop(!!status.capture_available);
+      renderCatalog(data);
+    })
+    .catch((e) => { catalog.textContent = e.message; });
   const refreshBtn = el("button", { class: "btn", text: "Refresh catalog", onclick: async () => {
     try {
       renderCatalog(await api("/api/updates?refresh=true"));
@@ -367,6 +385,7 @@ function tabUpdates() {
     el("div", { class: "card" },
       el("h3", { text: "Install" }),
       field("Pre-update checkpoint", preop),
+      preopHint,
       el("label", {}, confirm, el("span", { text: " I confirm the exclusive bot drain, local API restart, and that conductor recovery uses recover-update rather than the replacement process." })),
     ),
     el("div", { class: "card" }, el("h3", { text: "Installed and availability" }), catalog),

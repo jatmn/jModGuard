@@ -57,6 +57,13 @@ pub struct Adapter {
     http: reqwest::Client,
 }
 
+pub enum DrainContext {
+    /// Apply/update job: SIGKILL that was required is ownership-uncertain even if the pid exited.
+    Apply,
+    /// recover-update: a SIGKILL that actually terminated the process is acceptable.
+    Recover,
+}
+
 impl Adapter {
     pub fn from_config(cfg: &Config, http: reqwest::Client) -> Result<Self> {
         let root = cfg
@@ -167,7 +174,12 @@ impl Adapter {
         Ok(dest)
     }
 
-    pub async fn drain(&self, name: &str, record: &ComponentRecord) -> Result<()> {
+    pub async fn drain(
+        &self,
+        name: &str,
+        record: &ComponentRecord,
+        context: DrainContext,
+    ) -> Result<()> {
         if name == "frontend" {
             return Ok(());
         }
@@ -191,9 +203,12 @@ impl Adapter {
                 "ownership uncertain; {name} pid {pid} survived SIGKILL and must be resolved before activating a replacement"
             );
         }
-        anyhow::bail!(
-            "ownership uncertain; {name} required SIGKILL so the old instance may still restart"
-        );
+        match context {
+            DrainContext::Recover => Ok(()),
+            DrainContext::Apply => anyhow::bail!(
+                "ownership uncertain; {name} required SIGKILL so the old instance may still restart"
+            ),
+        }
     }
 
     pub async fn confirm_dead(&self, name: &str, record: &ComponentRecord) -> Result<()> {
@@ -455,6 +470,17 @@ fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some(state) = stat.split_whitespace().nth(2)
+            && (state == "Z" || state == "X")
+        {
+            return false;
+        }
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if waited == pid as i32 {
+            return false;
+        }
         let rc = unsafe { libc::kill(pid as i32, 0) };
         if rc == 0 {
             return true;

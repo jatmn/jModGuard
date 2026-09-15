@@ -267,6 +267,54 @@ impl Config {
                 )?;
             }
         }
+        if let Some(artifact) = &artifact_root {
+            if let Some(backup) = &backup_root {
+                ensure_disjoint_roots(
+                    backup,
+                    artifact,
+                    "artifact root must not overlap the backup root",
+                )?;
+            }
+            if let Some(evidence) = &evidence_root {
+                ensure_disjoint_roots(
+                    evidence,
+                    artifact,
+                    "artifact root must not overlap the evidence root",
+                )?;
+            }
+            if let Some(restore) = &restore_target {
+                ensure_disjoint_roots(
+                    restore,
+                    artifact,
+                    "artifact root must not overlap the restore target",
+                )?;
+            }
+            for capture in &capture_stores {
+                ensure_disjoint_roots(
+                    artifact,
+                    &capture.path,
+                    "artifact root must not overlap capture stores",
+                )?;
+            }
+            for store in &guild_stores {
+                ensure_disjoint_roots(
+                    artifact,
+                    &store.path,
+                    "artifact root must not overlap guild stores",
+                )?;
+            }
+            if let Some(update) = &update_root
+                && artifact != update
+                && !artifact.starts_with(update)
+                && !update.starts_with(artifact)
+            {
+                ensure_disjoint_roots(
+                    update,
+                    artifact,
+                    "artifact root must not overlap the update root",
+                )?;
+            }
+        }
         Ok(Self {
             bind,
             log_filter,
@@ -694,5 +742,22 @@ mod tests {
             Some(std::path::Path::new("/tmp/jmodguard-update"))
         );
         assert_eq!(cfg.update_provider.as_deref(), Some("http://127.0.0.1:9/"));
+    }
+
+    #[test]
+    fn artifact_root_must_not_overlap_backup_root() {
+        assert!(
+            Config::from_lookup(|key| {
+                Ok(Some(
+                    match key {
+                        "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                        "JMODGUARD_CONDUCTOR_ARTIFACT_ROOT" => "/tmp/jmodguard-backups/cache",
+                        _ => return Ok(None),
+                    }
+                    .into(),
+                ))
+            })
+            .is_err()
+        );
     }
 }
