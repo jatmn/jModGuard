@@ -356,7 +356,19 @@ pub async fn clear_stale_fences(cfg: &Config, store: &ControlStore) -> Result<()
         return Ok(());
     }
     let conn = open(core).await?;
-    let _ = conn.execute("DELETE FROM guild_write_fences", ()).await;
+    // Only drop fences left after a completed cutover (placement matches destination).
+    // Failed moves that copied to the destination while placement still points at the
+    // source must keep the fence until retry or restore.
+    conn.execute(
+        "DELETE FROM guild_write_fences WHERE EXISTS (
+            SELECT 1 FROM guild_store_placements p
+            WHERE p.guild_id = guild_write_fences.guild_id
+              AND p.store_id = guild_write_fences.destination_store_id
+              AND p.revision = guild_write_fences.destination_revision
+        )",
+        (),
+    )
+    .await?;
     Ok(())
 }
 

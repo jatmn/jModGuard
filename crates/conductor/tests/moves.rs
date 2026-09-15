@@ -322,6 +322,64 @@ async fn text(path: &Path, sql: &str) -> String {
     rows.next().await.unwrap().unwrap().get(0).unwrap()
 }
 
+const DEST_REV: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+#[tokio::test]
+async fn clear_stale_fences_keeps_fence_while_placement_still_on_source() {
+    let h = setup().await;
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+         VALUES(10, ?, 'freeze', ?, ?, unixepoch())",
+        libsql::params![DEST_REV, DEDICATED, DEST_REV],
+    )
+    .await
+    .unwrap();
+    jmodguard_conductor::guild_move::clear_stale_fences(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(&core, "SELECT COUNT(*) FROM guild_write_fences").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn clear_stale_fences_drops_orphan_fence_after_cutover() {
+    let h = setup().await;
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+         VALUES(10, ?, 'switch', ?, ?, unixepoch())",
+        libsql::params![DEST_REV, DEDICATED, DEST_REV],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_store_placements SET store_id=?, revision=? WHERE guild_id=10",
+        libsql::params![DEDICATED, DEST_REV],
+    )
+    .await
+    .unwrap();
+    jmodguard_conductor::guild_move::clear_stale_fences(
+        &h.conductor.cfg,
+        h.conductor.store().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(&core, "SELECT COUNT(*) FROM guild_write_fences").await,
+        0
+    );
+}
+
 #[tokio::test]
 async fn denied_users_cannot_plan_or_start_moves() {
     let h = setup().await;

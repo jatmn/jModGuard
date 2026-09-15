@@ -53,8 +53,11 @@ Backup/restore jobs and guild-move jobs share one idle mutex.
 
 ## Core schema
 
-Migration 0012 adds `guild_write_fences`. It is not a restore fence. Stale rows
-are cleared when no `guild_move` job is queued or running.
+Migration 0012 adds `guild_write_fences`. It is not a restore fence. When no
+`guild_move` job is queued or running, the conductor only deletes fence rows whose
+destination already matches `guild_store_placements` (orphans after cutover).
+Fences for failed moves that copied to the destination but never switched placement
+stay until manual retry or restore.
 
 `rebind_placement` is a data-crate helper for tests and future callers. The
 conductor uses SQL against the core file and must not call catalog write APIs

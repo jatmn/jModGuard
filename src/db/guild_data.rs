@@ -312,10 +312,10 @@ impl GuildDataStore {
     }
 
     pub(super) async fn refuse_fenced_guild_write(&self, guild: i64) -> Result<()> {
-        if let Some(core) = &self.core {
-            if super::guild_stores::guild_is_write_fenced(core, guild).await? {
-                return Err(super::guild_stores::GuildWriteFenced.into());
-            }
+        if let Some(core) = &self.core
+            && super::guild_stores::guild_is_write_fenced(core, guild).await?
+        {
+            return Err(super::guild_stores::GuildWriteFenced.into());
         }
         Ok(())
     }
