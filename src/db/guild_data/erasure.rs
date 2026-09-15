@@ -9,6 +9,7 @@ impl GuildDataStore {
     /// activation; populated bindings must match the full scope. Never authorizes data access.
     pub async fn finish_empty_erasure(&self, scope: GuildDataScope) -> Result<bool> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
@@ -52,6 +53,7 @@ impl GuildDataStore {
     /// to resume its core suffix after this transaction has removed the binding.
     pub async fn erase_closed_scope(&self, scope: GuildDataScope) -> Result<bool> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {

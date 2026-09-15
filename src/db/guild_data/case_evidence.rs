@@ -179,6 +179,7 @@ impl GuildDataStore {
         limits: EvidenceLimits,
     ) -> Result<ReserveEvidence> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         limits.validate()?;
         anyhow::ensure!(
             request.bytes > 0 && request.bytes <= limits.max_file_bytes,
@@ -218,6 +219,7 @@ impl GuildDataStore {
         result: EvidenceCapture,
     ) -> Result<EvidenceState> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         if let EvidenceCapture::Stored { bytes, sha256 } = &result {
             anyhow::ensure!(
                 *bytes > 0
@@ -262,6 +264,7 @@ impl GuildDataStore {
         id: CaseId,
     ) -> Result<bool> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
             let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,false)?;
@@ -366,6 +369,7 @@ impl GuildDataStore {
         limits: EvidenceLimits,
     ) -> Result<usize> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         limits.validate()?;
         anyhow::ensure!(count > 0 && count <= limits.max_page_size, CaseError::Limit);
         let expected = self.expected.clone();

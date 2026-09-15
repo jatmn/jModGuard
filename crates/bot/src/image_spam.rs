@@ -393,8 +393,7 @@ impl Detector {
         }) {
             return false;
         }
-        let Ok(Some(proving)) =
-            common_images(&posts, proof.policy, self.limits.comparison_steps)
+        let Ok(Some(proving)) = common_images(&posts, proof.policy, self.limits.comparison_steps)
         else {
             return false;
         };
@@ -506,8 +505,9 @@ impl Detector {
                 .map(|b| b.retired_before)
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
-        if replace && let Some(outcome) =
-            replace_existing(&mut state, guild, author, &post, token, policy, now)
+        if replace
+            && let Some(outcome) =
+                replace_existing(&mut state, guild, author, &post, token, policy, now)
         {
             return match outcome {
                 ReplaceOutcome::Unchanged => AdmitOutcome::Unchanged,
@@ -804,7 +804,9 @@ fn replace_existing(
     state.bytes += old.cost;
     b.token = token;
     b.last_seen = now;
-    Some(ReplaceOutcome::Updated(candidate_job(guild, author, token, b, policy, now)))
+    Some(ReplaceOutcome::Updated(candidate_job(
+        guild, author, token, b, policy, now,
+    )))
 }
 
 fn apply_admit_outcome(
@@ -1025,7 +1027,14 @@ pub fn observe(
         received,
         false,
     );
-    if let Some(job) = apply_admit_outcome(detector, outcome, guild.get(), msg.channel_id.get(), msg.id.get(), false) {
+    if let Some(job) = apply_admit_outcome(
+        detector,
+        outcome,
+        guild.get(),
+        msg.channel_id.get(),
+        msg.id.get(),
+        false,
+    ) {
         spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
     }
 }
@@ -1110,7 +1119,10 @@ pub(crate) fn observe_update(
         .edited_timestamp
         .map(|t| t.timestamp_millis())
         .unwrap_or_else(|| update.received_at.timestamp_millis());
-    let age_ms = update.received_at.timestamp_millis().saturating_sub(edited_ms);
+    let age_ms = update
+        .received_at
+        .timestamp_millis()
+        .saturating_sub(edited_ms);
     if age_ms < 0 || age_ms as u64 >= policy.window_secs * 1000 {
         detector.invalidate(guild_id, channel, message);
         return;
@@ -1461,15 +1473,7 @@ mod tests {
             d.admit(1, 2, first, (0, 0), &policy(), now, false),
             AdmitOutcome::Admitted
         ));
-        assert!(apply_admit_outcome(
-            &d,
-            AdmitOutcome::Unchanged,
-            1,
-            10,
-            1,
-            true
-        )
-        .is_none());
+        assert!(apply_admit_outcome(&d, AdmitOutcome::Unchanged, 1, 10, 1, true).is_none());
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));

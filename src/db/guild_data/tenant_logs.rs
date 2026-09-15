@@ -96,6 +96,7 @@ impl GuildDataStore {
     /// No automatic adoption, replacement, rejoin or reopening of a closed scope.
     pub async fn bind_initial_membership(&self, scope: GuildDataScope) -> Result<()> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_read()?;
@@ -141,6 +142,7 @@ impl GuildDataStore {
     /// coordinated directory/backup cleanup and subsequent enrollment are future work.
     pub async fn close_membership(&self, scope: GuildDataScope) -> Result<()> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
@@ -190,6 +192,7 @@ impl GuildDataStore {
         channel: Option<i64>,
     ) -> Result<String> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         anyhow::ensure!(valid_token(revision), TenantDataError::Revision);
         anyhow::ensure!(
             crate::types::EVENT_TYPES.contains(&event) && channel.is_none_or(|id| id > 0),

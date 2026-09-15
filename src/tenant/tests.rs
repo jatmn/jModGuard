@@ -1436,3 +1436,41 @@ async fn live_tenant_writes_fail_closed_while_the_guild_is_fenced() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn guild_store_writes_after_live_respect_move_fence() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    let dest = crate::db::guild_stores::StoreId::new();
+    crate::db::guild_stores::register_store(
+        &f.db,
+        dest.clone(),
+        crate::db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    crate::db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        dest,
+        format!("{:032x}", 9u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    let error = store
+        .record_case(
+            scope,
+            crate::db::guild_data::CaseId::new(),
+            case_data(3),
+            case_limits(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
+            .is_some()
+    );
+}

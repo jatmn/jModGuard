@@ -304,6 +304,9 @@ impl TenantRuntime {
     }
 
     async fn erase_job(&self, job: &GuildErasureJob) -> Result<()> {
+        if guild_is_write_fenced(&self.core, job.guild_id).await? {
+            return Ok(());
+        }
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
         if !handle.finish_empty_erasure(scope.clone()).await? {
@@ -551,7 +554,10 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
             "owned guild store is missing or empty; restore its original database before retrying"
         );
     }
-    GuildDataStore::initialize(store.options.clone(), store.registration.clone())
+    Ok(
+        GuildDataStore::initialize(store.options.clone(), store.registration.clone())?
+            .with_core_write_fence(core.clone()),
+    )
 }
 
 async fn resolve_configured(

@@ -25,6 +25,7 @@ struct Directory {
     guild: i64,
     source_id: String,
     source_revision: String,
+    source_role: String,
     dest_id: String,
     dest_revision: String,
     dest_role: String,
@@ -33,6 +34,10 @@ struct Directory {
 pub fn moves_available(cfg: &Config) -> bool {
     cfg.capture_core_ready()
         && cfg.guild_stores.iter().any(|store| store.role == "shared")
+        && cfg
+            .guild_stores
+            .iter()
+            .any(|store| store.role == "dedicated")
         && cfg.guild_stores.len() >= 2
 }
 
@@ -61,6 +66,10 @@ pub async fn plan(cfg: &Config, guild_id: i64, dest_id: &str) -> Result<Value> {
     );
     let source_path = store_path(cfg, &source.0)?;
     ensure!(source_path.path.exists(), "source guild store is missing");
+    let source_role = catalog(&conn, &source.0)
+        .await?
+        .context("source store is not registered")?;
+    ensure_move_pair(&conn, guild_id, &source.0, &source_role, dest_id, &dest).await?;
     let counts = tenant_counts(&source_path.path, guild_id).await?;
     let neighbors = shared_neighbors(&conn, &source.0, guild_id).await?;
     Ok(json!({
@@ -142,8 +151,9 @@ pub async fn run(conductor: &Conductor, payload_json: &str) -> Result<()> {
         .unwrap_or("fresh");
     checkpoint(conductor, preop).await?;
     let directory = freeze(conductor, guild, &dest_id, &dest_revision).await?;
-    let result = copy_and_cutover(conductor, &directory).await;
-    if result.is_err() {
+    let mut destination_committed = false;
+    let result = copy_and_cutover(conductor, &directory, &mut destination_committed).await;
+    if result.is_err() && !destination_committed {
         let _ = clear_fence(&conductor.cfg, guild, &directory.dest_revision).await;
     }
     result
@@ -182,21 +192,13 @@ async fn freeze(
     let (source_id, source_revision) = placement(&conn, guild)
         .await?
         .context("guild is not placed")?;
+    let source_role = catalog(&conn, &source_id)
+        .await?
+        .context("source store is not registered")?;
     let dest_role = catalog(&conn, dest_id)
         .await?
         .context("destination store is not registered")?;
-    if dest_role == "dedicated" {
-        let owner = dedicated_owner(&conn, dest_id).await?;
-        ensure!(
-            owner == Some(guild),
-            "dedicated destination belongs to another guild"
-        );
-    } else {
-        ensure!(
-            dest_role == "shared",
-            "destination must be shared or dedicated"
-        );
-    }
+    ensure_move_pair(&conn, guild, &source_id, &source_role, dest_id, &dest_role).await?;
     let queued: i64 = scalar(
         &conn,
         "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?)",
@@ -234,13 +236,18 @@ async fn freeze(
         guild,
         source_id,
         source_revision,
+        source_role,
         dest_id: dest_id.to_owned(),
         dest_revision: dest_revision.to_owned(),
         dest_role,
     })
 }
 
-async fn copy_and_cutover(conductor: &Conductor, directory: &Directory) -> Result<()> {
+async fn copy_and_cutover(
+    conductor: &Conductor,
+    directory: &Directory,
+    destination_committed: &mut bool,
+) -> Result<()> {
     let cfg = &conductor.cfg;
     let source = store_path(cfg, &directory.source_id)?;
     let dest = store_path(cfg, &directory.dest_id)?;
@@ -250,9 +257,23 @@ async fn copy_and_cutover(conductor: &Conductor, directory: &Directory) -> Resul
         && revision == directory.dest_revision
     {
         resume(cfg, directory).await?;
+        ensure_guild_schema(
+            &source.path,
+            &directory.source_id,
+            &directory.source_role,
+            directory.guild,
+        )
+        .await?;
         cleanup_source(&source.path, directory.guild).await?;
         return Ok(());
     }
+    ensure_guild_schema(
+        &source.path,
+        &directory.source_id,
+        &directory.source_role,
+        directory.guild,
+    )
+    .await?;
     ensure_guild_schema(
         &dest.path,
         &directory.dest_id,
@@ -261,9 +282,17 @@ async fn copy_and_cutover(conductor: &Conductor, directory: &Directory) -> Resul
     )
     .await?;
     copy_guild(&source.path, &dest.path, directory).await?;
+    *destination_committed = true;
     verify_copy(&source.path, &dest.path, directory.guild).await?;
     switch_placement(cfg, directory).await?;
     resume(cfg, directory).await?;
+    ensure_guild_schema(
+        &source.path,
+        &directory.source_id,
+        &directory.source_role,
+        directory.guild,
+    )
+    .await?;
     cleanup_source(&source.path, directory.guild).await?;
     Ok(())
 }
@@ -272,6 +301,13 @@ async fn switch_placement(cfg: &Config, directory: &Directory) -> Result<()> {
     let conn = open(core_path(cfg)?).await?;
     conn.execute("BEGIN IMMEDIATE", ()).await?;
     let switched: Result<()> = async {
+        let queued: i64 = scalar(
+            &conn,
+            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?)",
+            libsql::params![directory.guild],
+        )
+        .await?;
+        ensure!(queued == 0, "guild has a pending erasure job");
         conn.execute(
             "UPDATE guild_write_fences SET phase='switch' WHERE guild_id=? AND destination_store_id=? AND destination_revision=?",
             libsql::params![directory.guild, directory.dest_id.as_str(), directory.dest_revision.as_str()],
@@ -891,6 +927,34 @@ async fn dedicated_owner(conn: &libsql::Connection, store_id: &str) -> Result<Op
         )
         .await?;
     Ok(rows.next().await?.and_then(|row| row.get(0).ok()))
+}
+
+async fn ensure_move_pair(
+    conn: &libsql::Connection,
+    guild: i64,
+    source_id: &str,
+    source_role: &str,
+    dest_id: &str,
+    dest_role: &str,
+) -> Result<()> {
+    ensure!(
+        (source_role == "shared" && dest_role == "dedicated")
+            || (source_role == "dedicated" && dest_role == "shared"),
+        "moves only support shared ↔ dedicated store pairs"
+    );
+    if dest_role == "dedicated" {
+        ensure!(
+            dedicated_owner(conn, dest_id).await? == Some(guild),
+            "dedicated destination belongs to another guild"
+        );
+    }
+    if source_role == "dedicated" {
+        ensure!(
+            dedicated_owner(conn, source_id).await? == Some(guild),
+            "dedicated source belongs to another guild"
+        );
+    }
+    Ok(())
 }
 
 async fn shared_neighbors(

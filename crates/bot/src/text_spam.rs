@@ -163,12 +163,7 @@ impl Detector {
             .copied()
     }
 
-    pub fn excerpts(
-        &self,
-        guild: u64,
-        author: u64,
-        messages: &[(u64, u64)],
-    ) -> Vec<TextEvidence> {
+    pub fn excerpts(&self, guild: u64, author: u64, messages: &[(u64, u64)]) -> Vec<TextEvidence> {
         let state = self.state.lock();
         let Some(bucket) = state
             .guilds
@@ -273,10 +268,7 @@ impl Detector {
         if posts.len() != messages.len() {
             return false;
         }
-        if posts
-            .iter()
-            .any(|p| now.duration_since(p.at) >= window)
-        {
+        if posts.iter().any(|p| now.duration_since(p.at) >= window) {
             return false;
         }
         let text = &posts[0].text;
@@ -287,7 +279,8 @@ impl Detector {
             .iter()
             .map(|p| p.channel)
             .collect::<BTreeSet<_>>()
-            .len() >= policy.min_channels
+            .len()
+            >= policy.min_channels
     }
 
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
@@ -541,13 +534,7 @@ fn drop_author_posts(
     }
 }
 
-fn drop_stale_update(
-    detector: &Detector,
-    guild: u64,
-    channel: u64,
-    message: u64,
-    replace: bool,
-) {
+fn drop_stale_update(detector: &Detector, guild: u64, channel: u64, message: u64, replace: bool) {
     if replace {
         detector.invalidate(guild, channel, message);
     }
@@ -752,13 +739,14 @@ fn consider(
         received,
         replace,
     );
-    let messages = match apply_admit_outcome(&app.text_spam, outcome, guild, channel, message, replace) {
-        Some(messages) => messages,
-        None => return,
-    };
-    let Some(report_window) = app
-        .text_spam
-        .begin_report_window(guild, author, policy.window_secs, received)
+    let messages =
+        match apply_admit_outcome(&app.text_spam, outcome, guild, channel, message, replace) {
+            Some(messages) => messages,
+            None => return,
+        };
+    let Some(report_window) =
+        app.text_spam
+            .begin_report_window(guild, author, policy.window_secs, received)
     else {
         return;
     };
@@ -869,9 +857,7 @@ mod tests {
             d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false),
             AdmitOutcome::Admitted
         );
-        let hit = matched(
-            d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false),
-        );
+        let hit = matched(d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false));
         assert_eq!(hit.unwrap().len(), 3);
         let d = Detector::default();
         assert_eq!(
@@ -929,15 +915,7 @@ mod tests {
             d.admit(1, 2, first, (0, 0), &p, now, false),
             AdmitOutcome::Admitted
         );
-        assert!(apply_admit_outcome(
-            &d,
-            AdmitOutcome::Unchanged,
-            1,
-            10,
-            1,
-            true
-        )
-        .is_none());
+        assert!(apply_admit_outcome(&d, AdmitOutcome::Unchanged, 1, 10, 1, true).is_none());
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
         assert!(apply_admit_outcome(&d, AdmitOutcome::Rejected, 1, 10, 1, true).is_none());
         assert!(!d.state.lock().index.contains_key(&(1, 10, 1)));
@@ -1092,9 +1070,7 @@ mod tests {
             d.admit(1, 2, post(3, 12, now, "hello"), (0, 0), &p, now, false),
             AdmitOutcome::Admitted
         );
-        let hit = matched(
-            d.admit(1, 2, post(4, 13, now, "spam"), (0, 0), &p, now, false),
-        );
+        let hit = matched(d.admit(1, 2, post(4, 13, now, "spam"), (0, 0), &p, now, false));
         assert_eq!(hit.unwrap().len(), 3);
     }
 
@@ -1164,10 +1140,7 @@ mod tests {
             d.admit(1, 2, post(2, 11, now, "spam"), (0, 0), &p, now, false),
             AdmitOutcome::Admitted
         );
-        let hit = matched(
-            d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false),
-        )
-        .unwrap();
+        let hit = matched(d.admit(1, 2, post(3, 12, now, "spam"), (0, 0), &p, now, false)).unwrap();
         let excerpts = d.excerpts(1, 2, &hit);
         assert_eq!(excerpts.len(), 3);
         assert!(excerpts.iter().all(|e| e.text == "spam"));

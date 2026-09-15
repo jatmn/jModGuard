@@ -413,12 +413,8 @@ impl EventHandler for Handler {
             let update = UpdateObservation {
                 author: select_update_author(
                     event.author.as_ref().map(|user| user.id.get()),
-                    self.app
-                        .text_spam
-                        .author_of(guild.get(), channel, message),
-                    self.app
-                        .image_spam
-                        .author_of(guild.get(), channel, message),
+                    self.app.text_spam.author_of(guild.get(), channel, message),
+                    self.app.image_spam.author_of(guild.get(), channel, message),
                 ),
                 received,
                 received_at,
@@ -457,9 +453,7 @@ impl EventHandler for Handler {
                     self.app
                         .image_spam
                         .invalidate(guild.get(), channel, message);
-                    self.app
-                        .text_spam
-                        .invalidate(guild.get(), channel, message);
+                    self.app.text_spam.invalidate(guild.get(), channel, message);
                 }
             }
         }

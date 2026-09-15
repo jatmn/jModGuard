@@ -171,6 +171,7 @@ impl GuildDataStore {
         note_intent: bool,
     ) -> Result<AppendCaseHistory> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         validate(&data, limits)?;
         let payload = serde_json::to_string(&data)?;
         anyhow::ensure!(

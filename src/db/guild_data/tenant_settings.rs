@@ -59,6 +59,7 @@ impl GuildDataStore {
         roles: Vec<i64>,
     ) -> Result<String> {
         self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
         anyhow::ensure!(valid_token(revision), TenantDataError::Revision);
         parse_roles(&serde_json::to_string(&roles)?)?;
         let revision = revision.to_owned();

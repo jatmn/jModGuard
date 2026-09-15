@@ -45,6 +45,8 @@ pub struct GuildStoreOptions {
 pub struct GuildDataStore {
     db: Db,
     expected: StoreRegistration,
+    /// When set, tenant mutations consult core `guild_write_fences` before writing.
+    core: Option<Db>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -293,7 +295,29 @@ impl GuildDataStore {
             |conn| initialize_store(conn, &expected, create),
             |_| Ok(()),
         )?;
-        Ok(Self { db, expected })
+        Ok(Self {
+            db,
+            expected,
+            core: None,
+        })
+    }
+
+    /// Bot/API tenant runtimes attach the core database so move fences fail closed on
+    /// guild-store mutations, not only at `TenantRuntime::live` handle acquisition.
+    pub fn with_core_write_fence(self, core: Db) -> Self {
+        Self {
+            core: Some(core),
+            ..self
+        }
+    }
+
+    pub(super) async fn refuse_fenced_guild_write(&self, guild: i64) -> Result<()> {
+        if let Some(core) = &self.core {
+            if super::guild_stores::guild_is_write_fenced(core, guild).await? {
+                return Err(super::guild_stores::GuildWriteFenced.into());
+            }
+        }
+        Ok(())
     }
 
     fn check_target(&self, placement: &GuildPlacement) -> Result<()> {
@@ -310,6 +334,7 @@ impl GuildDataStore {
     /// cannot be overwritten; this is not a move or stale-writer fencing protocol.
     pub async fn bind_initial_placement(&self, placement: GuildPlacement) -> Result<()> {
         self.check_target(&placement)?;
+        self.refuse_fenced_guild_write(placement.guild_id()).await?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {

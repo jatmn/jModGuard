@@ -316,7 +316,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     return Err(warn_result.unwrap_err());
                 }
                 _ => {
-                    return Err(anyhow!("warn outcome is uncertain; verify it in the database"));
+                    return Err(anyhow!(
+                        "warn outcome is uncertain; verify it in the database"
+                    ));
                 }
             }
             log_mod(

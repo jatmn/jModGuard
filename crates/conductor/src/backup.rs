@@ -762,10 +762,7 @@ pub async fn restore_fence_active(path: &Path) -> Result<bool> {
     let db = libsql::Builder::new_local(path).build().await?;
     let conn = db.connect()?;
     let mut rows = match conn
-        .query(
-            "SELECT value FROM meta WHERE key = 'restore_fence'",
-            (),
-        )
+        .query("SELECT value FROM meta WHERE key = 'restore_fence'", ())
         .await
     {
         Ok(rows) => rows,
@@ -1560,8 +1557,12 @@ fn recover_restore_stage(stage: &Path, restore_target: &Path) -> Result<bool> {
                 "restore target must be an absent directory"
             );
             fs::rename(stage, restore_target)?;
-            File::open(restore_target.parent().context("restore target has no parent")?)?
-                .sync_all()?;
+            File::open(
+                restore_target
+                    .parent()
+                    .context("restore target has no parent")?,
+            )?
+            .sync_all()?;
             return Ok(true);
         }
     } else {
