@@ -139,6 +139,8 @@ docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 
 The image is not automatically published on ordinary main SHA builds. Stable
 and Nightly publication can include the conductor image plus a complete signed
-manifest. Point-and-click updates remain later work. See [overhaul status](OVERHAUL.md),
+manifest. Point-and-click install and code-only rollback are documented in
+[updates](UPDATES.md) (local process adapter, `recover.json`, no silent automatic
+update). See [overhaul status](OVERHAUL.md),
 [releases](RELEASES.md),
 [backup and restore](BACKUP-RESTORE.md) and [guild moves](GUILD-MOVES.md).

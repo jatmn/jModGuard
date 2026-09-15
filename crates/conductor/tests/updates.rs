@@ -1149,6 +1149,190 @@ async fn release_update_rejected_while_guild_move_fence_active() {
 }
 
 #[tokio::test]
+async fn retry_preserves_recover_previous_after_partial_deploy() {
+    let env = setup(true).await;
+    let cookie = login(&env).await;
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    let previous_frontend = adapter.load_inventory().unwrap().components["frontend"]
+        .digest
+        .clone();
+    assert_eq!(previous_frontend, digest('d'));
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.1","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.conductor.tick_job().await.unwrap();
+    let job = env
+        .conductor
+        .store()
+        .unwrap()
+        .get_job(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, "failed", "{:?}", job.last_error);
+    let recover = Adapter::load_recover(&adapter.root).unwrap().unwrap();
+    assert_eq!(recover.previous.get("frontend").map(String::as_str), Some(digest('d').as_str()));
+    assert_eq!(recover.previous_release_id, "v0.1.0");
+    let inventory = adapter.load_inventory().unwrap();
+    assert_eq!(
+        inventory.components["frontend"].digest,
+        digest('4'),
+        "frontend already switched before api readiness failed"
+    );
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        &format!("/api/jobs/{id}/retry"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    env.conductor.tick_job().await.unwrap();
+    let recover = Adapter::load_recover(&adapter.root).unwrap().unwrap();
+    assert_eq!(
+        recover.previous.get("frontend").map(String::as_str),
+        Some(digest('d').as_str()),
+        "retry must not rebase recover.previous onto the partial inventory"
+    );
+    assert_eq!(recover.previous_release_id, "v0.1.0");
+    adapter
+        .wait_ready("api", &adapter.load_inventory().unwrap().components["api"])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn release_update_retry_rejected_while_guild_move_fence_active() {
+    let env = setup(true).await;
+    let payload = json!({
+        "release_id": "v0.2.0",
+        "preop": "skip",
+        "rollback": false,
+        "phase": "planned",
+        "plan": {
+            "desired": { "bot": digest('1') },
+            "previous": {},
+            "installed": "v0.1.0"
+        }
+    });
+    let job_id = env
+        .conductor
+        .store()
+        .unwrap()
+        .insert_job("release_update", &payload, 1)
+        .await
+        .unwrap();
+    env.conductor
+        .store()
+        .unwrap()
+        .finish_job(&job_id, false, Some("failed"))
+        .await
+        .unwrap();
+
+    let core = env.root.join("core.db");
+    write_core_for_fence(&core).await;
+    let mut cfg = env.conductor.cfg.clone();
+    cfg.capture_stores = vec![CaptureStore {
+        role: "core".into(),
+        path: core.clone(),
+    }];
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    const DEST_REV: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    conn.execute(
+        "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+         VALUES(10, ?, 'freeze', ?, ?, unixepoch())",
+        libsql::params![DEST_REV, "22222222222222222222222222222222", DEST_REV],
+    )
+    .await
+    .unwrap();
+    let harness = Env {
+        conductor,
+        router,
+        root: env.root.clone(),
+        _discord: tokio::spawn(async {}),
+        _feed: tokio::spawn(async {}),
+        _provider: tokio::spawn(async {}),
+    };
+    let cookie = login(&harness).await;
+    let (status, body) = call(
+        &harness.router,
+        "POST",
+        &format!("/api/jobs/{job_id}/retry"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("write-fence"), "{body}");
+}
+
+#[tokio::test]
+async fn recover_update_persists_inventory_after_each_component() {
+    let env = setup(true).await;
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    let before = adapter.load_inventory().unwrap();
+    let conductor_before = before.components["conductor"].clone();
+    let live = before.components["bot"].clone();
+    let mut inventory = before.clone();
+    inventory.components.insert(
+        "bot".into(),
+        jmodguard_conductor::update_adapter::ComponentRecord {
+            digest: live.digest.clone(),
+            kind: "process".into(),
+            pid: None,
+            port: live.port,
+            generation: live.generation,
+        },
+    );
+    adapter.save_inventory(&inventory).unwrap();
+    adapter
+        .write_recover(&jmodguard_conductor::update_adapter::RecoverInventory {
+            format: RECOVER_FORMAT.into(),
+            job_id: "job-partial-recover".into(),
+            release_id: "v0.2.0".into(),
+            previous_release_id: "v0.1.0".into(),
+            previous: BTreeMap::from([
+                ("conductor".into(), digest('c')),
+                ("bot".into(), digest('a')),
+            ]),
+            desired: BTreeMap::from([("bot".into(), digest('1'))]),
+            phase: "deploying".into(),
+            component: "bot".into(),
+            status: "replacing".into(),
+        })
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_jmodguard-conductor"))
+        .arg("recover-update")
+        .env_clear()
+        .env("JMODGUARD_CONDUCTOR_UPDATE_ROOT", env.root.join("update"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let after = adapter.load_inventory().unwrap();
+    assert_ne!(
+        after.components["conductor"].pid,
+        conductor_before.pid,
+        "conductor restore must persist before a later component fails"
+    );
+    assert_eq!(after.release_id, "v0.1.0");
+    adapter.wait_ready("bot", &live).await.unwrap();
+}
+
+#[tokio::test]
 async fn conductor_reconciles_installed_meta_from_inventory_on_start() {
     let env = setup(true).await;
     let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();

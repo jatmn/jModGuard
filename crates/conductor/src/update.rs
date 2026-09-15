@@ -175,8 +175,20 @@ async fn ensure_guild_move_fences_allow_update(conductor: &Conductor) -> Result<
 }
 
 /// Shared install/plan/rollback gate: recover sidecar, guild fences, and inventory coverage.
+/// Blocks while recover is failed/replacing so a *new* install cannot start over an unresolved mutation.
 pub async fn validate_update_mutation_context(conductor: &Conductor) -> Result<()> {
     ensure_new_update_allowed(&conductor.cfg)?;
+    ensure_guild_move_fences_allow_update(conductor).await?;
+    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
+    Ok(())
+}
+
+/// Shared execute/retry gate for an already-queued `release_update` job.
+/// Allows recover `failed`/`replacing`/`running` so the same job can retry after a failed deploy,
+/// but still refuses `uncertain` ownership, guild write-fences, and missing incumbent inventory.
+pub async fn validate_update_execution_context(conductor: &Conductor) -> Result<()> {
+    ensure_retry_allowed(&conductor.cfg)?;
     ensure_guild_move_fences_allow_update(conductor).await?;
     let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
     ensure_inventory_covers_incumbents(conductor, &adapter).await?;
@@ -363,7 +375,7 @@ pub async fn enqueue_rollback(
 pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Result<()> {
     let mut payload: Value = serde_json::from_str(payload_json)?;
     let rollback = payload.get("rollback").and_then(Value::as_bool) == Some(true);
-    ensure_retry_allowed(&conductor.cfg)?;
+    validate_update_execution_context(conductor).await?;
     if !rollback {
         let release_id = payload
             .get("release_id")
@@ -391,9 +403,6 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         .await?;
     }
     let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
-    if !rollback {
-        ensure_inventory_covers_incumbents(conductor, &adapter).await?;
-    }
     let desired = payload
         .get("plan")
         .and_then(|plan| plan.get("desired"))
@@ -416,6 +425,8 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let (previous, previous_release_id) =
+        recover_baseline_for_job(&adapter, job_id, previous, previous_release_id);
     let mut inventory = adapter.load_inventory()?;
     let order: Vec<&str> = if rollback {
         COMPONENTS.iter().rev().copied().collect()
@@ -524,8 +535,13 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
     )
     .await?;
     for name in &order {
-        if let Some(record) = inventory.components.get(*name) {
-            adapter.wait_ready(name, record).await?;
+        if let Some(record) = inventory.components.get(*name)
+            && let Err(error) = adapter.wait_ready(name, record).await
+        {
+            if let Ok(Some(recover)) = Adapter::load_recover(&adapter.root) {
+                mark_deploy_failed(&adapter, &recover);
+            }
+            return Err(error);
         }
     }
 
@@ -596,6 +612,7 @@ pub async fn recover_update(cfg: &Config) -> Result<Value> {
         let restored = adapter.activate(name, digest, current.as_ref()).await?;
         adapter.wait_ready(name, &restored).await?;
         inventory.components.insert((*name).to_string(), restored);
+        adapter.save_inventory(&inventory)?;
     }
     inventory.release_id = recover.previous_release_id.clone();
     adapter.save_inventory(&inventory)?;
@@ -608,6 +625,27 @@ pub async fn recover_update(cfg: &Config) -> Result<Value> {
         "job_id": recover.job_id,
         "database": "Code restored from recover.json. The previous database was not applied.",
     }))
+}
+
+/// Keep the original pre-attempt recover baseline when retrying the same job.
+/// Refreshing `plan` from current inventory must not rewrite `recover.previous`.
+fn recover_baseline_for_job(
+    adapter: &Adapter,
+    job_id: &str,
+    plan_previous: Value,
+    plan_previous_release_id: String,
+) -> (Value, String) {
+    let Ok(Some(existing)) = Adapter::load_recover(&adapter.root) else {
+        return (plan_previous, plan_previous_release_id);
+    };
+    if existing.job_id != job_id {
+        return (plan_previous, plan_previous_release_id);
+    }
+    match existing.status.as_str() {
+        "committed" | "recovered" => (plan_previous, plan_previous_release_id),
+        _ if !existing.previous.is_empty() => (json!(existing.previous), existing.previous_release_id),
+        _ => (plan_previous, plan_previous_release_id),
+    }
 }
 
 async fn checkpoint(conductor: &Conductor, preop: &str) -> Result<()> {

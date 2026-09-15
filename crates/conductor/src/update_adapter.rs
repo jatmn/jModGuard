@@ -110,10 +110,9 @@ impl Adapter {
 
     pub fn save_inventory(&self, inventory: &Inventory) -> Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        std::fs::write(
-            Self::inventory_path(&self.root),
-            serde_json::to_vec_pretty(inventory)?,
-        )?;
+        let tmp = self.root.join("inventory.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(inventory)?)?;
+        std::fs::rename(tmp, Self::inventory_path(&self.root))?;
         Ok(())
     }
 

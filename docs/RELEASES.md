@@ -69,7 +69,9 @@ invalid/incomplete artifacts and returns the catalog. `POST /api/updates` and
 `POST /api/updates/apply` queue an install when the update root is configured
 and the owner confirms interruption; they return 404 when apply is not
 configured. Owner settings select Stable/Nightly
-channels and a background poll interval.
+channels and a background poll interval. Channel selection filters the Updates
+catalog and update notifications; it is not an install ACL. An authenticated owner
+can still plan/apply a compatible signed `release_id` listed on the feed.
 Enabling the `updates` notification category can report a newly seen compatible
 build; that is not an install.
 

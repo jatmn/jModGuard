@@ -57,9 +57,10 @@ failed job payload. Use **Retry failed move** in the conductor Moves tab or
 different destination revision and is rejected while the guild write-fence from
 the failed attempt remains.
 
-Backup/restore jobs and guild-move jobs share one idle mutex. Release install and
-code rollback also use that mutex and are refused while a guild write-fence from
-a failed move is still present (see [updates](UPDATES.md)).
+Backup/restore jobs and guild-move jobs share one idle mutex. Release install,
+code rollback, and **retry of a failed `release_update` job** also use that mutex
+and are refused while a guild write-fence from a failed move is still present
+(see [updates](UPDATES.md)). Independent `recover-update` does not read fences.
 
 ## Core schema
 

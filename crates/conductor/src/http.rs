@@ -477,7 +477,7 @@ async fn api_retry_job(
     };
     if let Ok(Some(job)) = store.get_job(&id).await
         && job.kind == "release_update"
-        && let Err(error) = crate::update::ensure_retry_allowed(&state.cfg)
+        && let Err(error) = crate::update::validate_update_execution_context(&state).await
     {
         return error_response(StatusCode::BAD_REQUEST, error);
     }
