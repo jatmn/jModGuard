@@ -75,7 +75,9 @@ must not replace captured-scope helpers in dashboard routes. Status reads hide
 old/unbound memberships. `bot_action_dispatch` rechecks running claim identity,
 current membership and guild-move fencing at the primary, preserving whether dispatch
 was blocked by enrollment replacement or a move. It does not perform Discord validation
-or a mutation. Local log-channel completion checks the move fence again in the same
+or a mutation. Claim selection excludes fenced guilds; expiry of overdue `pending`/`claimed`
+work and `running`→`uncertain` still run when `expires_at` has passed, even if no other
+guild has claimable work. Local log-channel completion checks the move fence again in the same
 transaction as the setting write so a fence raised during Discord channel validation
 still fails closed. Unban completion preserves the Discord result but skips its local
 ban-mirror and event writes if a move fence was raised after dispatch.

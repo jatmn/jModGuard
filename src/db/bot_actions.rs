@@ -293,10 +293,16 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
+        // Housekeeping (expiry/uncertain) is independent of move fences. Claim
+        // selection still excludes fenced guilds in the UPDATE/SELECT below.
         let due: i64 = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE (state='pending'
-             OR (state IN ('claimed','running') AND expires_at<=?1)) AND {ACTIVE}
-             AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))"),
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND (
+             (state IN ('pending','claimed','running') AND expires_at<=?1)
+             OR (state='pending'
+                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))
+            ))"
+            ),
             params![now],
             |r| Ok(r.get(0)?),
         )?;

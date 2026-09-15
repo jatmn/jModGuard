@@ -31,7 +31,9 @@ hot-reload and automatic shared-service restarts are not claimed.
    `skip` is explicit: there is no pre-move archive.
 3. **Freeze** inserts `guild_write_fences` for that guild only. Bot/API tenant
    writes, enrolled configuration/moderation writes, nickname jobs and Discord
-   action dispatch for that guild fail closed. Other guilds continue.
+   action dispatch for that guild fail closed. Other guilds continue. Overdue
+   queued-action receipts still expire on their existing `expires_at`; they are
+   not held `pending` merely because the guild is fenced.
 4. **Copy** binds the destination with a new placement revision and copies this
    guild's membership, log mappings, cases, extra sources, history and live
    evidence. Global defaults and credentials are not copied. Pending Discord

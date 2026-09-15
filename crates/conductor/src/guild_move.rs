@@ -83,7 +83,7 @@ pub async fn plan(cfg: &Config, guild_id: i64, dest_id: &str) -> Result<Value> {
         "interruption": "This guild's writes freeze until cutover. Shared bot/API processes must already have the destination store credentials; adding a new store requires restarting those services first.",
         "confirm_shared_impact": true,
         "checkpoint": "Uses an R4 checkpoint archive when capture is configured. Source tenant rows are removed after a verified cutover; rollback is restore from that checkpoint, not a placement pointer flip.",
-        "discord": "Queued Discord actions are not replayed. Pending work stays queued until this guild resumes.",
+        "discord": "Queued Discord actions are not replayed. Claim and dispatch wait until this guild resumes; overdue receipts still expire on their existing deadline.",
     }))
 }
 

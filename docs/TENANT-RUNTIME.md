@@ -19,7 +19,9 @@ store `id` rediscovers the stamped store identity, then the matching catalog row
 id is minted only when both are absent. There is no
 per-guild task or connection pool. A dedicated store is used only for its owner guild;
 every other guild uses the shared store. Initial placement is assigned once and cannot
-be changed by this runtime. Activation checks the captured active core enrollment and
+be changed by this runtime. When `guild_store_placements` already exists, activation
+admits that catalog row even if a dedicated store remains configured for the guild;
+config is only the hint used to mint the first placement. Activation checks the captured active core enrollment and
 absence of an erasure job in the same primary transaction that admits placement.
 A departure before admission prevents activation; a departure after admission sees
 that placement and queues cleanup. The runtime guild lock orders subsequent store
