@@ -114,6 +114,7 @@ pub async fn enqueue(conductor: &Conductor, request: MoveRequest) -> Result<Stri
         &request.destination_store_id,
     )
     .await?;
+    ensure_new_move_allowed(conductor, request.guild_id).await?;
     let dest_revision = hex32();
     let payload = json!({
         "guild_id": request.guild_id,
@@ -179,6 +180,42 @@ async fn checkpoint(conductor: &Conductor, preop: &str) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn ensure_new_move_allowed(conductor: &Conductor, guild_id: i64) -> Result<()> {
+    if active_move_fence(&conductor.cfg, guild_id).await?.is_none() {
+        return Ok(());
+    }
+    let store = conductor.store().context("control store is not configured")?;
+    if let Some(job) = store.latest_failed_guild_move_for_guild(guild_id).await? {
+        anyhow::bail!(
+            "guild {guild_id} still has a move write-fence from a failed attempt; \
+             retry job {job_id} instead of starting a new move (POST /api/jobs/{job_id}/retry)",
+            job_id = job.id,
+        );
+    }
+    anyhow::bail!(
+        "guild {guild_id} has an active move write-fence; wait for the in-flight move job, \
+         retry its failed job record, or restore from checkpoint before starting a new move",
+    );
+}
+
+async fn active_move_fence(cfg: &Config, guild: i64) -> Result<Option<(String, String)>> {
+    let core = core_path(cfg)?;
+    if !core.exists() {
+        return Ok(None);
+    }
+    let conn = open(core).await?;
+    let mut rows = conn
+        .query(
+            "SELECT destination_store_id, destination_revision FROM guild_write_fences WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => Some((row.get(0)?, row.get(1)?)),
+        None => None,
+    })
 }
 
 async fn freeze(

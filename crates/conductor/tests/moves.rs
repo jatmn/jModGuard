@@ -381,6 +381,86 @@ async fn clear_stale_fences_drops_orphan_fence_after_cutover() {
 }
 
 #[tokio::test]
+async fn start_move_rejected_while_move_fence_requires_job_retry() {
+    let h = setup().await;
+    let cookie = login(&h).await;
+    let core = h.root.join("core.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+         VALUES(10, ?, 'freeze', ?, ?, unixepoch())",
+        libsql::params![DEST_REV, DEDICATED, DEST_REV],
+    )
+    .await
+    .unwrap();
+    let store = h.conductor.store().unwrap();
+    let job_id = store
+        .insert_job(
+            "guild_move",
+            &serde_json::json!({
+                "guild_id": 10,
+                "destination_store_id": DEDICATED,
+                "destination_revision": DEST_REV,
+                "preop": "skip",
+            }),
+            1,
+        )
+        .await
+        .unwrap();
+    let claimed = store.claim_job().await.unwrap().unwrap();
+    assert_eq!(claimed.id, job_id);
+    store
+        .finish_job(&job_id, false, Some("simulated failure"))
+        .await
+        .unwrap();
+
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&job_id), "{body}");
+    assert!(body.contains("retry job"), "{body}");
+}
+
+#[tokio::test]
+async fn failed_move_jobs_surface_retry_on_moves_api() {
+    let h = setup().await;
+    let cookie = login(&h).await;
+    let store = h.conductor.store().unwrap();
+    let job_id = store
+        .insert_job(
+            "guild_move",
+            &serde_json::json!({
+                "guild_id": 10,
+                "destination_store_id": DEDICATED,
+                "destination_revision": DEST_REV,
+                "preop": "skip",
+            }),
+            1,
+        )
+        .await
+        .unwrap();
+    let claimed = store.claim_job().await.unwrap().unwrap();
+    assert_eq!(claimed.id, job_id);
+    store
+        .finish_job(&job_id, false, Some("simulated failure"))
+        .await
+        .unwrap();
+
+    let (status, body, _) = call(&h.router, "GET", "/api/moves", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"failed_jobs\""), "{body}");
+    assert!(body.contains(&job_id), "{body}");
+    assert!(body.contains("\"status\":\"failed\""), "{body}");
+}
+
+#[tokio::test]
 async fn denied_users_cannot_plan_or_start_moves() {
     let h = setup().await;
     let (status, _, _) = call(&h.router, "GET", "/api/moves", None, None).await;

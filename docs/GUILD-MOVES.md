@@ -49,6 +49,12 @@ Interrupted running jobs fail closed. Manual retry resumes: if placement already
 points at the destination revision, copy/switch are skipped and source cleanup
 retries. A destination that already has a different binding is refused.
 
+Recovery after a failed attempt keeps the original move generation in the
+failed job payload. Use **Retry failed move** in the conductor Moves tab or
+`POST /api/jobs/{id}/retry` on that job record. Starting a new move mints a
+different destination revision and is rejected while the guild write-fence from
+the failed attempt remains.
+
 Backup/restore jobs and guild-move jobs share one idle mutex.
 
 ## Core schema

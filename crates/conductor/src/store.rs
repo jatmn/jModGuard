@@ -687,6 +687,23 @@ impl ControlStore {
         }
     }
 
+    /// Latest failed guild-move job for this guild, if any (same payload `guild_id`).
+    pub async fn latest_failed_guild_move_for_guild(
+        &self,
+        guild_id: i64,
+    ) -> Result<Option<JobRow>> {
+        for job in self.list_jobs(50).await? {
+            if job.kind != "guild_move" || job.status != "failed" {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(&job.payload_json)?;
+            if payload.get("guild_id").and_then(serde_json::Value::as_i64) == Some(guild_id) {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn list_jobs(&self, limit: i64) -> Result<Vec<JobRow>> {
         let conn = self.connect().await?;
         let mut rows = conn

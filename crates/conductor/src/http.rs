@@ -975,10 +975,16 @@ async fn api_moves(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> R
         .into_iter()
         .filter(|job| job.kind == "guild_move")
         .collect();
+    let failed_moves: Vec<_> = moves
+        .iter()
+        .filter(|job| job.status == "failed")
+        .cloned()
+        .collect();
     Json(serde_json::json!({
         "available": crate::guild_move::moves_available(&state.cfg),
         "catalog": catalog,
         "jobs": moves,
+        "failed_jobs": failed_moves,
     }))
     .into_response()
 }
