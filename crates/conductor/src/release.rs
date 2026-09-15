@@ -704,6 +704,50 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_matches_python_utf8_strings() {
+        let value = serde_json::json!({"a": 1, "notes": "café"});
+        assert_eq!(
+            String::from_utf8(canonical_json(&value)).unwrap(),
+            r#"{"a":1,"notes":"café"}"#
+        );
+    }
+
+    #[test]
+    fn non_ascii_notes_manifest_verifies() {
+        let body = serde_json::json!({
+            "format": FORMAT,
+            "release_id": "v0.2.0",
+            "channel": "stable",
+            "version": "0.2.0",
+            "source_commit": "a".repeat(40),
+            "published_at": "2026-09-15T00:00:00Z",
+            "components": {
+                "bot": {"digest": format!("sha256:{}", "1".repeat(64)), "platform": "linux/amd64", "size": 1},
+                "api": {"digest": format!("sha256:{}", "2".repeat(64)), "platform": "linux/amd64", "size": 1},
+                "conductor": {"digest": format!("sha256:{}", "3".repeat(64)), "platform": "linux/amd64", "size": 1},
+                "frontend": {
+                    "sha256": format!("sha256:{}", "4".repeat(64)),
+                    "files": {"index.html": "a", "app.js": "b", "style.css": "c"}
+                }
+            },
+            "schema": {
+                "core_family": "jmodguard-core-1",
+                "core_version": 12,
+                "guild_family": "jmodguard-guild-1",
+                "guild_version": 8
+            },
+            "settings_schema": 1,
+            "backup_format": "JMODGUARD-BACKUP-1",
+            "compatibility": {"min_conductor": "0.1.0", "rollback": "matching-backup"},
+            "notes": "café",
+        });
+        let signed = sign_manifest(body, "rp1", &"a".repeat(64)).unwrap();
+        let mut keys = BTreeMap::new();
+        keys.insert("rp1".into(), "a".repeat(64));
+        verify_manifest(&signed, &keys).expect("utf-8 notes must verify");
+    }
+
+    #[test]
     fn merge_discovered_catalog_retains_indexed_release_when_reverify_fails() {
         let previous = vec![DiscoveredRelease {
             release_id: "v0.2.0".into(),

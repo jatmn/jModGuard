@@ -62,6 +62,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(body["channel"], "stable")
         self.assertEqual(set(body["components"]), set(release.REQUIRED))
 
+    def test_canonical_json_uses_utf8_for_non_ascii(self):
+        self.assertEqual(
+            release.canonical({"a": 1, "notes": "café"}),
+            '{"a":1,"notes":"café"}'.encode("utf-8"),
+        )
+
+    def test_non_ascii_notes_sign_and_verify(self):
+        unsigned = self.complete()
+        unsigned["notes"] = "café"
+        key_id, secret = "rp1", release.generate_hmac_key()
+        signed = release.sign(unsigned, key_id, secret)
+        body = release.verify(signed, {key_id: secret})
+        self.assertEqual(body["notes"], "café")
+
     def test_partial_or_unsigned_or_unknown_key_is_unavailable(self):
         with self.assertRaises(ValueError):
             release.build_unsigned("stable", "v0.2.0", SHA, "t", {"bot": BOT, "api": API})

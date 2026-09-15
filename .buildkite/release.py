@@ -24,7 +24,10 @@ HEX32 = re.compile(r"[0-9a-f]{64}")
 
 
 def canonical(value):
-    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    # Match conductor canonical_json: UTF-8 in JSON strings (serde_json), sorted object keys.
+    return json.dumps(
+        value, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
 
 
 def stable_tag(name):
