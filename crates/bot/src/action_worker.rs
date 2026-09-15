@@ -166,13 +166,18 @@ async fn execute_inner(
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
         }
+        match db::bot_action_dispatch(db, job).await {
+            Ok(db::BotActionDispatch::Ready) => {}
+            Ok(db::BotActionDispatch::EnrollmentEnded) => {
+                return Outcome::failed("enrollment_ended");
+            }
+            Ok(db::BotActionDispatch::GuildMoveFenced) => {
+                return Outcome::failed("guild_move_fenced");
+            }
+            Err(_) => return Outcome::failed("enrollment_check_unavailable"),
+        }
         match &job.action {
             Action::Unban { user_id, reason } => {
-                match db::bot_action_can_dispatch(db, job).await {
-                    Ok(true) => {}
-                    Ok(false) => return Outcome::failed("enrollment_ended"),
-                    Err(_) => return Outcome::failed("enrollment_check_unavailable"),
-                }
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
                 }

@@ -103,6 +103,7 @@ pub async fn pending_nickname_reconciles(
                  ON e.guild_id=n.guild_id AND e.id=n.enrollment_id AND e.active=1
              WHERE n.state='pending' AND n.next_attempt_at <= ?1 AND n.job_id IS NOT NULL
                  AND n.nickname IS NOT NULL
+                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=n.guild_id)
              ORDER BY n.next_attempt_at,n.guild_id LIMIT ?2",
         )?;
         let out = stmt.query_map(params![now, i64::from(limit.max(1))], |row| {
@@ -174,7 +175,8 @@ pub async fn nickname_reconcile_can_dispatch(db: &Db, job: &NicknameReconcileJob
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let matches = nickname_job_matches_conn(&tx, &job)?;
+        let matches = nickname_job_matches_conn(&tx, &job)?
+            && !super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
         tx.finish_read()?;
         Ok(matches)
     })

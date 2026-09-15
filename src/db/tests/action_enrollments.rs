@@ -118,7 +118,10 @@ async fn old_claim_and_completion_cannot_change_new_enrollment_or_another_guild(
     .await
     .unwrap();
     enroll_guild(&f.db, 10, 101).await.unwrap();
-    assert!(!bot_action_can_dispatch(&f.db, &claim).await.unwrap());
+    assert_eq!(
+        bot_action_dispatch(&f.db, &claim).await.unwrap(),
+        BotActionDispatch::EnrollmentEnded
+    );
     assert!(
         !finish_bot_action(&f.db, &claim, "succeeded", "log_channel_set")
             .await
@@ -177,7 +180,10 @@ async fn altered_claim_identity_is_rejected_before_dispatch_and_local_effects() 
             3 => forged.enrollment_id = Some("forged".into()),
             _ => forged.joined_at_ns = Some(101),
         }
-        assert!(!bot_action_can_dispatch(&f.db, &forged).await.unwrap());
+        assert_eq!(
+            bot_action_dispatch(&f.db, &forged).await.unwrap(),
+            BotActionDispatch::EnrollmentEnded
+        );
         assert!(
             !finish_bot_action(&f.db, &forged, "succeeded", "unbanned")
                 .await

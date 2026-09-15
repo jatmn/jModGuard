@@ -26,6 +26,14 @@ impl BotAction {
         self.state == "claimed" && self.claim.is_some()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotActionDispatch {
+    Ready,
+    EnrollmentEnded,
+    GuildMoveFenced,
+}
+
 const ACTIVE: &str =
     "EXISTS(SELECT 1 FROM guild_enrollments e WHERE e.guild_id=bot_actions.guild_id
     AND e.id=bot_actions.enrollment_id AND e.joined_at_ns=bot_actions.joined_at_ns AND e.active=1)";
@@ -406,6 +414,15 @@ async fn finish_bot_action_inner(
         } else {
             (state, outcome)
         };
+        let (state, outcome) = if enforce_local_deadline
+            && state == "succeeded"
+            && matches!(job.action, Action::SetLogChannel { .. })
+            && super::guild_stores::guild_write_fenced(&tx, job.guild_id)?
+        {
+            ("failed".to_owned(), "guild_move_fenced".to_owned())
+        } else {
+            (state, outcome)
+        };
         let changed = tx.execute(
             &format!(
                 "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
@@ -571,15 +588,20 @@ fn claimed_identity_matches(
     }))
 }
 
-/// Recheck committed membership after HTTP validation, immediately before dispatch.
-pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
+/// Recheck committed membership and move fencing immediately before dispatch.
+pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDispatch> {
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let valid = claimed_identity_matches(&tx, &job, Some("running"))?
-            && !super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
+        let status = if !claimed_identity_matches(&tx, &job, Some("running"))? {
+            BotActionDispatch::EnrollmentEnded
+        } else if super::guild_stores::guild_write_fenced(&tx, job.guild_id)? {
+            BotActionDispatch::GuildMoveFenced
+        } else {
+            BotActionDispatch::Ready
+        };
         tx.finish_read()?;
-        Ok(valid)
+        Ok(status)
     })
     .await
 }

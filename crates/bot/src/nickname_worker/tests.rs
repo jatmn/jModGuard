@@ -101,6 +101,50 @@ async fn matching_membership_allows_current_request_only() {
 }
 
 #[tokio::test]
+async fn move_fence_defers_pending_nickname_without_discord_lookup() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let destination = db::guild_stores::StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    let generation = db::guild_stores::set_guild_write_fence(
+        &f.db,
+        10,
+        destination,
+        format!("{:032x}", 9u128),
+        "freeze",
+    )
+    .await
+    .unwrap();
+    assert!(
+        db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let source = Source::default();
+    assert!(!dispatch_ready(&f.db, &job, &source).await.unwrap());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+
+    db::guild_stores::clear_guild_write_fence(&f.db, 10, &generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
+            .await
+            .unwrap(),
+        vec![job.clone()]
+    );
+    assert!(dispatch_ready(&f.db, &job, &source).await.unwrap());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn changed_membership_blocks_work_without_retiring_or_rebinding() {
     let f = Fixture::new();
     let job = f.job().await;

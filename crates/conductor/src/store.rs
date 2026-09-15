@@ -692,16 +692,40 @@ impl ControlStore {
         &self,
         guild_id: i64,
     ) -> Result<Option<JobRow>> {
-        for job in self.list_jobs(50).await? {
-            if job.kind != "guild_move" || job.status != "failed" {
-                continue;
-            }
+        for job in self.failed_guild_move_jobs().await? {
             let payload: serde_json::Value = serde_json::from_str(&job.payload_json)?;
             if payload.get("guild_id").and_then(serde_json::Value::as_i64) == Some(guild_id) {
                 return Ok(Some(job));
             }
         }
         Ok(None)
+    }
+
+    pub async fn failed_guild_move_jobs(&self) -> Result<Vec<JobRow>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, payload_json, attempts, max_attempts, due_ms, last_error, created_ms, finished_ms \
+                 FROM jobs WHERE kind='guild_move' AND status='failed' ORDER BY created_ms DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(JobRow {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                status: row.get(2)?,
+                payload_json: row.get(3)?,
+                attempts: row.get(4)?,
+                max_attempts: row.get(5)?,
+                due_ms: row.get(6)?,
+                last_error: row.get(7).ok(),
+                created_ms: row.get(8)?,
+                finished_ms: row.get(9).ok(),
+            });
+        }
+        Ok(out)
     }
 
     pub async fn list_jobs(&self, limit: i64) -> Result<Vec<JobRow>> {

@@ -414,6 +414,13 @@ async fn start_move_rejected_while_move_fence_requires_job_retry() {
         .finish_job(&job_id, false, Some("simulated failure"))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    for index in 0..51 {
+        store
+            .insert_job("notify_test", &serde_json::json!({ "index": index }), 1)
+            .await
+            .unwrap();
+    }
 
     let (status, body, _) = call(
         &h.router,
@@ -452,6 +459,13 @@ async fn failed_move_jobs_surface_retry_on_moves_api() {
         .finish_job(&job_id, false, Some("simulated failure"))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    for index in 0..51 {
+        store
+            .insert_job("notify_test", &serde_json::json!({ "index": index }), 1)
+            .await
+            .unwrap();
+    }
 
     let (status, body, _) = call(&h.router, "GET", "/api/moves", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");

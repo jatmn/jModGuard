@@ -186,7 +186,9 @@ async fn ensure_new_move_allowed(conductor: &Conductor, guild_id: i64) -> Result
     if active_move_fence(&conductor.cfg, guild_id).await?.is_none() {
         return Ok(());
     }
-    let store = conductor.store().context("control store is not configured")?;
+    let store = conductor
+        .store()
+        .context("control store is not configured")?;
     if let Some(job) = store.latest_failed_guild_move_for_guild(guild_id).await? {
         anyhow::bail!(
             "guild {guild_id} still has a move write-fence from a failed attempt; \
