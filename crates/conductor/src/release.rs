@@ -212,8 +212,14 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
     let mut discovered = Vec::new();
     for item in listed {
         let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
-        let url = absolute(feed, path)?;
-        let raw = fetch_text(&conductor.http, &url, MAX_MANIFEST_BYTES).await?;
+        let url = match absolute(feed, path) {
+            Ok(url) => url,
+            Err(_) => continue,
+        };
+        let raw = match fetch_text(&conductor.http, &url, MAX_MANIFEST_BYTES).await {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
         let manifest = match verify_manifest(&raw, &cfg.release_keys) {
             Ok(value) => value,
             Err(_) => continue,
@@ -261,6 +267,9 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
     }
     if let Ok(store) = conductor.store() {
         let previous = store.list_discovered_releases().await.unwrap_or_default();
+        if discovered.is_empty() && !previous.is_empty() {
+            anyhow::bail!("release feed contained no verified manifests");
+        }
         store.replace_discovered_releases(&discovered).await?;
         store
             .meta_set("release_last_poll_ms", &now_ms().to_string())
@@ -270,12 +279,37 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
     Ok(discovered)
 }
 
-pub async fn catalog_for(conductor: &Conductor) -> Result<Value> {
+async fn poll_interval_elapsed(store: &crate::store::ControlStore, interval_secs: u64) -> Result<bool> {
+    if let Some(last) = store.meta_get("release_last_poll_ms").await?
+        && let Ok(last_ms) = last.parse::<i64>()
+    {
+        let wait = i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        if now_ms().saturating_sub(last_ms) < wait {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Polls the feed when `force` is true or the configured interval has elapsed.
+pub async fn refresh_if_due(conductor: &Conductor, force: bool) -> Result<()> {
+    if !discovery_available(&conductor.cfg) {
+        return Ok(());
+    }
+    let store = conductor.store()?;
+    if !force {
+        let settings = conductor.settings().await.unwrap_or_default();
+        if !poll_interval_elapsed(store, settings.discovery_interval_secs).await? {
+            return Ok(());
+        }
+    }
+    refresh(conductor).await.map(|_| ())
+}
+
+pub async fn catalog_for(conductor: &Conductor, force: bool) -> Result<Value> {
     let settings = conductor.settings().await.unwrap_or_default();
     let mut poll_error = None;
-    if discovery_available(&conductor.cfg)
-        && let Err(error) = refresh(conductor).await
-    {
+    if let Err(error) = refresh_if_due(conductor, force).await {
         poll_error = Some(error.to_string());
     }
     let releases = match conductor.store() {

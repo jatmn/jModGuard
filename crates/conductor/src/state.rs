@@ -485,25 +485,7 @@ impl Conductor {
     }
 
     async fn maybe_refresh_releases(&self) -> Result<()> {
-        if !crate::release::discovery_available(&self.cfg) {
-            return Ok(());
-        }
-        let store = self.store()?;
-        let interval = self
-            .settings()
-            .await
-            .unwrap_or_default()
-            .discovery_interval_secs;
-        if let Some(last) = store.meta_get("release_last_poll_ms").await?
-            && let Ok(last_ms) = last.parse::<i64>()
-        {
-            let wait = i64::try_from(interval.saturating_mul(1000)).unwrap_or(i64::MAX);
-            if now_ms().saturating_sub(last_ms) < wait {
-                return Ok(());
-            }
-        }
-        crate::release::refresh(self).await?;
-        Ok(())
+        crate::release::refresh_if_due(self, false).await
     }
 
     async fn run_job(&self, job_id: &str, kind: &str, payload_json: &str) -> Result<()> {

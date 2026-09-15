@@ -179,7 +179,7 @@ impl ControlSettings {
             "backup_retain_checkpoints": { "value": self.backup_retain_checkpoints, "applied": true, "unit": "releases" },
             "backup_max_archive_bytes": { "value": self.backup_max_archive_bytes, "applied": true, "unit": "bytes" },
             "discovery_channels": { "value": self.discovery_channels, "applied": true },
-            "discovery_interval_secs": { "value": self.discovery_interval_secs, "applied": true, "unit": "seconds" },
+            "discovery_interval_secs": { "value": self.discovery_interval_secs, "applied": true, "unit": "seconds", "note": "Background worker only; use Refresh catalog for an immediate poll." },
             "process_owned": {
                 "image_spam": "Bot process configuration. Not applied by the conductor.",
                 "log_discord_concurrency": "Bot process configuration. Not applied by the conductor.",

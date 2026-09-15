@@ -54,5 +54,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, json.JSONDecodeError) as error:
+    except (ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         sys.exit(f"Release Please failed: {error}")

@@ -401,6 +401,32 @@ async fn catalog_lists_complete_signed_releases_and_refuses_apply() {
 }
 
 #[tokio::test]
+async fn forced_refresh_query_polls_immediately() {
+    let env = setup(&["stable"]).await;
+    let cookie = login(&env).await;
+    let store = env.conductor.store().unwrap();
+    store
+        .meta_set("release_last_poll_ms", &jmodguard_conductor::store::now_ms().to_string())
+        .await
+        .unwrap();
+    let (status, body) = call(
+        &env.router,
+        "GET",
+        "/api/updates?refresh=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let catalog: Value = serde_json::from_str(&body).unwrap();
+    assert!(catalog["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["release_id"] == "v0.2.0"));
+}
+
+#[tokio::test]
 async fn stable_only_hides_nightly_and_unconfigured_discovery_stays_inactive() {
     let env = setup(&["stable"]).await;
     let cookie = login(&env).await;

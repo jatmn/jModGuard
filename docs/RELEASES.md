@@ -50,9 +50,11 @@ installation; restore a matching backup instead.
 
 `/version` keeps `update_available: false`. `discovery_available` is true only
 when operations, a feed and at least one key are configured. `GET /api/updates`
-polls the feed, verifies signatures, skips invalid/incomplete artifacts and
-returns the catalog. `POST /api/updates` and `POST /api/updates/apply` return
-404. Owner settings select Stable/Nightly channels and a poll interval.
+returns the cached catalog and polls the feed when the background interval has
+elapsed (or immediately when `?refresh=true`). It verifies signatures, skips
+invalid/incomplete artifacts and returns the catalog. `POST /api/updates` and
+`POST /api/updates/apply` return 404. Owner settings select Stable/Nightly
+channels and a background poll interval.
 Enabling the `updates` notification category can report a newly seen compatible
 build; that is not an install.
 

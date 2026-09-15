@@ -257,13 +257,18 @@ function tabUpdates() {
     }
     rows.forEach((row) => list.append(el("div", { class: "card" },
       el("strong", { text: `${row.release_id} · ${row.channel}` }),
-      el("p", { class: "muted", text: row.compatible ? "Compatible with this installation's schema and backup format." : (row.blocked_reason || "Incompatible") }),
+      el("p", { class: "muted", text: row.compatible ? "Signed release passes current core-version and backup-format checks (install still inactive)." : (row.blocked_reason || "Incompatible") }),
       el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
       el("p", { class: "muted", text: (row.components || []).join(", ") }),
       el("p", { class: "muted", text: row.notes || "No notes." }),
     )));
   };
   api("/api/updates").then(renderCatalog).catch((e) => { catalog.textContent = e.message; });
+  const refreshBtn = el("button", { class: "btn", text: "Refresh catalog", onclick: async () => {
+    try {
+      renderCatalog(await api("/api/updates?refresh=true"));
+    } catch (e) { toast(e.message, "error"); }
+  } });
   return el("div", {},
     el("h2", { text: "Updates" }),
     el("p", { class: "muted", text: "Browse signed Stable and Nightly publications. This page never installs a build; point-and-click apply arrives later. There is no silent automatic update." }),
@@ -271,7 +276,7 @@ function tabUpdates() {
       el("h3", { text: "Discovery" }),
       field("Stable channel", stable),
       field("Nightly channel", nightly),
-      field("Poll interval (seconds, applied)", interval),
+      field("Poll interval (seconds, background worker)", interval),
       el("button", { class: "btn primary", text: "Save discovery settings", onclick: async () => {
         try {
           const channels = [];
@@ -286,7 +291,7 @@ function tabUpdates() {
           render();
         } catch (e) { toast(e.message, "error"); }
       } }),
-      el("button", { class: "btn", text: "Refresh catalog", onclick: () => render() }),
+      refreshBtn,
     ),
     el("div", { class: "card" }, el("h3", { text: "Installed and availability" }), catalog),
     el("div", { class: "card" }, el("h3", { text: "Complete publications" }), list),

@@ -61,7 +61,9 @@ idle and absolute limits remain authoritative. Logout revokes that row; a restar
 unrevoked sessions. Administration
 pages: System Status, Installation, Notifications, Updates, Backups, Moves. The Updates
 page lists complete signed publications for selected channels. It never exposes an
-install button. `GET /api/updates` is discovery; apply POST routes return 404.
+install button. `GET /api/updates` returns the cached catalog and polls the feed
+when the background interval has elapsed (or when `?refresh=true`). Apply POST
+routes return 404.
 
 Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
 takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending

@@ -1090,11 +1090,21 @@ async fn api_move_start(
     }
 }
 
-async fn api_updates(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct UpdatesQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn api_updates(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Query(query): Query<UpdatesQuery>,
+) -> Response {
     if let Err(error) = operator(&state, &headers).await {
         return auth_error(error);
     }
-    match crate::release::catalog_for(&state).await {
+    match crate::release::catalog_for(&state, query.refresh).await {
         Ok(body) => Json(body).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
