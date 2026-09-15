@@ -1152,6 +1152,8 @@ async fn api_updates(
 #[derive(Deserialize)]
 struct UpdatesPlanQuery {
     release_id: String,
+    #[serde(default)]
+    preop: String,
 }
 
 async fn api_updates_plan(
@@ -1171,7 +1173,11 @@ async fn api_updates_plan(
         )
             .into_response();
     }
-    match crate::update::plan(&state, &query.release_id, None).await {
+    let preop = match crate::update::parse_preop(query.preop.as_str()) {
+        Ok(value) => value,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    match crate::update::plan(&state, &query.release_id, Some(preop)).await {
         Ok(body) => Json(body).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }

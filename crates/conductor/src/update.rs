@@ -127,6 +127,25 @@ pub fn ensure_retry_allowed(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+pub fn parse_preop(preop: &str) -> Result<&'static str> {
+    Ok(match preop {
+        "" | "fresh" => "fresh",
+        "recent" => "recent",
+        "skip" => "skip",
+        _ => anyhow::bail!("preop must be fresh, recent, or skip"),
+    })
+}
+
+pub fn ensure_preop_capture(conductor: &Conductor, preop: &str) -> Result<()> {
+    if preop != "skip" {
+        ensure!(
+            conductor.capture_available(),
+            "checkpoint capture is not configured; pass preop=skip only after accepting no pre-update archive"
+        );
+    }
+    Ok(())
+}
+
 fn checkpoint_plan_summary(preop: &str) -> &'static str {
     match preop {
         "skip" => "No pre-update archive (preop=skip). Compatible rollback does not restore the previous database.",
@@ -223,18 +242,8 @@ pub async fn enqueue(conductor: &Conductor, request: ApplyRequest) -> Result<Str
         request.confirm_interruption,
         "confirm the bot exclusive drain, local API restart, and conductor recover-update path"
     );
-    let preop = match request.preop.as_str() {
-        "" | "fresh" => "fresh",
-        "recent" => "recent",
-        "skip" => "skip",
-        _ => anyhow::bail!("preop must be fresh, recent, or skip"),
-    };
-    if preop != "skip" {
-        ensure!(
-            conductor.capture_available(),
-            "checkpoint capture is not configured; pass preop=skip only after accepting no pre-update archive"
-        );
-    }
+    let preop = parse_preop(request.preop.as_str())?;
+    ensure_preop_capture(conductor, preop)?;
     let release_id = request.release_id.trim();
     ensure!(!release_id.is_empty(), "release_id is required");
     ensure_new_update_allowed(&conductor.cfg)?;
@@ -440,7 +449,6 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         match adapter.wait_ready(name, &activated).await {
             Ok(()) => {
                 inventory.components.insert((*name).to_string(), activated);
-                inventory.release_id = release_id.clone();
                 adapter.save_inventory(&inventory)?;
             }
             Err(error) => {

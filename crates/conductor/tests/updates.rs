@@ -439,7 +439,7 @@ async fn successful_update_and_code_only_rollback() {
     let (status, plan) = call(
         &env.router,
         "GET",
-        "/api/updates/plan?release_id=v0.2.0",
+        "/api/updates/plan?release_id=v0.2.0&preop=skip",
         Some(&cookie),
         None,
     )
@@ -593,6 +593,11 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
         let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
         let inventory = adapter.load_inventory().unwrap();
         assert_eq!(inventory.components["api"].digest, digest('b'));
+        assert_eq!(
+            inventory.release_id,
+            "v0.1.0",
+            "release_id must not advance until the job commits"
+        );
         adapter
             .wait_ready("api", &inventory.components["api"])
             .await
@@ -802,6 +807,38 @@ async fn update_shares_idle_mutex_and_refuses_incompatible() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("older schema"), "{body}");
+}
+
+#[tokio::test]
+async fn plan_preflight_reflects_preop_query() {
+    let env = setup(true).await;
+    let cookie = login(&env).await;
+    let (status, body) = call(
+        &env.router,
+        "GET",
+        "/api/updates/plan?release_id=v0.2.0&preop=skip",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("preop=skip"),
+        "plan checkpoint text should match skip preop: {body}"
+    );
+    let (status, body) = call(
+        &env.router,
+        "GET",
+        "/api/updates/plan?release_id=v0.2.0&preop=fresh",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("fresh R4 checkpoint"),
+        "plan checkpoint text should match fresh preop: {body}"
+    );
 }
 
 #[tokio::test]

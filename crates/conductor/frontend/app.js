@@ -271,7 +271,7 @@ function tabUpdates() {
       if (data.update_available && row.compatible) {
         actions.push(el("button", { class: "btn", text: "Preview impact", onclick: async () => {
           try {
-            toast(JSON.stringify(await api(`/api/updates/plan?release_id=${encodeURIComponent(row.release_id)}`)), "info");
+            toast(JSON.stringify(await api(`/api/updates/plan?release_id=${encodeURIComponent(row.release_id)}&preop=${encodeURIComponent(preop.value)}`)), "info");
           } catch (e) { toast(e.message, "error"); }
         } }));
         actions.push(el("button", { class: "btn primary", text: "Install this release", onclick: async () => {
