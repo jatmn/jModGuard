@@ -1,7 +1,11 @@
 //! Process configuration only. Guild/bot/API credentials are never loaded here.
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
-use std::{net::SocketAddr, path::{Path, PathBuf}, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct CaptureStore {
@@ -28,6 +32,7 @@ pub struct Config {
     pub capture_stores: Vec<CaptureStore>,
     pub evidence_root: Option<PathBuf>,
     pub restore_target: Option<PathBuf>,
+    pub guild_stores: Vec<GuildStorePath>,
 }
 
 impl std::fmt::Debug for Config {
@@ -53,6 +58,7 @@ impl std::fmt::Debug for Config {
             .field("capture_stores", &self.capture_stores)
             .field("evidence_root", &self.evidence_root)
             .field("restore_target", &self.restore_target)
+            .field("guild_stores", &self.guild_stores)
             .finish()
     }
 }
@@ -128,6 +134,8 @@ impl Config {
         )?;
         let evidence_root = optional_path(lookup("JMODGUARD_CONDUCTOR_EVIDENCE_ROOT")?)?;
         let restore_target = optional_path(lookup("JMODGUARD_CONDUCTOR_RESTORE_TARGET")?)?;
+        let guild_stores =
+            parse_guild_stores(lookup("JMODGUARD_CONDUCTOR_GUILD_STORES")?.unwrap_or_default())?;
         if let (Some(backup), Some(evidence)) = (&backup_root, &evidence_root) {
             ensure_disjoint_roots(
                 backup,
@@ -172,6 +180,29 @@ impl Config {
                 )?;
             }
         }
+        for store in &guild_stores {
+            if let Some(backup) = &backup_root {
+                ensure_disjoint_roots(
+                    backup,
+                    &store.path,
+                    "guild stores must not overlap the backup root",
+                )?;
+            }
+            if let Some(evidence) = &evidence_root {
+                ensure_disjoint_roots(
+                    evidence,
+                    &store.path,
+                    "guild stores must not overlap the evidence root",
+                )?;
+            }
+            if let Some(restore) = &restore_target {
+                ensure_disjoint_roots(
+                    restore,
+                    &store.path,
+                    "guild stores must not overlap the restore target",
+                )?;
+            }
+        }
         Ok(Self {
             bind,
             log_filter,
@@ -190,6 +221,7 @@ impl Config {
             capture_stores,
             evidence_root,
             restore_target,
+            guild_stores,
         })
     }
 
@@ -306,6 +338,51 @@ fn parse_capture_stores(raw: String) -> Result<Vec<CaptureStore>> {
         let path = PathBuf::from(store.path.trim());
         anyhow::ensure!(path.is_absolute(), "capture store paths must be absolute");
         out.push(CaptureStore { role, path });
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub struct GuildStorePath {
+    pub id: String,
+    pub role: String,
+    pub path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct GuildStoreJson {
+    id: String,
+    role: String,
+    path: String,
+}
+
+fn parse_guild_stores(raw: String) -> Result<Vec<GuildStorePath>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Vec<GuildStoreJson> =
+        serde_json::from_str(trimmed).context("JMODGUARD_CONDUCTOR_GUILD_STORES")?;
+    let mut out = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for store in parsed {
+        let id = store.id.trim().to_string();
+        anyhow::ensure!(
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "guild store id is invalid"
+        );
+        anyhow::ensure!(ids.insert(id.clone()), "duplicate guild store id");
+        let role = store.role.trim().to_string();
+        anyhow::ensure!(
+            role == "shared" || role == "dedicated",
+            "guild store role must be shared or dedicated"
+        );
+        let path = PathBuf::from(store.path.trim());
+        anyhow::ensure!(path.is_absolute(), "guild store paths must be absolute");
+        out.push(GuildStorePath { id, role, path });
     }
     Ok(out)
 }

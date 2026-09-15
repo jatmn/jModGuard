@@ -520,6 +520,42 @@ impl ControlStore {
         }
     }
 
+    pub async fn insert_move_job_if_idle(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: i64,
+    ) -> Result<Option<String>> {
+        anyhow::ensure!(kind == "guild_move", "not a guild-move job");
+        let id = random_token();
+        let conn = self.connect().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<bool> = async {
+            if backup_job_is_active(&conn).await? {
+                return Ok(false);
+            }
+            let now = now_ms();
+            conn.execute(
+                "INSERT INTO jobs(id, kind, status, payload_json, attempts, max_attempts, due_ms, created_ms)
+                 VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+                libsql::params![id.clone(), kind, payload.to_string(), max_attempts, now, now],
+            )
+            .await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(inserted.then_some(id))
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn claim_job(&self) -> Result<Option<JobRow>> {
         let conn = self.connect().await?;
         let now = now_ms();
@@ -624,8 +660,10 @@ impl ControlStore {
             if status != "failed" {
                 return Ok(false);
             }
-            if is_backup_job_kind(&kind) && backup_job_is_active(&conn).await? {
-                anyhow::bail!("a backup or restore job is already running");
+            if (is_backup_job_kind(&kind) || kind == "guild_move")
+                && backup_job_is_active(&conn).await?
+            {
+                anyhow::bail!("a backup, restore or guild-move job is already running");
             }
             let changed = conn
                 .execute(
@@ -975,6 +1013,17 @@ impl ControlStore {
         backup_job_is_active(&conn).await
     }
 
+    pub async fn has_active_move_job(&self) -> Result<bool> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE kind = 'guild_move' AND status IN ('queued', 'running') LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
     pub async fn has_failed_backup_sanitize_job(&self) -> Result<bool> {
         let conn = self.connect().await?;
         let mut rows = conn
@@ -1098,7 +1147,7 @@ async fn backup_job_is_active(conn: &libsql::Connection) -> Result<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM jobs
-             WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize')
+             WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize', 'guild_move')
                AND status IN ('queued', 'running')
              LIMIT 1",
             (),

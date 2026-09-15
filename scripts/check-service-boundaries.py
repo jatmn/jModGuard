@@ -83,7 +83,7 @@ def main():
     for path in (ROOT / "crates/conductor/src").rglob("*.rs"):
         if runtime.search(path.read_text()):
             raise SystemExit(f"Guild-store runtime in conductor: {path}")
-    print("Guild-store catalog remains inactive in the conductor")
+    print("Guild-store catalog writes stay out of the conductor")
 
     # Bot-owned Discord mutations record their classified application case and
     # suppress the matching gateway echo. Unmarked manual/external events remain cases.

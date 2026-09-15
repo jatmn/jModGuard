@@ -54,7 +54,7 @@ function render() {
   });
   const content = $("#content");
   content.replaceChildren();
-  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabLater, backups: tabBackups };
+  const tabs = { status: tabStatus, installation: tabInstallation, notifications: tabNotifications, updates: tabLater, backups: tabBackups, moves: tabMoves };
   content.append((tabs[state.tab] || tabStatus)());
   if (state.tab === "status" && !document.hidden) startLease();
   else stopLease();
@@ -374,6 +374,65 @@ function tabBackups() {
     ),
     el("div", { class: "card" }, el("h3", { text: "Failed backup jobs" }), failures),
     el("div", { class: "card" }, el("h3", { text: "Catalog" }), list),
+  );
+}
+
+function tabMoves() {
+  const guild = el("input", { placeholder: "Guild snowflake" });
+  const dest = el("input", { placeholder: "Destination store id" });
+  const confirm = el("input", { type: "checkbox" });
+  const preop = el("select", {},
+    el("option", { value: "fresh", text: "Fresh checkpoint" }),
+    el("option", { value: "recent", text: "Reuse a checkpoint from the last 6 hours" }),
+    el("option", { value: "skip", text: "Skip checkpoint (no pre-move archive)" }),
+  );
+  const planBox = el("pre", { class: "muted", text: "Choose a guild and destination, then preview." });
+  const jobs = el("pre", { class: "muted", text: "Loading…" });
+  const catalog = el("pre", { class: "muted", text: "Loading…" });
+  api("/api/moves").then((data) => {
+    catalog.textContent = JSON.stringify(data.catalog || data, null, 2);
+    jobs.textContent = JSON.stringify(data.jobs || [], null, 2);
+    if (!data.available) {
+      planBox.textContent = "Moves need a core capture store plus shared and dedicated guild-store paths in JMODGUARD_CONDUCTOR_GUILD_STORES. Bot/API must already have those destination credentials.";
+    }
+  }).catch((e) => {
+    catalog.textContent = e.message;
+    jobs.textContent = e.message;
+  });
+  return el("div", {},
+    el("h2", { text: "Guild database moves" }),
+    el("p", { class: "muted", text: "Move one enrolled guild between an already-configured shared store and its dedicated store. Neighboring guilds on the shared database are left in place. Destination credentials stay in bot/API process configuration; adding a new store requires restarting those services first." }),
+    el("div", { class: "card" },
+      el("h3", { text: "Plan and start" }),
+      field("Guild id", guild),
+      field("Destination store id", dest),
+      field("Pre-move checkpoint", preop),
+      el("label", {}, confirm, el("span", { text: " I confirm this guild will be interrupted, Discord actions will not be replayed, and bot/API already have the destination store." })),
+      el("div", { class: "row" },
+        el("button", { class: "btn", text: "Preview impact", onclick: async () => {
+          try {
+            const data = await api(`/api/moves/plan?guild_id=${encodeURIComponent(guild.value.trim())}&destination_store_id=${encodeURIComponent(dest.value.trim())}`);
+            planBox.textContent = JSON.stringify(data, null, 2);
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+        el("button", { class: "btn primary", text: "Start move", onclick: async () => {
+          try {
+            if (!confirm.checked) throw new Error("confirm the shared impact before starting");
+            const data = await api("/api/moves", "POST", {
+              guild_id: guild.value.trim(),
+              destination_store_id: dest.value.trim(),
+              preop: preop.value,
+              confirm_shared_impact: true,
+            });
+            toast(`Move queued ${data.id}`, "success");
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+      ),
+      planBox,
+    ),
+    el("div", { class: "card" }, el("h3", { text: "Move jobs" }), jobs),
+    el("div", { class: "card" }, el("h3", { text: "Catalog" }), catalog),
   );
 }
 

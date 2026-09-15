@@ -94,8 +94,8 @@ entire configuration bundle. Complete tenant isolation and replica coordination 
 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
-nonsecret. Credentials stay in process configuration. Initial placement cannot be changed
-here; populated-guild moves are later work. Never run core migrations/defaults on a guild
+nonsecret. Credentials stay in process configuration. Populated shared/dedicated
+moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/defaults on a guild
 store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 8. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write. The conductor still has no tenant routing.
@@ -106,7 +106,7 @@ Identity/placement/membership checks must share the data transaction, including 
 paths. Keep per-membership edit revisions and closure atomic with mappings; never rebind or
 reopen a closed scope automatically. Initial binding is trusted lifecycle work, not
 permission checking. A successful snapshot check never authorizes a later write. Cloned
-backups can retain the same identity/revision. Writer exclusion for moves remains pending.
+backups can retain the same identity/revision. Writer exclusion for moves uses core `guild_write_fences`. Bunny credential hot-reload remains pending.
 
 Version3 adds inactive selected cases/text evidence; see `docs/TENANT-CASES.md`. Reuse
 captured scope checks with data; preserve immutable source/payload retry semantics, bounded
@@ -148,7 +148,7 @@ acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve im
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core is at migration 0011. Local HTTP/SQL fixtures
+and backup-copy lifecycle remain before activation. Core is at migration 0012. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and
@@ -382,7 +382,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
-migrations/             0001_init through 0011_tenant_runtime
+migrations/             0001_init through 0012_guild_moves
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
 ```

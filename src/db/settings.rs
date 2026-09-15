@@ -302,6 +302,8 @@ async fn patch_settings_inner(
         let mut tx = conn.transaction_primary_read()?;
         if let Some(scope) = &expected {
             scope.verify_conn(&tx)?;
+        } else if guild_id > 0 {
+            super::guild_stores::refuse_fenced_write(&tx, guild_id)?;
         }
         if !settings_changed && !reconcile_nickname {
             let defaults = terminal_defaults_conn(&tx)?;

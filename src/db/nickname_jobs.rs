@@ -45,6 +45,7 @@ pub(super) fn enqueue_nickname_reconcile_conn(
 pub async fn request_nickname_reconcile(db: &Db, guild_id: i64) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        super::guild_stores::refuse_fenced_write(&tx, guild_id)?;
         enqueue_nickname_reconcile_conn(&tx, guild_id)?;
         tx.commit()?;
         Ok(())

@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0011. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0012. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -98,6 +98,9 @@ Migration 0011 adds `guild_erasure_jobs` and `backup_cleanup_intents`. These are
 application-owned lifecycle rows, not a departed-guild membership ledger. Backup-copy
 workers are not activated.
 
+Migration 0012 adds `guild_write_fences` for populated shared/dedicated moves. See
+[guild moves](GUILD-MOVES.md).
+
 ## Separate guild-store family
 
 The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version8,
@@ -106,7 +109,7 @@ database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress and tenant settings. Initialize verifies and upgrades a matching version1–7
 store atomically; open requires 8. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0011. Each opener refuses the other family. No records are moved by startup.
+migration 0012. Each opener refuses the other family. No records are moved by startup.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
 Selected case payload removal, replay-key cleanup and live guild erasure are described in

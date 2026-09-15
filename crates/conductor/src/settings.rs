@@ -170,7 +170,7 @@ impl ControlSettings {
                 "log_discord_concurrency": "Bot process configuration. Not applied by the conductor.",
                 "enrollment_repair": "Bot process configuration. Not applied by the conductor.",
             },
-            "unavailable": ["updates", "guild_moves"],
+            "unavailable": ["updates"],
         })
     }
 }

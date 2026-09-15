@@ -71,6 +71,7 @@ async fn observe_membership(
                     params![guild, id.as_str()], |r| Ok(r.get(0)?),
                 )?;
                 if dormant {
+                    super::guild_stores::refuse_fenced_write(&tx, guild)?;
                     tx.ensure_mutation_receipt()?;
                     tx.execute(
                         "UPDATE nickname_reconcile SET generation=generation+1,state='pending',
@@ -91,6 +92,7 @@ async fn observe_membership(
         }
         // The primary snapshot already holds the write lock: enabling recovery
         // here preserves the comparison/write atomicity without no-op receipts.
+        super::guild_stores::refuse_fenced_write(&tx, guild)?;
         tx.ensure_mutation_receipt()?;
         // Membership transition and invalidation commit together. Never replay running work.
         // Departure or a newer positive join ends the previous identity. Preserve
@@ -248,6 +250,10 @@ impl ConfigurationWriteScope {
         self.request.verify_conn(conn)?;
         if self.request != self.target {
             self.target.verify_conn(conn)?;
+        }
+        let guild = self.target.guild_id();
+        if guild > 0 {
+            super::guild_stores::refuse_fenced_write(conn, guild)?;
         }
         Ok(())
     }

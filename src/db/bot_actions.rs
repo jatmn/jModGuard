@@ -77,6 +77,7 @@ impl ActionScope {
         if let Some(enrollment) = &self.expected {
             super::enrollments::verify_enrollment_conn(conn, enrollment)?;
         }
+        super::guild_stores::refuse_fenced_write(conn, self.guild)?;
         Ok(())
     }
 }
@@ -286,7 +287,8 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         // can defer a poll but never authorizes dispatch: claim below is primary.
         let due: i64 = conn.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE (state='pending'
-             OR (state IN ('claimed','running') AND expires_at<=?1)) AND {ACTIVE})"),
+             OR (state IN ('claimed','running') AND expires_at<=?1)) AND {ACTIVE}
+             AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))"),
             params![now],
             |r| Ok(r.get(0)?),
         )?;
@@ -308,6 +310,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         )?;
         let job = tx.query_row(
             &format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
+                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
                       ORDER BY created_at,id LIMIT 1"),
             params![now],
             row_action,
@@ -573,7 +576,8 @@ pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_read()?;
-        let valid = claimed_identity_matches(&tx, &job, Some("running"))?;
+        let valid = claimed_identity_matches(&tx, &job, Some("running"))?
+            && !super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
         tx.finish_read()?;
         Ok(valid)
     })

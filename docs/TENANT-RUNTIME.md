@@ -8,8 +8,8 @@ file (`jmodguard.db.guild.db`) and, on Unix, a private local evidence directory
 `JMODGUARD_GUILD_STORE_TOKEN` environment pair. Catalog rows store only opaque IDs and shared/dedicated
 policy; URLs and tokens stay in process configuration.
 
-This is not a guild move. Populated-guild shared/dedicated moves remain a later feature
-and are not exposed. The conductor still has no tenant routing.
+This is not a guild move. Populated-guild shared/dedicated moves are conductor-owned;
+see [guild moves](GUILD-MOVES.md). The conductor still has no tenant routing.
 
 ## Routing and handles
 
@@ -98,9 +98,10 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: conductor updates and guild-move controls
-are not registered. Local encrypted backup/restore is available on the conductor
-when a dedicated backup root is configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+Unfinished services stay inactive: conductor updates are not registered. Local encrypted
+backup/restore and guild-store moves are available on the conductor when their process
+paths are configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) and
+[GUILD-MOVES.md](GUILD-MOVES.md).
 Image and text spam enforcement is implemented separately; see
 [IMAGE-SPAM.md](IMAGE-SPAM.md). See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
 [evidence](CASE-EVIDENCE.md) and [enrollments](ENROLLMENTS.md).

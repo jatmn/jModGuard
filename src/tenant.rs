@@ -4,8 +4,9 @@ use crate::db::guild_data::{
     CaseLimits, EvidenceLimits, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
 };
 use crate::db::guild_stores::{
-    StoreId, StorePolicy, StoreRegistration, admit_tenant_placement, clear_erased_placement,
-    dedicated_store_registration, guild_placement, register_store, shared_store_registration,
+    GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
+    clear_erased_placement, dedicated_store_registration, guild_is_write_fenced, guild_placement,
+    register_store, shared_store_registration,
 };
 use crate::db::{
     self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure_after,
@@ -211,6 +212,9 @@ impl TenantRuntime {
         &self,
         enrollment: GuildEnrollment,
     ) -> Result<(GuildDataStore, GuildDataScope)> {
+        if guild_is_write_fenced(&self.core, enrollment.guild_id).await? {
+            return Err(GuildWriteFenced.into());
+        }
         let scope = self.scope(enrollment).await?;
         let store = self.store(&scope).await?;
         match store.stored_membership(scope.placement().clone()).await {
@@ -235,6 +239,9 @@ impl TenantRuntime {
                 if error.downcast_ref::<TenantError>().is_some()
                     || error
                         .downcast_ref::<crate::db::guild_data::TenantDataError>()
+                        .is_some()
+                    || error
+                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
                         .is_some() =>
             {
                 tracing::warn!(guild_id, "selected case not recorded: {error:#}");
@@ -249,6 +256,9 @@ impl TenantRuntime {
                 if error.downcast_ref::<TenantError>().is_some()
                     || error
                         .downcast_ref::<crate::db::guild_data::TenantDataError>()
+                        .is_some()
+                    || error
+                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
                         .is_some() =>
             {
                 tracing::warn!("selected case not recorded: {error:#}");

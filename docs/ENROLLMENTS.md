@@ -124,7 +124,7 @@ Bot configuration callers retain their existing helpers. No schema change is int
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
 it does not infer membership from existing guild settings or old queue jobs. The current
-recognized lineage extends through migration 0011. Version 10 binaries reject version 11;
+recognized lineage extends through migration 0012. Version 11 binaries reject version 12;
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported. Live guild-store erasure is described in
 [tenant runtime](TENANT-RUNTIME.md).

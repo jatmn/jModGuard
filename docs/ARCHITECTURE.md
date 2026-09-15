@@ -174,11 +174,12 @@ be sanitized against surviving cleanup intents.
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0011. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0012. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
-Migration 0011 adds live-erasure jobs and backup-copy cleanup intents. Bot/API startup
+Migration 0011 adds live-erasure jobs and backup-copy cleanup intents. Migration 0012
+adds guild-write fences for populated store moves. Bot/API startup
 opens [tenant runtime](TENANT-RUNTIME.md) against that catalog. Unban/log-channel WebUI
 operations now use API admission and bot dispatch.
 
@@ -212,7 +213,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui)
-migrations/                0001_init through 0011_tenant_runtime
+migrations/                0001_init through 0012_guild_moves
 Dockerfile.bot
 Dockerfile.api
 ```
