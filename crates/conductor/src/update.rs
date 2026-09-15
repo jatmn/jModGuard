@@ -158,22 +158,28 @@ pub fn validate_apply_preop(conductor: &Conductor, preop: &str) -> Result<&'stat
 
 async fn ensure_guild_move_fences_allow_update(conductor: &Conductor) -> Result<()> {
     let guilds = crate::guild_move::active_move_fence_guilds(&conductor.cfg).await?;
-    if guilds.is_empty() {
+    let Some(guild_id) = guilds.into_iter().next() else {
         return Ok(());
-    }
+    };
     let store = conductor.store()?;
-    for guild_id in guilds {
-        if let Some(job) = store.latest_failed_guild_move_for_guild(guild_id).await? {
-            anyhow::bail!(
-                "guild {guild_id} has an active move write-fence from a failed attempt; \
-                 retry move job {job_id} (POST /api/jobs/{job_id}/retry) before installing or rolling back a release",
-                job_id = job.id,
-            );
-        }
+    if let Some(job) = store.latest_failed_guild_move_for_guild(guild_id).await? {
         anyhow::bail!(
-            "guild {guild_id} has an active move write-fence; wait for the in-flight move or its retry before installing or rolling back a release"
+            "guild {guild_id} has an active move write-fence from a failed attempt; \
+             retry move job {job_id} (POST /api/jobs/{job_id}/retry) before installing or rolling back a release",
+            job_id = job.id,
         );
     }
+    anyhow::bail!(
+        "guild {guild_id} has an active move write-fence; wait for the in-flight move or its retry before installing or rolling back a release"
+    );
+}
+
+/// Shared install/plan/rollback gate: recover sidecar, guild fences, and inventory coverage.
+pub async fn validate_update_mutation_context(conductor: &Conductor) -> Result<()> {
+    ensure_new_update_allowed(&conductor.cfg)?;
+    ensure_guild_move_fences_allow_update(conductor).await?;
+    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
     Ok(())
 }
 
@@ -276,10 +282,7 @@ pub async fn enqueue(conductor: &Conductor, request: ApplyRequest) -> Result<Str
     let preop = validate_apply_preop(conductor, request.preop.as_str())?;
     let release_id = request.release_id.trim();
     ensure!(!release_id.is_empty(), "release_id is required");
-    ensure_new_update_allowed(&conductor.cfg)?;
-    ensure_guild_move_fences_allow_update(conductor).await?;
-    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
-    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
+    validate_update_mutation_context(conductor).await?;
     let plan = plan(conductor, release_id, Some(preop)).await?;
     let payload = json!({
         "release_id": release_id,
@@ -324,10 +327,7 @@ pub async fn enqueue_rollback(
             || payload.get("phase").and_then(Value::as_str) == Some("committed"),
         "rollback requires a committed update; failed or uncertain jobs use recover-update or retry"
     );
-    ensure_new_update_allowed(&conductor.cfg)?;
-    ensure_guild_move_fences_allow_update(conductor).await?;
-    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
-    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
+    validate_update_mutation_context(conductor).await?;
     let previous_id = payload
         .get("plan")
         .and_then(|plan| plan.get("installed"))
@@ -651,6 +651,7 @@ async fn set_phase(
     }
     if let Ok(adapter) = Adapter::from_config(&conductor.cfg, conductor.http.clone())
         && let Ok(Some(mut recover)) = Adapter::load_recover(&adapter.root)
+        && recover.job_id == job_id
     {
         recover.phase = phase.to_string();
         if recover.status != "uncertain" {

@@ -517,6 +517,89 @@ async fn successful_update_and_code_only_rollback() {
 }
 
 #[tokio::test]
+async fn committed_recover_unchanged_when_follow_on_install_fails_early() {
+    let env = setup(true).await;
+    let cookie = login(&env).await;
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.0","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first_id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.conductor.tick_job().await.unwrap();
+    let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
+    let recover_before = Adapter::load_recover(&adapter.root)
+        .unwrap()
+        .expect("recover after successful install");
+    assert_eq!(recover_before.status, "committed");
+    assert_eq!(recover_before.job_id, first_id);
+    assert_eq!(frontend_marker(&env), "index-new");
+
+    std::fs::remove_dir_all(
+        env.root
+            .join("update/cache")
+            .join(digest('4').trim_start_matches("sha256:")),
+    )
+    .unwrap();
+    let (status, body) = call(
+        &env.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.1","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second_id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(second_id, first_id);
+    env.conductor.tick_job().await.unwrap();
+    let job = env
+        .conductor
+        .store()
+        .unwrap()
+        .get_job(&second_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, "failed");
+
+    let recover_after = Adapter::load_recover(&adapter.root)
+        .unwrap()
+        .expect("recover after failed follow-on install");
+    assert_eq!(recover_after.status, "committed");
+    assert_eq!(recover_after.job_id, first_id);
+    assert_eq!(frontend_marker(&env), "index-new");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_jmodguard-conductor"))
+        .arg("recover-update")
+        .env_clear()
+        .env("JMODGUARD_CONDUCTOR_UPDATE_ROOT", env.root.join("update"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("already committed"),
+        "recover-update must not roll back a committed release: {combined}"
+    );
+    assert_eq!(frontend_marker(&env), "index-new");
+}
+
+#[tokio::test]
 async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
     {
         let env = setup(true).await;

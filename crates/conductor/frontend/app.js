@@ -351,7 +351,12 @@ function tabUpdates() {
     .catch((e) => { catalog.textContent = e.message; });
   const refreshBtn = el("button", { class: "btn", text: "Refresh catalog", onclick: async () => {
     try {
-      renderCatalog(await api("/api/updates?refresh=true"));
+      const [data, status] = await Promise.all([
+        api("/api/updates?refresh=true"),
+        api("/api/status"),
+      ]);
+      configurePreop(!!status.capture_available);
+      renderCatalog(data);
     } catch (e) { toast(e.message, "error"); }
   } });
   return el("div", {},

@@ -1177,6 +1177,9 @@ async fn api_updates_plan(
         Ok(value) => value,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
+    if let Err(error) = crate::update::validate_update_mutation_context(&state).await {
+        return error_response(StatusCode::BAD_REQUEST, error);
+    }
     match crate::update::plan(&state, &query.release_id, Some(preop)).await {
         Ok(body) => Json(body).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
