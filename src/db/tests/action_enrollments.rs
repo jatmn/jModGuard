@@ -106,6 +106,7 @@ async fn old_claim_and_completion_cannot_change_new_enrollment_or_another_guild(
     let claim = claim_bot_action(&f.db, 1000).await.unwrap().unwrap();
     assert_eq!(claim.id, job.id);
     assert!(begin_bot_action(&f.db, &claim, 1000).await.unwrap());
+    assert!(bot_action_can_dispatch(&f.db, &claim).await.unwrap());
     let other = enqueue_bot_action(
         &f.db,
         20,
@@ -122,6 +123,7 @@ async fn old_claim_and_completion_cannot_change_new_enrollment_or_another_guild(
         bot_action_dispatch(&f.db, &claim).await.unwrap(),
         BotActionDispatch::EnrollmentEnded
     );
+    assert!(!bot_action_can_dispatch(&f.db, &claim).await.unwrap());
     assert!(
         !finish_bot_action(&f.db, &claim, "succeeded", "log_channel_set")
             .await

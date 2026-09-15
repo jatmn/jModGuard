@@ -77,7 +77,8 @@ current membership and guild-move fencing at the primary, preserving whether dis
 was blocked by enrollment replacement or a move. It does not perform Discord validation
 or a mutation. Local log-channel completion checks the move fence again in the same
 transaction as the setting write so a fence raised during Discord channel validation
-still fails closed.
+still fails closed. Unban completion preserves the Discord result but skips its local
+ban-mirror and event writes if a move fence was raised after dispatch.
 
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing

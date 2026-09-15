@@ -198,6 +198,13 @@ pub struct CmdEnv<'a> {
     pub source_message: Option<serenity::model::id::MessageId>,
 }
 
+pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<()> {
+    if db::guild_stores::guild_is_write_fenced(&env.app.db, env.guild_id.get() as i64).await? {
+        return Err(db::guild_stores::GuildWriteFenced.into());
+    }
+    Ok(())
+}
+
 pub struct BehaviorOutcome {
     pub response: Option<String>,
     pub vars: BTreeMap<String, String>,

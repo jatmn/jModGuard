@@ -383,7 +383,7 @@ function tabMoves() {
   const confirm = el("input", { type: "checkbox" });
   const preop = el("select", {},
     el("option", { value: "fresh", text: "Fresh checkpoint" }),
-    el("option", { value: "recent", text: "Reuse a checkpoint from the last 6 hours" }),
+    el("option", { value: "recent", text: "Reuse a complete archive from the last 6 hours" }),
     el("option", { value: "skip", text: "Skip checkpoint (no pre-move archive)" }),
   );
   const planBox = el("pre", { class: "muted", text: "Choose a guild and destination, then preview." });

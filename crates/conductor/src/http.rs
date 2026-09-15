@@ -967,18 +967,37 @@ async fn api_moves(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> R
         }
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
-    let jobs = match state.store() {
-        Ok(store) => store.list_jobs(50).await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+    let store = match state.store() {
+        Ok(store) => store,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    let jobs = match store.list_jobs(50).await {
+        Ok(jobs) => jobs,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
     let moves: Vec<_> = jobs
         .into_iter()
         .filter(|job| job.kind == "guild_move")
         .collect();
-    let failed_moves = match state.store() {
-        Ok(store) => store.failed_guild_move_jobs().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+    let mut failed_moves = match store.list_failed_guild_move_jobs(50).await {
+        Ok(jobs) => jobs,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
+    let fenced_guilds = match crate::guild_move::active_move_fence_guilds(&state.cfg).await {
+        Ok(guilds) => guilds,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    for guild_id in fenced_guilds {
+        let job = match store.latest_failed_guild_move_for_guild(guild_id).await {
+            Ok(job) => job,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        };
+        if let Some(job) = job
+            && !failed_moves.iter().any(|known| known.id == job.id)
+        {
+            failed_moves.push(job);
+        }
+    }
     Json(serde_json::json!({
         "available": crate::guild_move::moves_available(&state.cfg),
         "catalog": catalog,

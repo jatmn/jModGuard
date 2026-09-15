@@ -239,6 +239,12 @@ async fn enforce(
     if !policy.enforce() || !rule_def.enabled {
         return ReportDisposition::Consumed;
     }
+    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
+        .await
+        .unwrap_or(true)
+    {
+        return ReportDisposition::Retryable;
+    }
     let enrollment = crate::cases::capture(app, found.guild).await;
     let Some(enrollment) = enrollment.clone() else {
         return ReportDisposition::Consumed;
@@ -317,6 +323,12 @@ async fn enforce(
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
+    }
+    if crate::db::guild_stores::guild_is_write_fenced(&app.db, found.guild as i64)
+        .await
+        .unwrap_or(true)
+    {
+        return ReportDisposition::Retryable;
     }
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();

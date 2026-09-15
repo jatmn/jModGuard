@@ -499,3 +499,29 @@ async fn fenced_rebind_moves_placement_and_blocks_unfenced_cutover() {
         .unwrap();
     assert!(!guild_is_write_fenced(&f.db, 10).await.unwrap());
 }
+
+#[tokio::test]
+async fn guild_configuration_writers_fail_inside_the_move_fence_transaction() {
+    let f = Fixture::new();
+    upsert_template(&f.db, 10, "ban", "before").await.unwrap();
+    upsert_log_channel(&f.db, 10, "automod", 55).await.unwrap();
+    let destination = StoreId::new();
+    register_store(
+        &f.db,
+        destination.clone(),
+        StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    set_guild_write_fence(&f.db, 10, destination, format!("{:032x}", 8u128), "freeze")
+        .await
+        .unwrap();
+
+    assert!(upsert_template(&f.db, 10, "ban", "blocked").await.is_err());
+    assert!(delete_template(&f.db, 10, "ban").await.is_err());
+    assert!(upsert_log_channel(&f.db, 10, "automod", 66).await.is_err());
+    assert!(delete_log_channel(&f.db, 10, "automod").await.is_err());
+    upsert_template(&f.db, 0, "ban", "global remains writable")
+        .await
+        .unwrap();
+}

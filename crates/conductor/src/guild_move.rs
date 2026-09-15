@@ -220,6 +220,27 @@ async fn active_move_fence(cfg: &Config, guild: i64) -> Result<Option<(String, S
     })
 }
 
+pub async fn active_move_fence_guilds(cfg: &Config) -> Result<Vec<i64>> {
+    let Ok(core) = core_path(cfg) else {
+        return Ok(Vec::new());
+    };
+    if !core.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open(core).await?;
+    let mut rows = conn
+        .query(
+            "SELECT guild_id FROM guild_write_fences ORDER BY guild_id",
+            (),
+        )
+        .await?;
+    let mut guilds = Vec::new();
+    while let Some(row) = rows.next().await? {
+        guilds.push(row.get(0)?);
+    }
+    Ok(guilds)
+}
+
 async fn freeze(
     conductor: &Conductor,
     guild: i64,

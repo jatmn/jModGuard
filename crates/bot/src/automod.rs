@@ -355,6 +355,19 @@ pub async fn execute_pending(
         return;
     }
 
+    if matches!(rule.action.as_str(), "delete" | "timeout" | "kick" | "ban")
+        && db::guild_stores::guild_is_write_fenced(&app.db, guild_id.get() as i64)
+            .await
+            .unwrap_or(true)
+    {
+        tracing::warn!(
+            guild_id = guild_id.get(),
+            action = rule.action,
+            "automod Discord mutation skipped during guild move fence"
+        );
+        return;
+    }
+
     match rule.action.as_str() {
         "log" => {}
         "delete" => {

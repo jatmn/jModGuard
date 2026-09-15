@@ -414,10 +414,10 @@ async fn finish_bot_action_inner(
         } else {
             (state, outcome)
         };
-        let (state, outcome) = if enforce_local_deadline
+        let write_fenced = enforce_local_deadline
             && state == "succeeded"
-            && matches!(job.action, Action::SetLogChannel { .. })
-            && super::guild_stores::guild_write_fenced(&tx, job.guild_id)?
+            && super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
+        let (state, outcome) = if write_fenced && matches!(job.action, Action::SetLogChannel { .. })
         {
             ("failed".to_owned(), "guild_move_fenced".to_owned())
         } else {
@@ -441,7 +441,7 @@ async fn finish_bot_action_inner(
         }
         if state == "succeeded" {
             match &job.action {
-                Action::Unban { user_id, reason } => {
+                Action::Unban { user_id, reason } if !write_fenced => {
                     tx.execute(
                         "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2",
                         params![job.guild_id, user_id],
@@ -456,6 +456,7 @@ async fn finish_bot_action_inner(
                         params![job.guild_id, user_id, job.actor_id, data, now_str()],
                     )?;
                 }
+                Action::Unban { .. } => {}
                 Action::SetLogChannel { event, channel_id } => {
                     write_log_channel_conn(&tx, job.guild_id, event, *channel_id)?;
                 }
@@ -604,4 +605,9 @@ pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDi
         Ok(status)
     })
     .await
+}
+
+/// Compatibility boolean for callers that do not need the refusal reason.
+pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
+    Ok(bot_action_dispatch(db, job).await? == BotActionDispatch::Ready)
 }
