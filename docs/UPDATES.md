@@ -79,9 +79,11 @@ see live digests. That refresh must **not** replace `recover.previous` or
 
 `inventory.json` is written with the same tmp+rename durability as `recover.json`.
 Forward deploy and `recover-update` persist each component after it passes
-readiness. `inventory.release_id` and control-store `installed_release` still
-advance only when the job **commits** (or when CLI recover finishes the loop
-and sets `release_id` to `previous_release_id`).
+readiness. When verify succeeds, `recover.json` is marked `committed` **before**
+`inventory.release_id` and control-store `installed_release` advance, so
+`recover-update` cannot restore `previous` after a completed deploy. Those
+release labels still advance only on that commit path (or when CLI recover
+finishes the loop and sets `release_id` to `previous_release_id`).
 
 HTTP health is not mutation authority.
 

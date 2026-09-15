@@ -545,16 +545,16 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
         }
     }
 
-    inventory.release_id = release_id.clone();
-    adapter.save_inventory(&inventory)?;
-    if let Ok(store) = conductor.store() {
-        store.meta_set("installed_release", &release_id).await?;
-    }
     let mut recover = Adapter::load_recover(&adapter.root)?.context("recover inventory")?;
     recover.status = "committed".into();
     recover.phase = "committed".into();
     recover.component = String::new();
     adapter.write_recover(&recover)?;
+    inventory.release_id = release_id.clone();
+    adapter.save_inventory(&inventory)?;
+    if let Ok(store) = conductor.store() {
+        store.meta_set("installed_release", &release_id).await?;
+    }
     set_phase(
         conductor,
         job_id,
