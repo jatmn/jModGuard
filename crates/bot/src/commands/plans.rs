@@ -369,6 +369,7 @@ async fn run_step(
             responses.push(text);
         }
         PlanStep::Dm { template } => {
+            refuse_fenced_discord_mutation(env).await?;
             let text = crate::templates::render(template, vars);
             let user_id = target.unwrap_or(env.actor);
             let channel = env
