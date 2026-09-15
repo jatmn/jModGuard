@@ -1173,7 +1173,7 @@ async fn api_updates_plan(
         )
             .into_response();
     }
-    let preop = match crate::update::parse_preop(query.preop.as_str()) {
+    let preop = match crate::update::validate_apply_preop(&state, query.preop.as_str()) {
         Ok(value) => value,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };

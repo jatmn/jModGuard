@@ -3,6 +3,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jmodguard_conductor::release;
 use jmodguard_conductor::update_adapter::{Adapter, DrainContext, INVENTORY_FORMAT, Inventory, RECOVER_FORMAT};
+use jmodguard_conductor::config::CaptureStore;
 use jmodguard_conductor::{Conductor, config::Config, router_for, update};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -598,6 +599,12 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
             "v0.1.0",
             "release_id must not advance until the job commits"
         );
+        let recover = Adapter::load_recover(&adapter.root).unwrap().unwrap();
+        assert_eq!(
+            recover.status,
+            "failed",
+            "readiness revert should terminalize recover sidecar"
+        );
         adapter
             .wait_ready("api", &inventory.components["api"])
             .await
@@ -613,6 +620,16 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
             "/api/updates",
             Some(&cookie),
             Some(r#"{"release_id":"v0.2.0","preop":"fresh","confirm_interruption":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("checkpoint capture"), "{body}");
+        let (status, body) = call(
+            &env.router,
+            "GET",
+            "/api/updates/plan?release_id=v0.2.0&preop=fresh",
+            Some(&cookie),
+            None,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -800,7 +817,7 @@ async fn update_shares_idle_mutex_and_refuses_incompatible() {
     let (status, body) = call(
         &env.router,
         "GET",
-        "/api/updates/plan?release_id=v0.0.1",
+        "/api/updates/plan?release_id=v0.0.1&preop=skip",
         Some(&cookie),
         None,
     )
@@ -834,10 +851,10 @@ async fn plan_preflight_reflects_preop_query() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body.contains("fresh R4 checkpoint"),
-        "plan checkpoint text should match fresh preop: {body}"
+        body.contains("checkpoint capture"),
+        "plan should reject fresh preop when capture is not configured: {body}"
     );
 }
 
@@ -979,22 +996,73 @@ async fn apply_requires_inventory_when_health_urls_configured() {
         Some(r#"{"release_id":"v0.2.0","preop":"skip","confirm_interruption":true}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    env.conductor.tick_job().await.unwrap();
-    let job = store.get_job(&id).await.unwrap().unwrap();
-    assert_eq!(job.status, "failed");
-    assert!(
-        job.last_error
-            .as_deref()
-            .unwrap_or("")
-            .contains("inventory has no bot"),
-        "{:?}",
-        job.last_error
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("inventory has no bot"), "{body}");
+}
+
+async fn write_core_for_fence(path: &std::path::Path) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/0010_guild_store_catalog.sql"
+    ))
+    .await
+    .unwrap();
+    conn.execute_batch(include_str!("../../../migrations/0012_guild_moves.sql"))
+        .await
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta(key,value) VALUES('schema_family','jmodguard-core-1');
+         INSERT INTO guild_store_catalog(store_id, dedicated_guild_id) VALUES
+           ('11111111111111111111111111111111', NULL),
+           ('22222222222222222222222222222222', 10);",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn release_update_rejected_while_guild_move_fence_active() {
+    let env = setup(true).await;
+    let core = env.root.join("core.db");
+    write_core_for_fence(&core).await;
+    let mut cfg = env.conductor.cfg.clone();
+    cfg.capture_stores = vec![CaptureStore {
+        role: "core".into(),
+        path: core.clone(),
+    }];
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    const DEST_REV: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    conn.execute(
+        "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+         VALUES(10, ?, 'freeze', ?, ?, unixepoch())",
+        libsql::params![DEST_REV, "22222222222222222222222222222222", DEST_REV],
+    )
+    .await
+    .unwrap();
+    let harness = Env {
+        conductor,
+        router,
+        root: env.root.clone(),
+        _discord: tokio::spawn(async {}),
+        _feed: tokio::spawn(async {}),
+        _provider: tokio::spawn(async {}),
+    };
+    let cookie = login(&harness).await;
+    let (status, body) = call(
+        &harness.router,
+        "POST",
+        "/api/updates",
+        Some(&cookie),
+        Some(r#"{"release_id":"v0.2.0","preop":"skip","confirm_interruption":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("write-fence"), "{body}");
 }
 
 #[tokio::test]

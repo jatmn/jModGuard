@@ -38,7 +38,9 @@ update root are configured.
    `skip` is explicit: there is no pre-update archive.
 3. **Exclusive mutation.** `release_update` shares the backup/guild-move idle
    mutex. One installation mutation at a time. New installs and rollbacks are
-   refused while `recover.json` is `uncertain` or mid-`replacing`/`running`.
+   refused while `recover.json` is `uncertain`, `failed`, or mid-`replacing`/`running`.
+   They are also refused while any guild **write-fence** remains (failed move
+   recovery); retry the move job or clear the fence before installing code.
 4. **Stage** copies digest-keyed artifacts. Missing files fail before activate.
 5. **Deploy** drains the previous process, confirms it is dead, then activates the
    replacement and waits for health. Bot is exclusive: the old worker must be dead
@@ -71,7 +73,7 @@ When `recover-update` restores code, the running conductor reconciles
 | Request | Behavior |
 |---|---|
 | `GET /api/updates` | Cached catalog; polls when due or `?refresh=true`. Includes jobs and recover status when an update root is configured. |
-| `GET /api/updates/plan?release_id=` | Compatibility/impact preflight. |
+| `GET /api/updates/plan?release_id=&preop=` | Compatibility/impact preflight (same preop/capture rules as install). |
 | `POST /api/updates` and `POST /api/updates/apply` | Queue `release_update` when `confirm_interruption` is true. 404 when the update root is unset. |
 | `POST /api/updates/{id}/rollback` | Queue code-only rollback of a committed update. |
 

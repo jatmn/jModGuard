@@ -106,6 +106,9 @@ fn ensure_new_update_allowed(cfg: &Config) -> Result<()> {
             "recover inventory is still in progress (status={}); retry the failed update job or run recover-update before starting a new install",
             recover.status
         ),
+        "failed" => anyhow::bail!(
+            "last release update failed (recover status=failed); retry the failed update job or run recover-update before starting a new install"
+        ),
         other => anyhow::bail!(
             "recover inventory status {other} must be resolved before a new update"
         ),
@@ -141,6 +144,34 @@ pub fn ensure_preop_capture(conductor: &Conductor, preop: &str) -> Result<()> {
         ensure!(
             conductor.capture_available(),
             "checkpoint capture is not configured; pass preop=skip only after accepting no pre-update archive"
+        );
+    }
+    Ok(())
+}
+
+/// Shared install/plan gate: parse preop and apply the capture rule.
+pub fn validate_apply_preop(conductor: &Conductor, preop: &str) -> Result<&'static str> {
+    let preop = parse_preop(preop)?;
+    ensure_preop_capture(conductor, preop)?;
+    Ok(preop)
+}
+
+async fn ensure_guild_move_fences_allow_update(conductor: &Conductor) -> Result<()> {
+    let guilds = crate::guild_move::active_move_fence_guilds(&conductor.cfg).await?;
+    if guilds.is_empty() {
+        return Ok(());
+    }
+    let store = conductor.store()?;
+    for guild_id in guilds {
+        if let Some(job) = store.latest_failed_guild_move_for_guild(guild_id).await? {
+            anyhow::bail!(
+                "guild {guild_id} has an active move write-fence from a failed attempt; \
+                 retry move job {job_id} (POST /api/jobs/{job_id}/retry) before installing or rolling back a release",
+                job_id = job.id,
+            );
+        }
+        anyhow::bail!(
+            "guild {guild_id} has an active move write-fence; wait for the in-flight move or its retry before installing or rolling back a release"
         );
     }
     Ok(())
@@ -242,11 +273,13 @@ pub async fn enqueue(conductor: &Conductor, request: ApplyRequest) -> Result<Str
         request.confirm_interruption,
         "confirm the bot exclusive drain, local API restart, and conductor recover-update path"
     );
-    let preop = parse_preop(request.preop.as_str())?;
-    ensure_preop_capture(conductor, preop)?;
+    let preop = validate_apply_preop(conductor, request.preop.as_str())?;
     let release_id = request.release_id.trim();
     ensure!(!release_id.is_empty(), "release_id is required");
     ensure_new_update_allowed(&conductor.cfg)?;
+    ensure_guild_move_fences_allow_update(conductor).await?;
+    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
     let plan = plan(conductor, release_id, Some(preop)).await?;
     let payload = json!({
         "release_id": release_id,
@@ -292,6 +325,9 @@ pub async fn enqueue_rollback(
         "rollback requires a committed update; failed or uncertain jobs use recover-update or retry"
     );
     ensure_new_update_allowed(&conductor.cfg)?;
+    ensure_guild_move_fences_allow_update(conductor).await?;
+    let adapter = Adapter::from_config(&conductor.cfg, conductor.http.clone())?;
+    ensure_inventory_covers_incumbents(conductor, &adapter).await?;
     let previous_id = payload
         .get("plan")
         .and_then(|plan| plan.get("installed"))
@@ -467,6 +503,7 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
                     {
                         inventory.components.insert((*name).to_string(), restored);
                         adapter.save_inventory(&inventory)?;
+                        mark_deploy_failed(&adapter, &recover);
                         anyhow::bail!(
                             "{name} failed readiness; previous digest restored. {error:#}"
                         );
@@ -626,6 +663,14 @@ async fn set_phase(
     }
     let _ = recover_status;
     Ok(())
+}
+
+fn mark_deploy_failed(adapter: &Adapter, recover: &RecoverInventory) {
+    let mut body = recover.clone();
+    body.status = "failed".into();
+    body.phase = "failed".into();
+    body.component.clear();
+    let _ = adapter.write_recover(&body);
 }
 
 fn mark_uncertain(
