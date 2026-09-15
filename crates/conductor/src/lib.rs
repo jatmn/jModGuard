@@ -9,6 +9,8 @@ pub mod release;
 pub mod settings;
 pub mod state;
 pub mod store;
+pub mod update;
+pub mod update_adapter;
 
 use axum::Router;
 use std::sync::Arc;

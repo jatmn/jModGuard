@@ -36,6 +36,9 @@ pub struct Config {
     pub release_feed: Option<String>,
     pub release_keys: std::collections::BTreeMap<String, String>,
     pub installed_release: Option<String>,
+    pub update_root: Option<PathBuf>,
+    pub artifact_root: Option<PathBuf>,
+    pub update_provider: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -68,6 +71,9 @@ impl std::fmt::Debug for Config {
                 &self.release_keys.keys().cloned().collect::<Vec<_>>(),
             )
             .field("installed_release", &self.installed_release)
+            .field("update_root", &self.update_root)
+            .field("artifact_root", &self.artifact_root)
+            .field("update_provider", &self.update_provider)
             .finish()
     }
 }
@@ -151,6 +157,12 @@ impl Config {
         let installed_release = lookup("JMODGUARD_CONDUCTOR_INSTALLED_RELEASE")?
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let update_root = optional_path(lookup("JMODGUARD_CONDUCTOR_UPDATE_ROOT")?)?;
+        let artifact_root = optional_path(lookup("JMODGUARD_CONDUCTOR_ARTIFACT_ROOT")?)?;
+        let update_provider = optional_named_url(
+            lookup("JMODGUARD_CONDUCTOR_UPDATE_PROVIDER")?,
+            "JMODGUARD_CONDUCTOR_UPDATE_PROVIDER",
+        )?;
         if let (Some(backup), Some(evidence)) = (&backup_root, &evidence_root) {
             ensure_disjoint_roots(
                 backup,
@@ -218,6 +230,43 @@ impl Config {
                 )?;
             }
         }
+        if let Some(update) = &update_root {
+            if let Some(backup) = &backup_root {
+                ensure_disjoint_roots(
+                    backup,
+                    update,
+                    "update root must not overlap the backup root",
+                )?;
+            }
+            if let Some(evidence) = &evidence_root {
+                ensure_disjoint_roots(
+                    evidence,
+                    update,
+                    "update root must not overlap the evidence root",
+                )?;
+            }
+            if let Some(restore) = &restore_target {
+                ensure_disjoint_roots(
+                    restore,
+                    update,
+                    "update root must not overlap the restore target",
+                )?;
+            }
+            for capture in &capture_stores {
+                ensure_disjoint_roots(
+                    update,
+                    &capture.path,
+                    "update root must not overlap capture stores",
+                )?;
+            }
+            for store in &guild_stores {
+                ensure_disjoint_roots(
+                    update,
+                    &store.path,
+                    "update root must not overlap guild stores",
+                )?;
+            }
+        }
         Ok(Self {
             bind,
             log_filter,
@@ -240,6 +289,9 @@ impl Config {
             release_feed,
             release_keys,
             installed_release,
+            update_root,
+            artifact_root,
+            update_provider,
         })
     }
 
@@ -308,7 +360,7 @@ fn optional_path(raw: Option<String>) -> Result<Option<PathBuf>> {
     let path = PathBuf::from(&value);
     anyhow::ensure!(
         path.is_absolute(),
-        "backup/evidence/restore paths must be absolute"
+        "conductor directory paths must be absolute"
     );
     Ok(Some(path))
 }
@@ -406,12 +458,14 @@ fn parse_guild_stores(raw: String) -> Result<Vec<GuildStorePath>> {
 }
 
 fn optional_feed(raw: Option<String>) -> Result<Option<String>> {
+    optional_named_url(raw, "JMODGUARD_CONDUCTOR_RELEASE_FEED")
+}
+
+fn optional_named_url(raw: Option<String>, name: &'static str) -> Result<Option<String>> {
     let Some(value) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    Ok(Some(
-        parse_http_url(&value).context("JMODGUARD_CONDUCTOR_RELEASE_FEED")?,
-    ))
+    Ok(Some(parse_http_url(&value).context(name)?))
 }
 
 fn parse_release_keys(raw: String) -> Result<std::collections::BTreeMap<String, String>> {
@@ -607,5 +661,38 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn update_root_must_not_overlap_backup_root() {
+        assert!(
+            Config::from_lookup(|key| {
+                Ok(Some(
+                    match key {
+                        "JMODGUARD_CONDUCTOR_BACKUP_ROOT" => "/tmp/jmodguard-backups",
+                        "JMODGUARD_CONDUCTOR_UPDATE_ROOT" => "/tmp/jmodguard-backups/update",
+                        _ => return Ok(None),
+                    }
+                    .into(),
+                ))
+            })
+            .is_err()
+        );
+        let cfg = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_UPDATE_ROOT" => "/tmp/jmodguard-update",
+                    "JMODGUARD_CONDUCTOR_UPDATE_PROVIDER" => "http://127.0.0.1:9/",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(
+            cfg.update_root.as_deref(),
+            Some(std::path::Path::new("/tmp/jmodguard-update"))
+        );
+        assert_eq!(cfg.update_provider.as_deref(), Some("http://127.0.0.1:9/"));
     }
 }

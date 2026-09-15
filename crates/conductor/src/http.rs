@@ -40,8 +40,8 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "backup_available": false,
         "capture_available": false,
         "moves_available": false,
-        "update_available": false,
         "discovery_available": false,
+        "update_available": false,
     });
     let ready_state = state.clone();
     let router = Router::new()
@@ -119,6 +119,8 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/moves/plan", get(api_move_plan))
         .route("/api/updates", get(api_updates).post(api_updates_apply))
         .route("/api/updates/apply", post(api_updates_apply))
+        .route("/api/updates/plan", get(api_updates_plan))
+        .route("/api/updates/{id}/rollback", post(api_updates_rollback))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
                 response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
@@ -152,6 +154,9 @@ fn placeholder_state() -> Conductor {
             release_feed: None,
             release_keys: Default::default(),
             installed_release: None,
+            update_root: None,
+            artifact_root: None,
+            update_provider: None,
         },
         store: None,
         backup: None,
@@ -181,8 +186,8 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "backup_available": state.backup_available(),
         "capture_available": state.capture_available(),
         "moves_available": crate::guild_move::moves_available(&state.cfg),
-        "update_available": false,
         "discovery_available": crate::release::discovery_available(&state.cfg),
+        "update_available": crate::update::updates_available(&state.cfg),
     }))
 }
 
@@ -388,7 +393,7 @@ async fn status_payload(state: &Conductor) -> anyhow::Result<serde_json::Value> 
         "capture_available": state.capture_available(),
         "moves_available": crate::guild_move::moves_available(&state.cfg),
         "discovery_available": crate::release::discovery_available(&state.cfg),
-        "update_available": false,
+        "update_available": crate::update::updates_available(&state.cfg),
         "unavailable": [],
     }))
 }
@@ -1105,19 +1110,160 @@ async fn api_updates(
         return auth_error(error);
     }
     match crate::release::catalog_for(&state, query.refresh).await {
+        Ok(mut body) => {
+            if let Some(object) = body.as_object_mut() {
+                object.insert("recover".into(), crate::update::recover_status(&state.cfg));
+            }
+            if let Ok(store) = state.store()
+                && let Ok(jobs) = store.list_jobs(50).await
+            {
+                let updates: Vec<_> = jobs
+                    .into_iter()
+                    .filter(|job| job.kind == "release_update")
+                    .collect();
+                let failed: Vec<_> = updates
+                    .iter()
+                    .filter(|job| job.status == "failed")
+                    .cloned()
+                    .collect();
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "jobs".into(),
+                        serde_json::to_value(&updates).unwrap_or(serde_json::json!([])),
+                    );
+                    object.insert(
+                        "failed_jobs".into(),
+                        serde_json::to_value(&failed).unwrap_or(serde_json::json!([])),
+                    );
+                }
+            }
+            Json(body).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdatesPlanQuery {
+    release_id: String,
+}
+
+async fn api_updates_plan(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Query(query): Query<UpdatesPlanQuery>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    if !crate::update::updates_available(&state.cfg) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": crate::update::apply_message(&state.cfg)
+            })),
+        )
+            .into_response();
+    }
+    match crate::update::plan(&state, &query.release_id).await {
         Ok(body) => Json(body).into_response(),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
 
-async fn api_updates_apply() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": "Point-and-click install arrives in a later release. Selecting a build never deploys it."
-        })),
+#[derive(Deserialize)]
+struct ApplyBody {
+    release_id: String,
+    #[serde(default)]
+    preop: String,
+    #[serde(default)]
+    confirm_interruption: bool,
+}
+
+async fn api_updates_apply(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Json(body): Json<ApplyBody>,
+) -> Response {
+    let operator = match operator(&state, &headers).await {
+        Ok(op) => op,
+        Err(error) => return auth_error(error),
+    };
+    if !crate::update::updates_available(&state.cfg) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": crate::update::apply_message(&state.cfg)
+            })),
+        )
+            .into_response();
+    }
+    match crate::update::enqueue(
+        &state,
+        crate::update::ApplyRequest {
+            release_id: body.release_id,
+            preop: body.preop,
+            confirm_interruption: body.confirm_interruption,
+        },
     )
-        .into_response()
+    .await
+    {
+        Ok(id) => {
+            if let Ok(store) = state.store() {
+                let _ = store
+                    .audit(&operator.operator_id, "release_update", &id)
+                    .await;
+            }
+            Json(serde_json::json!({ "id": id })).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RollbackBody {
+    #[serde(default)]
+    confirm_rollback: bool,
+}
+
+async fn api_updates_rollback(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    let operator = match operator(&state, &headers).await {
+        Ok(op) => op,
+        Err(error) => return auth_error(error),
+    };
+    if !crate::update::updates_available(&state.cfg) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": crate::update::apply_message(&state.cfg)
+            })),
+        )
+            .into_response();
+    }
+    match crate::update::enqueue_rollback(
+        &state,
+        &id,
+        crate::update::RollbackRequest {
+            confirm_rollback: body.confirm_rollback,
+        },
+    )
+    .await
+    {
+        Ok(id) => {
+            if let Ok(store) = state.store() {
+                let _ = store
+                    .audit(&operator.operator_id, "release_update_rollback", &id)
+                    .await;
+            }
+            Json(serde_json::json!({ "id": id })).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
 }
 
 async fn operator(state: &Conductor, headers: &HeaderMap) -> anyhow::Result<Operator> {

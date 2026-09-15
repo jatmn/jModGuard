@@ -568,6 +568,57 @@ impl ControlStore {
         }
     }
 
+    pub async fn insert_update_job_if_idle(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: i64,
+    ) -> Result<Option<String>> {
+        anyhow::ensure!(kind == "release_update", "not a release-update job");
+        let id = random_token();
+        let conn = self.connect().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<bool> = async {
+            if backup_job_is_active(&conn).await? {
+                return Ok(false);
+            }
+            let now = now_ms();
+            conn.execute(
+                "INSERT INTO jobs(id, kind, status, payload_json, attempts, max_attempts, due_ms, created_ms)
+                 VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+                libsql::params![id.clone(), kind, payload.to_string(), max_attempts, now, now],
+            )
+            .await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(inserted) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(inserted.then_some(id))
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn get_job(&self, id: &str) -> Result<Option<JobRow>> {
+        let conn = self.connect().await?;
+        Self::job_conn(&conn, id).await
+    }
+
+    pub async fn patch_job_payload(&self, id: &str, payload: &serde_json::Value) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE jobs SET payload_json = ? WHERE id = ?",
+            libsql::params![payload.to_string(), id],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn claim_job(&self) -> Result<Option<JobRow>> {
         let conn = self.connect().await?;
         let now = now_ms();
@@ -672,10 +723,10 @@ impl ControlStore {
             if status != "failed" {
                 return Ok(false);
             }
-            if (is_backup_job_kind(&kind) || kind == "guild_move")
+            if (is_backup_job_kind(&kind) || kind == "guild_move" || kind == "release_update")
                 && backup_job_is_active(&conn).await?
             {
-                anyhow::bail!("a backup, restore or guild-move job is already running");
+                anyhow::bail!("a backup, restore, guild-move or update job is already running");
             }
             let changed = conn
                 .execute(
@@ -1289,7 +1340,7 @@ async fn backup_job_is_active(conn: &libsql::Connection) -> Result<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM jobs
-             WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize', 'guild_move')
+             WHERE kind IN ('backup_capture', 'backup_restore', 'backup_sanitize', 'guild_move', 'release_update')
                AND status IN ('queued', 'running')
              LIMIT 1",
             (),

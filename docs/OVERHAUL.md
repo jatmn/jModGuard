@@ -388,12 +388,12 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Point-and-click updates/rollback and public installation (R7–R8).
+1. Public installation and release acceptance (R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
 provider durability, distributed writer exclusion, access policy or billed resource use.
-Point-and-click updates and database credential hot-reload remain pending. Logging changes are described above; they do not establish full guild erasure.
+Point-and-click updates are implemented locally; database credential hot-reload remains pending. Logging changes are described above; they do not establish full guild erasure.
 
 ## Implemented: exact-image and repeated-text spam
 
@@ -454,10 +454,19 @@ pushes. Scheduled Buildkite Nightlies use a distinct `nightly-YYYYMMDD-<sha12>`
 identity that cannot enter that baseline or move `latest`. Complete publications
 sign `JMODGUARD-RELEASE-1` manifests covering bot, API, conductor and frontend.
 The conductor polls a configured feed, verifies HMAC trust/rotation, filters
-channels and records compatibility. `update_available` stays false. Apply POST
-routes return 404. Incomplete or unsigned artifacts stay unlistable.
+channels and records compatibility. Incomplete or unsigned artifacts stay unlistable.
 See [RELEASES.md](RELEASES.md).
 
-This is not point-and-click install, conductor self-replacement or live
-registry/deploy proof. Nightly and Stable remain operator-selected channels.
-No Bunny registry was added.
+## Implemented: point-and-click updates and rollback
+
+Owners can install a selected compatible release through Administration. Apply
+uses an R4 checkpoint when capture is configured, exclusive bot ownership, local
+process drain/stage/activate/readiness, and component order frontend → API → bot
+→ conductor. `update_available` is true when an update root is configured with
+discovery. There is no silent automatic update. Compatible rollback switches
+retained binaries and does not restore the previous database. Conductor
+self-replacement writes sidecar `recover.json`; `jmodguard-conductor recover-update`
+does not use the replacement process or private ops. Local tests cover success,
+missing artifacts, failed readiness, backup failure, interrupted jobs, old-instance
+restart and recover-update. Provider HTTP fixtures are not live Bunny cutover proof.
+See [UPDATES.md](UPDATES.md).

@@ -1,4 +1,4 @@
-//! Signed Stable/Nightly discovery. Local HTTP fixtures only; apply stays inactive.
+//! Signed Stable/Nightly discovery. Local HTTP fixtures only; apply stays inactive without an update root.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jmodguard_conductor::release::{self, DiscoveredRelease};
@@ -199,6 +199,9 @@ async fn setup(channels: &[&str]) -> Env {
         release_feed: Some(feed),
         release_keys: keys,
         installed_release: Some("v0.1.0".into()),
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     if !channels.is_empty() {
@@ -339,6 +342,9 @@ fn guild_and_settings_schema_compatibility() {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: Some("v0.1.0".into()),
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let mut body = unsigned("stable", "v0.2.0", 12, &[]);
     body["schema"]["guild_version"] = json!(1);
@@ -384,6 +390,9 @@ async fn failed_scheduled_poll_advances_interval() {
         release_feed: Some("http://127.0.0.1:1/index.json".into()),
         release_keys: keys,
         installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let store = conductor.store().unwrap();
@@ -391,7 +400,13 @@ async fn failed_scheduled_poll_advances_interval() {
     settings.discovery_interval_secs = 3600;
     store.save_settings(&settings, revision).await.unwrap();
     assert!(release::refresh_if_due(&conductor, false).await.is_err());
-    assert!(store.meta_get("release_last_poll_ms").await.unwrap().is_some());
+    assert!(
+        store
+            .meta_get("release_last_poll_ms")
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(release::refresh_if_due(&conductor, false).await.is_ok());
     discord_task.abort();
     let _ = std::fs::remove_file(&db);
@@ -423,6 +438,9 @@ fn older_schema_is_incompatible() {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: Some("v0.1.0".into()),
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let (ok, reason) = release::compatibility(&unsigned("stable", "v0.0.1", 1, &[]), &cfg).unwrap();
     assert!(!ok);
@@ -472,7 +490,7 @@ async fn catalog_lists_complete_signed_releases_and_refuses_apply() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{apply}");
-    assert!(apply.contains("later release"));
+    assert!(apply.contains("not configured"), "{apply}");
     let (status, apply) = call(
         &env.router,
         "POST",
@@ -482,6 +500,7 @@ async fn catalog_lists_complete_signed_releases_and_refuses_apply() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{apply}");
+    assert!(apply.contains("not configured"), "{apply}");
 }
 
 #[tokio::test]
@@ -490,7 +509,10 @@ async fn forced_refresh_query_polls_immediately() {
     let cookie = login(&env).await;
     let store = env.conductor.store().unwrap();
     store
-        .meta_set("release_last_poll_ms", &jmodguard_conductor::store::now_ms().to_string())
+        .meta_set(
+            "release_last_poll_ms",
+            &jmodguard_conductor::store::now_ms().to_string(),
+        )
         .await
         .unwrap();
     let (status, body) = call(
@@ -503,11 +525,13 @@ async fn forced_refresh_query_polls_immediately() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let catalog: Value = serde_json::from_str(&body).unwrap();
-    assert!(catalog["releases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|row| row["release_id"] == "v0.2.0"));
+    assert!(
+        catalog["releases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["release_id"] == "v0.2.0")
+    );
 }
 
 #[tokio::test]

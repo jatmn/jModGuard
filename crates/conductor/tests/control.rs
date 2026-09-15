@@ -79,6 +79,9 @@ async fn setup(owner: u64) -> Control {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -256,6 +259,9 @@ async fn session_revocation_and_restart_reuse_durable_store() {
             release_feed: None,
             release_keys: Default::default(),
             installed_release: None,
+            update_root: None,
+            artifact_root: None,
+            update_provider: None,
         },
         false,
     )

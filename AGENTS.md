@@ -21,8 +21,9 @@ is available on the conductor origin. Do not route guild Discord credentials or
 tenant routing through it. Backup and restore jobs are conductor-owned and use a
 dedicated backups-only root plus configured local capture paths; they must not import
 `TenantRuntime`. Signed Stable/Nightly discovery polls a configured feed when keys are
-present; `update_available` stays false and apply/install is not registered. Manifest
-HMAC secrets stay in environment/Buildkite secrets, never git. Guild dashboard View as… is a read-only preview
+present; `update_available` is true when an update root is also configured and
+owner apply/rollback is registered. There is no silent automatic update.
+Manifest HMAC secrets stay in environment/Buildkite secrets, never git. Guild dashboard View as… is a read-only preview
 tab on the API. No live provider testing or deployment is part of the current local
 implementation.
 Bot/API configuration remains available. The current baseline requires a fresh database
@@ -167,6 +168,10 @@ logs only, with no SQL cases. Enforcement rechecks membership/exemptions, delete
 matched messages and bans with truthful separate outcomes, and records selected
 case text (hashes/message IDs/trimmed excerpts). Discord attachment object capture
 remains later work. Process image budgets belong only to bot config.
+Owner-selected conductor updates use the local process adapter and R4 checkpoints;
+compatible rollback never restores an old database. Conductor self-replacement
+writes `recover.json` and `jmodguard-conductor recover-update` is independent of
+the replacement process.
 
 ## Commands
 

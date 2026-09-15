@@ -378,8 +378,13 @@ impl Conductor {
                 if job.kind == "backup_restore" && job.attempts >= job.max_attempts {
                     self.forget_restore_password(&job.id);
                 }
-                if job.kind.starts_with("backup_") || job.kind == "guild_move" {
-                    let category = if job.kind == "guild_move" {
+                if job.kind.starts_with("backup_")
+                    || job.kind == "guild_move"
+                    || job.kind == "release_update"
+                {
+                    let category = if job.kind == "release_update" {
+                        "updates"
+                    } else if job.kind == "guild_move" {
                         "jobs"
                     } else {
                         "backup"
@@ -397,7 +402,9 @@ impl Conductor {
                                 "notify_event",
                                 &serde_json::json!({
                                     "category": category,
-                                    "message": if job.kind == "guild_move" {
+                                    "message": if job.kind == "release_update" {
+                                        format!("Release update failed: {message}")
+                                    } else if job.kind == "guild_move" {
                                         format!("Guild move failed: {message}")
                                     } else {
                                         format!("Backup job failed: {message}")
@@ -509,6 +516,7 @@ impl Conductor {
             "backup_restore" => self.run_backup_restore(job_id, payload_json).await,
             "backup_sanitize" => self.run_backup_sanitize().await,
             "guild_move" => crate::guild_move::run(self, payload_json).await,
+            "release_update" => crate::update::run(self, job_id, payload_json).await,
             other => anyhow::bail!("unsupported job kind {other}"),
         }
     }

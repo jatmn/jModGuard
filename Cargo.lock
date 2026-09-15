@@ -1190,6 +1190,7 @@ dependencies = [
  "axum",
  "futures-util",
  "jmodguard-runtime",
+ "libc",
  "libsql",
  "percent-encoding",
  "rand 0.10.2",

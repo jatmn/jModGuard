@@ -3,9 +3,11 @@ use jmodguard_conductor::{Conductor, config::Config, router_for};
 use jmodguard_runtime::shutdown_signal;
 use std::future::IntoFuture;
 
-// Apply/install remains inactive. Discovery polls a configured feed without deploying.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("recover-update") {
+        return recover_main().await;
+    }
     let cfg = Config::load()?;
     let filter = tracing_subscriber::EnvFilter::try_new(&cfg.log_filter)
         .context("invalid JMODGUARD_CONDUCTOR_LOG filter")?;
@@ -43,5 +45,19 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn recover_main() -> Result<()> {
+    let cfg = Config::load()?;
+    let filter = tracing_subscriber::EnvFilter::try_new(&cfg.log_filter)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .try_init();
+    let report = jmodguard_conductor::update::recover_update(&cfg).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

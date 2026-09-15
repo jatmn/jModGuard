@@ -100,7 +100,9 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: conductor apply/install is not registered.
+Unfinished services stay inactive: public installation (R8) is not registered.
+Owner-selected updates and rollback are available on the conductor when an update
+root is configured; see [UPDATES.md](UPDATES.md).
 Signed Stable/Nightly discovery can list complete publications when a feed and
 trust keys are configured; see [RELEASES.md](RELEASES.md). Local encrypted
 backup/restore and guild-store moves are available on the conductor when their process
