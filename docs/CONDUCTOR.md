@@ -52,7 +52,7 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 |---|---|---|
 | `GET` / `HEAD /health` (also `/health/`) | `200`, process liveness only. | Same. |
 | `GET` / `HEAD /ready` | `503`, JSON code `control_not_configured`. | `200`. |
-| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false; `discovery_available` false; `update_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `discovery_available` is true when a release feed and trust keys are also configured; `update_available` stays false. |
+| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false; `discovery_available` false; `update_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `discovery_available` is true when a release feed and trust keys are also configured; `update_available` is true when that discovery path and `JMODGUARD_CONDUCTOR_UPDATE_ROOT` are configured. |
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
@@ -60,10 +60,11 @@ database. Its browser lifetime follows the applied absolute-session setting; ser
 idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
 unrevoked sessions. Administration
 pages: System Status, Installation, Notifications, Updates, Backups, Moves. The Updates
-page lists complete signed publications for selected channels. It never exposes an
-install button. `GET /api/updates` returns the cached catalog and polls the feed
-when the background interval has elapsed (or when `?refresh=true`). Apply POST
-routes return 404.
+page lists complete signed publications for selected channels. When an update root
+is configured it exposes plan/install/rollback. `GET /api/updates` returns the
+cached catalog and polls the feed when the background interval has elapsed (or
+when `?refresh=true`). Apply POST routes return 404 until
+`JMODGUARD_CONDUCTOR_UPDATE_ROOT` is set. See [UPDATES.md](UPDATES.md).
 
 Backups use a dedicated local zone marked `.jmodguard-backup-zone`. Capture
 takes a SQLite `VACUUM INTO` snapshot of each configured store, drops pending
@@ -138,6 +139,8 @@ docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 
 The image is not automatically published on ordinary main SHA builds. Stable
 and Nightly publication can include the conductor image plus a complete signed
-manifest. Point-and-click updates remain later work. See [overhaul status](OVERHAUL.md),
+manifest. Point-and-click install and code-only rollback are documented in
+[updates](UPDATES.md) (local process adapter, `recover.json`, no silent automatic
+update). See [overhaul status](OVERHAUL.md),
 [releases](RELEASES.md),
 [backup and restore](BACKUP-RESTORE.md) and [guild moves](GUILD-MOVES.md).

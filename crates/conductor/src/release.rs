@@ -1,4 +1,4 @@
-//! Signed Stable/Nightly discovery. Apply/install remains inactive.
+//! Signed Stable/Nightly discovery. Apply/install is owner-selected when an update root is configured.
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -209,7 +209,11 @@ fn validate_components(components: &Value) -> Result<()> {
     Ok(())
 }
 
-fn row_from_manifest(manifest: &Value, compatible: bool, blocked: Option<String>) -> DiscoveredRelease {
+fn row_from_manifest(
+    manifest: &Value,
+    compatible: bool,
+    blocked: Option<String>,
+) -> DiscoveredRelease {
     DiscoveredRelease {
         release_id: manifest
             .get("release_id")
@@ -452,12 +456,8 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
     }
     if let Ok(store) = conductor.store() {
         let previous = store.list_discovered_releases().await.unwrap_or_default();
-        let discovered = merge_discovered_catalog(
-            &previous,
-            &listed,
-            verified,
-            &retain_from_previous,
-        );
+        let discovered =
+            merge_discovered_catalog(&previous, &listed, verified, &retain_from_previous);
         if discovered.is_empty() && !previous.is_empty() {
             anyhow::bail!("release feed contained no verified manifests");
         }
@@ -465,16 +465,14 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
         notify_new_updates(conductor, store, &previous, &discovered).await?;
         return Ok(discovered);
     }
-    let discovered = merge_discovered_catalog(
-        &[],
-        &listed,
-        verified,
-        &retain_from_previous,
-    );
+    let discovered = merge_discovered_catalog(&[], &listed, verified, &retain_from_previous);
     Ok(discovered)
 }
 
-async fn poll_interval_elapsed(store: &crate::store::ControlStore, interval_secs: u64) -> Result<bool> {
+async fn poll_interval_elapsed(
+    store: &crate::store::ControlStore,
+    interval_secs: u64,
+) -> Result<bool> {
     if let Some(last) = store.meta_get("release_last_poll_ms").await?
         && let Ok(last_ms) = last.parse::<i64>()
     {
@@ -517,7 +515,14 @@ pub async fn catalog_for(conductor: &Conductor, force: bool) -> Result<Value> {
         Ok(store) => store.list_discovered_releases().await.unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let mut body = catalog(releases, &settings.discovery_channels, &conductor.cfg);
+    let mut cfg = conductor.cfg.clone();
+    if let Ok(store) = conductor.store()
+        && let Ok(Some(id)) = store.meta_get("installed_release").await
+        && !id.is_empty()
+    {
+        cfg.installed_release = Some(id);
+    }
+    let mut body = catalog(releases, &settings.discovery_channels, &cfg);
     if let Some(error) = poll_error
         && let Some(object) = body.as_object_mut()
     {
@@ -537,15 +542,68 @@ pub fn catalog(releases: Vec<DiscoveredRelease>, channels: &[String], cfg: &Conf
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let apply_on = crate::update::updates_available(cfg);
     serde_json::json!({
         "available": discovery_available(cfg),
-        "update_available": false,
+        "update_available": apply_on,
         "installed": installed(cfg),
         "channels": channels,
         "available_count": available_count(&selected, channels, &installed_id),
         "releases": selected,
-        "apply": "Point-and-click install arrives in a later release. Selecting a build here never deploys it.",
+        "apply": crate::update::apply_message(cfg),
     })
+}
+
+pub async fn load_verified_manifest(conductor: &Conductor, release_id: &str) -> Result<Value> {
+    let cfg = &conductor.cfg;
+    let feed = cfg
+        .release_feed
+        .as_deref()
+        .context("release feed is not configured")?;
+    ensure!(
+        !cfg.release_keys.is_empty(),
+        "release trust keys are not configured"
+    );
+    let index = fetch_json(&conductor.http, feed, MAX_INDEX_BYTES).await?;
+    ensure!(
+        index.get("format").and_then(Value::as_str) == Some(INDEX_FORMAT),
+        "release index format is not recognized"
+    );
+    let listed = index
+        .get("releases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in &listed {
+        let index_id = item.get("release_id").and_then(Value::as_str).unwrap_or("");
+        if index_id != release_id {
+            continue;
+        }
+        let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
+        let url = absolute(feed, path)?;
+        let raw = fetch_text(&conductor.http, &url, MAX_MANIFEST_BYTES).await?;
+        return verify_manifest(&raw, &cfg.release_keys);
+    }
+    anyhow::bail!("release {release_id} is not listed on the configured feed")
+}
+
+pub fn component_digest(manifest: &Value, name: &str) -> Result<String> {
+    let components = manifest
+        .get("components")
+        .context("manifest missing components")?;
+    let body = components
+        .get(name)
+        .with_context(|| format!("{name} is missing from the publication"))?;
+    let key = if name == "frontend" {
+        "sha256"
+    } else {
+        "digest"
+    };
+    body.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| is_sha256_digest(value))
+        .map(str::to_string)
+        .with_context(|| format!("{name} digest is missing"))
 }
 
 async fn notify_new_updates(
@@ -784,9 +842,11 @@ mod tests {
         let merged = merge_discovered_catalog(&previous, &listed, verified, &retain);
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|row| row.release_id == "v0.2.0"));
-        assert!(merged
-            .iter()
-            .any(|row| row.release_id == "nightly-20260915-aaaaaaaaaaaa"));
+        assert!(
+            merged
+                .iter()
+                .any(|row| row.release_id == "nightly-20260915-aaaaaaaaaaaa")
+        );
     }
 
     #[test]

@@ -99,6 +99,9 @@ async fn setup(restore_exists: bool) -> Harness {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -1695,6 +1698,9 @@ async fn capture_requires_a_reachable_core_store() {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -1768,6 +1774,9 @@ async fn restore_requires_a_configured_restore_target_at_enqueue() {
         release_feed: None,
         release_keys: Default::default(),
         installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));

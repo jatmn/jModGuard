@@ -233,8 +233,17 @@ function tabUpdates() {
   const nightly = el("input", { type: "checkbox" });
   nightly.checked = selected.has("nightly");
   const interval = el("input", { type: "number", value: String(s.discovery_interval_secs?.value ?? 3600) });
+  const preop = el("select", {},
+    el("option", { value: "fresh", text: "Fresh checkpoint" }),
+    el("option", { value: "recent", text: "Reuse a complete archive from the last 6 hours" }),
+    el("option", { value: "skip", text: "Skip checkpoint (no pre-update archive)" }),
+  );
+  const preopHint = el("p", { class: "muted", text: "" });
+  const confirm = el("input", { type: "checkbox" });
   const catalog = el("pre", { class: "muted", text: "Loading release catalog…" });
   const list = el("div", {});
+  const jobsBox = el("div", {}, el("p", { class: "muted", text: "Loading update jobs…" }));
+  const recoverBox = el("pre", { class: "muted", text: "Loading recover inventory…" });
   const renderCatalog = (data) => {
     catalog.textContent = JSON.stringify({
       available: data.available,
@@ -244,10 +253,12 @@ function tabUpdates() {
       available_count: data.available_count,
       apply: data.apply,
       poll_error: data.poll_error || null,
+      recover: data.recover || null,
     }, null, 2);
+    recoverBox.textContent = JSON.stringify(data.recover || { status: "unknown" }, null, 2);
     list.replaceChildren();
     if (!data.available) {
-      list.append(el("p", { class: "muted", text: "Discovery needs JMODGUARD_CONDUCTOR_RELEASE_FEED and JMODGUARD_CONDUCTOR_RELEASE_KEYS. Browsing a build never deploys it." }));
+      list.append(el("p", { class: "muted", text: "Discovery needs JMODGUARD_CONDUCTOR_RELEASE_FEED and JMODGUARD_CONDUCTOR_RELEASE_KEYS. Browsing a build never deploys it automatically." }));
       return;
     }
     const rows = data.releases || [];
@@ -255,23 +266,102 @@ function tabUpdates() {
       list.append(el("p", { class: "muted", text: "No complete signed releases in the selected channels." }));
       return;
     }
-    rows.forEach((row) => list.append(el("div", { class: "card" },
-      el("strong", { text: `${row.release_id} · ${row.channel}` }),
-      el("p", { class: "muted", text: row.compatible ? "Signed release passes current core/guild, settings-schema, and backup-format checks (install still inactive)." : (row.blocked_reason || "Incompatible") }),
-      el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
-      el("p", { class: "muted", text: (row.components || []).join(", ") }),
-      el("p", { class: "muted", text: row.notes || "No notes." }),
-    )));
+    rows.forEach((row) => {
+      const actions = [];
+      if (data.update_available && row.compatible) {
+        actions.push(el("button", { class: "btn", text: "Preview impact", onclick: async () => {
+          try {
+            toast(JSON.stringify(await api(`/api/updates/plan?release_id=${encodeURIComponent(row.release_id)}&preop=${encodeURIComponent(preop.value)}`)), "info");
+          } catch (e) { toast(e.message, "error"); }
+        } }));
+        actions.push(el("button", { class: "btn primary", text: "Install this release", onclick: async () => {
+          try {
+            if (!confirm.checked) throw new Error("confirm the exclusive bot drain, local API restart, and conductor recover-update path");
+            const queued = await api("/api/updates", "POST", {
+              release_id: row.release_id,
+              preop: preop.value,
+              confirm_interruption: true,
+            });
+            toast(`Update queued (${queued.id})`, "success");
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }));
+      }
+      list.append(el("div", { class: "card" },
+        el("strong", { text: `${row.release_id} · ${row.channel}` }),
+        el("p", { class: "muted", text: row.compatible ? (data.update_available ? "Signed release passes current core/guild, settings-schema, and backup-format checks." : "Compatible, but install needs JMODGUARD_CONDUCTOR_UPDATE_ROOT.") : (row.blocked_reason || "Incompatible") }),
+        el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
+        el("p", { class: "muted", text: (row.components || []).join(", ") }),
+        el("p", { class: "muted", text: row.notes || "No notes." }),
+        ...actions,
+      ));
+    });
+    jobsBox.replaceChildren();
+    const jobs = data.jobs || [];
+    if (!jobs.length) {
+      jobsBox.append(el("p", { class: "muted", text: "No update jobs yet." }));
+    } else {
+      jobs.forEach((job) => {
+        const payload = (() => { try { return JSON.parse(job.payload_json || "{}"); } catch { return {}; } })();
+        const buttons = [];
+        if (job.status === "failed") {
+          buttons.push(el("button", { class: "btn", text: "Retry failed update", onclick: async () => {
+            try {
+              await api(`/api/jobs/${job.id}/retry`, "POST", {});
+              toast("Update job queued for retry", "success");
+              render();
+            } catch (e) { toast(e.message, "error"); }
+          } }));
+        }
+        if (job.status === "succeeded" && !payload.rollback) {
+          buttons.push(el("button", { class: "btn", text: "Rollback code", onclick: async () => {
+            try {
+              await api(`/api/updates/${job.id}/rollback`, "POST", { confirm_rollback: true });
+              toast("Code rollback queued; the previous database is not restored", "success");
+              render();
+            } catch (e) { toast(e.message, "error"); }
+          } }));
+        }
+        jobsBox.append(el("div", { class: "card" },
+          el("strong", { text: `${job.kind} · ${job.status}` }),
+          el("p", { class: "muted", text: job.last_error || `phase ${payload.phase || "n/a"} · ${payload.release_id || ""}` }),
+          el("p", { class: "muted", text: `id: ${job.id}` }),
+          ...buttons,
+        ));
+      });
+    }
   };
-  api("/api/updates").then(renderCatalog).catch((e) => { catalog.textContent = e.message; });
+  const configurePreop = (captureAvailable) => {
+    if (captureAvailable) {
+      preopHint.textContent = "";
+      preop.querySelector('option[value="fresh"]').disabled = false;
+      preop.querySelector('option[value="recent"]').disabled = false;
+      return;
+    }
+    preop.value = "skip";
+    preopHint.textContent = "Capture is not configured; install requires preop=skip unless capture stores are configured.";
+    preop.querySelector('option[value="fresh"]').disabled = true;
+    preop.querySelector('option[value="recent"]').disabled = true;
+  };
+  Promise.all([api("/api/updates"), api("/api/status")])
+    .then(([data, status]) => {
+      configurePreop(!!status.capture_available);
+      renderCatalog(data);
+    })
+    .catch((e) => { catalog.textContent = e.message; });
   const refreshBtn = el("button", { class: "btn", text: "Refresh catalog", onclick: async () => {
     try {
-      renderCatalog(await api("/api/updates?refresh=true"));
+      const [data, status] = await Promise.all([
+        api("/api/updates?refresh=true"),
+        api("/api/status"),
+      ]);
+      configurePreop(!!status.capture_available);
+      renderCatalog(data);
     } catch (e) { toast(e.message, "error"); }
   } });
   return el("div", {},
     el("h2", { text: "Updates" }),
-    el("p", { class: "muted", text: "Browse signed Stable and Nightly publications. This page never installs a build; point-and-click apply arrives later. There is no silent automatic update." }),
+    el("p", { class: "muted", text: "Browse signed Stable and Nightly publications, then install a selected compatible build. There is no silent automatic update. Compatible rollback switches retained binaries and does not restore the old database. If conductor replacement fails, run `jmodguard-conductor recover-update` against the update root; that command does not use the new conductor or private ops." }),
     el("div", { class: "card" },
       el("h3", { text: "Discovery" }),
       field("Stable channel", stable),
@@ -297,8 +387,16 @@ function tabUpdates() {
       } }),
       refreshBtn,
     ),
+    el("div", { class: "card" },
+      el("h3", { text: "Install" }),
+      field("Pre-update checkpoint", preop),
+      preopHint,
+      el("label", {}, confirm, el("span", { text: " I confirm the exclusive bot drain, local API restart, and that conductor recovery uses recover-update rather than the replacement process." })),
+    ),
     el("div", { class: "card" }, el("h3", { text: "Installed and availability" }), catalog),
     el("div", { class: "card" }, el("h3", { text: "Complete publications" }), list),
+    el("div", { class: "card" }, el("h3", { text: "Update jobs" }), jobsBox),
+    el("div", { class: "card" }, el("h3", { text: "Recover inventory" }), recoverBox),
   );
 }
 

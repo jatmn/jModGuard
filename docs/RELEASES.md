@@ -2,7 +2,8 @@
 
 Public source produces signed Stable and Nightly publications. The conductor can
 browse complete manifests by channel and exact build. Selecting a build never
-deploys it. Point-and-click apply/install is a later change. There is no silent
+deploys it automatically. Point-and-click apply/install is owner-selected when
+`JMODGUARD_CONDUCTOR_UPDATE_ROOT` is configured. There is no silent
 automatic update and no Bunny registry.
 
 ## Channels
@@ -59,15 +60,23 @@ conductor can fetch the index and manifest JSON without credentials in the URL.
 | `JMODGUARD_CONDUCTOR_RELEASE_KEYS` | JSON map of current HMAC secrets. |
 | `JMODGUARD_CONDUCTOR_INSTALLED_RELEASE` | Optional installed release id. Defaults to `v` plus the crate version. |
 
-`/version` keeps `update_available: false`. `discovery_available` is true only
+`/version` sets `update_available` true only when operations, a feed, keys and
+`JMODGUARD_CONDUCTOR_UPDATE_ROOT` are configured. `discovery_available` is true only
 when operations, a feed and at least one key are configured. `GET /api/updates`
 returns the cached catalog and polls the feed when the background interval has
 elapsed (or immediately when `?refresh=true`). It verifies signatures, skips
 invalid/incomplete artifacts and returns the catalog. `POST /api/updates` and
-`POST /api/updates/apply` return 404. Owner settings select Stable/Nightly
-channels and a background poll interval.
+`POST /api/updates/apply` queue an install when the update root is configured
+and the owner confirms interruption; they return 404 when apply is not
+configured. Owner settings select Stable/Nightly
+channels and a background poll interval. Channel selection filters the Updates
+catalog and update notifications; it is not an install ACL. An authenticated owner
+can still plan/apply a compatible signed `release_id` listed on the feed.
 Enabling the `updates` notification category can report a newly seen compatible
 build; that is not an install.
+
+See [point-and-click updates](UPDATES.md) for plan/apply/rollback, recover-update
+and the local process adapter.
 
 Local tests cover complete and interrupted publication, channel isolation,
 unknown/retired keys, older-schema refusal and available-update counts. They
