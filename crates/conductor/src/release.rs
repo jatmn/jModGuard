@@ -164,6 +164,41 @@ pub fn compatibility(manifest: &Value, cfg: &Config) -> Result<(bool, Option<Str
             Some("older schema cannot replace a newer installation; restore a matching backup instead".into()),
         ));
     }
+    let guild_family = schema
+        .get("guild_family")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let guild_version = schema
+        .get("guild_version")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let current_guild = current
+        .get("guild_version")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if guild_family != "jmodguard-guild-1" {
+        return Ok((false, Some("incompatible guild store family".into())));
+    }
+    if guild_version < current_guild {
+        return Ok((
+            false,
+            Some("older guild schema cannot replace a newer installation; restore a matching backup instead".into()),
+        ));
+    }
+    let manifest_settings = manifest
+        .get("settings_schema")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let current_settings = current
+        .get("settings_schema")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if manifest_settings < current_settings {
+        return Ok((
+            false,
+            Some("older conductor settings schema cannot replace a newer installation".into()),
+        ));
+    }
     if manifest.get("backup_format").and_then(Value::as_str) != Some("JMODGUARD-BACKUP-1") {
         return Ok((false, Some("backup format is not compatible".into())));
     }
@@ -271,9 +306,6 @@ pub async fn refresh(conductor: &Conductor) -> Result<Vec<DiscoveredRelease>> {
             anyhow::bail!("release feed contained no verified manifests");
         }
         store.replace_discovered_releases(&discovered).await?;
-        store
-            .meta_set("release_last_poll_ms", &now_ms().to_string())
-            .await?;
         notify_new_updates(conductor, store, &previous, &discovered).await?;
     }
     Ok(discovered)
@@ -303,7 +335,13 @@ pub async fn refresh_if_due(conductor: &Conductor, force: bool) -> Result<()> {
             return Ok(());
         }
     }
-    refresh(conductor).await.map(|_| ())
+    let result = refresh(conductor).await.map(|_| ());
+    if !force {
+        store
+            .meta_set("release_last_poll_ms", &now_ms().to_string())
+            .await?;
+    }
+    result
 }
 
 pub async fn catalog_for(conductor: &Conductor, force: bool) -> Result<Value> {

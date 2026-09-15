@@ -40,6 +40,17 @@ Compatibility records the core/guild family and version, settings schema and
 backup format (`JMODGUARD-BACKUP-1`). An older schema cannot replace a newer
 installation; restore a matching backup instead.
 
+## Publishing the discovery feed
+
+Buildkite writes signed manifests to `dist/releases/` on the agent (`index.json`
+plus one `{release_id}.json` per complete Stable/Nightly publication). This
+repository does not upload that directory for you. Operators copy or sync those
+files to an HTTPS (or HTTP) origin and point
+`JMODGUARD_CONDUCTOR_RELEASE_FEED` at the `index.json` URL. The same layout is
+used in tests: index lists `path` entries relative to the index URL. Bunny
+Storage/Pull Zone, object storage, or any static host is fine as long as the
+conductor can fetch the index and manifest JSON without credentials in the URL.
+
 ## Conductor discovery
 
 | Environment variable | Purpose |

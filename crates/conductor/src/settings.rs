@@ -355,5 +355,20 @@ fn unique_channels(values: &[String]) -> Result<Vec<String>> {
             out.push(trimmed.to_string());
         }
     }
+    anyhow::ensure!(
+        !out.is_empty(),
+        "discovery_channels must include stable and/or nightly"
+    );
     Ok(out)
+}
+
+#[cfg(test)]
+mod discovery_channel_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_channels_reject_empty_selection() {
+        let err = unique_channels(&[]).unwrap_err();
+        assert!(err.to_string().contains("discovery_channels"));
+    }
 }

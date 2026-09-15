@@ -316,6 +316,90 @@ fn unsigned_unknown_key_and_incomplete_manifests_are_refused() {
 }
 
 #[test]
+fn guild_and_settings_schema_compatibility() {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: None,
+        public_url: String::new(),
+        owner_id: 0,
+        oauth_client_id: String::new(),
+        oauth_client_secret: String::new(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: String::new(),
+        oauth_me_url: String::new(),
+        backup_root: None,
+        backup_key: None,
+        capture_stores: Vec::new(),
+        evidence_root: None,
+        restore_target: None,
+        guild_stores: Vec::new(),
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: Some("v0.1.0".into()),
+    };
+    let mut body = unsigned("stable", "v0.2.0", 12, &[]);
+    body["schema"]["guild_version"] = json!(1);
+    let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
+    assert!(!ok);
+    assert!(reason.unwrap().contains("guild schema"));
+    body = unsigned("stable", "v0.2.0", 12, &[]);
+    body["settings_schema"] = json!(0);
+    let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
+    assert!(!ok);
+    assert!(reason.unwrap().contains("settings schema"));
+}
+
+#[tokio::test]
+async fn failed_scheduled_poll_advances_interval() {
+    let (discord, discord_task) = discord_stub(42).await;
+    let db = std::env::temp_dir().join(format!(
+        "jmodguard-conductor-release-poll-{}-{}.db",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let mut keys = std::collections::BTreeMap::new();
+    keys.insert("rp1".into(), SECRET.into());
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: Some(db.clone()),
+        public_url: "http://127.0.0.1:8081".into(),
+        owner_id: 42,
+        oauth_client_id: "cid".into(),
+        oauth_client_secret: "csecret".into(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: format!("{discord}/token"),
+        oauth_me_url: format!("{discord}/me"),
+        backup_root: None,
+        backup_key: None,
+        capture_stores: Vec::new(),
+        evidence_root: None,
+        restore_target: None,
+        guild_stores: Vec::new(),
+        release_feed: Some("http://127.0.0.1:1/index.json".into()),
+        release_keys: keys,
+        installed_release: None,
+    };
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let store = conductor.store().unwrap();
+    let (mut settings, revision, _) = store.load_settings().await.unwrap();
+    settings.discovery_interval_secs = 3600;
+    store.save_settings(&settings, revision).await.unwrap();
+    assert!(release::refresh_if_due(&conductor, false).await.is_err());
+    assert!(store.meta_get("release_last_poll_ms").await.unwrap().is_some());
+    assert!(release::refresh_if_due(&conductor, false).await.is_ok());
+    discord_task.abort();
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(format!("{}-wal", db.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db.display()));
+}
+
+#[test]
 fn older_schema_is_incompatible() {
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),

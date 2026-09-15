@@ -257,7 +257,7 @@ function tabUpdates() {
     }
     rows.forEach((row) => list.append(el("div", { class: "card" },
       el("strong", { text: `${row.release_id} · ${row.channel}` }),
-      el("p", { class: "muted", text: row.compatible ? "Signed release passes current core-version and backup-format checks (install still inactive)." : (row.blocked_reason || "Incompatible") }),
+      el("p", { class: "muted", text: row.compatible ? "Signed release passes current core/guild, settings-schema, and backup-format checks (install still inactive)." : (row.blocked_reason || "Incompatible") }),
       el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
       el("p", { class: "muted", text: (row.components || []).join(", ") }),
       el("p", { class: "muted", text: row.notes || "No notes." }),
@@ -282,6 +282,10 @@ function tabUpdates() {
           const channels = [];
           if (stable.checked) channels.push("stable");
           if (nightly.checked) channels.push("nightly");
+          if (!channels.length) {
+            toast("Select at least one discovery channel (Stable or Nightly)", "error");
+            return;
+          }
           state.settings = await api("/api/settings", "PATCH", {
             revision: state.settings.revision,
             discovery_channels: channels,

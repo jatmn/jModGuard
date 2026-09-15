@@ -115,7 +115,10 @@ in your deployment. Publishing never grants public access or deploys containers.
   pushes can publish changed bot/API images. A leftover `JMODGUARD_PUBLISH_SOURCE` on a
   webhook build is ignored so automatic publication still runs.
 - Scheduled builds on `main` publish Nightly images and a complete signed
-  manifest. Nightly IDs never become Release Please versions.
+  manifest. Nightly IDs never become Release Please versions. The manifest job
+  writes `dist/releases/index.json` and per-release JSON on the agent only;
+  operators sync that tree to the HTTPS origin configured as
+  `JMODGUARD_CONDUCTOR_RELEASE_FEED` (see [releases](RELEASES.md#publishing-the-discovery-feed)).
 - For automatic tag publication, enable **Build tags** in the pipeline's GitHub
   settings and ensure branch filters allow your release tags. Use trusted tags
   containing this Buildkite pipeline. This replaces GitHub's release-published
