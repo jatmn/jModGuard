@@ -16,12 +16,14 @@ and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
   Bare Cargo commands now select all workspace packages; production builds select a
   service explicitly, and CI uses `--workspace` to include all tests.
 - Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
-  deployment approval flow remain in place; the conductor is not auto-published or
-  required for startup.
+  deployment approval flow remain in place; the conductor is not required for startup
+  and is published only on Stable/Nightly, not ordinary main SHA builds.
 - The conductor can serve owner Administration when configured, including local
   backup and restore when a dedicated backup root is set. It is not an update
-  service and must not be deployed as one. Guild credentials and tenant
-  routing stay out of this process.
+  installer and must not be deployed as one. Guild credentials and tenant
+  routing stay out of this process. Signed release discovery can list complete
+  Stable/Nightly builds when a feed and trust keys are configured; apply stays
+  inactive.
 
 The target has three Rust services (Discord bot, guild API and installation conductor)
 and a static WebUI. Generic setup, releases and recovery tooling will live in this
@@ -43,13 +45,15 @@ does not import old databases. The fuller tenant/case model remains a later chan
   notifications) is available. Backup controls become available when a dedicated
   backup root is configured. Guild-store moves become available when a core
   capture store and configured shared/dedicated guild-store paths are present.
-  Update controls stay inactive.
+  Update *install* controls stay inactive; discovery can list signed releases.
   The conductor still does not import the application crate, Serenity or tenant routing.
 - CI checks that the conductor/runtime dependency trees do not include the application
   crate, bot/API service crates or Serenity. It tests the actual conductor process with
   local HTTP and process signals. Existing frontend and application checks remain.
 - All three Docker build definitions understand the workspace. The conductor image is
-  a development artifact; it is not included in automated release publication yet.
+  a development artifact; it is not included in automated main SHA publication.
+  Stable/Nightly builds can publish the conductor image with a complete signed
+  manifest.
 
 See [the conductor developer guide](CONDUCTOR.md) for commands and the current API.
 This is application source, not a separate proof project. No prototype's fixture
@@ -384,7 +388,7 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Releases, point-and-click updates and public installation (R6–R8).
+1. Point-and-click updates/rollback and public installation (R7–R8).
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
@@ -410,8 +414,9 @@ Discord attachment object capture into the evidence backend remains later work.
 The conductor can open a local control store and verify the installation operator
 through a Discord OAuth client independent of the guild API. Sessions are durable
 and revocable. Administration covers applied conductor settings, service health
-probes, bounded telemetry, owner webhook notifications and local backups. Update
-buttons are not exposed. The guild WebUI offers owner-only View as… preview in a
+probes, bounded telemetry, owner webhook notifications and local backups. Release
+discovery is available when a feed and keys are configured; install buttons are
+not exposed. The guild WebUI offers owner-only View as… preview in a
 separate tab; preview requests cannot write and never inherit owner authority.
 See [CONDUCTOR.md](CONDUCTOR.md).
 
@@ -441,3 +446,18 @@ credentials stay in bot/API process configuration; adding a new store requires
 restarting those services first. Discord actions are not replayed. Rollback after
 cutover is restore from an R4 checkpoint, not a placement pointer flip.
 See [GUILD-MOVES.md](GUILD-MOVES.md).
+
+## Implemented: complete releases and update discovery
+
+Release Please manages Stable version tags and changelog on trusted main
+pushes. Scheduled Buildkite Nightlies use a distinct `nightly-YYYYMMDD-<sha12>`
+identity that cannot enter that baseline or move `latest`. Complete publications
+sign `JMODGUARD-RELEASE-1` manifests covering bot, API, conductor and frontend.
+The conductor polls a configured feed, verifies HMAC trust/rotation, filters
+channels and records compatibility. `update_available` stays false. Apply POST
+routes return 404. Incomplete or unsigned artifacts stay unlistable.
+See [RELEASES.md](RELEASES.md).
+
+This is not point-and-click install, conductor self-replacement or live
+registry/deploy proof. Nightly and Stable remain operator-selected channels.
+No Bunny registry was added.

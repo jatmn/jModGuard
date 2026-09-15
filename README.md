@@ -7,9 +7,9 @@
 they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
 
 An optional conductor can serve owner Administration locally when configured,
-including local backup, restore, and guild-store moves. Updates remain pending.
-The existing bot/API installation does not require it. See
-[implementation status](docs/OVERHAUL.md).
+including local backup, restore, guild-store moves, and signed release discovery.
+Point-and-click install remains later work. The existing bot/API installation does
+not require the conductor. See [implementation status](docs/OVERHAUL.md).
 
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
 (bot + API/WebUI), libSQL-backed, multi-server.

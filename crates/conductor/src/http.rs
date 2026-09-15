@@ -41,6 +41,7 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "capture_available": false,
         "moves_available": false,
         "update_available": false,
+        "discovery_available": false,
     });
     let ready_state = state.clone();
     let router = Router::new()
@@ -116,6 +117,8 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/backups/{id}/restore", post(api_backup_restore))
         .route("/api/moves", get(api_moves).post(api_move_start))
         .route("/api/moves/plan", get(api_move_plan))
+        .route("/api/updates", get(api_updates).post(api_updates_apply))
+        .route("/api/updates/apply", post(api_updates_apply))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
                 response.headers_mut().insert(CACHE_CONTROL, NO_STORE);
@@ -146,6 +149,9 @@ fn placeholder_state() -> Conductor {
             evidence_root: None,
             restore_target: None,
             guild_stores: Vec::new(),
+            release_feed: None,
+            release_keys: Default::default(),
+            installed_release: None,
         },
         store: None,
         backup: None,
@@ -176,6 +182,7 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "capture_available": state.capture_available(),
         "moves_available": crate::guild_move::moves_available(&state.cfg),
         "update_available": false,
+        "discovery_available": crate::release::discovery_available(&state.cfg),
     }))
 }
 
@@ -380,7 +387,9 @@ async fn status_payload(state: &Conductor) -> anyhow::Result<serde_json::Value> 
         "backup_available": state.backup_available(),
         "capture_available": state.capture_available(),
         "moves_available": crate::guild_move::moves_available(&state.cfg),
-        "unavailable": ["updates"],
+        "discovery_available": crate::release::discovery_available(&state.cfg),
+        "update_available": false,
+        "unavailable": [],
     }))
 }
 
@@ -1079,6 +1088,36 @@ async fn api_move_start(
         },
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
+}
+
+#[derive(Deserialize)]
+struct UpdatesQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn api_updates(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Query(query): Query<UpdatesQuery>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    match crate::release::catalog_for(&state, query.refresh).await {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn api_updates_apply() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Point-and-click install arrives in a later release. Selecting a build never deploys it."
+        })),
+    )
+        .into_response()
 }
 
 async fn operator(state: &Conductor, headers: &HeaderMap) -> anyhow::Result<Operator> {

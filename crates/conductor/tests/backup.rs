@@ -96,6 +96,9 @@ async fn setup(restore_exists: bool) -> Harness {
         evidence_root: Some(evidence),
         restore_target: Some(restore),
         guild_stores: Vec::new(),
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -1689,6 +1692,9 @@ async fn capture_requires_a_reachable_core_store() {
         evidence_root: None,
         restore_target: Some(root.join("restore-target")),
         guild_stores: Vec::new(),
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));
@@ -1759,6 +1765,9 @@ async fn restore_requires_a_configured_restore_target_at_enqueue() {
         evidence_root: None,
         restore_target: None,
         guild_stores: Vec::new(),
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));

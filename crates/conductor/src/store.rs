@@ -171,6 +171,18 @@ impl ControlStore {
               last_error TEXT
             );
             CREATE INDEX IF NOT EXISTS archives_created ON archives(created_ms);
+            CREATE TABLE IF NOT EXISTS discovered_releases (
+              release_id TEXT PRIMARY KEY,
+              channel TEXT NOT NULL,
+              version TEXT NOT NULL,
+              source_commit TEXT NOT NULL,
+              published_at TEXT NOT NULL,
+              notes TEXT NOT NULL,
+              compatible INTEGER NOT NULL,
+              blocked_reason TEXT,
+              components_json TEXT NOT NULL,
+              observed_ms INTEGER NOT NULL
+            );
             "#,
         )
         .await
@@ -771,6 +783,74 @@ impl ControlStore {
                 last_error: row.get(7).ok(),
                 created_ms: row.get(8)?,
                 finished_ms: row.get(9).ok(),
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn replace_discovered_releases(
+        &self,
+        rows: &[crate::release::DiscoveredRelease],
+    ) -> Result<()> {
+        let conn = self.connect().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result: Result<()> = async {
+            conn.execute("DELETE FROM discovered_releases", ()).await?;
+            let observed = now_ms();
+            for row in rows {
+                conn.execute(
+                    "INSERT INTO discovered_releases(
+                        release_id, channel, version, source_commit, published_at, notes,
+                        compatible, blocked_reason, components_json, observed_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        row.release_id.clone(),
+                        row.channel.clone(),
+                        row.version.clone(),
+                        row.source_commit.clone(),
+                        row.published_at.clone(),
+                        row.notes.clone(),
+                        if row.compatible { 1i64 } else { 0 },
+                        row.blocked_reason.clone(),
+                        serde_json::to_string(&row.components)?,
+                        observed
+                    ],
+                )
+                .await?;
+            }
+            conn.execute("COMMIT", ()).await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            conn.execute("ROLLBACK", ()).await.ok();
+        }
+        result
+    }
+
+    pub async fn list_discovered_releases(&self) -> Result<Vec<crate::release::DiscoveredRelease>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT release_id, channel, version, source_commit, published_at, notes,
+                        compatible, blocked_reason, components_json
+                 FROM discovered_releases ORDER BY published_at DESC",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let components_json: String = row.get(8)?;
+            out.push(crate::release::DiscoveredRelease {
+                release_id: row.get(0)?,
+                channel: row.get(1)?,
+                version: row.get(2)?,
+                source_commit: row.get(3)?,
+                published_at: row.get(4)?,
+                notes: row.get(5)?,
+                compatible: row.get::<i64>(6)? != 0,
+                blocked_reason: row.get(7).ok(),
+                components: serde_json::from_str(&components_json).unwrap_or_default(),
             });
         }
         Ok(out)

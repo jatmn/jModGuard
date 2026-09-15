@@ -125,6 +125,9 @@ async fn setup() -> Harness {
                 path: dedicated,
             },
         ],
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
     };
     let conductor = Conductor::start(cfg, false).await.unwrap();
     let router = router_for(Arc::clone(&conductor));

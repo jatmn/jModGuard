@@ -38,6 +38,10 @@ pub struct ControlSettings {
     pub backup_retain_checkpoints: u64,
     #[serde(default = "default_backup_max_bytes")]
     pub backup_max_archive_bytes: u64,
+    #[serde(default = "default_discovery_channels")]
+    pub discovery_channels: Vec<String>,
+    #[serde(default = "default_discovery_interval")]
+    pub discovery_interval_secs: u64,
 }
 
 impl Default for ControlSettings {
@@ -70,6 +74,8 @@ impl Default for ControlSettings {
             backup_retain_daily: 7,
             backup_retain_checkpoints: 3,
             backup_max_archive_bytes: 256 * 1024 * 1024,
+            discovery_channels: default_discovery_channels(),
+            discovery_interval_secs: default_discovery_interval(),
         }
     }
 }
@@ -139,6 +145,13 @@ impl ControlSettings {
             1_048_576,
             2 * 1024 * 1024 * 1024,
         )?;
+        self.discovery_channels = unique_channels(&self.discovery_channels)?;
+        ensure_range(
+            "discovery_interval_secs",
+            self.discovery_interval_secs,
+            300,
+            86_400,
+        )?;
         Ok(())
     }
 
@@ -165,12 +178,14 @@ impl ControlSettings {
             "backup_retain_daily": { "value": self.backup_retain_daily, "applied": true, "unit": "points" },
             "backup_retain_checkpoints": { "value": self.backup_retain_checkpoints, "applied": true, "unit": "releases" },
             "backup_max_archive_bytes": { "value": self.backup_max_archive_bytes, "applied": true, "unit": "bytes" },
+            "discovery_channels": { "value": self.discovery_channels, "applied": true },
+            "discovery_interval_secs": { "value": self.discovery_interval_secs, "applied": true, "unit": "seconds", "note": "Background worker only; use Refresh catalog for an immediate poll." },
             "process_owned": {
                 "image_spam": "Bot process configuration. Not applied by the conductor.",
                 "log_discord_concurrency": "Bot process configuration. Not applied by the conductor.",
                 "enrollment_repair": "Bot process configuration. Not applied by the conductor.",
             },
-            "unavailable": ["updates"],
+            "unavailable": [],
         })
     }
 }
@@ -198,6 +213,8 @@ pub struct SettingsPatch {
     pub backup_retain_daily: Option<u64>,
     pub backup_retain_checkpoints: Option<u64>,
     pub backup_max_archive_bytes: Option<u64>,
+    pub discovery_channels: Option<Vec<String>>,
+    pub discovery_interval_secs: Option<u64>,
     pub revision: Option<i64>,
 }
 
@@ -272,6 +289,12 @@ impl ControlSettings {
         if let Some(v) = patch.backup_max_archive_bytes {
             self.backup_max_archive_bytes = v;
         }
+        if let Some(v) = patch.discovery_channels {
+            self.discovery_channels = v;
+        }
+        if let Some(v) = patch.discovery_interval_secs {
+            self.discovery_interval_secs = v;
+        }
         self.validate()?;
         Ok(patch.revision.unwrap_or(0))
     }
@@ -298,8 +321,16 @@ fn default_backup_max_bytes() -> u64 {
     256 * 1024 * 1024
 }
 
+fn default_discovery_channels() -> Vec<String> {
+    vec!["stable".into()]
+}
+
+fn default_discovery_interval() -> u64 {
+    3600
+}
+
 fn unique_categories(values: &[String]) -> Result<Vec<String>> {
-    const ALLOWED: &[&str] = &["health", "jobs", "login", "settings", "backup"];
+    const ALLOWED: &[&str] = &["health", "jobs", "login", "settings", "backup", "updates"];
     let mut out = Vec::new();
     for value in values {
         let trimmed = value.trim();
@@ -312,4 +343,32 @@ fn unique_categories(values: &[String]) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+fn unique_channels(values: &[String]) -> Result<Vec<String>> {
+    const ALLOWED: &[&str] = &["stable", "nightly"];
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        anyhow::ensure!(ALLOWED.contains(&trimmed), "unsupported discovery channel");
+        if !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    anyhow::ensure!(
+        !out.is_empty(),
+        "discovery_channels must include stable and/or nightly"
+    );
+    Ok(out)
+}
+
+#[cfg(test)]
+mod discovery_channel_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_channels_reject_empty_selection() {
+        let err = unique_channels(&[]).unwrap_err();
+        assert!(err.to_string().contains("discovery_channels"));
+    }
 }

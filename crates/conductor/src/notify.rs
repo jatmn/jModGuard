@@ -28,6 +28,7 @@ pub async fn deliver(conductor: &Conductor, kind: &str, payload_json: &str) -> R
     if settings.notify_verbosity == "errors"
         && kind != "notify_test"
         && payload.get("severity").and_then(|v| v.as_str()) != Some("error")
+        && category != "updates"
     {
         return Ok(());
     }

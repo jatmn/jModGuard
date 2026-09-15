@@ -50,8 +50,12 @@ last commit in a push. Frontend/docs-only changes skip image compilation when
 the published source can be verified. That skip inspects public GHCR history
 before fetching `GHCR_TOKEN` or logging in, so missing push credentials cannot
 fail a docs-only main build. Missing image labels, unavailable Git
-history or registry inspection errors cause a rebuild. Both images use the
-shared source trees, so shared Rust/migration changes can build both images.
+history or registry inspection errors cause a rebuild. Bot and API images use
+the shared source trees, so shared Rust/migration changes can build both images.
+Main SHA publication does not publish the conductor image or an installable
+manifest. Scheduled Nightly and Stable tag/manual builds publish bot, API,
+conductor and a complete signed `JMODGUARD-RELEASE-1` manifest. Nightly tags are
+unique and must not move `latest`. Incomplete publications stay unavailable.
 Skipping also requires `latest` and its labeled source-SHA tag to contain the
 same manifest. If a previous push updated only one tag, a retry republishes
 the image to repair the incomplete publication.
@@ -71,8 +75,10 @@ and tokens in cluster Secrets
 | Value | Where and purpose |
 |---|---|
 | `GHCR_USERNAME` | Non-secret. Set in this repo's `.buildkite/pipeline.yml` `env:` (already `jatmn`). The other official place is **Pipeline settings → Steps** (YAML editor) with a top-level `env:` before `steps`. |
-| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push both `jmodguard-bot` and `jmodguard-api`. |
-| `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker. If absent, `GHCR_TOKEN` is used and must also read this private repository. Do not set this to GitHub Actions' automatic token. |
+| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push `jmodguard-bot`, `jmodguard-api` and `jmodguard-conductor`. |
+| `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker and for Release Please. If absent, `GHCR_TOKEN` is used for Docker and must also read this private repository. Release Please is skipped when no token is available. Do not set this to GitHub Actions' automatic token. |
+| `JMODGUARD_RELEASE_KEY_ID` | Non-secret signing key id for complete Stable/Nightly manifests. |
+| `JMODGUARD_RELEASE_SIGNING_KEY` | 32-byte hex HMAC secret. Store as a Buildkite secret, never in git. |
 
 For personal access tokens, GitHub's container registry requires a **classic
 PAT** with `write:packages` and access to the existing packages. While this
@@ -104,10 +110,15 @@ in your deployment. Publishing never grants public access or deploys containers.
 
 ## Main, tags and manual builds
 
-- Keep branch/PR builds enabled as appropriate for CI. PRs, scheduled builds, and
-  UI/API builds without `JMODGUARD_PUBLISH_SOURCE` run tests only. Main webhook
-  pushes can publish changed images. A leftover `JMODGUARD_PUBLISH_SOURCE` on a
+- Keep branch/PR builds enabled as appropriate for CI. PRs and UI/API builds
+  without `JMODGUARD_PUBLISH_SOURCE` run tests only. Main webhook
+  pushes can publish changed bot/API images. A leftover `JMODGUARD_PUBLISH_SOURCE` on a
   webhook build is ignored so automatic publication still runs.
+- Scheduled builds on `main` publish Nightly images and a complete signed
+  manifest. Nightly IDs never become Release Please versions. The manifest job
+  writes `dist/releases/index.json` and per-release JSON on the agent only;
+  operators sync that tree to the HTTPS origin configured as
+  `JMODGUARD_CONDUCTOR_RELEASE_FEED` (see [releases](RELEASES.md#publishing-the-discovery-feed)).
 - For automatic tag publication, enable **Build tags** in the pipeline's GitHub
   settings and ensure branch filters allow your release tags. Use trusted tags
   containing this Buildkite pipeline. This replaces GitHub's release-published
@@ -119,12 +130,15 @@ in your deployment. Publishing never grants public access or deploys containers.
   components use the one resolved SHA recorded by the preparation job. Tests
   validate the current pipeline checkout; the image builds compile the selected
   source. A plain branch name such as `main` is rejected as a publication source.
+  Manual publication by commit SHA publishes container images only; the manifest
+  job skips when the source has no installable Stable/Nightly release id.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in
   place of the retired Actions `CI failover`. No hosted fallback is automatic.
 
 Published images remain single-manifest `linux/amd64`, without provenance/SBOM
-indexes, and carry `latest` and full-source-SHA tags. Tag/manual-tag builds add
-the normalized tag name when Docker accepts it. Prior versions remain available
+indexes. Bot/API main publications carry `latest` and full-source-SHA tags.
+Nightly publications use only the SHA and unique nightly tag. Tag/manual-tag
+builds add the normalized tag name when Docker accepts it. Prior versions remain available
 for approved releases and rollback. Publishing an older source can move `latest`
 backward; production must keep using approved image digests.
 
@@ -146,6 +160,8 @@ backward; production must keep using approved image digests.
 Local offline publisher tests: `python3 .buildkite/publish-image-test.py`.
 They exercise source identity, event guards, multi-commit change detection,
 credential handling and cleanup without pushing images or contacting Buildkite.
+Release publication contracts: `python3 .buildkite/release-test.py`.
+See [releases](RELEASES.md).
 
 References: [Buildkite GitHub integration](https://buildkite.com/docs/pipelines/source-control/github),
 [Buildkite secrets](https://buildkite.com/docs/pipelines/security/secrets/buildkite-secrets),

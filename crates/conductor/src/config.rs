@@ -33,6 +33,9 @@ pub struct Config {
     pub evidence_root: Option<PathBuf>,
     pub restore_target: Option<PathBuf>,
     pub guild_stores: Vec<GuildStorePath>,
+    pub release_feed: Option<String>,
+    pub release_keys: std::collections::BTreeMap<String, String>,
+    pub installed_release: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -59,6 +62,12 @@ impl std::fmt::Debug for Config {
             .field("evidence_root", &self.evidence_root)
             .field("restore_target", &self.restore_target)
             .field("guild_stores", &self.guild_stores)
+            .field("release_feed", &self.release_feed)
+            .field(
+                "release_keys",
+                &self.release_keys.keys().cloned().collect::<Vec<_>>(),
+            )
+            .field("installed_release", &self.installed_release)
             .finish()
     }
 }
@@ -136,6 +145,12 @@ impl Config {
         let restore_target = optional_path(lookup("JMODGUARD_CONDUCTOR_RESTORE_TARGET")?)?;
         let guild_stores =
             parse_guild_stores(lookup("JMODGUARD_CONDUCTOR_GUILD_STORES")?.unwrap_or_default())?;
+        let release_feed = optional_feed(lookup("JMODGUARD_CONDUCTOR_RELEASE_FEED")?)?;
+        let release_keys =
+            parse_release_keys(lookup("JMODGUARD_CONDUCTOR_RELEASE_KEYS")?.unwrap_or_default())?;
+        let installed_release = lookup("JMODGUARD_CONDUCTOR_INSTALLED_RELEASE")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         if let (Some(backup), Some(evidence)) = (&backup_root, &evidence_root) {
             ensure_disjoint_roots(
                 backup,
@@ -222,6 +237,9 @@ impl Config {
             evidence_root,
             restore_target,
             guild_stores,
+            release_feed,
+            release_keys,
+            installed_release,
         })
     }
 
@@ -387,6 +405,40 @@ fn parse_guild_stores(raw: String) -> Result<Vec<GuildStorePath>> {
     Ok(out)
 }
 
+fn optional_feed(raw: Option<String>) -> Result<Option<String>> {
+    let Some(value) = raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parse_http_url(&value).context("JMODGUARD_CONDUCTOR_RELEASE_FEED")?,
+    ))
+}
+
+fn parse_release_keys(raw: String) -> Result<std::collections::BTreeMap<String, String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let parsed: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(trimmed).context("JMODGUARD_CONDUCTOR_RELEASE_KEYS")?;
+    for (id, secret) in &parsed {
+        anyhow::ensure!(
+            id.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && (2..=32).contains(&id.len()),
+            "release key id is invalid"
+        );
+        anyhow::ensure!(
+            secret.len() == 64
+                && secret
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "release trust key must be 32 bytes hex"
+        );
+    }
+    Ok(parsed)
+}
+
 fn optional_health_url(raw: String, name: &str) -> Result<String> {
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
@@ -426,6 +478,41 @@ mod tests {
         assert!(cfg.backup_root.is_none());
         assert!(cfg.backup_key.is_none());
         assert!(!cfg.capture_core_ready());
+        assert!(cfg.release_feed.is_none());
+        assert!(cfg.release_keys.is_empty());
+    }
+    #[test]
+    fn release_feed_and_keys_are_validated() {
+        assert!(
+            Config::from_lookup(|k| Ok(
+                (k == "JMODGUARD_CONDUCTOR_RELEASE_FEED").then(|| "not-a-url".into())
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(|k| Ok(
+                (k == "JMODGUARD_CONDUCTOR_RELEASE_KEYS").then(|| r#"{"bad":"not-hex"}"#.into())
+            ))
+            .is_err()
+        );
+        let cfg = Config::from_lookup(|key| {
+            Ok(Some(
+                match key {
+                    "JMODGUARD_CONDUCTOR_RELEASE_FEED" => "https://example.test/index.json",
+                    "JMODGUARD_CONDUCTOR_RELEASE_KEYS" => {
+                        r#"{"rp1":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+                    }
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(
+            cfg.release_feed.as_deref(),
+            Some("https://example.test/index.json")
+        );
+        assert_eq!(cfg.release_keys.len(), 1);
     }
     #[test]
     fn backup_paths_must_be_absolute_and_distinct() {

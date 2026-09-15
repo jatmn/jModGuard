@@ -20,7 +20,9 @@ store, conductor OAuth and operator identity are configured; then owner Administ
 is available on the conductor origin. Do not route guild Discord credentials or
 tenant routing through it. Backup and restore jobs are conductor-owned and use a
 dedicated backups-only root plus configured local capture paths; they must not import
-`TenantRuntime`. Guild dashboard View as… is a read-only preview
+`TenantRuntime`. Signed Stable/Nightly discovery polls a configured feed when keys are
+present; `update_available` stays false and apply/install is not registered. Manifest
+HMAC secrets stay in environment/Buildkite secrets, never git. Guild dashboard View as… is a read-only preview
 tab on the API. No live provider testing or deployment is part of the current local
 implementation.
 Bot/API configuration remains available. The current baseline requires a fresh database
@@ -99,6 +101,10 @@ moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/
 store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 8. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write. The conductor still has no tenant routing.
+Stable/Nightly publication uses Release Please plus scheduled Buildkite Nightlies; complete
+`JMODGUARD-RELEASE-1` manifests are HMAC-SHA256 signed. The conductor discovers them without
+deployment authority; see `docs/RELEASES.md`. Nightly IDs never enter the Release Please
+baseline and must not move `latest`. Incomplete publications stay unavailable.
 Library contracts for membership, cases, history, sources and evidence remain as
 documented in their TENANT/CASE pages. Runtime routing, selected-case recording,
 authorized serving and live guild erasure are described in `docs/TENANT-RUNTIME.md`.

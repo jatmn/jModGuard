@@ -358,6 +358,9 @@ impl Conductor {
         }
         self.maybe_schedule_backup().await?;
         self.maybe_sanitize_backups().await?;
+        if let Err(error) = self.maybe_refresh_releases().await {
+            tracing::warn!("release discovery: {error:#}");
+        }
         let Some(job) = store.claim_job().await? else {
             return Ok(());
         };
@@ -479,6 +482,10 @@ impl Conductor {
             .insert_backup_job_if_idle("backup_sanitize", &serde_json::json!({}), 3)
             .await?;
         Ok(())
+    }
+
+    async fn maybe_refresh_releases(&self) -> Result<()> {
+        crate::release::refresh_if_due(self, false).await
     }
 
     async fn run_job(&self, job_id: &str, kind: &str, payload_json: &str) -> Result<()> {
