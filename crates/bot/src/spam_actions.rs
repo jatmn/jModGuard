@@ -550,11 +550,12 @@ async fn capture_attachments(
             attachment_id: item.file.id as i64,
         };
         let path = std::env::temp_dir().join(format!(
-            "jmodguard-attach-{}-{}.part",
-            case_id.as_str(),
-            item.file.id
+            "jmodguard-attach-{:032x}.part",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
         ));
-        let _guard = RemoveCapture(path.clone());
         if let Err(error) = hasher.fetch_file(&item.file, remaining, &path).await {
             tracing::warn!(
                 guild_id = enrollment.guild_id,
@@ -562,6 +563,7 @@ async fn capture_attachments(
             );
             continue;
         }
+        let _guard = RemoveCapture(path.clone());
         if let Err(error) = app
             .tenant
             .capture_selected_attachment(

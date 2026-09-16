@@ -1689,3 +1689,80 @@ async fn selected_attachment_capture_stores_bytes_and_skips_retries() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_attachment_capture_surfaces_discarded_reservation() {
+    use crate::db::guild_data::{EvidenceCapture, EvidenceOrigin, EvidenceRequest, RecordCase};
+    use std::io::Write;
+
+    let f = Fixture::with_stores(
+        Default::default(),
+        EvidenceConfig {
+            backend: "local".into(),
+            ..Default::default()
+        },
+    );
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let evidence_id = attachment_evidence_id(&origin).unwrap();
+    let (store, scope) = f.tenant.live(e.clone()).await.unwrap();
+    let storage_id =
+        CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+    store
+        .reserve_case_evidence(
+            scope.clone(),
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceRequest {
+                storage_id,
+                bytes: 3,
+                origin: origin.clone(),
+            },
+            evidence_limits(),
+        )
+        .await
+        .unwrap();
+    store
+        .settle_evidence_capture(
+            scope.clone(),
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceCapture::Discarded,
+        )
+        .await
+        .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "jmodguard-attach-discarded-{:032x}",
+        rand::random::<u128>()
+    ));
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"abc").unwrap();
+        file.sync_all().unwrap();
+    }
+    let error = f
+        .tenant
+        .capture_selected_attachment(e, case, origin, 3, path.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("attachment evidence origin was discarded and cannot be recaptured")
+    );
+    let _ = std::fs::remove_file(&path);
+}

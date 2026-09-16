@@ -289,8 +289,99 @@ impl TenantRuntime {
         }
     }
 
+    #[cfg(unix)]
+    async fn reconcile_attachment_evidence(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<EvidenceState> {
+        match &self.inner.evidence {
+            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Local(backend) => backend.reconcile(store, target).await,
+            EvidenceBackend::Bunny(backend) => backend.reconcile(store, target).await,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_attachment_evidence(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<()> {
+        match &self.inner.evidence {
+            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Local(backend) => {
+                backend.cleanup(store, target).await?;
+            }
+            EvidenceBackend::Bunny(backend) => {
+                backend.cleanup(store, target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn prepare_attachment_evidence_capture(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<bool> {
+        let Some(job) = store
+            .find_evidence_transfer_job(
+                target.scope.clone(),
+                target.case_id.clone(),
+                target.evidence_id.clone(),
+            )
+            .await?
+        else {
+            return Ok(true);
+        };
+        match job.state {
+            EvidenceState::Available => Ok(false),
+            EvidenceState::Capturing => {
+                let state = self
+                    .reconcile_attachment_evidence(store.clone(), target.clone())
+                    .await?;
+                self.after_attachment_reconcile(store, target, state).await
+            }
+            EvidenceState::CleanupPending => {
+                self.cleanup_attachment_evidence(store, target).await?;
+                Err(anyhow!(
+                    "attachment evidence origin was discarded and cannot be recaptured"
+                ))
+            }
+            EvidenceState::Erased => Err(anyhow!(
+                "attachment evidence origin was discarded and cannot be recaptured"
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn after_attachment_reconcile(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+        state: EvidenceState,
+    ) -> Result<bool> {
+        match state {
+            EvidenceState::Available => Ok(false),
+            EvidenceState::CleanupPending => {
+                self.cleanup_attachment_evidence(store, target).await?;
+                Err(anyhow!(
+                    "attachment evidence origin was discarded and cannot be recaptured"
+                ))
+            }
+            EvidenceState::Capturing => {
+                bail!("attachment capture remains in flight after reconciliation")
+            }
+            EvidenceState::Erased => Err(anyhow!(
+                "attachment evidence origin was discarded and cannot be recaptured"
+            )),
+        }
+    }
+
     /// Stream a proving Discord attachment into the configured evidence backend.
-    /// Existing reservations are not retried. A disabled backend is a no-op.
+    /// Completed objects are not re-uploaded. A disabled backend is a no-op.
     pub async fn capture_selected_attachment(
         &self,
         enrollment: GuildEnrollment,
@@ -322,24 +413,25 @@ impl TenantRuntime {
                 return Ok(None);
             };
             let evidence_id = attachment_evidence_id(&origin)?;
-            if store
-                .find_evidence_transfer_job(scope.clone(), case_id.clone(), evidence_id.clone())
+            let request = EvidenceRequest {
+                storage_id,
+                bytes,
+                origin,
+            };
+            let target = crate::evidence_transfer::EvidenceTarget {
+                scope: scope.clone(),
+                case_id: case_id.clone(),
+                evidence_id: evidence_id.clone(),
+            };
+            if !self
+                .prepare_attachment_evidence_capture(store.clone(), target.clone())
                 .await?
-                .is_some()
             {
                 return Ok(None);
             }
             let upload = crate::evidence_transfer::EvidenceUpload {
-                target: crate::evidence_transfer::EvidenceTarget {
-                    scope,
-                    case_id,
-                    evidence_id,
-                },
-                request: EvidenceRequest {
-                    storage_id,
-                    bytes,
-                    origin,
-                },
+                target,
+                request,
                 limits: evidence_limits(),
             };
             let state = match &self.inner.evidence {
