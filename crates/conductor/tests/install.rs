@@ -377,6 +377,18 @@ async fn install_api_requires_operator_and_rejects_rds() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
     assert!(err.contains("must not include a query string"));
+    let (status, err) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            r#"{"profile":"bunny","public_origin":"https://admin.example","core_database":"libsql","guild_database":"libsql","core_url":"libsql://core.lite.bunnydb.net#jwt=secret","guild_url":"libsql://guild.lite.bunnydb.net","api_embedded_ui":false,"frontend_storage":true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err.contains("must not include a fragment"));
     let root = scratch("http-local");
     let plan = serde_json::json!({
         "profile": "local",

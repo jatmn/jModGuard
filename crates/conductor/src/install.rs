@@ -533,6 +533,10 @@ fn reject_credentials(raw: &str, label: &str) -> Result<()> {
         url.query().is_none(),
         "{label} must not include a query string; keep secrets in environment configuration"
     );
+    ensure!(
+        url.fragment().is_none(),
+        "{label} must not include a fragment; keep secrets in environment configuration"
+    );
     Ok(())
 }
 
@@ -804,6 +808,33 @@ mod tests {
         let err = validate_plan(&plan).unwrap_err().to_string();
         assert!(
             err.contains("must not include a query string"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fragments_on_database_urls_are_rejected() {
+        let root = scratch("fragment-creds");
+        let mut plan = local_plan(&root);
+        plan.profile = Profile::Bunny;
+        plan.public_origin = "https://admin.example".into();
+        plan.core_database = DatabaseKind::Libsql;
+        plan.guild_database = DatabaseKind::Libsql;
+        plan.core_url = "libsql://core.lite.bunnydb.net#jwt=secret".into();
+        plan.guild_url = "libsql://guild.lite.bunnydb.net".into();
+        plan.api_embedded_ui = false;
+        plan.frontend_storage = true;
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("must not include a fragment"),
+            "{err}"
+        );
+        plan.core_url = "libsql://core.lite.bunnydb.net".into();
+        plan.guild_url = "libsql://guild.lite.bunnydb.net#api_key=secret".into();
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("must not include a fragment"),
             "{err}"
         );
         let _ = fs::remove_dir_all(root);

@@ -21,16 +21,22 @@ AWS proof. Eight merged overhaul PRs do not prove production cutover.
 
 Private GitHub Actions that publish Storage files are an **optional extra lock**
 ([examples/private-ops](examples/private-ops/README.md)). They are not required.
-Buildkite already publishes bot, API, conductor, and frontend artifacts from this
-repository.
+Buildkite publishes bot and API images from this repository on every main SHA.
+Conductor images and a complete signed `JMODGUARD-RELEASE-1` manifest ship only on
+scheduled Nightly, Stable tag, and manual builds ([BUILDKITE.md](BUILDKITE.md)).
 
 ## Public artifacts
 
 Use a git tag or the matching Buildkite image digests:
 
 - source: `https://github.com/jatmn/jModGuard`
-- images: `ghcr.io/jatmn/jmodguard-bot`, `jmodguard-api`, `jmodguard-conductor`
+- images on every main SHA: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`
+- conductor image and installable release manifest: Nightly / Stable tag / manual
+  Buildkite builds only (`ghcr.io/jatmn/jmodguard-conductor`); on main SHA build
+  from source (`cargo build --locked -p jmodguard-conductor`) or pin a tagged release
 - admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`
+  (from source or release manifest; Buildkite does not upload a separate frontend
+  artifact bundle—see [BUILDKITE.md](BUILDKITE.md))
 - license: `LICENSE.md`
 
 Do not copy secrets into git. Bunny Storage passwords, Discord tokens, OAuth
