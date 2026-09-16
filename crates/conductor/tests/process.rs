@@ -106,14 +106,22 @@ fn standalone_process_reports_liveness_but_not_operational_readiness() {
     let version = p.request("GET", "/version");
     assert!(version.starts_with("HTTP/1.1 200"));
     assert!(version.contains("\"operations_available\":false"));
+    assert!(version.contains("\"private_ops_required\":false"));
     for text in [ready, version] {
         assert!(text.contains("cache-control: no-store"));
         assert!(!text.contains("synthetic-do-not-expose"));
         assert!(!text.contains("invalid-database-url"));
     }
-    for path in ["/api/guilds", "/uploads", "/updates", "/login"] {
+    for path in [
+        "/api/guilds",
+        "/uploads",
+        "/updates",
+        "/login",
+        "/api/install",
+    ] {
         assert!(p.request("POST", path).starts_with("HTTP/1.1 404"));
     }
+    assert!(p.request("GET", "/api/install").starts_with("HTTP/1.1 404"));
     assert!(!p.root.join("jmodguard.db").exists());
     assert!(!p.root.join("logs").exists());
     assert!(!p.root.join("conductor.db").exists());

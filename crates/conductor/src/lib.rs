@@ -4,6 +4,7 @@ pub mod backup;
 pub mod config;
 pub mod guild_move;
 pub mod http;
+pub mod install;
 pub mod notify;
 pub mod release;
 pub mod settings;

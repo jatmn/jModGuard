@@ -16,12 +16,11 @@ workers: they talk to Bunny Database and (outbound) to Discord. They do not
 contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
-The UI files are published by **GitHub Actions in your private ops repo**.
-Source pushes build artifacts; production changes require a reviewed ops release
-selecting the source SHA and exact compatible bot/API image digests. Scheduled
-and manual ops runs reconcile that selection. CSS-only assets can move without
-an API rollout, but still require release approval. Keep Bunny credentials,
-resource IDs and recovery evidence in ops.
+Publish the three `frontend/` files from **this public repository** or the
+`frontend/` paths in a signed Nightly/Stable/manual release manifest (Buildkite
+does not upload a separate frontend bundle on main). A private ops GitHub Actions workflow is
+an optional extra lock so Storage passwords never sit in git; it is **not
+required** for a Bunny install. See [INSTALL.md](INSTALL.md).
 
 ```text
 Browser  →  Bunny CDN (Pull Zone)
@@ -106,20 +105,21 @@ and do not log in on the system `*.b-cdn.net` hostname afterward (OAuth
 CSRF cookies are host-only). On the admin Pull Zone, **Disable Cookies**
 must be **off** (`DisableCookies=false`) or login cannot keep a session.
 
-**First time (manual).** In the Storage Zone, **Browse Files**, and upload
-those three files to the **root** so they are `/` (or `/index.html`),
+**First time (manual, public source).** In the Storage Zone, **Browse Files**,
+and upload those three files from this repository (or the same paths from a
+signed release manifest for the same tag) to the **root** so they are `/` (or `/index.html`),
 `/app.js`, and `/style.css`. Start from the same git tag as the container
 images so the first login works. After that, CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
 the page needs new API endpoints.
 
-**Later updates.** Publishing is meant to be GitHub Actions in your
-**private** ops repo (Bunny Storage passwords do not belong in this public
-project), using
+**Later updates (optional private ops).** Repeating Storage publishes with a
+GitHub Actions lock is optional. Bunny Storage passwords do not belong in this
+public project. If you want that extra lock, copy
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
-and its [private ops installation instructions](examples/private-ops/README.md).
-A private repo is not required for a one-off upload. Copy the workflow
-into the private repo when you want repeats. Store these secrets there:
+and follow its [optional installation instructions](examples/private-ops/README.md).
+A private repo is **not required**. Store these secrets there only if you use
+the example:
 
 | Secret | What it is |
 |---|---|
@@ -130,11 +130,13 @@ into the private repo when you want repeats. Store these secrets there:
 | `BUNNY_API_KEY` | Account API key for API state inspection and CDN purge |
 | `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
 
-Install all files and variables listed in the
-[private ops README](examples/private-ops/README.md), including its disabled
-`frontend-release.json` and ops-owned Python helpers. The example publishes only
-an approved full source SHA from ops `main`. It is a frontend publisher; use your
-container runbook to deploy compatible bot/API digests and apply migrations.
+Install the optional example files listed in the
+[private ops README](examples/private-ops/README.md) only when you want that
+lock. The example publishes an approved full source SHA from ops `main`. It is a
+frontend publisher, not a required runtime path; use your container runbook to
+deploy compatible bot/API digests and apply migrations. Public source already
+ships the UI files; Nightly/Stable/manual Buildkite builds publish signed
+manifests that inventory them.
 
 Release review must establish API compatibility and completed recovery evidence.
 The frontend checker verifies live Storage contents, publication completion and,
@@ -428,7 +430,8 @@ schema-open against a local libSQL server, not Bunny TLS.
   during remote database retry (startup then exits 0 instead of failing).
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
-- Pin bot and API image **digests** in the private ops repo and point
+- Pin bot and API image **digests** in your container runbook (an optional
+  private ops repo can store them) and point
   Magic Containers at those digests, not floating `:latest`. Storage
   `frontend/` can move independently for CSS/layout; do not mix a new
   website with an old API when the page needs new endpoints. A later
@@ -440,6 +443,9 @@ schema-open against a local libSQL server, not Bunny TLS.
 
 ## References
 
+- [Public installation](INSTALL.md)
+- [AWS EC2 path](DEPLOY-AWS.md)
+- [Cost formulas](COST.md)
 - [Bunny Database overview](https://docs.bunny.net/database)
 - [Bunny Storage static sites](https://docs.bunny.net/storage/static-site-hosting)
 - [Magic Containers endpoints](https://docs.bunny.net/magic-containers/endpoints)

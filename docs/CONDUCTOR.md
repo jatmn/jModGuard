@@ -3,7 +3,8 @@
 The conductor is an optional independent installation-control process. When its
 control store, Discord OAuth client and operator identity are configured, it serves
 an owner-only Administration UI for settings, service status, telemetry,
-notifications, backups, guild-store moves and signed release discovery. Guild Discord credentials and tenant
+notifications, backups, guild-store moves, signed release discovery, and public
+install validation. Guild Discord credentials and tenant
 routing are not available on this service.
 
 ## Build and run locally
@@ -13,6 +14,8 @@ From the source workspace, using the pinned Rust toolchain:
 ```bash
 cargo build --locked -p jmodguard-conductor
 cargo run --locked -p jmodguard-conductor
+jmodguard-conductor init-local --root /var/lib/jmodguard
+jmodguard-conductor validate-install --plan /var/lib/jmodguard/plan.json
 ```
 
 It defaults to `127.0.0.1:8081`. It does not read `config.toml`,
@@ -52,14 +55,19 @@ operator authority by itself: OAuth and owner identity must be supplied independ
 |---|---|---|
 | `GET` / `HEAD /health` (also `/health/`) | `200`, process liveness only. | Same. |
 | `GET` / `HEAD /ready` | `503`, JSON code `control_not_configured`. | `200`. |
-| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false; `discovery_available` false; `update_available` false. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `discovery_available` is true when a release feed and trust keys are also configured; `update_available` is true when that discovery path and `JMODGUARD_CONDUCTOR_UPDATE_ROOT` are configured. |
+| `GET` / `HEAD /version` | `operations_available: false`; `backup_available` false; `capture_available` false; `moves_available` false; `discovery_available` false; `update_available` false; `private_ops_required` false; `license` PolyForm Noncommercial. | `operations_available: true`; `backup_available` is true only with a dedicated backup root; `capture_available` is true only when that zone is present and a reachable `core` capture store is configured; `moves_available` is true when that core path exists and shared plus dedicated guild-store paths are configured; `discovery_available` is true when a release feed and trust keys are also configured; `update_available` is true when that discovery path and `JMODGUARD_CONDUCTOR_UPDATE_ROOT` are configured. Same license and `private_ops_required: false`. |
 | `/login` | `404`. | Discord OAuth for the conductor operator. |
 
 Sessions use the host-only `jmodguard_conductor_session` cookie stored in the control
 database. Its browser lifetime follows the applied absolute-session setting; server-side
 idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
 unrevoked sessions. Administration
-pages: System Status, Installation, Notifications, Updates, Backups, Moves. The Updates
+pages: System Status, Installation, Notifications, Updates, Backups, Moves. The
+Installation page shows a public setup checklist (`GET /api/install`), seeds the
+form from the inferred local plan (`GET /api/install/plan`), and validates
+Bunny/local/AWS plans (`POST /api/install/validate`) without applying conductor
+settings or requiring private ops. Local plans require a SQLite layout with
+disjoint storage paths; Bunny/AWS preflight does not require those paths. The Updates
 page lists complete signed publications for selected channels. When an update root
 is configured it exposes plan/install/rollback. `GET /api/updates` returns the
 cached catalog and polls the feed when the background interval has elapsed (or
@@ -122,6 +130,7 @@ row budget. Observed RSS is not a configured memory limit.
 cargo test --locked --workspace
 cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
 python3 scripts/check-service-boundaries.py
+python3 scripts/public-install-acceptance-test.py
 ```
 
 Process tests bind loopback ports and send SIGTERM to their own child on Unix. They

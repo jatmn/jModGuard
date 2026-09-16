@@ -34,5 +34,6 @@ cargo build --locked -p jmodguard-api
 cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
 cargo build --locked -p jmodguard-conductor
 python3 scripts/check-service-boundaries.py
+python3 scripts/public-install-acceptance-test.py
 
 echo "==> CI checks complete (no Discord network required)"

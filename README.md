@@ -7,8 +7,10 @@
 they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
 
 An optional conductor can serve owner Administration locally when configured,
-including local backup, restore, guild-store moves, and signed release discovery.
-Point-and-click install remains later work. The existing bot/API installation does
+including local backup, restore, guild-store moves, signed release discovery,
+and owner-selected updates. Public install validation lives on the conductor
+(`init-local`, `validate-install`, `/api/install`). See
+[public installation](docs/INSTALL.md). The existing bot/API installation does
 not require the conductor. See [implementation status](docs/OVERHAUL.md).
 
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
@@ -16,9 +18,10 @@ A **data-driven Discord moderation bot** written in Rust — open source, dual-p
 
 It can use a local SQLite file for single-host self-hosting or a remote libSQL
 service. **Bunny.net is the first-class cloud provider**: Bunny Database, private
-Magic Containers for the bot and API, and the admin UI on Storage/CDN published
-from a private GitHub Actions repo. You do not need Bunny to run it
-([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider path.
+Magic Containers for the bot and API, and the admin UI on Storage/CDN from this
+public `frontend/` (a private GitHub Actions lock is optional). You do not need
+Bunny to run it ([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider
+path.
 
 - **Automod** against spam bots: @everyone/@here pings, multi-channel
   [exact-image and repeated-text spam](docs/IMAGE-SPAM.md) (test or delete-and-ban),
@@ -77,8 +80,11 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 
 | Path | Doc |
 |------|-----|
+| Public install (Bunny, local, AWS) | [docs/INSTALL.md](docs/INSTALL.md) |
 | Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
 | Bunny Database + private Magic Containers + CDN admin UI | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
+| AWS EC2 + local adapter + SQLite/libSQL | [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) |
+| Cost formulas | [docs/COST.md](docs/COST.md) |
 | Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
 ## Documentation
@@ -86,6 +92,9 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | Doc | Contents |
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Linux |
+| [docs/INSTALL.md](docs/INSTALL.md) | public Bunny/local/AWS install and deferred live checks |
+| [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) | EC2 + local adapter; not RDS |
+| [docs/COST.md](docs/COST.md) | measured local resource formulas |
 | [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
 | [docs/BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) | local recovery procedure and Bunny production blocker |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |

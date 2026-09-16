@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Upload frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
 #
-# Copy this and frontend_publication.py into the private ops repository.
-# Run that reviewed ops-owned copy with Bunny secrets, and point
-# JMODGUARD_FRONTEND_ROOT at the approved source frontend/ directory.
+# Optional: copy this and frontend_publication.py into a private ops repository
+# if you want a GitHub Actions lock. Public installs can upload the same files
+# from this repository or from frontend/ paths in a signed release manifest without that repo.
 set -euo pipefail
 
 pull_zone="$(python3 "$(dirname "$0")/frontend_publication.py" zone)"

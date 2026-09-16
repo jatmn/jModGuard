@@ -47,19 +47,19 @@ serves them at `http://localhost:8080`.
    Containers on a Storage Pull Zone. Leave `window.JMODGUARD_API_BASE`
    unset. Disable Cookies must be off.
 
-You can upload by hand in the Bunny dashboard (**Browse Files**), or
-repeat it with GitHub Actions. The script
+You can upload by hand in the Bunny dashboard (**Browse Files**) from this
+public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
+tag, or manual release manifest. Buildkite does not upload a separate frontend
+bundle on every main SHA. Repeating that with GitHub Actions is **optional**. The script
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
 and the example workflow
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
-are for a **private** ops repo so Bunny Storage passwords are not stored
-in this public project. A private repo is not required to try it once;
-follow the [private ops installation instructions](examples/private-ops/README.md)
-to copy the reviewed publisher and Python helpers. Production updates select a
-full source SHA and compatible API digest in a reviewed ops release. Source
-pushes do not promote production. The example verifies changed JS/HTML against
-the approved active API and application readiness, and records completion only
-after CDN purge. CSS-only updates still need approval but not an API rollout.
+keep Bunny Storage passwords out of this public project. A private ops repo is
+**not required** to install. Follow the
+[optional private ops instructions](examples/private-ops/README.md) only if you
+want that extra lock. Production updates can still select a full source SHA and
+compatible API digest in a reviewed ops release; source pushes do not promote
+production.
 
 **Another host or CDN.** Copy the same three files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
