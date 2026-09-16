@@ -2,8 +2,9 @@
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
 use crate::state::Conductor;
@@ -18,7 +19,7 @@ pub enum Profile {
     Aws,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DatabaseKind {
     Sqlite,
@@ -160,24 +161,14 @@ pub fn validate_plan(plan: &InstallPlan) -> Result<Value> {
         Profile::Bunny => validate_bunny(plan)?,
         Profile::Aws => validate_aws(plan)?,
     }
+    check_database_urls(plan)?;
     check_disjoint_roots(plan)?;
     if let Some(restore) = &plan.restore_target {
+        let restore = normalize_install_path(restore)?;
         ensure!(
             !restore.exists(),
             "restore target must stay absent until a restore job ({})",
             restore.display()
-        );
-    }
-    if let (DatabaseKind::Libsql, DatabaseKind::Libsql) =
-        (&plan.core_database, &plan.guild_database)
-    {
-        ensure!(
-            !plan.core_url.is_empty() && !plan.guild_url.is_empty(),
-            "libSQL core and guild URLs must both be set"
-        );
-        ensure!(
-            plan.core_url.trim_end_matches('/') != plan.guild_url.trim_end_matches('/'),
-            "core and guild databases must be distinct"
         );
     }
     Ok(json!({
@@ -305,10 +296,6 @@ fn validate_local(plan: &InstallPlan) -> Result<()> {
         );
     }
     ensure!(
-        plan.core_database == DatabaseKind::Sqlite || plan.core_database == DatabaseKind::Libsql,
-        "local core database must be sqlite or libsql"
-    );
-    ensure!(
         plan.api_embedded_ui,
         "local topology uses the API embedded UI"
     );
@@ -358,20 +345,45 @@ fn validate_aws(plan: &InstallPlan) -> Result<()> {
         );
     }
     ensure!(
-        matches!(
-            (&plan.core_database, &plan.guild_database),
-            (DatabaseKind::Sqlite, DatabaseKind::Sqlite)
-                | (DatabaseKind::Libsql, DatabaseKind::Libsql)
-                | (DatabaseKind::Sqlite, DatabaseKind::Libsql)
-                | (DatabaseKind::Libsql, DatabaseKind::Sqlite)
-        ),
-        "AWS path uses local SQLite or compatible libSQL, not RDS/Postgres"
+        !plan.frontend_storage,
+        "AWS topology does not use Bunny Storage for the admin UI"
     );
     Ok(())
 }
 
+fn check_database_urls(plan: &InstallPlan) -> Result<()> {
+    check_database_side(plan.core_database, &plan.core_url, "core")?;
+    check_database_side(plan.guild_database, &plan.guild_url, "guild")?;
+    if !plan.core_url.trim().is_empty() && !plan.guild_url.trim().is_empty() {
+        ensure!(
+            plan.core_url.trim_end_matches('/') != plan.guild_url.trim_end_matches('/'),
+            "core and guild databases must be distinct"
+        );
+    }
+    Ok(())
+}
+
+fn check_database_side(kind: DatabaseKind, raw: &str, label: &str) -> Result<()> {
+    let url = raw.trim();
+    match kind {
+        DatabaseKind::Sqlite => {
+            ensure!(url.is_empty(), "{label} sqlite database must not set a URL");
+        }
+        DatabaseKind::Libsql => {
+            ensure!(!url.is_empty(), "{label} libSQL URL must be set");
+            let parsed = url::Url::parse(url)
+                .with_context(|| format!("{label} libSQL URL must be an absolute URL"))?;
+            ensure!(
+                parsed.scheme() == "libsql",
+                "{label} libSQL URL must use the libsql scheme"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check_disjoint_roots(plan: &InstallPlan) -> Result<()> {
-    let mut labeled: Vec<(&str, &Path)> = Vec::new();
+    let mut labeled: Vec<(&str, PathBuf)> = Vec::new();
     for (label, path) in [
         ("backup_root", plan.backup_root.as_deref()),
         ("evidence_root", plan.evidence_root.as_deref()),
@@ -386,13 +398,13 @@ fn check_disjoint_roots(plan: &InstallPlan) -> Result<()> {
         ),
     ] {
         if let Some(path) = path {
-            labeled.push((label, path));
+            labeled.push((label, normalize_install_path(path)?));
         }
     }
     for i in 0..labeled.len() {
         for j in i + 1..labeled.len() {
-            let (left_name, left) = labeled[i];
-            let (right_name, right) = labeled[j];
+            let (left_name, left) = &labeled[i];
+            let (right_name, right) = &labeled[j];
             ensure!(
                 left != right && !left.starts_with(right) && !right.starts_with(left),
                 "{left_name} must not overlap {right_name}"
@@ -400,6 +412,53 @@ fn check_disjoint_roots(plan: &InstallPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(_) => out.push(component),
+        }
+    }
+    out
+}
+
+fn normalize_install_path(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.is_absolute(),
+        "install paths must be absolute ({})",
+        path.display()
+    );
+    let lexical = normalize_lexical(path);
+    if let Ok(canonical) = lexical.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut rest = Vec::<OsString>::new();
+    let mut cursor = lexical.as_path();
+    loop {
+        match cursor.parent() {
+            Some(parent) if parent != cursor => {
+                if let Some(name) = cursor.file_name() {
+                    rest.push(name.to_os_string());
+                }
+                cursor = parent;
+                if let Ok(canonical) = cursor.canonicalize() {
+                    let mut out = canonical;
+                    for name in rest.iter().rev() {
+                        out.push(name);
+                    }
+                    return Ok(out);
+                }
+            }
+            _ => return Ok(lexical),
+        }
+    }
 }
 
 fn parse_origin(raw: &str) -> Result<url::Url> {
@@ -424,14 +483,34 @@ fn is_loopback(url: &url::Url) -> bool {
 }
 
 fn reject_unsupported_engine(raw: &str) -> Result<()> {
-    let lower = raw.to_ascii_lowercase();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if let Ok(url) = url::Url::parse(trimmed) {
+        ensure!(
+            !matches!(
+                url.scheme(),
+                "postgres" | "postgresql" | "mysql" | "mariadb"
+            ),
+            "unsupported database engine in URL; use SQLite or compatible libSQL"
+        );
+        if let Some(host) = url.host_str() {
+            let host = host.to_ascii_lowercase();
+            ensure!(
+                host != "rds.amazonaws.com" && !host.ends_with(".rds.amazonaws.com"),
+                "unsupported database engine in URL; use SQLite or compatible libSQL"
+            );
+        }
+        return Ok(());
+    }
+    let lower = trimmed.to_ascii_lowercase();
     for needle in [
         "postgres://",
         "postgresql://",
         "mysql://",
         "mariadb://",
         "rds.amazonaws.com",
-        "aurora",
     ] {
         ensure!(
             !lower.contains(needle),
@@ -470,8 +549,24 @@ fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
     let update = display_opt(&plan.update_root);
     let artifacts = display_opt(&plan.artifact_root);
     let capture = display_opt(&plan.capture_core);
-    let shared = display_opt(&plan.shared_guild_store);
-    let dedicated = display_opt(&plan.dedicated_guild_store);
+    let capture_stores = serde_json::to_string(&json!([{
+        "role": "core",
+        "path": plan.capture_core,
+    }]))
+    .context("serialize capture stores")?;
+    let guild_stores = serde_json::to_string(&json!([
+        {
+            "id": "shared",
+            "role": "shared",
+            "path": plan.shared_guild_store,
+        },
+        {
+            "id": "dedicated",
+            "role": "dedicated",
+            "path": plan.dedicated_guild_store,
+        }
+    ]))
+    .context("serialize guild stores")?;
     fs::write(
         root.join("conductor.env.example"),
         format!(
@@ -482,15 +577,15 @@ fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
              JMODGUARD_CONDUCTOR_OWNER_ID=\n\
              JMODGUARD_CONDUCTOR_OAUTH_CLIENT_ID=\n\
              JMODGUARD_CONDUCTOR_OAUTH_CLIENT_SECRET=\n\
-             JMODGUARD_CONDUCTOR_BOT_HEALTH_URL=http://127.0.0.1:8080/health\n\
+             JMODGUARD_CONDUCTOR_BOT_HEALTH_URL=http://127.0.0.1:18080/health\n\
              JMODGUARD_CONDUCTOR_API_HEALTH_URL=http://127.0.0.1:8080/health\n\
              JMODGUARD_CONDUCTOR_BACKUP_ROOT={backup}\n\
              JMODGUARD_CONDUCTOR_EVIDENCE_ROOT={evidence}\n\
              JMODGUARD_CONDUCTOR_RESTORE_TARGET={restore}\n\
              JMODGUARD_CONDUCTOR_UPDATE_ROOT={update}\n\
              JMODGUARD_CONDUCTOR_ARTIFACT_ROOT={artifacts}\n\
-             JMODGUARD_CONDUCTOR_CAPTURE_STORES=[{{ \"role\": \"core\", \"path\": \"{capture}\" }}]\n\
-             JMODGUARD_CONDUCTOR_GUILD_STORES=[{{ \"id\": \"shared\", \"role\": \"shared\", \"path\": \"{shared}\" }},{{ \"id\": \"dedicated\", \"role\": \"dedicated\", \"path\": \"{dedicated}\" }}]\n",
+             JMODGUARD_CONDUCTOR_CAPTURE_STORES={capture_stores}\n\
+             JMODGUARD_CONDUCTOR_GUILD_STORES={guild_stores}\n",
             root = root.display()
         ),
     )?;
@@ -708,7 +803,104 @@ mod tests {
         let env = fs::read_to_string(root.join("conductor.env.example")).unwrap();
         assert!(!env.to_ascii_lowercase().contains("sk-"));
         assert!(env.contains("JMODGUARD_CONDUCTOR_OAUTH_CLIENT_SECRET="));
+        assert!(env.contains("JMODGUARD_CONDUCTOR_BOT_HEALTH_URL=http://127.0.0.1:18080/health"));
+        assert!(env.contains("JMODGUARD_CONDUCTOR_API_HEALTH_URL=http://127.0.0.1:8080/health"));
+        let bot_env = fs::read_to_string(root.join("bot.env.example")).unwrap();
+        assert!(bot_env.contains("JMODGUARD_HEALTH_BIND=127.0.0.1:18080"));
         validate_plan_file(&root.join("plan.json")).unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn libsql_kind_requires_libsql_url_on_each_side() {
+        let root = scratch("mixed-url");
+        let mut plan = local_plan(&root);
+        plan.guild_database = DatabaseKind::Libsql;
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(err.contains("guild libSQL URL must be set"), "{err}");
+        plan.guild_url = "https://example".into();
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("guild libSQL URL must use the libsql scheme"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_kind_rejects_populated_libsql_url() {
+        let root = scratch("sqlite-url");
+        let mut plan = local_plan(&root);
+        plan.profile = Profile::Aws;
+        plan.public_origin = "https://admin.example".into();
+        plan.core_url = "libsql://core.lite.bunnydb.net".into();
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("core sqlite database must not set a URL"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn aws_bunny_storage_flags_are_rejected() {
+        let root = scratch("aws-cdn");
+        let mut plan = local_plan(&root);
+        plan.profile = Profile::Aws;
+        plan.public_origin = "https://admin.example".into();
+        plan.api_embedded_ui = false;
+        plan.frontend_storage = true;
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("AWS topology does not use Bunny Storage"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_directory_components_cannot_alias_roots() {
+        let root = scratch("dotdot");
+        let mut plan = local_plan(&root);
+        plan.evidence_root = Some(root.join("evidence/../backup"));
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(err.contains("must not overlap"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn libsql_hostname_may_contain_aurora_substring() {
+        let root = scratch("aurora-host");
+        let mut plan = local_plan(&root);
+        plan.profile = Profile::Bunny;
+        plan.public_origin = "https://admin.example".into();
+        plan.core_database = DatabaseKind::Libsql;
+        plan.guild_database = DatabaseKind::Libsql;
+        plan.core_url = "libsql://core.aurora-test.lite.bunnydb.net".into();
+        plan.guild_url = "libsql://guild.lite.bunnydb.net".into();
+        plan.api_embedded_ui = false;
+        plan.frontend_storage = true;
+        assert_eq!(validate_plan(&plan).unwrap()["ok"], true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_local_serializes_store_paths_as_json() {
+        let parent = scratch("json-path");
+        let root = parent.join("quote\"root");
+        init_local(&root).unwrap();
+        let env = fs::read_to_string(root.join("conductor.env.example")).unwrap();
+        let line = env
+            .lines()
+            .find(|line| line.starts_with("JMODGUARD_CONDUCTOR_CAPTURE_STORES="))
+            .unwrap();
+        let parsed: Value =
+            serde_json::from_str(line.trim_start_matches("JMODGUARD_CONDUCTOR_CAPTURE_STORES="))
+                .unwrap();
+        assert_eq!(
+            parsed[0]["path"].as_str().unwrap(),
+            root.join("capture/core.db").to_string_lossy().as_ref()
+        );
+        let _ = fs::remove_dir_all(parent);
     }
 }

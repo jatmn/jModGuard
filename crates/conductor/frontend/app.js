@@ -148,14 +148,16 @@ function tabInstallation() {
         try {
           const base = state.installPlan || {};
           const bunny = profile.value === "bunny";
+          const coreUrlValue = coreUrl.value.trim();
+          const guildUrlValue = guildUrl.value.trim();
           const saved = await api("/api/install/validate", "POST", {
             ...base,
             profile: profile.value,
             public_origin: origin.value,
-            core_database: bunny ? "libsql" : (base.core_database || "sqlite"),
-            guild_database: bunny ? "libsql" : (base.guild_database || "sqlite"),
-            core_url: coreUrl.value,
-            guild_url: guildUrl.value,
+            core_database: (bunny || coreUrlValue) ? "libsql" : "sqlite",
+            guild_database: (bunny || guildUrlValue) ? "libsql" : "sqlite",
+            core_url: coreUrlValue,
+            guild_url: guildUrlValue,
             api_embedded_ui: profile.value !== "bunny",
             frontend_storage: bunny,
             private_ops_required: false,

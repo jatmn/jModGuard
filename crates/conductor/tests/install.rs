@@ -389,6 +389,51 @@ async fn install_api_requires_operator_and_rejects_rds() {
     .await;
     assert_eq!(status, StatusCode::OK, "{ok}");
     assert!(ok.contains("\"ok\":true"));
+    let (status, mixed) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            r#"{"profile":"aws","public_origin":"https://admin.example","core_database":"sqlite","guild_database":"libsql","guild_url":""}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{mixed}");
+    assert!(mixed.contains("guild libSQL URL must be set"));
+    let (status, overlap) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            &serde_json::json!({
+                "profile": "local",
+                "public_origin": "http://127.0.0.1:8081",
+                "core_database": "sqlite",
+                "guild_database": "sqlite",
+                "backup_root": root.join("backup"),
+                "evidence_root": root.join("evidence/../backup"),
+                "api_embedded_ui": true,
+                "frontend_storage": false
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{overlap}");
+    assert!(overlap.contains("must not overlap"));
+    let (status, aurora) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            r#"{"profile":"bunny","public_origin":"https://admin.example","core_database":"libsql","guild_database":"libsql","core_url":"libsql://core.aurora-test.lite.bunnydb.net","guild_url":"libsql://guild.lite.bunnydb.net","api_embedded_ui":false,"frontend_storage":true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{aurora}");
     let _ = std::fs::remove_dir_all(root);
 }
 
