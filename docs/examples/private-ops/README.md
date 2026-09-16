@@ -1,11 +1,17 @@
-# Private ops examples
+# Private ops example (optional)
 
-Production releases are selected in your **private ops repository**, not by
-tracking source `main`. Source publishes artifacts; an operator reviews the
-source, compatible bot/API image digests, migrations and recovery evidence before
-promoting a release. Keep production IDs, secrets and actual approval records in
-ops. [DEPLOY-BUNNY.md](https://github.com/jatmn/jModGuard/blob/main/docs/DEPLOY-BUNNY.md)
-contains the generic topology.
+This example is an **optional extra lock** for operators who want GitHub Actions
+to publish Storage files without putting Bunny passwords in the public
+jModGuard repo. It is **not required** to install from public source.
+[INSTALL.md](../../INSTALL.md) and [DEPLOY-BUNNY.md](../../DEPLOY-BUNNY.md)
+cover a Bunny install with a manual Storage upload or Buildkite frontend
+artifacts.
+
+If you do keep a private ops repository, production releases can be selected
+there instead of tracking source `main`. Source publishes artifacts; an operator
+reviews the source, compatible bot/API image digests, migrations and recovery
+evidence before promoting a release. Keep production IDs, secrets and actual
+approval records in ops.
 
 ## Install this frontend example
 

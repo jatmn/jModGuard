@@ -4,8 +4,9 @@ All CI and image publication for this repository run on the self-hosted
 Buildkite `linux` queue. There are no GitHub Actions workflows or GHA runner
 selection/fallback jobs. Keep **Update commit statuses** enabled in the
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
-tests and image jobs. The separate private-ops frontend example belongs to
-the operator's deployment repository; it is not executed by this source repo.
+tests and image jobs. The separate private-ops frontend example is an optional
+operator lock; it is not executed by this source repo and is not required to
+install.
 
 ## Pipeline and agents
 

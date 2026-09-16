@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Public-source install docs must not require the private ops repository."""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class PublicInstallDocs(unittest.TestCase):
+    def read(self, relative: str) -> str:
+        return (ROOT / relative).read_text(encoding="utf-8")
+
+    def test_license_is_polyform_noncommercial(self):
+        license_text = self.read("LICENSE.md")
+        self.assertIn("PolyForm Noncommercial License 1.0.0", license_text)
+        cargo = self.read("Cargo.toml")
+        self.assertIn("LicenseRef-PolyForm-Noncommercial-1.0.0", cargo)
+
+    def test_install_guide_is_public_and_lists_deferred_checks(self):
+        install = self.read("docs/INSTALL.md")
+        self.assertIn("without the private", install)
+        self.assertIn("ops repo", install)
+        self.assertIn("not required", install)
+        self.assertIn("Still-deferred live provider checks", install)
+        self.assertIn("Live Bunny Database", install)
+        self.assertIn("recover-update", install)
+        self.assertIn("LICENSE.md", install)
+
+    def test_aws_path_does_not_promise_rds(self):
+        aws = self.read("docs/DEPLOY-AWS.md")
+        self.assertIn("There is **no** RDS", aws)
+        self.assertIn("Not RDS/Postgres", aws)
+        self.assertIn("EC2", aws)
+        self.assertIn("libSQL", aws)
+        self.assertNotIn("create an RDS instance", aws.lower())
+
+    def test_bunny_and_webui_do_not_require_private_ops(self):
+        bunny = self.read("docs/DEPLOY-BUNNY.md")
+        self.assertNotIn(
+            "The UI files are published by **GitHub Actions in your private ops repo**.",
+            bunny,
+        )
+        self.assertIn("optional", bunny.lower())
+        self.assertIn("not required", bunny.lower())
+        webui = self.read("docs/WEBUI.md")
+        self.assertIn("not required", webui.lower())
+        example = self.read("docs/examples/private-ops/README.md")
+        self.assertIn("optional", example.lower())
+
+    def test_cost_formulas_are_measured_not_invented(self):
+        cost = self.read("docs/COST.md")
+        self.assertIn("local measurements", cost.lower())
+        self.assertIn("does not invent", cost.lower())
+        self.assertIn("256 MiB", cost)
+        self.assertIn("list prices", cost.lower())
+
+    def test_readme_points_at_public_install(self):
+        readme = self.read("README.md")
+        self.assertIn("docs/INSTALL.md", readme)
+        self.assertIn("docs/DEPLOY-AWS.md", readme)
+        self.assertNotIn("Point-and-click install remains later work", readme)
+
+
+if __name__ == "__main__":
+    unittest.main()

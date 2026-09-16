@@ -108,9 +108,65 @@ function tabInstallation() {
   const daily = num("backup_retain_daily", 7);
   const checkpoints = num("backup_retain_checkpoints", 3);
   const maxBytes = num("backup_max_archive_bytes", 268435456);
+  const profile = el("select", {},
+    el("option", { value: "local", text: "Local" }),
+    el("option", { value: "bunny", text: "Bunny" }),
+    el("option", { value: "aws", text: "AWS (EC2 + SQLite or libSQL)" }),
+  );
+  const origin = el("input", { type: "url", value: "http://127.0.0.1:8081", placeholder: "https://admin.example" });
+  const coreUrl = el("input", { type: "url", placeholder: "libsql://CORE.lite.bunnydb.net" });
+  const guildUrl = el("input", { type: "url", placeholder: "libsql://GUILD.lite.bunnydb.net" });
+  const checklist = el("pre", { class: "muted", text: "Loading setup checklist…" });
+  Promise.all([api("/api/install"), api("/api/install/plan")]).then(([report, plan]) => {
+    if (plan?.public_origin) origin.value = plan.public_origin;
+    checklist.textContent = JSON.stringify({
+      operations_available: report.operations_available,
+      backup_available: report.backup_available,
+      capture_available: report.capture_available,
+      moves_available: report.moves_available,
+      discovery_available: report.discovery_available,
+      update_available: report.update_available,
+      private_ops_required: report.private_ops_required,
+      license: report.license,
+      owner_setup: report.owner_setup,
+      deferred_live_checks: report.deferred_live_checks,
+      docs: report.docs,
+    }, null, 2);
+    state.installPlan = plan;
+  }).catch((e) => { checklist.textContent = e.message; toast(e.message, "error"); });
   return el("div", {},
     el("h2", { text: "Installation settings" }),
-    el("p", { class: "muted", text: "These values apply in the conductor immediately. Bot process limits stay in bot configuration until a later credential-delivery feature." }),
+    el("p", { class: "muted", text: "Validate a public Bunny, local, or AWS topology from this source. Private ops automation is optional. Live provider checks stay deferred." }),
+    el("div", { class: "card" },
+      el("h3", { text: "Public setup checklist" }),
+      field("Topology", profile),
+      field("Public origin", origin),
+      field("Core libSQL URL (Bunny/AWS remote)", coreUrl),
+      field("Guild libSQL URL (Bunny/AWS remote)", guildUrl),
+      checklist,
+      el("button", { class: "btn", text: "Validate install plan", onclick: async () => {
+        try {
+          const base = state.installPlan || {};
+          const bunny = profile.value === "bunny";
+          const saved = await api("/api/install/validate", "POST", {
+            ...base,
+            profile: profile.value,
+            public_origin: origin.value,
+            core_database: bunny ? "libsql" : (base.core_database || "sqlite"),
+            guild_database: bunny ? "libsql" : (base.guild_database || "sqlite"),
+            core_url: coreUrl.value,
+            guild_url: guildUrl.value,
+            api_embedded_ui: profile.value !== "bunny",
+            frontend_storage: bunny,
+            private_ops_required: false,
+            license: "LicenseRef-PolyForm-Noncommercial-1.0.0",
+          });
+          toast(saved.ok ? "Install plan accepted" : "Install plan checked", "success");
+          checklist.textContent = JSON.stringify(saved, null, 2);
+        } catch (e) { toast(e.message, "error"); }
+      } }),
+    ),
+    el("p", { class: "muted", text: "Applied settings below stay on this conductor. Bot process limits stay in bot configuration until a later credential-delivery feature." }),
     el("div", { class: "card" },
       el("h3", { text: "Sessions and monitoring" }),
       field("Session idle (seconds, applied)", idle),

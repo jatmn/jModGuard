@@ -2,7 +2,8 @@
 
 How to move an existing jModGuard install to a newer version (git tag or release).
 
-For a **first** install, use [SETUP.md](SETUP.md). For a Bunny
+For a **first** install, use [INSTALL.md](INSTALL.md) (Bunny, local, or AWS).
+[SETUP.md](SETUP.md) is the local Discord walkthrough. For a Bunny
 deploy, see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). If you maintain your own
 registry/CDN/secrets pipeline, follow this guide for product steps, then apply
 your operator runbook for promote and rollout.
@@ -137,11 +138,11 @@ the Pull Zone when the page needs the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **OriginUrl**, not OriginMagicContainers.
 
-Select production from a reviewed ops release: full source SHA, exact bot/API
+Select production from a reviewed release: full source SHA, exact bot/API
 digests and matching recovery evidence. Source publication creates artifacts;
-it does not authorize deployment. Scheduled/manual reconciliation must retry the
-approved selection, including after a failed rollout. The frontend example and
-its installation requirements are in [private ops](examples/private-ops/README.md).
+it does not authorize deployment. An optional private-ops frontend example can
+lock Storage publishes; it is **not required**. See
+[private ops](examples/private-ops/README.md) only if you want that extra lock.
 
 Retain current and rollback images before publishing a candidate. Source image
 workflows retain older versions; manual registry cleanup must protect those

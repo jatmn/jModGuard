@@ -8,8 +8,10 @@ A data-driven Discord moderation bot: automod against spam bots, per-server
 config with global fallback, editable commands/events/templates, and a WebUI.
 
 This guide covers everything from zero to a running bot on **Linux**
-(self-host / VPS). For Bunny.net Magic Containers, use
-[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) instead.
+(self-host / VPS). Canonical public-source installation, Bunny, AWS, and
+deferred live checks: [INSTALL.md](INSTALL.md). For Bunny.net Magic Containers,
+use [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). For EC2, [DEPLOY-AWS.md](DEPLOY-AWS.md)
+(SQLite or libSQL; not RDS).
 
 ---
 

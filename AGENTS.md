@@ -1,7 +1,8 @@
 # jModGuard — agent notes
 
 Contributor-oriented build and design invariants for the public jModGuard repo.
-Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Upgrades: `docs/UPGRADE.md`.
+Deploy topology for Bunny: `docs/DEPLOY-BUNNY.md`. Public install: `docs/INSTALL.md`.
+Upgrades: `docs/UPGRADE.md`.
 
 ## Incremental overhaul
 
@@ -171,7 +172,10 @@ remains later work. Process image budgets belong only to bot config.
 Owner-selected conductor updates use the local process adapter and R4 checkpoints;
 compatible rollback never restores an old database. Conductor self-replacement
 writes `recover.json` and `jmodguard-conductor recover-update` is independent of
-the replacement process.
+the replacement process. Public install validation (`init-local`,
+`validate-install`, `/api/install`) does not require the private ops repository;
+that example remains an optional Storage-publish lock. AWS is EC2 plus SQLite or
+libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands
 
@@ -192,6 +196,7 @@ python3 .buildkite/publish-image-test.py
 cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
 cargo build --locked -p jmodguard-conductor
 python3 scripts/check-service-boundaries.py
+python3 scripts/public-install-acceptance-test.py
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -392,8 +397,8 @@ crates/bot/src/automod.rs          rule engine + action executor
 crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
-frontend/               admin SPA (Bunny Storage/CDN via private ops runners; local: embedded in API)
+frontend/               admin SPA (Bunny Storage/CDN from public artifacts; optional private-ops lock; local: embedded in API)
 migrations/             0001_init through 0012_guild_moves
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
-docs/                   SETUP, UPGRADE, ARCHITECTURE, DEPLOY-BUNNY, …
+docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```

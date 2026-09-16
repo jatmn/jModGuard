@@ -1,12 +1,27 @@
-use anyhow::{Context as _, Result};
-use jmodguard_conductor::{Conductor, config::Config, router_for};
+use anyhow::{Context as _, Result, bail};
+use jmodguard_conductor::{Conductor, config::Config, install, router_for};
 use jmodguard_runtime::shutdown_signal;
 use std::future::IntoFuture;
+use std::path::PathBuf;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("recover-update") {
-        return recover_main().await;
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("recover-update") => return recover_main().await,
+        Some("init-local") => return init_local_main(&args),
+        Some("validate-install") => return validate_install_main(&args),
+        Some("-h" | "--help" | "help") => {
+            print!("{}", install::help_text());
+            return Ok(());
+        }
+        Some(other) if !other.starts_with('-') => {
+            bail!(
+                "unknown conductor command {other}; {}",
+                install::help_text().trim_end()
+            );
+        }
+        _ => {}
     }
     let cfg = Config::load()?;
     let filter = tracing_subscriber::EnvFilter::try_new(&cfg.log_filter)
@@ -58,6 +73,28 @@ async fn recover_main() -> Result<()> {
         .with_ansi(false)
         .try_init();
     let report = jmodguard_conductor::update::recover_update(&cfg).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn flag(args: &[String], name: &str) -> Result<String> {
+    let mut values = args.iter().skip_while(|arg| arg.as_str() != name).skip(1);
+    values
+        .next()
+        .cloned()
+        .context(format!("{name} requires a value"))
+}
+
+fn init_local_main(args: &[String]) -> Result<()> {
+    let root = PathBuf::from(flag(args, "--root")?);
+    let report = install::init_local(&root)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn validate_install_main(args: &[String]) -> Result<()> {
+    let path = PathBuf::from(flag(args, "--plan")?);
+    let report = install::validate_plan_file(&path)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

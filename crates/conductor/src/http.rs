@@ -42,6 +42,8 @@ fn status_router(state: Option<Arc<Conductor>>) -> Router {
         "moves_available": false,
         "discovery_available": false,
         "update_available": false,
+        "license": crate::install::LICENSE_ID,
+        "private_ops_required": false,
     });
     let ready_state = state.clone();
     let router = Router::new()
@@ -103,6 +105,9 @@ fn operational_router(state: Arc<Conductor>) -> Router {
         .route("/api/me", get(api_me))
         .route("/api/settings", get(get_settings).patch(patch_settings))
         .route("/api/status", get(api_status))
+        .route("/api/install", get(api_install))
+        .route("/api/install/plan", get(api_install_plan))
+        .route("/api/install/validate", post(api_install_validate))
         .route("/api/telemetry", get(api_telemetry))
         .route("/api/telemetry/lease", post(api_lease))
         .route("/api/jobs", get(api_jobs))
@@ -188,7 +193,37 @@ async fn version(State(state): State<Arc<Conductor>>) -> Json<serde_json::Value>
         "moves_available": crate::guild_move::moves_available(&state.cfg),
         "discovery_available": crate::release::discovery_available(&state.cfg),
         "update_available": crate::update::updates_available(&state.cfg),
+        "license": crate::install::LICENSE_ID,
+        "private_ops_required": false,
     }))
+}
+
+async fn api_install(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    Json(crate::install::current_report(&state)).into_response()
+}
+
+async fn api_install_plan(State(state): State<Arc<Conductor>>, headers: HeaderMap) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    Json(crate::install::inferred_local_plan(&state.cfg)).into_response()
+}
+
+async fn api_install_validate(
+    State(state): State<Arc<Conductor>>,
+    headers: HeaderMap,
+    Json(plan): Json<crate::install::InstallPlan>,
+) -> Response {
+    if let Err(error) = operator(&state, &headers).await {
+        return auth_error(error);
+    }
+    match crate::install::validate_plan(&plan) {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
 }
 
 async fn index() -> impl IntoResponse {

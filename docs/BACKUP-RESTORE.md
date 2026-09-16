@@ -71,8 +71,8 @@ acceptance drill below. Treat missing evidence as a production-readiness blocker
 Operator tooling may implement export/restore/verify and pass local regression
 tests while still lacking validation against Bunny's session, transaction and
 size limits. Keep the tool version, actual drill results, encrypted off-service
-backup reference, retention policy and responsible operator in the private ops
-runbook. Local tests and provider durability are not proof of application recovery.
+backup reference, retention policy and responsible operator in your operator
+runbook (an optional private ops repo can hold that evidence). Local tests and provider durability are not proof of application recovery.
 Tie production promotion to that evidence and the approved source/image digests;
 keep updates disabled until the drill succeeds. Do not copy placeholder approval
 records as evidence or infer that a running deployment has a usable backup.

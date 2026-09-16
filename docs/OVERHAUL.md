@@ -470,3 +470,26 @@ does not use the replacement process or private ops. Local tests cover success,
 missing artifacts, failed readiness, backup failure, interrupted jobs, old-instance
 restart and recover-update. Provider HTTP fixtures are not live Bunny cutover proof.
 See [UPDATES.md](UPDATES.md).
+
+## Implemented: public installation and release acceptance
+
+A new operator can install from this public repository without the private ops
+repo. `jmodguard-conductor init-local` and `validate-install` (and owner
+`GET /api/install` / `POST /api/install/validate`) check Bunny, local, and AWS
+topologies, disjoint private roots, scope-limited URLs, and that private ops is
+not required. AWS is EC2 plus the local adapter and SQLite or compatible libSQL;
+RDS/Postgres URLs are refused. The PolyForm Noncommercial license is unchanged.
+
+Bunny Storage publication from public `frontend/` or Buildkite artifacts is the
+required path; the private-ops GitHub Actions example remains an optional extra
+lock and is not deleted. Owner setup, backup-key portability and recover-update
+are documented in [INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
+samples plus current provider list prices ([COST.md](COST.md)).
+
+The isolation/update/move/backup/recovery matrix stays in the existing conductor
+and dual-process tests, plus `crates/conductor/tests/install.rs` and
+`scripts/public-install-acceptance-test.py`. Local tests are not live Bunny,
+Discord, or AWS proof; the operator guide lists the remaining provider checks.
+
+See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and
+[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
