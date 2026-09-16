@@ -265,11 +265,12 @@ impl Hasher {
         timeout: Duration,
         dest: &Path,
     ) -> Result<Hash> {
-        tokio::time::timeout(timeout, async {
+        let dest = dest.to_path_buf();
+        match tokio::time::timeout(timeout, async {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(dest)
+                .open(&dest)
                 .map_err(|_| anyhow::anyhow!("image capture file could not be created"))?;
             match stream_body(
                 self.get_body(attachment).await?,
@@ -280,13 +281,23 @@ impl Hasher {
             {
                 Ok(hash) => Ok(hash),
                 Err(error) => {
-                    let _ = std::fs::remove_file(dest);
+                    let _ = std::fs::remove_file(&dest);
                     Err(error)
                 }
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("image download timed out"))?
+        {
+            Ok(Ok(hash)) => Ok(hash),
+            Ok(Err(error)) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(error)
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(anyhow::anyhow!("image download timed out"))
+            }
+        }
     }
 }
 async fn hash_body(body: Body, expected: u64) -> Result<Hash> {
@@ -467,6 +478,21 @@ mod tests {
                 .await
                 .is_err(),
             "capture must not overwrite an existing file"
+        );
+        let timeout_dest = std::env::temp_dir().join(format!(
+            "jmodguard-attach-fetch-timeout-{:032x}.part",
+            rand::random::<u128>()
+        ));
+        source.uri = format!("http://{address}/slow").parse().unwrap();
+        assert!(
+            client
+                .fetch_file(&source, Duration::from_millis(30), &timeout_dest)
+                .await
+                .is_err()
+        );
+        assert!(
+            !timeout_dest.exists(),
+            "timed-out fetch must not leave a temporary capture file"
         );
         let _ = std::fs::remove_file(&dest);
         task.abort();

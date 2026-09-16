@@ -1,13 +1,12 @@
 # Private evidence ownership journal
 
-The inactive guild-store library records selected attachment ownership and lifecycle state.
-It does not upload, fetch, serve or delete files, create URLs, bind Storage resources, run
-workers or enable current bot/API capture. The separate opt-in [local transfer backend](LOCAL-EVIDENCE.md)
-implements local file I/O and exclusive coordination. The opt-in [Bunny adapter](BUNNY-EVIDENCE.md)
-adds HTTP transfer with durable single-use attempts. Bot and API now serve available
-private objects after the journal confirms them; see [tenant runtime](TENANT-RUNTIME.md).
-Selected image-spam enforcement can now capture proving Discord attachments through that
-runtime; backup-copy cleanup remains later work.
+The inactive guild-store library records selected attachment ownership and lifecycle state in
+SQL. It does not fetch Discord attachments, run background workers, or perform provider HTTP
+by itself. Bot and API capture proving attachments through [tenant runtime](TENANT-RUNTIME.md)
+for selected image-spam enforcement; that path reserves journal rows and streams bytes through
+the opt-in [local transfer backend](LOCAL-EVIDENCE.md) or [Bunny adapter](BUNNY-EVIDENCE.md).
+Bot and API serve available private objects after the journal confirms them. Backup-copy
+cleanup remains later work.
 
 ## Reservation and identity
 
@@ -89,8 +88,8 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
 1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
 Open requires 8 after the erasure/settings extension. Rollback needs matching pre-upgrade
-database/binary. Core is at migration 0012. Discord attachment capture is implemented
-through tenant runtime for selected image-spam enforcement; backup-copy cleanup remains
+database/binary. Core is at migration 0012. Selected image-spam enforcement captures
+proving attachments through tenant runtime as described above; backup-copy cleanup remains
 later work.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
