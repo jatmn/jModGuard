@@ -44,11 +44,12 @@ secrets, and database tokens stay with the operator.
 
 ## Validate a plan
 
-The conductor checks topology, distinct private roots, scope-limited URLs, and
-that private ops is not required. A **local** plan must be SQLite on both
-databases and include the same storage paths `init-local` writes. Bunny and AWS
-URL preflight still validate origin, database kinds, and credentials without
-requiring those local paths:
+The conductor checks topology, scope-limited URLs, and that private ops is not
+required. Validation does **not** apply process configuration. A **local** plan
+must be SQLite on both databases, include the same storage paths `init-local`
+writes, and keep those roots disjoint. Bunny and AWS URL preflight still
+validate origin, database kinds, and credentials without requiring those local
+paths:
 
 ```bash
 cargo build --locked -p jmodguard-conductor
@@ -58,11 +59,13 @@ jmodguard-conductor validate-install --plan /var/lib/jmodguard/plan.json
 
 `init-local` writes disjoint `backup/`, `evidence/`, `update/`, `artifacts/`,
 `capture/`, and `guild/` directories, env examples without secrets, and
-`NEXT-STEPS.txt`. It does **not** create `restore/` — restore writes into an
-absent target.
+`NEXT-STEPS.txt`. On Unix the install root and those directories are mode
+`0700` and generated files are `0600`. It does **not** create `restore/` —
+restore writes into an absent target.
 
-Owner Administration can run the same check: Installation → Validate install
-plan (`GET /api/install`, `GET /api/install/plan`, `POST /api/install/validate`).
+Owner Administration can run the same check (it still does not apply settings):
+Installation → Validate install plan (`GET /api/install`, `GET /api/install/plan`,
+`POST /api/install/validate`).
 
 ## Guided owner setup
 

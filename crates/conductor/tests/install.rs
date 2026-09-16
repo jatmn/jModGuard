@@ -221,6 +221,17 @@ fn init_local_and_validate_install_cli_use_public_artifacts() {
     assert!(stdout.contains("\"private_ops_required\": false"));
     assert!(root.join("plan.json").is_file());
     assert!(!root.join("restore").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("backup")), 0o700);
+        assert_eq!(mode(&root.join("plan.json")), 0o600);
+        assert_eq!(mode(&root.join("conductor.env.example")), 0o600);
+    }
     let validate = conductor_cmd()
         .args([
             "validate-install",
@@ -236,11 +247,21 @@ fn init_local_and_validate_install_cli_use_public_artifacts() {
     );
     let report = String::from_utf8_lossy(&validate.stdout);
     assert!(report.contains("\"ok\": true"));
+    assert!(report.contains("\"applied\": false"));
     assert!(report.contains("LicenseRef-PolyForm-Noncommercial-1.0.0"));
     let unknown = conductor_cmd().args(["deploy-bunny"]).output().unwrap();
     assert!(!unknown.status.success());
     let help = conductor_cmd().args(["help"]).output().unwrap();
     assert!(help.status.success());
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    assert!(
+        help_text.contains("does not apply process configuration"),
+        "{help_text}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -423,6 +444,7 @@ async fn install_api_requires_operator_and_rejects_rds() {
     .await;
     assert_eq!(status, StatusCode::OK, "{ok}");
     assert!(ok.contains("\"ok\":true"));
+    assert!(ok.contains("\"applied\":false"), "{ok}");
     let (status, mixed) = call(
         &control.router,
         "POST",

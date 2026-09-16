@@ -84,6 +84,46 @@ class PublicInstallDocs(unittest.TestCase):
         self.assertIn("256 MiB", cost)
         self.assertIn("list prices", cost.lower())
 
+    def test_validate_contract_is_check_not_apply_across_operator_surfaces(self):
+        surfaces = [
+            "docs/INSTALL.md",
+            "docs/OVERHAUL.md",
+            "docs/CONDUCTOR.md",
+            "docs/DEPLOY-AWS.md",
+            "docs/DEPLOY-BUNNY.md",
+            "docs/WEBUI.md",
+            "docs/SETUP.md",
+            "AGENTS.md",
+            "README.md",
+            "crates/conductor/src/install.rs",
+            "crates/conductor/frontend/app.js",
+        ]
+        for relative in surfaces:
+            with self.subTest(relative):
+                text = self.read(relative)
+                self.assertNotIn("Install plan accepted", text)
+                self.assertNotIn(
+                    "topologies, disjoint private roots, scope-limited URLs",
+                    text,
+                )
+                self.assertNotIn(
+                    "The conductor checks topology, distinct private roots",
+                    text,
+                )
+        install = self.read("docs/INSTALL.md")
+        self.assertIn("does **not** apply process configuration", install)
+        self.assertIn("without requiring those local", install)
+        self.assertIn("`0700`", install)
+        overhaul = self.read("docs/OVERHAUL.md")
+        self.assertIn("does not apply process configuration", overhaul)
+        self.assertIn("without requiring those local paths", overhaul)
+        conductor = self.read("docs/CONDUCTOR.md")
+        self.assertIn("without applying conductor", conductor)
+        app = self.read("crates/conductor/frontend/app.js")
+        self.assertIn("Install plan validated (not applied)", app)
+        steps = self.read("crates/conductor/src/install.rs")
+        self.assertIn("does not apply process configuration", steps)
+
     def test_readme_points_at_public_install(self):
         readme = self.read("README.md")
         self.assertIn("docs/INSTALL.md", readme)

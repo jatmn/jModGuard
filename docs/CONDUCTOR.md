@@ -65,8 +65,9 @@ unrevoked sessions. Administration
 pages: System Status, Installation, Notifications, Updates, Backups, Moves. The
 Installation page shows a public setup checklist (`GET /api/install`), seeds the
 form from the inferred local plan (`GET /api/install/plan`), and validates
-Bunny/local/AWS plans (`POST /api/install/validate`) without requiring
-private ops. The Updates
+Bunny/local/AWS plans (`POST /api/install/validate`) without applying conductor
+settings or requiring private ops. Local plans require a SQLite layout with
+disjoint storage paths; Bunny/AWS preflight does not require those paths. The Updates
 page lists complete signed publications for selected channels. When an update root
 is configured it exposes plan/install/rollback. `GET /api/updates` returns the
 cached catalog and polls the feed when the background interval has elapsed (or

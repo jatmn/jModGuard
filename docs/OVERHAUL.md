@@ -476,9 +476,13 @@ See [UPDATES.md](UPDATES.md).
 A new operator can install from this public repository without the private ops
 repo. `jmodguard-conductor init-local` and `validate-install` (and owner
 `GET /api/install` / `POST /api/install/validate`) check Bunny, local, and AWS
-topologies, disjoint private roots, scope-limited URLs, and that private ops is
-not required. AWS is EC2 plus the local adapter and SQLite or compatible libSQL;
-RDS/Postgres URLs are refused. The PolyForm Noncommercial license is unchanged.
+topologies, scope-limited URLs, and that private ops is not required. Validation
+does not apply process configuration. A local plan must be SQLite on both
+databases, include the same disjoint storage paths `init-local` writes, and keep
+those roots disjoint. Bunny and AWS URL preflight still validate origin,
+database kinds, and credentials without requiring those local paths. AWS is EC2
+plus the local adapter and SQLite or compatible libSQL; RDS/Postgres URLs are
+refused. The PolyForm Noncommercial license is unchanged.
 
 Bunny Storage publication from public `frontend/` or from `frontend/` paths in
 a Nightly/Stable/manual signed release manifest is the required path (Buildkite

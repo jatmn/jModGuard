@@ -174,7 +174,9 @@ compatible rollback never restores an old database. Conductor self-replacement
 writes `recover.json` and `jmodguard-conductor recover-update` is independent of
 the replacement process. Public install validation (`init-local`,
 `validate-install`, `/api/install`) does not require the private ops repository;
-that example remains an optional Storage-publish lock. AWS is EC2 plus SQLite or
+that example remains an optional Storage-publish lock. Validation checks a plan
+and does not apply process configuration. Local plans require SQLite and disjoint
+storage paths; Bunny/AWS URL preflight does not. AWS is EC2 plus SQLite or
 libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands

@@ -76,6 +76,7 @@ pub fn deferred_live_checks() -> Vec<&'static str> {
 
 pub fn help_text() -> &'static str {
     "jmodguard-conductor [recover-update | init-local --root PATH | validate-install --plan FILE]\n\
+     validate-install checks a plan and does not apply process configuration.\n\
      Run with no command to serve Administration. Public install docs: docs/INSTALL.md.\n"
 }
 
@@ -165,6 +166,7 @@ pub fn validate_plan(plan: &InstallPlan) -> Result<Value> {
     check_disjoint_roots(plan)?;
     Ok(json!({
         "ok": true,
+        "applied": false,
         "profile": plan.profile,
         "license": LICENSE_ID,
         "private_ops_required": false,
@@ -188,13 +190,10 @@ pub fn init_local(root: &Path) -> Result<Value> {
         restore.display()
     );
     fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    restrict_dir(root)?;
     for dir in [&backup, &evidence, &update, &artifacts, &capture, &guild] {
         fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        }
+        restrict_dir(dir)?;
     }
     let plan = InstallPlan {
         profile: Profile::Local,
@@ -217,12 +216,12 @@ pub fn init_local(root: &Path) -> Result<Value> {
         license: LICENSE_ID.into(),
     };
     let report = validate_plan(&plan)?;
-    fs::write(
-        root.join("plan.json"),
+    write_private_file(
+        &root.join("plan.json"),
         serde_json::to_string_pretty(&plan).context("serialize plan")?,
     )?;
     write_env_examples(root, &plan)?;
-    fs::write(root.join("NEXT-STEPS.txt"), next_steps(root))?;
+    write_private_file(&root.join("NEXT-STEPS.txt"), next_steps(root))?;
     Ok(json!({
         "ok": true,
         "root": root,
@@ -551,6 +550,39 @@ fn reject_credentials(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn restrict_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn restrict_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restrict file {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    restrict_file(path)
+}
+
 fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
     let backup = display_opt(&plan.backup_root);
     let evidence = display_opt(&plan.evidence_root);
@@ -576,8 +608,8 @@ fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
         }
     ]))
     .context("serialize guild stores")?;
-    fs::write(
-        root.join("conductor.env.example"),
+    write_private_file(
+        &root.join("conductor.env.example"),
         format!(
             "# Fill locally. Never commit secrets.\n\
              JMODGUARD_CONDUCTOR_BIND=127.0.0.1:8081\n\
@@ -598,8 +630,8 @@ fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
             root = root.display()
         ),
     )?;
-    fs::write(
-        root.join("bot.env.example"),
+    write_private_file(
+        &root.join("bot.env.example"),
         format!(
             "# Fill locally. Never commit secrets. Start the bot before the API.\n\
              JMODGUARD_DISCORD_TOKEN=\n\
@@ -607,8 +639,8 @@ fn write_env_examples(root: &Path, plan: &InstallPlan) -> Result<()> {
              JMODGUARD_HEALTH_BIND=127.0.0.1:18080\n"
         ),
     )?;
-    fs::write(
-        root.join("api.env.example"),
+    write_private_file(
+        &root.join("api.env.example"),
         format!(
             "# Fill locally. Never commit secrets. API has no bot token.\n\
              JMODGUARD_DB_PATH={capture}\n\
@@ -632,7 +664,8 @@ fn next_steps(root: &Path) -> String {
     format!(
         "Public local install created at {}.\n\n\
          1. Copy the *.env.example files, fill secrets locally, and never git-add them.\n\
-         2. Follow docs/INSTALL.md. Start jmodguard-bot, then jmodguard-api, then this conductor.\n\
+         2. Follow docs/INSTALL.md. `validate-install` checks a plan and does not apply\n\
+            process configuration. Start jmodguard-bot, then jmodguard-api, then this conductor.\n\
          3. Owner login stamps conductor operator identity. Guild Discord credentials stay out.\n\
          4. Record the backup key before the first portable export (docs/BACKUP-RESTORE.md).\n\
          5. Restore only into the absent restore/ directory. After conductor self-replacement,\n\
@@ -665,6 +698,24 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    fn assert_private_unix_tree(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fn visit(path: &Path) {
+            let meta = fs::metadata(path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            if meta.is_dir() {
+                assert_eq!(mode, 0o700, "{} dir mode {mode:o}", path.display());
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(&entry.unwrap().path());
+                }
+            } else {
+                assert_eq!(mode, 0o600, "{} file mode {mode:o}", path.display());
+            }
+        }
+        visit(root);
+    }
+
     fn local_plan(root: &Path) -> InstallPlan {
         InstallPlan {
             profile: Profile::Local,
@@ -693,6 +744,7 @@ mod tests {
         let root = scratch("local");
         let report = validate_plan(&local_plan(&root)).unwrap();
         assert_eq!(report["ok"], true);
+        assert_eq!(report["applied"], false);
         assert_eq!(report["private_ops_required"], false);
         let _ = fs::remove_dir_all(root);
     }
@@ -858,6 +910,7 @@ mod tests {
         let root = scratch("init");
         let report = init_local(&root).unwrap();
         assert_eq!(report["ok"], true);
+        assert_eq!(report["validation"]["applied"], false);
         assert!(root.join("plan.json").is_file());
         assert!(root.join("backup").is_dir());
         assert!(root.join("NEXT-STEPS.txt").is_file());
@@ -874,6 +927,10 @@ mod tests {
         assert!(env.contains("JMODGUARD_CONDUCTOR_API_HEALTH_URL=http://127.0.0.1:8080/health"));
         let bot_env = fs::read_to_string(root.join("bot.env.example")).unwrap();
         assert!(bot_env.contains("JMODGUARD_HEALTH_BIND=127.0.0.1:18080"));
+        #[cfg(unix)]
+        {
+            assert_private_unix_tree(&root);
+        }
         validate_plan_file(&root.join("plan.json")).unwrap();
         let _ = fs::remove_dir_all(root);
     }

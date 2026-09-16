@@ -151,7 +151,7 @@ function tabInstallation() {
           const local = profile.value === "local";
           const coreUrlValue = local ? "" : coreUrl.value.trim();
           const guildUrlValue = local ? "" : guildUrl.value.trim();
-          const saved = await api("/api/install/validate", "POST", {
+          const validation = await api("/api/install/validate", "POST", {
             ...base,
             profile: profile.value,
             public_origin: origin.value,
@@ -164,10 +164,10 @@ function tabInstallation() {
             private_ops_required: false,
             license: "LicenseRef-PolyForm-Noncommercial-1.0.0",
           });
-          toast(saved.ok ? "Install plan accepted" : "Install plan checked", "success");
+          toast("Install plan validated (not applied)", "success");
           let current = {};
           try { current = JSON.parse(checklist.textContent) || {}; } catch (_) {}
-          checklist.textContent = JSON.stringify({ ...current, validation: saved }, null, 2);
+          checklist.textContent = JSON.stringify({ ...current, validation }, null, 2);
         } catch (e) { toast(e.message, "error"); }
       } }),
     ),
