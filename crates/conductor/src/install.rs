@@ -163,14 +163,6 @@ pub fn validate_plan(plan: &InstallPlan) -> Result<Value> {
     }
     check_database_urls(plan)?;
     check_disjoint_roots(plan)?;
-    if let Some(restore) = &plan.restore_target {
-        let restore = normalize_install_path(restore)?;
-        ensure!(
-            !restore.exists(),
-            "restore target must stay absent until a restore job ({})",
-            restore.display()
-        );
-    }
     Ok(json!({
         "ok": true,
         "profile": plan.profile,
@@ -627,7 +619,9 @@ fn next_steps(root: &Path) -> String {
          5. Restore only into the absent restore/ directory. After conductor self-replacement,\n\
             run `jmodguard-conductor recover-update` independently of OAuth and private ops.\n\
          6. Optional GitHub Actions in a private ops repo can lock Bunny Storage publishes.\n\
-            They are not required. Buildkite already publishes public bot/API/conductor/frontend artifacts.\n\
+            They are not required. Buildkite publishes bot/API images on every main SHA;\n\
+            conductor images and signed release manifests ship on Nightly/Stable/manual builds only.\n\
+            Admin UI files come from frontend/ in this repo or a release manifest (see docs/INSTALL.md).\n\
          7. Live Bunny, Discord, and AWS provider checks remain deferred; see docs/INSTALL.md.\n\
          License: {LICENSE_ID} (LICENSE.md). Do not promise RDS/Postgres.\n",
         root.display()
@@ -852,6 +846,8 @@ mod tests {
         let steps = fs::read_to_string(root.join("NEXT-STEPS.txt")).unwrap();
         assert!(steps.contains("private ops"));
         assert!(steps.contains("not required"));
+        assert!(steps.contains("Nightly/Stable/manual"));
+        assert!(!steps.contains("bot/API/conductor/frontend artifacts"));
         let env = fs::read_to_string(root.join("conductor.env.example")).unwrap();
         assert!(!env.to_ascii_lowercase().contains("sk-"));
         assert!(env.contains("JMODGUARD_CONDUCTOR_OAUTH_CLIENT_SECRET="));
@@ -908,6 +904,17 @@ mod tests {
             "{err}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_plan_allows_existing_restore_target_for_topology_recheck() {
+        let root = scratch("restore-exists");
+        let mut plan = local_plan(&root);
+        let restore = root.join("restore");
+        std::fs::create_dir_all(&restore).unwrap();
+        plan.restore_target = Some(restore);
+        assert_eq!(validate_plan(&plan).unwrap()["ok"], true);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

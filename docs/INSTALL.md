@@ -59,7 +59,7 @@ jmodguard-conductor validate-install --plan /var/lib/jmodguard/plan.json
 absent target.
 
 Owner Administration can run the same check: Installation → Validate install
-plan (`GET /api/install`, `POST /api/install/validate`).
+plan (`GET /api/install`, `GET /api/install/plan`, `POST /api/install/validate`).
 
 ## Guided owner setup
 

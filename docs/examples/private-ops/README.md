@@ -4,8 +4,8 @@ This example is an **optional extra lock** for operators who want GitHub Actions
 to publish Storage files without putting Bunny passwords in the public
 jModGuard repo. It is **not required** to install from public source.
 [INSTALL.md](../../INSTALL.md) and [DEPLOY-BUNNY.md](../../DEPLOY-BUNNY.md)
-cover a Bunny install with a manual Storage upload or Buildkite frontend
-artifacts.
+cover a Bunny install with a manual Storage upload or the `frontend/` files from
+this repository or a signed release manifest.
 
 If you do keep a private ops repository, production releases can be selected
 there instead of tracking source `main`. Source publishes artifacts; an operator

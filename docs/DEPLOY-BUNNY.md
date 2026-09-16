@@ -17,7 +17,8 @@ contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
 Publish the three `frontend/` files from **this public repository** or the
-matching Buildkite frontend artifact. A private ops GitHub Actions workflow is
+`frontend/` paths in a signed Nightly/Stable/manual release manifest (Buildkite
+does not upload a separate frontend bundle on main). A private ops GitHub Actions workflow is
 an optional extra lock so Storage passwords never sit in git; it is **not
 required** for a Bunny install. See [INSTALL.md](INSTALL.md).
 
@@ -105,8 +106,8 @@ CSRF cookies are host-only). On the admin Pull Zone, **Disable Cookies**
 must be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual, public source).** In the Storage Zone, **Browse Files**,
-and upload those three files from this repository (or the Buildkite frontend
-artifact for the same tag) to the **root** so they are `/` (or `/index.html`),
+and upload those three files from this repository (or the same paths from a
+signed release manifest for the same tag) to the **root** so they are `/` (or `/index.html`),
 `/app.js`, and `/style.css`. Start from the same git tag as the container
 images so the first login works. After that, CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
@@ -134,7 +135,8 @@ Install the optional example files listed in the
 lock. The example publishes an approved full source SHA from ops `main`. It is a
 frontend publisher, not a required runtime path; use your container runbook to
 deploy compatible bot/API digests and apply migrations. Public source already
-ships the UI files and Buildkite artifacts.
+ships the UI files; Nightly/Stable/manual Buildkite builds publish signed
+manifests that inventory them.
 
 Release review must establish API compatibility and completed recovery evidence.
 The frontend checker verifies live Storage contents, publication completion and,

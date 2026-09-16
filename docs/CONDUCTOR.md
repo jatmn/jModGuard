@@ -63,8 +63,9 @@ database. Its browser lifetime follows the applied absolute-session setting; ser
 idle and absolute limits remain authoritative. Logout revokes that row; a restart keeps
 unrevoked sessions. Administration
 pages: System Status, Installation, Notifications, Updates, Backups, Moves. The
-Installation page shows a public setup checklist (`GET /api/install`) and
-validates Bunny/local/AWS plans (`POST /api/install/validate`) without requiring
+Installation page shows a public setup checklist (`GET /api/install`), seeds the
+form from the inferred local plan (`GET /api/install/plan`), and validates
+Bunny/local/AWS plans (`POST /api/install/validate`) without requiring
 private ops. The Updates
 page lists complete signed publications for selected channels. When an update root
 is configured it exposes plan/install/rollback. `GET /api/updates` returns the

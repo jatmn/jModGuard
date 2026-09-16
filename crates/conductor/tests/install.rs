@@ -462,6 +462,33 @@ async fn install_api_requires_operator_and_rejects_rds() {
 }
 
 #[test]
+fn validate_install_succeeds_after_restore_directory_exists() {
+    let root = scratch("restore-revalidate");
+    let init = conductor_cmd()
+        .args(["init-local", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    std::fs::create_dir_all(root.join("restore")).unwrap();
+    let validate = conductor_cmd()
+        .args([
+            "validate-install",
+            "--plan",
+            root.join("plan.json").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let report = String::from_utf8_lossy(&validate.stdout);
+    assert!(report.contains("\"ok\": true"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn public_acceptance_matrix_files_still_cover_isolation_update_move_backup() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for (path, needle) in [

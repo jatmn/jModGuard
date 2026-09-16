@@ -28,7 +28,9 @@ Owner    →  jmodguard-conductor     →  local backup / update roots
 ## VM
 
 1. Ubuntu/Debian x86-64 with the pinned Rust **1.96.0** toolchain, or pull the
-   public GHCR images (`jmodguard-bot`, `jmodguard-api`, `jmodguard-conductor`).
+   public GHCR bot and API images on every main SHA (`jmodguard-bot`,
+   `jmodguard-api`). For `jmodguard-conductor`, build from source on main or pin
+   a Nightly/Stable/manual Buildkite tag ([INSTALL.md](INSTALL.md)).
 2. Open only the HTTPS reverse-proxy port to the internet. Keep bot and
    conductor binds on loopback or a private interface.
 3. Put SQLite files on local disk (not NFS). Remote libSQL is the distributed

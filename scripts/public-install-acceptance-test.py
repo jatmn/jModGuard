@@ -38,6 +38,22 @@ class PublicInstallDocs(unittest.TestCase):
         self.assertIn("EC2", aws)
         self.assertIn("libSQL", aws)
         self.assertNotIn("create an RDS instance", aws.lower())
+        self.assertNotIn(
+            "jmodguard-bot`, `jmodguard-api`, `jmodguard-conductor`",
+            aws,
+        )
+
+    def test_public_artifact_wording_matches_install(self):
+        install = self.read("docs/INSTALL.md")
+        self.assertIn("does not upload a separate frontend", install)
+        bunny = self.read("docs/DEPLOY-BUNNY.md")
+        self.assertNotIn("Buildkite frontend artifact", bunny)
+        install_rs = self.read("crates/conductor/src/install.rs")
+        self.assertNotIn(
+            "Buildkite already publishes public bot/API/conductor/frontend artifacts",
+            install_rs,
+        )
+        self.assertIn("Nightly/Stable/manual", install_rs)
 
     def test_bunny_and_webui_do_not_require_private_ops(self):
         bunny = self.read("docs/DEPLOY-BUNNY.md")
