@@ -99,7 +99,7 @@ function tabInstallation() {
   const history = num("telemetry_history_hours", 48);
   const rows = num("telemetry_max_rows", 4096);
   const lease = num("lease_secs", 30);
-  const bot = el("input", { type: "url", value: s.bot_health_url?.value || "", placeholder: "http://127.0.0.1:8080/health" });
+  const bot = el("input", { type: "url", value: s.bot_health_url?.value || "", placeholder: "http://127.0.0.1:18080/health" });
   const apiUrl = el("input", { type: "url", value: s.api_health_url?.value || "", placeholder: "http://127.0.0.1:8080/health" });
   const backupEnabled = el("input", { type: "checkbox" });
   backupEnabled.checked = !!s.backup_enabled?.value;
