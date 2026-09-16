@@ -9,19 +9,26 @@ import subprocess
 import sys
 from pathlib import Path
 
+CONDUCTOR = "jmodguard-conductor"
+
 
 def conductor_bin() -> Path | None:
     env = os.environ.get("JMODGUARD_CONDUCTOR_BIN")
+    candidates: list[Path] = []
     if env:
-        path = Path(env)
-        return path if path.is_file() else None
+        candidates.append(Path(env))
     target = Path(os.environ.get("CARGO_TARGET_DIR", Path.cwd() / "target"))
-    for name in ("debug/jmodguard-conductor", "release/jmodguard-conductor"):
-        candidate = target / name
-        if candidate.is_file():
-            return candidate
-    which = shutil.which("jmodguard-conductor")
-    return Path(which) if which else None
+    candidates.extend(
+        target / name
+        for name in (f"debug/{CONDUCTOR}", f"release/{CONDUCTOR}")
+    )
+    which = shutil.which(CONDUCTOR)
+    if which:
+        candidates.append(Path(which))
+    for path in candidates:
+        if path.is_file() and path.name == CONDUCTOR:
+            return path
+    return None
 
 
 def main() -> int:
@@ -34,11 +41,12 @@ def main() -> int:
     binary = conductor_bin()
     if binary is None:
         raise SystemExit(
-            "jmodguard-conductor not found. Build it with "
-            "`cargo build --locked -p jmodguard-conductor` or set JMODGUARD_CONDUCTOR_BIN."
+            f"{CONDUCTOR} not found. Build it with "
+            f"`cargo build --locked -p jmodguard-conductor` or set JMODGUARD_CONDUCTOR_BIN."
         )
     completed = subprocess.run(
-        [str(binary), "init-local", "--root", str(root)],
+        [CONDUCTOR, "init-local", "--root", str(root)],
+        executable=str(binary),
         check=False,
     )
     if completed.returncode != 0:
