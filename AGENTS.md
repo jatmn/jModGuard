@@ -139,7 +139,8 @@ Reserve before object writes, preserve stable identity/byte admission, and never
 capture settlement while a write can still arrive. Removal cancels/hides metadata immediately;
 closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jobs are snapshots,
 not leases or provider proof. Authorized serving of available objects is now
-implemented; Discord attachment capture and backup-copy cleanup remain later work.
+implemented; selected image-spam enforcement now captures proving Discord attachments
+through tenant runtime. Backup-copy cleanup remains later work.
 Private evidence and backups-only resources must remain separate.
 
 The opt-in Unix local evidence backend uses real bounded streaming and durable receipts;
@@ -149,7 +150,8 @@ keys or retry an existing reservation's source. Keep the evidence root private/d
 only verified file absence can acknowledge cleanup. Local advisory locks require cooperating
 writers and trusted parents; they do not establish remote PUT completion or restore fencing.
 Bot and API open this backend through tenant runtime for authorized serving of available
-objects. Discord attachment capture and backup-copy cleanup remain later work.
+objects. Selected image-spam enforcement now captures proving Discord attachments through
+tenant runtime. Backup-copy cleanup remains later work.
 
 The opt-in Bunny evidence adapter uses guild schema7 single-use attempts and durable201
 acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve immutable scoped
@@ -168,7 +170,9 @@ keep work/metadata bounds with no background task queue. Test reports are Discor
 logs only, with no SQL cases. Enforcement rechecks membership/exemptions, deletes
 matched messages and bans with truthful separate outcomes, and records selected
 case text (hashes/message IDs/trimmed excerpts). Discord attachment object capture
-remains later work. Process image budgets belong only to bot config.
+runs after a recorded image-spam ban case using the Hasher CDN contract and the
+configured evidence backend; test mode and `none` skip it. Failures do not undo
+delete or ban. Process image budgets belong only to bot config.
 Owner-selected conductor updates use the local process adapter and R4 checkpoints;
 compatible rollback never restores an old database. Conductor self-replacement
 writes `recover.json` and `jmodguard-conductor recover-update` is independent of

@@ -794,6 +794,7 @@ fn consider(
                     token,
                     messages,
                     excerpts,
+                    attachments: Vec::new(),
                     reason: format!(
                         "Exact trimmed text across {} channels in {} seconds (minimum {} scalars)",
                         policy.min_channels, policy.window_secs, policy.min_length

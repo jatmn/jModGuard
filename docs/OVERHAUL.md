@@ -388,7 +388,9 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-1. Public installation and release acceptance (R8).
+Live Bunny evidence zone privacy, backup-copy cleanup, Discord-audit source
+association, database credential hot-reload, writer leases and multi-replica
+sessions remain later work.
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
@@ -407,7 +409,10 @@ message IDs, trimmed excerpts). The WebUI exposes those choices. No new dependen
 versions, schema changes or SQL message archival.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md) for limits and coverage.
 
-Discord attachment object capture into the evidence backend remains later work.
+Selected image-spam enforcement can now capture proving Discord attachments into the
+configured evidence backend after a ban case is recorded. Test mode and a `none`
+backend skip capture. Failures do not undo delete or ban. Live Discord CDN and Bunny
+zone privacy remain provider checks.
 
 ## Implemented: conductor owner administration
 
@@ -499,3 +504,16 @@ Discord, or AWS proof; the operator guide lists the remaining provider checks.
 
 See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+
+## Implemented: Discord attachment capture
+
+After image-spam delete-and-ban records a ban case, the bot re-fetches proving
+attachments with the existing Hasher CDN contract, writes a temporary file, and
+streams it through `TenantRuntime` into the local or Bunny evidence backend.
+Evidence IDs are derived from channel/message/attachment origin so retries keep
+the same identity; existing reservations are not re-uploaded. Test reports, a
+disabled backend and capture failures leave the Discord outcomes in place.
+Authorized serving of available objects is unchanged. Local HTTP/file fixtures
+are not live Discord CDN or Bunny zone proof.
+See [IMAGE-SPAM.md](IMAGE-SPAM.md), [CASE-EVIDENCE.md](CASE-EVIDENCE.md) and
+[LOCAL-EVIDENCE.md](LOCAL-EVIDENCE.md).

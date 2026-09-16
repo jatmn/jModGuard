@@ -275,6 +275,12 @@ impl Detector {
             dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
+    pub(crate) fn hasher(&self) -> &Hasher {
+        &self.hasher
+    }
+    pub(crate) fn download_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.limits.timeout_secs)
+    }
     fn capacity_drop(&self) {
         use std::sync::atomic::Ordering;
         let count = self.dropped.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -1224,6 +1230,19 @@ async fn run_job(
             )
         })
         .collect();
+    let attachments: Vec<_> = job
+        .posts
+        .iter()
+        .flat_map(|p| {
+            p.files
+                .iter()
+                .map(|file| crate::spam_actions::ProvingAttachment {
+                    channel: p.channel,
+                    message: p.id,
+                    file: file.clone(),
+                })
+        })
+        .collect();
     let completed_at = Instant::now();
     let Some(report) = detector.complete(job, &policy, failed, completed_at) else {
         return;
@@ -1254,6 +1273,14 @@ async fn run_job(
                     }
                 })
                 .collect();
+            let attachments: Vec<_> = attachments
+                .into_iter()
+                .filter(|item| {
+                    messages
+                        .iter()
+                        .any(|found| found == &(item.channel, item.message))
+                })
+                .collect();
             let disposition = crate::spam_actions::report(
                 app,
                 ctx,
@@ -1266,6 +1293,7 @@ async fn run_job(
                     token,
                     messages,
                     excerpts,
+                    attachments,
                     reason: format!(
                         "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
                         policy.min_attachments, policy.min_channels, policy.window_secs

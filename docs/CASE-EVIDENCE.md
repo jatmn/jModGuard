@@ -6,7 +6,8 @@ workers or enable current bot/API capture. The separate opt-in [local transfer b
 implements local file I/O and exclusive coordination. The opt-in [Bunny adapter](BUNNY-EVIDENCE.md)
 adds HTTP transfer with durable single-use attempts. Bot and API now serve available
 private objects after the journal confirms them; see [tenant runtime](TENANT-RUNTIME.md).
-Capture of Discord attachments and backup-copy cleanup remain later work.
+Selected image-spam enforcement can now capture proving Discord attachments through that
+runtime; backup-copy cleanup remains later work.
 
 ## Reservation and identity
 
@@ -88,7 +89,9 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
 1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
 Open requires 8 after the erasure/settings extension. Rollback needs matching pre-upgrade
-database/binary. Core is at migration 0012. Discord attachment capture remains later work.
+database/binary. Core is at migration 0012. Discord attachment capture is implemented
+through tenant runtime for selected image-spam enforcement; backup-copy cleanup remains
+later work.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
 races, scope denial, bounded closed cleanup/pages, SQL guards, cancellation/purge rollback

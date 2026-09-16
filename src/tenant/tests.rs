@@ -1536,3 +1536,156 @@ async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
         &shared_id
     );
 }
+
+#[test]
+fn attachment_evidence_id_is_stable_and_origin_bound() {
+    use crate::db::guild_data::EvidenceOrigin;
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let first = attachment_evidence_id(&origin).unwrap();
+    assert_eq!(first, attachment_evidence_id(&origin).unwrap());
+    assert_ne!(
+        first,
+        attachment_evidence_id(&EvidenceOrigin {
+            channel_id: 1,
+            message_id: 2,
+            attachment_id: 4,
+        })
+        .unwrap()
+    );
+    assert!(
+        attachment_evidence_id(&EvidenceOrigin {
+            channel_id: 0,
+            message_id: 2,
+            attachment_id: 3,
+        })
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn none_backend_skips_attachment_capture() {
+    use crate::db::guild_data::{EvidenceOrigin, RecordCase};
+    let f = Fixture::new();
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    assert!(
+        f.tenant
+            .capture_selected_attachment(
+                e,
+                case,
+                EvidenceOrigin {
+                    channel_id: 1,
+                    message_id: 2,
+                    attachment_id: 3,
+                },
+                3,
+                PathBuf::from("/missing-capture-source"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_attachment_capture_stores_bytes_and_skips_retries() {
+    use crate::db::guild_data::{EvidenceOrigin, EvidenceState, RecordCase};
+    use std::io::Write;
+
+    let f = Fixture::with_stores(
+        Default::default(),
+        EvidenceConfig {
+            backend: "local".into(),
+            ..Default::default()
+        },
+    );
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let evidence_id = attachment_evidence_id(&origin).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "jmodguard-attach-src-{:032x}",
+        rand::random::<u128>()
+    ));
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"abc").unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_eq!(
+        f.tenant
+            .capture_selected_attachment(e.clone(), case.clone(), origin.clone(), 3, path.clone())
+            .await
+            .unwrap(),
+        Some(EvidenceState::Available)
+    );
+    let (available, bytes) = f
+        .tenant
+        .read_available_evidence(e.clone(), case.clone(), evidence_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, b"abc");
+    assert_eq!(available.origin, origin);
+    assert_eq!(
+        f.tenant
+            .capture_selected_attachment(e.clone(), case.clone(), origin.clone(), 3, path.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    let (_, bytes) = f
+        .tenant
+        .read_available_evidence(e.clone(), case.clone(), evidence_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, b"abc");
+
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.tenant.schedule_erasure(e.clone()).await.unwrap();
+    f.tenant.drive_erasure().await.unwrap();
+    assert!(
+        f.tenant
+            .capture_selected_attachment(
+                e,
+                case,
+                EvidenceOrigin {
+                    channel_id: 4,
+                    message_id: 5,
+                    attachment_id: 6,
+                },
+                3,
+                path.clone(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let _ = std::fs::remove_file(&path);
+}

@@ -3,8 +3,10 @@
 The opt-in Unix `evidence_transfer::LocalEvidenceStore` implements real file capture,
 verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.md).
 It is a library backend for a dedicated local filesystem. Bot and API now serve available
-objects through [tenant runtime](TENANT-RUNTIME.md). There is no Discord attachment capture
-worker in this change. Core is at migration 0012; the current guild schema is 8.
+objects through [tenant runtime](TENANT-RUNTIME.md). Selected image-spam enforcement
+streams proving attachments into this backend through that runtime after a ban case is
+recorded. There is no background capture worker. Core is at migration 0012; the current
+guild schema is 8.
 
 ## Resource contract
 
@@ -27,7 +29,7 @@ Operations reload the exact captured guild/enrollment/case/evidence identity fro
 callers cannot supply an arbitrary object key. The journal's derived key names only three
 artifacts: `.data`, `.complete` and `.complete-tmp`. No URL, credential or source filename
 is stored. The supplied blocking `Read` is trusted input: attachment ownership, permission,
-source selection and bounded network timeouts belong to the future runtime integration.
+source selection and bounded Discord CDN timeouts belong to the bot Hasher integration.
 
 ## Capture and recovery
 

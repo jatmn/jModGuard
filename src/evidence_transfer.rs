@@ -339,6 +339,10 @@ impl LocalEvidenceStore {
         Ok(buf)
     }
 
+    pub fn storage_id(&self) -> &CaseId {
+        &self.storage_id
+    }
+
     pub async fn capture<R: Read + Send + 'static>(
         &self,
         store: GuildDataStore,

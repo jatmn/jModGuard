@@ -301,6 +301,10 @@ impl BunnyEvidenceStore {
         .await
     }
 
+    pub fn storage_id(&self) -> &CaseId {
+        &self.storage_id
+    }
+
     pub async fn capture<R: AsyncRead + AsyncSeek + Unpin + Send + 'static>(
         &self,
         store: GuildDataStore,
