@@ -353,6 +353,11 @@ async fn install_api_requires_operator_and_rejects_rds() {
     let sample = control.conductor.resource_sample("dashboard");
     let rss = sample["rss_bytes"].as_u64().unwrap();
     assert!(rss > 0 && rss < 256 * 1024 * 1024);
+    let (status, status_body) = call(&control.router, "GET", "/api/status", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "{status_body}");
+    let status_json: serde_json::Value = serde_json::from_str(&status_body).unwrap();
+    let status_rss = status_json["conductor"]["rss_bytes"].as_u64().unwrap();
+    assert!(status_rss > 0 && status_rss < 256 * 1024 * 1024);
     let (status, err) = call(
         &control.router,
         "POST",
@@ -398,6 +403,11 @@ async fn install_api_requires_operator_and_rejects_rds() {
         "backup_root": root.join("backup"),
         "evidence_root": root.join("evidence"),
         "restore_target": root.join("restore"),
+        "update_root": root.join("update"),
+        "artifact_root": root.join("artifacts"),
+        "capture_core": root.join("capture/core.db"),
+        "shared_guild_store": root.join("guild/shared.db"),
+        "dedicated_guild_store": root.join("guild/dedicated.db"),
         "api_embedded_ui": true,
         "frontend_storage": false,
         "private_ops_required": false,
@@ -438,6 +448,12 @@ async fn install_api_requires_operator_and_rejects_rds() {
                 "guild_database": "sqlite",
                 "backup_root": root.join("backup"),
                 "evidence_root": root.join("evidence/../backup"),
+                "restore_target": root.join("restore"),
+                "update_root": root.join("update"),
+                "artifact_root": root.join("artifacts"),
+                "capture_core": root.join("capture/core.db"),
+                "shared_guild_store": root.join("guild/shared.db"),
+                "dedicated_guild_store": root.join("guild/dedicated.db"),
                 "api_embedded_ui": true,
                 "frontend_storage": false
             })
@@ -458,6 +474,55 @@ async fn install_api_requires_operator_and_rejects_rds() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{aurora}");
+    let (status, local_libsql) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            r#"{"profile":"local","public_origin":"http://127.0.0.1:8081","core_database":"libsql","guild_database":"sqlite","core_url":"libsql://core.example","api_embedded_ui":true,"frontend_storage":false}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{local_libsql}");
+    assert!(local_libsql.contains("local topology uses SQLite"));
+    let (status, missing_root) = call(
+        &control.router,
+        "POST",
+        "/api/install/validate",
+        Some(&cookie),
+        Some(
+            r#"{"profile":"local","public_origin":"http://127.0.0.1:8081","core_database":"sqlite","guild_database":"sqlite","api_embedded_ui":true,"frontend_storage":false}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{missing_root}");
+    assert!(missing_root.contains("local topology requires backup_root"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn init_local_fails_closed_when_restore_already_exists() {
+    let root = scratch("init-restore-present-cli");
+    std::fs::create_dir_all(root.join("restore")).unwrap();
+    let init = conductor_cmd()
+        .args(["init-local", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!init.status.success());
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(err.contains("restore target must remain absent"), "{err}");
+    for name in ["backup", "evidence", "update", "artifacts", "capture", "guild"] {
+        assert!(
+            !root.join(name).exists(),
+            "partial layout created {name} after restore-present failure"
+        );
+    }
+    assert!(!root.join("plan.json").exists());
     let _ = std::fs::remove_dir_all(root);
 }
 

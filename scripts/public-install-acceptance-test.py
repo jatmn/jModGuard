@@ -48,6 +48,15 @@ class PublicInstallDocs(unittest.TestCase):
         self.assertIn("does not upload a separate frontend", install)
         bunny = self.read("docs/DEPLOY-BUNNY.md")
         self.assertNotIn("Buildkite frontend artifact", bunny)
+        webui = self.read("docs/WEBUI.md")
+        self.assertNotIn("matching Buildkite artifact", webui)
+        self.assertIn("does not upload a separate frontend", webui)
+        overhaul = self.read("docs/OVERHAUL.md")
+        self.assertNotIn(
+            "or Buildkite artifacts is the required path",
+            overhaul,
+        )
+        self.assertIn("does not upload a separate frontend", overhaul)
         install_rs = self.read("crates/conductor/src/install.rs")
         self.assertNotIn(
             "Buildkite already publishes public bot/API/conductor/frontend artifacts",

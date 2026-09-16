@@ -480,10 +480,12 @@ topologies, disjoint private roots, scope-limited URLs, and that private ops is
 not required. AWS is EC2 plus the local adapter and SQLite or compatible libSQL;
 RDS/Postgres URLs are refused. The PolyForm Noncommercial license is unchanged.
 
-Bunny Storage publication from public `frontend/` or Buildkite artifacts is the
-required path; the private-ops GitHub Actions example remains an optional extra
-lock and is not deleted. Owner setup, backup-key portability and recover-update
-are documented in [INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
+Bunny Storage publication from public `frontend/` or from `frontend/` paths in
+a Nightly/Stable/manual signed release manifest is the required path (Buildkite
+does not upload a separate frontend bundle on every main SHA). The private-ops
+GitHub Actions example remains an optional extra lock and is not deleted. Owner
+setup, backup-key portability and recover-update are documented in
+[INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
 samples plus current provider list prices ([COST.md](COST.md)).
 
 The isolation/update/move/backup/recovery matrix stays in the existing conductor

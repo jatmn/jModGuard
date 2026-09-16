@@ -11,7 +11,7 @@ read at purchase time. This file does not invent a Bunny or AWS invoice.
 | Sample | How | What it is |
 |---|---|---|
 | Idle conductor RSS | `/proc/<pid>/status` `VmRSS` after `GET /health` | Observed process memory, not a cgroup limit |
-| Dashboard RSS | `GET /api/status` `conductor.rss_bytes` after owner login | Same observation while Administration is up |
+| Dashboard RSS | `GET /api/status` `conductor.rss_bytes` after owner login | Same observation while Administration is up (`resource_sample` uses kind `current` on that route) |
 | Backup input | 4 KiB stand-in core file | Archive size scales with capture + evidence bytes |
 | Interruption | `jmodguard-conductor recover-update` without `UPDATE_ROOT` | Must fail closed quickly |
 

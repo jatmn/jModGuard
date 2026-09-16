@@ -48,8 +48,9 @@ serves them at `http://localhost:8080`.
    unset. Disable Cookies must be off.
 
 You can upload by hand in the Bunny dashboard (**Browse Files**) from this
-public `frontend/` directory or the matching Buildkite artifact. Repeating
-that with GitHub Actions is **optional**. The script
+public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
+tag, or manual release manifest. Buildkite does not upload a separate frontend
+bundle on every main SHA. Repeating that with GitHub Actions is **optional**. The script
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
 and the example workflow
 [docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)

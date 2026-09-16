@@ -45,7 +45,10 @@ secrets, and database tokens stay with the operator.
 ## Validate a plan
 
 The conductor checks topology, distinct private roots, scope-limited URLs, and
-that private ops is not required:
+that private ops is not required. A **local** plan must be SQLite on both
+databases and include the same storage paths `init-local` writes. Bunny and AWS
+URL preflight still validate origin, database kinds, and credentials without
+requiring those local paths:
 
 ```bash
 cargo build --locked -p jmodguard-conductor

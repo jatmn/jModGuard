@@ -148,14 +148,15 @@ function tabInstallation() {
         try {
           const base = state.installPlan || {};
           const bunny = profile.value === "bunny";
-          const coreUrlValue = coreUrl.value.trim();
-          const guildUrlValue = guildUrl.value.trim();
+          const local = profile.value === "local";
+          const coreUrlValue = local ? "" : coreUrl.value.trim();
+          const guildUrlValue = local ? "" : guildUrl.value.trim();
           const saved = await api("/api/install/validate", "POST", {
             ...base,
             profile: profile.value,
             public_origin: origin.value,
-            core_database: (bunny || coreUrlValue) ? "libsql" : "sqlite",
-            guild_database: (bunny || guildUrlValue) ? "libsql" : "sqlite",
+            core_database: local ? "sqlite" : ((bunny || coreUrlValue) ? "libsql" : "sqlite"),
+            guild_database: local ? "sqlite" : ((bunny || guildUrlValue) ? "libsql" : "sqlite"),
             core_url: coreUrlValue,
             guild_url: guildUrlValue,
             api_embedded_ui: profile.value !== "bunny",
@@ -164,7 +165,9 @@ function tabInstallation() {
             license: "LicenseRef-PolyForm-Noncommercial-1.0.0",
           });
           toast(saved.ok ? "Install plan accepted" : "Install plan checked", "success");
-          checklist.textContent = JSON.stringify(saved, null, 2);
+          let current = {};
+          try { current = JSON.parse(checklist.textContent) || {}; } catch (_) {}
+          checklist.textContent = JSON.stringify({ ...current, validation: saved }, null, 2);
         } catch (e) { toast(e.message, "error"); }
       } }),
     ),

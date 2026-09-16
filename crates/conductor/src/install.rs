@@ -175,7 +175,6 @@ pub fn validate_plan(plan: &InstallPlan) -> Result<Value> {
 
 pub fn init_local(root: &Path) -> Result<Value> {
     ensure!(root.is_absolute(), "install root must be an absolute path");
-    fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     let backup = root.join("backup");
     let evidence = root.join("evidence");
     let update = root.join("update");
@@ -183,6 +182,12 @@ pub fn init_local(root: &Path) -> Result<Value> {
     let capture = root.join("capture");
     let guild = root.join("guild");
     let restore = root.join("restore");
+    ensure!(
+        !restore.exists(),
+        "restore target must remain absent: {}",
+        restore.display()
+    );
+    fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     for dir in [&backup, &evidence, &update, &artifacts, &capture, &guild] {
         fs::create_dir_all(dir)?;
         #[cfg(unix)]
@@ -191,11 +196,6 @@ pub fn init_local(root: &Path) -> Result<Value> {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         }
     }
-    ensure!(
-        !restore.exists(),
-        "restore target must remain absent: {}",
-        restore.display()
-    );
     let plan = InstallPlan {
         profile: Profile::Local,
         public_origin: "http://127.0.0.1:8081".into(),
@@ -295,6 +295,25 @@ fn validate_local(plan: &InstallPlan) -> Result<()> {
         !plan.frontend_storage,
         "local topology does not use Bunny Storage for the admin UI"
     );
+    ensure!(
+        plan.core_database == DatabaseKind::Sqlite && plan.guild_database == DatabaseKind::Sqlite,
+        "local topology uses SQLite for core and guild databases"
+    );
+    for (label, path) in [
+        ("backup_root", plan.backup_root.as_ref()),
+        ("evidence_root", plan.evidence_root.as_ref()),
+        ("restore_target", plan.restore_target.as_ref()),
+        ("update_root", plan.update_root.as_ref()),
+        ("artifact_root", plan.artifact_root.as_ref()),
+        ("capture_core", plan.capture_core.as_ref()),
+        ("shared_guild_store", plan.shared_guild_store.as_ref()),
+        (
+            "dedicated_guild_store",
+            plan.dedicated_guild_store.as_ref(),
+        ),
+    ] {
+        ensure!(path.is_some(), "local topology requires {label}");
+    }
     Ok(())
 }
 
@@ -863,6 +882,8 @@ mod tests {
     fn libsql_kind_requires_libsql_url_on_each_side() {
         let root = scratch("mixed-url");
         let mut plan = local_plan(&root);
+        plan.profile = Profile::Aws;
+        plan.public_origin = "https://admin.example".into();
         plan.guild_database = DatabaseKind::Libsql;
         let err = validate_plan(&plan).unwrap_err().to_string();
         assert!(err.contains("guild libSQL URL must be set"), "{err}");
@@ -872,6 +893,40 @@ mod tests {
             err.contains("guild libSQL URL must use the libsql scheme"),
             "{err}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_plan_rejects_libsql_and_missing_layout_paths() {
+        let root = scratch("local-shape");
+        let mut plan = local_plan(&root);
+        plan.guild_database = DatabaseKind::Libsql;
+        plan.guild_url = "libsql://guild.lite.bunnydb.net".into();
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("local topology uses SQLite for core and guild databases"),
+            "{err}"
+        );
+        plan = local_plan(&root);
+        plan.backup_root = None;
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(err.contains("local topology requires backup_root"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_local_does_not_create_layout_when_restore_exists() {
+        let root = scratch("init-restore-present");
+        fs::create_dir_all(root.join("restore")).unwrap();
+        let err = init_local(&root).unwrap_err().to_string();
+        assert!(err.contains("restore target must remain absent"), "{err}");
+        for name in ["backup", "evidence", "update", "artifacts", "capture", "guild"] {
+            assert!(
+                !root.join(name).exists(),
+                "partial layout created {name} after restore-present failure"
+            );
+        }
+        assert!(!root.join("plan.json").exists());
         let _ = fs::remove_dir_all(root);
     }
 
