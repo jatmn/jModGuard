@@ -529,16 +529,10 @@ fn reject_credentials(raw: &str, label: &str) -> Result<()> {
         url.username().is_empty() && url.password().is_none(),
         "{label} must not embed credentials"
     );
-    if let Some(query) = url.query() {
-        let lower = query.to_ascii_lowercase();
-        ensure!(
-            !lower.contains("token=")
-                && !lower.contains("auth=")
-                && !lower.contains("password=")
-                && !lower.contains("secret="),
-            "{label} must not carry secrets in the query"
-        );
-    }
+    ensure!(
+        url.query().is_none(),
+        "{label} must not include a query string; keep secrets in environment configuration"
+    );
     Ok(())
 }
 
@@ -784,6 +778,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("must not embed credentials")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_strings_on_database_urls_are_rejected() {
+        let root = scratch("query-creds");
+        let mut plan = local_plan(&root);
+        plan.profile = Profile::Bunny;
+        plan.public_origin = "https://admin.example".into();
+        plan.core_database = DatabaseKind::Libsql;
+        plan.guild_database = DatabaseKind::Libsql;
+        plan.core_url = "libsql://core.lite.bunnydb.net?jwt=secret".into();
+        plan.guild_url = "libsql://guild.lite.bunnydb.net".into();
+        plan.api_embedded_ui = false;
+        plan.frontend_storage = true;
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("must not include a query string"),
+            "{err}"
+        );
+        plan.core_url = "libsql://core.lite.bunnydb.net".into();
+        plan.guild_url = "libsql://guild.lite.bunnydb.net?api_key=secret".into();
+        let err = validate_plan(&plan).unwrap_err().to_string();
+        assert!(
+            err.contains("must not include a query string"),
+            "{err}"
         );
         let _ = fs::remove_dir_all(root);
     }

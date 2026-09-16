@@ -14,14 +14,14 @@ CONDUCTOR = "jmodguard-conductor"
 
 def conductor_bin() -> Path | None:
     env = os.environ.get("JMODGUARD_CONDUCTOR_BIN")
-    candidates: list[Path] = []
     if env:
-        candidates.append(Path(env))
+        path = Path(env)
+        if path.is_file():
+            return path
     target = Path(os.environ.get("CARGO_TARGET_DIR", Path.cwd() / "target"))
-    candidates.extend(
-        target / name
-        for name in (f"debug/{CONDUCTOR}", f"release/{CONDUCTOR}")
-    )
+    candidates: list[Path] = [
+        target / name for name in (f"debug/{CONDUCTOR}", f"release/{CONDUCTOR}")
+    ]
     which = shutil.which(CONDUCTOR)
     if which:
         candidates.append(Path(which))
