@@ -167,8 +167,10 @@ and guild erasure are described in [tenant runtime](TENANT-RUNTIME.md).
 Selected [case storage](TENANT-CASES.md) now reuses captured tenant scope for immutable
 facts, bounded text evidence, source-key deduplication, payload removal and closed-scope
 batch cleanup. Bot and API now record selected outcomes and serve authorized case/evidence
-administration; see [tenant runtime](TENANT-RUNTIME.md). Selected image-spam enforcement
-now captures proving Discord attachments through that runtime. Live Bunny backup-copy
+administration; see [tenant runtime](TENANT-RUNTIME.md). The bot captures proving
+Discord attachments for selected image-spam enforcement through that runtime; the API
+serves authorized journal-available objects and does not perform that Discord re-fetch.
+Live Bunny backup-copy
 cleanup remains later work. Local conductor archives can already
 be sanitized against surviving cleanup intents.
 

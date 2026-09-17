@@ -409,8 +409,9 @@ message IDs, trimmed excerpts). The WebUI exposes those choices. No new dependen
 versions, schema changes or SQL message archival.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md) for limits and coverage.
 
-Selected image-spam enforcement can now capture proving Discord attachments into the
-configured evidence backend after a ban case is recorded. Test mode and a `none`
+After a ban case is recorded, the bot re-fetches proving Discord attachments and captures
+them into the configured evidence backend. The API serves authorized journal-available
+objects and does not perform that Discord re-fetch. Test mode and a `none`
 backend skip capture. Failures do not undo delete or ban. Live Discord CDN and Bunny
 zone privacy remain provider checks.
 

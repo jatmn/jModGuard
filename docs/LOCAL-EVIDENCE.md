@@ -3,9 +3,10 @@
 The opt-in Unix `evidence_transfer::LocalEvidenceStore` implements real file capture,
 verification, recovery and cleanup against the [evidence journal](CASE-EVIDENCE.md).
 It is a library backend for a dedicated local filesystem. Bot and API now serve available
-objects through [tenant runtime](TENANT-RUNTIME.md). Selected image-spam enforcement
-streams proving attachments into this backend through that runtime after a ban case is
-recorded. There is no background capture worker. Core is at migration 0012; the current
+objects through [tenant runtime](TENANT-RUNTIME.md). The bot captures proving Discord
+attachments for selected image-spam enforcement and streams them into this backend
+through that runtime after a ban case is recorded; the API does not perform that Discord
+re-fetch. There is no background capture worker. Core is at migration 0012; the current
 guild schema is 8.
 
 ## Resource contract

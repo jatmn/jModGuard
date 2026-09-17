@@ -89,9 +89,9 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
 1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
 Open requires 8 after the erasure/settings extension. Rollback needs matching pre-upgrade
-database/binary. Core is at migration 0012. Selected image-spam enforcement captures
-proving attachments through tenant runtime on the bot path as described above; backup-copy
-cleanup remains later work.
+database/binary. Core is at migration 0012. The bot captures proving attachments through
+tenant runtime as described above; the API does not perform that Discord re-fetch.
+Backup-copy cleanup remains later work.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
 races, scope denial, bounded closed cleanup/pages, SQL guards, cancellation/purge rollback
