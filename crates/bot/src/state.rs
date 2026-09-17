@@ -94,6 +94,109 @@ impl GatewayCaseSuppressions {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingAuditLink {
+    pub(crate) action: crate::db::guild_data::CaseAction,
+    pub(crate) guild: u64,
+    pub(crate) subject: u64,
+    pub(crate) case_id: crate::db::guild_data::CaseId,
+    pub(crate) operation_id: crate::db::guild_data::CaseId,
+    pub(crate) enrollment: db::GuildEnrollment,
+}
+
+#[derive(Clone)]
+struct PendingDiscordAudit {
+    action: crate::db::guild_data::CaseAction,
+    guild: u64,
+    subject: u64,
+    entry_id: i64,
+}
+
+#[derive(Default)]
+struct PendingAuditLinks {
+    next_token: u128,
+    applications: HashMap<u128, (PendingAuditLink, Instant)>,
+    audits: HashMap<u128, (PendingDiscordAudit, Instant)>,
+}
+
+impl PendingAuditLinks {
+    fn prune(&mut self, now: Instant) {
+        self.applications.retain(|_, (_, expires)| *expires > now);
+        self.audits.retain(|_, (_, expires)| *expires > now);
+    }
+
+    fn cap<T>(entries: &mut HashMap<u128, (T, Instant)>) {
+        if entries.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(key, _)| *key)
+        {
+            entries.remove(&oldest);
+        }
+    }
+
+    fn take_matching<T>(
+        entries: &mut HashMap<u128, (T, Instant)>,
+        matches: impl Fn(&T) -> bool,
+    ) -> Option<T> {
+        let token = entries
+            .iter()
+            .filter(|(_, (value, _))| matches(value))
+            .min_by_key(|(_, (_, expires))| *expires)
+            .map(|(token, _)| *token)?;
+        entries.remove(&token).map(|(value, _)| value)
+    }
+
+    fn remember_application(&mut self, link: PendingAuditLink) -> Option<i64> {
+        let now = Instant::now();
+        self.prune(now);
+        if let Some(audit) = Self::take_matching(&mut self.audits, |audit| {
+            audit.action == link.action
+                && audit.guild == link.guild
+                && audit.subject == link.subject
+        }) {
+            return Some(audit.entry_id);
+        }
+        Self::cap(&mut self.applications);
+        self.next_token += 1;
+        self.applications
+            .insert(self.next_token, (link, now + GATEWAY_CASE_SUPPRESSION_TTL));
+        None
+    }
+
+    fn remember_audit(
+        &mut self,
+        action: crate::db::guild_data::CaseAction,
+        guild: u64,
+        subject: u64,
+        entry_id: i64,
+    ) -> Option<PendingAuditLink> {
+        let now = Instant::now();
+        self.prune(now);
+        if let Some(link) = Self::take_matching(&mut self.applications, |link| {
+            link.action == action && link.guild == guild && link.subject == subject
+        }) {
+            return Some(link);
+        }
+        Self::cap(&mut self.audits);
+        self.next_token += 1;
+        self.audits.insert(
+            self.next_token,
+            (
+                PendingDiscordAudit {
+                    action,
+                    guild,
+                    subject,
+                    entry_id,
+                },
+                now + GATEWAY_CASE_SUPPRESSION_TTL,
+            ),
+        );
+        None
+    }
+}
+
 /// Plan for one poll tick of slash re-sync work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashResyncPlan {
@@ -144,6 +247,7 @@ pub struct BotState {
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
+    pending_audit_links: Mutex<PendingAuditLinks>,
 }
 
 impl BotState {
@@ -194,6 +298,7 @@ impl BotState {
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
+            pending_audit_links: Mutex::new(PendingAuditLinks::default()),
         }))
     }
 
@@ -221,6 +326,22 @@ impl BotState {
         self.gateway_case_suppressions
             .lock()
             .remove(action, guild, user)
+    }
+
+    pub(crate) fn remember_application_audit(&self, link: PendingAuditLink) -> Option<i64> {
+        self.pending_audit_links.lock().remember_application(link)
+    }
+
+    pub(crate) fn remember_discord_audit(
+        &self,
+        action: crate::db::guild_data::CaseAction,
+        guild: u64,
+        subject: u64,
+        entry_id: i64,
+    ) -> Option<PendingAuditLink> {
+        self.pending_audit_links
+            .lock()
+            .remember_audit(action, guild, subject, entry_id)
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -722,6 +843,55 @@ mod tests {
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
+    }
+
+    fn dummy_link(subject: u64) -> PendingAuditLink {
+        PendingAuditLink {
+            action: crate::db::guild_data::CaseAction::Ban,
+            guild: 10,
+            subject,
+            case_id: crate::db::guild_data::CaseId::new(),
+            operation_id: crate::db::guild_data::CaseId::new(),
+            enrollment: db::GuildEnrollment {
+                guild_id: 10,
+                id: "a".repeat(32),
+                joined_at_ns: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_audit_links_match_oldest_owned_dispatch() {
+        let mut pending = PendingAuditLinks::default();
+        let first = dummy_link(20);
+        let first_id = first.case_id.clone();
+        let second = dummy_link(20);
+        assert!(pending.remember_application(first).is_none());
+        assert!(pending.remember_application(second).is_none());
+        let linked = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123)
+            .unwrap();
+        assert_eq!(linked.case_id, first_id);
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Unban, 10, 20, 124)
+                .is_none()
+        );
+        assert!(pending.remember_application(dummy_link(21)).is_none());
+    }
+
+    #[test]
+    fn pending_audit_event_can_arrive_before_the_case() {
+        let mut pending = PendingAuditLinks::default();
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Kick, 10, 20, 55)
+                .is_none()
+        );
+        let mut kick = dummy_link(20);
+        kick.action = crate::db::guild_data::CaseAction::Kick;
+        assert_eq!(pending.remember_application(kick), Some(55));
+        assert!(pending.remember_application(dummy_link(20)).is_none());
     }
 
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {

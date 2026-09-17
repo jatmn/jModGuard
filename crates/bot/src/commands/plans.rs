@@ -509,11 +509,29 @@ async fn record_step_outcome(
     target: UserId,
     result: &serenity::Result<()>,
 ) {
+    let outcome = crate::cases::classify_discord(result.as_ref().err());
+    if matches!(
+        action,
+        crate::db::guild_data::CaseAction::Ban | crate::db::guild_data::CaseAction::Kick
+    ) {
+        crate::cases::record_application(
+            app,
+            enrollment,
+            action,
+            outcome,
+            target.get(),
+            Some(actor.get()),
+            Some("custom command".into()),
+            crate::db::guild_data::CaseEvidence::Unavailable,
+        )
+        .await;
+        return;
+    }
     crate::cases::record(
         app,
         enrollment,
         action,
-        crate::cases::classify_discord(result.as_ref().err()),
+        outcome,
         target.get(),
         Some(actor.get()),
         Some("custom command".into()),

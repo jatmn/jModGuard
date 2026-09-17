@@ -435,7 +435,7 @@ async fn enforce(
             .await;
         }
         ban_outcome = Some(outcome.clone());
-        ban_case = crate::cases::record(
+        ban_case = crate::cases::record_application(
             app,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -444,7 +444,6 @@ async fn enforce(
             None,
             Some(found.reason.clone()),
             evidence(found.excerpts.clone()),
-            crate::cases::application_source(),
         )
         .await;
     }
@@ -540,10 +539,7 @@ async fn capture_attachments(
     let limits = crate::tenant::evidence_limits();
     let sizes: Vec<u64> = attachments.iter().map(|item| item.file.size).collect();
     let plan = crate::tenant::plan_case_evidence_captures(&sizes, limits);
-    if plan.skipped_invalid > 0
-        || plan.skipped_item_limit > 0
-        || plan.skipped_byte_limit > 0
-    {
+    if plan.skipped_invalid > 0 || plan.skipped_item_limit > 0 || plan.skipped_byte_limit > 0 {
         tracing::warn!(
             guild_id = enrollment.guild_id,
             case_id = case_id.as_str(),

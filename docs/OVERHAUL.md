@@ -338,7 +338,8 @@ accept a late opaque counterpart without reviving content. Closed-case cleanup a
 removes owned mappings. See [source contracts and limits](CASE-SOURCES.md).
 
 Current services/core0010 remain unchanged; no new dependency, worker or inference policy.
-Runtime source matching and durable reconciliation, permissions, richer/file evidence and
+Runtime source matching for bot-owned Ban/Unban/Kick is implemented below. Durable
+reconciliation, permissions, richer/file evidence and
 full lifecycle/erasure/routing remain pending. Locally verified storage is not live Discord
 correlation proof, a complete guild purge or a provider resource measurement.
 
@@ -518,3 +519,17 @@ Authorized serving of available objects is unchanged. Local HTTP/file fixtures
 are not live Discord CDN or Bunny zone proof.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md), [CASE-EVIDENCE.md](CASE-EVIDENCE.md) and
 [LOCAL-EVIDENCE.md](LOCAL-EVIDENCE.md).
+
+## Implemented: Discord-audit source association
+
+Bot-owned Ban, Unban and Kick now bind a Discord audit counterpart onto the
+application case they already recorded. The bot remembers the dispatch's own
+application identity in-process (same 30s/4096 bound as gateway-case
+suppression) and consumes `GUILD_AUDIT_LOG_ENTRY_CREATE` only when the executor
+is this bot and the action/guild/subject match that pending identity. Audit
+events may arrive before the case row; unmarked gateway BAN_ADD/REMOVE records
+do not steal those pending links. Failed outcomes, timeouts, foreign executors
+and missing `VIEW_AUDIT_LOG` leave application-only cases. This does not search
+cases by subject or time, merge records, or change image-spam attachment
+capture. See [CASE-SOURCES.md](CASE-SOURCES.md) and
+[TENANT-RUNTIME.md](TENANT-RUNTIME.md).

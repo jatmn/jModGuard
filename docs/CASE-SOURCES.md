@@ -1,9 +1,11 @@
 # Explicit case source association
 
 The inactive guild-store library can associate one application operation and one Discord
-audit entry with the same retained case. This is a storage contract for trusted producers;
-it does not watch Discord, infer matches from timestamps/subjects, merge existing cases,
-grant permission or enable current bot/API recording.
+audit entry with the same retained case. The bot now uses this for Ban/Unban/Kick that it
+executed: it records the application source, remembers that identity in-process, and
+links the Discord audit entry from `GUILD_AUDIT_LOG_ENTRY_CREATE` only when the executor
+is this bot. It does not watch Discord for subject/time matches, infer unmarked gateway
+cases, merge existing cases, grant permission or enable API recording.
 
 ## Identity and conflicts
 
@@ -41,8 +43,9 @@ A producer should resolve the source and append permitted selected context throu
 [case history](CASE-HISTORY.md), preserving a stable history entry ID across retries. The
 library does not infer a final outcome from a successful link or automatically append history.
 Linking and appending are separate idempotent operations; a producer must survive a crash
-between them without losing required follow-up work. Runtime ingestion/reconciliation and
-its durable progress contract remain pending.
+between them without losing required follow-up work. The bot's in-process pending identity
+covers the short Gateway race for bot-owned Ban/Unban/Kick. Durable cross-restart
+reconciliation remains pending.
 
 If one producer records a new case while another links that source elsewhere, only one
 claim of the source can succeed. The loser receives a conflict and must reconcile through
@@ -91,4 +94,6 @@ isolation/rollback, raw SQL guards, scope validation and version4 backfill. Earl
 upgrade regressions remain. Disposable libSQL exercises lost commit responses for source
 creation/linking, removed-parent linking, removal and cleanup, plus cross-handle visibility.
 No live Discord/Bunny proof, resource measurement, runtime permission enforcement or
-complete tenant isolation is claimed.
+complete tenant isolation is claimed. Local tests cover bot-owned audit association,
+foreign executors, unmarked gateway records, failed/timeout skips and audit-before-record
+races. Missing `VIEW_AUDIT_LOG` leaves application-only cases.

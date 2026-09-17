@@ -1,8 +1,8 @@
 //! Shared/dedicated guild-store routing, case/evidence handles and live erasure.
 use crate::config::{EvidenceConfig, GuildStoreConfig, GuildStoresConfig};
 use crate::db::guild_data::{
-    CaseId, CaseLimits, EvidenceLimits, EvidenceOrigin, EvidenceRequest, EvidenceState,
-    EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
+    CaseError, CaseId, CaseLimits, CaseSource, EvidenceLimits, EvidenceOrigin, EvidenceRequest,
+    EvidenceState, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions, LinkCaseSource,
 };
 use crate::db::guild_stores::{
     GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
@@ -324,6 +324,35 @@ impl TenantRuntime {
             Ok(result) => Ok(Some(result)),
             Err(error) if skippable_live(&error) => {
                 tracing::warn!("selected case not recorded: {error:#}");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Bind a Discord audit entry to an already-recorded application case.
+    /// Callers must supply the dispatch's own source identity; this does not
+    /// search cases by subject or time.
+    pub async fn link_selected_source(
+        &self,
+        enrollment: GuildEnrollment,
+        case_id: CaseId,
+        anchor: CaseSource,
+        source: CaseSource,
+    ) -> Result<Option<LinkCaseSource>> {
+        let guild_id = enrollment.guild_id;
+        let (store, scope) = match self.live(enrollment).await {
+            Ok(live) => live,
+            Err(error) if skippable_live(&error) => {
+                tracing::warn!(guild_id, "selected source not linked: {error:#}");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match store.link_case_source(scope, case_id, anchor, source).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if skippable_live(&error) || error.downcast_ref::<CaseError>().is_some() => {
+                tracing::warn!(guild_id, "selected source not linked: {error:#}");
                 Ok(None)
             }
             Err(error) => Err(error),

@@ -46,7 +46,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
                 env.app.release_gateway_case_suppression(suppression);
             }
-            crate::cases::record(
+            crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
@@ -55,7 +55,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 Some(env.actor.get()),
                 Some(reason.clone()),
                 crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::cases::application_source(),
             )
             .await;
             match outcome {
@@ -114,7 +113,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
                 env.app.release_gateway_case_suppression(suppression);
             }
-            crate::cases::record(
+            crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Unban,
@@ -123,7 +122,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 Some(env.actor.get()),
                 Some(reason.clone()),
                 crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::cases::application_source(),
             )
             .await;
             discord?;
@@ -167,7 +165,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             refuse_fenced_discord_mutation(env).await?;
             let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
-            crate::cases::record(
+            crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Kick,
@@ -176,7 +174,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 Some(env.actor.get()),
                 Some(reason.clone()),
                 crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::cases::application_source(),
             )
             .await;
             discord?;

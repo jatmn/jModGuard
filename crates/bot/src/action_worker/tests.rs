@@ -1265,3 +1265,63 @@ async fn known_noop_unban_does_not_consume_a_future_external_echo() {
         ));
     }
 }
+
+#[tokio::test]
+async fn queued_unban_links_a_bot_audit_without_subject_search() {
+    let f = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    let job = f.enqueue(10, "audit", unban(99)).await;
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    drain_with_state(
+        &app,
+        &MockDiscord {
+            outcome: Outcome::succeeded("unbanned"),
+            ..Default::default()
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    crate::cases::await_discord_audit(
+        &app,
+        7,
+        8,
+        crate::db::guild_data::CaseAction::Unban,
+        10,
+        99,
+        321,
+    )
+    .await;
+    crate::cases::await_discord_audit(
+        &app,
+        7,
+        7,
+        crate::db::guild_data::CaseAction::Unban,
+        10,
+        99,
+        321,
+    )
+    .await;
+    let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+    let by_application = store
+        .case_for_source(
+            scope.clone(),
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(job.id).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let by_audit = store
+        .case_for_source(
+            scope,
+            crate::db::guild_data::CaseSource::DiscordAudit { entry_id: 321 },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!by_audit.removed);
+    assert_eq!(by_application.id, by_audit.id);
+}

@@ -132,7 +132,9 @@ explicit inputs; no new runtime defaults, permissions or automatic effective-out
 Version5 adds explicit application/audit source associations; see `docs/CASE-SOURCES.md`.
 Require an already-bound anchor and reject conflicts; never infer matches or merge cases.
 Preserve original facts and both source replay keys after removal, including late explicit
-links to removed parents. Closed cleanup removes owned keys atomically. No runtime adoption.
+links to removed parents. Closed cleanup removes owned keys atomically. Bot-owned
+Ban/Unban/Kick now link Discord audit entries from the same process dispatch using that
+application identity; unmarked gateway cases and foreign executors stay application-only.
 
 Version6 adds the inactive evidence ownership journal; see `docs/CASE-EVIDENCE.md`.
 Reserve before object writes, preserve stable identity/byte admission, and never acknowledge

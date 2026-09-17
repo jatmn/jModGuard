@@ -244,21 +244,20 @@ async fn execute_inner(
                 "failed" => crate::db::guild_data::CaseOutcome::Failed,
                 _ => crate::db::guild_data::CaseOutcome::Uncertain,
             };
-            crate::cases::record_data(
-                tenant,
-                enrollment,
-                crate::db::guild_data::CaseData {
-                    source: crate::db::guild_data::CaseSource::Application { operation_id },
-                    action: crate::db::guild_data::CaseAction::Unban,
-                    outcome: case_outcome,
-                    subject_id: *user_id,
-                    actor_id: Some(job.actor_id),
-                    occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
-                    reason: Some(reason.clone()),
-                    evidence: crate::db::guild_data::CaseEvidence::Unavailable,
-                },
-            )
-            .await;
+            let data = crate::db::guild_data::CaseData {
+                source: crate::db::guild_data::CaseSource::Application { operation_id },
+                action: crate::db::guild_data::CaseAction::Unban,
+                outcome: case_outcome,
+                subject_id: *user_id,
+                actor_id: Some(job.actor_id),
+                occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+                reason: Some(reason.clone()),
+                evidence: crate::db::guild_data::CaseEvidence::Unavailable,
+            };
+            let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
+            if let (Some(app), Some(case_id)) = (app, case_id) {
+                crate::cases::remember_recorded_application(app, enrollment, &data, case_id).await;
+            }
         } else {
             tracing::warn!(
                 action_id = %job.id,
