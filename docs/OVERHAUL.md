@@ -324,9 +324,10 @@ Single reads bound payload size, pages return references only. SQL triggers remo
 with parent payload removal or closed-case purge and roll back both on failure. No new
 library/task/recorder is enabled. See [history contracts](CASE-HISTORY.md).
 
-Trusted runtime source matching, permission/presentation, file evidence and complete
-lifecycle/backup cleanup remain pending. Corrections are observations, not inferred Discord
-success or automatic rewriting of effective state. Core remains10.
+Trusted runtime source matching beyond bot-owned in-process Ban/Unban/Kick (see
+Discord-audit source association below), permission/presentation, file evidence and
+complete lifecycle/backup cleanup remain pending. Corrections are observations, not inferred
+Discord success or automatic rewriting of effective state. Core remains10.
 
 ## Implemented: explicit case source association (wave 22)
 
@@ -338,7 +339,8 @@ accept a late opaque counterpart without reviving content. Closed-case cleanup a
 removes owned mappings. See [source contracts and limits](CASE-SOURCES.md).
 
 Current services/core0010 remain unchanged; no new dependency, worker or inference policy.
-Runtime source matching and durable reconciliation, permissions, richer/file evidence and
+Runtime source matching for bot-owned Ban/Unban/Kick is implemented below. Durable
+reconciliation, permissions, richer/file evidence and
 full lifecycle/erasure/routing remain pending. Locally verified storage is not live Discord
 correlation proof, a complete guild purge or a provider resource measurement.
 
@@ -388,9 +390,10 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-Live Bunny evidence zone privacy, backup-copy cleanup, Discord-audit source
-association, database credential hot-reload, writer leases and multi-replica
-sessions remain later work.
+Live Bunny evidence zone privacy, backup-copy cleanup, durable cross-restart
+Discord-audit reconciliation and dashboard presentation of linked sources,
+database credential hot-reload, writer leases and multi-replica sessions remain
+later work.
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish
@@ -518,3 +521,20 @@ Authorized serving of available objects is unchanged. Local HTTP/file fixtures
 are not live Discord CDN or Bunny zone proof.
 See [IMAGE-SPAM.md](IMAGE-SPAM.md), [CASE-EVIDENCE.md](CASE-EVIDENCE.md) and
 [LOCAL-EVIDENCE.md](LOCAL-EVIDENCE.md).
+
+## Implemented: Discord-audit source association
+
+Bot-owned Ban, Unban and Kick now bind a Discord audit counterpart onto the
+application case they already recorded. The bot remembers the dispatch's own
+application identity in-process (same 30s/4096 bound as gateway-case
+suppression) and consumes `GUILD_AUDIT_LOG_ENTRY_CREATE` only when the executor
+is this bot and the action/guild/subject match that pending identity. A matched pair
+that cannot durably link yet is quarantined onto the deferred retry queue for the same
+30s/4096 bound, including transient store errors; later same-subject dispatches cannot
+reuse those halves. Expired pending links stay application-only.
+Audit events may arrive before the case row; unmarked gateway BAN_ADD/REMOVE records
+do not steal those pending links. Failed outcomes, timeouts, foreign executors
+and missing `VIEW_AUDIT_LOG` leave application-only cases. This does not search
+cases by subject or time, merge records, or change image-spam attachment
+capture. See [CASE-SOURCES.md](CASE-SOURCES.md) and
+[TENANT-RUNTIME.md](TENANT-RUNTIME.md).

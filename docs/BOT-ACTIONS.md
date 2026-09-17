@@ -115,7 +115,11 @@ and transport/server/timeout ambiguity is uncertain. The worker does not automat
 resend failed or uncertain actions. The underlying SDK's HTTP/rate-limit behavior remains;
 this is not a guarantee of exactly one wire request. Once an unban reaches the Discord
 mutation boundary, the worker also records one tenant case using the durable action ID as
-its application source, preserving the captured enrollment, actor and reason. Before
+its application source, preserving the captured enrollment, actor and reason. Succeeded
+and uncertain unban cases that may still receive a bot-executor audit entry remember that
+identity in-process so it can be linked; `already_unbanned` records the case but does not
+register audit pending identity because Discord made no mutation. Unmarked manual/external
+unbans still do not. Before
 dispatch it registers a bounded one-shot suppression so the matching gateway echo does
 not create another case; unmarked manual/external unbans still do. A definitive Discord
 rejection releases the marker immediately, while an uncertain result retains it for the

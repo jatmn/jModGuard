@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(90);
 
+fn release_gateway_ban_suppression(outcome: &CaseOutcome) -> bool {
+    matches!(outcome, CaseOutcome::Failed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Image,
@@ -421,7 +425,7 @@ async fn enforce(
             now,
             matches!(outcome, CaseOutcome::Succeeded),
         );
-        if matches!(outcome, CaseOutcome::Failed | CaseOutcome::Uncertain) {
+        if release_gateway_ban_suppression(&outcome) {
             app.release_gateway_case_suppression(suppression);
         }
         if matches!(outcome, CaseOutcome::Succeeded) {
@@ -435,7 +439,7 @@ async fn enforce(
             .await;
         }
         ban_outcome = Some(outcome.clone());
-        ban_case = crate::cases::record(
+        ban_case = crate::cases::record_application(
             app,
             Some(enrollment.clone()),
             CaseAction::Ban,
@@ -444,7 +448,6 @@ async fn enforce(
             None,
             Some(found.reason.clone()),
             evidence(found.excerpts.clone()),
-            crate::cases::application_source(),
         )
         .await;
     }
@@ -540,10 +543,7 @@ async fn capture_attachments(
     let limits = crate::tenant::evidence_limits();
     let sizes: Vec<u64> = attachments.iter().map(|item| item.file.size).collect();
     let plan = crate::tenant::plan_case_evidence_captures(&sizes, limits);
-    if plan.skipped_invalid > 0
-        || plan.skipped_item_limit > 0
-        || plan.skipped_byte_limit > 0
-    {
+    if plan.skipped_invalid > 0 || plan.skipped_item_limit > 0 || plan.skipped_byte_limit > 0 {
         tracing::warn!(
             guild_id = enrollment.guild_id,
             case_id = case_id.as_str(),
@@ -659,5 +659,12 @@ mod tests {
         assert!(gate.claim_ban(1, 2, now));
         gate.finish_ban(1, 2, now, true);
         assert!(!gate.claim_ban(1, 2, now));
+    }
+
+    #[test]
+    fn uncertain_ban_keeps_gateway_suppression() {
+        assert!(!release_gateway_ban_suppression(&CaseOutcome::Succeeded));
+        assert!(!release_gateway_ban_suppression(&CaseOutcome::Uncertain));
+        assert!(release_gateway_ban_suppression(&CaseOutcome::Failed));
     }
 }

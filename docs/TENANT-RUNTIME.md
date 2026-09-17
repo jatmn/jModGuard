@@ -42,8 +42,16 @@ create cases. Bot command, automod and queued WebUI action paths own these appli
 cases. Gateway ban/unban observations continue to maintain core audit mirrors, but do
 not create a second tenant case for bot-owned actions: those paths register a bounded,
 one-shot in-process suppression before dispatch. Unmarked manual/external gateway
-actions still create a case. This is event ownership, not a guessed application/audit
-source association; trusted durable Discord-audit association remains pending. Ordinary
+actions still create a case. Bot-owned Ban/Unban/Kick then bind a Discord audit entry
+when `GUILD_AUDIT_LOG_ENTRY_CREATE` reports this bot as executor and an in-process
+pending application identity matches the same action, guild and subject. That is the
+dispatch's own source identity, not a subject/time search. `TenantRuntime::link_selected_source`
+performs the durable association using the recorded application anchor.
+A matched pair deferred by skippable live scope or a transient store error stays
+quarantined for the same 30s/4096 bound; a later same-subject dispatch cannot reuse
+those halves. Missing `VIEW_AUDIT_LOG`,
+expired pending links and unmarked gateway cases stay application-sourced. Timeout is
+not associated (member-update audits are too generic). Ordinary
 messages are not archived in SQL. Selected operations capture their enrollment before
 asynchronous effects and carry it through result recording; completion never adopts a
 replacement enrollment.

@@ -34,6 +34,18 @@ fn user_display(member: &Member) -> String {
     member.display_name().to_string()
 }
 
+fn audit_case_action(
+    action: serenity::model::guild::audit_log::Action,
+) -> Option<crate::db::guild_data::CaseAction> {
+    use serenity::model::guild::audit_log::{Action, MemberAction};
+    match action {
+        Action::Member(MemberAction::Kick) => Some(crate::db::guild_data::CaseAction::Kick),
+        Action::Member(MemberAction::BanAdd) => Some(crate::db::guild_data::CaseAction::Ban),
+        Action::Member(MemberAction::BanRemove) => Some(crate::db::guild_data::CaseAction::Unban),
+        _ => None,
+    }
+}
+
 fn select_update_author(
     event_author: Option<u64>,
     text_author: Option<u64>,
@@ -124,7 +136,7 @@ impl EventHandler for Handler {
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
         let app = Arc::clone(self.app());
         let gid = guild.id;
-        if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
+        match crate::enrollment_repair::observe_gateway_membership(
             &app.db,
             &app.tenant,
             gid.get(),
@@ -134,10 +146,15 @@ impl EventHandler for Handler {
         )
         .await
         {
-            tracing::warn!(
-                guild_id = gid.get(),
-                "guild membership observation deferred: {error:#}"
-            );
+            Ok(()) => {
+                crate::cases::retry_deferred_discord_audit_links(&app, Some(gid.get())).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id = gid.get(),
+                    "guild membership observation deferred: {error:#}"
+                );
+            }
         }
         // No guild_settings seed on join — global inheritance stays unblocked.
         if !commands::sync_slash_commands(&app, &ctx, gid).await {
@@ -275,6 +292,34 @@ impl EventHandler for Handler {
         extra.insert("reason".into(), "unbanned".into());
         logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)
             .await;
+    }
+
+    async fn guild_audit_log_entry_create(
+        &self,
+        ctx: Context,
+        entry: serenity::model::guild::audit_log::AuditLogEntry,
+        guild_id: GuildId,
+    ) {
+        let Some(action) = audit_case_action(entry.action) else {
+            return;
+        };
+        let Some(target) = entry.target_id else {
+            return;
+        };
+        let Ok(entry_id) = i64::try_from(entry.id.get()) else {
+            return;
+        };
+        let bot_user = ctx.cache.current_user().id.get();
+        crate::cases::await_discord_audit(
+            self.app(),
+            bot_user,
+            entry.user_id.get(),
+            action,
+            guild_id.get(),
+            target.get(),
+            entry_id,
+        )
+        .await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -569,7 +614,8 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::select_update_author;
+    use super::{audit_case_action, select_update_author};
+    use serenity::model::guild::audit_log::{Action, MemberAction};
 
     #[test]
     fn update_author_prefers_event_then_text_then_image_observation() {
@@ -577,5 +623,26 @@ mod tests {
         assert_eq!(select_update_author(None, Some(2), Some(3)), Some(2));
         assert_eq!(select_update_author(None, None, Some(3)), Some(3));
         assert_eq!(select_update_author(None, None, None), None);
+    }
+
+    #[test]
+    fn audit_case_action_maps_bot_owned_member_events_only() {
+        assert_eq!(
+            audit_case_action(Action::Member(MemberAction::Kick)),
+            Some(crate::db::guild_data::CaseAction::Kick)
+        );
+        assert_eq!(
+            audit_case_action(Action::Member(MemberAction::BanAdd)),
+            Some(crate::db::guild_data::CaseAction::Ban)
+        );
+        assert_eq!(
+            audit_case_action(Action::Member(MemberAction::BanRemove)),
+            Some(crate::db::guild_data::CaseAction::Unban)
+        );
+        assert_eq!(
+            audit_case_action(Action::Member(MemberAction::Update)),
+            None
+        );
+        assert_eq!(audit_case_action(Action::GuildUpdate), None);
     }
 }

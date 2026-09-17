@@ -471,7 +471,7 @@ pub async fn execute_pending(
             if let Some(outcome) =
                 crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
-                crate::cases::record(
+                crate::cases::record_application(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Kick,
@@ -485,7 +485,6 @@ pub async fn execute_pending(
                         target.id.get(),
                         pending.evidence["content"].as_str().unwrap_or(""),
                     ),
-                    crate::cases::application_source(),
                 )
                 .await;
             }
@@ -513,7 +512,7 @@ pub async fn execute_pending(
                 )
                 .await;
             }
-            crate::cases::record(
+            crate::cases::record_application(
                 app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
@@ -527,7 +526,6 @@ pub async fn execute_pending(
                     target.id.get(),
                     pending.evidence["content"].as_str().unwrap_or(""),
                 ),
-                crate::cases::application_source(),
             )
             .await;
         }

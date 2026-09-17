@@ -1747,8 +1747,7 @@ async fn selected_attachment_capture_surfaces_discarded_reservation() {
     };
     let evidence_id = attachment_evidence_id(&origin).unwrap();
     let (store, scope) = f.tenant.live(e.clone()).await.unwrap();
-    let storage_id =
-        CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+    let storage_id = CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
     store
         .reserve_case_evidence(
             scope.clone(),
@@ -1792,4 +1791,52 @@ async fn selected_attachment_capture_surfaces_discarded_reservation() {
             .contains("attachment evidence origin was discarded and cannot be recaptured")
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn link_selected_source_binds_the_supplied_identity() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let mut data = case_data(1);
+    let operation = CaseId::new();
+    data.source = CaseSource::Application {
+        operation_id: operation.clone(),
+    };
+    data.action = CaseAction::Ban;
+    let recorded = f
+        .tenant
+        .record_selected_case(enrollment.clone(), data)
+        .await
+        .unwrap()
+        .unwrap();
+    let case_id = match recorded {
+        crate::db::guild_data::RecordCase::Created(id)
+        | crate::db::guild_data::RecordCase::Existing(id) => id,
+        crate::db::guild_data::RecordCase::Removed(_) => panic!("expected a live case"),
+    };
+    let linked = f
+        .tenant
+        .link_selected_source(
+            enrollment.clone(),
+            case_id.clone(),
+            CaseSource::Application {
+                operation_id: operation.clone(),
+            },
+            CaseSource::DiscordAudit { entry_id: 44 },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        linked,
+        crate::db::guild_data::LinkCaseSource::Linked(_)
+    ));
+    let (store, scope) = f.tenant.live(enrollment).await.unwrap();
+    let found = store
+        .case_for_source(scope, CaseSource::DiscordAudit { entry_id: 44 })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, case_id);
+    assert!(!found.removed);
 }

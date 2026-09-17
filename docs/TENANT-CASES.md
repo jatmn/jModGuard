@@ -24,7 +24,10 @@ returns the original case ID even if the caller generated a different ID. Change
 reuse of an existing ID for another source fails. If both requested identities conflict with
 two records, the operation fails. Callers must retain the original source and payload across
 retries. [Explicit source association](CASE-SOURCES.md) can now bind an application ID and
-Discord audit ID to one canonical case. Trusted runtime matching remains pending; the
+Discord audit ID to one canonical case. The bot associates Ban/Unban/Kick it executed using
+the in-process application identity from that dispatch; deferred pairs stay quarantined
+for the same 30s/4096 bound so a later same-subject dispatch cannot reuse them.
+Expired pending links stay application-only. The
 storage layer never guesses a match or merges two existing cases.
 
 Evidence is explicitly unavailable or a bounded nonempty list of selected text excerpts,
@@ -68,8 +71,9 @@ Real mutations use existing remote receipt recovery. Reads, identical retries, r
 replays and missing removals create no receipts. Cases do not change log/config/slash
 revisions. Original payloads are immutable. [Append-only history](CASE-HISTORY.md) now records notes,
 corrections and selected policy context without rewriting them. Explicit source association
-is described in [case sources](CASE-SOURCES.md); trusted runtime matching and presentation
-remain pending.
+is described in [case sources](CASE-SOURCES.md). Bot-owned Ban/Unban/Kick now bind a Discord
+audit counterpart through in-process pending identity; presentation of both sources in the
+dashboard remains pending.
 
 ## Removal and closure
 

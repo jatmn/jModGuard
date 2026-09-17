@@ -234,6 +234,22 @@ async fn main() -> Result<()> {
     {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
+            let mut poll = tokio::time::interval(Duration::from_secs(1));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal() => break,
+                    _ = poll.tick() => {
+                        jmodguard_bot::cases::retry_deferred_discord_audit_links(&app, None).await;
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_secs(5));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {

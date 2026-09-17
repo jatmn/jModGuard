@@ -94,6 +94,180 @@ impl GatewayCaseSuppressions {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingAuditLink {
+    pub(crate) action: crate::db::guild_data::CaseAction,
+    pub(crate) guild: u64,
+    pub(crate) subject: u64,
+    pub(crate) case_id: crate::db::guild_data::CaseId,
+    pub(crate) operation_id: crate::db::guild_data::CaseId,
+    pub(crate) enrollment: db::GuildEnrollment,
+}
+
+#[derive(Clone)]
+struct PendingDiscordAudit {
+    action: crate::db::guild_data::CaseAction,
+    guild: u64,
+    subject: u64,
+    entry_id: i64,
+}
+
+/// Application and audit halves matched in-memory but not yet durably linked.
+#[derive(Clone)]
+pub(crate) struct PendingAuditReady {
+    pub(crate) link: PendingAuditLink,
+    pub(crate) entry_id: i64,
+    pub(crate) audit_token: Option<u128>,
+    pub(crate) application_token: Option<u128>,
+}
+
+#[derive(Default)]
+struct PendingAuditLinks {
+    next_token: u128,
+    applications: HashMap<u128, (PendingAuditLink, Instant)>,
+    audits: HashMap<u128, (PendingDiscordAudit, Instant)>,
+    deferred_links: Vec<(PendingAuditReady, Instant)>,
+}
+
+impl PendingAuditLinks {
+    fn prune(&mut self, now: Instant) {
+        self.applications.retain(|_, (_, expires)| *expires > now);
+        self.audits.retain(|_, (_, expires)| *expires > now);
+        self.deferred_links.retain(|(_, expires)| *expires > now);
+    }
+
+    fn defer_link(&mut self, ready: PendingAuditReady) {
+        let now = Instant::now();
+        self.prune(now);
+        self.finalize_link(ready.audit_token, ready.application_token);
+        if self.deferred_links.iter().any(|(existing, _)| {
+            existing.entry_id == ready.entry_id && existing.link.case_id == ready.link.case_id
+        }) {
+            return;
+        }
+        if self.deferred_links.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = self
+                .deferred_links
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(index, _)| index)
+        {
+            self.deferred_links.remove(oldest);
+        }
+        self.deferred_links
+            .push((ready, now + GATEWAY_CASE_SUPPRESSION_TTL));
+    }
+
+    fn clear_deferred_link(&mut self, case_id: &crate::db::guild_data::CaseId, entry_id: i64) {
+        self.deferred_links
+            .retain(|(ready, _)| ready.entry_id != entry_id || ready.link.case_id != *case_id);
+    }
+
+    fn deferred_links_for_guild(&mut self, guild: Option<u64>) -> Vec<PendingAuditReady> {
+        let now = Instant::now();
+        self.prune(now);
+        self.deferred_links
+            .iter()
+            .filter(|(ready, _)| guild.is_none_or(|g| ready.link.guild == g))
+            .map(|(ready, _)| ready.clone())
+            .collect()
+    }
+
+    fn cap<T>(entries: &mut HashMap<u128, (T, Instant)>) {
+        if entries.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(key, _)| *key)
+        {
+            entries.remove(&oldest);
+        }
+    }
+
+    fn find_matching<T: Clone>(
+        entries: &HashMap<u128, (T, Instant)>,
+        matches: impl Fn(&T) -> bool,
+    ) -> Option<(u128, T)> {
+        let token = entries
+            .iter()
+            .filter(|(_, (value, _))| matches(value))
+            .min_by_key(|(_, (_, expires))| *expires)
+            .map(|(token, _)| *token)?;
+        entries.get(&token).map(|(value, _)| (token, value.clone()))
+    }
+
+    fn finalize_link(&mut self, audit_token: Option<u128>, application_token: Option<u128>) {
+        self.prune(Instant::now());
+        if let Some(token) = audit_token {
+            self.audits.remove(&token);
+        }
+        if let Some(token) = application_token {
+            self.applications.remove(&token);
+        }
+    }
+
+    fn remember_application(&mut self, link: PendingAuditLink) -> Option<PendingAuditReady> {
+        let now = Instant::now();
+        self.prune(now);
+        if let Some((audit_token, audit)) = Self::find_matching(&self.audits, |audit| {
+            audit.action == link.action
+                && audit.guild == link.guild
+                && audit.subject == link.subject
+        }) {
+            self.audits.remove(&audit_token);
+            return Some(PendingAuditReady {
+                link,
+                entry_id: audit.entry_id,
+                audit_token: Some(audit_token),
+                application_token: None,
+            });
+        }
+        Self::cap(&mut self.applications);
+        self.next_token += 1;
+        self.applications
+            .insert(self.next_token, (link, now + GATEWAY_CASE_SUPPRESSION_TTL));
+        None
+    }
+
+    fn remember_audit(
+        &mut self,
+        action: crate::db::guild_data::CaseAction,
+        guild: u64,
+        subject: u64,
+        entry_id: i64,
+    ) -> Option<PendingAuditReady> {
+        let now = Instant::now();
+        self.prune(now);
+        if let Some((application_token, link)) = Self::find_matching(&self.applications, |link| {
+            link.action == action && link.guild == guild && link.subject == subject
+        }) {
+            self.applications.remove(&application_token);
+            return Some(PendingAuditReady {
+                link,
+                entry_id,
+                audit_token: None,
+                application_token: Some(application_token),
+            });
+        }
+        Self::cap(&mut self.audits);
+        self.next_token += 1;
+        self.audits.insert(
+            self.next_token,
+            (
+                PendingDiscordAudit {
+                    action,
+                    guild,
+                    subject,
+                    entry_id,
+                },
+                now + GATEWAY_CASE_SUPPRESSION_TTL,
+            ),
+        );
+        None
+    }
+}
+
 /// Plan for one poll tick of slash re-sync work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashResyncPlan {
@@ -144,6 +318,7 @@ pub struct BotState {
     /// Per-target retry state for slash re-sync (see [`SlashSyncProgress`]).
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
+    pending_audit_links: Mutex<PendingAuditLinks>,
 }
 
 impl BotState {
@@ -194,6 +369,7 @@ impl BotState {
             version_reconcile_lock: tokio::sync::Mutex::new(()),
             slash_sync_progress: Mutex::new(None),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
+            pending_audit_links: Mutex::new(PendingAuditLinks::default()),
         }))
     }
 
@@ -221,6 +397,58 @@ impl BotState {
         self.gateway_case_suppressions
             .lock()
             .remove(action, guild, user)
+    }
+
+    pub(crate) fn remember_application_audit(
+        &self,
+        link: PendingAuditLink,
+    ) -> Option<PendingAuditReady> {
+        self.pending_audit_links.lock().remember_application(link)
+    }
+
+    pub(crate) fn remember_discord_audit(
+        &self,
+        action: crate::db::guild_data::CaseAction,
+        guild: u64,
+        subject: u64,
+        entry_id: i64,
+    ) -> Option<PendingAuditReady> {
+        self.pending_audit_links
+            .lock()
+            .remember_audit(action, guild, subject, entry_id)
+    }
+
+    pub(crate) fn finalize_pending_audit_link(
+        &self,
+        audit_token: Option<u128>,
+        application_token: Option<u128>,
+    ) {
+        self.pending_audit_links
+            .lock()
+            .finalize_link(audit_token, application_token);
+    }
+
+    pub(crate) fn defer_pending_audit_link(&self, ready: PendingAuditReady) {
+        self.pending_audit_links.lock().defer_link(ready);
+    }
+
+    pub(crate) fn clear_deferred_audit_link(
+        &self,
+        case_id: &crate::db::guild_data::CaseId,
+        entry_id: i64,
+    ) {
+        self.pending_audit_links
+            .lock()
+            .clear_deferred_link(case_id, entry_id);
+    }
+
+    pub(crate) fn deferred_audit_links_for_guild(
+        &self,
+        guild: Option<u64>,
+    ) -> Vec<PendingAuditReady> {
+        self.pending_audit_links
+            .lock()
+            .deferred_links_for_guild(guild)
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -722,6 +950,109 @@ mod tests {
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(s.remove(GatewayCaseAction::Ban, 10, 20));
         assert!(!s.remove(GatewayCaseAction::Ban, 10, 20));
+    }
+
+    fn dummy_link(subject: u64) -> PendingAuditLink {
+        PendingAuditLink {
+            action: crate::db::guild_data::CaseAction::Ban,
+            guild: 10,
+            subject,
+            case_id: crate::db::guild_data::CaseId::new(),
+            operation_id: crate::db::guild_data::CaseId::new(),
+            enrollment: db::GuildEnrollment {
+                guild_id: 10,
+                id: "a".repeat(32),
+                joined_at_ns: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_audit_links_match_oldest_owned_dispatch() {
+        let mut pending = PendingAuditLinks::default();
+        let first = dummy_link(20);
+        let first_id = first.case_id.clone();
+        let second = dummy_link(20);
+        assert!(pending.remember_application(first).is_none());
+        assert!(pending.remember_application(second).is_none());
+        let ready = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123)
+            .unwrap();
+        assert_eq!(ready.link.case_id, first_id);
+        assert_eq!(ready.entry_id, 123);
+        pending.finalize_link(ready.audit_token, ready.application_token);
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Unban, 10, 20, 124)
+                .is_none()
+        );
+        assert!(pending.remember_application(dummy_link(21)).is_none());
+    }
+
+    #[test]
+    fn pending_audit_event_can_arrive_before_the_case() {
+        let mut pending = PendingAuditLinks::default();
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Kick, 10, 20, 55)
+                .is_none()
+        );
+        let mut kick = dummy_link(20);
+        kick.action = crate::db::guild_data::CaseAction::Kick;
+        let ready = pending.remember_application(kick).unwrap();
+        assert_eq!(ready.entry_id, 55);
+        pending.finalize_link(ready.audit_token, ready.application_token);
+        assert!(pending.remember_application(dummy_link(20)).is_none());
+    }
+
+    #[test]
+    fn pending_audit_match_consumes_live_half() {
+        let mut pending = PendingAuditLinks::default();
+        pending.remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123);
+        let first = pending.remember_application(dummy_link(20)).unwrap();
+        assert_eq!(first.entry_id, 123);
+        assert!(pending.remember_application(dummy_link(20)).is_none());
+        let later = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 124)
+            .unwrap();
+        assert_eq!(later.entry_id, 124);
+        assert_ne!(later.link.case_id, first.link.case_id);
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 125)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deferred_audit_pair_is_quarantined_from_live_maps() {
+        let mut pending = PendingAuditLinks::default();
+        pending.remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123);
+        let first = pending.remember_application(dummy_link(20)).unwrap();
+        let first_id = first.link.case_id.clone();
+        pending.defer_link(first);
+        assert!(pending.remember_application(dummy_link(20)).is_none());
+        let later = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 124)
+            .unwrap();
+        assert_ne!(later.link.case_id, first_id);
+        assert_eq!(later.entry_id, 124);
+    }
+
+    #[test]
+    fn deferred_audit_queue_is_capped_like_gateway_suppression() {
+        let mut pending = PendingAuditLinks::default();
+        for subject in 1..=(MAX_GATEWAY_CASE_SUPPRESSIONS as u64 + 1) {
+            pending.remember_audit(
+                crate::db::guild_data::CaseAction::Ban,
+                10,
+                subject,
+                subject as i64,
+            );
+            let ready = pending.remember_application(dummy_link(subject)).unwrap();
+            pending.defer_link(ready);
+        }
+        assert_eq!(pending.deferred_links.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
     }
 
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
