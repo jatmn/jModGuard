@@ -93,6 +93,14 @@ pub struct ProvingAttachment {
     pub channel: u64,
     pub message: u64,
     pub file: jmodguard::image_spam::Attachment,
+    pub proving_hash: jmodguard::image_spam::Hash,
+}
+
+fn fetched_matches_proving(
+    fetched: &jmodguard::image_spam::Hash,
+    proving: &jmodguard::image_spam::Hash,
+) -> bool {
+    fetched == proving
 }
 
 struct Applied {
@@ -578,12 +586,27 @@ async fn capture_attachments(
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        if let Err(error) = hasher.fetch_file(&item.file, remaining, &path).await {
-            tracing::warn!(
-                guild_id = enrollment.guild_id,
-                "attachment download failed: {error:#}"
-            );
-            continue;
+        match hasher.fetch_file(&item.file, remaining, &path).await {
+            Ok(digest) if fetched_matches_proving(&digest, &item.proving_hash) => {}
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+                tracing::warn!(
+                    guild_id = enrollment.guild_id,
+                    case_id = case_id.as_str(),
+                    channel_id = item.channel,
+                    message_id = item.message,
+                    attachment_id = item.file.id,
+                    "attachment re-fetch digest does not match proving hash"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id = enrollment.guild_id,
+                    "attachment download failed: {error:#}"
+                );
+                continue;
+            }
         }
         let _guard = RemoveCapture(path.clone());
         if let Err(error) = app
@@ -610,6 +633,14 @@ async fn capture_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn re_fetch_digest_must_match_proving_hash() {
+        let proving = [1u8; 32];
+        let other = [2u8; 32];
+        assert!(fetched_matches_proving(&proving, &proving));
+        assert!(!fetched_matches_proving(&other, &proving));
+    }
 
     #[test]
     fn failed_delete_and_ban_claims_can_be_retried() {

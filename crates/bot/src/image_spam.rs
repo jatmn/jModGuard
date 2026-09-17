@@ -418,6 +418,35 @@ impl Detector {
                 .all(|message| image_match.messages.contains(message))
     }
 
+    /// Live bucket posts for matched messages after `complete()` merges hashes.
+    fn live_posts_for_messages(
+        &self,
+        guild: u64,
+        author: u64,
+        messages: &[(u64, u64)],
+        policy: &Policy,
+        now: Instant,
+    ) -> Vec<Post> {
+        let state = self.state.lock();
+        let Some(bucket) = state
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+        else {
+            return Vec::new();
+        };
+        messages
+            .iter()
+            .filter_map(|(channel, message)| {
+                bucket
+                    .posts
+                    .iter()
+                    .find(|p| p.channel == *channel && p.id == *message && live(p, policy, now))
+                    .cloned()
+            })
+            .collect()
+    }
+
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
@@ -960,6 +989,7 @@ fn capture_attachments_for_match(
                 channel: post.channel,
                 message: post.id,
                 file: file.clone(),
+                proving_hash: *hash,
             });
         }
     }
@@ -1277,7 +1307,6 @@ async fn run_job(
             )
         })
         .collect();
-    let posts_for_capture = job.posts.clone();
     let completed_at = Instant::now();
     let Some(report) = detector.complete(job, &policy, failed, completed_at) else {
         return;
@@ -1309,7 +1338,14 @@ async fn run_job(
                     }
                 })
                 .collect();
-            let attachments = capture_attachments_for_match(&posts_for_capture, &image_match);
+            let live_posts = detector.live_posts_for_messages(
+                guild,
+                author,
+                messages,
+                &current_policy,
+                completed_at,
+            );
+            let attachments = capture_attachments_for_match(&live_posts, &image_match);
             let disposition = crate::spam_actions::report(
                 app,
                 ctx,
@@ -1768,6 +1804,43 @@ mod tests {
         assert_eq!(
             d.complete(old_job, &p, false, now + Duration::from_secs(1)),
             None
+        );
+    }
+
+    #[test]
+    fn capture_attachments_for_match_carries_proving_hash_per_file() {
+        let now = Instant::now();
+        let a = post(1, 1, now, &[1, 2]);
+        let b = post(2, 2, now, &[2, 1]);
+        let c = post(3, 3, now, &[1, 2]);
+        let image_match = common_images(&[&a, &b, &c], &policy(), 100_000)
+            .unwrap()
+            .unwrap();
+        let attachments = capture_attachments_for_match(&[a, b, c], &image_match);
+        assert!(
+            attachments
+                .iter()
+                .any(|item| item.channel == 1 && item.file.id == 1 && item.proving_hash == [1; 32])
+        );
+    }
+
+    #[test]
+    fn live_posts_for_messages_uses_bucket_not_stale_job_snapshot() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let p = policy();
+        for (id, channel) in [(1, 1), (2, 2), (3, 3)] {
+            admit(&d, id, channel, now);
+        }
+        let messages = vec![(1, 1), (2, 2), (3, 3)];
+        let live = d.live_posts_for_messages(1, 2, &messages, &p, now);
+        assert_eq!(live.len(), 3);
+        let refs: Vec<_> = live.iter().collect();
+        let image_match = common_images(&refs, &p, 100_000).unwrap().unwrap();
+        let stale = vec![live[0].clone()];
+        assert!(
+            capture_attachments_for_match(&stale, &image_match).len()
+                < capture_attachments_for_match(&live, &image_match).len()
         );
     }
 
