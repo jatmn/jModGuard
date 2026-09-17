@@ -112,7 +112,7 @@ Local tests do **not** replace:
 - Live Bunny Database TLS and production credentials
 - Live Magic Container deploy, private-zone confirmation, and CDN origin-pull
 - Live Discord Gateway, OAuth redirect, and guild permission checks
-- Live Bunny evidence zone privacy and attachment capture
+- Live Bunny evidence zone privacy and live Discord CDN attachment fetch
 - Live AWS account, VPC, and billed resource provisioning
 - Provider-billed cost at current Bunny/AWS list prices
 - Multi-replica session stores and writer leases

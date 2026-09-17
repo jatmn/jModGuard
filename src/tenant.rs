@@ -1,7 +1,8 @@
 //! Shared/dedicated guild-store routing, case/evidence handles and live erasure.
 use crate::config::{EvidenceConfig, GuildStoreConfig, GuildStoresConfig};
 use crate::db::guild_data::{
-    CaseLimits, EvidenceLimits, EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
+    CaseId, CaseLimits, EvidenceLimits, EvidenceOrigin, EvidenceRequest, EvidenceState,
+    EvidenceWork, GuildDataScope, GuildDataStore, GuildStoreOptions,
 };
 use crate::db::guild_stores::{
     GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
@@ -14,6 +15,7 @@ use crate::db::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -73,6 +75,77 @@ pub fn evidence_limits() -> EvidenceLimits {
         max_case_bytes: 33_554_432,
         max_page_size: 32,
     }
+}
+
+/// Admission plan for sequential case-evidence reservations matching
+/// `GuildDataStore::reserve_case_evidence` item, per-file, and per-case byte checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EvidenceCapturePlan {
+    pub admitted: Vec<usize>,
+    pub skipped_invalid: u32,
+    pub skipped_item_limit: u32,
+    pub skipped_byte_limit: u32,
+}
+
+pub fn plan_case_evidence_captures(
+    reserved_bytes: &[u64],
+    limits: EvidenceLimits,
+) -> EvidenceCapturePlan {
+    let _ = limits.validate();
+    let max_items = limits.max_items_per_case as usize;
+    let mut plan = EvidenceCapturePlan::default();
+    let mut case_bytes = 0u64;
+    for (index, bytes) in reserved_bytes.iter().enumerate() {
+        if *bytes == 0 || *bytes > limits.max_file_bytes {
+            plan.skipped_invalid += 1;
+            continue;
+        }
+        if plan.admitted.len() >= max_items {
+            plan.skipped_item_limit += 1;
+            continue;
+        }
+        let Some(sum) = case_bytes.checked_add(*bytes) else {
+            plan.skipped_byte_limit += 1;
+            continue;
+        };
+        if sum > limits.max_case_bytes {
+            plan.skipped_byte_limit += 1;
+            continue;
+        }
+        case_bytes = sum;
+        plan.admitted.push(index);
+    }
+    plan
+}
+
+/// Stable evidence identity for one Discord attachment origin. Retries of the
+/// same channel/message/attachment reuse this ID; it is not a random CaseId.
+pub fn attachment_evidence_id(origin: &EvidenceOrigin) -> Result<CaseId> {
+    anyhow::ensure!(
+        origin.channel_id > 0 && origin.message_id > 0 && origin.attachment_id > 0,
+        "attachment origin is incomplete"
+    );
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"jmodguard-discord-attachment-1");
+    digest.update(&origin.channel_id.to_le_bytes());
+    digest.update(&origin.message_id.to_le_bytes());
+    digest.update(&origin.attachment_id.to_le_bytes());
+    let digest = digest.finish();
+    let mut hex = String::with_capacity(32);
+    for byte in &digest.as_ref()[..16] {
+        write!(&mut hex, "{byte:02x}").expect("hex");
+    }
+    CaseId::try_from(hex)
+}
+
+fn skippable_live(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TenantError>().is_some()
+        || error
+            .downcast_ref::<crate::db::guild_data::TenantDataError>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
+            .is_some()
 }
 
 pub fn history_limits() -> crate::db::guild_data::CaseHistoryLimits {
@@ -240,36 +313,192 @@ impl TenantRuntime {
         let guild_id = enrollment.guild_id;
         let (store, scope) = match self.live(enrollment).await {
             Ok(live) => live,
-            Err(error)
-                if error.downcast_ref::<TenantError>().is_some()
-                    || error
-                        .downcast_ref::<crate::db::guild_data::TenantDataError>()
-                        .is_some()
-                    || error
-                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
-                        .is_some() =>
-            {
+            Err(error) if skippable_live(&error) => {
                 tracing::warn!(guild_id, "selected case not recorded: {error:#}");
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        let id = crate::db::guild_data::CaseId::new();
+        let id = CaseId::new();
         match store.record_case(scope, id, data, case_limits()).await {
             Ok(result) => Ok(Some(result)),
-            Err(error)
-                if error.downcast_ref::<TenantError>().is_some()
-                    || error
-                        .downcast_ref::<crate::db::guild_data::TenantDataError>()
-                        .is_some()
-                    || error
-                        .downcast_ref::<crate::db::guild_stores::GuildWriteFenced>()
-                        .is_some() =>
-            {
+            Err(error) if skippable_live(&error) => {
                 tracing::warn!("selected case not recorded: {error:#}");
                 Ok(None)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn reconcile_attachment_evidence(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<EvidenceState> {
+        match &self.inner.evidence {
+            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Local(backend) => backend.reconcile(store, target).await,
+            EvidenceBackend::Bunny(backend) => backend.reconcile(store, target).await,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_attachment_evidence(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<()> {
+        match &self.inner.evidence {
+            EvidenceBackend::None => bail!("evidence backend is not configured"),
+            EvidenceBackend::Local(backend) => {
+                backend.cleanup(store, target).await?;
+            }
+            EvidenceBackend::Bunny(backend) => {
+                backend.cleanup(store, target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn prepare_attachment_evidence_capture(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+    ) -> Result<bool> {
+        let Some(job) = store
+            .find_evidence_transfer_job(
+                target.scope.clone(),
+                target.case_id.clone(),
+                target.evidence_id.clone(),
+            )
+            .await?
+        else {
+            return Ok(true);
+        };
+        match job.state {
+            EvidenceState::Available => Ok(false),
+            EvidenceState::Capturing => {
+                let state = self
+                    .reconcile_attachment_evidence(store.clone(), target.clone())
+                    .await?;
+                self.after_attachment_reconcile(store, target, state).await
+            }
+            EvidenceState::CleanupPending => {
+                self.cleanup_attachment_evidence(store, target).await?;
+                Err(anyhow!(
+                    "attachment evidence origin was discarded and cannot be recaptured"
+                ))
+            }
+            EvidenceState::Erased => Err(anyhow!(
+                "attachment evidence origin was discarded and cannot be recaptured"
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn after_attachment_reconcile(
+        &self,
+        store: GuildDataStore,
+        target: crate::evidence_transfer::EvidenceTarget,
+        state: EvidenceState,
+    ) -> Result<bool> {
+        match state {
+            EvidenceState::Available => Ok(false),
+            EvidenceState::CleanupPending => {
+                self.cleanup_attachment_evidence(store, target).await?;
+                Err(anyhow!(
+                    "attachment evidence origin was discarded and cannot be recaptured"
+                ))
+            }
+            EvidenceState::Capturing => {
+                bail!("attachment capture remains in flight after reconciliation")
+            }
+            EvidenceState::Erased => Err(anyhow!(
+                "attachment evidence origin was discarded and cannot be recaptured"
+            )),
+        }
+    }
+
+    /// Stream a proving Discord attachment into the configured evidence backend.
+    /// Completed objects are not re-uploaded. A disabled backend is a no-op.
+    pub async fn capture_selected_attachment(
+        &self,
+        enrollment: GuildEnrollment,
+        case_id: CaseId,
+        origin: EvidenceOrigin,
+        bytes: u64,
+        source: PathBuf,
+    ) -> Result<Option<EvidenceState>> {
+        #[cfg(not(unix))]
+        {
+            let _ = (enrollment, case_id, origin, bytes, source);
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            if matches!(self.inner.evidence, EvidenceBackend::None) {
+                return Ok(None);
+            }
+            let guild_id = enrollment.guild_id;
+            let (store, scope) = match self.live(enrollment).await {
+                Ok(live) => live,
+                Err(error) if skippable_live(&error) => {
+                    tracing::warn!(guild_id, "selected attachment not captured: {error:#}");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(storage_id) = self.evidence_storage_id() else {
+                return Ok(None);
+            };
+            let evidence_id = attachment_evidence_id(&origin)?;
+            let request = EvidenceRequest {
+                storage_id,
+                bytes,
+                origin,
+            };
+            let target = crate::evidence_transfer::EvidenceTarget {
+                scope: scope.clone(),
+                case_id: case_id.clone(),
+                evidence_id: evidence_id.clone(),
+            };
+            if !self
+                .prepare_attachment_evidence_capture(store.clone(), target.clone())
+                .await?
+            {
+                return Ok(None);
+            }
+            let upload = crate::evidence_transfer::EvidenceUpload {
+                target,
+                request,
+                limits: evidence_limits(),
+            };
+            let state = match &self.inner.evidence {
+                EvidenceBackend::None => return Ok(None),
+                EvidenceBackend::Local(backend) => {
+                    let file = std::fs::File::open(&source)
+                        .context("attachment capture source is missing")?;
+                    backend.capture(store, upload, file).await?
+                }
+                EvidenceBackend::Bunny(backend) => {
+                    let file = tokio::fs::File::open(&source)
+                        .await
+                        .context("attachment capture source is missing")?;
+                    backend.capture(store, upload, file).await?
+                }
+            };
+            Ok(Some(state))
+        }
+    }
+
+    #[cfg(unix)]
+    fn evidence_storage_id(&self) -> Option<CaseId> {
+        match &self.inner.evidence {
+            EvidenceBackend::None => None,
+            EvidenceBackend::Local(store) => Some(store.storage_id().clone()),
+            EvidenceBackend::Bunny(store) => Some(store.storage_id().clone()),
         }
     }
 

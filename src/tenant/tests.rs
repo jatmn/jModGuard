@@ -1536,3 +1536,260 @@ async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
         &shared_id
     );
 }
+
+#[test]
+fn plan_case_evidence_captures_matches_journal_admission() {
+    let limits = evidence_limits();
+    let ten = vec![1u64; 10];
+    let plan = plan_case_evidence_captures(&ten, limits);
+    assert_eq!(plan.admitted.len(), 8);
+    assert_eq!(plan.skipped_item_limit, 2);
+    assert_eq!(plan.skipped_invalid, 0);
+    assert_eq!(plan.skipped_byte_limit, 0);
+
+    let oversize = vec![limits.max_file_bytes + 1];
+    let plan = plan_case_evidence_captures(&oversize, limits);
+    assert!(plan.admitted.is_empty());
+    assert_eq!(plan.skipped_invalid, 1);
+
+    let file = limits.max_file_bytes;
+    let four = vec![file, file, file, file];
+    let plan = plan_case_evidence_captures(&four, limits);
+    assert_eq!(plan.admitted.len(), 4);
+    assert_eq!(plan.skipped_byte_limit, 0);
+
+    let five = vec![file, file, file, file, file];
+    let plan = plan_case_evidence_captures(&five, limits);
+    assert_eq!(plan.admitted.len(), 4);
+    assert_eq!(plan.skipped_byte_limit, 1);
+}
+
+#[test]
+fn attachment_evidence_id_is_stable_and_origin_bound() {
+    use crate::db::guild_data::EvidenceOrigin;
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let first = attachment_evidence_id(&origin).unwrap();
+    assert_eq!(first, attachment_evidence_id(&origin).unwrap());
+    assert_ne!(
+        first,
+        attachment_evidence_id(&EvidenceOrigin {
+            channel_id: 1,
+            message_id: 2,
+            attachment_id: 4,
+        })
+        .unwrap()
+    );
+    assert!(
+        attachment_evidence_id(&EvidenceOrigin {
+            channel_id: 0,
+            message_id: 2,
+            attachment_id: 3,
+        })
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn none_backend_skips_attachment_capture() {
+    use crate::db::guild_data::{EvidenceOrigin, RecordCase};
+    let f = Fixture::new();
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    assert!(
+        f.tenant
+            .capture_selected_attachment(
+                e,
+                case,
+                EvidenceOrigin {
+                    channel_id: 1,
+                    message_id: 2,
+                    attachment_id: 3,
+                },
+                3,
+                PathBuf::from("/missing-capture-source"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_attachment_capture_stores_bytes_and_skips_retries() {
+    use crate::db::guild_data::{EvidenceOrigin, EvidenceState, RecordCase};
+    use std::io::Write;
+
+    let f = Fixture::with_stores(
+        Default::default(),
+        EvidenceConfig {
+            backend: "local".into(),
+            ..Default::default()
+        },
+    );
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let evidence_id = attachment_evidence_id(&origin).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "jmodguard-attach-src-{:032x}",
+        rand::random::<u128>()
+    ));
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"abc").unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_eq!(
+        f.tenant
+            .capture_selected_attachment(e.clone(), case.clone(), origin.clone(), 3, path.clone())
+            .await
+            .unwrap(),
+        Some(EvidenceState::Available)
+    );
+    let (available, bytes) = f
+        .tenant
+        .read_available_evidence(e.clone(), case.clone(), evidence_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, b"abc");
+    assert_eq!(available.origin, origin);
+    assert_eq!(
+        f.tenant
+            .capture_selected_attachment(e.clone(), case.clone(), origin.clone(), 3, path.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    let (_, bytes) = f
+        .tenant
+        .read_available_evidence(e.clone(), case.clone(), evidence_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, b"abc");
+
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    f.tenant.schedule_erasure(e.clone()).await.unwrap();
+    f.tenant.drive_erasure().await.unwrap();
+    assert!(
+        f.tenant
+            .capture_selected_attachment(
+                e,
+                case,
+                EvidenceOrigin {
+                    channel_id: 4,
+                    message_id: 5,
+                    attachment_id: 6,
+                },
+                3,
+                path.clone(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_attachment_capture_surfaces_discarded_reservation() {
+    use crate::db::guild_data::{EvidenceCapture, EvidenceOrigin, EvidenceRequest, RecordCase};
+    use std::io::Write;
+
+    let f = Fixture::with_stores(
+        Default::default(),
+        EvidenceConfig {
+            backend: "local".into(),
+            ..Default::default()
+        },
+    );
+    let e = enroll(&f, 10, 100).await;
+    let RecordCase::Created(case) = f
+        .tenant
+        .record_selected_case(e.clone(), case_data(99))
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a created case");
+    };
+    let origin = EvidenceOrigin {
+        channel_id: 1,
+        message_id: 2,
+        attachment_id: 3,
+    };
+    let evidence_id = attachment_evidence_id(&origin).unwrap();
+    let (store, scope) = f.tenant.live(e.clone()).await.unwrap();
+    let storage_id =
+        CaseId::try_from(db::evidence_storage_id(&f.db, "").await.unwrap()).unwrap();
+    store
+        .reserve_case_evidence(
+            scope.clone(),
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceRequest {
+                storage_id,
+                bytes: 3,
+                origin: origin.clone(),
+            },
+            evidence_limits(),
+        )
+        .await
+        .unwrap();
+    store
+        .settle_evidence_capture(
+            scope.clone(),
+            case.clone(),
+            evidence_id.clone(),
+            EvidenceCapture::Discarded,
+        )
+        .await
+        .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "jmodguard-attach-discarded-{:032x}",
+        rand::random::<u128>()
+    ));
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"abc").unwrap();
+        file.sync_all().unwrap();
+    }
+    let error = f
+        .tenant
+        .capture_selected_attachment(e, case, origin, 3, path.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("attachment evidence origin was discarded and cannot be recaptured")
+    );
+    let _ = std::fs::remove_file(&path);
+}

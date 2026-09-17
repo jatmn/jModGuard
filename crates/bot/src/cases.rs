@@ -56,23 +56,6 @@ pub fn text_excerpt(channel_id: u64, message_id: u64, author_id: u64, text: &str
     }])
 }
 
-pub(crate) async fn record_data(
-    tenant: &crate::tenant::TenantRuntime,
-    enrollment: db::GuildEnrollment,
-    data: CaseData,
-) {
-    let guild_id = enrollment.guild_id;
-    if let Err(error) = tenant.record_selected_case(enrollment, data).await {
-        tracing::warn!(guild_id, "selected case not recorded: {error:#}");
-    }
-}
-
-/// Capture at selected-operation admission, before its asynchronous effects.
-pub async fn capture(app: &BotState, guild: u64) -> Option<db::GuildEnrollment> {
-    let guild = i64::try_from(guild).ok()?;
-    db::guild_enrollment(&app.db, guild).await.ok().flatten()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
     app: &BotState,
@@ -84,13 +67,11 @@ pub async fn record(
     reason: Option<String>,
     evidence: CaseEvidence,
     source: CaseSource,
-) {
-    let Some(enrollment) = enrollment else {
-        return;
-    };
+) -> Option<db::guild_data::CaseId> {
+    let enrollment = enrollment?;
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
     if occurred_at_ms <= 0 {
-        return;
+        return None;
     }
     let data = CaseData {
         source,
@@ -104,7 +85,34 @@ pub async fn record(
         reason,
         evidence,
     };
-    record_data(&app.tenant, enrollment, data).await;
+    record_data(&app.tenant, enrollment, data).await
+}
+
+pub(crate) async fn record_data(
+    tenant: &crate::tenant::TenantRuntime,
+    enrollment: db::GuildEnrollment,
+    data: CaseData,
+) -> Option<db::guild_data::CaseId> {
+    let guild_id = enrollment.guild_id;
+    match tenant.record_selected_case(enrollment, data).await {
+        Ok(Some(result)) => match result {
+            db::guild_data::RecordCase::Created(id) | db::guild_data::RecordCase::Existing(id) => {
+                Some(id)
+            }
+            db::guild_data::RecordCase::Removed(_) => None,
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(guild_id, "selected case not recorded: {error:#}");
+            None
+        }
+    }
+}
+
+/// Capture at selected-operation admission, before its asynchronous effects.
+pub async fn capture(app: &BotState, guild: u64) -> Option<db::GuildEnrollment> {
+    let guild = i64::try_from(guild).ok()?;
+    db::guild_enrollment(&app.db, guild).await.ok().flatten()
 }
 
 #[cfg(test)]
@@ -146,18 +154,21 @@ mod tests {
         app.tenant.drive_erasure().await.unwrap();
         let new = db::enroll_guild(&app.db, 10, 101).await.unwrap().unwrap();
         app.tenant.activate(new.clone()).await.unwrap();
-        record(
-            &app,
-            Some(old),
-            CaseAction::Ban,
-            CaseOutcome::Succeeded,
-            99,
-            Some(42),
-            Some("old membership private reason".into()),
-            CaseEvidence::Unavailable,
-            application_source(),
-        )
-        .await;
+        assert!(
+            record(
+                &app,
+                Some(old),
+                CaseAction::Ban,
+                CaseOutcome::Succeeded,
+                99,
+                Some(42),
+                Some("old membership private reason".into()),
+                CaseEvidence::Unavailable,
+                application_source(),
+            )
+            .await
+            .is_none()
+        );
         let (s, scope) = app.tenant.live(new).await.unwrap();
         assert_eq!(
             s.case_count(scope.clone(), crate::tenant::case_limits())
@@ -165,18 +176,21 @@ mod tests {
                 .unwrap(),
             0
         );
-        record(
-            &app,
-            Some(scope.enrollment().clone()),
-            CaseAction::Ban,
-            CaseOutcome::Succeeded,
-            99,
-            None,
-            None,
-            CaseEvidence::Unavailable,
-            application_source(),
-        )
-        .await;
+        assert!(
+            record(
+                &app,
+                Some(scope.enrollment().clone()),
+                CaseAction::Ban,
+                CaseOutcome::Succeeded,
+                99,
+                None,
+                None,
+                CaseEvidence::Unavailable,
+                application_source(),
+            )
+            .await
+            .is_some()
+        );
         assert_eq!(
             s.case_count(scope, crate::tenant::case_limits())
                 .await

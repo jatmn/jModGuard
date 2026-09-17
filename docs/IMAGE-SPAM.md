@@ -60,10 +60,23 @@ and exemptions, then deletes each matched message and bans the author. Deletion 
 ban outcomes are recorded separately. A 404 on delete is treated as already gone.
 If both rules match the same author in a short window, only one ban is attempted;
 remaining matched messages can still be deleted. Cases store proving message IDs,
-hashes or trimmed text. Test reports stay Discord logs only.
+hashes or trimmed text. Test reports stay Discord logs only, with no SQL cases and no
+object capture.
 
-Private Discord attachment *object* capture into the evidence backend remains later
-work; selected case text records the proving posts.
+After a ban case is recorded for an image match, the bot re-fetches proving
+attachments through the same Hasher CDN contract (no arbitrary URLs, redirects,
+credentials or retries) into a temporary file, then streams that file into the
+configured evidence backend. Capture uses a stable evidence ID derived from the
+channel/message/attachment origin so the same attachment retries the same identity.
+Existing reservations are not re-uploaded. Failures are logged and do not undo the
+delete or ban. A `none` backend skips capture. Capture admission uses the same
+per-case `EvidenceLimits` as the guild evidence journal (currently eight items,
+eight mebibytes per file, and thirty-two mebibytes total per case on the bot
+path); proving files that cannot be admitted are skipped with a warning rather
+than attempted. Process image budgets stay in `[image_spam]`; the capture batch
+shares the existing download timeout. Live Discord
+CDN and Bunny zone privacy remain separate provider checks. Authorized dashboard
+serving of available objects is unchanged.
 
 ## Resource controls
 

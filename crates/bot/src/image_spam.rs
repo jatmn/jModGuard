@@ -37,11 +37,18 @@ struct Post {
     serial: u64,
     at: Instant,
     files: Vec<Attachment>,
+    /// One hash per file, in `files` order.
+    file_hashes: Option<Vec<Hash>>,
     hashes: Option<Vec<Hash>>,
     valid: bool,
     cost: usize,
     revision: u64,
     edited_ms: i64,
+}
+#[derive(Debug, PartialEq)]
+struct ImageMatch {
+    messages: Vec<(u64, u64)>,
+    proving: Vec<Hash>,
 }
 struct Bucket {
     retired_before: u64,
@@ -239,7 +246,7 @@ struct Job {
 }
 #[derive(Debug, PartialEq)]
 enum Report {
-    Verified(Vec<(u64, u64)>),
+    Verified(ImageMatch),
     Unverified,
 }
 #[derive(Clone, Copy, Debug)]
@@ -274,6 +281,12 @@ impl Detector {
             hasher: Hasher::default(),
             dropped: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+    pub(crate) fn hasher(&self) -> &Hasher {
+        &self.hasher
+    }
+    pub(crate) fn download_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.limits.timeout_secs)
     }
     fn capacity_drop(&self) {
         use std::sync::atomic::Ordering;
@@ -393,15 +406,45 @@ impl Detector {
         }) {
             return false;
         }
-        let Ok(Some(proving)) = common_images(&posts, proof.policy, self.limits.comparison_steps)
+        let Ok(Some(image_match)) =
+            common_images(&posts, proof.policy, self.limits.comparison_steps)
         else {
             return false;
         };
-        proving.len() == proof.messages.len()
+        image_match.messages.len() == proof.messages.len()
             && proof
                 .messages
                 .iter()
-                .all(|message| proving.contains(message))
+                .all(|message| image_match.messages.contains(message))
+    }
+
+    /// Live bucket posts for matched messages after `complete()` merges hashes.
+    fn live_posts_for_messages(
+        &self,
+        guild: u64,
+        author: u64,
+        messages: &[(u64, u64)],
+        policy: &Policy,
+        now: Instant,
+    ) -> Vec<Post> {
+        let state = self.state.lock();
+        let Some(bucket) = state
+            .guilds
+            .get(&guild)
+            .and_then(|g| g.authors.get(&author))
+        else {
+            return Vec::new();
+        };
+        messages
+            .iter()
+            .filter_map(|(channel, message)| {
+                bucket
+                    .posts
+                    .iter()
+                    .find(|p| p.channel == *channel && p.id == *message && live(p, policy, now))
+                    .cloned()
+            })
+            .collect()
     }
 
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
@@ -664,6 +707,7 @@ impl Detector {
         for old in job.posts {
             if let Some(p) = b.posts.iter_mut().find(|p| p.serial == old.serial) {
                 p.hashes = old.hashes;
+                p.file_hashes = old.file_hashes.clone();
             }
         }
         let posts: Vec<_> = b.posts.iter().filter(|p| live(p, policy, now)).collect();
@@ -879,7 +923,7 @@ fn common_images(
     posts: &[&Post],
     policy: &Policy,
     mut work: usize,
-) -> Result<Option<Vec<(u64, u64)>>, ()> {
+) -> Result<Option<ImageMatch>, ()> {
     for anchor in posts {
         let Some(hashes) = &anchor.hashes else {
             continue;
@@ -892,7 +936,7 @@ fn common_images(
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| mask & (1 << i) != 0)
-                .map(|(_, h)| h)
+                .map(|(_, h)| *h)
                 .collect();
             let mut matched = Vec::new();
             for p in posts {
@@ -910,11 +954,46 @@ fn common_images(
                 .len()
                 >= policy.min_channels
             {
-                return Ok(Some(matched));
+                return Ok(Some(ImageMatch {
+                    messages: matched,
+                    proving: subset,
+                }));
             }
         }
     }
     Ok(None)
+}
+
+fn capture_attachments_for_match(
+    posts: &[Post],
+    image_match: &ImageMatch,
+) -> Vec<crate::spam_actions::ProvingAttachment> {
+    let proving: BTreeSet<Hash> = image_match.proving.iter().copied().collect();
+    let mut attachments = Vec::new();
+    for post in posts {
+        if !image_match
+            .messages
+            .iter()
+            .any(|found| found == &(post.channel, post.id))
+        {
+            continue;
+        }
+        let Some(file_hashes) = post.file_hashes.as_deref() else {
+            continue;
+        };
+        for (file, hash) in post.files.iter().zip(file_hashes) {
+            if !proving.contains(hash) {
+                continue;
+            }
+            attachments.push(crate::spam_actions::ProvingAttachment {
+                channel: post.channel,
+                message: post.id,
+                file: file.clone(),
+                proving_hash: *hash,
+            });
+        }
+    }
+    attachments
 }
 fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {
     may_admit(rule, author, channel, Some(roles))
@@ -1016,6 +1095,7 @@ pub fn observe(
             serial: 0,
             at,
             files,
+            file_hashes: None,
             hashes: None,
             valid: true,
             cost: 0,
@@ -1144,6 +1224,7 @@ pub(crate) fn observe_update(
             serial: 0,
             at,
             files,
+            file_hashes: None,
             hashes: None,
             valid: true,
             cost: 0,
@@ -1179,16 +1260,18 @@ async fn run_job(
                     if post.hashes.is_some() {
                         continue;
                     }
-                    let mut hashes = BTreeSet::new();
+                    let mut unique = BTreeSet::new();
+                    let mut file_hashes = Vec::with_capacity(post.files.len());
                     for file in &post.files {
-                        hashes.insert(
-                            detector
-                                .hasher
-                                .hash(file, Duration::from_secs(detector.limits.timeout_secs))
-                                .await?,
-                        );
+                        let hash = detector
+                            .hasher
+                            .hash(file, Duration::from_secs(detector.limits.timeout_secs))
+                            .await?;
+                        file_hashes.push(hash);
+                        unique.insert(hash);
                     }
-                    post.hashes = Some(hashes.into_iter().collect());
+                    post.file_hashes = Some(file_hashes);
+                    post.hashes = Some(unique.into_iter().collect());
                 }
                 Ok::<_, anyhow::Error>(())
             })
@@ -1240,7 +1323,8 @@ async fn run_job(
             let vars = report_vars(Report::Unverified, author, channel, &policy);
             crate::logging::emit(app, ctx, GuildId::new(guild), "automod", vars).await;
         }
-        Report::Verified(messages) => {
+        Report::Verified(image_match) => {
+            let messages = &image_match.messages;
             let excerpts = excerpts
                 .into_iter()
                 .filter(|(c, m, _, _)| messages.iter().any(|found| found == &(*c, *m)))
@@ -1254,6 +1338,14 @@ async fn run_job(
                     }
                 })
                 .collect();
+            let live_posts = detector.live_posts_for_messages(
+                guild,
+                author,
+                messages,
+                &current_policy,
+                completed_at,
+            );
+            let attachments = capture_attachments_for_match(&live_posts, &image_match);
             let disposition = crate::spam_actions::report(
                 app,
                 ctx,
@@ -1264,8 +1356,9 @@ async fn run_job(
                     channel,
                     policy: crate::spam_actions::MatchPolicy::Image(current_policy),
                     token,
-                    messages,
+                    messages: messages.clone(),
                     excerpts,
+                    attachments,
                     reason: format!(
                         "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
                         policy.min_attachments, policy.min_channels, policy.window_secs
@@ -1298,12 +1391,13 @@ fn report_vars(
     policy: &Policy,
 ) -> BTreeMap<String, String> {
     let (reason, content) = match report {
-        Report::Verified(posts) => (
+        Report::Verified(image_match) => (
             format!(
                 "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
                 policy.min_attachments, policy.min_channels, policy.window_secs
             ),
-            posts
+            image_match
+                .messages
                 .iter()
                 .map(|(c, m)| format!("channel {c}, message {m}"))
                 .collect::<Vec<_>>()
@@ -1364,6 +1458,7 @@ mod tests {
                     .unwrap()
                 })
                 .collect(),
+            file_hashes: Some(values.iter().map(|v| [*v; 32]).collect()),
             hashes: Some(hashes.into_iter().collect()),
             edited_ms: 0,
         }
@@ -1562,7 +1657,7 @@ mod tests {
         let matched = d
             .complete(job, &p, false, now)
             .and_then(|report| match report {
-                Report::Verified(messages) => Some(messages),
+                Report::Verified(image_match) => Some(image_match.messages),
                 _ => None,
             })
             .unwrap();
@@ -1602,7 +1697,7 @@ mod tests {
         let matched = d
             .complete(job, &p, false, now)
             .and_then(|report| match report {
-                Report::Verified(messages) => Some(messages),
+                Report::Verified(image_match) => Some(image_match.messages),
                 _ => None,
             })
             .unwrap();
@@ -1713,14 +1808,73 @@ mod tests {
     }
 
     #[test]
+    fn capture_attachments_for_match_carries_proving_hash_per_file() {
+        let now = Instant::now();
+        let a = post(1, 1, now, &[1, 2]);
+        let b = post(2, 2, now, &[2, 1]);
+        let c = post(3, 3, now, &[1, 2]);
+        let image_match = common_images(&[&a, &b, &c], &policy(), 100_000)
+            .unwrap()
+            .unwrap();
+        let attachments = capture_attachments_for_match(&[a, b, c], &image_match);
+        assert!(
+            attachments
+                .iter()
+                .any(|item| item.channel == 1 && item.file.id == 1 && item.proving_hash == [1; 32])
+        );
+    }
+
+    #[test]
+    fn live_posts_for_messages_uses_bucket_not_stale_job_snapshot() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let p = policy();
+        for (id, channel) in [(1, 1), (2, 2), (3, 3)] {
+            admit(&d, id, channel, now);
+        }
+        let messages = vec![(1, 1), (2, 2), (3, 3)];
+        let live = d.live_posts_for_messages(1, 2, &messages, &p, now);
+        assert_eq!(live.len(), 3);
+        let refs: Vec<_> = live.iter().collect();
+        let image_match = common_images(&refs, &p, 100_000).unwrap().unwrap();
+        let stale = vec![live[0].clone()];
+        assert!(
+            capture_attachments_for_match(&stale, &image_match).len()
+                < capture_attachments_for_match(&live, &image_match).len()
+        );
+    }
+
+    #[test]
+    fn capture_attachments_for_match_excludes_extra_files_on_matched_messages() {
+        let now = Instant::now();
+        let a = post(1, 1, now, &[1, 2]);
+        let b = post(2, 2, now, &[2, 1, 3]);
+        let c = post(3, 3, now, &[1, 2]);
+        let image_match = common_images(&[&a, &b, &c], &policy(), 100_000)
+            .unwrap()
+            .unwrap();
+        let attachments = capture_attachments_for_match(&[a, b, c], &image_match);
+        assert_eq!(attachments.len(), 6);
+        assert!(
+            attachments
+                .iter()
+                .all(|item| !(item.channel == 2 && item.file.id == 3)),
+            "non-proving attachment must not be captured"
+        );
+    }
+
+    #[test]
     fn exact_common_set_allows_extras_order_and_rejects_overlap_chain() {
         let now = Instant::now();
         let a = post(1, 1, now, &[1, 2]);
         let b = post(2, 2, now, &[2, 1, 3]);
         let c = post(3, 3, now, &[1, 2]);
         assert_eq!(
-            common_images(&[&a, &b, &c], &policy(), 100_000).unwrap(),
-            Some(vec![(1, 1), (2, 2), (3, 3)])
+            common_images(&[&a, &b, &c], &policy(), 100_000)
+                .unwrap()
+                .unwrap()
+                .messages,
+            vec![(1, 1), (2, 2), (3, 3)]
         );
         let c = post(3, 3, now, &[2, 3]);
         assert_eq!(common_images(&[&a, &b, &c], &policy(), 100_000), Ok(None));

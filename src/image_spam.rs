@@ -3,6 +3,7 @@
 use anyhow::{Result, ensure};
 use hyper::{Body, Client, body::HttpBody};
 use serde::Deserialize;
+use std::path::Path;
 use std::time::Duration;
 
 pub const TEST_MODE: &str = "exact_image_test";
@@ -230,30 +231,84 @@ impl Default for Hasher {
     }
 }
 impl Hasher {
+    async fn get_body(&self, attachment: &Attachment) -> Result<Body> {
+        let response = self
+            .client
+            .get(attachment.uri.clone())
+            .await
+            .map_err(|_| anyhow::anyhow!("image download failed"))?;
+        ensure!(
+            response.status() == hyper::StatusCode::OK,
+            "image download did not return 200"
+        );
+        ensure!(
+            !response
+                .headers()
+                .contains_key(hyper::header::CONTENT_ENCODING),
+            "encoded image response is unsupported"
+        );
+        Ok(response.into_body())
+    }
+
     pub async fn hash(&self, attachment: &Attachment, timeout: Duration) -> Result<Hash> {
         tokio::time::timeout(timeout, async {
-            let response = self
-                .client
-                .get(attachment.uri.clone())
-                .await
-                .map_err(|_| anyhow::anyhow!("image download failed"))?;
-            ensure!(
-                response.status() == hyper::StatusCode::OK,
-                "image download did not return 200"
-            );
-            ensure!(
-                !response
-                    .headers()
-                    .contains_key(hyper::header::CONTENT_ENCODING),
-                "encoded image response is unsupported"
-            );
-            hash_body(response.into_body(), attachment.size).await
+            hash_body(self.get_body(attachment).await?, attachment.size).await
         })
         .await
         .map_err(|_| anyhow::anyhow!("image download timed out"))?
     }
+
+    /// Stream the attachment to a new local file using the same CDN contract as `hash`.
+    pub async fn fetch_file(
+        &self,
+        attachment: &Attachment,
+        timeout: Duration,
+        dest: &Path,
+    ) -> Result<Hash> {
+        let dest = dest.to_path_buf();
+        match tokio::time::timeout(timeout, async {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .map_err(|_| anyhow::anyhow!("image capture file could not be created"))?;
+            match stream_body(
+                self.get_body(attachment).await?,
+                attachment.size,
+                Some(&mut file),
+            )
+            .await
+            {
+                Ok(hash) => Ok(hash),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&dest);
+                    Err(error)
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(hash)) => Ok(hash),
+            Ok(Err(error)) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(error)
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(anyhow::anyhow!("image download timed out"))
+            }
+        }
+    }
 }
-async fn hash_body(mut body: Body, expected: u64) -> Result<Hash> {
+async fn hash_body(body: Body, expected: u64) -> Result<Hash> {
+    stream_body(body, expected, None).await
+}
+async fn stream_body(
+    mut body: Body,
+    expected: u64,
+    mut dest: Option<&mut std::fs::File>,
+) -> Result<Hash> {
+    use std::io::Write;
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
     let mut bytes = 0u64;
     while let Some(chunk) = body.data().await {
@@ -262,12 +317,20 @@ async fn hash_body(mut body: Body, expected: u64) -> Result<Hash> {
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| anyhow::anyhow!("image body too large"))?;
         ensure!(bytes <= expected, "image body exceeds declared size");
+        if let Some(file) = dest.as_mut() {
+            file.write_all(&chunk)
+                .map_err(|_| anyhow::anyhow!("image capture write failed"))?;
+        }
         hash.update(&chunk);
     }
     ensure!(
         bytes == expected,
         "image body length differs from declared size"
     );
+    if let Some(file) = dest.as_mut() {
+        file.sync_all()
+            .map_err(|_| anyhow::anyhow!("image capture sync failed"))?;
+    }
     Ok(hash.finish().as_ref().try_into().expect("SHA256 length"))
 }
 
@@ -396,6 +459,42 @@ mod tests {
                 .await
                 .is_err()
         );
+        source.uri = format!("http://{address}/ok").parse().unwrap();
+        let dest = std::env::temp_dir().join(format!(
+            "jmodguard-attach-fetch-{:032x}.part",
+            rand::random::<u128>()
+        ));
+        assert_eq!(
+            client
+                .fetch_file(&source, Duration::from_secs(1), &dest)
+                .await
+                .unwrap(),
+            hash_body(Body::from("abc"), 3).await.unwrap()
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert!(
+            client
+                .fetch_file(&source, Duration::from_secs(1), &dest)
+                .await
+                .is_err(),
+            "capture must not overwrite an existing file"
+        );
+        let timeout_dest = std::env::temp_dir().join(format!(
+            "jmodguard-attach-fetch-timeout-{:032x}.part",
+            rand::random::<u128>()
+        ));
+        source.uri = format!("http://{address}/slow").parse().unwrap();
+        assert!(
+            client
+                .fetch_file(&source, Duration::from_millis(30), &timeout_dest)
+                .await
+                .is_err()
+        );
+        assert!(
+            !timeout_dest.exists(),
+            "timed-out fetch must not leave a temporary capture file"
+        );
+        let _ = std::fs::remove_file(&dest);
         task.abort();
     }
 

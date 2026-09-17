@@ -84,7 +84,23 @@ pub struct Match {
     pub token: (u64, u64),
     pub messages: Vec<(u64, u64)>,
     pub excerpts: Vec<TextEvidence>,
+    pub attachments: Vec<ProvingAttachment>,
     pub reason: String,
+}
+
+#[derive(Clone)]
+pub struct ProvingAttachment {
+    pub channel: u64,
+    pub message: u64,
+    pub file: jmodguard::image_spam::Attachment,
+    pub proving_hash: jmodguard::image_spam::Hash,
+}
+
+fn fetched_matches_proving(
+    fetched: &jmodguard::image_spam::Hash,
+    proving: &jmodguard::image_spam::Hash,
+) -> bool {
+    fetched == proving
 }
 
 struct Applied {
@@ -377,6 +393,7 @@ async fn enforce(
         .await;
     }
     let mut ban_outcome = None;
+    let mut ban_case = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
         let suppression = app.suppress_next_gateway_case(
             crate::state::GatewayCaseAction::Ban,
@@ -418,18 +435,23 @@ async fn enforce(
             .await;
         }
         ban_outcome = Some(outcome.clone());
-        crate::cases::record(
+        ban_case = crate::cases::record(
             app,
-            Some(enrollment),
+            Some(enrollment.clone()),
             CaseAction::Ban,
             outcome,
             found.author,
             None,
             Some(found.reason.clone()),
-            evidence(found.excerpts),
+            evidence(found.excerpts.clone()),
             crate::cases::application_source(),
         )
         .await;
+    }
+    if found.kind == Kind::Image
+        && let Some(case_id) = ban_case
+    {
+        capture_attachments(app, enrollment, case_id, &found.attachments).await;
     }
     let action = match ban_outcome {
         None => "delete remaining; ban already applied this window".into(),
@@ -496,9 +518,129 @@ fn evidence(excerpts: Vec<TextEvidence>) -> CaseEvidence {
     }
 }
 
+struct RemoveCapture(std::path::PathBuf);
+impl Drop for RemoveCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn capture_attachments(
+    app: &BotState,
+    enrollment: crate::db::GuildEnrollment,
+    case_id: crate::db::guild_data::CaseId,
+    attachments: &[ProvingAttachment],
+) {
+    if !app.tenant.evidence_enabled() {
+        return;
+    }
+    let hasher = app.image_spam.hasher();
+    let budget = app.image_spam.download_timeout();
+    let started = Instant::now();
+    let limits = crate::tenant::evidence_limits();
+    let sizes: Vec<u64> = attachments.iter().map(|item| item.file.size).collect();
+    let plan = crate::tenant::plan_case_evidence_captures(&sizes, limits);
+    if plan.skipped_invalid > 0
+        || plan.skipped_item_limit > 0
+        || plan.skipped_byte_limit > 0
+    {
+        tracing::warn!(
+            guild_id = enrollment.guild_id,
+            case_id = case_id.as_str(),
+            proving_total = attachments.len(),
+            capturing = plan.admitted.len(),
+            skipped_invalid = plan.skipped_invalid,
+            skipped_item_limit = plan.skipped_item_limit,
+            skipped_byte_limit = plan.skipped_byte_limit,
+            max_items_per_case = limits.max_items_per_case,
+            max_file_bytes = limits.max_file_bytes,
+            max_case_bytes = limits.max_case_bytes,
+            "proving attachment capture plan excludes files that cannot be admitted to case evidence"
+        );
+    }
+    let admitted_total = plan.admitted.len();
+    let mut captured = 0usize;
+    for index in plan.admitted {
+        let item = &attachments[index];
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
+                guild_id = enrollment.guild_id,
+                case_id = case_id.as_str(),
+                proving_total = attachments.len(),
+                admitted = admitted_total,
+                captured_before_timeout = captured,
+                "attachment capture budget exhausted"
+            );
+            break;
+        }
+        let origin = crate::db::guild_data::EvidenceOrigin {
+            channel_id: item.channel as i64,
+            message_id: item.message as i64,
+            attachment_id: item.file.id as i64,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard-attach-{:032x}.part",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        match hasher.fetch_file(&item.file, remaining, &path).await {
+            Ok(digest) if fetched_matches_proving(&digest, &item.proving_hash) => {}
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+                tracing::warn!(
+                    guild_id = enrollment.guild_id,
+                    case_id = case_id.as_str(),
+                    channel_id = item.channel,
+                    message_id = item.message,
+                    attachment_id = item.file.id,
+                    "attachment re-fetch digest does not match proving hash"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id = enrollment.guild_id,
+                    "attachment download failed: {error:#}"
+                );
+                continue;
+            }
+        }
+        let _guard = RemoveCapture(path.clone());
+        if let Err(error) = app
+            .tenant
+            .capture_selected_attachment(
+                enrollment.clone(),
+                case_id.clone(),
+                origin,
+                item.file.size,
+                path,
+            )
+            .await
+        {
+            tracing::warn!(
+                guild_id = enrollment.guild_id,
+                "attachment capture failed: {error:#}"
+            );
+        } else {
+            captured += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn re_fetch_digest_must_match_proving_hash() {
+        let proving = [1u8; 32];
+        let other = [2u8; 32];
+        assert!(fetched_matches_proving(&proving, &proving));
+        assert!(!fetched_matches_proving(&other, &proving));
+    }
 
     #[test]
     fn failed_delete_and_ban_claims_can_be_retried() {

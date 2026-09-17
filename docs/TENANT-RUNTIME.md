@@ -100,8 +100,8 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished services stay inactive: public installation (R8) is not registered.
-Owner-selected updates and rollback are available on the conductor when an update
+Unfinished live provider checks stay deferred; public installation validation is
+available on the conductor. Owner-selected updates and rollback are available on the conductor when an update
 root is configured; see [UPDATES.md](UPDATES.md).
 Signed Stable/Nightly discovery can list complete publications when a feed and
 trust keys are configured; see [RELEASES.md](RELEASES.md). Local encrypted
@@ -109,7 +109,9 @@ backup/restore and guild-store moves are available on the conductor when their p
 paths are configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) and
 [GUILD-MOVES.md](GUILD-MOVES.md).
 Image and text spam enforcement is implemented separately; see
-[IMAGE-SPAM.md](IMAGE-SPAM.md). See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
+[IMAGE-SPAM.md](IMAGE-SPAM.md). The bot captures proving Discord attachments for
+selected image-spam enforcement through tenant runtime; the API serves authorized
+journal-available objects and does not perform that Discord re-fetch. See [guild stores](GUILD-STORES.md), [cases](TENANT-CASES.md),
 [evidence](CASE-EVIDENCE.md) and [enrollments](ENROLLMENTS.md).
 
 ## Continuation and retry boundaries

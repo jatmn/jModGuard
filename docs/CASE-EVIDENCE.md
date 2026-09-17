@@ -1,12 +1,13 @@
 # Private evidence ownership journal
 
-The inactive guild-store library records selected attachment ownership and lifecycle state.
-It does not upload, fetch, serve or delete files, create URLs, bind Storage resources, run
-workers or enable current bot/API capture. The separate opt-in [local transfer backend](LOCAL-EVIDENCE.md)
-implements local file I/O and exclusive coordination. The opt-in [Bunny adapter](BUNNY-EVIDENCE.md)
-adds HTTP transfer with durable single-use attempts. Bot and API now serve available
-private objects after the journal confirms them; see [tenant runtime](TENANT-RUNTIME.md).
-Capture of Discord attachments and backup-copy cleanup remain later work.
+The inactive guild-store library records selected attachment ownership and lifecycle state in
+SQL. It does not fetch Discord attachments, run background workers, or perform provider HTTP
+by itself. The bot captures proving Discord attachments for selected image-spam enforcement
+through [tenant runtime](TENANT-RUNTIME.md); that path reserves journal rows and streams bytes
+through the opt-in [local transfer backend](LOCAL-EVIDENCE.md) or [Bunny adapter](BUNNY-EVIDENCE.md).
+The API serves authorized journal-available objects and does not perform that Discord re-fetch.
+Backup-copy
+cleanup remains later work.
 
 ## Reservation and identity
 
@@ -88,7 +89,9 @@ or unbounded metadata blobs enter SQL. No age expiry, dependency, cache or task 
 Guild0006 adds the journal, three indexes and ownership/transition triggers. Fresh setup applies
 1–7; verified versions1–6 upgrade atomically without inventing attachments or PUT attempts.
 Open requires 8 after the erasure/settings extension. Rollback needs matching pre-upgrade
-database/binary. Core is at migration 0012. Discord attachment capture remains later work.
+database/binary. Core is at migration 0012. The bot captures proving attachments through
+tenant runtime as described above; the API does not perform that Discord re-fetch.
+Backup-copy cleanup remains later work.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
 races, scope denial, bounded closed cleanup/pages, SQL guards, cancellation/purge rollback

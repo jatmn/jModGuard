@@ -31,9 +31,11 @@ Evidence is explicitly unavailable or a bounded nonempty list of selected text e
 with channel/message/author IDs and original timestamps. Guild/membership ownership comes
 from the case. No attachment URLs, arbitrary object keys, downloads or external evidence
 references are accepted by `CaseData`. Separate [evidence ownership](CASE-EVIDENCE.md)
-now journals selected attachment reservations and cleanup. Discord attachment capture,
-backup-copy cleanup and private Storage integration remain disabled. Authorized serving of
-journal-available objects is implemented through [tenant runtime](TENANT-RUNTIME.md). Text evidence is a selected subset, not a completeness guarantee or general history.
+now journals selected attachment reservations and cleanup. The bot captures proving
+Discord attachments for selected image-spam enforcement through [tenant runtime](TENANT-RUNTIME.md).
+Backup-copy cleanup remains later work. The API serves authorized
+journal-available objects through [tenant runtime](TENANT-RUNTIME.md) and does not perform
+that Discord re-fetch. Text evidence is a selected subset, not a completeness guarantee or general history.
 Discord snowflake serialization reuses the existing string helpers.
 
 ## Operations and memory bounds
