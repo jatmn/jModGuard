@@ -215,6 +215,7 @@ impl PendingAuditLinks {
                 && audit.guild == link.guild
                 && audit.subject == link.subject
         }) {
+            self.audits.remove(&audit_token);
             return Some(PendingAuditReady {
                 link,
                 entry_id: audit.entry_id,
@@ -241,6 +242,7 @@ impl PendingAuditLinks {
         if let Some((application_token, link)) = Self::find_matching(&self.applications, |link| {
             link.action == action && link.guild == guild && link.subject == subject
         }) {
+            self.applications.remove(&application_token);
             return Some(PendingAuditReady {
                 link,
                 entry_id,
@@ -1004,15 +1006,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_audit_match_survives_until_durable_link() {
+    fn pending_audit_match_consumes_live_half() {
         let mut pending = PendingAuditLinks::default();
         pending.remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123);
         let first = pending.remember_application(dummy_link(20)).unwrap();
-        let second = pending.remember_application(dummy_link(20)).unwrap();
         assert_eq!(first.entry_id, 123);
-        assert_eq!(second.entry_id, 123);
-        pending.finalize_link(second.audit_token, second.application_token);
         assert!(pending.remember_application(dummy_link(20)).is_none());
+        let later = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 124)
+            .unwrap();
+        assert_eq!(later.entry_id, 124);
+        assert_ne!(later.link.case_id, first.link.case_id);
+        assert!(
+            pending
+                .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 125)
+                .is_none()
+        );
     }
 
     #[test]

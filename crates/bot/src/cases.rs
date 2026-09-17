@@ -545,6 +545,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_same_subject_dispatch_does_not_reuse_matched_audit() {
+        let (app, enrollment, path) = app_with_guild(10).await;
+        await_discord_audit(&app, 7, 7, CaseAction::Ban, 10, 99, 123).await;
+        let first = record_application(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            CaseOutcome::Succeeded,
+            99,
+            Some(42),
+            Some("ban".into()),
+            CaseEvidence::Unavailable,
+        )
+        .await
+        .unwrap();
+        let second = record_application(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            CaseOutcome::Succeeded,
+            99,
+            Some(42),
+            Some("ban".into()),
+            CaseEvidence::Unavailable,
+        )
+        .await
+        .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            linked(
+                &app,
+                enrollment.clone(),
+                CaseSource::DiscordAudit { entry_id: 123 }
+            )
+            .await
+            .as_ref(),
+            Some(&first)
+        );
+        await_discord_audit(&app, 7, 7, CaseAction::Ban, 10, 99, 124).await;
+        assert_eq!(
+            linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 124 })
+                .await
+                .as_ref(),
+            Some(&second)
+        );
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
     async fn deferred_audit_link_retries_after_live_scope_returns() {
         let (app, enrollment, path) = app_with_guild(10).await;
         await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 77).await;
