@@ -351,9 +351,13 @@ impl TenantRuntime {
         };
         match store.link_case_source(scope, case_id, anchor, source).await {
             Ok(result) => Ok(Some(result)),
-            Err(error) if skippable_live(&error) || error.downcast_ref::<CaseError>().is_some() => {
+            Err(error) if skippable_live(&error) => {
                 tracing::warn!(guild_id, "selected source not linked: {error:#}");
                 Ok(None)
+            }
+            Err(error) if error.downcast_ref::<CaseError>().is_some() => {
+                tracing::warn!(guild_id, "selected source not linked: {error:#}");
+                Err(error.context("selected source link conflict"))
             }
             Err(error) => Err(error),
         }

@@ -324,9 +324,10 @@ Single reads bound payload size, pages return references only. SQL triggers remo
 with parent payload removal or closed-case purge and roll back both on failure. No new
 library/task/recorder is enabled. See [history contracts](CASE-HISTORY.md).
 
-Trusted runtime source matching, permission/presentation, file evidence and complete
-lifecycle/backup cleanup remain pending. Corrections are observations, not inferred Discord
-success or automatic rewriting of effective state. Core remains10.
+Trusted runtime source matching beyond bot-owned in-process Ban/Unban/Kick (see
+Discord-audit source association below), permission/presentation, file evidence and
+complete lifecycle/backup cleanup remain pending. Corrections are observations, not inferred
+Discord success or automatic rewriting of effective state. Core remains10.
 
 ## Implemented: explicit case source association (wave 22)
 
@@ -389,9 +390,10 @@ now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-Live Bunny evidence zone privacy, backup-copy cleanup, Discord-audit source
-association, database credential hot-reload, writer leases and multi-replica
-sessions remain later work.
+Live Bunny evidence zone privacy, backup-copy cleanup, durable cross-restart
+Discord-audit reconciliation and dashboard presentation of linked sources,
+database credential hot-reload, writer leases and multi-replica sessions remain
+later work.
 
 Each slice must keep local tests runnable and record what is implemented versus pending.
 Live Bunny/Discord testing and deployment are deferred. Local tests do not establish

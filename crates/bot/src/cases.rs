@@ -53,28 +53,47 @@ fn pending_outcome(outcome: &CaseOutcome) -> bool {
     matches!(outcome, CaseOutcome::Succeeded | CaseOutcome::Uncertain)
 }
 
-async fn link_discord_audit(app: &BotState, link: crate::state::PendingAuditLink, entry_id: i64) {
-    if entry_id <= 0 {
+async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditReady) {
+    if ready.entry_id <= 0 {
         return;
     }
+    let link = ready.link;
+    let audit_token = ready.audit_token;
+    let application_token = ready.application_token;
+    let entry_id = ready.entry_id;
     match app
         .tenant
         .link_selected_source(
             link.enrollment,
-            link.case_id,
+            link.case_id.clone(),
             CaseSource::Application {
-                operation_id: link.operation_id,
+                operation_id: link.operation_id.clone(),
             },
             CaseSource::DiscordAudit { entry_id },
         )
         .await
     {
-        Ok(_) => {}
+        Ok(Some(_)) => {
+            app.finalize_pending_audit_link(audit_token, application_token);
+        }
+        Ok(None) => {
+            tracing::warn!(
+                guild_id = link.guild,
+                entry_id,
+                case_id = link.case_id.as_str(),
+                "selected discord audit link deferred; pending identity retained"
+            );
+        }
         Err(error) => {
             tracing::warn!(
                 guild_id = link.guild,
+                entry_id,
+                case_id = link.case_id.as_str(),
                 "selected discord audit not linked: {error:#}"
             );
+            if error.downcast_ref::<db::guild_data::CaseError>().is_some() {
+                app.finalize_pending_audit_link(audit_token, application_token);
+            }
         }
     }
 }
@@ -103,8 +122,8 @@ async fn remember_owned_application(
         operation_id,
         enrollment,
     };
-    if let Some(entry_id) = app.remember_application_audit(link.clone()) {
-        link_discord_audit(app, link, entry_id).await;
+    if let Some(ready) = app.remember_application_audit(link) {
+        link_discord_audit(app, ready).await;
     }
 }
 
@@ -186,8 +205,8 @@ pub async fn await_discord_audit(
     if executor != bot_user || !auditable_action(&action) || subject == 0 || entry_id <= 0 {
         return;
     }
-    if let Some(link) = app.remember_discord_audit(action, guild, subject, entry_id) {
-        link_discord_audit(app, link, entry_id).await;
+    if let Some(ready) = app.remember_discord_audit(action, guild, subject, entry_id) {
+        link_discord_audit(app, ready).await;
     }
 }
 

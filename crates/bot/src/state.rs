@@ -112,6 +112,15 @@ struct PendingDiscordAudit {
     entry_id: i64,
 }
 
+/// Application and audit halves matched in-memory but not yet durably linked.
+#[derive(Clone)]
+pub(crate) struct PendingAuditReady {
+    pub(crate) link: PendingAuditLink,
+    pub(crate) entry_id: i64,
+    pub(crate) audit_token: Option<u128>,
+    pub(crate) application_token: Option<u128>,
+}
+
 #[derive(Default)]
 struct PendingAuditLinks {
     next_token: u128,
@@ -136,27 +145,48 @@ impl PendingAuditLinks {
         }
     }
 
-    fn take_matching<T>(
-        entries: &mut HashMap<u128, (T, Instant)>,
+    fn find_matching<T: Clone>(
+        entries: &HashMap<u128, (T, Instant)>,
         matches: impl Fn(&T) -> bool,
-    ) -> Option<T> {
+    ) -> Option<(u128, T)> {
         let token = entries
             .iter()
             .filter(|(_, (value, _))| matches(value))
             .min_by_key(|(_, (_, expires))| *expires)
             .map(|(token, _)| *token)?;
-        entries.remove(&token).map(|(value, _)| value)
+        entries
+            .get(&token)
+            .map(|(value, _)| (token, value.clone()))
     }
 
-    fn remember_application(&mut self, link: PendingAuditLink) -> Option<i64> {
+    fn finalize_link(
+        &mut self,
+        audit_token: Option<u128>,
+        application_token: Option<u128>,
+    ) {
+        self.prune(Instant::now());
+        if let Some(token) = audit_token {
+            self.audits.remove(&token);
+        }
+        if let Some(token) = application_token {
+            self.applications.remove(&token);
+        }
+    }
+
+    fn remember_application(&mut self, link: PendingAuditLink) -> Option<PendingAuditReady> {
         let now = Instant::now();
         self.prune(now);
-        if let Some(audit) = Self::take_matching(&mut self.audits, |audit| {
+        if let Some((audit_token, audit)) = Self::find_matching(&self.audits, |audit| {
             audit.action == link.action
                 && audit.guild == link.guild
                 && audit.subject == link.subject
         }) {
-            return Some(audit.entry_id);
+            return Some(PendingAuditReady {
+                link,
+                entry_id: audit.entry_id,
+                audit_token: Some(audit_token),
+                application_token: None,
+            });
         }
         Self::cap(&mut self.applications);
         self.next_token += 1;
@@ -171,13 +201,18 @@ impl PendingAuditLinks {
         guild: u64,
         subject: u64,
         entry_id: i64,
-    ) -> Option<PendingAuditLink> {
+    ) -> Option<PendingAuditReady> {
         let now = Instant::now();
         self.prune(now);
-        if let Some(link) = Self::take_matching(&mut self.applications, |link| {
+        if let Some((application_token, link)) = Self::find_matching(&self.applications, |link| {
             link.action == action && link.guild == guild && link.subject == subject
         }) {
-            return Some(link);
+            return Some(PendingAuditReady {
+                link,
+                entry_id,
+                audit_token: None,
+                application_token: Some(application_token),
+            });
         }
         Self::cap(&mut self.audits);
         self.next_token += 1;
@@ -328,7 +363,10 @@ impl BotState {
             .remove(action, guild, user)
     }
 
-    pub(crate) fn remember_application_audit(&self, link: PendingAuditLink) -> Option<i64> {
+    pub(crate) fn remember_application_audit(
+        &self,
+        link: PendingAuditLink,
+    ) -> Option<PendingAuditReady> {
         self.pending_audit_links.lock().remember_application(link)
     }
 
@@ -338,10 +376,20 @@ impl BotState {
         guild: u64,
         subject: u64,
         entry_id: i64,
-    ) -> Option<PendingAuditLink> {
+    ) -> Option<PendingAuditReady> {
         self.pending_audit_links
             .lock()
             .remember_audit(action, guild, subject, entry_id)
+    }
+
+    pub(crate) fn finalize_pending_audit_link(
+        &self,
+        audit_token: Option<u128>,
+        application_token: Option<u128>,
+    ) {
+        self.pending_audit_links
+            .lock()
+            .finalize_link(audit_token, application_token);
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -868,10 +916,12 @@ mod tests {
         let second = dummy_link(20);
         assert!(pending.remember_application(first).is_none());
         assert!(pending.remember_application(second).is_none());
-        let linked = pending
+        let ready = pending
             .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123)
             .unwrap();
-        assert_eq!(linked.case_id, first_id);
+        assert_eq!(ready.link.case_id, first_id);
+        assert_eq!(ready.entry_id, 123);
+        pending.finalize_link(ready.audit_token, ready.application_token);
         assert!(
             pending
                 .remember_audit(crate::db::guild_data::CaseAction::Unban, 10, 20, 124)
@@ -890,7 +940,21 @@ mod tests {
         );
         let mut kick = dummy_link(20);
         kick.action = crate::db::guild_data::CaseAction::Kick;
-        assert_eq!(pending.remember_application(kick), Some(55));
+        let ready = pending.remember_application(kick).unwrap();
+        assert_eq!(ready.entry_id, 55);
+        pending.finalize_link(ready.audit_token, ready.application_token);
+        assert!(pending.remember_application(dummy_link(20)).is_none());
+    }
+
+    #[test]
+    fn pending_audit_match_survives_until_durable_link() {
+        let mut pending = PendingAuditLinks::default();
+        pending.remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123);
+        let first = pending.remember_application(dummy_link(20)).unwrap();
+        let second = pending.remember_application(dummy_link(20)).unwrap();
+        assert_eq!(first.entry_id, 123);
+        assert_eq!(second.entry_id, 123);
+        pending.finalize_link(second.audit_token, second.application_token);
         assert!(pending.remember_application(dummy_link(20)).is_none());
     }
 
