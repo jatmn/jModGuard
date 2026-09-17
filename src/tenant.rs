@@ -77,6 +77,47 @@ pub fn evidence_limits() -> EvidenceLimits {
     }
 }
 
+/// Admission plan for sequential case-evidence reservations matching
+/// `GuildDataStore::reserve_case_evidence` item, per-file, and per-case byte checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EvidenceCapturePlan {
+    pub admitted: Vec<usize>,
+    pub skipped_invalid: u32,
+    pub skipped_item_limit: u32,
+    pub skipped_byte_limit: u32,
+}
+
+pub fn plan_case_evidence_captures(
+    reserved_bytes: &[u64],
+    limits: EvidenceLimits,
+) -> EvidenceCapturePlan {
+    let _ = limits.validate();
+    let max_items = limits.max_items_per_case as usize;
+    let mut plan = EvidenceCapturePlan::default();
+    let mut case_bytes = 0u64;
+    for (index, bytes) in reserved_bytes.iter().enumerate() {
+        if *bytes == 0 || *bytes > limits.max_file_bytes {
+            plan.skipped_invalid += 1;
+            continue;
+        }
+        if plan.admitted.len() >= max_items {
+            plan.skipped_item_limit += 1;
+            continue;
+        }
+        let Some(sum) = case_bytes.checked_add(*bytes) else {
+            plan.skipped_byte_limit += 1;
+            continue;
+        };
+        if sum > limits.max_case_bytes {
+            plan.skipped_byte_limit += 1;
+            continue;
+        }
+        case_bytes = sum;
+        plan.admitted.push(index);
+    }
+    plan
+}
+
 /// Stable evidence identity for one Discord attachment origin. Retries of the
 /// same channel/message/attachment reuse this ID; it is not a random CaseId.
 pub fn attachment_evidence_id(origin: &EvidenceOrigin) -> Result<CaseId> {

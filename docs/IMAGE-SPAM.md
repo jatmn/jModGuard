@@ -69,8 +69,12 @@ credentials or retries) into a temporary file, then streams that file into the
 configured evidence backend. Capture uses a stable evidence ID derived from the
 channel/message/attachment origin so the same attachment retries the same identity.
 Existing reservations are not re-uploaded. Failures are logged and do not undo the
-delete or ban. A `none` backend skips capture. Process image budgets stay in
-`[image_spam]`; the capture batch shares the existing download timeout. Live Discord
+delete or ban. A `none` backend skips capture. Capture admission uses the same
+per-case `EvidenceLimits` as the guild evidence journal (currently eight items,
+eight mebibytes per file, and thirty-two mebibytes total per case on the bot
+path); proving files that cannot be admitted are skipped with a warning rather
+than attempted. Process image budgets stay in `[image_spam]`; the capture batch
+shares the existing download timeout. Live Discord
 CDN and Bunny zone privacy remain separate provider checks. Authorized dashboard
 serving of available objects is unchanged.
 

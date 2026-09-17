@@ -530,19 +530,41 @@ async fn capture_attachments(
     let budget = app.image_spam.download_timeout();
     let started = Instant::now();
     let limits = crate::tenant::evidence_limits();
-    let max_items = limits.max_items_per_case as usize;
-    let max_bytes = limits.max_file_bytes;
-    for item in attachments.iter().take(max_items) {
+    let sizes: Vec<u64> = attachments.iter().map(|item| item.file.size).collect();
+    let plan = crate::tenant::plan_case_evidence_captures(&sizes, limits);
+    if plan.skipped_invalid > 0
+        || plan.skipped_item_limit > 0
+        || plan.skipped_byte_limit > 0
+    {
+        tracing::warn!(
+            guild_id = enrollment.guild_id,
+            case_id = case_id.as_str(),
+            proving_total = attachments.len(),
+            capturing = plan.admitted.len(),
+            skipped_invalid = plan.skipped_invalid,
+            skipped_item_limit = plan.skipped_item_limit,
+            skipped_byte_limit = plan.skipped_byte_limit,
+            max_items_per_case = limits.max_items_per_case,
+            max_file_bytes = limits.max_file_bytes,
+            max_case_bytes = limits.max_case_bytes,
+            "proving attachment capture plan excludes files that cannot be admitted to case evidence"
+        );
+    }
+    let admitted_total = plan.admitted.len();
+    let mut captured = 0usize;
+    for index in plan.admitted {
+        let item = &attachments[index];
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             tracing::warn!(
                 guild_id = enrollment.guild_id,
+                case_id = case_id.as_str(),
+                proving_total = attachments.len(),
+                admitted = admitted_total,
+                captured_before_timeout = captured,
                 "attachment capture budget exhausted"
             );
             break;
-        }
-        if item.file.size == 0 || item.file.size > max_bytes {
-            continue;
         }
         let origin = crate::db::guild_data::EvidenceOrigin {
             channel_id: item.channel as i64,
@@ -579,6 +601,8 @@ async fn capture_attachments(
                 guild_id = enrollment.guild_id,
                 "attachment capture failed: {error:#}"
             );
+        } else {
+            captured += 1;
         }
     }
 }

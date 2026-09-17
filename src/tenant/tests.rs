@@ -1538,6 +1538,33 @@ async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
 }
 
 #[test]
+fn plan_case_evidence_captures_matches_journal_admission() {
+    let limits = evidence_limits();
+    let ten = vec![1u64; 10];
+    let plan = plan_case_evidence_captures(&ten, limits);
+    assert_eq!(plan.admitted.len(), 8);
+    assert_eq!(plan.skipped_item_limit, 2);
+    assert_eq!(plan.skipped_invalid, 0);
+    assert_eq!(plan.skipped_byte_limit, 0);
+
+    let oversize = vec![limits.max_file_bytes + 1];
+    let plan = plan_case_evidence_captures(&oversize, limits);
+    assert!(plan.admitted.is_empty());
+    assert_eq!(plan.skipped_invalid, 1);
+
+    let file = limits.max_file_bytes;
+    let four = vec![file, file, file, file];
+    let plan = plan_case_evidence_captures(&four, limits);
+    assert_eq!(plan.admitted.len(), 4);
+    assert_eq!(plan.skipped_byte_limit, 0);
+
+    let five = vec![file, file, file, file, file];
+    let plan = plan_case_evidence_captures(&five, limits);
+    assert_eq!(plan.admitted.len(), 4);
+    assert_eq!(plan.skipped_byte_limit, 1);
+}
+
+#[test]
 fn attachment_evidence_id_is_stable_and_origin_bound() {
     use crate::db::guild_data::EvidenceOrigin;
     let origin = EvidenceOrigin {
