@@ -53,6 +53,10 @@ fn pending_outcome(outcome: &CaseOutcome) -> bool {
     matches!(outcome, CaseOutcome::Succeeded | CaseOutcome::Uncertain)
 }
 
+fn durable_audit_link_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<db::guild_data::CaseError>().is_some()
+}
+
 async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditReady) {
     if ready.entry_id <= 0 {
         return;
@@ -82,7 +86,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
                 guild_id = link.guild,
                 entry_id,
                 case_id = link.case_id.as_str(),
-                "selected discord audit link deferred; pending identity retained"
+                "selected discord audit link deferred; pending identity quarantined"
             );
             app.defer_pending_audit_link(ready);
         }
@@ -93,9 +97,17 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
                 case_id = link.case_id.as_str(),
                 "selected discord audit not linked: {error:#}"
             );
-            if error.downcast_ref::<db::guild_data::CaseError>().is_some() {
+            if durable_audit_link_conflict(&error) {
                 app.finalize_pending_audit_link(audit_token, application_token);
                 app.clear_deferred_audit_link(&link.case_id, entry_id);
+            } else {
+                tracing::warn!(
+                    guild_id = link.guild,
+                    entry_id,
+                    case_id = link.case_id.as_str(),
+                    "selected discord audit link deferred after transient failure"
+                );
+                app.defer_pending_audit_link(ready);
             }
         }
     }
@@ -590,6 +602,138 @@ mod tests {
         retry_deferred_discord_audit_links(&app, Some(10)).await;
         assert_eq!(
             linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 77 })
+                .await
+                .as_ref(),
+            Some(&case_id)
+        );
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn transient_link_errors_retry_and_conflicts_do_not() {
+        assert!(!durable_audit_link_conflict(&anyhow::anyhow!(
+            "store unavailable"
+        )));
+        assert!(durable_audit_link_conflict(&anyhow::anyhow!(
+            db::guild_data::CaseError::Conflict
+        )));
+    }
+
+    #[tokio::test]
+    async fn deferred_audit_link_does_not_bind_a_later_same_subject_dispatch() {
+        let (app, enrollment, path) = app_with_guild(10).await;
+        await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 77).await;
+        let operation_id = CaseId::new();
+        let data = CaseData {
+            source: CaseSource::Application {
+                operation_id: operation_id.clone(),
+            },
+            action: CaseAction::Kick,
+            outcome: CaseOutcome::Succeeded,
+            subject_id: 99,
+            actor_id: Some(42),
+            occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+            reason: Some("first".into()),
+            evidence: CaseEvidence::Unavailable,
+        };
+        let first = record(
+            &app,
+            Some(enrollment.clone()),
+            data.action.clone(),
+            data.outcome.clone(),
+            99,
+            Some(42),
+            data.reason.clone(),
+            data.evidence.clone(),
+            data.source.clone(),
+        )
+        .await
+        .unwrap();
+        let destination = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &app.db,
+            destination.clone(),
+            db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+        )
+        .await
+        .unwrap();
+        let generation = db::guild_stores::set_guild_write_fence(
+            &app.db,
+            10,
+            destination,
+            format!("{:032x}", 9u128),
+            "freeze",
+        )
+        .await
+        .unwrap();
+        remember_recorded_application(&app, enrollment.clone(), &data, first.clone()).await;
+        assert!(
+            !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
+            "expected a deferred audit link while the guild store is fenced"
+        );
+        db::guild_stores::clear_guild_write_fence(&app.db, 10, &generation)
+            .await
+            .unwrap();
+        let second = record_application(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Kick,
+            CaseOutcome::Succeeded,
+            99,
+            Some(42),
+            Some("second".into()),
+            CaseEvidence::Unavailable,
+        )
+        .await
+        .unwrap();
+        await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 78).await;
+        retry_deferred_discord_audit_links(&app, Some(10)).await;
+        assert_ne!(first, second);
+        assert_eq!(
+            linked(
+                &app,
+                enrollment.clone(),
+                CaseSource::DiscordAudit { entry_id: 77 }
+            )
+            .await
+            .as_ref(),
+            Some(&first)
+        );
+        assert_eq!(
+            linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 78 })
+                .await
+                .as_ref(),
+            Some(&second)
+        );
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn uncertain_ban_keeps_gateway_suppression_and_links_audit() {
+        let (app, enrollment, path) = app_with_guild(10).await;
+        let _suppression =
+            app.suppress_next_gateway_case(crate::state::GatewayCaseAction::Ban, 10, 99);
+        let case_id = record_application(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            CaseOutcome::Uncertain,
+            99,
+            Some(42),
+            Some("timeout".into()),
+            CaseEvidence::Unavailable,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.consume_gateway_case_suppression(crate::state::GatewayCaseAction::Ban, 10, 99),
+            "uncertain bot-owned bans must keep the gateway echo suppression"
+        );
+        await_discord_audit(&app, 7, 7, CaseAction::Ban, 10, 99, 11).await;
+        assert_eq!(
+            linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 11 })
                 .await
                 .as_ref(),
             Some(&case_id)

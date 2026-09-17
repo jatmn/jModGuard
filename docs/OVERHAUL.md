@@ -528,8 +528,10 @@ Bot-owned Ban, Unban and Kick now bind a Discord audit counterpart onto the
 application case they already recorded. The bot remembers the dispatch's own
 application identity in-process (same 30s/4096 bound as gateway-case
 suppression) and consumes `GUILD_AUDIT_LOG_ENTRY_CREATE` only when the executor
-is this bot and the action/guild/subject match that pending identity. Audit
-events may arrive before the case row; unmarked gateway BAN_ADD/REMOVE records
+is this bot and the action/guild/subject match that pending identity. A matched pair
+that cannot durably link yet is quarantined onto the deferred retry queue, including
+transient store errors; later same-subject dispatches cannot reuse those halves.
+Audit events may arrive before the case row; unmarked gateway BAN_ADD/REMOVE records
 do not steal those pending links. Failed outcomes, timeouts, foreign executors
 and missing `VIEW_AUDIT_LOG` leave application-only cases. This does not search
 cases by subject or time, merge records, or change image-spam attachment

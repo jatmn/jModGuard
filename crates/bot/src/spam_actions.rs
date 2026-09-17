@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(90);
 
+fn release_gateway_ban_suppression(outcome: &CaseOutcome) -> bool {
+    matches!(outcome, CaseOutcome::Failed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Image,
@@ -421,7 +425,7 @@ async fn enforce(
             now,
             matches!(outcome, CaseOutcome::Succeeded),
         );
-        if matches!(outcome, CaseOutcome::Failed | CaseOutcome::Uncertain) {
+        if release_gateway_ban_suppression(&outcome) {
             app.release_gateway_case_suppression(suppression);
         }
         if matches!(outcome, CaseOutcome::Succeeded) {
@@ -655,5 +659,12 @@ mod tests {
         assert!(gate.claim_ban(1, 2, now));
         gate.finish_ban(1, 2, now, true);
         assert!(!gate.claim_ban(1, 2, now));
+    }
+
+    #[test]
+    fn uncertain_ban_keeps_gateway_suppression() {
+        assert!(!release_gateway_ban_suppression(&CaseOutcome::Succeeded));
+        assert!(!release_gateway_ban_suppression(&CaseOutcome::Uncertain));
+        assert!(release_gateway_ban_suppression(&CaseOutcome::Failed));
     }
 }

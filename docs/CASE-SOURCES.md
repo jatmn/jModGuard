@@ -44,8 +44,10 @@ A producer should resolve the source and append permitted selected context throu
 library does not infer a final outcome from a successful link or automatically append history.
 Linking and appending are separate idempotent operations; a producer must survive a crash
 between them without losing required follow-up work. The bot's in-process pending identity
-covers the short Gateway race for bot-owned Ban/Unban/Kick. Durable cross-restart
-reconciliation remains pending.
+covers the short Gateway race for bot-owned Ban/Unban/Kick. A matched pair that cannot
+durably link yet (skippable live scope or a transient store error) is quarantined onto
+the deferred retry queue so a later same-subject dispatch cannot reuse those halves.
+Storage conflicts drop the pair. Durable cross-restart reconciliation remains pending.
 
 If one producer records a new case while another links that source elsewhere, only one
 claim of the source can succeed. The loser receives a conflict and must reconcile through
@@ -95,5 +97,5 @@ upgrade regressions remain. Disposable libSQL exercises lost commit responses fo
 creation/linking, removed-parent linking, removal and cleanup, plus cross-handle visibility.
 No live Discord/Bunny proof, resource measurement, runtime permission enforcement or
 complete tenant isolation is claimed. Local tests cover bot-owned audit association,
-foreign executors, unmarked gateway records, failed/timeout skips and audit-before-record
-races. Missing `VIEW_AUDIT_LOG` leaves application-only cases.
+foreign executors, unmarked gateway records, failed/timeout skips, audit-before-record
+races, deferred-pair quarantine, and transient link retry. Missing `VIEW_AUDIT_LOG` leaves application-only cases.

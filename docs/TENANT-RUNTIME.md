@@ -47,6 +47,8 @@ when `GUILD_AUDIT_LOG_ENTRY_CREATE` reports this bot as executor and an in-proce
 pending application identity matches the same action, guild and subject. That is the
 dispatch's own source identity, not a subject/time search. `TenantRuntime::link_selected_source`
 performs the durable association using the recorded application anchor.
+A matched pair deferred by skippable live scope or a transient store error stays
+quarantined until retry; a later same-subject dispatch cannot reuse those halves.
 Missing `VIEW_AUDIT_LOG`,
 expired pending links and unmarked gateway cases stay application-sourced. Timeout is
 not associated (member-update audits are too generic). Ordinary

@@ -139,6 +139,7 @@ impl PendingAuditLinks {
     fn defer_link(&mut self, ready: PendingAuditReady) {
         let now = Instant::now();
         self.prune(now);
+        self.finalize_link(ready.audit_token, ready.application_token);
         if self.deferred_links.iter().any(|(existing, _)| {
             existing.entry_id == ready.entry_id && existing.link.case_id == ready.link.case_id
         }) {
@@ -149,9 +150,8 @@ impl PendingAuditLinks {
     }
 
     fn clear_deferred_link(&mut self, case_id: &crate::db::guild_data::CaseId, entry_id: i64) {
-        self.deferred_links.retain(|(ready, _)| {
-            ready.entry_id != entry_id || ready.link.case_id != *case_id
-        });
+        self.deferred_links
+            .retain(|(ready, _)| ready.entry_id != entry_id || ready.link.case_id != *case_id);
     }
 
     fn deferred_links_for_guild(&mut self, guild: Option<u64>) -> Vec<PendingAuditReady> {
@@ -184,16 +184,10 @@ impl PendingAuditLinks {
             .filter(|(_, (value, _))| matches(value))
             .min_by_key(|(_, (_, expires))| *expires)
             .map(|(token, _)| *token)?;
-        entries
-            .get(&token)
-            .map(|(value, _)| (token, value.clone()))
+        entries.get(&token).map(|(value, _)| (token, value.clone()))
     }
 
-    fn finalize_link(
-        &mut self,
-        audit_token: Option<u128>,
-        application_token: Option<u128>,
-    ) {
+    fn finalize_link(&mut self, audit_token: Option<u128>, application_token: Option<u128>) {
         self.prune(Instant::now());
         if let Some(token) = audit_token {
             self.audits.remove(&token);
@@ -436,8 +430,13 @@ impl BotState {
             .clear_deferred_link(case_id, entry_id);
     }
 
-    pub(crate) fn deferred_audit_links_for_guild(&self, guild: Option<u64>) -> Vec<PendingAuditReady> {
-        self.pending_audit_links.lock().deferred_links_for_guild(guild)
+    pub(crate) fn deferred_audit_links_for_guild(
+        &self,
+        guild: Option<u64>,
+    ) -> Vec<PendingAuditReady> {
+        self.pending_audit_links
+            .lock()
+            .deferred_links_for_guild(guild)
     }
 
     /// Invalidates the config cache (call after any config write).
@@ -1004,6 +1003,21 @@ mod tests {
         assert_eq!(second.entry_id, 123);
         pending.finalize_link(second.audit_token, second.application_token);
         assert!(pending.remember_application(dummy_link(20)).is_none());
+    }
+
+    #[test]
+    fn deferred_audit_pair_is_quarantined_from_live_maps() {
+        let mut pending = PendingAuditLinks::default();
+        pending.remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 123);
+        let first = pending.remember_application(dummy_link(20)).unwrap();
+        let first_id = first.link.case_id.clone();
+        pending.defer_link(first);
+        assert!(pending.remember_application(dummy_link(20)).is_none());
+        let later = pending
+            .remember_audit(crate::db::guild_data::CaseAction::Ban, 10, 20, 124)
+            .unwrap();
+        assert_ne!(later.link.case_id, first_id);
+        assert_eq!(later.entry_id, 124);
     }
 
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
