@@ -69,7 +69,7 @@ and requires captured administrative queue access.
 
 ## HTTP and browser contract
 
-`GET /api/guilds/{id}/config` returns `enrollment_id` alongside the configuration. For a
+`GET` or `POST /api/guilds/{id}/config` returns `enrollment_id` alongside the configuration. For a
 nonzero guild path, configuration mutations and the individual reads below must send it as
 `x-jmodguard-enrollment`. The initial `/config` request obtains that token without requiring one.
 The token identifies the page's bot membership; it grants no permissions and is not a

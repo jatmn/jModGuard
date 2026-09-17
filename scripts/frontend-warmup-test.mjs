@@ -57,6 +57,22 @@ test("isOriginStarting retries proxy and network failures until axum answers", (
   assert.equal(isOriginStarting(apiError("rate limited", 503, 0)), false);
 });
 
+test("waitForApiMe bootstraps with POST /api/me", async () => {
+  let method;
+  const fetchImpl = async (url, opts) => {
+    method = opts && opts.method;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
+    };
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl);
+  await waitForApiMe();
+  assert.equal(method, "POST");
+});
+
 test("waitForApiMe does not retry application JSON 503", async () => {
   let calls = 0;
   const fetchImpl = async () => {

@@ -100,7 +100,9 @@ async function handleEvent(node, handler, event) {
       await result;
       if (!node.isConnected) retainDrafts(guildId, tab, drafts, enrollmentId);
     }
-  } catch (e) { toast(e.message || String(e), "error"); }
+  } catch (e) {
+    reportApiError(e);
+  }
   finally { if (busy) setBusy(false); }
 }
 function navigate(tab) {
@@ -204,6 +206,21 @@ function isUnauthenticated(err) {
   return err.status === 401 || msg.includes("not authenticated") || msg === "session expired" || msg.includes("401");
 }
 
+/** Cached GET /api/me must not keep a write UI after the session is gone. */
+function handleAuthLoss(error) {
+  if (!isUnauthenticated(error)) return false;
+  if (currentPreviewToken()) {
+    showPreviewUnavailable();
+    return true;
+  }
+  showView("login-view");
+  return true;
+}
+
+function reportApiError(error) {
+  if (!handleAuthLoss(error)) toast(error.message || String(error), "error");
+}
+
 /** Pre-axum JSON warmup, not arbitrary proxy/origin 503s. */
 function isApiWarmup(err) {
   return err.status === 503 && String(err && err.message) === "not ready";
@@ -274,13 +291,27 @@ function pageEnrollment(path, method = "GET") {
   return null;
 }
 
-async function api(path, method = "GET", body = null, signal) {
+function credentialedOpts(path, method) {
   // credentials: include so cross-origin CDN SPA (JMODGUARD_API_BASE) sends the session cookie.
   const opts = { method, headers: {}, credentials: "include", cache: "no-store" };
   const enrollment = pageEnrollment(path, method);
   if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
   const preview = currentPreviewToken();
   if (preview) opts.headers["x-jmodguard-preview"] = preview;
+  return opts;
+}
+
+function throwApiFailure(data, status, retryAfterMs) {
+  const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `HTTP ${status}`;
+  const error = apiError(msg, status, retryAfterMs);
+  error.code = data && data.code;
+  handlePreviewError(error);
+  handleAuthLoss(error);
+  throw error;
+}
+
+async function api(path, method = "GET", body = null, signal) {
+  const opts = credentialedOpts(path, method);
   const controller = signal ? null : new AbortController();
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   opts.signal = signal || controller.signal;
@@ -290,13 +321,7 @@ async function api(path, method = "GET", body = null, signal) {
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
-    if (!res.ok) {
-      const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
-      const error = apiError(msg, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
-      error.code = data && data.code;
-      handlePreviewError(error);
-      throw error;
-    }
+    if (!res.ok) throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
     return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
@@ -306,25 +331,18 @@ async function api(path, method = "GET", body = null, signal) {
   } finally { if (timeout !== null) clearTimeout(timeout); }
 }
 
+/** Workspace JSON reads use POST so a CDN cannot reuse a cached GET. */
+function apiRead(path, signal) {
+  return api(path, "POST", null, signal);
+}
+
 async function downloadPrivate(path, filename) {
-  const opts = { method: "GET", headers: {}, credentials: "include", cache: "no-store" };
-  const enrollment = pageEnrollment(path, "GET");
-  if (enrollment) opts.headers["x-jmodguard-enrollment"] = enrollment;
-  const preview = currentPreviewToken();
-  if (preview) opts.headers["x-jmodguard-preview"] = preview;
+  const opts = credentialedOpts(path, "GET");
   const res = await fetch(apiUrl(path), opts);
   if (!res.ok) {
-    let message = `HTTP ${res.status}`;
-    let code = null;
-    try {
-      const data = JSON.parse(await res.text());
-      if (data && data.error) message = data.error;
-      code = data && data.code;
-    } catch (_) {}
-    const error = apiError(message, res.status);
-    error.code = code;
-    handlePreviewError(error);
-    throw error;
+    let data = null;
+    try { data = JSON.parse(await res.text()); } catch (_) {}
+    throwApiFailure(data, res.status);
   }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -410,7 +428,7 @@ async function waitForApiMe() {
       ORIGIN_REACHABILITY_BUDGET_MS,
     );
     try {
-      const me = await api("/api/me", "GET", null, controller.signal);
+      const me = await apiRead("/api/me", controller.signal);
       return me;
     } catch (e) {
       if (!isOriginStarting(e)) throw e;
@@ -481,9 +499,8 @@ async function init() {
     renderTab();
     bindOwnerTools();
   } catch (e) {
-    if (isUnauthenticated(e)) {
-      if (currentPreviewToken()) showPreviewUnavailable();
-      else showView("login-view");
+    if (handleAuthLoss(e)) {
+      /* Login / preview-unavailable view already shown. */
     } else {
       showView("startup-view");
       setStartupStatus("Failed to load: " + (e.message || String(e)));
@@ -500,7 +517,7 @@ async function loadConfig() {
   state.error = null;
   if (!state.config) renderTab();
   try {
-    const config = await api(`/api/guilds/${guildId}/config`);
+    const config = await apiRead(`/api/guilds/${guildId}/config`);
     if (request !== configRequest || guildId !== state.guildId) return;
     if (state.config && state.config.enrollment_id !== config.enrollment_id) {
       pendingDrafts = null;
@@ -511,6 +528,7 @@ async function loadConfig() {
     return true;
   } catch (e) {
     if (request !== configRequest || guildId !== state.guildId) return;
+    if (handleAuthLoss(e)) return;
     state.config = null;
     state.error = e.message || String(e);
     toast("Could not refresh configuration: " + state.error, "error");
@@ -881,12 +899,31 @@ function editRule(r) {
   return modal;
 }
 
+/** Discord snowflake from mention, channel URL, or raw digits. Never Number(). */
+function parseSnowflake(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "";
+  const mention = text.match(/^<(?:#|@!?|@&)(\d+)>$/);
+  if (mention) return mention[1];
+  const url = text.match(/discord(?:app)?\.com\/channels\/\d+\/(\d+)/i);
+  if (url) return url[1];
+  return /^\d+$/.test(text) ? text : "";
+}
+
 function splitIds(s) {
-  // Keep Discord snowflakes as digit strings — never Number() (precision loss above 2^53−1).
   return String(s ?? "")
     .split(",")
-    .map((x) => x.trim())
-    .filter((x) => /^\d+$/.test(x));
+    .map((x) => parseSnowflake(x.trim()))
+    .filter(Boolean);
+}
+
+function applyPlanStepInput(step, type, raw) {
+  if (type === "reply" || type === "dm" || type === "log") step.template = raw;
+  else if (type === "add_role" || type === "remove_role") step.role_id = parseSnowflake(raw);
+  else if (type === "timeout") step.minutes = Number(raw) || 1;
+  else if (type === "ban") step.delete_days = Math.min(7, Math.max(0, Number(raw) || 0));
+  else if (type === "react") step.emoji = raw;
+  else if (type === "wait") step.secs = Math.max(1, Number(raw) || 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,12 +1086,7 @@ function editCommand(c) {
       type.onchange = () => {
         const t = type.value;
         const n = { type: t };
-        if (t === "reply" || t === "dm" || t === "log") n.template = field.value;
-        if (t === "add_role" || t === "remove_role") n.role_id = String(field.value || "").trim();
-        if (t === "timeout") n.minutes = Number(field.value) || 1;
-        if (t === "ban") n.delete_days = Math.min(7, Math.max(0, Number(field.value) || 0));
-        if (t === "react") n.emoji = field.value;
-        if (t === "wait") n.secs = Math.max(1, Number(field.value) || 1);
+        applyPlanStepInput(n, t, field.value);
         if (t === "log") n.event = "plan_executed";
         steps[i] = n;
         syncPlanJson();
@@ -1062,13 +1094,7 @@ function editCommand(c) {
         field.value = field.placeholder === "…" ? "" : String(n.template ?? n.role_id ?? n.minutes ?? n.delete_days ?? n.emoji ?? n.secs ?? "");
       };
       field.onchange = () => {
-        const t = steps[i].type;
-        if (t === "reply" || t === "dm" || t === "log") steps[i].template = field.value;
-        if (t === "add_role" || t === "remove_role") steps[i].role_id = String(field.value || "").trim();
-        if (t === "timeout") steps[i].minutes = Number(field.value) || 1;
-        if (t === "ban") steps[i].delete_days = Math.min(7, Math.max(0, Number(field.value) || 0));
-        if (t === "react") steps[i].emoji = field.value;
-        if (t === "wait") steps[i].secs = Math.max(1, Number(field.value) || 1);
+        applyPlanStepInput(steps[i], steps[i].type, field.value);
         syncPlanJson();
       };
       stepsBox.append(el("div", { class: "step-card" },
@@ -1156,8 +1182,9 @@ function editCommand(c) {
         if (isPlan) {
           const steps = (data.behavior.params && data.behavior.params.steps) || [];
           for (const s of steps) {
-            if ((s.type === "add_role" || s.type === "remove_role") && !String(s.role_id || "").trim()) {
-              return toast("Role steps need a role id", "error");
+            if (s.type === "add_role" || s.type === "remove_role") {
+              s.role_id = parseSnowflake(s.role_id);
+              if (!s.role_id) return toast("Role steps need a role id", "error");
             }
           }
         }
@@ -1256,7 +1283,7 @@ function tabLogChannels() {
       if (await loadConfig()) renderTab();
     } }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Each event type routes to a channel in this server. Enter a channel ID or mention (<#id>). Changes are queued for bot validation; check Bot actions for results, then refresh this page."),
+      "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes are queued for bot validation; check Bot actions for results, then refresh this page."),
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
       const scopeSel = scopeSelect("This server", "Global", false);
@@ -1264,8 +1291,8 @@ function tabLogChannels() {
         el("label", { style: "width:180px", text: lc.event }),
         input, scopeSel,
         el("button", { class: "btn small primary", text: "Set", onclick: async () => {
-          const v = input.value.trim().replace(/[<#>]/g, "");
-          if (!v) return toast("Enter a channel id", "error");
+          const v = parseSnowflake(input.value);
+          if (!v) return toast("Enter a Discord channel ID, <#id> mention, or channel URL", "error");
           await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
         } }),
         el("button", { class: "btn small", text: "Clear", onclick: async () => {
@@ -1317,7 +1344,7 @@ function tabEvents() {
   };
   typeSel.onchange = run;
   userIn.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
-  run().catch((e) => toast(e.message, "error"));
+  run().catch((e) => reportApiError(e));
   return el("div", {},
     el("h2", { text: "Audit log" }),
     el("div", { class: "row", style: "margin-bottom:12px" }, typeSel, userIn, el("button", { class: "btn", text: "Refresh", onclick: run })),
@@ -1348,7 +1375,7 @@ function tabBans() {
           try {
             await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
           } catch (e) {
-            toast(e.message || String(e), "error");
+            reportApiError(e);
           }
         } }) : null),
       )));
@@ -1357,7 +1384,7 @@ function tabBans() {
       tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
     }
   };
-  run().catch((e) => toast(e.message, "error"));
+  run().catch((e) => reportApiError(e));
   return el("div", {},
     el("h2", { text: "Bans" }),
     el("p", { class: "muted", style: "margin-bottom:12px" }, "Bans performed by the bot (automod + commands). Request an unban here or unban in Discord. Check Bot actions for queued results."),
@@ -1465,7 +1492,7 @@ function tabCases() {
               ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
               : "Case record removed", "success");
             renderTab();
-          } catch (e) { toast(e.message || String(e), "error"); }
+          } catch (e) { reportApiError(e); }
         } }) : null,
         el("h3", { text: "History" }),
         ...(history.history || []).map((entry) => el("p", { class: "muted", text: JSON.stringify(entry.entry.body) })),
@@ -1482,7 +1509,7 @@ function tabCases() {
               noteIntent = null;
               toast("Note added", "success");
               await openCase(id);
-            } catch (e) { toast(e.message || String(e), "error"); }
+            } catch (e) { reportApiError(e); }
             finally { notePending = false; }
           } })),
         el("h3", { text: "Private evidence" }),
@@ -1492,7 +1519,7 @@ function tabCases() {
         ...(evidence.evidence || []).map((item) => el("p", {},
           el("button", { class: "btn small", type: "button", text: `Download ${item.id}`, onclick: async () => {
             try { await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id); }
-            catch (e) { toast(e.message || String(e), "error"); }
+            catch (e) { reportApiError(e); }
           } }))),
       );
     } catch (e) {
@@ -1528,7 +1555,7 @@ function tabCases() {
               try {
                 const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
                 toast(result.cleanup_pending ? "Cleanup is pending. Retry when storage is available." : "Live record cleanup complete. This does not delete backup copies.", "success");
-              } catch (e) { toast(e.message || String(e), "error"); }
+              } catch (e) { reportApiError(e); }
             } }))));
           continue;
         }
@@ -1569,11 +1596,13 @@ function tabSettings() {
     const guildId = srcSel.value;
     if (!guildId) return;
     try {
-      const source = await api(`/api/guilds/${guildId}/config`);
+      const source = await apiRead(`/api/guilds/${guildId}/config`);
       if (srcSel.value === guildId && source.enrollment_id) {
         sourceEnrollment = { guildId, id: source.enrollment_id };
       }
-    } catch (e) { toast("Could not load source server: " + e.message, "error"); }
+    } catch (e) {
+      reportApiError(e);
+    }
   } },
     el("option", { value: "", text: "Select a source server" }),
     ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => el("option", { value: g.id, text: g.name })),
@@ -1592,7 +1621,7 @@ function tabSettings() {
       toast(`Using global ${field.replaceAll("_", " ")}`, "success");
       renderTab();
     } catch (e) {
-      toast(e.message || String(e), "error");
+      reportApiError(e);
     }
   }
 
@@ -1667,7 +1696,7 @@ function tabSettings() {
           toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success");
           renderTab();
         } catch (e) {
-          toast(e.message || String(e), "error");
+          reportApiError(e);
         }
       } }),
       el("button", { class: "btn", text: "Re-sync Discord nickname", savedInputs: [], onclick: async () => {
@@ -1679,15 +1708,15 @@ function tabSettings() {
           toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success");
           renderTab();
         } catch (e) {
-          toast(e.message || String(e), "error");
+          reportApiError(e);
         }
       } }),
     ),
   ];
 
-  const roleInput = el("input", { type: "text", placeholder: "Role IDs, comma-separated" });
+  const roleInput = el("input", { type: "text", placeholder: "role id, <@&id> mention, comma-separated" });
   const roleRevision = { value: "" };
-  api(`/api/guilds/${state.guildId}/case-delete-roles`).then((roles) => {
+  apiRead(`/api/guilds/${state.guildId}/case-delete-roles`).then((roles) => {
     roleInput.value = (roles.roles || []).join(", ");
     roleRevision.value = roles.revision || "";
   }).catch(() => {});
@@ -1697,11 +1726,11 @@ function tabSettings() {
     el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
     el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
       try {
-        const roles = roleInput.value.split(",").map((s) => s.trim()).filter(Boolean);
+        const roles = splitIds(roleInput.value);
         const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles, revision: roleRevision.value });
         roleRevision.value = saved.revision;
         toast("Case-removal roles saved", "success");
-      } catch (e) { toast(e.message || String(e), "error"); }
+      } catch (e) { reportApiError(e); }
     } }),
   ));
 
@@ -1724,7 +1753,7 @@ function tabSettings() {
             toast("Global prefix saved", "success");
             renderTab();
           } catch (e) {
-            toast(e.message || String(e), "error");
+            reportApiError(e);
           }
         } }),
       ),
@@ -1756,7 +1785,7 @@ function tabSettings() {
             toast(msg, (res.skipped_badwords > 0 || res.skipped_logchannels) ? "info" : "success");
             renderTab();
           } catch (e) {
-            toast(e.message || String(e), "error");
+            reportApiError(e);
           }
         } }),
       ),

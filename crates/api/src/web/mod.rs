@@ -7,10 +7,10 @@ pub mod preview;
 pub mod state;
 
 use axum::extract::Query;
-use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, MethodRouter};
 use axum::{Json, Router};
 use std::sync::Arc;
 use tower_sessions::cookie::time::Duration as CookieDuration;
@@ -31,6 +31,10 @@ const COOKIE_OAUTH_RETURN_TO: &str = "jmodguard_oauth_return_to";
 const SESSION_COOKIE_NAME: &str = "jmodguard_session";
 const OAUTH_COOKIE_MAX_AGE: CookieDuration = CookieDuration::minutes(10);
 const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
+/// Bunny (and other CDNs) honor this independently of browser Cache-Control.
+const CDN_CACHE_CONTROL: HeaderName = HeaderName::from_static("cdn-cache-control");
+const CDN_NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
+const VARY_COOKIE: HeaderValue = HeaderValue::from_static("Cookie");
 
 // ---------------------------------------------------------------------------
 // errors
@@ -688,7 +692,11 @@ async fn index() -> impl IntoResponse {
 async fn health() -> impl IntoResponse {
     (
         axum::http::StatusCode::OK,
-        [(CACHE_CONTROL, NO_STORE)],
+        [
+            (CACHE_CONTROL, NO_STORE),
+            (CDN_CACHE_CONTROL, CDN_NO_STORE),
+            (VARY, VARY_COOKIE),
+        ],
         "ok",
     )
 }
@@ -720,6 +728,16 @@ fn session_same_site(cross_origin: bool, secure: bool) -> tower_sessions::cookie
     } else {
         tower_sessions::cookie::SameSite::Lax
     }
+}
+
+/// GET remains for older clients; POST is the SPA read so CDNs cannot reuse GET cache.
+fn get_post<H, T, S>(handler: H) -> MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S> + Clone,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    get(handler.clone()).post(handler)
 }
 
 pub fn router(app: Arc<ApiState>) -> Router {
@@ -778,12 +796,12 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/login", get(login))
         .route("/logout", axum::routing::post(logout))
         .route("/oauth/callback", get(callback))
-        .route("/api/me", get(api_me))
+        .route("/api/me", get_post(api_me))
         .route(
             "/api/preview",
             axum::routing::post(preview::launch).delete(preview::exit),
         )
-        .route("/api/guilds/{guild_id}/config", get(api::guild_config))
+        .route("/api/guilds/{guild_id}/config", get_post(api::guild_config))
         .route(
             "/api/guilds/{guild_id}/settings",
             axum::routing::put(api::update_settings),
@@ -868,7 +886,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         )
         .route(
             "/api/guilds/{guild_id}/case-delete-roles",
-            get(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
+            get_post(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
         )
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(
@@ -878,6 +896,14 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,
             NO_STORE,
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            CDN_CACHE_CONTROL,
+            CDN_NO_STORE,
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            VARY,
+            VARY_COOKIE,
         ));
 
     // CORS is a browser credential policy for the SPA/API. Process liveness
@@ -1189,31 +1215,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
-            Some(NO_STORE.as_bytes())
-        );
+        assert_uncacheable_headers(res.headers());
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    fn assert_uncacheable_headers(headers: &HeaderMap) {
+        assert_eq!(
+            headers.get(CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(NO_STORE.as_bytes()),
+            "credentialed API JSON must not be browser-cacheable"
+        );
+        assert_eq!(
+            headers.get(CDN_CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(CDN_NO_STORE.as_bytes()),
+            "credentialed API JSON must send CDN-Cache-Control: no-store"
+        );
+        assert_eq!(
+            headers.get(VARY).map(|v| v.as_bytes()),
+            Some(VARY_COOKIE.as_bytes()),
+            "credentialed API JSON must vary CDN caches by Cookie"
+        );
+    }
+
+    async fn assert_unauthenticated(app: Router, method: &str, uri: &str, body: &str) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let req_body = if body.is_empty() {
+            Body::empty()
+        } else {
+            builder = builder.header("content-type", "application/json");
+            Body::from(body.to_owned())
+        };
+        let res = app
+            .oneshot(builder.body(req_body).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_uncacheable_headers(res.headers());
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "not authenticated", "{method} {uri}");
     }
 
     #[tokio::test]
     async fn api_me_sets_no_store_cache_control() {
         let app = test_app();
+        for method in ["GET", "POST"] {
+            assert_unauthenticated(app.clone(), method, "/api/me", "").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_settings_paths_are_not_authenticated() {
+        let app = test_app();
+        let cases: &[(&str, &str, &str)] = &[
+            ("POST", "/api/guilds/1273405807861694557/config", ""),
+            ("GET", "/api/guilds/1273405807861694557/config", ""),
+            (
+                "PUT",
+                "/api/guilds/1273405807861694557/settings",
+                r#"{"prefix":"!"}"#,
+            ),
+            (
+                "POST",
+                "/api/guilds/1273405807861694557/case-delete-roles",
+                "",
+            ),
+            (
+                "PUT",
+                "/api/guilds/1273405807861694557/case-delete-roles",
+                r#"{"roles":[],"revision":""}"#,
+            ),
+            (
+                "POST",
+                "/api/guilds/1273405807861694557/copy",
+                r#"{"from_guild_id":"271083998816632834","from_enrollment_id":"x","sections":["settings"]}"#,
+            ),
+            (
+                "PUT",
+                "/api/guilds/1273405807861694557/logchannels/member_join",
+                r#"{"request_id":"1758140000_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","scope":"guild","channel_id":"123"}"#,
+            ),
+        ];
+        for (method, uri, body) in cases {
+            assert_unauthenticated(app.clone(), method, uri, body).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn logchannel_put_rejects_non_snowflake_channel_id() {
+        let app = test_app();
         let res = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/me")
-                    .body(Body::empty())
+                    .method("PUT")
+                    .uri("/api/guilds/271083998816632834/logchannels/member_join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"request_id":"1758140000_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","channel_id":"general"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(
-            res.headers().get(CACHE_CONTROL).map(|v| v.as_bytes()),
-            Some(NO_STORE.as_bytes()),
-            "credentialed API JSON must not be CDN-cacheable"
-        );
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_uncacheable_headers(res.headers());
     }
 
     #[tokio::test]
