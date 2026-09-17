@@ -26,7 +26,8 @@ two records, the operation fails. Callers must retain the original source and pa
 retries. [Explicit source association](CASE-SOURCES.md) can now bind an application ID and
 Discord audit ID to one canonical case. The bot associates Ban/Unban/Kick it executed using
 the in-process application identity from that dispatch; deferred pairs stay quarantined
-until retry so a later same-subject dispatch cannot reuse them. The
+for the same 30s/4096 bound so a later same-subject dispatch cannot reuse them.
+Expired pending links stay application-only. The
 storage layer never guesses a match or merges two existing cases.
 
 Evidence is explicitly unavailable or a bounded nonempty list of selected text excerpts,

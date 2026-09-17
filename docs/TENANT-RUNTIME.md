@@ -48,8 +48,8 @@ pending application identity matches the same action, guild and subject. That is
 dispatch's own source identity, not a subject/time search. `TenantRuntime::link_selected_source`
 performs the durable association using the recorded application anchor.
 A matched pair deferred by skippable live scope or a transient store error stays
-quarantined until retry; a later same-subject dispatch cannot reuse those halves.
-Missing `VIEW_AUDIT_LOG`,
+quarantined for the same 30s/4096 bound; a later same-subject dispatch cannot reuse
+those halves. Missing `VIEW_AUDIT_LOG`,
 expired pending links and unmarked gateway cases stay application-sourced. Timeout is
 not associated (member-update audits are too generic). Ordinary
 messages are not archived in SQL. Selected operations capture their enrollment before

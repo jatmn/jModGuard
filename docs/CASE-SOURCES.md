@@ -46,7 +46,8 @@ Linking and appending are separate idempotent operations; a producer must surviv
 between them without losing required follow-up work. The bot's in-process pending identity
 covers the short Gateway race for bot-owned Ban/Unban/Kick. A matched pair that cannot
 durably link yet (skippable live scope or a transient store error) is quarantined onto
-the deferred retry queue so a later same-subject dispatch cannot reuse those halves.
+the deferred retry queue for the same 30s/4096 bound so a later same-subject dispatch
+cannot reuse those halves. Expired pending links stay application-only.
 Storage conflicts drop the pair. Durable cross-restart reconciliation remains pending.
 
 If one producer records a new case while another links that source elsewhere, only one

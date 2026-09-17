@@ -145,6 +145,16 @@ impl PendingAuditLinks {
         }) {
             return;
         }
+        if self.deferred_links.len() >= MAX_GATEWAY_CASE_SUPPRESSIONS
+            && let Some(oldest) = self
+                .deferred_links
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(index, _)| index)
+        {
+            self.deferred_links.remove(oldest);
+        }
         self.deferred_links
             .push((ready, now + GATEWAY_CASE_SUPPRESSION_TTL));
     }
@@ -1018,6 +1028,22 @@ mod tests {
             .unwrap();
         assert_ne!(later.link.case_id, first_id);
         assert_eq!(later.entry_id, 124);
+    }
+
+    #[test]
+    fn deferred_audit_queue_is_capped_like_gateway_suppression() {
+        let mut pending = PendingAuditLinks::default();
+        for subject in 1..=(MAX_GATEWAY_CASE_SUPPRESSIONS as u64 + 1) {
+            pending.remember_audit(
+                crate::db::guild_data::CaseAction::Ban,
+                10,
+                subject,
+                subject as i64,
+            );
+            let ready = pending.remember_application(dummy_link(subject)).unwrap();
+            pending.defer_link(ready);
+        }
+        assert_eq!(pending.deferred_links.len(), MAX_GATEWAY_CASE_SUPPRESSIONS);
     }
 
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {

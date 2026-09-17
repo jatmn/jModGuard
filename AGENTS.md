@@ -135,8 +135,8 @@ Preserve original facts and both source replay keys after removal, including lat
 links to removed parents. Closed cleanup removes owned keys atomically. Bot-owned
 Ban/Unban/Kick now link Discord audit entries from the same process dispatch using that
 application identity; unmarked gateway cases and foreign executors stay application-only.
-Deferred matched pairs stay quarantined until retry so a later same-subject dispatch
-cannot reuse those halves.
+Deferred matched pairs stay quarantined for that same 30s/4096 window so a later
+same-subject dispatch cannot reuse those halves; expired pending links stay application-only.
 
 Version6 adds the inactive evidence ownership journal; see `docs/CASE-EVIDENCE.md`.
 Reserve before object writes, preserve stable identity/byte admission, and never acknowledge

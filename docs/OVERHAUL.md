@@ -529,8 +529,9 @@ application case they already recorded. The bot remembers the dispatch's own
 application identity in-process (same 30s/4096 bound as gateway-case
 suppression) and consumes `GUILD_AUDIT_LOG_ENTRY_CREATE` only when the executor
 is this bot and the action/guild/subject match that pending identity. A matched pair
-that cannot durably link yet is quarantined onto the deferred retry queue, including
-transient store errors; later same-subject dispatches cannot reuse those halves.
+that cannot durably link yet is quarantined onto the deferred retry queue for the same
+30s/4096 bound, including transient store errors; later same-subject dispatches cannot
+reuse those halves. Expired pending links stay application-only.
 Audit events may arrive before the case row; unmarked gateway BAN_ADD/REMOVE records
 do not steal those pending links. Failed outcomes, timeouts, foreign executors
 and missing `VIEW_AUDIT_LOG` leave application-only cases. This does not search
