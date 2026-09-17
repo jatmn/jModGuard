@@ -136,7 +136,7 @@ impl EventHandler for Handler {
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
         let app = Arc::clone(self.app());
         let gid = guild.id;
-        if let Err(error) = crate::enrollment_repair::observe_gateway_membership(
+        match crate::enrollment_repair::observe_gateway_membership(
             &app.db,
             &app.tenant,
             gid.get(),
@@ -146,10 +146,15 @@ impl EventHandler for Handler {
         )
         .await
         {
-            tracing::warn!(
-                guild_id = gid.get(),
-                "guild membership observation deferred: {error:#}"
-            );
+            Ok(()) => {
+                crate::cases::retry_deferred_discord_audit_links(&app, Some(gid.get())).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id = gid.get(),
+                    "guild membership observation deferred: {error:#}"
+                );
+            }
         }
         // No guild_settings seed on join — global inheritance stays unblocked.
         if !commands::sync_slash_commands(&app, &ctx, gid).await {

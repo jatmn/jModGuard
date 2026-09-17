@@ -57,14 +57,14 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
     if ready.entry_id <= 0 {
         return;
     }
-    let link = ready.link;
+    let link = ready.link.clone();
     let audit_token = ready.audit_token;
     let application_token = ready.application_token;
     let entry_id = ready.entry_id;
     match app
         .tenant
         .link_selected_source(
-            link.enrollment,
+            link.enrollment.clone(),
             link.case_id.clone(),
             CaseSource::Application {
                 operation_id: link.operation_id.clone(),
@@ -75,6 +75,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
     {
         Ok(Some(_)) => {
             app.finalize_pending_audit_link(audit_token, application_token);
+            app.clear_deferred_audit_link(&link.case_id, entry_id);
         }
         Ok(None) => {
             tracing::warn!(
@@ -83,6 +84,7 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
                 case_id = link.case_id.as_str(),
                 "selected discord audit link deferred; pending identity retained"
             );
+            app.defer_pending_audit_link(ready);
         }
         Err(error) => {
             tracing::warn!(
@@ -93,8 +95,16 @@ async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditRea
             );
             if error.downcast_ref::<db::guild_data::CaseError>().is_some() {
                 app.finalize_pending_audit_link(audit_token, application_token);
+                app.clear_deferred_audit_link(&link.case_id, entry_id);
             }
         }
+    }
+}
+
+/// Re-attempt durable links after a skippable live-scope deferral.
+pub async fn retry_deferred_discord_audit_links(app: &BotState, guild: Option<u64>) {
+    for ready in app.deferred_audit_links_for_guild(guild) {
+        link_discord_audit(app, ready).await;
     }
 }
 
@@ -125,6 +135,7 @@ async fn remember_owned_application(
     if let Some(ready) = app.remember_application_audit(link) {
         link_discord_audit(app, ready).await;
     }
+    retry_deferred_discord_audit_links(app, Some(guild)).await;
 }
 
 pub(crate) async fn remember_recorded_application(
@@ -208,6 +219,7 @@ pub async fn await_discord_audit(
     if let Some(ready) = app.remember_discord_audit(action, guild, subject, entry_id) {
         link_discord_audit(app, ready).await;
     }
+    retry_deferred_discord_audit_links(app, Some(guild)).await;
 }
 
 pub fn text_excerpt(channel_id: u64, message_id: u64, author_id: u64, text: &str) -> CaseEvidence {
@@ -515,6 +527,72 @@ mod tests {
                 .await
                 .as_ref(),
             Some(&owned)
+        );
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn deferred_audit_link_retries_after_live_scope_returns() {
+        let (app, enrollment, path) = app_with_guild(10).await;
+        await_discord_audit(&app, 7, 7, CaseAction::Kick, 10, 99, 77).await;
+        let operation_id = CaseId::new();
+        let data = CaseData {
+            source: CaseSource::Application {
+                operation_id: operation_id.clone(),
+            },
+            action: CaseAction::Kick,
+            outcome: CaseOutcome::Succeeded,
+            subject_id: 99,
+            actor_id: Some(42),
+            occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+            reason: Some("kick".into()),
+            evidence: CaseEvidence::Unavailable,
+        };
+        let case_id = record(
+            &app,
+            Some(enrollment.clone()),
+            data.action.clone(),
+            data.outcome.clone(),
+            99,
+            Some(42),
+            data.reason.clone(),
+            data.evidence.clone(),
+            data.source.clone(),
+        )
+        .await
+        .unwrap();
+        let destination = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &app.db,
+            destination.clone(),
+            db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+        )
+        .await
+        .unwrap();
+        let generation = db::guild_stores::set_guild_write_fence(
+            &app.db,
+            10,
+            destination,
+            format!("{:032x}", 9u128),
+            "freeze",
+        )
+        .await
+        .unwrap();
+        remember_recorded_application(&app, enrollment.clone(), &data, case_id.clone()).await;
+        assert!(
+            !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
+            "expected a deferred audit link while the guild store is fenced"
+        );
+        db::guild_stores::clear_guild_write_fence(&app.db, 10, &generation)
+            .await
+            .unwrap();
+        retry_deferred_discord_audit_links(&app, Some(10)).await;
+        assert_eq!(
+            linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 77 })
+                .await
+                .as_ref(),
+            Some(&case_id)
         );
         drop(app);
         cleanup(&path);

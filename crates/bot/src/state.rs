@@ -126,12 +126,42 @@ struct PendingAuditLinks {
     next_token: u128,
     applications: HashMap<u128, (PendingAuditLink, Instant)>,
     audits: HashMap<u128, (PendingDiscordAudit, Instant)>,
+    deferred_links: Vec<(PendingAuditReady, Instant)>,
 }
 
 impl PendingAuditLinks {
     fn prune(&mut self, now: Instant) {
         self.applications.retain(|_, (_, expires)| *expires > now);
         self.audits.retain(|_, (_, expires)| *expires > now);
+        self.deferred_links.retain(|(_, expires)| *expires > now);
+    }
+
+    fn defer_link(&mut self, ready: PendingAuditReady) {
+        let now = Instant::now();
+        self.prune(now);
+        if self.deferred_links.iter().any(|(existing, _)| {
+            existing.entry_id == ready.entry_id && existing.link.case_id == ready.link.case_id
+        }) {
+            return;
+        }
+        self.deferred_links
+            .push((ready, now + GATEWAY_CASE_SUPPRESSION_TTL));
+    }
+
+    fn clear_deferred_link(&mut self, case_id: &crate::db::guild_data::CaseId, entry_id: i64) {
+        self.deferred_links.retain(|(ready, _)| {
+            ready.entry_id != entry_id || ready.link.case_id != *case_id
+        });
+    }
+
+    fn deferred_links_for_guild(&mut self, guild: Option<u64>) -> Vec<PendingAuditReady> {
+        let now = Instant::now();
+        self.prune(now);
+        self.deferred_links
+            .iter()
+            .filter(|(ready, _)| guild.is_none_or(|g| ready.link.guild == g))
+            .map(|(ready, _)| ready.clone())
+            .collect()
     }
 
     fn cap<T>(entries: &mut HashMap<u128, (T, Instant)>) {
@@ -390,6 +420,24 @@ impl BotState {
         self.pending_audit_links
             .lock()
             .finalize_link(audit_token, application_token);
+    }
+
+    pub(crate) fn defer_pending_audit_link(&self, ready: PendingAuditReady) {
+        self.pending_audit_links.lock().defer_link(ready);
+    }
+
+    pub(crate) fn clear_deferred_audit_link(
+        &self,
+        case_id: &crate::db::guild_data::CaseId,
+        entry_id: i64,
+    ) {
+        self.pending_audit_links
+            .lock()
+            .clear_deferred_link(case_id, entry_id);
+    }
+
+    pub(crate) fn deferred_audit_links_for_guild(&self, guild: Option<u64>) -> Vec<PendingAuditReady> {
+        self.pending_audit_links.lock().deferred_links_for_guild(guild)
     }
 
     /// Invalidates the config cache (call after any config write).
