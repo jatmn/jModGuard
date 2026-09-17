@@ -53,6 +53,23 @@ fn pending_outcome(outcome: &CaseOutcome) -> bool {
     matches!(outcome, CaseOutcome::Succeeded | CaseOutcome::Uncertain)
 }
 
+fn registers_in_process_audit_pending(
+    action: &CaseAction,
+    outcome: &CaseOutcome,
+    expects_discord_audit: bool,
+) -> bool {
+    auditable_action(action) && pending_outcome(outcome) && expects_discord_audit
+}
+
+/// Whether a queued WebUI unban dispatch can still receive a bot-executor audit entry.
+pub(crate) fn queued_unban_expects_discord_audit(dispatch_state: &str, dispatch_code: &str) -> bool {
+    match dispatch_state {
+        "uncertain" => true,
+        "succeeded" => dispatch_code != "already_unbanned",
+        _ => false,
+    }
+}
+
 fn durable_audit_link_conflict(error: &anyhow::Error) -> bool {
     error.downcast_ref::<db::guild_data::CaseError>().is_some()
 }
@@ -120,6 +137,7 @@ pub async fn retry_deferred_discord_audit_links(app: &BotState, guild: Option<u6
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn remember_owned_application(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
@@ -128,8 +146,9 @@ async fn remember_owned_application(
     subject: u64,
     case_id: CaseId,
     operation_id: CaseId,
+    expects_discord_audit: bool,
 ) {
-    if !auditable_action(&action) || !pending_outcome(outcome) || subject == 0 {
+    if !registers_in_process_audit_pending(&action, outcome, expects_discord_audit) || subject == 0 {
         return;
     }
     let Some(enrollment) = enrollment else {
@@ -155,6 +174,7 @@ pub(crate) async fn remember_recorded_application(
     enrollment: db::GuildEnrollment,
     data: &CaseData,
     case_id: CaseId,
+    expects_discord_audit: bool,
 ) {
     let CaseSource::Application { operation_id } = &data.source else {
         return;
@@ -170,6 +190,7 @@ pub(crate) async fn remember_recorded_application(
         subject,
         case_id,
         operation_id.clone(),
+        expects_discord_audit,
     )
     .await;
 }
@@ -210,6 +231,7 @@ pub async fn record_application(
         subject,
         case_id.clone(),
         operation_id,
+        true,
     )
     .await;
     Some(case_id)
@@ -641,7 +663,7 @@ mod tests {
         )
         .await
         .unwrap();
-        remember_recorded_application(&app, enrollment.clone(), &data, case_id.clone()).await;
+        remember_recorded_application(&app, enrollment.clone(), &data, case_id.clone(), true).await;
         assert!(
             !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
             "expected a deferred audit link while the guild store is fenced"
@@ -658,6 +680,14 @@ mod tests {
         );
         drop(app);
         cleanup(&path);
+    }
+
+    #[test]
+    fn queued_unban_audit_pending_follows_dispatch_outcome() {
+        assert!(!crate::cases::queued_unban_expects_discord_audit("succeeded", "already_unbanned"));
+        assert!(crate::cases::queued_unban_expects_discord_audit("succeeded", "unbanned"));
+        assert!(crate::cases::queued_unban_expects_discord_audit("uncertain", "discord_outcome_unknown"));
+        assert!(!crate::cases::queued_unban_expects_discord_audit("failed", "discord_rejected"));
     }
 
     #[test]
@@ -717,7 +747,7 @@ mod tests {
         )
         .await
         .unwrap();
-        remember_recorded_application(&app, enrollment.clone(), &data, first.clone()).await;
+        remember_recorded_application(&app, enrollment.clone(), &data, first.clone(), true).await;
         assert!(
             !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
             "expected a deferred audit link while the guild store is fenced"

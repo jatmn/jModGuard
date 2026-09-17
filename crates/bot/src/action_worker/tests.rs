@@ -1325,3 +1325,73 @@ async fn queued_unban_links_a_bot_audit_without_subject_search() {
     assert!(!by_audit.removed);
     assert_eq!(by_application.id, by_audit.id);
 }
+
+#[tokio::test]
+async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
+    let f = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    let noop_job = f.enqueue(10, "noop", unban(99)).await;
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    app.tenant.activate(enrollment.clone()).await.unwrap();
+    drain_with_state(
+        &app,
+        &MockDiscord {
+            outcome: Outcome::succeeded("already_unbanned"),
+            ..Default::default()
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    let real_job = f.enqueue(10, "real", unban(99)).await;
+    drain_with_state(
+        &app,
+        &MockDiscord {
+            outcome: Outcome::succeeded("unbanned"),
+            ..Default::default()
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    crate::cases::await_discord_audit(
+        &app,
+        7,
+        7,
+        crate::db::guild_data::CaseAction::Unban,
+        10,
+        99,
+        555,
+    )
+    .await;
+    let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+    let noop_case = store
+        .case_for_source(
+            scope.clone(),
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(noop_job.id).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let real_case = store
+        .case_for_source(
+            scope.clone(),
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(real_job.id).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let audit_case = store
+        .case_for_source(
+            scope,
+            crate::db::guild_data::CaseSource::DiscordAudit { entry_id: 555 },
+        )
+        .await
+        .unwrap();
+    assert_ne!(noop_case.id, real_case.id);
+    assert_eq!(audit_case.as_ref().map(|m| m.id.as_str()), Some(real_case.id.as_str()));
+}

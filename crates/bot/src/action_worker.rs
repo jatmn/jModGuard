@@ -256,7 +256,18 @@ async fn execute_inner(
             };
             let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
             if let (Some(app), Some(case_id)) = (app, case_id) {
-                crate::cases::remember_recorded_application(app, enrollment, &data, case_id).await;
+                let expects_discord_audit = crate::cases::queued_unban_expects_discord_audit(
+                    outcome.state,
+                    outcome.code,
+                );
+                crate::cases::remember_recorded_application(
+                    app,
+                    enrollment,
+                    &data,
+                    case_id,
+                    expects_discord_audit,
+                )
+                .await;
             }
         } else {
             tracing::warn!(
