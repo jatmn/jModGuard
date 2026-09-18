@@ -22,12 +22,15 @@ separate `remote-database` job. Optional local hooks:
 
 ```bash
 bash scripts/install-git-hooks.sh
+# For a PR whose base is not main:
+# bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That sets `core.hooksPath` to `.githooks` so `pre-commit` and `pre-push` run
-the same full preflight as the Buildkite `test` job (commit then push runs it
-twice). Git then uses only `.githooks` for this checkout; previous hook
-directories are not chained. It does not add GitHub Actions.
+That sets worktree-local `core.hooksPath` to `.githooks` so `pre-commit` and
+`pre-push` run the same full preflight as the Buildkite `test` job (commit then
+push runs it twice). Git then uses only `.githooks` in this worktree; previous
+hook directories are not chained. Linked worktrees are unaffected unless you run
+install there too. It does not add GitHub Actions.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.

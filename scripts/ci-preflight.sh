@@ -49,7 +49,14 @@ fi
 
 for hook in pre-commit pre-push; do
   hook_path="$root/.githooks/$hook"
-  if [ -f "$hook_path" ] && ! grep -Fq 'scripts/ci-preflight.sh' "$hook_path"; then
+  if [ ! -f "$hook_path" ]; then
+    continue
+  fi
+  if [ ! -x "$hook_path" ]; then
+    echo "ci-preflight: .githooks/$hook must be executable (git skips non-executable hooks)" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'scripts/ci-preflight.sh' "$hook_path"; then
     echo "ci-preflight: .githooks/$hook must invoke scripts/ci-preflight.sh" >&2
     exit 1
   fi

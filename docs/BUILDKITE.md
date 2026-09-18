@@ -27,8 +27,9 @@ plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 after GitHub git-credential setup. If `cargo-deny` or `cargo-audit` is missing,
 that script installs the pinned versions with `cargo install --locked`.
 Optional local `pre-commit`/`pre-push` hooks (`bash scripts/install-git-hooks.sh`)
-wrap the same full test script and set `core.hooksPath` to `.githooks` (they do
-not chain previous hook directories). They are not GitHub Actions.
+wrap the same full test script and set worktree-local `core.hooksPath` to
+`.githooks` (they do not chain previous hook directories). They are not GitHub
+Actions.
 
 Scheduled builds set `JMODGUARD_AUDIT_FAIL_CLOSED=1` so `cargo audit` fails the
 job; pull requests and ordinary main pushes still run audit but do not fail on a

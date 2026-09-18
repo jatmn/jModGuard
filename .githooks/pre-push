@@ -4,5 +4,8 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 # Drain the ref list Git sends on stdin so the hook cannot SIGPIPE the client.
 cat >/dev/null
-base_ref="$(git -C "$root" config --get jmodguard.preflight-base || printf '%s' origin/main)"
+base_ref="$(git -C "$root" config --get jmodguard.preflight-base 2>/dev/null || true)"
+if [ -z "$base_ref" ]; then
+  base_ref="origin/main"
+fi
 exec bash "$root/scripts/ci-preflight.sh" --base "$base_ref"

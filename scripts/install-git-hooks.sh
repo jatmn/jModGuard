@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Point this checkout at .githooks so commits and pushes run ci-preflight.sh.
+# Point this worktree at .githooks so commits and pushes run ci-preflight.sh.
 # GitHub Actions is not involved; CI remains Buildkite.
 set -euo pipefail
 
@@ -16,16 +16,35 @@ elif [ "$#" -ne 0 ]; then
   exit 2
 fi
 
+if [ -z "$base_ref" ]; then
+  echo 'install-git-hooks: --base must not be empty' >&2
+  exit 1
+fi
+
+if ! git -C "$root" rev-parse --verify "${base_ref}^{commit}" >/dev/null 2>&1; then
+  echo "install-git-hooks: base ref does not resolve to a commit: $base_ref" >&2
+  exit 1
+fi
+
 for hook in pre-commit pre-push; do
-  [ -f "$root/.githooks/$hook" ] || {
+  hook_path="$root/.githooks/$hook"
+  if [ ! -f "$hook_path" ]; then
     echo "install-git-hooks: missing .githooks/$hook" >&2
     exit 1
-  }
+  fi
+  if [ ! -x "$hook_path" ]; then
+    chmod +x "$hook_path" 2>/dev/null || true
+  fi
+  if [ ! -x "$hook_path" ]; then
+    echo "install-git-hooks: .githooks/$hook must be executable (git skips non-executable hooks)" >&2
+    exit 1
+  fi
 done
 
-git -C "$root" config --local core.hooksPath .githooks
-git -C "$root" config --local jmodguard.preflight-base "$base_ref"
-echo "Installed .githooks for this checkout (core.hooksPath) with preflight base $base_ref."
-echo "Git will use only .githooks for this checkout (previous hook directories are not chained)."
+git -C "$root" config --local extensions.worktreeConfig true
+git -C "$root" config --worktree core.hooksPath .githooks
+git -C "$root" config --worktree jmodguard.preflight-base "$base_ref"
+echo "Installed .githooks for this worktree (core.hooksPath) with preflight base $base_ref."
+echo "Git will use only .githooks here (previous hook directories are not chained)."
 echo "Each hook runs the full bash scripts/ci-preflight.sh Buildkite test job."
 echo "This does not add GitHub Actions."
