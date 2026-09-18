@@ -199,6 +199,10 @@ add GitHub Actions workflows.
 bash scripts/ci-preflight.sh
 # For a PR whose base is not main:
 # bash scripts/ci-preflight.sh --base origin/<base-branch>
+# Optional local git hooks (same full Buildkite test script; not GitHub Actions).
+# Worktree-local core.hooksPath (.githooks); does not chain previous hook dirs:
+# bash scripts/install-git-hooks.sh
+# bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
 That script runs lockfile verification, `cargo fmt --check`, whitespace

@@ -47,6 +47,21 @@ if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.yml"; th
   exit 1
 fi
 
+for hook in pre-commit pre-push; do
+  hook_path="$root/.githooks/$hook"
+  if [ ! -f "$hook_path" ]; then
+    continue
+  fi
+  if [ ! -x "$hook_path" ]; then
+    echo "ci-preflight: .githooks/$hook must be executable (git skips non-executable hooks)" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'scripts/ci-preflight.sh' "$hook_path"; then
+    echo "ci-preflight: .githooks/$hook must invoke scripts/ci-preflight.sh" >&2
+    exit 1
+  fi
+done
+
 require_command() {
   local command="$1"
   local install="$2"
