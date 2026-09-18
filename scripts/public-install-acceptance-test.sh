@@ -234,4 +234,28 @@ require_contains scripts/publish-frontend-bunny.sh "frontend_publication.sh"
 require_absent scripts/publish-frontend-bunny.sh "frontend_publication.py"
 require_absent scripts/ci-preflight.sh "public-install-acceptance-test.py"
 
+# Remaining CI/tooling must not require Python.
+for py in \
+  scripts/check-service-boundaries.py \
+  .buildkite/publish-image.py \
+  .buildkite/publish-image-test.py \
+  .buildkite/release.py \
+  .buildkite/release-test.py \
+  .buildkite/release-please.py
+do
+  [[ ! -e "$root/$py" ]] || fail "$py must not exist"
+done
+require_absent scripts/ci-preflight.sh "python3"
+require_absent .buildkite/pipeline.yml "python3"
+require_absent docs/BUILDKITE.md "Python 3"
+require_absent docs/RELEASES.md "release-please.py"
+require_absent docs/RELEASES.md "Python CI"
+require_contains scripts/ci-preflight.sh "bash scripts/check-service-boundaries.sh"
+require_contains scripts/ci-preflight.sh "bash .buildkite/publish-image-test.sh"
+require_contains .buildkite/pipeline.yml "bash .buildkite/publish-image.sh"
+require_contains .buildkite/pipeline.yml "bash .buildkite/release-please.sh"
+require_contains docs/RELEASES.md "release-please.sh"
+require_contains docs/BUILDKITE.md "bash .buildkite/publish-image-test.sh"
+require_contains AGENTS.md "bash scripts/check-service-boundaries.sh"
+
 echo 'public-install-acceptance-test: ok'

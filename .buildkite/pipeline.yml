@@ -101,9 +101,9 @@ steps:
         trap - EXIT
       done
 
-  # Match publish-image.py request() success paths, except UI/API with
-  # JMODGUARD_PUBLISH_SOURCE is scheduled even off main / with a tag so Python
-  # can fail an invalid manual instead of a green skip of an attempted publish.
+  # Match publish-image.sh request() success paths, except UI/API with
+  # JMODGUARD_PUBLISH_SOURCE is scheduled even off main / with a tag so the
+  # publisher can fail an invalid manual instead of a green skip of an attempted publish.
   - label: "prepare image publication"
     key: prepare-images
     depends_on: [test, remote-database]
@@ -117,7 +117,7 @@ steps:
         (build.source == "schedule" && build.branch == "main" && build.tag == null)
       )
     timeout_in_minutes: 5
-    command: python3 .buildkite/publish-image.py prepare
+    command: bash .buildkite/publish-image.sh prepare
 
   - label: "publish bot image"
     key: publish-bot
@@ -126,7 +126,7 @@ steps:
     concurrency: 1
     concurrency_group: jmodguard/ghcr-bot
     timeout_in_minutes: 45
-    command: python3 .buildkite/publish-image.py bot
+    command: bash .buildkite/publish-image.sh bot
 
   - label: "publish api image"
     key: publish-api
@@ -135,7 +135,7 @@ steps:
     concurrency: 1
     concurrency_group: jmodguard/ghcr-api
     timeout_in_minutes: 45
-    command: python3 .buildkite/publish-image.py api
+    command: bash .buildkite/publish-image.sh api
 
   - label: "publish conductor image"
     key: publish-conductor
@@ -144,18 +144,18 @@ steps:
     concurrency: 1
     concurrency_group: jmodguard/ghcr-conductor
     timeout_in_minutes: 45
-    command: python3 .buildkite/publish-image.py conductor
+    command: bash .buildkite/publish-image.sh conductor
 
   - label: "publish release manifest"
     key: publish-manifest
     depends_on: [publish-bot, publish-api, publish-conductor]
     if: *publish_if
     timeout_in_minutes: 10
-    command: python3 .buildkite/publish-image.py manifest
+    command: bash .buildkite/publish-image.sh manifest
 
   - label: "release please"
     key: release-please
     depends_on: [test, remote-database]
     if: build.pull_request.id == null && build.source == "webhook" && build.branch == "main" && build.tag == null && (build.env("BUILDKITE_GITHUB_EVENT") == null || build.env("BUILDKITE_GITHUB_EVENT") == "push")
     timeout_in_minutes: 10
-    command: python3 .buildkite/release-please.py
+    command: bash .buildkite/release-please.sh

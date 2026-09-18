@@ -205,10 +205,11 @@ bash scripts/ci-preflight.sh
 ```
 
 That script runs lockfile verification, `cargo fmt --check`, whitespace
-`git diff --check`, the publisher/release contract tests, workspace and
+`git diff --check`, the publisher/release contract tests
+(`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
-service boundaries, public-install acceptance
+service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
 (`bash scripts/dependabot-config-test.sh`), frontend Node tests,
 `dual_process_smoke`, independent `jmodguard-bot` / `jmodguard-api` builds (with

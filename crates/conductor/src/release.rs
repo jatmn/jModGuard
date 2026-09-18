@@ -3,6 +3,9 @@ use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::config::parse_http_url;
@@ -14,6 +17,8 @@ pub const INDEX_FORMAT: &str = "JMODGUARD-RELEASE-INDEX-1";
 const MAX_INDEX_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_RELEASES: usize = 64;
+const REQUIRED_COMPONENTS: [&str; 4] = ["bot", "api", "conductor", "frontend"];
+const INDEX_RETAIN: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredRelease {
@@ -308,6 +313,245 @@ pub fn sign_manifest(mut body: Value, key_id: &str, secret_hex: &str) -> Result<
         );
     }
     Ok(String::from_utf8(canonical_json(&body))?)
+}
+
+pub fn channel_for(mode: &str, tag: &str) -> Option<&'static str> {
+    let tag = tag.strip_prefix("refs/tags/").unwrap_or(tag);
+    if mode == "nightly" {
+        return Some("nightly");
+    }
+    if matches!(mode, "tag" | "manual") && stable_release_id(tag) {
+        return Some("stable");
+    }
+    None
+}
+
+pub fn image_component(name: &str, digest: &str, size: i64, image: Option<&str>) -> Result<Value> {
+    ensure!(
+        is_sha256_digest(digest),
+        "{name} digest must be sha256:<64 hex>"
+    );
+    ensure!(size > 0, "{name} size must be a positive integer");
+    let mut body = serde_json::json!({
+        "digest": digest,
+        "platform": "linux/amd64",
+        "size": size,
+    });
+    if let Some(image) = image {
+        body.as_object_mut()
+            .expect("component object")
+            .insert("image".into(), Value::String(image.to_string()));
+    }
+    Ok(body)
+}
+
+pub fn frontend_inventory(root: &Path) -> Result<Value> {
+    let mut files = BTreeMap::new();
+    for name in ["index.html", "app.js", "style.css"] {
+        let path = root.join(name);
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("frontend {name} must be a regular file"))?;
+        ensure!(
+            !meta.file_type().is_symlink() && meta.is_file(),
+            "frontend {name} must be a regular file"
+        );
+        let hex =
+            hex_encode(ring::digest::digest(&ring::digest::SHA256, &fs::read(&path)?).as_ref());
+        files.insert(name.to_string(), hex);
+    }
+    let joined = ["app.js", "index.html", "style.css"]
+        .into_iter()
+        .map(|name| files[name].as_str())
+        .collect::<String>();
+    let digest =
+        hex_encode(ring::digest::digest(&ring::digest::SHA256, joined.as_bytes()).as_ref());
+    Ok(serde_json::json!({
+        "files": files,
+        "platform": "cdn",
+        "sha256": format!("sha256:{digest}"),
+    }))
+}
+
+fn key_id_valid(key_id: &str) -> bool {
+    (2..=32).contains(&key_id.len())
+        && key_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn hex32_secret(secret: &str) -> bool {
+    secret.len() == 64
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn source_commit_valid(sha: &str) -> bool {
+    sha.len() == 40
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn refuse_partial(components: &Value) -> Result<()> {
+    let Some(map) = components.as_object() else {
+        anyhow::bail!("failed/partial publication remains unavailable");
+    };
+    for name in REQUIRED_COMPONENTS {
+        ensure!(
+            map.contains_key(name),
+            "failed/partial publication remains unavailable"
+        );
+    }
+    Ok(())
+}
+
+fn stage_write(directory: &Path, identity: &str, payload: &Value) -> Result<PathBuf> {
+    fs::create_dir_all(directory).context("release output directory")?;
+    let staged = directory.join(format!(".{identity}.staging.json"));
+    let final_path = directory.join(format!("{identity}.json"));
+    let mut bytes = canonical_json(payload);
+    bytes.push(b'\n');
+    {
+        let mut file = fs::File::create(&staged).context("release staging write")?;
+        file.write_all(&bytes).context("release staging write")?;
+        file.sync_all().context("release staging sync")?;
+    }
+    fs::rename(&staged, &final_path).context("release staging promote")?;
+    Ok(final_path)
+}
+
+fn index_releases(rows: Vec<Value>, retain: usize) -> Result<Value> {
+    ensure!(
+        retain >= 1,
+        "retention must be at least one complete release"
+    );
+    let mut by_channel: BTreeMap<String, Vec<Value>> = BTreeMap::from([
+        ("stable".into(), Vec::new()),
+        ("nightly".into(), Vec::new()),
+    ]);
+    for row in rows {
+        let channel = row
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        ensure!(
+            by_channel.contains_key(&channel),
+            "index contains an unknown channel"
+        );
+        by_channel.get_mut(&channel).expect("channel").push(row);
+    }
+    let mut kept = Vec::new();
+    for items in by_channel.values_mut() {
+        items.sort_by(|a, b| {
+            b.get("published_at")
+                .and_then(Value::as_str)
+                .cmp(&a.get("published_at").and_then(Value::as_str))
+        });
+        kept.extend(items.iter().take(retain).cloned());
+    }
+    kept.sort_by(|a, b| {
+        b.get("published_at")
+            .and_then(Value::as_str)
+            .cmp(&a.get("published_at").and_then(Value::as_str))
+    });
+    Ok(serde_json::json!({
+        "format": INDEX_FORMAT,
+        "releases": kept,
+    }))
+}
+
+pub struct CompletePublication {
+    pub channel: String,
+    pub release_id: String,
+    pub source_commit: String,
+    pub published_at: String,
+    pub components: Value,
+    pub notes: String,
+    pub key_id: String,
+    pub secret_hex: String,
+    pub out_dir: PathBuf,
+}
+
+pub fn write_complete_publication(request: CompletePublication) -> Result<PathBuf> {
+    let CompletePublication {
+        channel,
+        release_id,
+        source_commit: sha,
+        published_at,
+        components,
+        notes,
+        key_id,
+        secret_hex,
+        out_dir,
+    } = request;
+    refuse_partial(&components)?;
+    validate_publication_identity(&channel, &release_id)?;
+    ensure!(
+        source_commit_valid(&sha),
+        "source_commit must be a full lowercase SHA"
+    );
+    ensure!(key_id_valid(&key_id), "signing key id is invalid");
+    ensure!(
+        hex32_secret(&secret_hex),
+        "signing key must be 32 bytes hex"
+    );
+    validate_components(&components)?;
+    let version = if channel == "stable" {
+        release_id.trim_start_matches('v').to_string()
+    } else {
+        release_id.clone()
+    };
+    let unsigned = serde_json::json!({
+        "backup_format": "JMODGUARD-BACKUP-1",
+        "channel": channel,
+        "compatibility": {
+            "min_conductor": "0.1.0",
+            "rollback": "matching-backup",
+        },
+        "components": components,
+        "format": FORMAT,
+        "notes": notes,
+        "published_at": published_at,
+        "release_id": release_id,
+        "schema": {
+            "core_family": "jmodguard-core-1",
+            "core_version": 12,
+            "guild_family": "jmodguard-guild-1",
+            "guild_version": 8,
+        },
+        "settings_schema": 1,
+        "source_commit": sha,
+        "version": version,
+    });
+    let signed_raw = sign_manifest(unsigned, &key_id, &secret_hex)?;
+    let signed: Value = serde_json::from_str(&signed_raw)?;
+    let path = stage_write(&out_dir, &release_id, &signed)?;
+    let index_path = out_dir.join("index.json");
+    let mut rows = Vec::new();
+    if index_path.exists() {
+        let existing: Value =
+            serde_json::from_str(&fs::read_to_string(&index_path)?).context("release index")?;
+        if let Some(list) = existing.get("releases").and_then(Value::as_array) {
+            rows = list
+                .iter()
+                .filter(|row| {
+                    row.get("release_id").and_then(Value::as_str) != Some(release_id.as_str())
+                })
+                .cloned()
+                .collect();
+        }
+    }
+    rows.push(serde_json::json!({
+        "channel": channel,
+        "path": path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+        "published_at": signed.get("published_at").cloned().unwrap_or(Value::String(published_at)),
+        "release_id": release_id,
+        "source_commit": sha,
+    }));
+    stage_write(&out_dir, "index", &index_releases(rows, INDEX_RETAIN)?)?;
+    Ok(path)
 }
 
 pub fn compatibility(manifest: &Value, cfg: &Config) -> Result<(bool, Option<String>)> {
@@ -925,5 +1169,167 @@ mod tests {
             1
         );
         assert_eq!(available_count(&rows, &["nightly".into()], "v0.1.0"), 0);
+    }
+
+    fn fixture_components(root: &Path) -> Value {
+        fs::write(root.join("index.html"), "<html></html>").unwrap();
+        fs::write(root.join("app.js"), "void 0;").unwrap();
+        fs::write(root.join("style.css"), "body{}").unwrap();
+        serde_json::json!({
+            "bot": image_component("bot", &format!("sha256:{}", "1".repeat(64)), 10, Some("ghcr.io/jatmn/jmodguard-bot")).unwrap(),
+            "api": image_component("api", &format!("sha256:{}", "2".repeat(64)), 11, Some("ghcr.io/jatmn/jmodguard-api")).unwrap(),
+            "conductor": image_component("conductor", &format!("sha256:{}", "3".repeat(64)), 12, Some("ghcr.io/jatmn/jmodguard-conductor")).unwrap(),
+            "frontend": frontend_inventory(root).unwrap(),
+        })
+    }
+
+    #[test]
+    fn channel_for_keeps_stable_and_nightly_separate() {
+        assert_eq!(channel_for("tag", "v1.2.3"), Some("stable"));
+        assert_eq!(
+            channel_for("nightly", "nightly-20260915-aaaaaaaaaaaa"),
+            Some("nightly")
+        );
+        assert_eq!(channel_for("main", ""), None);
+        assert_eq!(channel_for("tag", "nightly-20260915-aaaaaaaaaaaa"), None);
+        assert!(stable_release_id("v0.1.0"));
+        assert!(!stable_release_id("nightly-20260915-aaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn write_complete_publication_refuses_partial_then_indexes() {
+        let tmp = std::env::temp_dir().join(format!("jmodguard-release-{}", std::process::id()));
+        let frontend = tmp.join("frontend");
+        let out = tmp.join("out");
+        fs::create_dir_all(&frontend).unwrap();
+        let components = fixture_components(&frontend);
+        let secret = "a".repeat(64);
+        assert!(
+            write_complete_publication(CompletePublication {
+                channel: "stable".into(),
+                release_id: "v0.2.0".into(),
+                source_commit: "a".repeat(40),
+                published_at: "2026-09-15T00:00:00Z".into(),
+                components: serde_json::json!({"bot": components["bot"]}),
+                notes: String::new(),
+                key_id: "rp1".into(),
+                secret_hex: secret.clone(),
+                out_dir: out.clone(),
+            })
+            .is_err()
+        );
+        let path = write_complete_publication(CompletePublication {
+            channel: "stable".into(),
+            release_id: "v0.2.0".into(),
+            source_commit: "a".repeat(40),
+            published_at: "2026-09-15T00:00:00Z".into(),
+            components,
+            notes: "notes".into(),
+            key_id: "rp1".into(),
+            secret_hex: secret.clone(),
+            out_dir: out.clone(),
+        })
+        .unwrap();
+        let index: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("index.json")).unwrap()).unwrap();
+        assert_eq!(index["format"], INDEX_FORMAT);
+        assert_eq!(index["releases"][0]["release_id"], "v0.2.0");
+        let mut keys = BTreeMap::new();
+        keys.insert("rp1".into(), secret);
+        verify_manifest(&fs::read_to_string(&path).unwrap(), &keys).unwrap();
+        assert!(
+            fs::read_dir(&out)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".staging.json"))
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_retention_keeps_channels_independent() {
+        let mut rows = Vec::new();
+        for index in 0..5 {
+            rows.push(serde_json::json!({
+                "release_id": format!("v0.0.{index}"),
+                "channel": "stable",
+                "published_at": format!("2026-09-0{}", index + 1),
+            }));
+            rows.push(serde_json::json!({
+                "release_id": format!("nightly-2026090{}-{}", index + 1, "a".repeat(12)),
+                "channel": "nightly",
+                "published_at": format!("2026-09-1{index}"),
+            }));
+        }
+        let index = index_releases(rows, 2).unwrap();
+        let releases = index["releases"].as_array().unwrap();
+        let stables = releases
+            .iter()
+            .filter(|row| row["channel"] == "stable")
+            .count();
+        let nightlies = releases
+            .iter()
+            .filter(|row| row["channel"] == "nightly")
+            .count();
+        assert_eq!(stables, 2);
+        assert_eq!(nightlies, 2);
+    }
+
+    #[test]
+    fn nightly_cannot_reuse_stable_identity() {
+        let tmp = std::env::temp_dir().join(format!("jmodguard-release-id-{}", std::process::id()));
+        let frontend = tmp.join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        let components = fixture_components(&frontend);
+        let secret = "a".repeat(64);
+        assert!(
+            write_complete_publication(CompletePublication {
+                channel: "nightly".into(),
+                release_id: "v0.2.0".into(),
+                source_commit: "a".repeat(40),
+                published_at: "2026-09-15T00:00:00Z".into(),
+                components: components.clone(),
+                notes: String::new(),
+                key_id: "rp1".into(),
+                secret_hex: secret.clone(),
+                out_dir: tmp.join("out"),
+            })
+            .is_err()
+        );
+        assert!(
+            write_complete_publication(CompletePublication {
+                channel: "stable".into(),
+                release_id: "nightly-20260915-aaaaaaaaaaaa".into(),
+                source_commit: "a".repeat(40),
+                published_at: "2026-09-15T00:00:00Z".into(),
+                components,
+                notes: String::new(),
+                key_id: "rp1".into(),
+                secret_hex: secret,
+                out_dir: tmp.join("out2"),
+            })
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn release_please_config_is_stable_only() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(root.join("release-please-config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["release-type"], "simple");
+        assert_eq!(config["include-v-in-tag"], true);
+        assert!(config["packages"].get(".").is_some());
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".release-please-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["."], "0.1.0");
     }
 }

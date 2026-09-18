@@ -20,7 +20,7 @@ steps:
       queue: linux
 ```
 
-The agents need Linux x86-64, Git, Python 3, Node, Rust 1.96.0 with Clippy and
+The agents need Linux x86-64, Git, Node, Rust 1.96.0 with Clippy and
 rustfmt, `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The `test` job runs `bash scripts/ci-preflight.sh`
@@ -178,10 +178,11 @@ backward; production must keep using approved image digests.
    Do not re-register leftover Proxmox GHA runners. Keep the Buildkite agents
    running.
 
-Local offline publisher tests: `python3 .buildkite/publish-image-test.py`.
+Local offline publisher tests: `bash .buildkite/publish-image-test.sh`.
 They exercise source identity, event guards, multi-commit change detection,
 credential handling and cleanup without pushing images or contacting Buildkite.
-Release publication contracts: `python3 .buildkite/release-test.py`.
+Release publication contracts live in `jmodguard-conductor` tests and the
+CI-only `jmodguard-release-publish` binary.
 See [releases](RELEASES.md).
 
 References: [Buildkite GitHub integration](https://buildkite.com/docs/pipelines/source-control/github),
