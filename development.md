@@ -18,7 +18,14 @@ bash scripts/ci-preflight.sh
 ```
 
 The Buildkite `test` job is that script. Remote libSQL containers stay in the
-separate `remote-database` job.
+separate `remote-database` job. Optional local hooks:
+
+```bash
+bash scripts/install-git-hooks.sh
+```
+
+That sets `core.hooksPath` to `.githooks` so `pre-commit` and `pre-push` run
+the same preflight. It does not add GitHub Actions.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.

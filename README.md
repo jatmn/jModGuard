@@ -125,6 +125,7 @@ commercial licensing is granted by the author only.
 ```bash
 bash scripts/ci-preflight.sh
 # or: ./scripts/smoke-dual-process.sh
+# optional: bash scripts/install-git-hooks.sh
 ```
 
 Bot and API are independent Cargo packages. The API defaults to `embed-ui` for local

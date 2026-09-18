@@ -26,6 +26,8 @@ plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The `test` job runs `bash scripts/ci-preflight.sh`
 after GitHub git-credential setup. If `cargo-deny` or `cargo-audit` is missing,
 that script installs the pinned versions with `cargo install --locked`.
+Optional local `pre-commit`/`pre-push` hooks (`bash scripts/install-git-hooks.sh`)
+wrap the same script; they are not GitHub Actions.
 Scheduled builds set `JMODGUARD_AUDIT_FAIL_CLOSED=1` so `cargo audit` fails the
 job; pull requests and ordinary main pushes still run audit but do not fail on a
 reported CVE advisories. `cargo audit` operational failures (for example
