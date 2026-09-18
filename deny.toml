@@ -1,7 +1,8 @@
 # Supply-chain policy for cargo-deny (licenses, bans, sources).
 # Advisories are not part of this file. Buildkite runs cargo-audit:
 # pull requests and ordinary main pushes do not fail the test job on a new
-# CVE; scheduled builds fail closed so the advisory is visible.
+# CVE (advisory exit 1); cargo-audit operational errors still fail the job.
+# Scheduled builds fail closed so the advisory is visible.
 #
 # The root workspace uses LicenseRef-PolyForm-Noncommercial-1.0.0 and is not
 # published to crates.io. Ignore unpublished workspace crates; third-party

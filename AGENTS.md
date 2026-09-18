@@ -207,7 +207,9 @@ no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), conductor/bot/API builds, service
 boundaries, public-install acceptance, frontend Node/Python tests,
 `dual_process_smoke`, `cargo deny check bans licenses sources`, and
-`cargo audit` (fail-closed only when `JMODGUARD_AUDIT_FAIL_CLOSED=1`).
+`cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
+and ordinary main pushes ignore advisory exit 1 but still fail on audit tool
+errors).
 Remote libSQL tests stay in the Buildkite `remote-database` job.
 
 ```bash

@@ -84,6 +84,15 @@ whitespace_check() {
     if ! merge_base="$(git merge-base "$base_ref" HEAD)"; then
       merge_base="$base_ref"
     fi
+    # Buildkite main checkouts have origin/main == HEAD, so merge-base vs the
+    # working tree is empty. Compare the first-parent patch in that case.
+    if [ "$(git rev-parse "$merge_base")" = "$(git rev-parse HEAD)" ]; then
+      if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+        echo "ci-preflight: git diff --check HEAD^ HEAD (base $base_ref is HEAD)"
+        git diff --check HEAD^ HEAD
+        return 0
+      fi
+    fi
     echo "ci-preflight: git diff --check $merge_base"
     git diff --check "$merge_base"
     return 0
@@ -155,13 +164,22 @@ echo 'ci-preflight: cargo deny check bans licenses sources'
 cargo deny check bans licenses sources
 
 echo 'ci-preflight: cargo audit'
-if cargo audit; then
+set +e
+cargo audit
+audit_rc=$?
+set -e
+# cargo-audit 0.22.2: 0 clean, 1 vulnerability report (and some advisory-DB
+# fetch failures), 2 lockfile/report errors. Only 1 is the CVE fail-open path.
+if [ "$audit_rc" -eq 0 ]; then
   :
+elif [ "$audit_rc" -eq 1 ] && [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" != "1" ]; then
+  echo 'ci-preflight: cargo audit reported advisories; pull requests and ordinary main pushes do not fail the test job' >&2
 elif [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" = "1" ]; then
   echo 'ci-preflight: cargo audit failed closed (scheduled Buildkite)' >&2
   exit 1
 else
-  echo 'ci-preflight: cargo audit reported advisories; pull requests and ordinary main pushes do not fail the test job' >&2
+  echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
+  exit 1
 fi
 
 echo 'ci-preflight: Buildkite test gates passed'
