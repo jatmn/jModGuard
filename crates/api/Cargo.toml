@@ -22,7 +22,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
-tower-http = { version = "0.6", features = ["cors", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "set-header"] }
 tower-sessions = { version = "0.15", features = ["memory-store"] }
 tracing = "0.1"
 
