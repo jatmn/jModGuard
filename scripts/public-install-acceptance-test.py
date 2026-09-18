@@ -133,7 +133,11 @@ class PublicInstallDocs(unittest.TestCase):
         self.assertNotIn("install-local.py", install)
         self.assertNotIn("python3 scripts/install-local", install)
         self.assertIn(
-            "cargo run --locked -p jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable",
+            "cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable",
+            install,
+        )
+        self.assertNotIn(
+            "cargo run --locked -p jmodguard-conductor -- init-local",
             install,
         )
 

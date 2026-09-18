@@ -87,11 +87,11 @@ Installation → Validate install plan (`GET /api/install`, `GET /api/install/pl
 ## Local disposable install and recovery drill
 
 ```bash
-cargo run --locked -p jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable
+cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable
 # fill the generated env examples locally
 cargo run --locked -p jmodguard-bot
 cargo run --locked -p jmodguard-api
-cargo run --locked -p jmodguard-conductor
+cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor
 ```
 
 Recovery without live providers:
