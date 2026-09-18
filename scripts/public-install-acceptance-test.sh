@@ -97,7 +97,9 @@ require_contains docs/DEPLOY-BUNNY.md "does **not** expose sticky-session settin
 require_contains docs/WEBUI.md "not on the add-endpoint screen"
 require_contains docs/DEPLOY-BUNNY.md "Open the **public admin host**"
 require_contains docs/DEPLOY-BUNNY.md "a browser on the **public admin host**"
+require_contains docs/DEPLOY-BUNNY.md "is the **public admin host**"
 require_absent docs/DEPLOY-BUNNY.md "Open the **CDN** hostname"
+require_absent docs/DEPLOY-BUNNY.md "is the **CDN** origin"
 
 # test_discord_invite_permissions_follow_url_generator_order
 python3 - "$root" <<'PY' || fail "discord invite permission order"

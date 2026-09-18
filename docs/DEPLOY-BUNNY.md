@@ -312,7 +312,7 @@ With the shared-store/evidence environment above, no `config.toml` is required. 
 `JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix
 and bot status are bot-owned — set those on the bot app.
 
-`JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators type into the
+`JMODGUARD_WEB_BASE_URL` is the **public admin host** operators type into the
 browser: the Pull Zone `*.b-cdn.net` hostname, or the owned
 domain/subdomain if you added one. It is not a Magic Container hostname
 and not a leftover `*.b-cdn.net` system host after an owned-host cutover.
