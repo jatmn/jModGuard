@@ -409,11 +409,9 @@ async fn empty_store_ids_stay_stable_across_runtime_reopen() {
     );
     let catalog =
         f.db.with_conn(|c| {
-            Ok(
-                c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
-                    Ok(r.get::<i64>(0)?)
-                })?,
-            )
+            c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
+                Ok(r.get::<i64>(0)?)
+            })
         })
         .await
         .unwrap();
@@ -454,11 +452,9 @@ async fn empty_implicit_shared_store_id_stays_stable_across_runtime_reopen() {
     reopened.live(enrollment).await.unwrap();
     let catalog =
         f.db.with_conn(|c| {
-            Ok(
-                c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
-                    Ok(r.get::<i64>(0)?)
-                })?,
-            )
+            c.query_row("SELECT COUNT(*) FROM guild_store_catalog", (), |r| {
+                Ok(r.get::<i64>(0)?)
+            })
         })
         .await
         .unwrap();

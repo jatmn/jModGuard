@@ -148,11 +148,10 @@ async fn source_retries_conflicts_and_removed_replays_preserve_canonical_identit
     store
         .db
         .with_conn(|c| {
-            assert_eq!(
+            assert!(
                 c.query_row("SELECT payload IS NULL FROM guild_cases", (), |r| Ok(
                     r.get::<bool>(0)?
-                ))?,
-                true
+                ))?
             );
             Ok(())
         })

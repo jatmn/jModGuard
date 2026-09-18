@@ -171,189 +171,6 @@ async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::mod
         .map_err(|e| anyhow!("target is not available in this server: {e}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn selected_plan_results_keep_actor_outcome_and_original_membership() {
-        use crate::db::guild_data::{CaseAction, CaseOutcome, CaseSource};
-        let path =
-            std::env::temp_dir().join(format!("plan_cases_{:032x}.db", rand::random::<u128>()));
-        let app = crate::state::BotState::new(Default::default(), db::Db::open(&path, 2).unwrap())
-            .unwrap();
-        let old = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
-        app.tenant.activate(old.clone()).await.unwrap();
-        for action in [CaseAction::Timeout, CaseAction::Kick, CaseAction::Ban] {
-            for success in [true, false] {
-                let result = if success {
-                    Ok(())
-                } else {
-                    Err(serenity::Error::Other("interrupted response"))
-                };
-                record_step_outcome(
-                    &app,
-                    UserId::new(42),
-                    Some(old.clone()),
-                    action.clone(),
-                    UserId::new(99),
-                    &result,
-                )
-                .await;
-            }
-        }
-        let (store, scope) = app.tenant.live(old.clone()).await.unwrap();
-        let ids = store
-            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
-            .await
-            .unwrap();
-        assert_eq!(ids.len(), 6);
-        let mut succeeded = 0;
-        let mut uncertain = 0;
-        for id in ids {
-            let data = store
-                .case(scope.clone(), id, crate::tenant::case_limits())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(data.actor_id, Some(42));
-            assert_eq!(data.subject_id, 99);
-            assert_eq!(data.reason.as_deref(), Some("custom command"));
-            assert!(matches!(data.source, CaseSource::Application { .. }));
-            match data.outcome {
-                CaseOutcome::Succeeded => succeeded += 1,
-                CaseOutcome::Uncertain => uncertain += 1,
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        assert_eq!((succeeded, uncertain), (3, 3));
-        db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
-        app.tenant.drive_erasure().await.unwrap();
-        let current = db::enroll_guild(&app.db, 10, 101).await.unwrap().unwrap();
-        app.tenant.activate(current.clone()).await.unwrap();
-        record_step_outcome(
-            &app,
-            UserId::new(42),
-            Some(old),
-            CaseAction::Ban,
-            UserId::new(99),
-            &Ok(()),
-        )
-        .await;
-        let (store, scope) = app.tenant.live(current).await.unwrap();
-        assert_eq!(
-            store
-                .case_count(scope, crate::tenant::case_limits())
-                .await
-                .unwrap(),
-            0
-        );
-        drop(store);
-        drop(app);
-        crate::tenant::remove_sidecars(&path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[tokio::test]
-    async fn routine_plans_leave_no_sql_summary_but_moderation_plans_keep_theirs() {
-        let path = std::env::temp_dir().join(format!(
-            "jmodguard_plan_audit_{:032x}.db",
-            rand::random::<u128>()
-        ));
-        let db = db::Db::open(&path, 2).unwrap();
-        let baseline = db::get_config_version(&db).await.unwrap();
-        for steps in [
-            vec![PlanStep::Reply {
-                template: "hello".into(),
-            }],
-            vec![PlanStep::Log {
-                event: "system".into(),
-                template: "hello".into(),
-            }],
-        ] {
-            record_moderation_plan(
-                &db,
-                db::enroll_guild(&db, 10, 100).await.unwrap(),
-                20,
-                "routine",
-                &steps,
-            )
-            .await
-            .unwrap();
-        }
-        assert!(
-            db::query_events(&db, 10, None, None, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        for step in [
-            PlanStep::Timeout { minutes: 5 },
-            PlanStep::Kick,
-            PlanStep::Ban { delete_days: 0 },
-        ] {
-            record_moderation_plan(
-                &db,
-                db::enroll_guild(&db, 10, 100).await.unwrap(),
-                20,
-                "moderate",
-                &[step],
-            )
-            .await
-            .unwrap();
-        }
-        let rows = db::query_events(&db, 10, Some("plan_executed"), None, 10)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 3);
-        for row in rows {
-            assert_eq!(row.actor_id, Some(20));
-            let data: serde_json::Value =
-                serde_json::from_str(row.data.as_deref().unwrap()).unwrap();
-            assert_eq!(
-                data,
-                serde_json::json!({"command":"moderate", "steps":1, "moderation":true})
-            );
-        }
-        assert_eq!(db::guild_stats(&db, 10).await.unwrap().events, 3);
-        assert!(
-            db::query_events(&db, 11, None, None, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(db::get_config_version(&db).await.unwrap(), baseline);
-        drop(db);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[test]
-    fn only_moderation_steps_require_a_target() {
-        assert!(!plan_requires_target(&[
-            PlanStep::Reply {
-                template: "hello".into(),
-            },
-            PlanStep::AddRole { role_id: 1 },
-        ]));
-        assert!(plan_requires_target(&[PlanStep::Timeout { minutes: 5 }]));
-        assert!(plan_requires_target(&[PlanStep::Kick]));
-        assert!(plan_requires_target(&[PlanStep::Ban { delete_days: 0 }]));
-    }
-
-    #[test]
-    fn only_target_capable_steps_consume_the_first_argument() {
-        assert!(!plan_accepts_target(&[PlanStep::Reply {
-            template: "hello".into(),
-        }]));
-        assert!(plan_accepts_target(&[PlanStep::AddRole { role_id: 1 }]));
-        assert!(plan_accepts_target(&[PlanStep::Timeout { minutes: 5 }]));
-    }
-}
-
 async fn run_step(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
@@ -539,4 +356,187 @@ async fn record_step_outcome(
         crate::cases::application_source(),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selected_plan_results_keep_actor_outcome_and_original_membership() {
+        use crate::db::guild_data::{CaseAction, CaseOutcome, CaseSource};
+        let path =
+            std::env::temp_dir().join(format!("plan_cases_{:032x}.db", rand::random::<u128>()));
+        let app = crate::state::BotState::new(Default::default(), db::Db::open(&path, 2).unwrap())
+            .unwrap();
+        let old = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(old.clone()).await.unwrap();
+        for action in [CaseAction::Timeout, CaseAction::Kick, CaseAction::Ban] {
+            for success in [true, false] {
+                let result = if success {
+                    Ok(())
+                } else {
+                    Err(serenity::Error::Other("interrupted response"))
+                };
+                record_step_outcome(
+                    &app,
+                    UserId::new(42),
+                    Some(old.clone()),
+                    action.clone(),
+                    UserId::new(99),
+                    &result,
+                )
+                .await;
+            }
+        }
+        let (store, scope) = app.tenant.live(old.clone()).await.unwrap();
+        let ids = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 6);
+        let mut succeeded = 0;
+        let mut uncertain = 0;
+        for id in ids {
+            let data = store
+                .case(scope.clone(), id, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.actor_id, Some(42));
+            assert_eq!(data.subject_id, 99);
+            assert_eq!(data.reason.as_deref(), Some("custom command"));
+            assert!(matches!(data.source, CaseSource::Application { .. }));
+            match data.outcome {
+                CaseOutcome::Succeeded => succeeded += 1,
+                CaseOutcome::Uncertain => uncertain += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!((succeeded, uncertain), (3, 3));
+        db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
+        app.tenant.drive_erasure().await.unwrap();
+        let current = db::enroll_guild(&app.db, 10, 101).await.unwrap().unwrap();
+        app.tenant.activate(current.clone()).await.unwrap();
+        record_step_outcome(
+            &app,
+            UserId::new(42),
+            Some(old),
+            CaseAction::Ban,
+            UserId::new(99),
+            &Ok(()),
+        )
+        .await;
+        let (store, scope) = app.tenant.live(current).await.unwrap();
+        assert_eq!(
+            store
+                .case_count(scope, crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            0
+        );
+        drop(store);
+        drop(app);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn routine_plans_leave_no_sql_summary_but_moderation_plans_keep_theirs() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_plan_audit_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        let baseline = db::get_config_version(&db).await.unwrap();
+        for steps in [
+            vec![PlanStep::Reply {
+                template: "hello".into(),
+            }],
+            vec![PlanStep::Log {
+                event: "system".into(),
+                template: "hello".into(),
+            }],
+        ] {
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "routine",
+                &steps,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            db::query_events(&db, 10, None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for step in [
+            PlanStep::Timeout { minutes: 5 },
+            PlanStep::Kick,
+            PlanStep::Ban { delete_days: 0 },
+        ] {
+            record_moderation_plan(
+                &db,
+                db::enroll_guild(&db, 10, 100).await.unwrap(),
+                20,
+                "moderate",
+                &[step],
+            )
+            .await
+            .unwrap();
+        }
+        let rows = db::query_events(&db, 10, Some("plan_executed"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row.actor_id, Some(20));
+            let data: serde_json::Value =
+                serde_json::from_str(row.data.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                data,
+                serde_json::json!({"command":"moderate", "steps":1, "moderation":true})
+            );
+        }
+        assert_eq!(db::guild_stats(&db, 10).await.unwrap().events, 3);
+        assert!(
+            db::query_events(&db, 11, None, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db::get_config_version(&db).await.unwrap(), baseline);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn only_moderation_steps_require_a_target() {
+        assert!(!plan_requires_target(&[
+            PlanStep::Reply {
+                template: "hello".into(),
+            },
+            PlanStep::AddRole { role_id: 1 },
+        ]));
+        assert!(plan_requires_target(&[PlanStep::Timeout { minutes: 5 }]));
+        assert!(plan_requires_target(&[PlanStep::Kick]));
+        assert!(plan_requires_target(&[PlanStep::Ban { delete_days: 0 }]));
+    }
+
+    #[test]
+    fn only_target_capable_steps_consume_the_first_argument() {
+        assert!(!plan_accepts_target(&[PlanStep::Reply {
+            template: "hello".into(),
+        }]));
+        assert!(plan_accepts_target(&[PlanStep::AddRole { role_id: 1 }]));
+        assert!(plan_accepts_target(&[PlanStep::Timeout { minutes: 5 }]));
+    }
 }

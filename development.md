@@ -13,9 +13,12 @@ Contributor / agent build commands and invariants: **[AGENTS.md](AGENTS.md)**.
 Automated verification (no Discord tokens):
 
 ```bash
-./scripts/smoke-dual-process.sh
-# or the individual cargo test / clippy / build steps in AGENTS.md
+bash scripts/ci-preflight.sh
+# or: ./scripts/smoke-dual-process.sh
 ```
+
+The Buildkite `test` job is that script. Remote libSQL containers stay in the
+separate `remote-database` job.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.
@@ -36,10 +39,9 @@ maintain its reviewed revision and security regression test manually.
 The vendored `tokio-tungstenite` compatibility patch also requires manual
 maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
-and the Buildkite agents. The runtime image uses the floating
-`debian:bookworm-slim` alias without a digest, which does not give Dependabot
-a version or digest to update. There is no Docker update job; this setup
-also does not update image references embedded in the Buildkite pipeline.
+and the Buildkite agents. `Dockerfile.{bot,api,conductor}` pin
+`rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
+no Docker Dependabot job; bump those digests together with the toolchain pin.
 
 Dependabot supports private source repositories. The Cargo Git patch points
 back to this repository; it is not a GitHub Packages registry dependency.

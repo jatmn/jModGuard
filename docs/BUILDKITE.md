@@ -20,12 +20,19 @@ steps:
       queue: linux
 ```
 
-The agents need Linux x86-64, Git, Python 3, Node, Rust 1.96.0 with Clippy,
-Docker with the Buildx plugin/default Docker builder, and a Buildkite agent
-supporting `secret get`, `redactor add` and `meta-data`. The existing clone
-credential must also fetch tags and full commits from this repository.
-Publishing uses the existing Docker daemon's BuildKit cache and inline cache
-metadata in the published image; it does not depend on the Actions cache service.
+The agents need Linux x86-64, Git, Python 3, Node, Rust 1.96.0 with Clippy and
+rustfmt, `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
+plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
+`redactor add` and `meta-data`. The `test` job runs `bash scripts/ci-preflight.sh`
+after GitHub git-credential setup. If `cargo-deny` or `cargo-audit` is missing,
+that script installs the pinned versions with `cargo install --locked`.
+Scheduled builds set `JMODGUARD_AUDIT_FAIL_CLOSED=1` so `cargo audit` fails the
+job; pull requests and ordinary main pushes still run audit but do not fail on a
+new CVE. The existing clone credential must also fetch tags and full commits from
+this repository. Publishing uses the existing Docker daemon's BuildKit cache and
+inline cache metadata in the published image; it does not depend on the Actions
+cache service. Do not add `.github/workflows`; there are no GitHub-hosted CI
+minutes for this repository.
 
 The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
 `jmodguard-integration-tests`, plus the root library's

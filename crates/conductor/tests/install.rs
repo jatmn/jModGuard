@@ -224,9 +224,8 @@ fn init_local_and_validate_install_cli_use_public_artifacts() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = |path: &std::path::Path| {
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-        };
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&root.join("backup")), 0o700);
         assert_eq!(mode(&root.join("plan.json")), 0o600);
@@ -374,7 +373,8 @@ async fn install_api_requires_operator_and_rejects_rds() {
     let sample = control.conductor.resource_sample("dashboard");
     let rss = sample["rss_bytes"].as_u64().unwrap();
     assert!(rss > 0 && rss < 256 * 1024 * 1024);
-    let (status, status_body) = call(&control.router, "GET", "/api/status", Some(&cookie), None).await;
+    let (status, status_body) =
+        call(&control.router, "GET", "/api/status", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "{status_body}");
     let status_json: serde_json::Value = serde_json::from_str(&status_body).unwrap();
     let status_rss = status_json["conductor"]["rss_bytes"].as_u64().unwrap();
@@ -538,7 +538,14 @@ fn init_local_fails_closed_when_restore_already_exists() {
         String::from_utf8_lossy(&init.stderr)
     );
     assert!(err.contains("restore target must remain absent"), "{err}");
-    for name in ["backup", "evidence", "update", "artifacts", "capture", "guild"] {
+    for name in [
+        "backup",
+        "evidence",
+        "update",
+        "artifacts",
+        "capture",
+        "guild",
+    ] {
         assert!(
             !root.join(name).exists(),
             "partial layout created {name} after restore-present failure"
@@ -555,7 +562,11 @@ fn validate_install_succeeds_after_restore_directory_exists() {
         .args(["init-local", "--root", root.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     std::fs::create_dir_all(root.join("restore")).unwrap();
     let validate = conductor_cmd()
         .args([

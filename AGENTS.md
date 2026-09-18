@@ -192,24 +192,25 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands
 
+The Buildkite `test` job and local Linux preflight are the same script. Do not
+add GitHub Actions workflows.
+
 ```bash
-cargo test --locked --workspace
-cargo test --locked -p jmodguard-api --no-default-features --lib
-cargo clippy --locked --workspace --bins --lib -- -D warnings
-cargo clippy --locked -p jmodguard-bot -- -D warnings
-cargo clippy --locked -p jmodguard-api --no-default-features -- -D warnings
-cargo build --locked -p jmodguard-bot
-cargo build --locked -p jmodguard-api
-cargo build --locked -p jmodguard-api --no-default-features
-node --test scripts/frontend-state-test.mjs
-node --test scripts/frontend-warmup-test.mjs
-node --test scripts/publish-frontend-test.mjs
-python3 scripts/frontend-release-test.py
-python3 .buildkite/publish-image-test.py
-cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
-cargo build --locked -p jmodguard-conductor
-python3 scripts/check-service-boundaries.py
-python3 scripts/public-install-acceptance-test.py
+bash scripts/ci-preflight.sh
+# For a PR whose base is not main:
+# bash scripts/ci-preflight.sh --base origin/<base-branch>
+```
+
+That script runs lockfile verification, `cargo fmt --check`, whitespace
+`git diff --check`, the publisher/release contract tests, workspace and
+no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
+API `--no-default-features --all-targets`), conductor/bot/API builds, service
+boundaries, public-install acceptance, frontend Node/Python tests,
+`dual_process_smoke`, `cargo deny check bans licenses sources`, and
+`cargo audit` (fail-closed only when `JMODGUARD_AUDIT_FAIL_CLOSED=1`).
+Remote libSQL tests stay in the Buildkite `remote-database` job.
+
+```bash
 # or: ./scripts/smoke-dual-process.sh
 ```
 
@@ -223,8 +224,9 @@ cargo run -p jmodguard-api                         # waits ~30s locally / ~6m re
 ## Version pins (verified)
 
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
-  `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm`) must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
-  Buildkite; see `docs/BUILDKITE.md`.
+  `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
+  must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
+  Buildkite; see `docs/BUILDKITE.md`. Do not add GitHub Actions workflows.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).

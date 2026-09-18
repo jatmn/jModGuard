@@ -1,0 +1,43 @@
+# Supply-chain policy for cargo-deny (licenses, bans, sources).
+# Advisories are not part of this file. Buildkite runs cargo-audit:
+# pull requests and ordinary main pushes do not fail the test job on a new
+# CVE; scheduled builds fail closed so the advisory is visible.
+#
+# The root workspace uses LicenseRef-PolyForm-Noncommercial-1.0.0 and is not
+# published to crates.io. Ignore unpublished workspace crates; third-party
+# crates still go through the allow list.
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "LicenseRef-PolyForm-Noncommercial-1.0.0",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Zlib",
+]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/jatmn/jModGuard"]

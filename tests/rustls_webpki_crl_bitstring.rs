@@ -43,11 +43,9 @@ fn package_versions<'a>(lock: &'a str, package: &str) -> Vec<&'a str> {
             matching = false;
         } else if line == format!("name = \"{package}\"") {
             matching = true;
-        } else if matching {
-            if let Some(version) = line.strip_prefix("version = \"") {
-                versions.push(version.trim_end_matches('"'));
-                matching = false;
-            }
+        } else if matching && let Some(version) = line.strip_prefix("version = \"") {
+            versions.push(version.trim_end_matches('"'));
+            matching = false;
         }
     }
     versions
