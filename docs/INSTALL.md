@@ -100,7 +100,7 @@ Recovery without live providers:
 - Public install/resource checks: `cargo test --locked -p jmodguard-conductor --test install`
 - Dual-process bot/API: `cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke`
 
-`scripts/public-install-acceptance-test.py` checks that these docs stay public-source
+`scripts/public-install-acceptance-test.sh` checks that these docs stay public-source
 and do not require private ops.
 
 ## Still-deferred live provider checks

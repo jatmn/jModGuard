@@ -5,7 +5,7 @@
 # frontend/ paths in a signed release manifest. Keep Storage passwords out of git.
 set -euo pipefail
 
-pull_zone="$(python3 "$(dirname "$0")/frontend_publication.py" zone)"
+pull_zone="$(bash "$(dirname "$0")/frontend_publication.sh" zone)"
 key="${BUNNY_API_KEY:?set BUNNY_API_KEY to purge the Pull Zone}"
 
 zone="${BUNNY_STORAGE_ZONE:?set BUNNY_STORAGE_ZONE}"
@@ -151,8 +151,8 @@ receipt=".jmodguard-publication.json"
 download_existing "$receipt"
 # Invalidate the one mutable receipt before any PUT, even on A -> B -> A.
 # Keep the last completed asset hashes so a CSS-only retry stays independent.
-python3 "$(dirname "$0")/frontend_publication.py" pending "$root" "$backup_dir/$receipt" >"$backup_dir/pending.json"
-python3 "$(dirname "$0")/frontend_publication.py" complete "$root" "$backup_dir/$receipt" >"$backup_dir/complete.json"
+bash "$(dirname "$0")/frontend_publication.sh" pending "$root" "$backup_dir/$receipt" >"$backup_dir/pending.json"
+bash "$(dirname "$0")/frontend_publication.sh" complete "$root" "$backup_dir/$receipt" >"$backup_dir/complete.json"
 if ! storage_put "$receipt" "$backup_dir/pending.json" "application/json"; then
   echo "cannot mark publication pending; refusing to upload assets" >&2
   exit 1

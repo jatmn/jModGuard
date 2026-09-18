@@ -222,8 +222,8 @@ cargo build --locked -p jmodguard-conductor
 echo 'ci-preflight: python3 scripts/check-service-boundaries.py'
 python3 scripts/check-service-boundaries.py
 
-echo 'ci-preflight: python3 scripts/public-install-acceptance-test.py'
-python3 scripts/public-install-acceptance-test.py
+echo 'ci-preflight: bash scripts/public-install-acceptance-test.sh'
+bash scripts/public-install-acceptance-test.sh
 
 echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
 bash scripts/dependabot-config-test.sh

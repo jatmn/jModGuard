@@ -502,7 +502,7 @@ samples plus current provider list prices ([COST.md](COST.md)).
 
 The isolation/update/move/backup/recovery matrix stays in the existing conductor
 and dual-process tests, plus `crates/conductor/tests/install.rs` and
-`scripts/public-install-acceptance-test.py`. Local tests are not live Bunny,
+`scripts/public-install-acceptance-test.sh`. Local tests are not live Bunny,
 Discord, or AWS proof; the operator guide lists the remaining provider checks.
 
 See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and
