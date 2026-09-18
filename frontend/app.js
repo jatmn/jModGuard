@@ -913,10 +913,15 @@ function parseSnowflake(raw) {
 }
 
 function splitIds(s) {
-  return String(s ?? "")
-    .split(",")
-    .map((x) => parseSnowflake(x.trim()))
-    .filter(Boolean);
+  const ids = [];
+  for (const raw of String(s ?? "").split(",")) {
+    const token = raw.trim();
+    if (!token) continue;
+    const id = parseSnowflake(token);
+    if (!id) throw new Error("Enter Discord IDs as digits, mentions, or channel URLs");
+    ids.push(id);
+  }
+  return ids;
 }
 
 function applyPlanStepInput(step, type, raw) {

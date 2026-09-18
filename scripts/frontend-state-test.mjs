@@ -302,6 +302,33 @@ test('case-delete-role saves advance their revision token', async () => {
   assert.equal(puts[1].body.revision, 'revision-2');
 });
 
+test('case-delete-role save rejects invalid IDs instead of clearing roles', async () => {
+  const calls = [];
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const h = harness(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+      return response({ roles: ['1'], revision: 'revision-1' });
+    }
+    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+      return response({ revision: 'revision-2' });
+    }
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
+  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  roleInput.value = 'moderators';
+  await saveRoles.listeners.click({});
+  assert.equal(calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles')).length, 0);
+  assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
+});
+
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
   const { calls, inputs, save } = settingsHarness();
   inputs[0].value = '';
@@ -1043,9 +1070,12 @@ test('parseSnowflake keeps IDs as digit strings', () => {
   assert.equal(roles.length, 2);
   assert.equal(roles[0], '1329331947876479006');
   assert.equal(roles[1], '11');
-  const mixed = h.app.splitIds('not-an-id, 22');
-  assert.equal(mixed.length, 1);
-  assert.equal(mixed[0], '22');
+  const empty = h.app.splitIds('');
+  assert.equal(empty.length, 0);
+  assert.throws(
+    () => h.app.splitIds('not-an-id, 22'),
+    /digits, mentions, or channel URLs/,
+  );
 });
 
 test('loadConfig reads guild config with POST', async () => {

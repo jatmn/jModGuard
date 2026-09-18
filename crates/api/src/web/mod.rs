@@ -34,7 +34,6 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("private, no-store");
 /// Bunny (and other CDNs) honor this independently of browser Cache-Control.
 const CDN_CACHE_CONTROL: HeaderName = HeaderName::from_static("cdn-cache-control");
 const CDN_NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
-const VARY_COOKIE: HeaderValue = HeaderValue::from_static("Cookie");
 
 // ---------------------------------------------------------------------------
 // errors
@@ -732,6 +731,35 @@ where
     get(handler.clone()).post(handler)
 }
 
+/// Keep `Cookie` on `Vary` without dropping tokens other layers already set (CORS `Origin`).
+fn vary_including_cookie<B>(response: &axum::http::Response<B>) -> Option<HeaderValue> {
+    let mut tokens = Vec::new();
+    for value in response.headers().get_all(VARY) {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for part in text.split(',') {
+            let token = part.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if !tokens
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(token))
+            {
+                tokens.push(token.to_string());
+            }
+        }
+    }
+    if !tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("Cookie"))
+    {
+        tokens.push("Cookie".to_string());
+    }
+    HeaderValue::from_str(&tokens.join(", ")).ok()
+}
+
 /// Browser, CDN, and cookie-variant headers for every axum response, including `/health`.
 fn uncacheable_response_headers<S>(router: Router<S>) -> Router<S>
 where
@@ -748,7 +776,7 @@ where
         ))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             VARY,
-            VARY_COOKIE,
+            vary_including_cookie,
         ))
 }
 
@@ -1129,10 +1157,18 @@ fn assert_uncacheable_headers(headers: &HeaderMap) {
         Some(CDN_NO_STORE.as_bytes()),
         "API responses must send CDN-Cache-Control: no-store"
     );
-    assert_eq!(
-        headers.get(VARY).map(|v| v.as_bytes()),
-        Some(VARY_COOKIE.as_bytes()),
-        "API responses must vary CDN caches by Cookie"
+    let vary = headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|text| text.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        vary.iter()
+            .any(|token| token.eq_ignore_ascii_case("Cookie")),
+        "API responses must vary CDN caches by Cookie, got {vary:?}"
     );
 }
 
@@ -1386,6 +1422,50 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn cors_api_responses_keep_origin_and_cookie_vary() {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tmp =
+            std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
+        let db = crate::db::Db::open(&tmp, 2).unwrap();
+        let mut cfg = crate::config::ApiProcessConfig::default();
+        cfg.web.cors_origins = vec!["https://admin.example.com".into()];
+        let app = router(crate::web::state::ApiState::new(cfg, db).unwrap());
+        std::fs::remove_file(&tmp).ok();
+        crate::tenant::remove_sidecars(&tmp);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header("origin", "https://admin.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        super::assert_uncacheable_headers(res.headers());
+        let vary = res
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|text| text.split(','))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert!(
+            vary.iter()
+                .any(|token| token.eq_ignore_ascii_case("Origin")),
+            "CORS responses must still vary by Origin, got {vary:?}"
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://admin.example.com")
+        );
     }
 
     #[tokio::test]
