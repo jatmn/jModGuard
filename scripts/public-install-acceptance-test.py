@@ -67,12 +67,35 @@ class PublicInstallDocs(unittest.TestCase):
             "The UI files are published by **GitHub Actions in your private ops repo**.",
             bunny,
         )
-        self.assertIn("optional", bunny.lower())
+        self.assertNotIn("examples/private-ops", bunny)
         self.assertIn("not required", bunny.lower())
         webui = self.read("docs/WEBUI.md")
         self.assertIn("not required", webui.lower())
-        example = self.read("docs/examples/private-ops/README.md")
-        self.assertIn("optional", example.lower())
+        self.assertNotIn("examples/private-ops", webui)
+
+    def test_public_install_has_no_private_ops_frontend_release(self):
+        self.assertFalse((ROOT / "scripts/frontend_release.py").exists())
+        self.assertFalse((ROOT / "scripts/frontend-release-test.py").exists())
+        self.assertFalse((ROOT / "docs/examples/private-ops").exists())
+        for relative in (
+            "docs/INSTALL.md",
+            "docs/DEPLOY-BUNNY.md",
+            "docs/WEBUI.md",
+            "docs/OVERHAUL.md",
+            "docs/UPGRADE.md",
+            "docs/BUILDKITE.md",
+            "AGENTS.md",
+            "README.md",
+            "scripts/ci-preflight.sh",
+            "scripts/publish-frontend-bunny.sh",
+            "crates/conductor/src/install.rs",
+        ):
+            with self.subTest(relative):
+                text = self.read(relative)
+                self.assertNotIn("frontend_release.py", text)
+                self.assertNotIn("frontend-release-test.py", text)
+                self.assertNotIn("examples/private-ops", text)
+                self.assertNotIn("optional extra lock", text)
 
     def test_cost_formulas_are_measured_not_invented(self):
         cost = self.read("docs/COST.md")

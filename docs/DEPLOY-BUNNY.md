@@ -18,9 +18,8 @@ browse.
 
 Publish the three `frontend/` files from **this public repository** or the
 `frontend/` paths in a signed Nightly/Stable/manual release manifest (Buildkite
-does not upload a separate frontend bundle on main). A private ops GitHub Actions workflow is
-an optional extra lock so Storage passwords never sit in git; it is **not
-required** for a Bunny install. See [INSTALL.md](INSTALL.md).
+does not upload a separate frontend bundle on main). A private ops repository is
+**not required** for a Bunny install. See [INSTALL.md](INSTALL.md).
 
 ```text
 Browser  →  Bunny CDN (Pull Zone)
@@ -113,49 +112,14 @@ images so the first login works. After that, CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
 the page needs new API endpoints.
 
-**Later updates (optional private ops).** Repeating Storage publishes with a
-GitHub Actions lock is optional. Bunny Storage passwords do not belong in this
-public project. If you want that extra lock, copy
-[docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
-and follow its [optional installation instructions](examples/private-ops/README.md).
-A private repo is **not required**. Store these secrets there only if you use
-the example:
-
-| Secret | What it is |
-|---|---|
-| `BUNNY_STORAGE_ZONE` | Storage zone name |
-| `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
-| `BUNNY_STORAGE_ENDPOINT` | Regional host, default `storage.bunnycdn.com` |
-| `BUNNY_PULL_ZONE_ID` | Pull Zone id, used to purge CDN cache after upload |
-| `BUNNY_API_KEY` | Account API key for API state inspection and CDN purge |
-| `JMODGUARD_CHECKOUT_TOKEN` | PAT with `contents:read` on this repository. Required while jModGuard is private (the ops `GITHUB_TOKEN` cannot clone a different private repo). Omit once this repository is public. |
-
-Install the optional example files listed in the
-[private ops README](examples/private-ops/README.md) only when you want that
-lock. The example publishes an approved full source SHA from ops `main`. It is a
-frontend publisher, not a required runtime path; use your container runbook to
-deploy compatible bot/API digests and apply migrations. Public source already
-ships the UI files; Nightly/Stable/manual Buildkite builds publish signed
-manifests that inventory them.
-
-Release review must establish API compatibility and completed recovery evidence.
-The frontend checker verifies live Storage contents, publication completion and,
-for changed JS/HTML, the approved active API digest plus `/api/me` readiness.
-CSS-only changes can publish independently of an API rollout. API deployment
-workflows must share the example's concurrency group. `/health` alone cannot
-prove application readiness because it responds before database bootstrap.
-
-Publication requires both a valid Pull Zone id and purge credentials before any
-Storage access. All backup downloads must complete. On an upload error, restore
-all potentially modified assets, including a PUT accepted remotely despite a
-lost response. A mutable receipt records completion only after CDN purge; an old
-Actions cache entry or matching origin files cannot prove that purge finished.
-A failed purge leaves the new origin files and a pending receipt for retry.
-Uploads and rollback are not atomic at the CDN; verify the public site afterward.
-
-For a bad UI, commit an approved known-good release in ops and confirm its
-publication and purge. Disable publication and wait for in-flight runs before
-manual repairs; disabling a workflow does not undo an existing upload.
+**Later updates.** Upload the same three files again with **Browse Files**, or
+run [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
+with Storage and purge credentials in the environment (never git). CSS/layout-only
+revisions can publish without a new image; match the container revision again only
+when the page needs new API endpoints. That script backs up existing Storage
+objects, restores them if an upload fails, and records completion only after a
+successful Pull Zone purge. Uploads are not atomic at the CDN; verify the public
+site afterward. A failed purge leaves the new origin files for a retry.
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 6),
@@ -439,8 +403,7 @@ schema-open against a local libSQL server, not Bunny TLS.
   during remote database retry (startup then exits 0 instead of failing).
 - Missing Bunny DB secrets must not fall through to local SQLite
   (`JMODGUARD_REQUIRE_REMOTE_DB=1`).
-- Pin bot and API image **digests** in your container runbook (an optional
-  private ops repo can store them) and point
+- Pin bot and API image **digests** in your container runbook and point
   Magic Containers at those digests, not floating `:latest`. Storage
   `frontend/` can move independently for CSS/layout; do not mix a new
   website with an old API when the page needs new endpoints. A later

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Upload frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
 #
-# Optional: copy this and frontend_publication.py into a private ops repository
-# if you want a GitHub Actions lock. Public installs can upload the same files
-# from this repository or from frontend/ paths in a signed release manifest without that repo.
+# Public installs can upload the same files from this repository or from
+# frontend/ paths in a signed release manifest. Keep Storage passwords out of git.
 set -euo pipefail
 
 pull_zone="$(python3 "$(dirname "$0")/frontend_publication.py" zone)"

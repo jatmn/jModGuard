@@ -495,8 +495,7 @@ refused. The PolyForm Noncommercial license is unchanged.
 
 Bunny Storage publication from public `frontend/` or from `frontend/` paths in
 a Nightly/Stable/manual signed release manifest is the required path (Buildkite
-does not upload a separate frontend bundle on every main SHA). The private-ops
-GitHub Actions example remains an optional extra lock and is not deleted. Owner
+does not upload a separate frontend bundle on every main SHA). Owner
 setup, backup-key portability and recover-update are documented in
 [INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
 samples plus current provider list prices ([COST.md](COST.md)).

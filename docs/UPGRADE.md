@@ -140,9 +140,7 @@ the API with **OriginUrl**, not OriginMagicContainers.
 
 Select production from a reviewed release: full source SHA, exact bot/API
 digests and matching recovery evidence. Source publication creates artifacts;
-it does not authorize deployment. An optional private-ops frontend example can
-lock Storage publishes; it is **not required**. See
-[private ops](examples/private-ops/README.md) only if you want that extra lock.
+it does not authorize deployment.
 
 Retain current and rollback images before publishing a candidate. Source image
 workflows retain older versions; manual registry cleanup must protect those

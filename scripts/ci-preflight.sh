@@ -233,9 +233,6 @@ node --test scripts/frontend-warmup-test.mjs
 echo 'ci-preflight: node --test scripts/publish-frontend-test.mjs'
 node --test scripts/publish-frontend-test.mjs
 
-echo 'ci-preflight: python3 scripts/frontend-release-test.py'
-python3 scripts/frontend-release-test.py
-
 echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
 cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture
 

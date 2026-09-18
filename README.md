@@ -19,7 +19,7 @@ A **data-driven Discord moderation bot** written in Rust — open source, dual-p
 It can use a local SQLite file for single-host self-hosting or a remote libSQL
 service. **Bunny.net is the first-class cloud provider**: Bunny Database, private
 Magic Containers for the bot and API, and the admin UI on Storage/CDN from this
-public `frontend/` (a private GitHub Actions lock is optional). You do not need
+public `frontend/`. You do not need
 Bunny to run it ([SETUP.md](docs/SETUP.md)); that is the self-host / other-provider
 path.
 
