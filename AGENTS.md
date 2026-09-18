@@ -184,9 +184,8 @@ Owner-selected conductor updates use the local process adapter and R4 checkpoint
 compatible rollback never restores an old database. Conductor self-replacement
 writes `recover.json` and `jmodguard-conductor recover-update` is independent of
 the replacement process. Public install validation (`init-local`,
-`validate-install`, `/api/install`) does not require the private ops repository;
-that example remains an optional Storage-publish lock. Validation checks a plan
-and does not apply process configuration. Local plans require SQLite and disjoint
+`validate-install`, `/api/install`) does not require the private ops repository.
+Validation checks a plan and does not apply process configuration. Local plans require SQLite and disjoint
 storage paths; Bunny/AWS URL preflight does not. AWS is EC2 plus SQLite or
 libSQL, not RDS. See `docs/INSTALL.md`.
 
@@ -209,8 +208,9 @@ That script runs lockfile verification, `cargo fmt --check`, whitespace
 `git diff --check`, the publisher/release contract tests, workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
-service boundaries, public-install acceptance, the Dependabot config contract
-(`bash scripts/dependabot-config-test.sh`), frontend Node/Python tests,
+service boundaries, public-install acceptance
+(`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
+(`bash scripts/dependabot-config-test.sh`), frontend Node tests,
 `dual_process_smoke`, independent `jmodguard-bot` / `jmodguard-api` builds (with
 and without default features), `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
@@ -432,7 +432,7 @@ crates/bot/src/automod.rs          rule engine + action executor
 crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
-frontend/               admin SPA (Bunny Storage/CDN from public artifacts; optional private-ops lock; local: embedded in API)
+frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API)
 migrations/             0001_init through 0012_guild_moves
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …

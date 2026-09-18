@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -84,6 +85,29 @@ function setup() {
   const store = path.join(dir, "store");
   fs.mkdirSync(store);
   return { dir, frontend, store, log: path.join(dir, "log") };
+}
+
+function assetHashes(root) {
+  const names = ["index.html", "app.js", "style.css"];
+  const files = {};
+  for (const name of names) {
+    files[name] = crypto.createHash("sha256").update(fs.readFileSync(path.join(root, name))).digest("hex");
+  }
+  return files;
+}
+
+function seedCompletedReceipt(store, frontend, { compact = false } = {}) {
+  for (const name of ["index.html", "app.js", "style.css"]) {
+    fs.writeFileSync(path.join(store, name), fs.readFileSync(path.join(frontend, name)));
+  }
+  const receipt = {
+    version: 1,
+    complete: true,
+    pull_zone_id: "123",
+    files: assetHashes(frontend),
+  };
+  const body = compact ? JSON.stringify(receipt) : JSON.stringify(receipt, null, 2);
+  fs.writeFileSync(path.join(store, ".jmodguard-publication.json"), body);
 }
 
 function publish(ctx, extra = {}) {
@@ -191,6 +215,28 @@ test("returning to a previous revision cannot hide a failed purge", () => {
   assert.equal(publish(ctx).status, 0);
   assert.equal(receipt().complete, true);
   assert.equal(receipt().pull_zone_id, "123");
+});
+
+test("publish accepts Storage receipt without requires_api field", () => {
+  const ctx = setup();
+  seedCompletedReceipt(ctx.store, ctx.frontend);
+  fs.writeFileSync(path.join(ctx.frontend, "style.css"), "CSS-ONLY-UPDATE");
+  const result = publish(ctx);
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(fs.readFileSync(path.join(ctx.store, ".jmodguard-publication.json"), "utf8"));
+  assert.equal(receipt.complete, true);
+  assert.equal(receipt.requires_api, false);
+});
+
+test("publish accepts compact legacy receipt JSON for CSS-only update", () => {
+  const ctx = setup();
+  seedCompletedReceipt(ctx.store, ctx.frontend, { compact: true });
+  fs.writeFileSync(path.join(ctx.frontend, "style.css"), "CSS-ONLY-UPDATE");
+  const result = publish(ctx);
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(fs.readFileSync(path.join(ctx.store, ".jmodguard-publication.json"), "utf8"));
+  assert.equal(receipt.complete, true);
+  assert.equal(receipt.requires_api, false);
 });
 
 test("JS repair keeps API retry intent after purge or completion receipt failure", () => {

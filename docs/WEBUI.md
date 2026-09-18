@@ -52,16 +52,12 @@ serves them at `http://localhost:8080`.
 You can upload by hand in the Bunny dashboard (**Browse Files**) from this
 public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
 tag, or manual release manifest. Buildkite does not upload a separate frontend
-bundle on every main SHA. Repeating that with GitHub Actions is **optional**. The script
-[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
-and the example workflow
-[docs/examples/private-ops/publish-frontend.yml](examples/private-ops/publish-frontend.yml)
-keep Bunny Storage passwords out of this public project. A private ops repo is
-**not required** to install. Follow the
-[optional private ops instructions](examples/private-ops/README.md) only if you
-want that extra lock. Production updates can still select a full source SHA and
-compatible API digest in a reviewed ops release; source pushes do not promote
-production.
+bundle on every main SHA. To repeat an upload from a checkout, run
+[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
+`BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
+`BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
+[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
+ selects a non-default `frontend/` directory. A private ops repo is **not required** to install.
 
 **Another host or CDN.** Copy the same three files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only

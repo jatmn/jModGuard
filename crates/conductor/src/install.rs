@@ -667,10 +667,10 @@ fn next_steps(root: &Path) -> String {
          4. Record the backup key before the first portable export (docs/BACKUP-RESTORE.md).\n\
          5. Restore only into the absent restore/ directory. After conductor self-replacement,\n\
             run `jmodguard-conductor recover-update` independently of OAuth and private ops.\n\
-         6. Optional GitHub Actions in a private ops repo can lock Bunny Storage publishes.\n\
-            They are not required. Buildkite publishes bot/API images on every main SHA;\n\
-            conductor images and signed release manifests ship on Nightly/Stable/manual builds only.\n\
-            Admin UI files come from frontend/ in this repo or a release manifest (see docs/INSTALL.md).\n\
+         6. A private ops repository is not required. Buildkite publishes bot/API images on\n\
+            every main SHA; conductor images and signed release manifests ship on\n\
+            Nightly/Stable/manual builds only. Admin UI files come from frontend/ in this repo\n\
+            or a release manifest (see docs/INSTALL.md).\n\
          7. Live Bunny, Discord, and AWS provider checks remain deferred; see docs/INSTALL.md.\n\
          License: {LICENSE_ID} (LICENSE.md). Do not promise RDS/Postgres.\n",
         root.display()
@@ -903,6 +903,7 @@ mod tests {
         let steps = fs::read_to_string(root.join("NEXT-STEPS.txt")).unwrap();
         assert!(steps.contains("private ops"));
         assert!(steps.contains("not required"));
+        assert!(!steps.contains("GitHub Actions"));
         assert!(steps.contains("Nightly/Stable/manual"));
         assert!(!steps.contains("bot/API/conductor/frontend artifacts"));
         let env = fs::read_to_string(root.join("conductor.env.example")).unwrap();

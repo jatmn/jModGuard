@@ -222,8 +222,8 @@ cargo build --locked -p jmodguard-conductor
 echo 'ci-preflight: python3 scripts/check-service-boundaries.py'
 python3 scripts/check-service-boundaries.py
 
-echo 'ci-preflight: python3 scripts/public-install-acceptance-test.py'
-python3 scripts/public-install-acceptance-test.py
+echo 'ci-preflight: bash scripts/public-install-acceptance-test.sh'
+bash scripts/public-install-acceptance-test.sh
 
 echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
 bash scripts/dependabot-config-test.sh
@@ -236,9 +236,6 @@ node --test scripts/frontend-warmup-test.mjs
 
 echo 'ci-preflight: node --test scripts/publish-frontend-test.mjs'
 node --test scripts/publish-frontend-test.mjs
-
-echo 'ci-preflight: python3 scripts/frontend-release-test.py'
-python3 scripts/frontend-release-test.py
 
 echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
 cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture

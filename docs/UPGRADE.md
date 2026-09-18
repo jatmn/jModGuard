@@ -140,9 +140,7 @@ the API with **OriginUrl**, not OriginMagicContainers.
 
 Select production from a reviewed release: full source SHA, exact bot/API
 digests and matching recovery evidence. Source publication creates artifacts;
-it does not authorize deployment. An optional private-ops frontend example can
-lock Storage publishes; it is **not required**. See
-[private ops](examples/private-ops/README.md) only if you want that extra lock.
+it does not authorize deployment.
 
 Retain current and rollback images before publishing a candidate. Source image
 workflows retain older versions; manual registry cleanup must protect those
@@ -150,11 +148,16 @@ inventories. Verify approved digests remain pullable. Rebuilding an old source
 SHA can produce a different digest; approve that replacement explicitly rather
 than silently substituting it. Tags, including SHA tags, can be retagged.
 
-Pause reconciliation and wait for in-flight runs before incident changes. For
-remote data recovery, restore into a separate database, verify it, and switch
+Before incident rollback or manual repair, wait for any active conductor
+`release_update` job or Storage publication you started to finish; overlapping
+changes can leave mixed frontend and API state.
+
+Do not mix a new website with an old API when the page needs new endpoints.
+For remote data recovery, restore into a separate database, verify it, and switch
 configuration under the incident plan. Do not overwrite production to test a
 restore. Start the matching bot then API and restore matching frontend assets
-with a successful CDN purge. Reverting an ops release does not reverse migrations.
+with a successful CDN purge. Rolling back images or frontend files does not
+reverse migrations.
 
 ## Related
 

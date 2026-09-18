@@ -136,7 +136,7 @@ function tabInstallation() {
   }).catch((e) => { checklist.textContent = e.message; toast(e.message, "error"); });
   return el("div", {},
     el("h2", { text: "Installation settings" }),
-    el("p", { class: "muted", text: "Validate a public Bunny, local, or AWS topology from this source. Private ops automation is optional. Live provider checks stay deferred." }),
+    el("p", { class: "muted", text: "Validate a public Bunny, local, or AWS topology from this source. A private ops repository is not required. Live provider checks stay deferred." }),
     el("div", { class: "card" },
       el("h3", { text: "Public setup checklist" }),
       field("Topology", profile),

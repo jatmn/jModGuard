@@ -495,15 +495,14 @@ refused. The PolyForm Noncommercial license is unchanged.
 
 Bunny Storage publication from public `frontend/` or from `frontend/` paths in
 a Nightly/Stable/manual signed release manifest is the required path (Buildkite
-does not upload a separate frontend bundle on every main SHA). The private-ops
-GitHub Actions example remains an optional extra lock and is not deleted. Owner
+does not upload a separate frontend bundle on every main SHA). Owner
 setup, backup-key portability and recover-update are documented in
 [INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
 samples plus current provider list prices ([COST.md](COST.md)).
 
 The isolation/update/move/backup/recovery matrix stays in the existing conductor
 and dual-process tests, plus `crates/conductor/tests/install.rs` and
-`scripts/public-install-acceptance-test.py`. Local tests are not live Bunny,
+`scripts/public-install-acceptance-test.sh`. Local tests are not live Bunny,
 Discord, or AWS proof; the operator guide lists the remaining provider checks.
 
 See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and

@@ -6,9 +6,7 @@ selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
-tests and image jobs. The separate private-ops frontend example is an optional
-operator lock; it is not executed by this source repo and is not required to
-install.
+tests and image jobs. This repository has no GitHub Actions frontend publisher.
 
 ## Pipeline and agents
 

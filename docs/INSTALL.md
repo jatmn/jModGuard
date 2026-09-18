@@ -19,8 +19,6 @@ AWS proof. Eight merged overhaul PRs do not prove production cutover.
 | AWS | [DEPLOY-AWS.md](DEPLOY-AWS.md) | EC2 with the local adapter and SQLite or compatible libSQL. Not RDS/Postgres. |
 | Cost | [COST.md](COST.md) | Formulas from local measurements plus current provider list prices |
 
-Private GitHub Actions that publish Storage files are an **optional extra lock**
-([examples/private-ops](examples/private-ops/README.md)). They are not required.
 Buildkite publishes bot and API images from this repository on every main SHA.
 Conductor images and a complete signed `JMODGUARD-RELEASE-1` manifest ship only on
 scheduled Nightly, Stable tag, and manual builds ([BUILDKITE.md](BUILDKITE.md)).
@@ -44,8 +42,8 @@ secrets, and database tokens stay with the operator.
 
 ## Validate a plan
 
-The conductor checks topology, scope-limited URLs, and that private ops is not
-required. Validation does **not** apply process configuration. A **local** plan
+The conductor checks topology, scope-limited URLs, and that private ops is not required.
+Validation does **not** apply process configuration. A **local** plan
 must be SQLite on both databases, include the same storage paths `init-local`
 writes, and keep those roots disjoint. Bunny and AWS URL preflight still
 validate origin, database kinds, and credentials without requiring those local
@@ -87,11 +85,11 @@ Installation → Validate install plan (`GET /api/install`, `GET /api/install/pl
 ## Local disposable install and recovery drill
 
 ```bash
-python3 scripts/install-local.py --root /tmp/jmodguard-disposable
+cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable
 # fill the generated env examples locally
 cargo run --locked -p jmodguard-bot
 cargo run --locked -p jmodguard-api
-cargo run --locked -p jmodguard-conductor
+cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor
 ```
 
 Recovery without live providers:
@@ -102,7 +100,7 @@ Recovery without live providers:
 - Public install/resource checks: `cargo test --locked -p jmodguard-conductor --test install`
 - Dual-process bot/API: `cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke`
 
-`scripts/public-install-acceptance-test.py` checks that these docs stay public-source
+`scripts/public-install-acceptance-test.sh` checks that these docs stay public-source
 and do not require private ops.
 
 ## Still-deferred live provider checks

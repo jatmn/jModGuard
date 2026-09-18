@@ -1,16 +1,17 @@
-#!/usr/bin/env python3
-"""Ops-owned publication receipt: asset hashes, never a source-commit checkpoint."""
+#!/usr/bin/env bash
+# Bunny publication receipt: asset hashes, never a source-commit checkpoint.
+set -euo pipefail
+exec python3 - "$@" <<'PY'
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
 
 FILES = ("index.html", "app.js", "style.css")
-RECEIPT = ".jmodguard-publication.json"
 
 
 def asset_hashes(root: str) -> dict[str, str]:
@@ -37,14 +38,17 @@ def configured_zone() -> str:
 def parse(raw: bytes, zone: str) -> dict | None:
     try:
         data = json.loads(raw)
-        if (not valid_zone(zone) or not isinstance(data, dict) or data.get("version") != 1
-                or type(data.get("complete")) is not bool
-                or data.get("pull_zone_id") != zone):
+        if (
+            not valid_zone(zone)
+            or not isinstance(data, dict)
+            or data.get("version") != 1
+            or type(data.get("complete")) is not bool
+            or data.get("pull_zone_id") != zone
+        ):
             return None
         files = data.get("files")
         if not isinstance(files, dict):
             return None
-        # Legacy pending receipts cannot prove a retry was CSS-only.
         requires_api = data.get("requires_api", not data["complete"])
         if type(requires_api) is not bool:
             return None
@@ -57,7 +61,7 @@ def parse(raw: bytes, zone: str) -> dict | None:
         ):
             return None
         return data
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
@@ -69,18 +73,20 @@ def make_receipt(mode: str, root: str, previous: str, zone: str) -> dict:
     if not complete:
         requires_api = old is None or (not old["complete"] and old["requires_api"])
         for name in ("index.html", "app.js"):
-            # previous lives beside the actual pre-upload Storage backups.
-            # Those bytes can differ even when the last completed hashes match
-            # the selected source (repair or an interrupted A -> B -> A).
             backup = Path(previous).parent / name
             requires_api |= (
-                not old or old["files"].get(name) != desired[name]
+                not old
+                or old["files"].get(name) != desired[name]
                 or not backup.is_file()
                 or hashlib.sha256(backup.read_bytes()).hexdigest() != desired[name]
             )
-    return {"version": 1, "complete": complete, "pull_zone_id": zone,
-            "files": desired if complete else (old["files"] if old else {}),
-            "requires_api": bool(requires_api)}
+    return {
+        "version": 1,
+        "complete": complete,
+        "pull_zone_id": zone,
+        "files": desired if complete else (old["files"] if old else {}),
+        "requires_api": bool(requires_api),
+    }
 
 
 def main() -> None:
@@ -88,9 +94,18 @@ def main() -> None:
     if sys.argv[1:] == ["zone"]:
         print(zone)
         return
+    if len(sys.argv) != 4:
+        raise ValueError("expected zone, or pending|complete ROOT PREVIOUS")
     mode, root, previous = sys.argv[1:]
+    if mode not in ("pending", "complete"):
+        raise ValueError("expected pending or complete")
     print(json.dumps(make_receipt(mode, root, previous, zone), sort_keys=True))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        print(f"frontend_publication: {error}", file=sys.stderr)
+        sys.exit(1)
+PY
