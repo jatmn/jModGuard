@@ -68,7 +68,7 @@ Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
 **disabled** so GitHub-hosted standard runners can execute the job. This
 repository has no GitHub Actions self-hosted runners; CI is Buildkite.
 Do not register leftover Proxmox GHA runners or label any runner
-`dependabot`. `python3 scripts/dependabot-config-test.py` guards this YAML
+`dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
 and the operator-copy contract.
 
 The Cargo Git patch points back to this repository; it is not a GitHub

@@ -210,7 +210,7 @@ That script runs lockfile verification, `cargo fmt --check`, whitespace
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
 service boundaries, public-install acceptance, the Dependabot config contract
-(`python3 scripts/dependabot-config-test.py`), frontend Node/Python tests,
+(`bash scripts/dependabot-config-test.sh`), frontend Node/Python tests,
 `dual_process_smoke`, independent `jmodguard-bot` / `jmodguard-api` builds (with
 and without default features), `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
