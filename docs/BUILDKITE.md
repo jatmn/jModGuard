@@ -41,7 +41,9 @@ fail-open path. The existing clone credential must also fetch tags and full comm
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
 cache service. Do not add `.github/workflows`; there are no GitHub-hosted CI
-minutes for this repository.
+minutes for this repository. Hosted Dependabot Updates are not CI and do not
+consume those minutes. If a Dependabot job stays queued on a `dependabot`
+label, GitHub cancels it after 24 hours.
 
 The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
 `jmodguard-integration-tests`, plus the root library's

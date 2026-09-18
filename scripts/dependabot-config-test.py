@@ -27,6 +27,8 @@ class DependabotConfigTests(unittest.TestCase):
             "interval: weekly",
             "open-pull-requests-limit: 5",
             "cargo-minor-and-patch",
+            "- minor",
+            "- patch",
             "dependency-name: libsql-sqlite3-parser",
         ):
             with self.subTest(needle=needle):
@@ -59,18 +61,25 @@ class DependabotConfigTests(unittest.TestCase):
         self.assertIn("Actions → Dependabot Updates", self.development)
         self.assertIn("Dependabot on self-hosted runners", self.development)
         self.assertIn("24 hours", self.development)
+        self.assertIn("idle", self.development)
         self.assertIn("gha-runner-jmodguard", self.development)
         self.assertIn("python3 scripts/dependabot-config-test.py", self.development)
         self.assertIn("Actions → Dependabot Updates", self.buildkite)
         self.assertIn("Dependabot on self-hosted", self.buildkite)
+        self.assertIn("24 hours", self.buildkite)
         self.assertIn("gha-runner-jmodguard", self.buildkite)
         self.assertNotIn("No Actions jobs should start for this repo.", self.buildkite)
         self.assertIn("no GitHub Actions CI or", self.deploy)
-        self.assertIn("Dependabot version updates still use GitHub-hosted", self.deploy)
+        self.assertIn("Dependabot on self-hosted runners", self.deploy)
+        self.assertNotIn("still use GitHub-hosted", self.deploy)
         self.assertNotIn("This repository has no GitHub Actions jobs", self.deploy)
         self.assertIn("python3 scripts/dependabot-config-test.py", self.agents)
+        self.assertIn("Dependabot on self-hosted runners", self.agents)
+        self.assertIn("24 hours", self.agents)
+        self.assertIn("gha-runner-jmodguard", self.agents)
         self.assertIn("python3 scripts/dependabot-config-test.py", self.preflight)
-        self.assertIn("GitHub Actions workflows are forbidden", self.preflight)
+        self.assertIn("GitHub Actions workflows and GitHub-hosted CI runners are forbidden", self.preflight)
+        self.assertIn("Dependabot Updates dynamic workflows are not CI", self.preflight)
 
 
 if __name__ == "__main__":

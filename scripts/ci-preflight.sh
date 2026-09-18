@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Single source of truth for the Buildkite `test` job.
 # The remote-database job (libSQL containers) stays separate.
-# GitHub Actions workflows and GitHub-hosted runners are forbidden.
+# GitHub Actions workflows and GitHub-hosted CI runners are forbidden.
+# Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"

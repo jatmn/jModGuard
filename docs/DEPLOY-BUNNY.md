@@ -166,8 +166,9 @@ these files.
 
 Buildkite's self-hosted `linux` queue runs tests and publishes the bot/API
 images after both test jobs pass. This repository has no GitHub Actions CI or
-image jobs or runner fallback. Dependabot version updates still use GitHub-hosted
-dynamic workflows; they are not image publication. GitHub still displays the Buildkite status and a link to
+image jobs or runner fallback. Dependabot version updates use GitHub-hosted
+dynamic workflows only while **Dependabot on self-hosted runners** stays
+disabled; they are not image publication. GitHub still displays the Buildkite status and a link to
 its build logs. See [Buildkite setup](BUILDKITE.md) for GHCR credentials,
 agent requirements, tag builds and manual publication.
 
