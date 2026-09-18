@@ -5,10 +5,12 @@ The WebUI is a single-page admin app. On a laptop it is served by
 on Storage/CDN; the API container stays private and only answers `/api`,
 login, and OAuth. The pages never open SQL from the browser. They call the
 API; the API (and the bot) open the database. If the CDN page loads while
-the API is still starting, `/api/me` returns `503` `{error:"not ready"}`
+the API is still starting, `POST /api/me` (and `GET /api/me`) returns `503` `{error:"not ready"}`
 and the UI keeps waiting (up to eight minutes). Consecutive `502`/`504`,
 failed fetches, or origin pulls that never complete stop after 90 seconds
-of those failures so a bad origin rule is not an infinite spinner. `/login` and
+of those failures so a bad origin rule is not an infinite spinner. After login,
+the SPA loads guild configuration with `POST /api/guilds/{id}/config` (GET remains
+for compatibility) so a CDN cannot reuse a cached settings document. `/login` and
 `/oauth/callback` return an HTML wait page that reloads until axum can
 redirect. OAuth CSRF lives in a cookie, so an API restart between Login
 and Discord's return still completes the handshake.
@@ -116,7 +118,7 @@ the editor does not undo an acknowledged global write.
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
-| **Log Channels** | map each event type to a channel ID for that server |
+| **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Bans** | ban history + unban via the bot token (API process) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
@@ -135,7 +137,10 @@ at **server** scope or **global** scope:
 - editors show which scope applies ("server override" / "global" badges).
 
 **Log channels are always per-server.** Discord channel IDs belong to one
-server, so they cannot be global defaults or copied between servers.
+server, so they cannot be global defaults or copied between servers. The
+Log Channels tab accepts a raw snowflake, `<#id>` mention, or channel URL
+as a **string** (never a JavaScript `Number`). The same snowflake parsing
+applies to role/user/channel ID fields on Rules, Commands, and Settings.
 
 **Global writes are owner-only.** The API requires the signed-in Discord user
 to match `bot.owner_id` (non-zero) for:
@@ -183,9 +188,11 @@ session can manage that guild (or bot ownership for global scope):
 
 ```
 GET    /api/me                         # includes is_bot_owner, conductor_url, preview
+POST   /api/me                         # same body as GET; SPA login bootstrap (not CDN-cached)
 POST   /api/preview                    # owner-only; returns a tab-scoped preview token
 DELETE /api/preview                    # exit preview; owner session is unchanged
 GET    /api/guilds/{id}/config
+POST   /api/guilds/{id}/config         # same body as GET; SPA workspace load (not CDN-cached)
 PUT    /api/guilds/{id}/settings
 GET    /api/guilds/{id}/rules/{rule}          PUT/DELETE …
 GET    /api/guilds/{id}/badwords              POST (add) / DELETE /{word_id}
@@ -198,6 +205,9 @@ GET    /api/guilds/{id}/events?event=&user=&limit=
 GET    /api/guilds/{id}/bans
 POST   /api/guilds/{id}/unban
 GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
+GET    /api/guilds/{id}/case-delete-roles
+POST   /api/guilds/{id}/case-delete-roles  # same body as GET; SPA settings load
+PUT    /api/guilds/{id}/case-delete-roles
 ```
 
 Scopes in request bodies: `"scope": "guild" | "global"` (`global` requires
@@ -213,8 +223,14 @@ bot owner).
   (empty or mismatched state is rejected). Successful login rotates the
   session id.
 - Session cookies use the `Secure` flag when `web.base_url` starts with
-  `https://`. API JSON sets `Cache-Control: private, no-store`. Expose
-  publicly only behind HTTPS (see SETUP.md §8).
+  `https://`. API JSON sets `Cache-Control: private, no-store`,
+  `CDN-Cache-Control: no-store`, and `Vary: Cookie`. The page loads the
+  signed-in workspace with `POST /api/me` so a CDN cannot reuse a cached
+  `GET /api/me` identity after the in-memory session is gone. Guild settings
+  load with `POST /api/guilds/{id}/config` for the same reason. Expose
+  publicly only behind HTTPS (see SETUP.md §8). On Bunny, API-path edge
+  rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
+  see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
 
 ### Appearance
 

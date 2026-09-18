@@ -145,7 +145,7 @@ fn probe_response(probe: Probe) -> String {
     };
     let body_out = if probe.head { "" } else { body };
     format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n{extra}content-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body_out}",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n{extra}content-length: {}\r\ncache-control: no-store\r\ncdn-cache-control: no-store\r\nconnection: close\r\n\r\n{body_out}",
         body.len()
     )
 }
@@ -281,6 +281,14 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_probe(b"POST /api/me HTTP/1.1"),
+            Probe {
+                liveness: false,
+                json_error: true,
+                head: false
+            }
+        );
+        assert_eq!(
             parse_probe(b"GET /api/me HTTP/1.1"),
             Probe {
                 liveness: false,
@@ -398,6 +406,15 @@ mod tests {
             assert!(
                 text.contains("content-type: application/json"),
                 "API warmup must be JSON: {text}"
+            );
+            let post = exchange(addr, b"POST /api/me HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(
+                post.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "SPA POST /api/me must also be fenced: {post}"
+            );
+            assert!(
+                post.contains(NOT_READY_JSON),
+                "SPA POST warmup must use the API JSON error shape: {post}"
             );
         };
         super::serve_while(&listener, work).await;

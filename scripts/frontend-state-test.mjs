@@ -57,7 +57,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -248,7 +248,9 @@ function settingsHarness() {
   const cfg = { settings: { prefix: '!', bot_name: 'Guard', retention_days: 30 }, settings_override: { prefix: '!', retention_days: 30 }, global_settings: { prefix: '/' } };
   const h = harness(async (url, options) => {
     calls.push({ url, method: options.method, body: options.body ? JSON.parse(options.body) : null });
-    return response(options.method === 'GET' ? cfg : { nickname_queued: false });
+    if (options.method === 'PUT' && url.endsWith('/settings')) return response({ nickname_queued: false });
+    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: '' });
+    return response(cfg);
   });
   h.app.state.config = cfg;
   h.app.state.tab = 'settings';
@@ -264,7 +266,7 @@ test('settings patches send only changed fields to the selected server', async (
   await save.listeners.click({});
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
-  assert.ok(calls.some((c) => c.method === 'GET' && c.url.endsWith('/case-delete-roles')));
+  assert.ok(calls.some((c) => c.method === 'POST' && c.url.endsWith('/case-delete-roles')));
 });
 
 test('case-delete-role saves advance their revision token', async () => {
@@ -274,7 +276,7 @@ test('case-delete-role saves advance their revision token', async () => {
   const h = harness(async (url, options) => {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method: options.method, body });
-    if (url.endsWith('/case-delete-roles') && options.method === 'GET') {
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
       return response({ roles: ['1'], revision: 'revision-1' });
     }
     if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
@@ -287,7 +289,7 @@ test('case-delete-role saves advance their revision token', async () => {
   h.app.tabSettings();
   await new Promise(resolve => setImmediate(resolve));
 
-  const roleInput = h.elements.find(n => n.tag === 'input' && n.attrs.placeholder === 'Role IDs, comma-separated');
+  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
   const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
   roleInput.value = '1, 2';
   await saveRoles.listeners.click({});
@@ -298,6 +300,33 @@ test('case-delete-role saves advance their revision token', async () => {
   assert.equal(puts.length, 2);
   assert.equal(puts[0].body.revision, 'revision-1');
   assert.equal(puts[1].body.revision, 'revision-2');
+});
+
+test('case-delete-role save rejects invalid IDs instead of clearing roles', async () => {
+  const calls = [];
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const h = harness(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+      return response({ roles: ['1'], revision: 'revision-1' });
+    }
+    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+      return response({ revision: 'revision-2' });
+    }
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
+  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  roleInput.value = 'moderators';
+  await saveRoles.listeners.click({});
+  assert.equal(calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles')).length, 0);
+  assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
 });
 
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
@@ -418,7 +447,7 @@ test('global rule partial success reconciles the committed value before navigati
   h.failures.delete = true;
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
   assert.equal(h.snapshot().rules[0].effective.enabled, false);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
@@ -435,7 +464,7 @@ test('global rule partial success with failed reconciliation stays unavailable t
   h.failures.delete = h.failures.refresh = true;
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
   assert.equal(h.app.state.config, null);
   assert.match(textOf(h.content), /Configuration unavailable/);
   assert.match(h.nodes.get('#toast').textContent, /Global rule saved/);
@@ -449,7 +478,7 @@ test('global rule partial success with failed reconciliation stays unavailable t
   await retry.listeners.click({});
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
   assert.match(textOf(h.content), /disabled/);
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET', 'GET']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST', 'POST']);
 });
 
 test('a refused rule PUT retains the checkbox draft and never deletes an override', async () => {
@@ -471,7 +500,7 @@ test('a successful global rule save clears the guild override and refreshes', as
   const h = ruleSaveHarness({ override: true });
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'GET']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
   assert.equal(h.calls[0].body.scope, 'global');
   assert.equal(h.calls[1].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].guild_override, null);
@@ -484,7 +513,7 @@ test('a guild-only rule save does not run global override cleanup', async () => 
   const h = ruleSaveHarness({ scope: 'guild' });
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'GET']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'POST']);
   assert.equal(h.calls[0].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].global.enabled, true);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
@@ -494,7 +523,7 @@ test('a refused command save retains its checkbox value for the next save', asyn
   const calls = [];
   let refuse = true;
   const h = harness(async (url, options) => {
-    if (options.method === 'GET') return response({ commands: [] });
+    if (String(url).includes('/config') || options.method === 'GET') return response({ commands: [] });
     calls.push(JSON.parse(options.body));
     if (refuse) throw new Error('write refused');
     return response({ ok: true });
@@ -572,7 +601,7 @@ test('copy captures source membership on selection and sends both page scopes', 
   const cfg = { enrollment_id: 'destination', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '!' } };
   const { app, elements } = harness(async (url, opts) => {
     calls.push({ url, opts });
-    if (opts.method === 'POST') return response({ copied: ['settings'] });
+    if (url.endsWith('/copy') && opts.method === 'POST') return response({ copied: ['settings'] });
     return response(url.includes('987654321098765433') ? { enrollment_id: 'selected-source' } : cfg);
   });
   app.state.config = cfg;
@@ -583,11 +612,11 @@ test('copy captures source membership on selection and sends both page scopes', 
   source.value = app.state.guilds[1].id;
   source.selectedOptions = [{ textContent: 'Second' }];
   await copy.listeners.click({});
-  assert.equal(calls.filter((c) => c.opts.method === 'POST').length, 0, 'copy waits for an explicitly loaded source');
+  assert.equal(calls.filter((c) => c.url.endsWith('/copy')).length, 0, 'copy waits for an explicitly loaded source');
   await source.listeners.change({});
   assert.equal(calls.filter((c) => c.url.includes(app.state.guilds[1].id)).length, 1);
   await copy.listeners.click({});
-  const sent = calls.find(c => c.opts.method === 'POST');
+  const sent = calls.find(c => c.opts.method === 'POST' && c.url.endsWith('/copy'));
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
   assert.equal(sent.opts.headers['x-jmodguard-enrollment'], 'destination');
   assert.equal(calls.filter(c => c.url.includes('987654321098765433')).length, 1, 'copy must not refresh the selected source token');
@@ -1027,4 +1056,67 @@ test('private downloads share preview authentication-loss handling', async () =>
     assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), true);
     assert.equal(h.nodes.get('#preview-return-link').classList.contains('hidden'), false);
   }
+});
+
+test('parseSnowflake keeps IDs as digit strings', () => {
+  const h = harness();
+  assert.equal(h.app.parseSnowflake('1329331947876479006'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('<#1329331947876479006>'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('https://discord.com/channels/10/1329331947876479006'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('general'), '');
+  assert.equal(h.app.parseSnowflake('<@&1329331947876479006>'), '1329331947876479006');
+  assert.equal(h.app.parseSnowflake('<@!1329331947876479006>'), '1329331947876479006');
+  const roles = h.app.splitIds('<@&1329331947876479006>, 11');
+  assert.equal(roles.length, 2);
+  assert.equal(roles[0], '1329331947876479006');
+  assert.equal(roles[1], '11');
+  const empty = h.app.splitIds('');
+  assert.equal(empty.length, 0);
+  assert.throws(
+    () => h.app.splitIds('not-an-id, 22'),
+    /digits, mentions, or channel URLs/,
+  );
+});
+
+test('loadConfig reads guild config with POST', async () => {
+  const calls = [];
+  const { app } = harness(async (url, opts) => {
+    calls.push({ url, method: opts.method });
+    return response({ settings: { prefix: '!' } });
+  });
+  await app.loadConfig();
+  assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
+});
+
+test('unauthenticated settings save returns to login', async () => {
+  const h = harness(async () => ({
+    ok: false,
+    status: 400,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }));
+  h.app.state.config = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  h.app.state.tab = 'settings';
+  h.nodes.get('#login-view').classList.add('hidden');
+  h.nodes.get('#main-view').classList.remove('hidden');
+  h.app.tabSettings();
+  const inputs = h.elements.filter(n => n.tag === 'input');
+  const save = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save');
+  inputs[0].value = '?';
+  await save.listeners.click({});
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
+});
+
+test('unauthenticated log-channel mutation returns to login', async () => {
+  const h = harness(async () => ({
+    ok: false,
+    status: 400,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ error: 'not authenticated' }),
+  }));
+  h.nodes.get('#login-view').classList.add('hidden');
+  h.nodes.get('#main-view').classList.remove('hidden');
+  const err = Object.assign(new Error('not authenticated'), { status: 400 });
+  assert.equal(h.app.handleAuthLoss(err), true);
+  assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
 });

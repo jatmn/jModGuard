@@ -222,10 +222,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap(),
-            "private, no-store"
-        );
+        super::assert_uncacheable_headers(response.headers());
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
             .await
@@ -292,6 +289,13 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
                 assert_eq!(status, StatusCode::CONFLICT, "{suffix}: {body}");
                 assert_eq!(body["code"], "guild_enrollment_inactive");
                 assert!(!body.to_string().contains("private"));
+            }
+            for suffix in ["config", "case-delete-roles"] {
+                let (status, body) = f
+                    .request("POST", &format!("/api/guilds/{guild}/{suffix}"), "")
+                    .await;
+                assert_eq!(status, StatusCode::CONFLICT, "POST {suffix}: {body}");
+                assert_eq!(body["code"], "guild_enrollment_inactive");
             }
         }
         for (method, suffix, body) in [

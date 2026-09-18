@@ -300,7 +300,7 @@ build), only `/health` returns `200`. `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
-`/api/me` while the origin is still starting (`not ready` for up to eight
+`POST /api/me` while the origin is still starting (`not ready` for up to eight
 minutes). Consecutive `502`/`504`, dropped origin pulls, or origin pulls
 that never complete stop after 90 seconds of those failures with an error
 instead of spinning forever. OAuth CSRF is a cookie, so a restart between
@@ -358,9 +358,18 @@ On the Pull Zone from step 2 (Storage origin for the files):
    ActionType 22) on a Storage-origin Pull Zone: that rule can match and
    still serve Bunny’s “We’re deploying your app” splash while the API is
    already live.
-2. Bypass Perma-Cache on the API paths (ExtraAction BypassPermaCache).
-   The API also sends `Cache-Control: private, no-store`, but a cached
-   `/api/me` would still leak sessions if you skip the bypass.
+2. On that same rule, add ExtraActions **Bypass Perma-Cache**
+   (`BypassPermaCache`) **and Override Cache Time = 0**
+   (`OverrideCacheTime`, ActionParameter1 `0`). Bypass Perma-Cache does
+   **not** skip Bunny’s ordinary edge cache. A cached `GET /api/me` is
+   served to browsers that never sent a session cookie and shows a
+   signed-in workspace whose later `PUT`s fail with `not authenticated`.
+   The API also sends `Cache-Control: private, no-store`,
+   `CDN-Cache-Control: no-store`, and `Vary: Cookie`. After adding the
+   cache-time override, **purge the Pull Zone** so an already-cached
+   `/api/me` cannot keep leaking. The SPA bootstraps with `POST /api/me`
+   so leftover GET cache entries are not used for login. The SPA also loads
+   guild settings with `POST /api/guilds/{id}/config`.
 3. Trigger on request URL for `/api*`, `/login*`, `/logout*`, `/oauth*`,
    and `/health*`. Bunny allows **at most five** PatternMatches per
    trigger. Matching both a custom hostname and the system `*.b-cdn.net`
