@@ -96,6 +96,8 @@ class PublicInstallDocs(unittest.TestCase):
                 self.assertNotIn("frontend-release-test.py", text)
                 self.assertNotIn("examples/private-ops", text)
                 self.assertNotIn("optional extra lock", text)
+                self.assertNotIn("Reverting an ops release", text)
+                self.assertNotIn("in-flight runs", text)
 
     def test_cost_formulas_are_measured_not_invented(self):
         cost = self.read("docs/COST.md")

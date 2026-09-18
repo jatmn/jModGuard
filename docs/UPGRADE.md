@@ -148,11 +148,12 @@ inventories. Verify approved digests remain pullable. Rebuilding an old source
 SHA can produce a different digest; approve that replacement explicitly rather
 than silently substituting it. Tags, including SHA tags, can be retagged.
 
-Pause reconciliation and wait for in-flight runs before incident changes. For
-remote data recovery, restore into a separate database, verify it, and switch
+Do not mix a new website with an old API when the page needs new endpoints.
+For remote data recovery, restore into a separate database, verify it, and switch
 configuration under the incident plan. Do not overwrite production to test a
 restore. Start the matching bot then API and restore matching frontend assets
-with a successful CDN purge. Reverting an ops release does not reverse migrations.
+with a successful CDN purge. Rolling back images or frontend files does not
+reverse migrations.
 
 ## Related
 
