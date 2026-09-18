@@ -87,7 +87,7 @@ Installation → Validate install plan (`GET /api/install`, `GET /api/install/pl
 ## Local disposable install and recovery drill
 
 ```bash
-python3 scripts/install-local.py --root /tmp/jmodguard-disposable
+cargo run --locked -p jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable
 # fill the generated env examples locally
 cargo run --locked -p jmodguard-bot
 cargo run --locked -p jmodguard-api

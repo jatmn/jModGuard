@@ -2,9 +2,6 @@
 """Public-source install docs must not require the private ops repository."""
 from __future__ import annotations
 
-import importlib.util
-import os
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -130,21 +127,15 @@ class PublicInstallDocs(unittest.TestCase):
         self.assertIn("docs/DEPLOY-AWS.md", readme)
         self.assertNotIn("Point-and-click install remains later work", readme)
 
-    def test_install_local_honors_custom_conductor_bin_path(self):
-        script = ROOT / "scripts/install-local.py"
-        spec = importlib.util.spec_from_file_location("install_local", script)
-        self.assertIsNotNone(spec and spec.loader)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        with tempfile.TemporaryDirectory() as tmp:
-            custom = Path(tmp) / "jmodguard-conductor-custom"
-            custom.write_bytes(b"")
-            with self.subTest("custom basename"):
-                os.environ["JMODGUARD_CONDUCTOR_BIN"] = str(custom)
-                try:
-                    self.assertEqual(mod.conductor_bin(), custom)
-                finally:
-                    os.environ.pop("JMODGUARD_CONDUCTOR_BIN", None)
+    def test_public_install_has_no_python_installer(self):
+        self.assertFalse((ROOT / "scripts/install-local.py").exists())
+        install = self.read("docs/INSTALL.md")
+        self.assertNotIn("install-local.py", install)
+        self.assertNotIn("python3 scripts/install-local", install)
+        self.assertIn(
+            "cargo run --locked -p jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable",
+            install,
+        )
 
 
 if __name__ == "__main__":
