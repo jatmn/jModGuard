@@ -79,6 +79,66 @@ require_contains docs/DEPLOY-BUNNY.md "BUNNY_API_KEY"
 require_contains docs/WEBUI.md "BUNNY_STORAGE_ZONE"
 require_contains docs/WEBUI.md "BUNNY_PULL_ZONE_ID"
 
+# test_bunny_dashboard_copy_matches_live_controls
+for relative in docs/DEPLOY-BUNNY.md docs/WEBUI.md docs/UPGRADE.md docs/SETUP.md; do
+  require_absent "$relative" "Change Origin URL"
+  require_absent "$relative" "Disable Cookies"
+done
+require_contains docs/DEPLOY-BUNNY.md "Override Origin URL"
+require_contains docs/WEBUI.md "Override Origin URL"
+require_contains docs/UPGRADE.md "Override Origin URL"
+require_contains docs/DEPLOY-BUNNY.md "Strip Response Cookies"
+require_contains docs/WEBUI.md "Strip Response Cookies"
+require_contains docs/DEPLOY-BUNNY.md "at least one replication region"
+require_contains docs/WEBUI.md "at least one replication region"
+require_contains docs/DEPLOY-BUNNY.md "Owned domain or subdomain"
+require_contains docs/WEBUI.md "owned domain/subdomain"
+require_contains docs/DEPLOY-BUNNY.md "does **not** expose sticky-session settings"
+require_contains docs/WEBUI.md "not on the add-endpoint screen"
+
+# test_discord_invite_permissions_follow_url_generator_order
+python3 - "$root" <<'PY' || fail "discord invite permission order"
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+expected = [
+    "Kick Members",
+    "Ban Members",
+    "Manage Nicknames",
+    "Manage Roles",
+    "Moderate Members",
+    "View Channels",
+    "Send Messages",
+    "Manage Messages",
+    "Read Message History",
+]
+setup = (root / "docs/SETUP.md").read_text()
+start = setup.find("Tick them in this Discord URL Generator order")
+end = setup.find("Open the generated URL", start)
+if start < 0 or end < 0:
+    sys.exit("docs/SETUP.md missing Discord URL Generator permission checklist")
+names = re.findall(r"- `([^`]+)`", setup[start:end])
+if names != expected:
+    sys.exit(f"docs/SETUP.md permission order {names!r} != {expected!r}")
+bunny = (root / "docs/DEPLOY-BUNNY.md").read_text()
+idx = bunny.find("**General:**")
+idx2 = bunny.find("**Text:**", idx)
+idx3 = bunny.find("## 7. Acceptance test", idx2)
+if min(idx, idx2, idx3) < 0:
+    sys.exit("docs/DEPLOY-BUNNY.md missing Discord URL Generator permission lists")
+chunk = bunny[idx:idx3]
+positions = []
+for name in expected:
+    pos = chunk.find(name)
+    if pos < 0:
+        sys.exit(f"docs/DEPLOY-BUNNY.md missing permission {name}")
+    positions.append(pos)
+if positions != sorted(positions):
+    sys.exit("docs/DEPLOY-BUNNY.md permissions are not in URL Generator order")
+PY
+
 # test_public_install_has_no_private_ops_frontend_release
 [[ ! -e "$root/scripts/frontend_release.py" ]] || fail "scripts/frontend_release.py must not exist"
 [[ ! -e "$root/scripts/frontend-release-test.py" ]] || fail "scripts/frontend-release-test.py must not exist"

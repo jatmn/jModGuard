@@ -136,7 +136,7 @@ Same order: migrate with the bot app, then roll the API app. Both must keep
 using the same Bunny Database. Upload matching `frontend/` to Storage and purge
 the Pull Zone when the page needs the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
-the API with **OriginUrl**, not OriginMagicContainers.
+the API with **Override Origin URL** (`OriginUrl`), not OriginMagicContainers.
 
 Select production from a reviewed release: full source SHA, exact bot/API
 digests and matching recovery evidence. Source publication creates artifacts;

@@ -37,17 +37,22 @@ serves them at `http://localhost:8080`.
 
 **Bunny (first-class cloud path, [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md)).**
 
-1. Create a Bunny **Storage Zone**.
+1. Create a Bunny **Storage Zone**. The create form requires a primary
+   region and at least one replication region; do not skip replication.
 2. Put the three files in the **root** of that zone so they are `/index.html`
    (or `/`), `/app.js`, and `/style.css`.
-3. Create a **Pull Zone** whose origin is that Storage Zone. That hostname
-   (or a custom domain on it) is the public admin site.
+3. Create a **Pull Zone** whose origin is that Storage Zone. The public
+   admin site is either the Pull Zone `*.b-cdn.net` hostname or an owned domain/subdomain
+   you add on that zone. Use that same host for `JMODGUARD_WEB_BASE_URL` and
+   the Discord OAuth redirect.
 4. Point `/api`, `/login`, `/logout`, `/oauth`, and `/health` on that Pull
-   Zone at the API container with **Change Origin URL** (`OriginUrl`) to
+   Zone at the API container with **Override Origin URL** (`OriginUrl`) to
    the API endpoint Pull Zone host (you must create a CDN endpoint on the
-   API app first; see DEPLOY-BUNNY.md). Do not use Override Origin: Magic
-   Containers on a Storage Pull Zone. Leave `window.JMODGUARD_API_BASE`
-   unset. Disable Cookies must be off.
+   API app first; sticky sessions are set on that endpoint after it
+   exists, not on the add-endpoint screen; see DEPLOY-BUNNY.md). Do not
+   use Override Origin: Magic Containers on a Storage Pull Zone. Leave
+   `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
+   (Caching → General; `DisableCookies=false`).
 
 You can upload by hand in the Bunny dashboard (**Browse Files**) from this
 public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
