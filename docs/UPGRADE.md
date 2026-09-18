@@ -148,6 +148,10 @@ inventories. Verify approved digests remain pullable. Rebuilding an old source
 SHA can produce a different digest; approve that replacement explicitly rather
 than silently substituting it. Tags, including SHA tags, can be retagged.
 
+Before incident rollback or manual repair, wait for any active conductor
+`release_update` job or Storage publication you started to finish; overlapping
+changes can leave mixed frontend and API state.
+
 Do not mix a new website with an old API when the page needs new endpoints.
 For remote data recovery, restore into a separate database, verify it, and switch
 configuration under the incident plan. Do not overwrite production to test a

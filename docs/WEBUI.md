@@ -54,8 +54,10 @@ public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
 tag, or manual release manifest. Buildkite does not upload a separate frontend
 bundle on every main SHA. To repeat an upload from a checkout, run
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
-Storage and purge credentials in the environment, never git. A private ops repo is
-**not required** to install.
+`BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
+`BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
+[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
+ selects a non-default `frontend/` directory. A private ops repo is **not required** to install.
 
 **Another host or CDN.** Copy the same three files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only

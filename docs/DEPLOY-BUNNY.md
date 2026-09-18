@@ -114,12 +114,24 @@ the page needs new API endpoints.
 
 **Later updates.** Upload the same three files again with **Browse Files**, or
 run [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
-with Storage and purge credentials in the environment (never git). CSS/layout-only
-revisions can publish without a new image; match the container revision again only
-when the page needs new API endpoints. That script backs up existing Storage
-objects, restores them if an upload fails, and records completion only after a
+with the environment variables below (never git). CSS/layout-only revisions can
+publish without a new image; match the container revision again only when the
+page needs new API endpoints. That script backs up existing Storage objects,
+restores them if an upload fails, and records completion only after a
 successful Pull Zone purge. Uploads are not atomic at the CDN; verify the public
 site afterward. A failed purge leaves the new origin files for a retry.
+
+| Variable | What it is |
+|---|---|
+| `BUNNY_STORAGE_ZONE` | Storage zone name |
+| `BUNNY_STORAGE_PASSWORD` | Storage zone HTTP AccessKey (not the account API key) |
+| `BUNNY_STORAGE_ENDPOINT` | Regional host; default `storage.bunnycdn.com` |
+| `BUNNY_PULL_ZONE_ID` | Pull Zone id for the publication receipt and purge target |
+| `BUNNY_API_KEY` | Account API key used to purge the Pull Zone after upload |
+
+Optional `JMODGUARD_FRONTEND_ROOT` points at a directory containing
+`index.html`, `app.js`, and `style.css` (defaults to this repository's
+`frontend/`).
 
 Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
 `/login`, `/logout`, and `/oauth/callback` to the API container (step 6),

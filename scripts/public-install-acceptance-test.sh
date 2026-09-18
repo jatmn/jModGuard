@@ -2,7 +2,10 @@
 # Public-source install docs must not require the private ops repository.
 set -euo pipefail
 
-root="$(git rev-parse --show-toplevel)"
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$root" ]]; then
+  root="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 cd "$root"
 
 fail() {
@@ -68,6 +71,14 @@ if ! grep -Fiq "not required" "$root/docs/WEBUI.md"; then
 fi
 require_absent docs/WEBUI.md "examples/private-ops"
 
+# test_bunny_publish_script_env_names_in_operator_docs
+require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_ZONE"
+require_contains docs/DEPLOY-BUNNY.md "BUNNY_STORAGE_PASSWORD"
+require_contains docs/DEPLOY-BUNNY.md "BUNNY_PULL_ZONE_ID"
+require_contains docs/DEPLOY-BUNNY.md "BUNNY_API_KEY"
+require_contains docs/WEBUI.md "BUNNY_STORAGE_ZONE"
+require_contains docs/WEBUI.md "BUNNY_PULL_ZONE_ID"
+
 # test_public_install_has_no_private_ops_frontend_release
 [[ ! -e "$root/scripts/frontend_release.py" ]] || fail "scripts/frontend_release.py must not exist"
 [[ ! -e "$root/scripts/frontend-release-test.py" ]] || fail "scripts/frontend-release-test.py must not exist"
@@ -95,6 +106,8 @@ do
   require_absent "$relative" "Reverting an ops release"
   require_absent "$relative" "in-flight runs"
 done
+require_absent crates/conductor/frontend/app.js "Private ops automation"
+require_contains crates/conductor/frontend/app.js "private ops repository is not required"
 
 # test_cost_formulas_are_measured_not_invented
 if ! grep -Fiq "local measurements" "$root/docs/COST.md"; then
