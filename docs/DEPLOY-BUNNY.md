@@ -375,10 +375,11 @@ On the Pull Zone from step 2 (Storage origin for the files):
    (`model.invalid` on `id`).
 5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
 
-After this, a browser on the CDN hostname loads the admin UI from
-Storage and calls `/api/...` on the same host; Bunny forwards those
-requests to the API container. The Magic Container endpoint hostname is
-not the product URL.
+After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
+the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you
+added one) loads the admin UI from Storage and calls `/api/...` on the same
+host; Bunny forwards those requests to the API container. The Magic Container
+endpoint hostname is not the product URL.
 
 ## Discord application (required for Bunny)
 
@@ -407,10 +408,12 @@ self-host.
 2. API logs: `database ready (migrate=false)` and listening. No public
    website hostname on the container.
 3. Each app: one region, one replica.
-4. Open the **CDN** hostname that matches `JMODGUARD_WEB_BASE_URL`. The
-   admin UI loads from Storage. Login with Discord. OAuth returns to that
-   origin. Probe `/health` (200 `ok`); do not use `/` on the Bunny API
-   origin as a ready check.
+4. Open the **public admin host** that matches `JMODGUARD_WEB_BASE_URL`
+   (the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain
+   if you added one — not a leftover `*.b-cdn.net` host after owned-host
+   cutover). The admin UI loads from Storage. Login with Discord. OAuth
+   returns to that origin. Probe `/health` (200 `ok`); do not use `/` on
+   the Bunny API origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure an `automod` log channel, enable a dry-run rule and check its Discord
