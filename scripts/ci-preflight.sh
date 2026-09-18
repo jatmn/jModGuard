@@ -71,6 +71,79 @@ require_command rustfmt 'rustup component add rustfmt'
 ensure_cargo_tool cargo-deny cargo-deny 0.20.2
 ensure_cargo_tool cargo-audit cargo-audit 0.22.2
 
+# cargo-audit 0.22.2 uses exit 1 for both advisory reports and some operational
+# failures (for example advisory DB fetch/load). Classify from JSON stdout and
+# stderr instead of trusting exit 1 alone.
+run_cargo_audit_gate() {
+  local audit_out audit_err audit_rc advisory_count
+  audit_out="$(mktemp)"
+  audit_err="$(mktemp)"
+  set +e
+  cargo audit --format json >"$audit_out" 2>"$audit_err"
+  audit_rc=$?
+  set -e
+  if [ -s "$audit_err" ]; then
+    cat "$audit_err" >&2
+  fi
+
+  if [ "$audit_rc" -eq 0 ]; then
+    rm -f "$audit_out" "$audit_err"
+    return 0
+  fi
+
+  if [ "$audit_rc" -eq 2 ]; then
+    echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  if [ "$audit_rc" -ne 1 ]; then
+    echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  if grep -qE '^error:' "$audit_err" || [ ! -s "$audit_out" ]; then
+    echo 'ci-preflight: cargo audit failed to run (operational error)' >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  advisory_count="$(
+    python3 - "$audit_out" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+vulnerabilities = report.get("vulnerabilities") or {}
+count = vulnerabilities.get("count")
+if count is None:
+    count = len(vulnerabilities.get("list") or [])
+if vulnerabilities.get("found") or count:
+    print(int(count))
+else:
+    print(-1)
+PY
+  )" || advisory_count=-1
+
+  if [ "$advisory_count" -lt 0 ]; then
+    echo 'ci-preflight: cargo audit failed to run (unexpected exit 1 without advisories)' >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  if [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" = "1" ]; then
+    echo "ci-preflight: cargo audit failed closed (scheduled Buildkite; ${advisory_count} advisories)" >&2
+    rm -f "$audit_out" "$audit_err"
+    return 1
+  fi
+
+  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the test job" >&2
+  rm -f "$audit_out" "$audit_err"
+  return 0
+}
+
 whitespace_check() {
   local merge_base
   if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
@@ -164,22 +237,6 @@ echo 'ci-preflight: cargo deny check bans licenses sources'
 cargo deny check bans licenses sources
 
 echo 'ci-preflight: cargo audit'
-set +e
-cargo audit
-audit_rc=$?
-set -e
-# cargo-audit 0.22.2: 0 clean, 1 vulnerability report (and some advisory-DB
-# fetch failures), 2 lockfile/report errors. Only 1 is the CVE fail-open path.
-if [ "$audit_rc" -eq 0 ]; then
-  :
-elif [ "$audit_rc" -eq 1 ] && [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" != "1" ]; then
-  echo 'ci-preflight: cargo audit reported advisories; pull requests and ordinary main pushes do not fail the test job' >&2
-elif [ "${JMODGUARD_AUDIT_FAIL_CLOSED:-0}" = "1" ]; then
-  echo 'ci-preflight: cargo audit failed closed (scheduled Buildkite)' >&2
-  exit 1
-else
-  echo "ci-preflight: cargo audit failed to run (exit ${audit_rc})" >&2
-  exit 1
-fi
+run_cargo_audit_gate
 
 echo 'ci-preflight: Buildkite test gates passed'

@@ -4,8 +4,7 @@
 # when the control store, OAuth client and operator identity are configured.
 # Backup/restore additionally needs JMODGUARD_CONDUCTOR_BACKUP_ROOT (and
 # capture/restore paths). Updates are not available in this image.
-# linux/amd64 digest of rust:1.96-bookworm
-# (index sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663).
+# linux/amd64 manifest digest for rust:1.96-bookworm (must match FROM below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
 FROM rust:1.96-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /app

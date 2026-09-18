@@ -28,8 +28,9 @@ after GitHub git-credential setup. If `cargo-deny` or `cargo-audit` is missing,
 that script installs the pinned versions with `cargo install --locked`.
 Scheduled builds set `JMODGUARD_AUDIT_FAIL_CLOSED=1` so `cargo audit` fails the
 job; pull requests and ordinary main pushes still run audit but do not fail on a
-new CVE (advisory exit 1). Audit tool errors (other exit codes) still fail the
-test job. The existing clone credential must also fetch tags and full commits from
+reported CVE advisories. `cargo audit` operational failures (for example
+advisory-database fetch/load errors) still fail the test job even on the
+fail-open path. The existing clone credential must also fetch tags and full commits from
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
 cache service. Do not add `.github/workflows`; there are no GitHub-hosted CI

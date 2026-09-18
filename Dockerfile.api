@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for jmodguard-api.
 # Pins Rust 1.96 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
-# embed frontend/ (Bunny serves that from Storage/CDN). linux/amd64 digest of
-# rust:1.96-bookworm (index sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663).
+# embed frontend/ (Bunny serves that from Storage/CDN). linux/amd64 manifest
+# digest for rust:1.96-bookworm (must match the FROM line below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.api .
 FROM rust:1.96-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /app

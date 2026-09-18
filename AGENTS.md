@@ -204,12 +204,13 @@ bash scripts/ci-preflight.sh
 That script runs lockfile verification, `cargo fmt --check`, whitespace
 `git diff --check`, the publisher/release contract tests, workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
-API `--no-default-features --all-targets`), conductor/bot/API builds, service
-boundaries, public-install acceptance, frontend Node/Python tests,
-`dual_process_smoke`, `cargo deny check bans licenses sources`, and
+API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
+service boundaries, public-install acceptance, frontend Node/Python tests,
+`dual_process_smoke`, independent `jmodguard-bot` / `jmodguard-api` builds (with
+and without default features), `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
-and ordinary main pushes ignore advisory exit 1 but still fail on audit tool
-errors).
+and ordinary main pushes ignore reported CVE advisories but still fail when
+`cargo audit` cannot run).
 Remote libSQL tests stay in the Buildkite `remote-database` job.
 
 ```bash
