@@ -25,7 +25,9 @@ bash scripts/install-git-hooks.sh
 ```
 
 That sets `core.hooksPath` to `.githooks` so `pre-commit` and `pre-push` run
-the same preflight. It does not add GitHub Actions.
+the same full preflight as the Buildkite `test` job (commit then push runs it
+twice). Git then uses only `.githooks` for this checkout; previous hook
+directories are not chained. It does not add GitHub Actions.
 
 Keep secrets, production domains, and operator-specific promote steps out of
 this repository — document those in your own ops environment.

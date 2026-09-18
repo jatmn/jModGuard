@@ -199,7 +199,8 @@ add GitHub Actions workflows.
 bash scripts/ci-preflight.sh
 # For a PR whose base is not main:
 # bash scripts/ci-preflight.sh --base origin/<base-branch>
-# Optional local git hooks (same script; not GitHub Actions):
+# Optional local git hooks (same full Buildkite test script; not GitHub Actions).
+# This sets core.hooksPath to .githooks and does not chain previous hook dirs:
 # bash scripts/install-git-hooks.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
