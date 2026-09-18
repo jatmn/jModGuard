@@ -123,12 +123,7 @@ commercial licensing is granted by the author only.
 ## Development
 
 ```bash
-cargo test --locked --workspace
-cargo clippy --locked --workspace --bins --lib -- -D warnings
-cargo clippy --locked -p jmodguard-bot -- -D warnings
-cargo clippy --locked -p jmodguard-api --no-default-features -- -D warnings
-cargo build --locked -p jmodguard-bot
-cargo build --locked -p jmodguard-api
+bash scripts/ci-preflight.sh
 # or: ./scripts/smoke-dual-process.sh
 ```
 

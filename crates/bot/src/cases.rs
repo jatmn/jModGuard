@@ -62,7 +62,10 @@ fn registers_in_process_audit_pending(
 }
 
 /// Whether a queued WebUI unban dispatch can still receive a bot-executor audit entry.
-pub(crate) fn queued_unban_expects_discord_audit(dispatch_state: &str, dispatch_code: &str) -> bool {
+pub(crate) fn queued_unban_expects_discord_audit(
+    dispatch_state: &str,
+    dispatch_code: &str,
+) -> bool {
     match dispatch_state {
         "uncertain" => true,
         "succeeded" => dispatch_code != "already_unbanned",
@@ -148,7 +151,8 @@ async fn remember_owned_application(
     operation_id: CaseId,
     expects_discord_audit: bool,
 ) {
-    if !registers_in_process_audit_pending(&action, outcome, expects_discord_audit) || subject == 0 {
+    if !registers_in_process_audit_pending(&action, outcome, expects_discord_audit) || subject == 0
+    {
         return;
     }
     let Some(enrollment) = enrollment else {
@@ -684,10 +688,22 @@ mod tests {
 
     #[test]
     fn queued_unban_audit_pending_follows_dispatch_outcome() {
-        assert!(!crate::cases::queued_unban_expects_discord_audit("succeeded", "already_unbanned"));
-        assert!(crate::cases::queued_unban_expects_discord_audit("succeeded", "unbanned"));
-        assert!(crate::cases::queued_unban_expects_discord_audit("uncertain", "discord_outcome_unknown"));
-        assert!(!crate::cases::queued_unban_expects_discord_audit("failed", "discord_rejected"));
+        assert!(!crate::cases::queued_unban_expects_discord_audit(
+            "succeeded",
+            "already_unbanned"
+        ));
+        assert!(crate::cases::queued_unban_expects_discord_audit(
+            "succeeded",
+            "unbanned"
+        ));
+        assert!(crate::cases::queued_unban_expects_discord_audit(
+            "uncertain",
+            "discord_outcome_unknown"
+        ));
+        assert!(!crate::cases::queued_unban_expects_discord_audit(
+            "failed",
+            "discord_rejected"
+        ));
     }
 
     #[test]

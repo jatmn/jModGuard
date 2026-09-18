@@ -321,8 +321,8 @@ fn config_version_bumps_on_settings_write() {
         default_prefix: "!".into(),
         retention_days: 7,
     })
-    .err()
-    .expect("remote URL without a token should fail");
+    .map(|_| ())
+    .expect_err("remote URL without a token should fail");
     assert!(
         err.to_string().contains("JMODGUARD_DB_TOKEN is required"),
         "unexpected: {err:#}"
@@ -336,8 +336,8 @@ fn config_version_bumps_on_settings_write() {
         default_prefix: "!".into(),
         retention_days: 7,
     })
-    .err()
-    .expect("remote token without a URL should fail instead of opening local SQLite");
+    .map(|_| ())
+    .expect_err("remote token without a URL should fail instead of opening local SQLite");
     assert!(
         err.to_string().contains("JMODGUARD_DB_URL is required"),
         "unexpected: {err:#}"
@@ -358,8 +358,8 @@ fn api_open_refuses_unmigrated_db() {
         default_prefix: "!".into(),
         retention_days: 7,
     })
-    .err()
-    .expect("unmigrated open should fail");
+    .map(|_| ())
+    .expect_err("unmigrated open should fail");
     let msg = err.to_string();
     assert!(msg.contains("schema is behind"), "unexpected error: {msg}");
     assert!(
@@ -391,8 +391,8 @@ fn api_open_retries_until_bot_migrates() {
     // cargo's parallel scheduler starve it until the API budget expires — that
     // failed PR CI after the park() fixture fix.
     let before = Db::open_with(api_opts.clone())
-        .err()
-        .expect("API must not open before bot migrate");
+        .map(|_| ())
+        .expect_err("API must not open before bot migrate");
     assert!(
         is_schema_not_ready(&before),
         "unexpected error before migrate: {before:#}"
@@ -428,8 +428,8 @@ fn api_waits_for_completed_bot_bootstrap() {
         retention_days: 7,
     };
     let err = Db::open_with(api_opts.clone())
-        .err()
-        .expect("API must not open before default rows are seeded");
+        .map(|_| ())
+        .expect_err("API must not open before default rows are seeded");
     assert!(is_schema_not_ready(&err), "unexpected error: {err:#}");
     assert!(
         err.to_string().contains("bootstrap is incomplete"),
@@ -500,8 +500,8 @@ fn api_open_until_ready_times_out_without_bot() {
         2,
         std::time::Duration::from_millis(1),
     ))
-    .err()
-    .expect("must not succeed without bot migrate");
+    .map(|_| ())
+    .expect_err("must not succeed without bot migrate");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("timed out retrying database open"),
@@ -544,8 +544,8 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
         2,
         std::time::Duration::from_millis(1),
     ))
-    .err()
-    .expect("exclusive lock must exhaust the retry budget");
+    .map(|_| ())
+    .expect_err("exclusive lock must exhaust the retry budget");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("timed out retrying database open"),
@@ -629,8 +629,7 @@ fn ensure_api_writes_allowed_fails_closed_on_query_only() {
     let conn = Connection::open(&tmp).unwrap();
     conn.execute_batch("PRAGMA query_only=ON;").unwrap();
     let err = ensure_api_writes_allowed(&conn)
-        .err()
-        .expect("query_only connection must fail the API write probe");
+        .expect_err("query_only connection must fail the API write probe");
     let msg = err.to_string();
     assert!(msg.contains("cannot write"), "unexpected: {msg}");
     assert!(
@@ -703,8 +702,8 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
         default_prefix: "!".into(),
         retention_days: 7,
     })
-    .err()
-    .expect("API must wait while bootstrap is incomplete");
+    .map(|_| ())
+    .expect_err("API must wait while bootstrap is incomplete");
     assert!(crate::db::is_schema_not_ready(&err), "unexpected: {err:#}");
     cleanup_db(&tmp);
 }
@@ -716,8 +715,7 @@ fn delete_badword_rejects_other_guild_idor() {
     let id_a = tokio_test_block_on(crate::db::add_badword(&db, 11, "spam", None)).unwrap();
     let id_b = tokio_test_block_on(crate::db::add_badword(&db, 22, "scam", None)).unwrap();
     let err = tokio_test_block_on(crate::db::delete_badword(&db, id_a, 22))
-        .err()
-        .expect("cross-guild delete should fail");
+        .expect_err("cross-guild delete should fail");
     assert!(err.to_string().contains("not found"), "unexpected: {err:#}");
     assert!(
         !err.to_string().contains("for this guild"),
@@ -728,8 +726,7 @@ fn delete_badword_rejects_other_guild_idor() {
     let id_g =
         tokio_test_block_on(crate::db::add_badword(&db, GLOBAL_SCOPE, "global", None)).unwrap();
     let err = tokio_test_block_on(crate::db::delete_badword(&db, id_g, 11))
-        .err()
-        .expect("guild context must not delete global via exact match");
+        .expect_err("guild context must not delete global via exact match");
     assert!(err.to_string().contains("not found"), "unexpected: {err:#}");
     assert!(
         !err.to_string().contains("for this guild"),
@@ -744,16 +741,14 @@ fn add_badword_rejects_pathological_pattern() {
     let tmp = tmp_db_path("badword_patho");
     let db = Db::open(&tmp, 2).unwrap();
     let err = tokio_test_block_on(crate::db::add_badword(&db, 11, r"\w{100000}", None))
-        .err()
-        .expect("pathological pattern must be rejected at persist");
+        .expect_err("pathological pattern must be rejected at persist");
     assert!(
         err.to_string().contains("invalid regex") || err.to_string().contains("size"),
         "unexpected: {err:#}"
     );
     let huge = "a".repeat(crate::normalize::USER_REGEX_MAX_PATTERN_BYTES + 1);
     let err = tokio_test_block_on(crate::db::add_badword(&db, 11, &huge, None))
-        .err()
-        .expect("oversized pattern must be rejected");
+        .expect_err("oversized pattern must be rejected");
     assert!(err.to_string().contains("too long"), "unexpected: {err:#}");
     cleanup_db(&tmp);
 }
@@ -818,8 +813,7 @@ fn copy_badwords_refuses_all_invalid_and_preserves_destination() {
         22,
         vec!["badwords".into()],
     ))
-    .err()
-    .expect("all-invalid source must refuse copy");
+    .expect_err("all-invalid source must refuse copy");
     assert!(
         err.to_string().contains("refused")
             || err.to_string().contains("destination left unchanged"),
@@ -857,8 +851,10 @@ fn copy_all_rolls_back_when_badwords_refuse() {
     // Atomic transaction: refused badwords must not leave partial section writes.
     let tmp = tmp_db_path("copy_atomic");
     let db = Db::open(&tmp, 2).unwrap();
-    let mut settings = GuildSettings::default();
-    settings.prefix = "!src".into();
+    let settings = GuildSettings {
+        prefix: "!src".into(),
+        ..Default::default()
+    };
     tokio_test_block_on(crate::db::upsert_settings(&db, 11, &settings)).unwrap();
     tokio_test_block_on(crate::db::add_badword(&db, 22, "keep", None)).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
@@ -876,8 +872,7 @@ fn copy_all_rolls_back_when_badwords_refuse() {
         22,
         vec!["all".into()],
     ))
-    .err()
-    .expect("all-invalid badwords must refuse entire copy");
+    .expect_err("all-invalid badwords must refuse entire copy");
     assert!(err.to_string().contains("refused"), "unexpected: {err:#}");
 
     let dest_settings = tokio_test_block_on(crate::db::get_settings(&db, 22)).unwrap();
@@ -1045,8 +1040,7 @@ fn dual_process_local_share_config_version() {
 fn config_parts_loads_effective_rules() {
     let tmp = tmp_db_path("config_parts_effective_rules");
     let db = Db::open(&tmp, 2).unwrap();
-    let parts = db.with_conn_sync(|_| Ok(())).unwrap();
-    let _ = parts;
+    db.with_conn_sync(|_| Ok(())).unwrap();
     // rule id keys must exist and match RULE_IDS
     let ids: Vec<String> = db
         .with_conn_sync(|conn| {
@@ -1533,8 +1527,7 @@ fn copy_refuses_all_invalid_badwords_before_writes() {
         22,
         vec!["settings".into(), "badwords".into()],
     ))
-    .err()
-    .expect("copy transaction must refuse");
+    .expect_err("copy transaction must refuse");
     assert!(err.to_string().contains("refused"), "unexpected: {err:#}");
     cleanup_db(&tmp);
 }
@@ -1791,8 +1784,7 @@ fn copy_logchannels_skips_cross_guild() {
         22,
         vec!["logchannels".into()],
     ))
-    .err()
-    .expect("cross-guild logchannels must refuse");
+    .expect_err("cross-guild logchannels must refuse");
     assert!(
         err.to_string().contains("server-specific"),
         "unexpected: {err:#}"
@@ -2079,8 +2071,8 @@ fn api_open_refuses_missing_terminal_defaults_meta() {
         default_prefix: "!".into(),
         retention_days: 7,
     })
-    .err()
-    .expect("API must refuse when terminal defaults meta is missing");
+    .map(|_| ())
+    .expect_err("API must refuse when terminal defaults meta is missing");
     assert!(
         err.to_string().contains("settings_terminal_defaults"),
         "unexpected: {err:#}"
@@ -2556,8 +2548,7 @@ fn patch_settings_rejects_empty_prefix() {
         None,
         None,
     ))
-    .err()
-    .expect("empty prefix must fail");
+    .expect_err("empty prefix must fail");
     assert!(
         err.to_string().contains("prefix cannot be empty"),
         "unexpected: {err:#}"

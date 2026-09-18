@@ -44,11 +44,9 @@ fn package_versions<'a>(lock: &'a str, package: &str) -> Vec<&'a str> {
             matching = false;
         } else if line == format!("name = \"{package}\"") {
             matching = true;
-        } else if matching {
-            if let Some(version) = line.strip_prefix("version = \"") {
-                versions.push(version.trim_end_matches('"'));
-                matching = false;
-            }
+        } else if matching && let Some(version) = line.strip_prefix("version = \"") {
+            versions.push(version.trim_end_matches('"'));
+            matching = false;
         }
     }
     versions
@@ -65,9 +63,5 @@ fn version_is_patched(version: &str) -> bool {
     let Some(patch) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
         return false;
     };
-    match (major, minor, patch) {
-        (0, 0..=12, _) => false,
-        (0, 13, 0) => false,
-        _ => true,
-    }
+    !matches!((major, minor, patch), (0, 0..=12, _) | (0, 13, 0))
 }

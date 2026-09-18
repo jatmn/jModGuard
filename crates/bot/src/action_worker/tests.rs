@@ -1393,5 +1393,8 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
         .await
         .unwrap();
     assert_ne!(noop_case.id, real_case.id);
-    assert_eq!(audit_case.as_ref().map(|m| m.id.as_str()), Some(real_case.id.as_str()));
+    assert_eq!(
+        audit_case.as_ref().map(|m| m.id.as_str()),
+        Some(real_case.id.as_str())
+    );
 }

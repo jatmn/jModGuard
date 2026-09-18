@@ -1150,8 +1150,10 @@ mod tests {
         let before = tokio_test_block_on(bot.configs.get(&bot.db, guild_id)).unwrap();
         assert_eq!(before.settings.prefix, "!");
 
-        let mut settings = GuildSettings::default();
-        settings.prefix = "!api-wrote".into();
+        let settings = GuildSettings {
+            prefix: "!api-wrote".into(),
+            ..Default::default()
+        };
         tokio_test_block_on(db::patch_settings(
             &api_db,
             guild_id as i64,

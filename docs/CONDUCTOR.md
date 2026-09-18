@@ -127,10 +127,7 @@ row budget. Observed RSS is not a configured memory limit.
 ## Validation and image
 
 ```bash
-cargo test --locked --workspace
-cargo clippy --locked -p jmodguard-runtime -p jmodguard-conductor --all-targets -- -D warnings
-python3 scripts/check-service-boundaries.py
-python3 scripts/public-install-acceptance-test.py
+bash scripts/ci-preflight.sh
 ```
 
 Process tests bind loopback ports and send SIGTERM to their own child on Unix. They

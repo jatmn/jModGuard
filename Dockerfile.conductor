@@ -4,8 +4,9 @@
 # when the control store, OAuth client and operator identity are configured.
 # Backup/restore additionally needs JMODGUARD_CONDUCTOR_BACKUP_ROOT (and
 # capture/restore paths). Updates are not available in this image.
+# linux/amd64 manifest digest for rust:1.96-bookworm (must match FROM below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.conductor .
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /app
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -24,7 +25,7 @@ RUN --mount=type=secret,id=github_token,required=true \
 RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
     cargo build --locked --release -p jmodguard-conductor
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

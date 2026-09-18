@@ -109,9 +109,9 @@ fn ensure_new_update_allowed(cfg: &Config) -> Result<()> {
         "failed" => anyhow::bail!(
             "last release update failed (recover status=failed); retry the failed update job or run recover-update before starting a new install"
         ),
-        other => anyhow::bail!(
-            "recover inventory status {other} must be resolved before a new update"
-        ),
+        other => {
+            anyhow::bail!("recover inventory status {other} must be resolved before a new update")
+        }
     }
 }
 
@@ -197,8 +197,12 @@ pub async fn validate_update_execution_context(conductor: &Conductor) -> Result<
 
 fn checkpoint_plan_summary(preop: &str) -> &'static str {
     match preop {
-        "skip" => "No pre-update archive (preop=skip). Compatible rollback does not restore the previous database.",
-        "recent" => "Reuses any complete backup archive from the last six hours when one exists; otherwise captures a fresh R4 checkpoint when capture is configured (same rule as guild moves).",
+        "skip" => {
+            "No pre-update archive (preop=skip). Compatible rollback does not restore the previous database."
+        }
+        "recent" => {
+            "Reuses any complete backup archive from the last six hours when one exists; otherwise captures a fresh R4 checkpoint when capture is configured (same rule as guild moves)."
+        }
         _ => "Captures a fresh R4 checkpoint archive when capture is configured.",
     }
 }
@@ -225,11 +229,7 @@ async fn ensure_inventory_covers_incumbents(
     Ok(())
 }
 
-pub async fn plan(
-    conductor: &Conductor,
-    release_id: &str,
-    preop: Option<&str>,
-) -> Result<Value> {
+pub async fn plan(conductor: &Conductor, release_id: &str, preop: Option<&str>) -> Result<Value> {
     ensure!(
         updates_available(&conductor.cfg),
         "point-and-click install is not configured"
@@ -503,9 +503,7 @@ pub async fn run(conductor: &Conductor, job_id: &str, payload_json: &str) -> Res
                     && !previous_record.digest.is_empty()
                     && previous_record.digest != digest
                 {
-                    let _ = adapter
-                        .drain(name, &activated, DrainContext::Apply)
-                        .await;
+                    let _ = adapter.drain(name, &activated, DrainContext::Apply).await;
                     if adapter.stage(&previous_record.digest).is_ok()
                         && let Ok(restored) = adapter
                             .activate(name, &previous_record.digest, Some(&activated))
@@ -643,7 +641,9 @@ fn recover_baseline_for_job(
     }
     match existing.status.as_str() {
         "committed" | "recovered" => (plan_previous, plan_previous_release_id),
-        _ if !existing.previous.is_empty() => (json!(existing.previous), existing.previous_release_id),
+        _ if !existing.previous.is_empty() => {
+            (json!(existing.previous), existing.previous_release_id)
+        }
         _ => (plan_previous, plan_previous_release_id),
     }
 }

@@ -966,56 +966,6 @@ pub async fn stats(
     Ok(Json(value))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{SettingsBody, log_channels_wire};
-
-    #[test]
-    fn log_channels_wire_stringifies_snowflake_channel_ids() {
-        let snow = 1329331947876479006i64;
-        let out = log_channels_wire(vec![("message_delete".into(), snow)]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["event"], "message_delete");
-        assert_eq!(out[0]["channel_id"], "1329331947876479006");
-        assert!(out[0]["channel_id"].is_string());
-    }
-
-    #[test]
-    fn chat_history_retention_is_not_an_api_setting() {
-        for value in [
-            serde_json::json!(0),
-            serde_json::json!(7),
-            serde_json::Value::Null,
-        ] {
-            assert!(
-                serde_json::from_value::<SettingsBody>(serde_json::json!({"retention_days":value}))
-                    .is_err()
-            );
-        }
-        let value = super::settings_wire(&crate::types::GuildSettings::default());
-        assert!(value.get("retention_days").is_none());
-        assert!(value.get("prefix").is_some());
-        assert!(super::settings_wire(&None::<crate::types::GuildSettingsOverride>).is_null());
-    }
-
-    #[test]
-    fn settings_body_null_means_clear_override() {
-        let body: SettingsBody =
-            serde_json::from_str(r#"{"prefix":null,"bot_name":null}"#).unwrap();
-        assert_eq!(body.prefix, Some(None));
-        assert_eq!(body.bot_name, Some(None));
-
-        let omit: SettingsBody = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(omit.prefix, None);
-        assert_eq!(omit.bot_name, None);
-
-        let set: SettingsBody =
-            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot"}"#).unwrap();
-        assert_eq!(set.prefix, Some(Some("!x".into())));
-        assert_eq!(set.bot_name, Some(Some("Bot".into())));
-    }
-}
-
 pub(super) async fn enqueue_action(
     app: &Arc<ApiState>,
     guild: u64,
@@ -1104,4 +1054,54 @@ pub async fn cancel_action(
         )));
     }
     Ok(Json(serde_json::json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SettingsBody, log_channels_wire};
+
+    #[test]
+    fn log_channels_wire_stringifies_snowflake_channel_ids() {
+        let snow = 1329331947876479006i64;
+        let out = log_channels_wire(vec![("message_delete".into(), snow)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["event"], "message_delete");
+        assert_eq!(out[0]["channel_id"], "1329331947876479006");
+        assert!(out[0]["channel_id"].is_string());
+    }
+
+    #[test]
+    fn chat_history_retention_is_not_an_api_setting() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<SettingsBody>(serde_json::json!({"retention_days":value}))
+                    .is_err()
+            );
+        }
+        let value = super::settings_wire(&crate::types::GuildSettings::default());
+        assert!(value.get("retention_days").is_none());
+        assert!(value.get("prefix").is_some());
+        assert!(super::settings_wire(&None::<crate::types::GuildSettingsOverride>).is_null());
+    }
+
+    #[test]
+    fn settings_body_null_means_clear_override() {
+        let body: SettingsBody =
+            serde_json::from_str(r#"{"prefix":null,"bot_name":null}"#).unwrap();
+        assert_eq!(body.prefix, Some(None));
+        assert_eq!(body.bot_name, Some(None));
+
+        let omit: SettingsBody = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(omit.prefix, None);
+        assert_eq!(omit.bot_name, None);
+
+        let set: SettingsBody =
+            serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot"}"#).unwrap();
+        assert_eq!(set.prefix, Some(Some("!x".into())));
+        assert_eq!(set.bot_name, Some(Some("Bot".into())));
+    }
 }

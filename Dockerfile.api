@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for jmodguard-api.
 # Pins Rust 1.96 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
-# embed frontend/ (Bunny serves that from Storage/CDN).
+# embed frontend/ (Bunny serves that from Storage/CDN). linux/amd64 manifest
+# digest for rust:1.96-bookworm (must match the FROM line below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.api .
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /app
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -22,7 +23,7 @@ RUN --mount=type=secret,id=github_token,required=true \
 RUN CARGO_NET_GIT_FETCH_WITH_CLI=true \
     cargo build --locked --release -p jmodguard-api --no-default-features
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

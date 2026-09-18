@@ -9,9 +9,9 @@ use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
 use jmodguard::db::{self, Db, DbOpenOptions};
 use jmodguard_api::web::state::ApiState;
 use jmodguard_bot::state::BotState;
-use std::path::PathBuf;
+use std::path::Path;
 
-fn tmp_db_path(label: &str) -> PathBuf {
+fn tmp_db_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "jmodguard_smoke_{label}_{}_{}.db",
         std::process::id(),
@@ -29,9 +29,9 @@ fn cleanup_db(path: &std::path::Path) {
     jmodguard::tenant::remove_sidecars(path);
 }
 
-fn open_dual(path: &PathBuf) -> (Db, Db) {
+fn open_dual(path: &Path) -> (Db, Db) {
     let bot = Db::open_with(DbOpenOptions {
-        path: path.clone(),
+        path: path.to_path_buf(),
         url: String::new(),
         token: String::new(),
         pool_size: 2,
@@ -41,7 +41,7 @@ fn open_dual(path: &PathBuf) -> (Db, Db) {
     })
     .expect("bot (migrate=true) must open shared DB");
     let api = Db::open_with(DbOpenOptions {
-        path: path.clone(),
+        path: path.to_path_buf(),
         url: String::new(),
         token: String::new(),
         pool_size: 2,

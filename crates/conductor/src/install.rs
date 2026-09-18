@@ -306,10 +306,7 @@ fn validate_local(plan: &InstallPlan) -> Result<()> {
         ("artifact_root", plan.artifact_root.as_ref()),
         ("capture_core", plan.capture_core.as_ref()),
         ("shared_guild_store", plan.shared_guild_store.as_ref()),
-        (
-            "dedicated_guild_store",
-            plan.dedicated_guild_store.as_ref(),
-        ),
+        ("dedicated_guild_store", plan.dedicated_guild_store.as_ref()),
     ] {
         ensure!(path.is_some(), "local topology requires {label}");
     }
@@ -864,17 +861,11 @@ mod tests {
         plan.api_embedded_ui = false;
         plan.frontend_storage = true;
         let err = validate_plan(&plan).unwrap_err().to_string();
-        assert!(
-            err.contains("must not include a query string"),
-            "{err}"
-        );
+        assert!(err.contains("must not include a query string"), "{err}");
         plan.core_url = "libsql://core.lite.bunnydb.net".into();
         plan.guild_url = "libsql://guild.lite.bunnydb.net?api_key=secret".into();
         let err = validate_plan(&plan).unwrap_err().to_string();
-        assert!(
-            err.contains("must not include a query string"),
-            "{err}"
-        );
+        assert!(err.contains("must not include a query string"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -891,17 +882,11 @@ mod tests {
         plan.api_embedded_ui = false;
         plan.frontend_storage = true;
         let err = validate_plan(&plan).unwrap_err().to_string();
-        assert!(
-            err.contains("must not include a fragment"),
-            "{err}"
-        );
+        assert!(err.contains("must not include a fragment"), "{err}");
         plan.core_url = "libsql://core.lite.bunnydb.net".into();
         plan.guild_url = "libsql://guild.lite.bunnydb.net#api_key=secret".into();
         let err = validate_plan(&plan).unwrap_err().to_string();
-        assert!(
-            err.contains("must not include a fragment"),
-            "{err}"
-        );
+        assert!(err.contains("must not include a fragment"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -977,7 +962,14 @@ mod tests {
         fs::create_dir_all(root.join("restore")).unwrap();
         let err = init_local(&root).unwrap_err().to_string();
         assert!(err.contains("restore target must remain absent"), "{err}");
-        for name in ["backup", "evidence", "update", "artifacts", "capture", "guild"] {
+        for name in [
+            "backup",
+            "evidence",
+            "update",
+            "artifacts",
+            "capture",
+            "guild",
+        ] {
             assert!(
                 !root.join(name).exists(),
                 "partial layout created {name} after restore-present failure"

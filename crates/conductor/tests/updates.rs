@@ -1,9 +1,11 @@
 //! Local process update/rollback. Provider HTTP is a fixture, not live Bunny.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use jmodguard_conductor::release;
-use jmodguard_conductor::update_adapter::{Adapter, DrainContext, INVENTORY_FORMAT, Inventory, RECOVER_FORMAT};
 use jmodguard_conductor::config::CaptureStore;
+use jmodguard_conductor::release;
+use jmodguard_conductor::update_adapter::{
+    Adapter, DrainContext, INVENTORY_FORMAT, Inventory, RECOVER_FORMAT,
+};
 use jmodguard_conductor::{Conductor, config::Config, router_for, update};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -678,14 +680,12 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
         let inventory = adapter.load_inventory().unwrap();
         assert_eq!(inventory.components["api"].digest, digest('b'));
         assert_eq!(
-            inventory.release_id,
-            "v0.1.0",
+            inventory.release_id, "v0.1.0",
             "release_id must not advance until the job commits"
         );
         let recover = Adapter::load_recover(&adapter.root).unwrap().unwrap();
         assert_eq!(
-            recover.status,
-            "failed",
+            recover.status, "failed",
             "readiness revert should terminalize recover sidecar"
         );
         adapter
@@ -756,7 +756,10 @@ async fn missing_artifacts_failed_readiness_backup_and_old_instance() {
     let adapter = Adapter::from_config(&env.conductor.cfg, env.conductor.http.clone()).unwrap();
     let inventory = adapter.load_inventory().unwrap();
     let bot = inventory.components["bot"].clone();
-    adapter.drain("bot", &bot, DrainContext::Apply).await.unwrap();
+    adapter
+        .drain("bot", &bot, DrainContext::Apply)
+        .await
+        .unwrap();
     adapter.confirm_dead("bot", &bot).await.unwrap();
     let zombie = adapter
         .activate("bot", &digest('a'), Some(&bot))
@@ -951,10 +954,7 @@ async fn uncertain_recover_blocks_new_apply_and_job_retry() {
             job_id: "job-uncertain".into(),
             release_id: "v0.2.0".into(),
             previous_release_id: "v0.1.0".into(),
-            previous: BTreeMap::from([
-                ("bot".into(), digest('a')),
-                ("api".into(), digest('b')),
-            ]),
+            previous: BTreeMap::from([("bot".into(), digest('a')), ("api".into(), digest('b'))]),
             desired: BTreeMap::new(),
             phase: "deploying".into(),
             component: "bot".into(),
@@ -1181,7 +1181,10 @@ async fn retry_preserves_recover_previous_after_partial_deploy() {
         .unwrap();
     assert_eq!(job.status, "failed", "{:?}", job.last_error);
     let recover = Adapter::load_recover(&adapter.root).unwrap().unwrap();
-    assert_eq!(recover.previous.get("frontend").map(String::as_str), Some(digest('d').as_str()));
+    assert_eq!(
+        recover.previous.get("frontend").map(String::as_str),
+        Some(digest('d').as_str())
+    );
     assert_eq!(recover.previous_release_id, "v0.1.0");
     let inventory = adapter.load_inventory().unwrap();
     assert_eq!(
@@ -1324,8 +1327,7 @@ async fn recover_update_persists_inventory_after_each_component() {
     assert!(!output.status.success());
     let after = adapter.load_inventory().unwrap();
     assert_ne!(
-        after.components["conductor"].pid,
-        conductor_before.pid,
+        after.components["conductor"].pid, conductor_before.pid,
         "conductor restore must persist before a later component fails"
     );
     assert_eq!(after.release_id, "v0.1.0");

@@ -2000,7 +2000,7 @@ mod tests {
         d.invalidate_author(1, 2);
         {
             let s = d.state.lock();
-            assert!(s.guilds[&1].authors.get(&2).is_none());
+            assert!(!s.guilds[&1].authors.contains_key(&2));
             assert_eq!(s.bytes, 0);
             assert!(s.index.is_empty());
             assert_eq!(s.authors, 0);
