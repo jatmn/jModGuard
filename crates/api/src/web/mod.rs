@@ -10,7 +10,7 @@ use axum::extract::Query;
 use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, MethodRouter};
+use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use std::sync::Arc;
 use tower_sessions::cookie::time::Duration as CookieDuration;
@@ -689,16 +689,8 @@ async fn index() -> impl IntoResponse {
     )
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        axum::http::StatusCode::OK,
-        [
-            (CACHE_CONTROL, NO_STORE),
-            (CDN_CACHE_CONTROL, CDN_NO_STORE),
-            (VARY, VARY_COOKIE),
-        ],
-        "ok",
-    )
+async fn health() -> &'static str {
+    "ok"
 }
 
 #[cfg(feature = "embed-ui")]
@@ -738,6 +730,26 @@ where
     S: Clone + Send + Sync + 'static,
 {
     get(handler.clone()).post(handler)
+}
+
+/// Browser, CDN, and cookie-variant headers for every axum response, including `/health`.
+fn uncacheable_response_headers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            NO_STORE,
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            CDN_CACHE_CONTROL,
+            CDN_NO_STORE,
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            VARY,
+            VARY_COOKIE,
+        ))
 }
 
 pub fn router(app: Arc<ApiState>) -> Router {
@@ -892,18 +904,6 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             preview::middleware,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            CACHE_CONTROL,
-            NO_STORE,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            CDN_CACHE_CONTROL,
-            CDN_NO_STORE,
-        ))
-        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-            VARY,
-            VARY_COOKIE,
         ));
 
     // CORS is a browser credential policy for the SPA/API. Process liveness
@@ -934,11 +934,13 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         sessioned
     };
 
-    Router::new()
-        .route("/health", get(health))
-        .route("/health/", get(health))
-        .merge(sessioned)
-        .with_state(app.clone())
+    uncacheable_response_headers(
+        Router::new()
+            .route("/health", get(health))
+            .route("/health/", get(health))
+            .merge(sessioned),
+    )
+    .with_state(app.clone())
 }
 
 /// Membership admission failures contain no database diagnostics or tenant data.
@@ -1116,10 +1118,29 @@ pub async fn guild_scope(
 }
 
 #[cfg(test)]
+fn assert_uncacheable_headers(headers: &HeaderMap) {
+    assert_eq!(
+        headers.get(CACHE_CONTROL).map(|v| v.as_bytes()),
+        Some(NO_STORE.as_bytes()),
+        "API responses must not be browser-cacheable"
+    );
+    assert_eq!(
+        headers.get(CDN_CACHE_CONTROL).map(|v| v.as_bytes()),
+        Some(CDN_NO_STORE.as_bytes()),
+        "API responses must send CDN-Cache-Control: no-store"
+    );
+    assert_eq!(
+        headers.get(VARY).map(|v| v.as_bytes()),
+        Some(VARY_COOKIE.as_bytes()),
+        "API responses must vary CDN caches by Cookie"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1215,27 +1236,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert_uncacheable_headers(res.headers());
+        super::assert_uncacheable_headers(res.headers());
         let body = axum::body::to_bytes(res.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"ok");
-    }
-
-    fn assert_uncacheable_headers(headers: &HeaderMap) {
-        assert_eq!(
-            headers.get(CACHE_CONTROL).map(|v| v.as_bytes()),
-            Some(NO_STORE.as_bytes()),
-            "credentialed API JSON must not be browser-cacheable"
-        );
-        assert_eq!(
-            headers.get(CDN_CACHE_CONTROL).map(|v| v.as_bytes()),
-            Some(CDN_NO_STORE.as_bytes()),
-            "credentialed API JSON must send CDN-Cache-Control: no-store"
-        );
-        assert_eq!(
-            headers.get(VARY).map(|v| v.as_bytes()),
-            Some(VARY_COOKIE.as_bytes()),
-            "credentialed API JSON must vary CDN caches by Cookie"
-        );
     }
 
     async fn assert_unauthenticated(app: Router, method: &str, uri: &str, body: &str) {
@@ -1246,13 +1249,12 @@ mod tests {
             builder = builder.header("content-type", "application/json");
             Body::from(body.to_owned())
         };
-        let res = app
-            .oneshot(builder.body(req_body).unwrap())
+        let res = app.oneshot(builder.body(req_body).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        super::assert_uncacheable_headers(res.headers());
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
-        assert_uncacheable_headers(res.headers());
-        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "not authenticated", "{method} {uri}");
     }
@@ -1319,7 +1321,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_uncacheable_headers(res.headers());
+        super::assert_uncacheable_headers(res.headers());
     }
 
     #[tokio::test]

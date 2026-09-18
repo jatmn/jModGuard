@@ -276,11 +276,6 @@ function returnFromPreview() {
   clearPreviewToken();
 }
 
-function handlePreviewError(error) {
-  if (error.code === "preview_expired") leaveExpiredPreview();
-  else if (isUnauthenticated(error) && currentPreviewToken()) showPreviewUnavailable();
-}
-
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
@@ -305,8 +300,8 @@ function throwApiFailure(data, status, retryAfterMs) {
   const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `HTTP ${status}`;
   const error = apiError(msg, status, retryAfterMs);
   error.code = data && data.code;
-  handlePreviewError(error);
-  handleAuthLoss(error);
+  if (error.code === "preview_expired") leaveExpiredPreview();
+  else handleAuthLoss(error);
   throw error;
 }
 
@@ -528,7 +523,7 @@ async function loadConfig() {
     return true;
   } catch (e) {
     if (request !== configRequest || guildId !== state.guildId) return;
-    if (handleAuthLoss(e)) return;
+    if (isUnauthenticated(e)) return;
     state.config = null;
     state.error = e.message || String(e);
     toast("Could not refresh configuration: " + state.error, "error");
@@ -542,6 +537,14 @@ async function loadConfig() {
 
 function selectedGuild() {
   return state.guilds.find((g) => g.id === state.guildId);
+}
+
+/** Persist a mutation, reload this server's config, then toast. Errors go to handleEvent. */
+async function reloadAfter(work, onSuccess) {
+  const res = await work();
+  if (!await loadConfig()) return;
+  if (onSuccess) onSuccess(res);
+  renderTab();
 }
 
 // ---------------------------------------------------------------------------
@@ -886,11 +889,10 @@ function editRule(r) {
         renderTab();
       } }),
       el("button", { class: "btn danger", text: "Reset to global", onclick: async () => {
-        await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
-        if (!await loadConfig()) return;
-        toast("Rule reset", "success");
-        closeOverlay();
-        renderTab();
+        await reloadAfter(
+          () => api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" }),
+          () => { toast("Rule reset", "success"); closeOverlay(); },
+        );
       } }),
       el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
@@ -948,11 +950,13 @@ function tabBadwords() {
       el("div", { class: "row" }, pattern, note, scope,
         el("button", { class: "btn primary", text: "Add", onclick: async () => {
           if (!pattern.value.trim()) return toast("Enter a pattern", "error");
-          await api(`/api/guilds/${state.guildId}/badwords`, "POST", { scope: scope.value, pattern: pattern.value.trim(), note: note.value || null });
-          pattern.value = ""; note.value = "";
-          if (!await loadConfig()) return;
-          toast("Badword added", "success");
-          renderTab();
+          await reloadAfter(
+            async () => {
+              await api(`/api/guilds/${state.guildId}/badwords`, "POST", { scope: scope.value, pattern: pattern.value.trim(), note: note.value || null });
+              pattern.value = ""; note.value = "";
+            },
+            () => toast("Badword added", "success"),
+          );
         } })),
     ),
     el("div", { class: "card" },
@@ -984,10 +988,10 @@ function tabBadwords() {
               ? el("span", { class: "tag off", title: w.error || "failed compile limits", text: "not enforced" })
               : el("span", { class: "tag on", text: "active" })),
             el("td", {}, canDelete ? el("button", { class: "btn small danger", text: "✕", onclick: async () => {
-              await api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE");
-              if (!await loadConfig()) return;
-              toast("Removed", "success");
-              renderTab();
+              await reloadAfter(
+                () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
+                () => toast("Removed", "success"),
+              );
             } }) : el("span", { class: "muted", text: "owner only" })),
           );
         })),
@@ -1183,20 +1187,17 @@ function editCommand(c) {
           const steps = (data.behavior.params && data.behavior.params.steps) || [];
           for (const s of steps) {
             if (s.type === "add_role" || s.type === "remove_role") {
-              s.role_id = parseSnowflake(s.role_id);
+              applyPlanStepInput(s, s.type, s.role_id);
               if (!s.role_id) return toast("Role steps need a role id", "error");
             }
           }
         }
-        if (isNew) {
-          await api(`/api/guilds/${state.guildId}/commands`, "POST", { scope: scopeSel.value, data });
-        } else {
-          await api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "PUT", { scope: scopeSel.value, data });
-        }
-        if (!await loadConfig()) return;
-        toast("Command saved", "success");
-        closeOverlay();
-        renderTab();
+        await reloadAfter(
+          () => isNew
+            ? api(`/api/guilds/${state.guildId}/commands`, "POST", { scope: scopeSel.value, data })
+            : api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "PUT", { scope: scopeSel.value, data }),
+          () => { toast("Command saved", "success"); closeOverlay(); },
+        );
       } }),
       el("button", { class: "btn danger", text: "Delete", hidden: isNew, onclick: async () => {
         if (!confirm(`Delete command ${c.name}?`)) return;
@@ -1205,11 +1206,10 @@ function editCommand(c) {
         const delScope = c.guild_override
           ? "guild"
           : (c.scope === "global" && isBotOwner()) ? "global" : "guild";
-        await api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "DELETE", { scope: delScope });
-        if (!await loadConfig()) return;
-        toast(c.guild_override ? "Override cleared" : "Deleted", "success");
-        closeOverlay();
-        renderTab();
+        await reloadAfter(
+          () => api(`/api/guilds/${state.guildId}/commands/${encodeURIComponent(c.name)}`, "DELETE", { scope: delScope }),
+          () => { toast(c.guild_override ? "Override cleared" : "Deleted", "success"); closeOverlay(); },
+        );
       } }),
       el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
@@ -1252,16 +1252,16 @@ function templateCard(t) {
       el("div", { class: "row" },
         scopeSel,
         el("button", { class: "btn primary small", text: "Save", onclick: async () => {
-          await api(`/api/guilds/${state.guildId}/templates/${t.event}`, "PUT", { scope: scopeSel.value, template: text.value });
-          if (!await loadConfig()) return;
-          toast("Template saved", "success");
-          renderTab();
+          await reloadAfter(
+            () => api(`/api/guilds/${state.guildId}/templates/${t.event}`, "PUT", { scope: scopeSel.value, template: text.value }),
+            () => toast("Template saved", "success"),
+          );
         } }),
         el("button", { class: "btn small", text: "Reset to global", onclick: async () => {
-          await api(`/api/guilds/${state.guildId}/templates/${t.event}`, "DELETE", { scope: "guild" });
-          if (!await loadConfig()) return;
-          toast("Reset", "success");
-          renderTab();
+          await reloadAfter(
+            () => api(`/api/guilds/${state.guildId}/templates/${t.event}`, "DELETE", { scope: "guild" }),
+            () => toast("Reset", "success"),
+          );
         } }),
       ),
     ),
@@ -1319,7 +1319,7 @@ function tabEvents() {
     const current = ++request;
     tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
     try {
-      const user = userIn.value.trim();
+      const user = parseSnowflake(userIn.value);
       const rows = await api(`/api/guilds/${guildId}/events?limit=100` +
         (typeSel.value ? `&event=${encodeURIComponent(typeSel.value)}` : "") +
         (user ? `&user=${encodeURIComponent(user)}` : ""));
@@ -1372,11 +1372,7 @@ function tabBans() {
         el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
         el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
           if (!confirm(`Unban ${r.user_id}?`)) return;
-          try {
-            await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
-          } catch (e) {
-            reportApiError(e);
-          }
+          await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", { user_id: String(r.user_id), reason: "unbanned via WebUI" });
         } }) : null),
       )));
     } catch (e) {
@@ -1486,31 +1482,28 @@ function tabCases() {
         el("p", { class: "muted", text: "Removing a case deletes retained private records. It does not reverse a Discord ban, kick, timeout, or warning." }),
         payload.can_delete ? el("button", { class: "btn small", text: "Remove case record", onclick: async () => {
           if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
-          try {
-            const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
-            toast(result?.cleanup_pending
-              ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
-              : "Case record removed", "success");
-            renderTab();
-          } catch (e) { reportApiError(e); }
+          const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
+          toast(result?.cleanup_pending
+            ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
+            : "Case record removed", "success");
+          renderTab();
         } }) : null,
         el("h3", { text: "History" }),
         ...(history.history || []).map((entry) => el("p", { class: "muted", text: JSON.stringify(entry.entry.body) })),
         el("div", { class: "field" }, el("label", { text: "Note" }), note,
           el("button", { class: "btn small", type: "button", text: "Add note", onclick: async () => {
             if (notePending) return;
+            const text = note.value.trim();
+            if (!noteIntent || noteIntent.text !== text) {
+              noteIntent = { entry_id: crypto.randomUUID().replaceAll("-", ""), text };
+            }
+            notePending = true;
             try {
-              const text = note.value.trim();
-              if (!noteIntent || noteIntent.text !== text) {
-                noteIntent = { entry_id: crypto.randomUUID().replaceAll("-", ""), text };
-              }
-              notePending = true;
               await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent);
               noteIntent = null;
               toast("Note added", "success");
               await openCase(id);
-            } catch (e) { reportApiError(e); }
-            finally { notePending = false; }
+            } finally { notePending = false; }
           } })),
         el("h3", { text: "Private evidence" }),
         ...(Array.isArray(c.evidence?.text) ? c.evidence.text : []).map((item) => el("div", {},
@@ -1518,8 +1511,7 @@ function tabCases() {
           el("pre", { text: item.text }))),
         ...(evidence.evidence || []).map((item) => el("p", {},
           el("button", { class: "btn small", type: "button", text: `Download ${item.id}`, onclick: async () => {
-            try { await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id); }
-            catch (e) { reportApiError(e); }
+            await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id);
           } }))),
       );
     } catch (e) {
@@ -1552,10 +1544,8 @@ function tabCases() {
         if (removed) {
           rows.push(el("tr", {}, el("td", { text: id }), el("td", { colspan: 4 },
             el("button", { class: "btn small", text: "Retry cleanup", onclick: async () => {
-              try {
                 const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
                 toast(result.cleanup_pending ? "Cleanup is pending. Retry when storage is available." : "Live record cleanup complete. This does not delete backup copies.", "success");
-              } catch (e) { reportApiError(e); }
             } }))));
           continue;
         }
@@ -1595,13 +1585,9 @@ function tabSettings() {
     sourceEnrollment = null;
     const guildId = srcSel.value;
     if (!guildId) return;
-    try {
-      const source = await apiRead(`/api/guilds/${guildId}/config`);
-      if (srcSel.value === guildId && source.enrollment_id) {
-        sourceEnrollment = { guildId, id: source.enrollment_id };
-      }
-    } catch (e) {
-      reportApiError(e);
+    const source = await apiRead(`/api/guilds/${guildId}/config`);
+    if (srcSel.value === guildId && source.enrollment_id) {
+      sourceEnrollment = { guildId, id: source.enrollment_id };
     }
   } },
     el("option", { value: "", text: "Select a source server" }),
@@ -1615,14 +1601,10 @@ function tabSettings() {
 
   /** Clear one override field via API null (inherit parent). */
   async function inheritField(field) {
-    try {
-      await api(`/api/guilds/${state.guildId}/settings`, "PUT", { [field]: null });
-      if (!await loadConfig()) return;
-      toast(`Using global ${field.replaceAll("_", " ")}`, "success");
-      renderTab();
-    } catch (e) {
-      reportApiError(e);
-    }
+    await reloadAfter(
+      () => api(`/api/guilds/${state.guildId}/settings`, "PUT", { [field]: null }),
+      () => toast(`Using global ${field.replaceAll("_", " ")}`, "success"),
+    );
   }
 
   function settingsField(labelText, input, overrideKey, hint, allowInheritance = true) {
@@ -1690,26 +1672,16 @@ function tabSettings() {
           toast("No settings changes", "success");
           return;
         }
-        try {
-          const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", body);
-          if (!await loadConfig()) return;
-          toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success");
-          renderTab();
-        } catch (e) {
-          reportApiError(e);
-        }
+        await reloadAfter(
+          () => api(`/api/guilds/${state.guildId}/settings`, "PUT", body),
+          (res) => toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success"),
+        );
       } }),
       el("button", { class: "btn", text: "Re-sync Discord nickname", savedInputs: [], onclick: async () => {
-        try {
-          const res = await api(`/api/guilds/${state.guildId}/settings`, "PUT", {
-            sync_nickname: true,
-          });
-          if (!await loadConfig()) return;
-          toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success");
-          renderTab();
-        } catch (e) {
-          reportApiError(e);
-        }
+        await reloadAfter(
+          () => api(`/api/guilds/${state.guildId}/settings`, "PUT", { sync_nickname: true }),
+          (res) => toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success"),
+        );
       } }),
     ),
   ];
@@ -1719,18 +1691,15 @@ function tabSettings() {
   apiRead(`/api/guilds/${state.guildId}/case-delete-roles`).then((roles) => {
     roleInput.value = (roles.roles || []).join(", ");
     roleRevision.value = roles.revision || "";
-  }).catch(() => {});
+  }).catch((e) => { if (!isUnauthenticated(e)) reportApiError(e); });
   cards.push(el("div", { class: "card" },
     el("h3", { text: "Case removal" }),
     el("p", { class: "muted", text: "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action." }),
     el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
     el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
-      try {
-        const roles = splitIds(roleInput.value);
-        const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles, revision: roleRevision.value });
-        roleRevision.value = saved.revision;
-        toast("Case-removal roles saved", "success");
-      } catch (e) { reportApiError(e); }
+      const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles: splitIds(roleInput.value), revision: roleRevision.value });
+      roleRevision.value = saved.revision;
+      toast("Case-removal roles saved", "success");
     } }),
   ));
 
@@ -1747,14 +1716,10 @@ function tabSettings() {
             toast("Global prefix cannot be empty", "error");
             return;
           }
-          try {
-            await api(`/api/guilds/0/settings`, "PUT", { prefix: raw });
-            if (!await loadConfig()) return;
-            toast("Global prefix saved", "success");
-            renderTab();
-          } catch (e) {
-            reportApiError(e);
-          }
+          await reloadAfter(
+            () => api(`/api/guilds/0/settings`, "PUT", { prefix: raw }),
+            () => toast("Global prefix saved", "success"),
+          );
         } }),
       ),
     ));
@@ -1769,24 +1734,22 @@ function tabSettings() {
         el("button", { class: "btn primary", text: "Copy", onclick: async () => {
           if (!sourceEnrollment || sourceEnrollment.guildId !== srcSel.value) return toast("Select a source server to load its current configuration", "error");
           if (!confirm(`Copy ${sectionSel.value} from ${srcSel.selectedOptions[0].textContent}?`)) return;
-          try {
-            let res = await api(`/api/guilds/${state.guildId}/copy`, "POST", {
+          await reloadAfter(
+            () => api(`/api/guilds/${state.guildId}/copy`, "POST", {
               from_guild_id: String(srcSel.value), from_enrollment_id: sourceEnrollment.id, sections: [sectionSel.value],
-            });
-            if (!await loadConfig()) return;
-            let msg = `Copied: ${(res.copied || []).join(", ") || "(nothing)"}`;
-            if (res.skipped_badwords > 0) {
-              msg += ` (${res.skipped_badwords} invalid badword(s) skipped — not enforced)`;
-            }
-            if (res.skipped_logchannels) {
-              msg += " (log channels skipped — channel IDs are server-specific; set them here)";
-            }
-            if (res.nickname_queued) msg += " (Discord nickname queued)";
-            toast(msg, (res.skipped_badwords > 0 || res.skipped_logchannels) ? "info" : "success");
-            renderTab();
-          } catch (e) {
-            reportApiError(e);
-          }
+            }),
+            (res) => {
+              let msg = `Copied: ${(res.copied || []).join(", ") || "(nothing)"}`;
+              if (res.skipped_badwords > 0) {
+                msg += ` (${res.skipped_badwords} invalid badword(s) skipped — not enforced)`;
+              }
+              if (res.skipped_logchannels) {
+                msg += " (log channels skipped — channel IDs are server-specific; set them here)";
+              }
+              if (res.nickname_queued) msg += " (Discord nickname queued)";
+              toast(msg, (res.skipped_badwords > 0 || res.skipped_logchannels) ? "info" : "success");
+            },
+          );
         } }),
       ),
     ));

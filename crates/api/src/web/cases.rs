@@ -290,9 +290,6 @@ pub async fn get_evidence(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_DISPOSITION, "attachment")
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .header("cdn-cache-control", "no-store")
-        .header(header::VARY, "Cookie")
         .body(Body::from(bytes))
         .map_err(|error| ApiError(anyhow::anyhow!(error)))
 }

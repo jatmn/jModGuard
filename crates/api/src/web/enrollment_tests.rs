@@ -2,7 +2,6 @@
 use super::*;
 use crate::db;
 use axum::body::Body;
-use axum::http::header::{CACHE_CONTROL, VARY};
 use axum::http::Request;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tower::ServiceExt;
@@ -223,15 +222,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL).unwrap(),
-            "private, no-store"
-        );
-        assert_eq!(
-            response.headers().get(CDN_CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        assert_eq!(response.headers().get(VARY).unwrap(), "Cookie");
+        super::assert_uncacheable_headers(response.headers());
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
             .await
