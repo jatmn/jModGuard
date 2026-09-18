@@ -208,12 +208,17 @@ That script runs lockfile verification, `cargo fmt --check`, whitespace
 `git diff --check`, the publisher/release contract tests, workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
-service boundaries, public-install acceptance, frontend Node tests,
+service boundaries, public-install acceptance, the Dependabot config contract
+(`bash scripts/dependabot-config-test.sh`), frontend Node tests,
 `dual_process_smoke`, independent `jmodguard-bot` / `jmodguard-api` builds (with
 and without default features), `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
-`cargo audit` cannot run).
+`cargo audit` cannot run). GitHub-hosted Dependabot Updates dynamic workflows
+are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled. This repository has no GitHub Actions self-hosted
+runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
+them after 24 hours. Do not register leftover Proxmox GHA runners or label
+any runner `dependabot`.
 Remote libSQL tests stay in the Buildkite `remote-database` job.
 
 ```bash

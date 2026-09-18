@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Single source of truth for the Buildkite `test` job.
 # The remote-database job (libSQL containers) stays separate.
-# GitHub Actions workflows and GitHub-hosted runners are forbidden.
+# GitHub Actions workflows and GitHub-hosted CI runners are forbidden.
+# Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
@@ -223,6 +224,9 @@ python3 scripts/check-service-boundaries.py
 
 echo 'ci-preflight: python3 scripts/public-install-acceptance-test.py'
 python3 scripts/public-install-acceptance-test.py
+
+echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
+bash scripts/dependabot-config-test.sh
 
 echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
 node --test scripts/frontend-state-test.mjs

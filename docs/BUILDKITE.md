@@ -2,7 +2,9 @@
 
 All CI and image publication for this repository run on the self-hosted
 Buildkite `linux` queue. There are no GitHub Actions workflows or GHA runner
-selection/fallback jobs. Keep **Update commit statuses** enabled in the
+selection/fallback jobs, and this repository has no registered GitHub Actions
+self-hosted runners. GitHub still runs Dependabot version updates as hosted
+dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
 tests and image jobs. This repository has no GitHub Actions frontend publisher.
 
@@ -37,7 +39,9 @@ fail-open path. The existing clone credential must also fetch tags and full comm
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
 cache service. Do not add `.github/workflows`; there are no GitHub-hosted CI
-minutes for this repository.
+minutes for this repository. Hosted Dependabot Updates are not CI and do not
+consume those minutes. If a Dependabot job stays queued on a `dependabot`
+label, GitHub cancels it after 24 hours.
 
 The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
 `jmodguard-integration-tests`, plus the root library's
@@ -165,10 +169,14 @@ backward; production must keep using approved image digests.
    both tests, preparation, and both image publications. If a publish fails,
    correct the credential/agent setup and retry it; no GHA fallback starts.
 3. Check the published image's source SHA and single-manifest shape in GHCR and
-   the Buildkite check on GitHub. No Actions jobs should start for this repo.
-4. Let existing Actions builds finish before stopping/unregistering
-   `gha-runner-jmodguard`. Confirm it is not used by another repository or private
-   ops workflow before removing its service. Keep the Buildkite agents running.
+   the Buildkite check on GitHub. No Actions **CI or image** jobs should start
+   for this repo. Dependabot Updates dynamic workflows should still start and
+   must run on GitHub-hosted standard runners: keep **Dependabot on self-hosted
+   runners** disabled. Do not register leftover Proxmox GHA runners or label
+   any runner `dependabot`.
+4. This repository has no registered GitHub Actions self-hosted runners.
+   Do not re-register leftover Proxmox GHA runners. Keep the Buildkite agents
+   running.
 
 Local offline publisher tests: `python3 .buildkite/publish-image-test.py`.
 They exercise source identity, event guards, multi-commit change detection,

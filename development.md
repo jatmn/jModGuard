@@ -55,17 +55,34 @@ and the Buildkite agents. `Dockerfile.{bot,api,conductor}` pin
 `rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
 
-Dependabot supports private source repositories. The Cargo Git patch points
-back to this repository; it is not a GitHub Packages registry dependency.
-If a job reports private Git authentication failures, inspect its update log
-and the repository's Dependabot access settings. Do not put tokens in YAML.
-The separate GitHub Packages automatic-access feature requires granting the
-consuming repository Read access under the package's **Manage Actions access**
-settings; it does not provide credentials to Buildkite.
+Dependabot version updates are supported on this private GitHub.com
+repository. GitHub enqueues those jobs as **Actions → Dependabot Updates**
+dynamic workflows (`dynamic/dependabot/dependabot-updates`). They are not
+`.github/workflows` files, they do not replace Buildkite, and on standard
+GitHub-hosted runners they do not consume included Actions minutes. A
+missing Insights update log does not mean the weekly schedule is idle: if
+the job stays **queued** on a `dependabot` label and then **cancelled** at
+24 hours, no runner matched.
+
+Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
+**disabled** so GitHub-hosted standard runners can execute the job. This
+repository has no GitHub Actions self-hosted runners; CI is Buildkite.
+Do not register leftover Proxmox GHA runners or label any runner
+`dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
+and the operator-copy contract.
+
+The Cargo Git patch points back to this repository; it is not a GitHub
+Packages registry dependency. The 2026-09-08 GitHub Packages
+automatic-access change does not authenticate that git clone. If a job
+starts and then reports private Git authentication failures, inspect that
+run's Actions log. Do not put tokens in YAML. The separate GitHub Packages
+feature requires granting the consuming repository Read access under the
+package's **Manage Actions access** settings; it does not provide
+credentials to Buildkite.
 
 Dependabot alerts and security updates are separate repository settings.
 Keep both enabled under **Settings → Advanced Security → Dependabot**;
 the weekly schedule controls version updates, not the timing of security
-fixes. Check update logs under **Insights → Dependency graph → Dependabot**
-after merging the configuration. These jobs generate PRs; application CI
-and image publication remain on Buildkite.
+fixes. After a job **starts**, check **Actions → Dependabot Updates** and
+**Insights → Dependency graph → Dependabot**. These jobs generate PRs;
+application CI and image publication remain on Buildkite.
