@@ -1,7 +1,21 @@
+# Version updates run as GitHub Actions dynamic workflows
+# (`dynamic/dependabot/dependabot-updates`). They are not stored under
+# `.github/workflows` and do not consume included Actions minutes on
+# standard GitHub-hosted runners.
+#
+# Keep Settings → Advanced Security → Dependabot on self-hosted runners
+# disabled unless a dedicated Linux x64 runner with Docker is labeled
+# `dependabot`. Enabling that setting without that label queues every
+# cycle until GitHub cancels it after 24 hours. Do not put that label on
+# leftover `gha-runner-jmodguard`.
+#
+# Private GitHub.com repositories are supported. The Cargo git patch is
+# this same private repository, not GitHub Packages; the 2026-09-08
+# Packages automatic-access change does not apply here.
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
