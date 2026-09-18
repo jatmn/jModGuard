@@ -216,9 +216,10 @@ and without default features), `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
 `cargo audit` cannot run). GitHub-hosted Dependabot Updates dynamic workflows
-are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled unless a dedicated Linux x64 Docker runner is
-labeled `dependabot`; otherwise jobs queue on that label and GitHub cancels
-them after 24 hours. Do not put that label on leftover `gha-runner-jmodguard`.
+are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled. This repository has no GitHub Actions self-hosted
+runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
+them after 24 hours. Do not register leftover Proxmox GHA runners or label
+any runner `dependabot`.
 Remote libSQL tests stay in the Buildkite `remote-database` job.
 
 ```bash

@@ -65,11 +65,11 @@ the job stays **queued** on a `dependabot` label and then **cancelled** at
 24 hours, no runner matched.
 
 Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
-**disabled** so GitHub-hosted standard runners can execute the job. Enable
-that setting only after a dedicated Linux x64 runner with Docker carries
-the `dependabot` label. Do not put that label on leftover
-`gha-runner-jmodguard`. `python3 scripts/dependabot-config-test.py` guards
-this YAML and the operator-copy contract.
+**disabled** so GitHub-hosted standard runners can execute the job. This
+repository has no GitHub Actions self-hosted runners; CI is Buildkite.
+Do not register leftover Proxmox GHA runners or label any runner
+`dependabot`. `python3 scripts/dependabot-config-test.py` guards this YAML
+and the operator-copy contract.
 
 The Cargo Git patch points back to this repository; it is not a GitHub
 Packages registry dependency. The 2026-09-08 GitHub Packages

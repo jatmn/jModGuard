@@ -42,7 +42,7 @@ class DependabotConfigTests(unittest.TestCase):
         for needle in (
             "Dependabot on self-hosted runners",
             "`dependabot`",
-            "gha-runner-jmodguard",
+            "no GitHub Actions self-hosted runners",
             "24 hours",
             "GitHub Packages",
         ):
@@ -62,12 +62,11 @@ class DependabotConfigTests(unittest.TestCase):
         self.assertIn("Dependabot on self-hosted runners", self.development)
         self.assertIn("24 hours", self.development)
         self.assertIn("idle", self.development)
-        self.assertIn("gha-runner-jmodguard", self.development)
+        self.assertIn("no GitHub Actions self-hosted runners", self.development)
         self.assertIn("python3 scripts/dependabot-config-test.py", self.development)
         self.assertIn("Actions → Dependabot Updates", self.buildkite)
         self.assertIn("Dependabot on self-hosted", self.buildkite)
-        self.assertIn("24 hours", self.buildkite)
-        self.assertIn("gha-runner-jmodguard", self.buildkite)
+        self.assertIn("no registered GitHub Actions self-hosted runners", self.buildkite)
         self.assertNotIn("No Actions jobs should start for this repo.", self.buildkite)
         self.assertIn("no GitHub Actions CI or", self.deploy)
         self.assertIn("Dependabot on self-hosted runners", self.deploy)
@@ -76,7 +75,7 @@ class DependabotConfigTests(unittest.TestCase):
         self.assertIn("python3 scripts/dependabot-config-test.py", self.agents)
         self.assertIn("Dependabot on self-hosted runners", self.agents)
         self.assertIn("24 hours", self.agents)
-        self.assertIn("gha-runner-jmodguard", self.agents)
+        self.assertIn("no GitHub Actions self-hosted", self.agents)
         self.assertIn("python3 scripts/dependabot-config-test.py", self.preflight)
         self.assertIn("GitHub Actions workflows and GitHub-hosted CI runners are forbidden", self.preflight)
         self.assertIn("Dependabot Updates dynamic workflows are not CI", self.preflight)
