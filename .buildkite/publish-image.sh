@@ -303,9 +303,11 @@ inspect_digest() {
   MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS'
 const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
-const size = data.size || (data.Descriptor && data.Descriptor.size) || 1;
+const sizeRaw = data.size ?? (data.Descriptor && data.Descriptor.size);
+const size = Number(sizeRaw);
 if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
-process.stdout.write(`${digest}\t${Number(size)}\n`);
+if (!Number.isInteger(size) || size <= 0) process.exit(2);
+process.stdout.write(`${digest}\t${size}\n`);
 JS
 }
 
@@ -374,12 +376,12 @@ publish_manifest() {
   scratch="$(scratch_dir manifest)"
   context="${scratch}/source"
   components="${scratch}/components.json"
-  run_git worktree add --detach "$context" "$sha" >/dev/null
   cleanup_manifest() {
     run_git worktree remove --force "$context" >/dev/null 2>&1 || true
     rm -rf "$scratch"
   }
   trap cleanup_manifest EXIT
+  run_git worktree add --detach "$context" "$sha" >/dev/null
   bin="$(release_publish_bin)"
   "$bin" frontend-inventory "$context/frontend" >"${scratch}/frontend.json"
   COMPONENTS="$components" FRONTEND_JSON="${scratch}/frontend.json" node --input-type=commonjs - <<'JS'
@@ -464,16 +466,16 @@ publish_component() {
   redact_tokens "$token" "$source_token"
   export GITHUB_TOKEN="$source_token"
   scratch="$(scratch_dir publish)"
-  export DOCKER_CONFIG="${scratch}/docker"
-  mkdir -m 700 "$DOCKER_CONFIG"
-  printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
   context="${scratch}/source"
-  run_git worktree add --detach "$context" "$sha" >/dev/null
   cleanup_publish() {
     run_git worktree remove --force "$context" >/dev/null 2>&1 || true
     rm -rf "$scratch"
   }
   trap cleanup_publish EXIT
+  export DOCKER_CONFIG="${scratch}/docker"
+  mkdir -m 700 "$DOCKER_CONFIG"
+  printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
+  run_git worktree add --detach "$context" "$sha" >/dev/null
   channel="$(channel_for "$mode" "$label" || true)"
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel")
   run_docker "${build_cmd[@]:1}"

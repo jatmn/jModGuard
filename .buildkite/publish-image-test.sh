@@ -420,6 +420,64 @@ JS
 exercise_publish 1 1
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'failed build must still remove the worktree'
 
+reload_publisher
+saved_publish_tmp="${TMPDIR:-/tmp}"
+publish_scratch_parent="$(mktemp -d "${saved_publish_tmp}/publish-scratch-parent-XXXXXX")"
+TMPDIR="$publish_scratch_parent"
+export TMPDIR
+with_main
+GHCR_USERNAME=fixture
+GHCR_TOKEN=fixture-token
+GITHUB_TOKEN=""
+PLAN_JSON="$(plan_json main "" "$HEAD_SHA" "$HEAD_SHA" "")"
+export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
+run_git() {
+  case "$1" in
+    rev-parse) printf '%s\n' "$HEAD_SHA" ;;
+    status) printf '' ;;
+    worktree)
+      if [[ "$2" == add ]]; then
+        publish_fail 'worktree add failed'
+      fi
+      ;;
+    *) fail "unexpected git $*" ;;
+  esac
+}
+run_docker() {
+  if [[ "$1" == login ]]; then
+    cat >/dev/null
+    return 0
+  fi
+  fail "unexpected docker $*"
+}
+run_bk() {
+  case "$1 $2" in
+    'meta-data get') printf '%s\n' "$PLAN_JSON" ;;
+    'redactor add') cat >/dev/null; return 0 ;;
+    *) fail "unexpected buildkite $*" ;;
+  esac
+}
+changed_since_publication() { return 0; }
+if ( publish_component api ) >/dev/null 2>&1; then
+  fail 'worktree failure must abort publish'
+fi
+if compgen -G "${publish_scratch_parent}/publish-*" >/dev/null; then
+  fail "publish scratch must be removed after worktree failure: $(ls -A "$publish_scratch_parent")"
+fi
+rm -rf "$publish_scratch_parent"
+TMPDIR="$saved_publish_tmp"
+export TMPDIR
+
+reload_publisher
+digest="$(printf 'a%.0s' {1..64})"
+run_docker() { printf '%s' "{\"digest\":\"sha256:${digest}\",\"size\":0}"; }
+if ( inspect_digest "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}" ) >/dev/null 2>&1; then
+  fail 'inspect_digest must reject non-positive size'
+fi
+run_docker() { printf '%s' "{\"digest\":\"sha256:${digest}\",\"size\":9}"; }
+got="$(inspect_digest "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}")"
+assert_eq "$got" "$(printf 'sha256:%s\t%s' "$digest" 9)"
+
 for pair in 'read-only-secret:read-only-secret' '$GITHUB_TOKEN:test-secret'; do
   token="${pair%%:*}"
   expected="${pair#*:}"

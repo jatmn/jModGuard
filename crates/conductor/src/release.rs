@@ -174,11 +174,42 @@ fn is_sha256_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+fn component_size(body: &serde_json::Map<String, Value>, name: &str) -> Result<i64> {
+    let size = body
+        .get("size")
+        .context(format!("{name} size is required"))?;
+    match size {
+        Value::Number(number) => {
+            let value = number
+                .as_i64()
+                .filter(|value| *value > 0)
+                .or_else(|| {
+                    number
+                        .as_u64()
+                        .and_then(|value| i64::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                });
+            ensure!(
+                value.is_some(),
+                "{name} size must be a positive integer"
+            );
+            Ok(value.expect("positive size"))
+        }
+        _ => anyhow::bail!("{name} size must be a positive integer"),
+    }
+}
+
 fn validate_components(components: &Value) -> Result<()> {
     let Some(map) = components.as_object() else {
         anyhow::bail!("incomplete publication remains unavailable");
     };
-    for name in ["bot", "api", "conductor", "frontend"] {
+    for name in map.keys() {
+        ensure!(
+            REQUIRED_COMPONENTS.contains(&name.as_str()),
+            "unexpected component {name}"
+        );
+    }
+    for name in REQUIRED_COMPONENTS {
         let Some(body) = map.get(name) else {
             anyhow::bail!("incomplete publication remains unavailable");
         };
@@ -203,12 +234,13 @@ fn validate_components(components: &Value) -> Result<()> {
                 "frontend sha256 is required"
             );
         } else {
-            ensure!(
-                obj.get("digest")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_sha256_digest),
-                "component digest is required"
-            );
+            let digest = obj
+                .get("digest")
+                .and_then(Value::as_str)
+                .context(format!("{name} digest is required"))?;
+            let size = component_size(obj, name)?;
+            let image = obj.get("image").and_then(Value::as_str);
+            image_component(name, digest, size, image)?;
         }
     }
     Ok(())
@@ -1313,6 +1345,31 @@ mod tests {
             })
             .is_err()
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_components_rejects_unexpected_keys_and_non_positive_size() {
+        let tmp = std::env::temp_dir().join(format!("jmodguard-release-validate-{}", std::process::id()));
+        let frontend = tmp.join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        let components = fixture_components(&frontend);
+        let mut extra = components.clone();
+        extra
+            .as_object_mut()
+            .expect("components object")
+            .insert("debug".into(), serde_json::json!({}));
+        assert!(validate_components(&extra).is_err());
+
+        let mut zero_size = components.clone();
+        zero_size["bot"]["size"] = serde_json::json!(0);
+        assert!(validate_components(&zero_size).is_err());
+
+        let mut missing_size = components.clone();
+        missing_size["api"].as_object_mut().expect("api").remove("size");
+        assert!(validate_components(&missing_size).is_err());
+
+        validate_components(&components).unwrap();
         let _ = fs::remove_dir_all(&tmp);
     }
 
