@@ -126,35 +126,54 @@ resolve_source() {
 }
 
 oci_revision() {
-  node --input-type=commonjs - <<'JS'
-const fs = require("fs");
-const data = JSON.parse(fs.readFileSync(0, "utf8"));
-const labels = (data.config && data.config.Labels) || {};
+  IMAGE_JSON="${1:-}" node --input-type=commonjs - <<'JS'
+const data = (() => {
+  try {
+    return JSON.parse(process.env.IMAGE_JSON || "");
+  } catch {
+    process.exit(1);
+  }
+})();
+const labels = (data && data.config && data.config.Labels) || {};
 const revision = labels["org.opencontainers.image.revision"] || "";
 const source = labels["org.opencontainers.image.source"] || "";
 process.stdout.write(`${revision}\n${source}\n`);
 JS
 }
 
+# Skip-path helpers must not publish_fail. Absent history, registry failures,
+# unknown git objects and foreign manifests require a rebuild.
+registry_inspect() {
+  docker buildx imagetools inspect "$@"
+}
+
+skip_source_diff() {
+  git diff --name-only "$@"
+}
+
 changed_since_publication() {
   local component="$1"
   local sha="$2"
   local image="$3"
-  local config previous source latest immutable
-  if ! config="$(docker buildx imagetools inspect "${image}:latest" --format '{{json .Image}}')"; then
+  local config previous source latest immutable names rev
+  if ! config="$(registry_inspect "${image}:latest" --format '{{json .Image}}')"; then
     return 0
   fi
-  {
-    read -r previous
-    read -r source
-  } < <(printf '%s' "$config" | oci_revision)
+  if ! rev="$(oci_revision "$config")"; then
+    return 0
+  fi
+  IFS= read -r previous <<<"${rev%%$'\n'*}"
+  IFS= read -r source <<<"${rev#*$'\n'}"
   [[ "$source" == "$REPOSITORY" && "$previous" =~ $SHA_RE ]] || return 0
-  if [[ -n "$(run_git diff --name-only "$previous" "$sha" -- \
-      "Dockerfile.${component}" Cargo.toml Cargo.lock rust-toolchain.toml src crates migrations vendor .buildkite)" ]]; then
+  if ! names="$(skip_source_diff "$previous" "$sha" -- \
+      "Dockerfile.${component}" Cargo.toml Cargo.lock rust-toolchain.toml src crates migrations vendor .buildkite)"; then
     return 0
   fi
-  latest="$(docker buildx imagetools inspect "${image}:latest" --raw)" || return 0
-  immutable="$(docker buildx imagetools inspect "${image}:${previous}" --raw)" || return 0
+  if [[ -n "$names" ]]; then
+    return 0
+  fi
+  latest="$(registry_inspect "${image}:latest" --raw)" || return 0
+  immutable="$(registry_inspect "${image}:${previous}" --raw)" || return 0
   [[ -z "${latest//[[:space:]]/}" || "$latest" != "$immutable" ]]
 }
 
@@ -281,9 +300,8 @@ JS
 inspect_digest() {
   local raw
   raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}')"
-  printf '%s' "$raw" | node --input-type=commonjs - <<'JS'
-const fs = require("fs");
-const data = JSON.parse(fs.readFileSync(0, "utf8"));
+  MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS'
+const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
 const size = data.size || (data.Descriptor && data.Descriptor.size) || 1;
 if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
