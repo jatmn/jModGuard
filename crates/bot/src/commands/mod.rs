@@ -608,14 +608,12 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             if deferred {
                 match answer {
                     SlashAnswer::Withdraw => {
-                        // The behavior's effect is already visible in the
-                        // channel (e.g. same-channel /say): withdraw the
-                        // deferred answer so no redundant public confirmation
-                        // appears.
-                        let _ = ctx
-                            .http
-                            .delete_original_interaction_response(&slash.token)
-                            .await;
+                        withdraw_deferred_slash_answer(
+                            ctx,
+                            &slash.token,
+                            &cmd.name,
+                        )
+                        .await;
                     }
                     // Ephemeral is fixed at the initial response; a deferred
                     // answer is already public and can only be edited.
@@ -752,6 +750,33 @@ fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
         SlashAnswer::Ephemeral
     } else {
         SlashAnswer::Public
+    }
+}
+
+/// When delete is rejected, edit the deferred placeholder to this instead of
+/// leaving the loading/"done" confirmation visible after same-channel say.
+const WITHDRAW_DEFERRED_FALLBACK_CONTENT: &str = "\u{200b}";
+
+/// Remove the public deferred interaction placeholder after a suppressed
+/// confirmation. Prefer delete; on failure log and edit to minimal content.
+async fn withdraw_deferred_slash_answer(ctx: &Context, token: &str, command_name: &str) {
+    if let Err(e) = ctx
+        .http
+        .delete_original_interaction_response(token)
+        .await
+    {
+        tracing::warn!(
+            "failed to delete deferred slash answer for `{command_name}`: {e:#}; editing to minimal content"
+        );
+        if let Err(edit_err) = EditInteractionResponse::new()
+            .content(WITHDRAW_DEFERRED_FALLBACK_CONTENT)
+            .execute(&ctx.http, token)
+            .await
+        {
+            tracing::warn!(
+                "failed to edit deferred slash answer for `{command_name}` after delete failure: {edit_err:#}"
+            );
+        }
     }
 }
 
