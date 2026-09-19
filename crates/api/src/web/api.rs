@@ -212,6 +212,10 @@ pub async fn update_settings(
     // override. Values equal to the parent layer are stripped so global
     // inheritance keeps working.
     let nickname_queued = (body.bot_name.is_some() || body.sync_nickname) && guild_id != 0;
+    let prefix_present = body.prefix.is_some();
+    let bot_name_present = body.bot_name.is_some();
+    let prefix_patch = body.prefix.clone();
+    let bot_name_patch = body.bot_name.clone();
     let settings = db::patch_enrolled_settings(
         &app.db,
         super::configuration_scope(&app, &auth, guild_id)?,
@@ -227,6 +231,16 @@ pub async fn update_settings(
         "nickname_applied": null,
         "nickname_queued": nickname_queued,
         "nickname_error": null,
+        "config_patch": {
+            "kind": "settings",
+            "scope": if guild_id == 0 { "global" } else { "guild" },
+            "settings": settings_wire(&settings),
+            "prefix_present": prefix_present,
+            "prefix": prefix_patch,
+            "bot_name_present": bot_name_present,
+            "bot_name": bot_name_patch,
+            "sync_nickname": body.sync_nickname,
+        }
     })))
 }
 
@@ -287,7 +301,15 @@ pub async fn put_rule(
         &body.data,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "config_patch": {
+            "kind": "rule",
+            "id": rule_id,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": body.data,
+        }
+    })))
 }
 
 #[derive(Deserialize)]
@@ -311,7 +333,15 @@ pub async fn delete_rule(
         &rule_id,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "config_patch": {
+            "kind": "rule",
+            "id": rule_id,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": null,
+        }
+    })))
 }
 
 pub(crate) fn scope_from(
@@ -372,7 +402,21 @@ pub async fn add_badword(
         body.note.as_deref(),
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "id": id,
+        "config_patch": {
+            "kind": "badword",
+            "operation": "add",
+            "value": {
+                "id": id,
+                "guild_id": scope.to_string(),
+                "pattern": body.pattern,
+                "note": body.note,
+                "valid": true,
+            }
+        }
+    })))
 }
 
 pub async fn delete_badword(
@@ -406,7 +450,14 @@ pub async fn delete_badword(
     )
     .await
     {
-        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Ok(()) => Ok(Json(serde_json::json!({
+            "ok": true,
+            "config_patch": {
+                "kind": "badword",
+                "operation": "delete",
+                "id": word_id,
+            }
+        }))),
         Err(e) if e.to_string().contains("badword not found") => Err(not_found()),
         Err(e) => Err(ApiError(e)),
     }
@@ -501,7 +552,15 @@ pub async fn put_command(
         &data,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "config_patch": {
+            "kind": "command",
+            "name": name,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": data,
+        }
+    })))
 }
 
 pub async fn create_command(
@@ -525,7 +584,16 @@ pub async fn create_command(
         &data,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "name": name,
+        "config_patch": {
+            "kind": "command",
+            "name": name,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": data,
+        }
+    })))
 }
 
 pub async fn delete_command(
@@ -614,7 +682,15 @@ pub async fn put_template(
         &body.template,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "config_patch": {
+            "kind": "template",
+            "event": event,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": body.template,
+        }
+    })))
 }
 
 pub async fn delete_template(
@@ -633,7 +709,15 @@ pub async fn delete_template(
         &event,
     )
     .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "config_patch": {
+            "kind": "template",
+            "event": event,
+            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
+            "value": null,
+        }
+    })))
 }
 
 // ---------------------------------------------------------------------------

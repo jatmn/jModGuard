@@ -112,17 +112,6 @@ pub(super) fn guild_write_fenced(conn: &impl SqlExecutor, guild: i64) -> Result<
     if guild <= 0 {
         return Ok(false);
     }
-    let exists = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='guild_write_fences')",
-            (),
-            |r| Ok(r.get::<i64>(0)?),
-        )
-        .optional()?
-        .unwrap_or(0);
-    if exists == 0 {
-        return Ok(false);
-    }
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM guild_write_fences WHERE guild_id=?1)",
         params![guild],

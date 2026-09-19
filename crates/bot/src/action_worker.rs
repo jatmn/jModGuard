@@ -40,6 +40,11 @@ impl Outcome {
 #[serenity::async_trait]
 pub trait DiscordActions: Send + Sync {
     async fn membership_matches(&self, job: &BotAction) -> Result<bool>;
+    /// A positive live membership observation used to repair a missed rejoin.
+    /// Implementations may return `None` when they cannot expose the identity.
+    async fn membership_joined_at_ns(&self, _job: &BotAction) -> Result<Option<i64>> {
+        Ok(None)
+    }
     async fn authorized(&self, job: &BotAction) -> Result<bool>;
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
@@ -51,6 +56,12 @@ pub struct LiveDiscord<'a> {
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
     async fn membership_matches(&self, job: &BotAction) -> Result<bool> {
+        let Some(joined_at_ns) = self.membership_joined_at_ns(job).await? else {
+            anyhow::bail!("Discord member has no supported join timestamp");
+        };
+        Ok(Some(joined_at_ns) == job.joined_at_ns)
+    }
+    async fn membership_joined_at_ns(&self, job: &BotAction) -> Result<Option<i64>> {
         anyhow::ensure!(self.bot_user_id.get() > 1, "bot identity is not ready");
         let member = self
             .http
@@ -59,7 +70,7 @@ impl DiscordActions for LiveDiscord<'_> {
         Ok(member
             .joined_at
             .and_then(|joined| joined.timestamp_nanos_opt())
-            .is_some_and(|joined| Some(joined) == job.joined_at_ns))
+            .filter(|joined| *joined > 0))
     }
     async fn authorized(&self, job: &BotAction) -> Result<bool> {
         let guild = self
@@ -133,6 +144,13 @@ fn classify_unban_response(status: u16, code: isize) -> Outcome {
     }
 }
 
+async fn finish_validation_outcome(db: &Db, job: &BotAction, code: &str) -> Result<()> {
+    if db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
+        db::finish_dispatched_bot_action(db, job, "failed", code).await?;
+    }
+    Ok(())
+}
+
 /// Execute only an admitted claim. The final transaction checks the claim again;
 /// direct log configuration changes may supersede this operation while HTTP runs.
 async fn execute_inner(
@@ -145,6 +163,56 @@ async fn execute_inner(
 ) -> Result<()> {
     limits.validate()?;
     anyhow::ensure!(job.is_claimed(), "unclaimed bot action");
+    let started = tokio::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(u64::from(limits.request_timeout_secs));
+    if chrono::Utc::now().timestamp() >= job.expires_at {
+        return Ok(());
+    }
+    let membership = async {
+        match discord.membership_joined_at_ns(job).await? {
+            Some(joined_at_ns) => {
+                Ok::<_, anyhow::Error>((Some(joined_at_ns) == job.joined_at_ns, Some(joined_at_ns)))
+            }
+            None => Ok::<_, anyhow::Error>((discord.membership_matches(job).await?, None)),
+        }
+    };
+    match tokio::time::timeout(timeout, membership).await {
+        Ok(Ok((true, _))) => {}
+        Ok(Ok((false, observed_joined_at_ns))) => {
+            tracing::warn!(
+                action_id = %job.id,
+                guild_id = job.guild_id,
+                expected_joined_at_ns = ?job.joined_at_ns,
+                observed_joined_at_ns = ?observed_joined_at_ns,
+                "bot action membership did not match its captured enrollment"
+            );
+            // A gateway event can be missed while Discord REST already exposes
+            // the replacement join. Repair that positive observation
+            // immediately so later actions do not repeat the same stale
+            // failure. The claim is still unconsumed, so the enrollment
+            // transition cancels it atomically instead of leaving it uncertain.
+            if let Some(tenant) = tenant
+                && let Some(joined_at_ns) = observed_joined_at_ns
+                && Some(joined_at_ns) != job.joined_at_ns
+                && let Some(enrollment) = db::enroll_guild(db, job.guild_id, joined_at_ns).await?
+            {
+                tracing::warn!(
+                    action_id = %job.id,
+                    guild_id = job.guild_id,
+                    expected_joined_at_ns = ?job.joined_at_ns,
+                    observed_joined_at_ns = joined_at_ns,
+                    "repaired bot enrollment after action membership mismatch"
+                );
+                tenant.activate(enrollment).await?;
+                return Ok(());
+            }
+            return finish_validation_outcome(db, job, "bot_membership_changed").await;
+        }
+        Ok(Err(_)) => {
+            return finish_validation_outcome(db, job, "bot_membership_check_unavailable").await;
+        }
+        Err(_) => return finish_validation_outcome(db, job, "validation_timed_out").await,
+    }
     if !db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
         return Ok(());
     }
@@ -152,11 +220,6 @@ async fn execute_inner(
     let work = async {
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
-        }
-        match discord.membership_matches(job).await {
-            Ok(true) => {}
-            Ok(false) => return Outcome::failed("bot_membership_changed"),
-            Err(_) => return Outcome::failed("bot_membership_check_unavailable"),
         }
         match discord.authorized(job).await {
             Ok(true) => {}
@@ -213,18 +276,16 @@ async fn execute_inner(
             } => Outcome::succeeded("log_channel_cleared"),
         }
     };
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(limits.request_timeout_secs)),
-        work,
-    )
-    .await
-    .unwrap_or_else(|_| {
-        if mutation_started.load(std::sync::atomic::Ordering::Relaxed) {
-            Outcome::uncertain("request_timed_out")
-        } else {
-            Outcome::failed("validation_timed_out")
-        }
-    });
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let outcome = tokio::time::timeout(remaining, work)
+        .await
+        .unwrap_or_else(|_| {
+            if mutation_started.load(std::sync::atomic::Ordering::Relaxed) {
+                Outcome::uncertain("request_timed_out")
+            } else {
+                Outcome::failed("validation_timed_out")
+            }
+        });
     if mutation_started.load(std::sync::atomic::Ordering::Relaxed)
         && let Some(tenant) = tenant
         && let Action::Unban { user_id, reason } = &job.action

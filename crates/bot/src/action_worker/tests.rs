@@ -699,6 +699,50 @@ async fn changed_discord_membership_never_dispatches_old_queued_work() {
 }
 
 #[tokio::test]
+async fn live_membership_mismatch_repairs_missed_rejoin_before_consuming_claim() {
+    struct RejoinedDiscord;
+    #[serenity::async_trait]
+    impl DiscordActions for RejoinedDiscord {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            Ok(false)
+        }
+        async fn membership_joined_at_ns(&self, _: &BotAction) -> Result<Option<i64>> {
+            Ok(Some(2))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            panic!("a stale action must not reach actor authorization")
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            panic!("a stale action must not validate its target channel")
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("a stale action must not dispatch")
+        }
+    }
+
+    let f = Fixture::new();
+    let job = f
+        .enqueue(10, "repair_membership", log_channel(Some(123)))
+        .await;
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    let old = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    app.tenant.activate(old).await.unwrap();
+
+    drain_with_state(&app, &RejoinedDiscord, &WorkerLimits::default())
+        .await
+        .unwrap();
+
+    let current = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    assert_eq!(current.joined_at_ns, 2);
+    assert_ne!(current.id.as_str(), job.enrollment_id.as_deref().unwrap());
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("cancelled".into(), Some("enrollment_ended".into()))
+    );
+    assert!(db::list_log_channels(&f.db, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn departure_during_authorization_blocks_dispatch() {
     struct DepartDuringCheck<'a>(&'a Db);
     #[serenity::async_trait]

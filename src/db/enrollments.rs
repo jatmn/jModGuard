@@ -247,13 +247,39 @@ impl ConfigurationWriteScope {
         self.target.guild_id()
     }
     pub(super) fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
-        self.request.verify_conn(conn)?;
-        if self.request != self.target {
-            self.target.verify_conn(conn)?;
+        let ConfigurationScope::Guild(expected) = &self.request else {
+            return Ok(());
+        };
+        if expected.guild_id <= 0 {
+            return Err(EnrollmentChanged.into());
         }
-        let guild = self.target.guild_id();
-        if guild > 0 {
-            super::guild_stores::refuse_fenced_write(conn, guild)?;
+        let target_guild = self.target.guild_id();
+        let (enrollment_matches, write_fenced) = conn
+            .query_row(
+                "SELECT
+                   EXISTS(SELECT 1 FROM guild_enrollments
+                          WHERE guild_id=?1 AND id=?2 AND joined_at_ns=?3 AND active=1),
+                   EXISTS(SELECT 1 FROM guild_write_fences WHERE guild_id=?4)",
+                params![
+                    expected.guild_id,
+                    expected.id.as_str(),
+                    expected.joined_at_ns,
+                    target_guild
+                ],
+                |row| Ok((row.get::<bool>(0)?, row.get::<bool>(1)?)),
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    guild_id = expected.guild_id,
+                    "configuration enrollment verification failed: {error:#}"
+                );
+                EnrollmentUnverified
+            })?;
+        if !enrollment_matches {
+            return Err(EnrollmentChanged.into());
+        }
+        if write_fenced {
+            return Err(super::guild_stores::GuildWriteFenced.into());
         }
         Ok(())
     }

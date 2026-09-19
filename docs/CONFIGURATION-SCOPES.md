@@ -51,7 +51,11 @@ An empty captured settings patch is a checked primary read. It verifies membersh
 though it changes nothing, then returns without a mutation receipt or version change.
 Actual settings writes enable recovery receipts after scope verification while retaining
 the primary transaction lock. Existing lost-commit reconciliation still applies. Other
-mutations retain their existing receipt and no-op version behavior.
+mutations retain their existing receipt and no-op version behavior. Captured configuration
+writes check the exact enrollment and any target-guild move fence in one SQL statement.
+On remote libSQL, transaction setup likewise checks the restore fence and creates the
+lost-commit receipt in one statement. These preserve the same fail-closed checks while
+removing avoidable serial provider round trips from each save.
 
 No new dependency, connection pool, cache or per-message work is added. These checks are
 not a transaction spanning Discord and SQL. Shared/dedicated routing, selected cases and

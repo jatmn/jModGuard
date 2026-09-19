@@ -57,7 +57,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -219,6 +219,26 @@ test('an older same-server refresh cannot roll back a newer saved snapshot', asy
   assert.equal(app.state.config.settings.prefix, '?');
 });
 
+test('an older refresh cannot roll back an acknowledged mutation representation', async () => {
+  let resolveRefresh;
+  const { app } = harness(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+  app.state.config = {
+    rules: [{ rule_id: 'mention_spam', global: { enabled: true }, guild_override: null, effective: { enabled: true } }],
+  };
+  const old = app.loadConfig();
+  assert.equal(app.applyConfigPatch({
+    config_patch: {
+      kind: 'rule', id: 'mention_spam', scope: 'guild', value: { enabled: false },
+    },
+  }), true);
+  resolveRefresh(response({
+    rules: [{ rule_id: 'mention_spam', global: { enabled: true }, guild_override: null, effective: { enabled: true } }],
+  }));
+  await old;
+  assert.equal(app.state.config.rules[0].effective.enabled, false);
+  assert.equal(app.state.loading, false);
+});
+
 test('failed refresh clears stale settings and exposes a retryable error', async () => {
   const { app } = harness(async () => { throw new Error('offline'); });
   app.state.config = { settings: { prefix: 'stale' } };
@@ -247,8 +267,21 @@ function settingsHarness() {
   const calls = [];
   const cfg = { settings: { prefix: '!', bot_name: 'Guard', retention_days: 30 }, settings_override: { prefix: '!', retention_days: 30 }, global_settings: { prefix: '/' } };
   const h = harness(async (url, options) => {
-    calls.push({ url, method: options.method, body: options.body ? JSON.parse(options.body) : null });
-    if (options.method === 'PUT' && url.endsWith('/settings')) return response({ nickname_queued: false });
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (options.method === 'PUT' && url.endsWith('/settings')) {
+      if (Object.hasOwn(body, 'prefix')) cfg.settings.prefix = body.prefix ?? cfg.global_settings.prefix;
+      if (Object.hasOwn(body, 'bot_name')) cfg.settings.bot_name = body.bot_name;
+      return response({
+        nickname_queued: false,
+        config_patch: {
+          kind: 'settings', scope: 'guild', settings: cfg.settings,
+          prefix_present: Object.hasOwn(body, 'prefix'), prefix: body.prefix,
+          bot_name_present: Object.hasOwn(body, 'bot_name'), bot_name: body.bot_name,
+          sync_nickname: false,
+        },
+      });
+    }
     if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: '' });
     return response(cfg);
   });
@@ -266,6 +299,7 @@ test('settings patches send only changed fields to the selected server', async (
   await save.listeners.click({});
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
+  assert.equal(calls.filter((c) => c.url.endsWith('/config')).length, 0);
   assert.ok(calls.some((c) => c.method === 'POST' && c.url.endsWith('/case-delete-roles')));
 });
 
@@ -419,14 +453,15 @@ function ruleSaveHarness({ scope = 'global', override = false } = {}) {
       if (failures.put) throw new Error('write refused');
       if (body.scope === 'global') globalRule = body.data;
       else guildRule = body.data;
+      return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: body.scope, value: body.data } });
     } else if (options.method === 'DELETE') {
       if (failures.delete) throw new Error('cleanup unavailable');
       guildRule = null;
+      return response({ ok: true, config_patch: { kind: 'rule', id: 'mention_spam', scope: 'guild', value: null } });
     } else {
       if (failures.refresh) throw new Error('refresh unavailable');
       return response(snapshot());
     }
-    return response({ ok: true });
   });
   h.app.state.me.is_bot_owner = true;
   h.app.state.config = structuredClone(snapshot());
@@ -496,11 +531,11 @@ test('a refused rule PUT retains the checkbox draft and never deletes an overrid
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);
 });
 
-test('a successful global rule save clears the guild override and refreshes', async () => {
+test('a successful global rule save applies both acknowledgments without a config reload', async () => {
   const h = ruleSaveHarness({ override: true });
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE', 'POST']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'DELETE']);
   assert.equal(h.calls[0].body.scope, 'global');
   assert.equal(h.calls[1].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].guild_override, null);
@@ -513,7 +548,7 @@ test('a guild-only rule save does not run global override cleanup', async () => 
   const h = ruleSaveHarness({ scope: 'guild' });
   await h.enabled.listeners.change({ target: { checked: false } });
   await h.save.listeners.click({});
-  assert.deepEqual(h.calls.map((c) => c.method), ['PUT', 'POST']);
+  assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
   assert.equal(h.calls[0].body.scope, 'guild');
   assert.equal(h.app.state.config.rules[0].global.enabled, true);
   assert.equal(h.app.state.config.rules[0].effective.enabled, false);

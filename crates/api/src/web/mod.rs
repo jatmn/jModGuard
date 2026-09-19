@@ -1089,13 +1089,20 @@ pub async fn authorize_manage_guild(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));
     }
-    let mut auth = require_auth_fresh(app, session).await?;
+    // Discord permission and database membership are independent admission
+    // inputs. Fetch them concurrently so remote deployments do not pay both
+    // network round trips serially before every guild operation.
+    let (auth, enrollment) = tokio::join!(
+        require_auth_fresh(app, session),
+        require_active_enrollment(app, guild_id)
+    );
+    let mut auth = auth?;
     if !auth.can_manage(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));
     }
-    auth.enrollment = Some(require_active_enrollment(app, guild_id).await?);
+    auth.enrollment = Some(enrollment?);
     Ok(auth)
 }
 
@@ -1111,13 +1118,17 @@ pub async fn authorize_ban_members(
             "this operation requires a Discord server"
         )));
     }
-    let mut auth = require_auth_fresh(app, session).await?;
+    let (auth, enrollment) = tokio::join!(
+        require_auth_fresh(app, session),
+        require_active_enrollment(app, guild_id)
+    );
+    let mut auth = auth?;
     if !auth.can_ban_members(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot unban members in this server (needs BAN_MEMBERS permission)"
         )));
     }
-    auth.enrollment = Some(require_active_enrollment(app, guild_id).await?);
+    auth.enrollment = Some(enrollment?);
     Ok(auth)
 }
 
