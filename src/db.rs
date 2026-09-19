@@ -124,6 +124,45 @@ pub fn is_database_operation_timeout(err: &anyhow::Error) -> bool {
     crate::db_compat::is_database_operation_timeout(err)
 }
 
+/// True when Bunny Database / Turso closed an interactive transaction.
+///
+/// Distinct from [`is_database_operation_timeout`]: that is this process's
+/// request deadline. This is the provider killing the Hrana stream, which
+/// reads may retry.
+pub fn is_remote_interactive_timeout(err: &anyhow::Error) -> bool {
+    crate::db_compat::is_remote_interactive_timeout(err)
+}
+
+/// Interactive remote reads that lost their Hrana stream may be retried.
+/// Never use this around a mutation: COMMIT could have succeeded.
+const REMOTE_INTERACTIVE_READ_ATTEMPTS: u32 = 3;
+
+pub(super) async fn retry_remote_interactive_read<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last = None;
+    for attempt in 1..=REMOTE_INTERACTIVE_READ_ATTEMPTS {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_remote_interactive_timeout(&error)
+                    && attempt < REMOTE_INTERACTIVE_READ_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt,
+                    error = %error,
+                    "retrying read after remote interactive transaction timeout"
+                );
+                last = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.expect("remote interactive read retry exhausted without an error"))
+}
+
 pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
     crate::db_compat::is_database_commit_indeterminate(err)
 }

@@ -883,43 +883,271 @@ fn rows_map_json<T: DeserializeOwned + Send + 'static>(
     Ok(out)
 }
 
-/// Loads `(key, value)` rows where the value column is plain text
-/// (templates) or an integer (log_channels).
-trait PlainValue: Sized {
-    fn get(row: &Row, index: i32) -> Result<Self>;
+/// One Hrana statement for every configuration collection in a snapshot.
+/// Bunny Database / Turso closes interactive transactions after a few seconds;
+/// the previous per-table prepare+query loop exceeded that on Magic Containers.
+const CONFIGURATION_SNAPSHOT_SQL: &str = r#"
+SELECT
+  (SELECT value FROM meta WHERE key = 'config_version'),
+  (SELECT value FROM meta WHERE key = 'slash_registry_version'),
+  (SELECT value FROM meta WHERE key = 'config_revision'),
+  (SELECT value FROM meta WHERE key = 'slash_registry_revision'),
+  (SELECT value FROM meta WHERE key = 'settings_terminal_defaults'),
+  (SELECT settings FROM guild_settings WHERE guild_id = ?2),
+  (SELECT settings FROM guild_settings WHERE guild_id = ?1),
+  (SELECT json_group_object(rule_id, data) FROM rules WHERE guild_id = ?1),
+  (SELECT json_group_object(rule_id, data) FROM rules WHERE guild_id = ?2),
+  (SELECT json_group_object(name, data) FROM commands WHERE guild_id = ?1),
+  (SELECT json_group_object(name, data) FROM commands WHERE guild_id = ?2),
+  (SELECT json_group_object(event_type, template) FROM templates WHERE guild_id = ?1),
+  (SELECT json_group_object(event_type, template) FROM templates WHERE guild_id = ?2),
+  (SELECT json_group_object(event_type, channel_id) FROM log_channels WHERE guild_id = ?1),
+  (SELECT json_group_array(json_object(
+        'id', id,
+        'guild_id', guild_id,
+        'pattern', pattern,
+        'note', note
+     ))
+     FROM (SELECT id, guild_id, pattern, note FROM badwords
+           WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id)),
+  (SELECT state FROM nickname_reconcile WHERE guild_id = ?1),
+  (SELECT attempt_count FROM nickname_reconcile WHERE guild_id = ?1),
+  (SELECT next_attempt_at FROM nickname_reconcile WHERE guild_id = ?1),
+  (SELECT last_error_code FROM nickname_reconcile WHERE guild_id = ?1),
+  (SELECT last_error FROM nickname_reconcile WHERE guild_id = ?1),
+  (SELECT last_error_at FROM nickname_reconcile WHERE guild_id = ?1)
+"#;
+
+struct ConfigurationSnapshotRows {
+    versions: VersionState,
+    defaults: GuildSettings,
+    guild_settings_raw: Option<String>,
+    global_settings_raw: Option<String>,
+    guild_rules: std::collections::HashMap<String, RuleDef>,
+    global_rules: std::collections::HashMap<String, RuleDef>,
+    guild_commands: std::collections::HashMap<String, CommandDef>,
+    global_commands: std::collections::HashMap<String, CommandDef>,
+    guild_templates: std::collections::HashMap<String, String>,
+    global_templates: std::collections::HashMap<String, String>,
+    guild_log_channels: std::collections::HashMap<String, i64>,
+    badwords: Vec<Badword>,
+    nickname_reconcile: Option<NicknameReconcileStatus>,
 }
 
-impl PlainValue for String {
-    fn get(row: &Row, index: i32) -> Result<Self> {
-        Ok(row.get(index)?)
+fn parse_meta_version(raw: Option<String>) -> u64 {
+    raw.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0)
+}
+
+fn json_agg_text(raw: Option<String>, empty: &str) -> String {
+    match raw {
+        Some(value) if !value.is_empty() && value != "null" => value,
+        _ => empty.to_owned(),
     }
 }
 
-impl PlainValue for i64 {
-    fn get(row: &Row, index: i32) -> Result<Self> {
-        Ok(row.get(index)?)
-    }
-}
-
-fn rows_map_plain<T: PlainValue + Send + 'static>(
-    conn: &impl SqlExecutor,
-    table: &str,
-    key_col: &str,
-    value_col: &str,
-    guild_id: i64,
+fn parse_json_encoded_map<T: DeserializeOwned>(
+    raw: Option<String>,
+    what: &str,
 ) -> Result<std::collections::HashMap<String, T>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {key_col}, {value_col} FROM {table} WHERE guild_id = ?1"
-    ))?;
-    let rows = stmt.query_map(params![guild_id], |r| {
-        Ok((r.get::<String>(0)?, T::get(r, 1)?))
-    })?;
+    let encoded: std::collections::HashMap<String, String> =
+        serde_json::from_str(&json_agg_text(raw, "{}"))
+            .with_context(|| format!("corrupt JSON object in {what}"))?;
     let mut out = std::collections::HashMap::new();
-    for row in rows {
-        let (k, v) = row?;
-        out.insert(k, v);
+    for (key, value) in encoded {
+        out.insert(key, read_json(&value, what)?);
     }
     Ok(out)
+}
+
+fn parse_json_map<T: DeserializeOwned>(
+    raw: Option<String>,
+    what: &str,
+) -> Result<std::collections::HashMap<String, T>> {
+    serde_json::from_str(&json_agg_text(raw, "{}"))
+        .with_context(|| format!("corrupt JSON object in {what}"))
+}
+
+fn parse_json_vec<T: DeserializeOwned>(raw: Option<String>, what: &str) -> Result<Vec<T>> {
+    serde_json::from_str(&json_agg_text(raw, "[]"))
+        .with_context(|| format!("corrupt JSON array in {what}"))
+}
+
+fn settings_override_from_raw(guild_id: i64, raw: Option<String>) -> Option<GuildSettingsOverride> {
+    raw.as_deref()
+        .and_then(|json| parse_settings_override_json(guild_id, json))
+}
+
+fn load_configuration_snapshot_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+) -> Result<ConfigurationSnapshotRows> {
+    conn.query_row(
+        CONFIGURATION_SNAPSHOT_SQL,
+        params![guild_id, GLOBAL_SCOPE],
+        |row| {
+            let config = parse_meta_version(row.get(0)?);
+            let slash = parse_meta_version(row.get(1)?);
+            let config_revision = row
+                .get::<Option<String>>(2)?
+                .unwrap_or_else(|| format!("legacy:{config}"));
+            let slash_revision = row
+                .get::<Option<String>>(3)?
+                .unwrap_or_else(|| format!("legacy:{slash}"));
+            let defaults_raw: Option<String> = row.get(4)?;
+            let defaults =
+                terminal_defaults_from_json(defaults_raw.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "meta.settings_terminal_defaults is missing; start jmodguard-bot first"
+                    )
+                })?)?;
+            let global_settings_raw: Option<String> = row.get(5)?;
+            let guild_settings_raw: Option<String> = row.get(6)?;
+            let nick_state: Option<String> = row.get(15)?;
+            let nickname_reconcile = match nick_state {
+                Some(state) if guild_id != GLOBAL_SCOPE => Some(NicknameReconcileStatus {
+                    state,
+                    attempt_count: row.get::<Option<i64>>(16)?.unwrap_or(0) as u32,
+                    next_attempt_at: row.get::<Option<i64>>(17)?.unwrap_or(0),
+                    last_error_code: row.get(18)?,
+                    last_error: row.get(19)?,
+                    last_error_at: row.get(20)?,
+                }),
+                _ => None,
+            };
+            Ok(ConfigurationSnapshotRows {
+                versions: VersionState {
+                    config,
+                    slash,
+                    config_revision,
+                    slash_revision,
+                },
+                defaults,
+                guild_settings_raw,
+                global_settings_raw,
+                guild_rules: parse_json_encoded_map(row.get(7)?, "rules")?,
+                global_rules: parse_json_encoded_map(row.get(8)?, "rules")?,
+                guild_commands: parse_json_encoded_map(row.get(9)?, "commands")?,
+                global_commands: parse_json_encoded_map(row.get(10)?, "commands")?,
+                guild_templates: parse_json_map(row.get(11)?, "templates")?,
+                global_templates: parse_json_map(row.get(12)?, "templates")?,
+                guild_log_channels: parse_json_map(row.get(13)?, "log_channels")?,
+                badwords: parse_json_vec(row.get(14)?, "badwords")?,
+                nickname_reconcile,
+            })
+        },
+    )
+}
+
+impl ConfigurationSnapshotRows {
+    fn settings_bundle(&self, guild_id: i64) -> SettingsWebBundle {
+        let global_override =
+            settings_override_from_raw(GLOBAL_SCOPE, self.global_settings_raw.clone());
+        let global_settings = resolve_settings(&None, &global_override, &self.defaults);
+        let (settings_override, settings) = if guild_id == GLOBAL_SCOPE {
+            (global_override.clone(), global_settings.clone())
+        } else {
+            let guild_override =
+                settings_override_from_raw(guild_id, self.guild_settings_raw.clone());
+            let settings = resolve_settings(&guild_override, &global_override, &self.defaults);
+            (guild_override, settings)
+        };
+        SettingsWebBundle {
+            settings,
+            settings_override,
+            global_settings,
+            global_settings_override: global_override,
+        }
+    }
+
+    fn into_web_snapshot(self, guild_id: i64) -> WebConfigSnapshot {
+        let settings = self.settings_bundle(guild_id);
+        WebConfigSnapshot {
+            version: self.versions.config,
+            settings,
+            nickname_reconcile: self.nickname_reconcile,
+            guild_rules: self.guild_rules,
+            global_rules: self.global_rules,
+            badwords: self.badwords,
+            guild_commands: self.guild_commands,
+            global_commands: self.global_commands,
+            guild_templates: self.guild_templates,
+            global_templates: self.global_templates,
+            guild_log_channels: self.guild_log_channels,
+        }
+    }
+
+    fn into_config_parts(self, guild_id: i64) -> (u64, String, ConfigParts) {
+        let g_settings = if guild_id == GLOBAL_SCOPE {
+            None
+        } else {
+            settings_override_from_raw(guild_id, self.guild_settings_raw.clone())
+        };
+        let gl_settings =
+            settings_override_from_raw(GLOBAL_SCOPE, self.global_settings_raw.clone());
+        let settings = resolve_settings(&g_settings, &gl_settings, &self.defaults);
+        let default_rules = crate::defaults::default_rules();
+        let mut rules = std::collections::HashMap::new();
+        for (i, id) in crate::types::RULE_IDS.iter().enumerate() {
+            let def = default_rules[i].clone();
+            rules.insert(
+                id.to_string(),
+                resolve(
+                    &self.guild_rules.get(*id).cloned(),
+                    &self.global_rules.get(*id).cloned(),
+                    &def,
+                ),
+            );
+        }
+        let mut commands = self.global_commands.clone();
+        for (name, def) in self.guild_commands {
+            commands.insert(name, def);
+        }
+        let mut templates = std::collections::HashMap::new();
+        for (event, def) in crate::defaults::default_templates() {
+            let resolved = resolve(
+                &self.guild_templates.get(event).cloned(),
+                &self.global_templates.get(event).cloned(),
+                &def.to_string(),
+            );
+            templates.insert(event.to_string(), resolved);
+        }
+        for (event, t) in &self.guild_templates {
+            templates.insert(event.clone(), t.clone());
+        }
+        for (event, t) in &self.global_templates {
+            templates.entry(event.clone()).or_insert_with(|| t.clone());
+        }
+        let mut log_channels = std::collections::HashMap::new();
+        // Discord channel IDs belong to exactly one guild. Deliberately ignore
+        // legacy global rows: falling back to one would post another guild's
+        // moderation events into a foreign channel.
+        for (event, c) in &self.guild_log_channels {
+            log_channels.insert(event.clone(), *c);
+        }
+        let mut badwords = Vec::new();
+        for word in &self.badwords {
+            if word.guild_id == GLOBAL_SCOPE {
+                badwords.push(word.pattern.clone());
+            }
+        }
+        for word in &self.badwords {
+            if word.guild_id == guild_id && guild_id != GLOBAL_SCOPE {
+                badwords.push(word.pattern.clone());
+            }
+        }
+        (
+            self.versions.config,
+            self.versions.config_revision,
+            ConfigParts {
+                settings,
+                rules,
+                commands,
+                templates,
+                log_channels,
+                badwords,
+            },
+        )
+    }
 }
 
 pub async fn load_config_parts(db: &Db, guild_id: i64) -> Result<ConfigParts> {
@@ -931,57 +1159,21 @@ async fn load_web_config_snapshot_primary(
     guild_id: i64,
     expected: Option<ConfigurationScope>,
 ) -> Result<WebConfigSnapshot> {
-    db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
-        if let Some(scope) = &expected {
-            scope.verify_conn(&tx)?;
-        }
-        let version = get_config_version_conn(&tx)?;
-        let settings = settings_web_bundle_conn(&tx, guild_id)?;
-        let nickname_reconcile = if guild_id == GLOBAL_SCOPE {
-            None
-        } else {
-            nickname_reconcile_status_conn(&tx, guild_id)?
-        };
-        let guild_rules = rows_map_json(&tx, "rules", "rule_id", "data", guild_id)?;
-        let global_rules = rows_map_json(&tx, "rules", "rule_id", "data", GLOBAL_SCOPE)?;
-        let guild_commands = rows_map_json(&tx, "commands", "name", "data", guild_id)?;
-        let global_commands = rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
-        let guild_templates = rows_map_plain(&tx, "templates", "event_type", "template", guild_id)?;
-        let global_templates =
-            rows_map_plain(&tx, "templates", "event_type", "template", GLOBAL_SCOPE)?;
-        let guild_log_channels =
-            rows_map_plain(&tx, "log_channels", "event_type", "channel_id", guild_id)?;
-        let mut stmt = tx.prepare(
-            "SELECT id, guild_id, pattern, note FROM badwords
-             WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![guild_id, GLOBAL_SCOPE], |r| {
-            Ok(Badword {
-                id: r.get(0)?,
-                guild_id: r.get(1)?,
-                pattern: r.get(2)?,
-                note: r.get(3)?,
+    retry_remote_interactive_read(|| {
+        let db = db.clone();
+        let expected = expected.clone();
+        async move {
+            db.with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                if let Some(scope) = &expected {
+                    scope.verify_conn(&tx)?;
+                }
+                let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
+                tx.finish_read()?;
+                Ok(snapshot.into_web_snapshot(guild_id))
             })
-        })?;
-        let mut badwords = Vec::new();
-        for row in rows {
-            badwords.push(row?);
+            .await
         }
-        tx.finish_read()?;
-        Ok(WebConfigSnapshot {
-            version,
-            settings,
-            nickname_reconcile,
-            guild_rules,
-            global_rules,
-            badwords,
-            guild_commands,
-            global_commands,
-            guild_templates,
-            global_templates,
-            guild_log_channels,
-        })
     })
     .await
 }
@@ -1003,105 +1195,21 @@ async fn load_config_parts_with_version_routed(
     guild_id: i64,
     primary: bool,
 ) -> Result<(u64, String, ConfigParts)> {
-    db.with_conn(move |conn| {
-        let tx = if primary {
-            conn.transaction_primary_read()?
-        } else {
-            conn.transaction()?
-        };
-        let versions = get_version_state_conn(&tx)?;
-        let conn = &tx;
-        let defaults = terminal_defaults_conn(conn)?;
-        // settings (effective: field-level guild → global → config terminal defaults)
-        let g_settings = if guild_id == GLOBAL_SCOPE {
-            None
-        } else {
-            read_settings_override_conn(conn, guild_id)?
-        };
-        let gl_settings = read_settings_override_conn(conn, GLOBAL_SCOPE)?;
-        let settings = resolve_settings(&g_settings, &gl_settings, &defaults);
-
-        // rules: map rule_id -> effective def
-        let g_rules: std::collections::HashMap<String, RuleDef> =
-            rows_map_json(conn, "rules", "rule_id", "data", guild_id)?;
-        let gl_rules: std::collections::HashMap<String, RuleDef> =
-            rows_map_json(conn, "rules", "rule_id", "data", GLOBAL_SCOPE)?;
-        let default_rules = crate::defaults::default_rules();
-        let mut rules = std::collections::HashMap::new();
-        for (i, id) in crate::types::RULE_IDS.iter().enumerate() {
-            let def = default_rules[i].clone();
-            rules.insert(
-                id.to_string(),
-                resolve(
-                    &g_rules.get(*id).cloned(),
-                    &gl_rules.get(*id).cloned(),
-                    &def,
-                ),
-            );
+    retry_remote_interactive_read(|| {
+        let db = db.clone();
+        async move {
+            db.with_conn(move |conn| {
+                let tx = if primary {
+                    conn.transaction_primary_read()?
+                } else {
+                    conn.transaction()?
+                };
+                let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
+                tx.finish_read()?;
+                Ok(snapshot.into_config_parts(guild_id))
+            })
+            .await
         }
-
-        // commands: name(lowercase) -> effective def (guild ?? global)
-        let g_cmds: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(conn, "commands", "name", "data", guild_id)?;
-        let gl_cmds: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(conn, "commands", "name", "data", GLOBAL_SCOPE)?;
-        let mut commands: std::collections::HashMap<String, CommandDef> = gl_cmds.clone();
-        for (name, def) in g_cmds {
-            commands.insert(name, def);
-        }
-
-        // templates: effective per event (plain text column `template`)
-        let g_tpl: std::collections::HashMap<String, String> =
-            rows_map_plain(conn, "templates", "event_type", "template", guild_id)?;
-        let gl_tpl: std::collections::HashMap<String, String> =
-            rows_map_plain(conn, "templates", "event_type", "template", GLOBAL_SCOPE)?;
-        let mut templates = std::collections::HashMap::new();
-        for (event, def) in crate::defaults::default_templates() {
-            let resolved = resolve(
-                &g_tpl.get(event).cloned(),
-                &gl_tpl.get(event).cloned(),
-                &def.to_string(),
-            );
-            templates.insert(event.to_string(), resolved);
-        }
-        for (event, t) in &g_tpl {
-            templates.insert(event.clone(), t.clone());
-        }
-        for (event, t) in &gl_tpl {
-            templates.entry(event.clone()).or_insert_with(|| t.clone());
-        }
-
-        // log channels: effective per event (integer column `channel_id`)
-        let g_lc: std::collections::HashMap<String, i64> =
-            rows_map_plain(conn, "log_channels", "event_type", "channel_id", guild_id)?;
-        let mut log_channels = std::collections::HashMap::new();
-        // Discord channel IDs belong to exactly one guild. Deliberately ignore
-        // legacy global rows: falling back to one would post another guild's
-        // moderation events into a foreign channel.
-        for (event, c) in &g_lc {
-            log_channels.insert(event.clone(), *c);
-        }
-
-        // badwords: effective = global + guild (union)
-        let mut badwords = Vec::new();
-        for scope in [GLOBAL_SCOPE, guild_id] {
-            let mut stmt = conn.prepare("SELECT pattern FROM badwords WHERE guild_id = ?1")?;
-            let rows = stmt.query_map(params![scope], |r| Ok(r.get::<String>(0)?))?;
-            for row in rows {
-                badwords.push(row?);
-            }
-        }
-
-        let parts = ConfigParts {
-            settings,
-            rules,
-            commands,
-            templates,
-            log_channels,
-            badwords,
-        };
-        tx.finish_read()?;
-        Ok((versions.config, versions.config_revision, parts))
     })
     .await
 }

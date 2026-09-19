@@ -569,6 +569,11 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
 fn startup_retries_transient_remote_errors_but_not_auth() {
     let timeout = anyhow::anyhow!("remote database connect timed out after 75s");
     assert!(crate::db::is_startup_retryable(&timeout, true));
+    let interactive = anyhow::anyhow!(
+        "Hrana: `cursor error`: `error at step 0: (error code: TRANSACTION_TIMEOUT) `Transaction timed out``"
+    );
+    assert!(crate::db::is_remote_interactive_timeout(&interactive));
+    assert!(!crate::db::is_database_operation_timeout(&interactive));
     assert!(
         !crate::db::is_startup_retryable(&timeout, false),
         "local SQLite must not treat transport timeouts as a migrate race"
@@ -620,6 +625,41 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     let schema = anyhow::anyhow!(crate::db::SchemaNotReady("schema is behind".into()));
     assert!(crate::db::is_startup_retryable(&schema, false));
     assert!(crate::db::is_startup_retryable(&schema, true));
+}
+
+#[tokio::test]
+async fn remote_interactive_read_retries_transaction_timeout_then_succeeds() {
+    let mut attempts = 0u32;
+    let value = retry_remote_interactive_read(|| {
+        attempts += 1;
+        let attempts = attempts;
+        async move {
+            if attempts < 3 {
+                Err(anyhow::anyhow!(
+                    "Hrana: `cursor error`: `error at step 0: (error code: TRANSACTION_TIMEOUT) `Transaction timed out``"
+                ))
+            } else {
+                Ok(7_u8)
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(value, 7);
+    assert_eq!(attempts, 3);
+}
+
+#[tokio::test]
+async fn remote_interactive_read_does_not_retry_membership_errors() {
+    let mut attempts = 0u32;
+    let error = retry_remote_interactive_read(|| {
+        attempts += 1;
+        async { Err::<(), _>(EnrollmentChanged.into()) }
+    })
+    .await
+    .expect_err("membership errors must not be retried");
+    assert!(error.is::<EnrollmentChanged>());
+    assert_eq!(attempts, 1);
 }
 
 #[test]

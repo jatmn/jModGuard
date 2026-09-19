@@ -93,7 +93,9 @@ unscoped moderation helpers. These reads create no receipts or version changes; 
 writer lock spans verification and data. Individual configuration GET reads also require page
 membership and captured primary snapshots, preserving the config-version read floor. Keep
 guild/global layers together, badword inheritance and guild-only log-channel mappings; explicit
-global context remains owner-only. Targeted rule/command/template reads must not load the
+global context remains owner-only. The WebUI/config-parts bundle verifies membership then
+reads those collections in one SQL statement: Bunny Database interactive transactions cannot
+survive a per-table Hrana round-trip loop. Targeted rule/command/template reads must not load the
 entire configuration bundle. Complete tenant isolation and replica coordination remain separate work.
 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the

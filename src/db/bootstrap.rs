@@ -360,9 +360,13 @@ pub(super) fn read_terminal_defaults_meta(
     let Some(raw) = value else {
         return Ok(None);
     };
-    let v: serde_json::Value = serde_json::from_str(&raw)
+    Ok(Some(terminal_defaults_from_json(&raw)?))
+}
+
+pub(crate) fn terminal_defaults_from_json(raw: &str) -> Result<GuildSettings> {
+    let v: serde_json::Value = serde_json::from_str(raw)
         .with_context(|| format!("corrupt meta.{META_TERMINAL_DEFAULTS}"))?;
-    Ok(Some(GuildSettings {
+    Ok(GuildSettings {
         prefix: v
             .get("prefix")
             .and_then(|p| p.as_str())
@@ -374,7 +378,7 @@ pub(super) fn read_terminal_defaults_meta(
             .and_then(|r| r.as_u64())
             .map(|r| r as u32)
             .unwrap_or(GuildSettings::default().retention_days),
-    }))
+    })
 }
 
 /// True when a migrate-open must hide `bootstrap_complete` from the API.

@@ -47,6 +47,30 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
     })
 }
 
+/// True when Bunny Database / Turso closed an interactive Hrana transaction.
+///
+/// This is distinct from the client-side [`DatabaseOperationTimedOut`] deadline.
+/// The provider kills idle or long interactive transactions (often around five
+/// seconds) and the next statement fails at cursor step 0 with
+/// `TRANSACTION_TIMEOUT`. ROLLBACK after that then reports that no transaction
+/// is active.
+pub(crate) fn is_remote_interactive_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        let lower = message.to_ascii_lowercase();
+        message.contains("TRANSACTION_TIMEOUT")
+            || lower.contains("transaction timed out")
+            || lower.contains("cannot rollback - no transaction is active")
+    })
+}
+
+/// A read already produced its snapshot. ROLLBACK is only how we avoid COMMIT
+/// semantics; if the provider already dropped the transaction, the read is
+/// still determinate.
+fn remote_read_rollback_is_complete(error: &anyhow::Error) -> bool {
+    is_remote_interactive_timeout(error)
+}
+
 /// Hidden helper for unit tests in dependent crates.
 #[doc(hidden)]
 pub fn test_database_commit_indeterminate_error() -> anyhow::Error {
@@ -560,7 +584,14 @@ impl Transaction {
         );
         let inner = self.inner.take().expect("transaction already completed");
         drop_transaction_without_runtime(inner);
-        result.map(|_| ())
+        match result {
+            Ok(_) => Ok(()),
+            // The rows were already collected. The provider closing the stream
+            // (TRANSACTION_TIMEOUT) or rejecting ROLLBACK because it already
+            // dropped the transaction does not make that snapshot indeterminate.
+            Err(error) if remote_read_rollback_is_complete(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn inner(&self) -> &libsql::Transaction {
@@ -740,5 +771,22 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn hrana_transaction_timeout_is_a_retryable_interactive_timeout() {
+        let timeout = anyhow::anyhow!(
+            "Hrana: `cursor error`: `error at step 0: (error code: TRANSACTION_TIMEOUT) `Transaction timed out``"
+        );
+        assert!(is_remote_interactive_timeout(&timeout));
+        assert!(!is_database_operation_timeout(&timeout));
+        let rollback = anyhow::anyhow!(
+            "Hrana: `api error: `SQLite error: cannot rollback - no transaction is active``"
+        );
+        assert!(is_remote_interactive_timeout(&rollback));
+        assert!(remote_read_rollback_is_complete(&rollback));
+        assert!(!is_remote_interactive_timeout(&anyhow::anyhow!(
+            "database is locked"
+        )));
     }
 }
