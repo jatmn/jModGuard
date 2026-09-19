@@ -6,7 +6,7 @@ use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
-use super::{BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
+use super::{Args, BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
 use crate::types::Behavior;
 use crate::{db, logging};
 
@@ -91,6 +91,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Unban { default_reason } => {
@@ -151,6 +152,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Kick { default_reason } => {
@@ -192,6 +194,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Timeout { default_minutes } => {
@@ -277,6 +280,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Warn { default_reason } => {
@@ -336,6 +340,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Warns => {
@@ -350,6 +355,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some(format!("**{}** has no warnings.", target_user.name)),
                     vars,
+                    suppress_response: false,
                 });
             }
             let lines: Vec<String> = warns
@@ -369,6 +375,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::WarnClear => {
@@ -393,6 +400,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(format!("Cleared {n} warnings for {}.", target_user.name)),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Banlist => {
@@ -402,6 +410,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 return Ok(BehaviorOutcome {
                     response: Some("No bans recorded.".into()),
                     vars,
+                    suppress_response: false,
                 });
             }
             let lines: Vec<String> = bans
@@ -418,6 +427,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Purge { default_count } => {
@@ -456,28 +466,19 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Say => {
-            let mut args = env.args.clone();
-            let mut text = args.rest();
-            let mut target = env.channel_id;
-            if let Some(ch) = parse_channel_mention(text.split_whitespace().next().unwrap_or("")) {
-                target = ch;
-                text = text
-                    .split_once(char::is_whitespace)
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .to_string();
-            }
-            if text.trim().is_empty() {
-                return Err(anyhow!("nothing to say"));
-            }
-            target.say(&env.ctx.http, text.trim()).await?;
+            let (target, text) = say_target_and_text(&env.args, env.channel_id)?;
+            target.say(&env.ctx.http, &text).await?;
             vars.insert("channel".into(), format!("<#{}>", target));
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                // The posted message is already visible in the invocation
+                // channel, so a confirmation reply there would be redundant.
+                suppress_response: target == env.channel_id,
             })
         }
         Behavior::Slowmode { default_seconds } => {
@@ -506,6 +507,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Setname => {
@@ -539,6 +541,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::SetPrefix => {
@@ -561,6 +564,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: None,
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Template { action } => run_template(env, action).await,
@@ -587,6 +591,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Help => {
@@ -635,6 +640,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::About => {
@@ -647,6 +653,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Stats => {
@@ -660,6 +667,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
+                suppress_response: false,
             })
         }
         Behavior::Plan { steps } => crate::commands::plans::run(env, steps).await,
@@ -736,6 +744,28 @@ fn parse_channel_mention(token: &str) -> Option<ChannelId> {
         .map(Into::into)
 }
 
+/// Resolves `!say` arguments into the target channel and the text to post.
+/// A leading `<#id>` mention redirects the post; without one the invocation
+/// channel is the target. Errors when no text remains.
+fn say_target_and_text(args: &Args, invocation: ChannelId) -> Result<(ChannelId, String)> {
+    let mut args = args.clone();
+    let mut text = args.rest();
+    let mut target = invocation;
+    if let Some(ch) = parse_channel_mention(text.split_whitespace().next().unwrap_or("")) {
+        target = ch;
+        text = text
+            .split_once(char::is_whitespace)
+            .map(|x| x.1)
+            .unwrap_or("")
+            .to_string();
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(anyhow!("nothing to say"));
+    }
+    Ok((target, text.to_string()))
+}
+
 async fn log_mod(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
@@ -789,6 +819,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("**Event templates:**\n{response}")),
                 vars,
+                suppress_response: false,
             })
         }
         "get" => {
@@ -798,6 +829,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}`:\n```\n{t}\n```")),
                 vars,
+                suppress_response: false,
             })
         }
         "set" => {
@@ -811,6 +843,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` updated for this server.")),
                 vars,
+                suppress_response: false,
             })
         }
         "reset" => {
@@ -820,6 +853,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
             Ok(BehaviorOutcome {
                 response: Some(format!("Template `{event}` reset to global/default.")),
                 vars,
+                suppress_response: false,
             })
         }
         other => Err(anyhow!("unknown template action `{other}`")),
@@ -864,6 +898,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("**Automod rules:**\n{}", lines.join("\n"))),
                 vars,
+                suppress_response: false,
             })
         }
         "toggle" => {
@@ -883,6 +918,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                     if rule.enabled { "enabled" } else { "disabled" }
                 )),
                 vars,
+                suppress_response: false,
             })
         }
         "dryrun" => {
@@ -904,6 +940,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
                 vars,
+                suppress_response: false,
             })
         }
         other => Err(anyhow!("unknown rule action `{other}`")),
@@ -927,6 +964,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                             .into(),
                     ),
                     vars,
+                    suppress_response: false,
                 });
             }
             let response = lc
@@ -937,6 +975,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("**Log channels:**\n{response}")),
                 vars,
+                suppress_response: false,
             })
         }
         "set" => {
@@ -952,6 +991,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` now logs to <#{channel}>.")),
                 vars,
+                suppress_response: false,
             })
         }
         "unset" => {
@@ -961,6 +1001,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
             Ok(BehaviorOutcome {
                 response: Some(format!("`{event}` logging cleared for this server.")),
                 vars,
+                suppress_response: false,
             })
         }
         other => Err(anyhow!("unknown logchannel action `{other}`")),
@@ -1099,5 +1140,42 @@ mod tests {
             }],
         });
         assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn say_without_mention_targets_invocation_channel() {
+        let (target, text) =
+            say_target_and_text(&Args::new("hello world"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn say_with_mention_redirects_and_strips_channel() {
+        let (target, text) =
+            say_target_and_text(&Args::new("<#42> hello there"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(42));
+        assert_eq!(text, "hello there");
+    }
+
+    #[test]
+    fn say_with_mention_of_invocation_channel_stays_same_channel() {
+        let (target, text) = say_target_and_text(&Args::new("<#7> hi"), ChannelId::new(7)).unwrap();
+        assert_eq!(target, ChannelId::new(7));
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn say_without_text_errors() {
+        assert!(say_target_and_text(&Args::new(""), ChannelId::new(7)).is_err());
+        assert!(say_target_and_text(&Args::new("<#42>"), ChannelId::new(7)).is_err());
+        assert!(say_target_and_text(&Args::new("<#42>   "), ChannelId::new(7)).is_err());
+    }
+
+    #[test]
+    fn say_text_is_trimmed() {
+        let (_, text) =
+            say_target_and_text(&Args::new("<#42>   padded  "), ChannelId::new(7)).unwrap();
+        assert_eq!(text, "padded");
     }
 }

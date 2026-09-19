@@ -208,6 +208,11 @@ pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<(
 pub struct BehaviorOutcome {
     pub response: Option<String>,
     pub vars: BTreeMap<String, String>,
+    /// True when the behavior's visible effect already landed in the
+    /// invocation channel (e.g. `!say` posting there), so a confirmation
+    /// reply would be redundant. Prefix dispatch sends nothing; slash
+    /// dispatch answers ephemerally (an interaction must always be answered).
+    pub suppress_response: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +604,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     match run_command(env).await {
         Ok(outcome) => {
             let text = render_outcome(&cmd, &outcome);
-            let ephemeral = outcome.response.is_none() && cmd.response.is_empty();
+            let ephemeral = slash_response_ephemeral(&cmd, &outcome);
             if deferred {
                 let _ = EditInteractionResponse::new()
                     .content(text)
@@ -691,6 +696,25 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     }
 }
 
+/// Text to post in the invocation channel after a prefix command, or None
+/// when there is nothing to post. A behavior whose visible effect already
+/// landed in the invocation channel (`suppress_response`, e.g. `!say`
+/// posting there) gets no confirmation reply — it would be redundant.
+fn prefix_response_text(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<String> {
+    if outcome.suppress_response {
+        return None;
+    }
+    let text = render_outcome(cmd, outcome);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether the slash interaction answer is ephemeral. Interactions must
+/// always be answered, so a suppressed confirmation (see
+/// `prefix_response_text`) goes ephemeral instead of posting publicly.
+fn slash_response_ephemeral(cmd: &CommandDef, outcome: &BehaviorOutcome) -> bool {
+    outcome.suppress_response || (outcome.response.is_none() && cmd.response.is_empty())
+}
+
 async fn send_outcome(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -700,8 +724,7 @@ async fn send_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
-    let text = render_outcome(cmd, &outcome);
-    if !text.is_empty()
+    if let Some(text) = prefix_response_text(cmd, &outcome)
         && let Err(e) = channel_id.say(&ctx.http, text).await
     {
         tracing::warn!(
@@ -791,4 +814,98 @@ pub async fn resolve_user(
                     .unwrap_or(false)
         })
         .map(|(_, m)| m.user.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Behavior;
+
+    fn say_cmd(response: &str) -> CommandDef {
+        CommandDef {
+            name: "say".into(),
+            aliases: vec![],
+            category: String::new(),
+            description: String::new(),
+            usage: String::new(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Say,
+            response: response.into(),
+            log_event: String::new(),
+        }
+    }
+
+    fn outcome(response: Option<&str>, suppress_response: bool) -> BehaviorOutcome {
+        BehaviorOutcome {
+            response: response.map(str::to_string),
+            vars: BTreeMap::new(),
+            suppress_response,
+        }
+    }
+
+    #[test]
+    fn prefix_same_channel_say_sends_no_confirmation() {
+        // Default command falls back to "done" — suppressed same-channel.
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(None, true)),
+            None
+        );
+        // A custom response template (e.g. "✅ Done.") is also suppressed.
+        assert_eq!(
+            prefix_response_text(&say_cmd("✅ Done."), &outcome(None, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn prefix_cross_channel_say_keeps_confirmation() {
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(None, false)),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            prefix_response_text(&say_cmd("✅ Done."), &outcome(None, false)),
+            Some("✅ Done.".to_string())
+        );
+    }
+
+    #[test]
+    fn prefix_empty_rendered_response_still_sends_nothing() {
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(Some(""), false)),
+            None
+        );
+    }
+
+    #[test]
+    fn slash_suppressed_confirmation_goes_ephemeral() {
+        assert!(slash_response_ephemeral(
+            &say_cmd("✅ Done."),
+            &outcome(None, true)
+        ));
+        assert!(slash_response_ephemeral(&say_cmd(""), &outcome(None, true)));
+    }
+
+    #[test]
+    fn slash_ephemeral_rule_unchanged_without_suppression() {
+        // Default say (no template, no inline reply) was already ephemeral.
+        assert!(slash_response_ephemeral(
+            &say_cmd(""),
+            &outcome(None, false)
+        ));
+        // A custom template stays public for cross-channel confirmations.
+        assert!(!slash_response_ephemeral(
+            &say_cmd("✅ Done."),
+            &outcome(None, false)
+        ));
+        // An inline behavior reply stays public.
+        assert!(!slash_response_ephemeral(
+            &say_cmd(""),
+            &outcome(Some("hi"), false)
+        ));
+    }
 }
