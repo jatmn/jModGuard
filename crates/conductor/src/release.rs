@@ -180,19 +180,13 @@ fn component_size(body: &serde_json::Map<String, Value>, name: &str) -> Result<i
         .context(format!("{name} size is required"))?;
     match size {
         Value::Number(number) => {
-            let value = number
-                .as_i64()
-                .filter(|value| *value > 0)
-                .or_else(|| {
-                    number
-                        .as_u64()
-                        .and_then(|value| i64::try_from(value).ok())
-                        .filter(|value| *value > 0)
-                });
-            ensure!(
-                value.is_some(),
-                "{name} size must be a positive integer"
-            );
+            let value = number.as_i64().filter(|value| *value > 0).or_else(|| {
+                number
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+            });
+            ensure!(value.is_some(), "{name} size must be a positive integer");
             Ok(value.expect("positive size"))
         }
         _ => anyhow::bail!("{name} size must be a positive integer"),
@@ -1350,7 +1344,8 @@ mod tests {
 
     #[test]
     fn validate_components_rejects_unexpected_keys_and_non_positive_size() {
-        let tmp = std::env::temp_dir().join(format!("jmodguard-release-validate-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("jmodguard-release-validate-{}", std::process::id()));
         let frontend = tmp.join("frontend");
         fs::create_dir_all(&frontend).unwrap();
         let components = fixture_components(&frontend);
@@ -1366,7 +1361,10 @@ mod tests {
         assert!(validate_components(&zero_size).is_err());
 
         let mut missing_size = components.clone();
-        missing_size["api"].as_object_mut().expect("api").remove("size");
+        missing_size["api"]
+            .as_object_mut()
+            .expect("api")
+            .remove("size");
         assert!(validate_components(&missing_size).is_err());
 
         validate_components(&components).unwrap();
