@@ -22,6 +22,10 @@ const INSERT_MUTATION_RECEIPT_SQL: &str = "
     SELECT ?1, unixepoch()
     WHERE COALESCE((SELECT value FROM meta WHERE key='restore_fence'), '0') != '1'
     RETURNING receipt_id";
+const INSERT_UNFENCED_MUTATION_RECEIPT_SQL: &str = "
+    INSERT INTO mutation_receipts (receipt_id, created_at)
+    VALUES (?1, unixepoch())
+    RETURNING receipt_id";
 
 #[derive(Debug, thiserror::Error)]
 #[error("query returned no rows")]
@@ -441,6 +445,20 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    fn insert_remote_mutation_receipt(&mut self, receipt: &str) -> Result<String> {
+        match self.query_row(INSERT_MUTATION_RECEIPT_SQL, params![receipt], |row| {
+            Ok(row.get::<String>(0)?)
+        }) {
+            Ok(inserted) => Ok(inserted),
+            Err(error) if error.to_string().contains("no such table: meta") => self.query_row(
+                INSERT_UNFENCED_MUTATION_RECEIPT_SQL,
+                params![receipt],
+                |row| Ok(row.get::<String>(0)?),
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Enable remote commit recovery only once a primary snapshot needs a write.
     /// Call before executing mutations; read-only exits need no receipt or pruning.
     pub(crate) fn ensure_mutation_receipt(&mut self) -> Result<()> {
@@ -469,11 +487,7 @@ impl Transaction {
         );
         // One statement both checks the restore fence and creates the commit
         // receipt. Remote libSQL otherwise pays a network round trip for each.
-        match self.query_row(
-            INSERT_MUTATION_RECEIPT_SQL,
-            params![receipt.as_str()],
-            |row| Ok(row.get::<String>(0)?),
-        ) {
+        match self.insert_remote_mutation_receipt(&receipt) {
             Ok(inserted) if inserted == receipt => {}
             Ok(_) => anyhow::bail!("mutation receipt identity changed"),
             Err(error) if error.downcast_ref::<QueryReturnedNoRows>().is_some() => {
@@ -800,6 +814,14 @@ mod tests {
             .unwrap_err();
         assert!(error.downcast_ref::<QueryReturnedNoRows>().is_some());
         tx.finish_read().unwrap();
+
+        connection.execute_batch("DROP TABLE meta").unwrap();
+        let mut tx = connection.transaction_primary_read().unwrap();
+        assert_eq!(
+            tx.insert_remote_mutation_receipt("guild-receipt").unwrap(),
+            "guild-receipt"
+        );
+        tx.commit().unwrap();
 
         drop(connection);
         for suffix in ["", "-wal", "-shm"] {
