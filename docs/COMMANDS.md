@@ -85,8 +85,8 @@ Each command's `response` field is a template rendered after success, e.g.
 {seconds} {response}`. Leave it empty and the behavior's built-in reply (if
 any) is used. When `!say` posts into the invoking channel the reply is
 suppressed as redundant — the posted text is already visible there — so a
-prefix invocation sends nothing and the slash answer goes ephemeral.
-`!say #other-channel …` still confirms in the invoking channel.
+prefix invocation sends nothing and the deferred slash answer is withdrawn.
+A post into another channel still confirms in the invoking channel.
 
 ## Alias notes
 

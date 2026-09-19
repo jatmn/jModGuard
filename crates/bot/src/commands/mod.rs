@@ -211,7 +211,8 @@ pub struct BehaviorOutcome {
     /// True when the behavior's visible effect already landed in the
     /// invocation channel (e.g. `!say` posting there), so a confirmation
     /// reply would be redundant. Prefix dispatch sends nothing; slash
-    /// dispatch answers ephemerally (an interaction must always be answered).
+    /// dispatch withdraws the deferred answer (or answers ephemerally when
+    /// the defer failed — an interaction must always be answered).
     pub suppress_response: bool,
 }
 
@@ -603,17 +604,36 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     };
     match run_command(env).await {
         Ok(outcome) => {
-            let text = render_outcome(&cmd, &outcome);
-            let ephemeral = slash_response_ephemeral(&cmd, &outcome);
+            let answer = slash_answer(&cmd, &outcome);
             if deferred {
-                let _ = EditInteractionResponse::new()
-                    .content(text)
-                    .execute(&ctx.http, slash.token.as_str())
-                    .await;
+                match answer {
+                    SlashAnswer::Withdraw => {
+                        // The behavior's effect is already visible in the
+                        // channel (e.g. same-channel /say): withdraw the
+                        // deferred answer so no redundant public confirmation
+                        // appears.
+                        let _ = ctx
+                            .http
+                            .delete_original_interaction_response(&slash.token)
+                            .await;
+                    }
+                    // Ephemeral is fixed at the initial response; a deferred
+                    // answer is already public and can only be edited.
+                    SlashAnswer::Public | SlashAnswer::Ephemeral => {
+                        let _ = EditInteractionResponse::new()
+                            .content(render_outcome(&cmd, &outcome))
+                            .execute(&ctx.http, slash.token.as_str())
+                            .await;
+                    }
+                }
             } else {
+                // The defer failed, so there is no deferred answer to
+                // withdraw; an interaction must still be answered, and a
+                // suppressed confirmation must not become a public message.
+                let ephemeral = answer != SlashAnswer::Public;
                 let _ = serenity::builder::CreateInteractionResponse::Message(
                     serenity::builder::CreateInteractionResponseMessage::new()
-                        .content(text)
+                        .content(render_outcome(&cmd, &outcome))
                         .ephemeral(ephemeral),
                 )
                 .execute(&ctx.http, (slash.id, slash.token.as_str()))
@@ -708,11 +728,31 @@ fn prefix_response_text(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<S
     (!text.is_empty()).then_some(text)
 }
 
-/// Whether the slash interaction answer is ephemeral. Interactions must
-/// always be answered, so a suppressed confirmation (see
-/// `prefix_response_text`) goes ephemeral instead of posting publicly.
-fn slash_response_ephemeral(cmd: &CommandDef, outcome: &BehaviorOutcome) -> bool {
-    outcome.suppress_response || (outcome.response.is_none() && cmd.response.is_empty())
+/// How the slash dispatcher answers a successful interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashAnswer {
+    /// Public reply: edit the deferred answer, or send a public initial
+    /// response when the defer failed.
+    Public,
+    /// Ephemeral initial response when the defer failed. A deferred answer is
+    /// already public (ephemeral is fixed at the initial response), so it is
+    /// edited in place like `Public`.
+    Ephemeral,
+    /// The behavior's visible effect already landed in the invocation channel
+    /// (e.g. same-channel `/say`): delete the deferred answer so no redundant
+    /// confirmation appears; when the defer failed, answer ephemerally
+    /// instead (an interaction must always be answered).
+    Withdraw,
+}
+
+fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
+    if outcome.suppress_response {
+        SlashAnswer::Withdraw
+    } else if outcome.response.is_none() && cmd.response.is_empty() {
+        SlashAnswer::Ephemeral
+    } else {
+        SlashAnswer::Public
+    }
 }
 
 async fn send_outcome(
@@ -882,30 +922,35 @@ mod tests {
     }
 
     #[test]
-    fn slash_suppressed_confirmation_goes_ephemeral() {
-        assert!(slash_response_ephemeral(
-            &say_cmd("✅ Done."),
-            &outcome(None, true)
-        ));
-        assert!(slash_response_ephemeral(&say_cmd(""), &outcome(None, true)));
+    fn slash_suppressed_say_withdraws_the_answer() {
+        // Same-channel say suppresses the confirmation regardless of whether
+        // a custom response template (e.g. "✅ Done.") is configured.
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(None, true)),
+            SlashAnswer::Withdraw
+        );
+        assert_eq!(
+            slash_answer(&say_cmd("✅ Done."), &outcome(None, true)),
+            SlashAnswer::Withdraw
+        );
     }
 
     #[test]
-    fn slash_ephemeral_rule_unchanged_without_suppression() {
-        // Default say (no template, no inline reply) was already ephemeral.
-        assert!(slash_response_ephemeral(
-            &say_cmd(""),
-            &outcome(None, false)
-        ));
+    fn slash_answer_rule_unchanged_without_suppression() {
+        // Default say (no template, no inline reply) keeps an ephemeral answer.
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(None, false)),
+            SlashAnswer::Ephemeral
+        );
         // A custom template stays public for cross-channel confirmations.
-        assert!(!slash_response_ephemeral(
-            &say_cmd("✅ Done."),
-            &outcome(None, false)
-        ));
+        assert_eq!(
+            slash_answer(&say_cmd("✅ Done."), &outcome(None, false)),
+            SlashAnswer::Public
+        );
         // An inline behavior reply stays public.
-        assert!(!slash_response_ephemeral(
-            &say_cmd(""),
-            &outcome(Some("hi"), false)
-        ));
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(Some("hi"), false)),
+            SlashAnswer::Public
+        );
     }
 }
