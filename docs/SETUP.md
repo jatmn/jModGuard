@@ -49,16 +49,19 @@ use [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). For EC2, [DEPLOY-AWS.md](DEPLOY-AWS.md)
 Use the **URL Generator** (OAuth2 → URL Generator):
 
 - Scopes: `bot`, `applications.commands`
-- Bot permissions (minimum set; add more if you want `!lockdown`-style power later):
-  - `Kick Members`
-  - `Ban Members`
-  - `Moderate Members` (timeouts)
-  - `Manage Messages` (delete/purge)
-  - `Read Message History`
-  - `View Channels`
-  - `Send Messages` (log events, command responses)
-  - `Manage Roles` (only if you use the `add_role`/`remove_role` plan steps)
-  - `Manage Nicknames` (WebUI nickname apply/clear and `!setname` / `/setname`)
+- Bot permissions (minimum set; add more if you want `!lockdown`-style power later).
+  Tick them in this Discord URL Generator order:
+  - **General:**
+    - `Kick Members`
+    - `Ban Members`
+    - `Manage Nicknames` (WebUI nickname apply/clear and `!setname` / `/setname`)
+    - `Manage Roles` (only if you use the `add_role`/`remove_role` plan steps)
+    - `Moderate Members` (timeouts)
+  - **Text:**
+    - `View Channels`
+    - `Send Messages` (log events, command responses)
+    - `Manage Messages` (delete/purge)
+    - `Read Message History`
 
 Open the generated URL in a browser, pick your server, authorize.
 

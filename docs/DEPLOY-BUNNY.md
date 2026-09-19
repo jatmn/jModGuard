@@ -97,12 +97,24 @@ The files are `frontend/index.html`, `frontend/app.js`, and
 go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
-The Pull Zone hostname (or a custom domain on it) is what operators open.
-If you add a custom hostname, enable Force SSL on it, set
-`JMODGUARD_WEB_BASE_URL` and the Discord OAuth redirect to **that** host,
-and do not log in on the system `*.b-cdn.net` hostname afterward (OAuth
-CSRF cookies are host-only). On the admin Pull Zone, **Disable Cookies**
-must be **off** (`DisableCookies=false`) or login cannot keep a session.
+When creating the Storage Zone, select a **primary region and at least one replication region**.
+Bunny's create form requires a replication region; do not try to skip
+replication or create a primary-only zone. Replication regions cannot be
+removed later, so pick the smallest set you actually want (one additional
+region is enough).
+
+The public admin URL is the hostname operators will type into the browser.
+Choose one and use it everywhere (`JMODGUARD_WEB_BASE_URL`, Discord OAuth
+redirect, and the login bookmark):
+
+- **Bunny hostname:** the Pull Zone `*.b-cdn.net` hostname.
+- **Owned domain or subdomain:** add that hostname on the Pull Zone
+  (General → Hostnames), CNAME it to the `*.b-cdn.net` hostname, enable SSL
+  and Force SSL on it, then use **that** host. After cutover, do not log in
+  on the system `*.b-cdn.net` hostname (OAuth CSRF cookies are host-only).
+
+On the admin Pull Zone, Caching → General, **Strip Response Cookies** must
+be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual, public source).** In the Storage Zone, **Browse Files**,
 and upload those three files from this repository (or the same paths from a
@@ -261,13 +273,13 @@ the public URL.
 
 Bunny can only origin-pull a Magic Container through an **Endpoint**. On
 this API app, **Endpoints → Add CDN endpoint**, container port `8080`.
-Enable sticky sessions on that endpoint. Prefer cookie name
-`jmodguard_session` (the API session cookie). If the dashboard cookie
-field is read-only (`BUNNYNET_MC_SESSIONID` on some trial UIs), one
-replica is still fine. Do not give operators this endpoint hostname; it
-exists so the Storage Pull Zone can origin-pull the API. GET/PATCH of a
-Magic Container via the Bunny API returns every env var — never paste
-those responses.
+That add-endpoint screen creates the endpoint; it does **not** expose sticky-session settings.
+After the endpoint exists, open it and enable sticky sessions. Prefer cookie
+name `jmodguard_session` (the API session cookie). If the dashboard cookie
+field is read-only (`BUNNYNET_MC_SESSIONID` on some trial UIs), one replica
+is still fine. Do not give operators this endpoint hostname; it exists so the
+Storage Pull Zone can origin-pull the API. GET/PATCH of a Magic Container via
+the Bunny API returns every env var — never paste those responses.
 
 The Bunny API image does not embed or serve the UI at `/`; a default
 local API build (`embed-ui`) may serve `/`. Do not treat `/` on
@@ -287,7 +299,7 @@ that one process (`jmodguard_session`).
 
 ```dotenv
 JMODGUARD_WEB_BIND=0.0.0.0:8080
-JMODGUARD_WEB_BASE_URL=https://YOUR-CDN-HOSTNAME
+JMODGUARD_WEB_BASE_URL=https://YOUR-PUBLIC-ADMIN-HOST
 JMODGUARD_OAUTH_CLIENT_ID=SECRET
 JMODGUARD_OAUTH_CLIENT_SECRET=SECRET
 JMODGUARD_OWNER_ID=123456789012345678
@@ -300,13 +312,14 @@ With the shared-store/evidence environment above, no `config.toml` is required. 
 `JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix
 and bot status are bot-owned — set those on the bot app.
 
-`JMODGUARD_WEB_BASE_URL` is the **CDN** origin operators type into the
-browser (custom hostname if you added one), not a container hostname and
-not a leftover `*.b-cdn.net` system host after you cut over. Discord
-OAuth redirect URI:
+`JMODGUARD_WEB_BASE_URL` is the **public admin host** operators type into the
+browser: the Pull Zone `*.b-cdn.net` hostname, or the owned
+domain/subdomain if you added one. It is not a Magic Container hostname
+and not a leftover `*.b-cdn.net` system host after an owned-host cutover.
+Discord OAuth redirect URI (same host):
 
 ```text
-https://YOUR-CDN-HOSTNAME/oauth/callback
+https://YOUR-PUBLIC-ADMIN-HOST/oauth/callback
 ```
 
 Leave `JMODGUARD_CORS_ORIGINS` unset. Same-origin via the Pull Zone does
@@ -328,7 +341,7 @@ expires — start the bot first and wait for `database ready (migrate=true)`.
 
 On the Pull Zone from step 2 (Storage origin for the files):
 
-1. Add an edge rule whose action is **Change Origin URL** (`OriginUrl`,
+1. Add an edge rule whose action is **Override Origin URL** (`OriginUrl`,
    ActionType 2). The origin host is the API **endpoint Pull Zone**
    `*.b-cdn.net` hostname from step 5 (Bunny creates that PZ when you add
    the CDN endpoint). Do **not** give operators that hostname. Do **not**
@@ -350,18 +363,23 @@ On the Pull Zone from step 2 (Storage origin for the files):
    guild settings with `POST /api/guilds/{id}/config`.
 3. Trigger on request URL for `/api*`, `/login*`, `/logout*`, `/oauth*`,
    and `/health*`. Bunny allows **at most five** PatternMatches per
-   trigger. Matching both a custom hostname and the system `*.b-cdn.net`
-   host means **two** triggers (five path patterns each), MatchAny.
-4. Set **Disable Cookies** to off on this Pull Zone (`DisableCookies` must
-   be **false**) so login cookies are not stripped. If you update the zone
-   via the Bunny API, send only the fields you are changing — posting the
-   full GET body back fails (`model.invalid` on `id`).
+   trigger. If operators might open both an owned hostname and the system
+   `*.b-cdn.net` host (before cutover), that is **two** triggers (five
+   path patterns each), MatchAny. After an owned-host cutover, keep the
+   owned-host trigger; do not send login to the leftover `*.b-cdn.net`
+   host.
+4. On this Pull Zone, Caching → General, leave **Strip Response Cookies**
+   off (`DisableCookies` must be **false**) so login cookies are not
+   stripped. If you update the zone via the Bunny API, send only the
+   fields you are changing — posting the full GET body back fails
+   (`model.invalid` on `id`).
 5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
 
-After this, a browser on the CDN hostname loads the admin UI from
-Storage and calls `/api/...` on the same host; Bunny forwards those
-requests to the API container. The Magic Container endpoint hostname is
-not the product URL.
+After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
+the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you
+added one) loads the admin UI from Storage and calls `/api/...` on the same
+host; Bunny forwards those requests to the API container. The Magic Container
+endpoint hostname is not the product URL.
 
 ## Discord application (required for Bunny)
 
@@ -372,12 +390,16 @@ self-host.
 1. **Bot → Privileged Gateway Intents:** enable **Server Members** and
    **Message Content**. Presence is unused.
 2. **OAuth2 → Redirects:** add exactly
-   `https://YOUR-CDN-HOSTNAME/oauth/callback` (must match
-   `JMODGUARD_WEB_BASE_URL`).
-3. **Invite** with scopes `bot` and `applications.commands`, and at least
-   Kick Members, Ban Members, Moderate Members, Manage Messages, Read
-   Message History, View Channels, Send Messages, Manage Nicknames
-   (Manage Roles only if you use role plan steps).
+   `https://YOUR-PUBLIC-ADMIN-HOST/oauth/callback` (must match
+   `JMODGUARD_WEB_BASE_URL`). That host is either the Pull Zone
+   `*.b-cdn.net` hostname or the owned domain/subdomain on that zone, not
+   a Magic Container hostname. After an owned-host cutover, do not also
+   keep a leftover `*.b-cdn.net` redirect as the login URL.
+3. **Invite** with scopes `bot` and `applications.commands`. Tick bot
+   permissions in this Discord URL Generator order (same list as
+   [SETUP.md](SETUP.md#3-invite-the-bot-to-your-server)):
+   - **General:** Kick Members, Ban Members, Manage Nicknames, Manage Roles (only if you use role plan steps), Moderate Members
+   - **Text:** View Channels, Send Messages, Manage Messages, Read Message History
 
 ## 7. Acceptance test
 
@@ -386,10 +408,12 @@ self-host.
 2. API logs: `database ready (migrate=false)` and listening. No public
    website hostname on the container.
 3. Each app: one region, one replica.
-4. Open the **CDN** hostname that matches `JMODGUARD_WEB_BASE_URL`. The
-   admin UI loads from Storage. Login with Discord. OAuth returns to that
-   origin. Probe `/health` (200 `ok`); do not use `/` on the Bunny API
-   origin as a ready check.
+4. Open the **public admin host** that matches `JMODGUARD_WEB_BASE_URL`
+   (the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain
+   if you added one — not a leftover `*.b-cdn.net` host after owned-host
+   cutover). The admin UI loads from Storage. Login with Discord. OAuth
+   returns to that origin. Probe `/health` (200 `ok`); do not use `/` on
+   the Bunny API origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure an `automod` log channel, enable a dry-run rule and check its Discord
@@ -405,13 +429,14 @@ schema-open against a local libSQL server, not Bunny TLS.
 
 - Bunny Database is Public Preview. Internal snapshots are not an
   operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
-- One bot replica. One API replica (in-memory sessions). Sticky session
-  cookie on the API Magic Container endpoint: `jmodguard_session` when
-  the dashboard allows it; a locked `BUNNYNET_MC_SESSIONID` is acceptable
-  at one replica.
-- On the Storage Pull Zone, origin-pull the API with **OriginUrl**, not
-  OriginMagicContainers. Disable Cookies must be off. Five PatternMatches
-  per trigger maximum.
+- One bot replica. One API replica (in-memory sessions). Sticky sessions
+  are enabled on the API Magic Container endpoint **after** it exists, not
+  on the add-endpoint screen. Prefer cookie `jmodguard_session` when the
+  dashboard allows it; a locked `BUNNYNET_MC_SESSIONID` is acceptable at
+  one replica.
+- On the Storage Pull Zone, origin-pull the API with **Override Origin URL**
+  (`OriginUrl`), not OriginMagicContainers. Strip Response Cookies must
+  be off. Five PatternMatches per trigger maximum.
 - Never paste Magic Container GET/PATCH JSON (it includes every secret).
 - SIGTERM stops the Discord gateway and the API listener cleanly, including
   during remote database retry (startup then exits 0 instead of failing).
