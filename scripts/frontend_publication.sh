@@ -1,111 +1,134 @@
 #!/usr/bin/env bash
 # Bunny publication receipt: asset hashes, never a source-commit checkpoint.
 set -euo pipefail
-exec python3 - "$@" <<'PY'
-from __future__ import annotations
 
-import hashlib
-import json
-import os
-import re
-import sys
-from pathlib import Path
+exec node --input-type=module - "$@" <<'JS'
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
-FILES = ("index.html", "app.js", "style.css")
+const FILES = ["index.html", "app.js", "style.css"];
 
+function die(message) {
+  process.stderr.write(`frontend_publication: ${message}\n`);
+  process.exit(1);
+}
 
-def asset_hashes(root: str) -> dict[str, str]:
-    result = {}
-    for name in FILES:
-        path = Path(root, name)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"{name} must be a regular asset")
-        result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return result
-
-
-def valid_zone(zone: str) -> bool:
-    return isinstance(zone, str) and re.fullmatch(r"[1-9][0-9]*", zone) is not None
-
-
-def configured_zone() -> str:
-    zone = os.environ.get("BUNNY_PULL_ZONE_ID", "")
-    if not valid_zone(zone):
-        raise ValueError("BUNNY_PULL_ZONE_ID must be a positive numeric Pull Zone ID")
-    return zone
-
-
-def parse(raw: bytes, zone: str) -> dict | None:
-    try:
-        data = json.loads(raw)
-        if (
-            not valid_zone(zone)
-            or not isinstance(data, dict)
-            or data.get("version") != 1
-            or type(data.get("complete")) is not bool
-            or data.get("pull_zone_id") != zone
-        ):
-            return None
-        files = data.get("files")
-        if not isinstance(files, dict):
-            return None
-        requires_api = data.get("requires_api", not data["complete"])
-        if type(requires_api) is not bool:
-            return None
-        data["requires_api"] = requires_api
-        if not files and not data["complete"]:
-            return data
-        if set(files) != set(FILES) or not all(
-            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
-            for value in files.values()
-        ):
-            return None
-        return data
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-
-
-def make_receipt(mode: str, root: str, previous: str, zone: str) -> dict:
-    old = parse(Path(previous).read_bytes(), zone) if Path(previous).exists() else None
-    desired = asset_hashes(root)
-    complete = mode == "complete"
-    requires_api = False
-    if not complete:
-        requires_api = old is None or (not old["complete"] and old["requires_api"])
-        for name in ("index.html", "app.js"):
-            backup = Path(previous).parent / name
-            requires_api |= (
-                not old
-                or old["files"].get(name) != desired[name]
-                or not backup.is_file()
-                or hashlib.sha256(backup.read_bytes()).hexdigest() != desired[name]
-            )
-    return {
-        "version": 1,
-        "complete": complete,
-        "pull_zone_id": zone,
-        "files": desired if complete else (old["files"] if old else {}),
-        "requires_api": bool(requires_api),
+function assetHashes(root) {
+  const result = {};
+  for (const name of FILES) {
+    const file = path.join(root, name);
+    let st;
+    try {
+      st = fs.lstatSync(file);
+    } catch {
+      die(`${name} must be a regular asset`);
     }
+    if (st.isSymbolicLink() || !st.isFile()) {
+      die(`${name} must be a regular asset`);
+    }
+    result[name] = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  }
+  return result;
+}
 
+function validZone(zone) {
+  return typeof zone === "string" && /^[1-9][0-9]*$/.test(zone);
+}
 
-def main() -> None:
-    zone = configured_zone()
-    if sys.argv[1:] == ["zone"]:
-        print(zone)
-        return
-    if len(sys.argv) != 4:
-        raise ValueError("expected zone, or pending|complete ROOT PREVIOUS")
-    mode, root, previous = sys.argv[1:]
-    if mode not in ("pending", "complete"):
-        raise ValueError("expected pending or complete")
-    print(json.dumps(make_receipt(mode, root, previous, zone), sort_keys=True))
+function configuredZone() {
+  const zone = process.env.BUNNY_PULL_ZONE_ID || "";
+  if (!validZone(zone)) {
+    die("BUNNY_PULL_ZONE_ID must be a positive numeric Pull Zone ID");
+  }
+  return zone;
+}
 
+function parse(raw, zone) {
+  try {
+    const data = JSON.parse(raw);
+    if (
+      !validZone(zone) ||
+      typeof data !== "object" ||
+      data === null ||
+      Array.isArray(data) ||
+      data.version !== 1 ||
+      typeof data.complete !== "boolean" ||
+      data.pull_zone_id !== zone
+    ) {
+      return null;
+    }
+    const files = data.files;
+    if (typeof files !== "object" || files === null || Array.isArray(files)) {
+      return null;
+    }
+    let requiresApi = data.requires_api;
+    if (requiresApi === undefined) {
+      requiresApi = !data.complete;
+    }
+    if (typeof requiresApi !== "boolean") {
+      return null;
+    }
+    data.requires_api = requiresApi;
+    if (Object.keys(files).length === 0 && !data.complete) {
+      return data;
+    }
+    if (
+      FILES.some((name) => !(name in files)) ||
+      Object.keys(files).length !== FILES.length ||
+      !Object.values(files).every((value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value))
+    ) {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
 
-if __name__ == "__main__":
-    try:
-        main()
-    except ValueError as error:
-        print(f"frontend_publication: {error}", file=sys.stderr)
-        sys.exit(1)
-PY
+function makeReceipt(mode, root, previous, zone) {
+  let old = null;
+  if (fs.existsSync(previous)) {
+    old = parse(fs.readFileSync(previous), zone);
+  }
+  const desired = assetHashes(root);
+  const complete = mode === "complete";
+  let requiresApi = false;
+  if (!complete) {
+    requiresApi = old === null || (!old.complete && old.requires_api);
+    for (const name of ["index.html", "app.js"]) {
+      const backup = path.join(path.dirname(previous), name);
+      requiresApi =
+        requiresApi ||
+        !old ||
+        old.files[name] !== desired[name] ||
+        !fs.existsSync(backup) ||
+        !fs.statSync(backup).isFile() ||
+        crypto.createHash("sha256").update(fs.readFileSync(backup)).digest("hex") !== desired[name];
+    }
+  }
+  const files = complete ? desired : old ? old.files : {};
+  return {
+    complete,
+    files,
+    pull_zone_id: zone,
+    requires_api: Boolean(requiresApi),
+    version: 1,
+  };
+}
+
+const args = process.argv.slice(2);
+const zone = configuredZone();
+if (args.length === 1 && args[0] === "zone") {
+  process.stdout.write(`${zone}\n`);
+  process.exit(0);
+}
+if (args.length !== 3) {
+  die("expected zone, or pending|complete ROOT PREVIOUS");
+}
+const [mode, root, previous] = args;
+if (mode !== "pending" && mode !== "complete") {
+  die("expected pending or complete");
+}
+process.stdout.write(`${JSON.stringify(makeReceipt(mode, root, previous, zone))}\n`);
+JS

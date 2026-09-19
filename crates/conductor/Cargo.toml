@@ -34,6 +34,10 @@ path = "src/main.rs"
 name = "jmodguard-update-standin"
 path = "src/bin/update_standin.rs"
 
+[[bin]]
+name = "jmodguard-release-publish"
+path = "src/bin/release_publish.rs"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }

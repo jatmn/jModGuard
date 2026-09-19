@@ -102,47 +102,60 @@ require_absent docs/DEPLOY-BUNNY.md "Open the **CDN** hostname"
 require_absent docs/DEPLOY-BUNNY.md "is the **CDN** origin"
 
 # test_discord_invite_permissions_follow_url_generator_order
-python3 - "$root" <<'PY' || fail "discord invite permission order"
-from pathlib import Path
-import re
-import sys
+node --input-type=module - "$root" <<'JS' || fail "discord invite permission order"
+import fs from "node:fs";
+import path from "node:path";
 
-root = Path(sys.argv[1])
-expected = [
-    "Kick Members",
-    "Ban Members",
-    "Manage Nicknames",
-    "Manage Roles",
-    "Moderate Members",
-    "View Channels",
-    "Send Messages",
-    "Manage Messages",
-    "Read Message History",
-]
-setup = (root / "docs/SETUP.md").read_text()
-start = setup.find("Tick them in this Discord URL Generator order")
-end = setup.find("Open the generated URL", start)
-if start < 0 or end < 0:
-    sys.exit("docs/SETUP.md missing Discord URL Generator permission checklist")
-names = re.findall(r"- `([^`]+)`", setup[start:end])
-if names != expected:
-    sys.exit(f"docs/SETUP.md permission order {names!r} != {expected!r}")
-bunny = (root / "docs/DEPLOY-BUNNY.md").read_text()
-idx = bunny.find("**General:**")
-idx2 = bunny.find("**Text:**", idx)
-idx3 = bunny.find("## 7. Acceptance test", idx2)
-if min(idx, idx2, idx3) < 0:
-    sys.exit("docs/DEPLOY-BUNNY.md missing Discord URL Generator permission lists")
-chunk = bunny[idx:idx3]
-positions = []
-for name in expected:
-    pos = chunk.find(name)
-    if pos < 0:
-        sys.exit(f"docs/DEPLOY-BUNNY.md missing permission {name}")
-    positions.append(pos)
-if positions != sorted(positions):
-    sys.exit("docs/DEPLOY-BUNNY.md permissions are not in URL Generator order")
-PY
+const root = process.argv[2];
+const expected = [
+  "Kick Members",
+  "Ban Members",
+  "Manage Nicknames",
+  "Manage Roles",
+  "Moderate Members",
+  "View Channels",
+  "Send Messages",
+  "Manage Messages",
+  "Read Message History",
+];
+const setup = fs.readFileSync(path.join(root, "docs/SETUP.md"), "utf8");
+const start = setup.indexOf("Tick them in this Discord URL Generator order");
+const end = setup.indexOf("Open the generated URL", start);
+if (start < 0 || end < 0) {
+  process.stderr.write("docs/SETUP.md missing Discord URL Generator permission checklist\n");
+  process.exit(1);
+}
+const names = [...setup.slice(start, end).matchAll(/- `([^`]+)`/g)].map((match) => match[1]);
+if (JSON.stringify(names) !== JSON.stringify(expected)) {
+  process.stderr.write(
+    `docs/SETUP.md permission order ${JSON.stringify(names)} != ${JSON.stringify(expected)}\n`,
+  );
+  process.exit(1);
+}
+const bunny = fs.readFileSync(path.join(root, "docs/DEPLOY-BUNNY.md"), "utf8");
+const idx = bunny.indexOf("**General:**");
+const idx2 = bunny.indexOf("**Text:**", idx);
+const idx3 = bunny.indexOf("## 7. Acceptance test", idx2);
+if (Math.min(idx, idx2, idx3) < 0) {
+  process.stderr.write("docs/DEPLOY-BUNNY.md missing Discord URL Generator permission lists\n");
+  process.exit(1);
+}
+const chunk = bunny.slice(idx, idx3);
+const positions = [];
+for (const name of expected) {
+  const pos = chunk.indexOf(name);
+  if (pos < 0) {
+    process.stderr.write(`docs/DEPLOY-BUNNY.md missing permission ${name}\n`);
+    process.exit(1);
+  }
+  positions.push(pos);
+}
+const sorted = [...positions].sort((a, b) => a - b);
+if (JSON.stringify(positions) !== JSON.stringify(sorted)) {
+  process.stderr.write("docs/DEPLOY-BUNNY.md permissions are not in URL Generator order\n");
+  process.exit(1);
+}
+JS
 
 # test_public_install_has_no_private_ops_frontend_release
 [[ ! -e "$root/scripts/frontend_release.py" ]] || fail "scripts/frontend_release.py must not exist"
@@ -233,5 +246,29 @@ require_contains scripts/ci-preflight.sh "bash scripts/public-install-acceptance
 require_contains scripts/publish-frontend-bunny.sh "frontend_publication.sh"
 require_absent scripts/publish-frontend-bunny.sh "frontend_publication.py"
 require_absent scripts/ci-preflight.sh "public-install-acceptance-test.py"
+
+# Remaining CI/tooling must not require Python.
+for py in \
+  scripts/check-service-boundaries.py \
+  .buildkite/publish-image.py \
+  .buildkite/publish-image-test.py \
+  .buildkite/release.py \
+  .buildkite/release-test.py \
+  .buildkite/release-please.py
+do
+  [[ ! -e "$root/$py" ]] || fail "$py must not exist"
+done
+require_absent scripts/ci-preflight.sh "python3"
+require_absent .buildkite/pipeline.yml "python3"
+require_absent docs/BUILDKITE.md "Python 3"
+require_absent docs/RELEASES.md "release-please.py"
+require_absent docs/RELEASES.md "Python CI"
+require_contains scripts/ci-preflight.sh "bash scripts/check-service-boundaries.sh"
+require_contains scripts/ci-preflight.sh "bash .buildkite/publish-image-test.sh"
+require_contains .buildkite/pipeline.yml "bash .buildkite/publish-image.sh"
+require_contains .buildkite/pipeline.yml "bash .buildkite/release-please.sh"
+require_contains docs/RELEASES.md "release-please.sh"
+require_contains docs/BUILDKITE.md "bash .buildkite/publish-image-test.sh"
+require_contains AGENTS.md "bash scripts/check-service-boundaries.sh"
 
 echo 'public-install-acceptance-test: ok'

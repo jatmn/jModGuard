@@ -126,21 +126,20 @@ run_cargo_audit_gate() {
   fi
 
   advisory_count="$(
-    python3 - "$audit_out" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    report = json.load(handle)
-vulnerabilities = report.get("vulnerabilities") or {}
-count = vulnerabilities.get("count")
-if count is None:
-    count = len(vulnerabilities.get("list") or [])
-if vulnerabilities.get("found") or count:
-    print(int(count))
-else:
-    print(-1)
-PY
+    AUDIT_OUT="$audit_out" node --input-type=commonjs - <<'JS'
+const fs = require("fs");
+const report = JSON.parse(fs.readFileSync(process.env.AUDIT_OUT, "utf8"));
+const vulnerabilities = report.vulnerabilities || {};
+let count = vulnerabilities.count;
+if (count == null) {
+  count = (vulnerabilities.list || []).length;
+}
+if (vulnerabilities.found || count) {
+  process.stdout.write(String(Number(count)));
+} else {
+  process.stdout.write("-1");
+}
+JS
   )" || advisory_count=-1
 
   if [ "$advisory_count" -lt 0 ]; then
@@ -198,11 +197,8 @@ cargo fmt --check
 
 whitespace_check
 
-echo 'ci-preflight: python3 .buildkite/publish-image-test.py'
-python3 .buildkite/publish-image-test.py
-
-echo 'ci-preflight: python3 .buildkite/release-test.py'
-python3 .buildkite/release-test.py
+echo 'ci-preflight: bash .buildkite/publish-image-test.sh'
+bash .buildkite/publish-image-test.sh
 
 echo 'ci-preflight: cargo test --locked --workspace'
 cargo test --locked --workspace
@@ -219,8 +215,8 @@ cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D
 echo 'ci-preflight: cargo build --locked -p jmodguard-conductor'
 cargo build --locked -p jmodguard-conductor
 
-echo 'ci-preflight: python3 scripts/check-service-boundaries.py'
-python3 scripts/check-service-boundaries.py
+echo 'ci-preflight: bash scripts/check-service-boundaries.sh'
+bash scripts/check-service-boundaries.sh
 
 echo 'ci-preflight: bash scripts/public-install-acceptance-test.sh'
 bash scripts/public-install-acceptance-test.sh

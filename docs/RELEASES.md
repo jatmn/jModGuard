@@ -22,14 +22,14 @@ manifest.
 ## Publication
 
 Buildkite remains the only CI. Release Please runs from
-`.buildkite/release-please.py` using `npx` on trusted main webhook pushes. It
+`.buildkite/release-please.sh` using `npx` on trusted main webhook pushes. It
 does not restore GitHub Actions image workflows.
 
 Complete installable publications require **bot, API, conductor and frontend**
 artifacts. Interrupted or partial sets stay unavailable; they are not listed for
 discovery. Manifests use format `JMODGUARD-RELEASE-1` and an index
 `JMODGUARD-RELEASE-INDEX-1`. Canonical JSON is compact with sorted object keys
-so Python CI and the conductor verify the same bytes.
+so CI publication and the conductor verify the same bytes.
 
 Signing is HMAC-SHA256 with a `key_id`. The 32-byte hex secret lives in
 `JMODGUARD_RELEASE_SIGNING_KEY` / Buildkite secrets, not git.
