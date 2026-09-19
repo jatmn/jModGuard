@@ -699,7 +699,59 @@ async fn changed_discord_membership_never_dispatches_old_queued_work() {
 }
 
 #[tokio::test]
-async fn live_membership_mismatch_repairs_missed_rejoin_before_consuming_claim() {
+async fn discord_timestamp_precision_skew_keeps_current_membership_valid() {
+    struct CoarseDiscord {
+        joined_at_ns: i64,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for CoarseDiscord {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            panic!("the live timestamp path must be used")
+        }
+        async fn membership_joined_at_ns(&self, _: &BotAction) -> Result<Option<i64>> {
+            Ok(Some(self.joined_at_ns))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("this test dispatches only a local log-channel action")
+        }
+    }
+
+    const PRECISE_JOIN: i64 = 1_591_971_316_123_000_000;
+    const SECOND_ONLY_JOIN: i64 = 1_591_971_316_000_000_000;
+    let f = Fixture::new();
+    db::enroll_guild(&f.db, 10, PRECISE_JOIN).await.unwrap();
+    let job = f
+        .enqueue(10, "timestamp_precision", log_channel(Some(123)))
+        .await;
+
+    drain(
+        &f.db,
+        &CoarseDiscord {
+            joined_at_ns: SECOND_ONLY_JOIN,
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("succeeded".into(), Some("log_channel_set".into()))
+    );
+    assert_eq!(
+        db::list_log_channels(&f.db, 10).await.unwrap(),
+        vec![("message_edit".into(), 123)]
+    );
+}
+
+#[tokio::test]
+async fn later_same_second_membership_repairs_missed_rejoin_before_consuming_claim() {
     struct RejoinedDiscord;
     #[serenity::async_trait]
     impl DiscordActions for RejoinedDiscord {
@@ -762,7 +814,7 @@ async fn move_fence_racing_membership_repair_finishes_the_claim_without_dispatch
                 "freeze",
             )
             .await?;
-            Ok(Some(2))
+            Ok(Some(1_000_000_001))
         }
         async fn authorized(&self, _: &BotAction) -> Result<bool> {
             panic!("a fenced repair must not reach actor authorization")

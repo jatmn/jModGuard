@@ -59,7 +59,9 @@ impl DiscordActions for LiveDiscord<'_> {
         let Some(joined_at_ns) = self.membership_joined_at_ns(job).await? else {
             anyhow::bail!("Discord member has no supported join timestamp");
         };
-        Ok(Some(joined_at_ns) == job.joined_at_ns)
+        Ok(job.joined_at_ns.is_some_and(|expected| {
+            crate::enrollment_repair::membership_joined_at_matches(expected, joined_at_ns)
+        }))
     }
     async fn membership_joined_at_ns(&self, job: &BotAction) -> Result<Option<i64>> {
         anyhow::ensure!(self.bot_user_id.get() > 1, "bot identity is not ready");
@@ -170,9 +172,12 @@ async fn execute_inner(
     }
     let membership = async {
         match discord.membership_joined_at_ns(job).await? {
-            Some(joined_at_ns) => {
-                Ok::<_, anyhow::Error>((Some(joined_at_ns) == job.joined_at_ns, Some(joined_at_ns)))
-            }
+            Some(joined_at_ns) => Ok::<_, anyhow::Error>((
+                job.joined_at_ns.is_some_and(|expected| {
+                    crate::enrollment_repair::membership_joined_at_matches(expected, joined_at_ns)
+                }),
+                Some(joined_at_ns),
+            )),
             None => Ok::<_, anyhow::Error>((discord.membership_matches(job).await?, None)),
         }
     };

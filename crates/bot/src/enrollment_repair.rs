@@ -15,6 +15,18 @@ pub trait MembershipSource: Send + Sync {
     async fn guilds_after(&self, after: Option<u64>, limit: u32) -> Result<Vec<u64>>;
     async fn joined_at_ns(&self, guild: u64) -> Result<i64>;
 }
+
+/// Discord REST may omit subseconds present in the Gateway observation. Accept
+/// that same-second truncation, but keep any later observation as replacement
+/// evidence. Exact timestamps and enrollment IDs remain the durable DB fence.
+pub(crate) fn membership_joined_at_matches(expected: i64, observed: i64) -> bool {
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
+    expected > 0
+        && observed > 0
+        && expected.div_euclid(NANOS_PER_SECOND) == observed.div_euclid(NANOS_PER_SECOND)
+        && observed <= expected
+}
+
 pub struct DiscordMembership<'a> {
     pub http: &'a serenity::http::Http,
     pub bot_user_id: UserId,

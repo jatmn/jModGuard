@@ -97,7 +97,11 @@ The executor first checks the bot's own join timestamp through REST. When that p
 observation proves that a gateway rejoin was missed, it advances the enrolled membership
 and atomically cancels the old, still-unconsumed claim; later requests can bind to the
 repaired membership instead of repeating `bot_membership_changed`. Missing or unreadable
-REST timestamps remain unavailable failures, not proof of a changed membership.
+REST timestamps remain unavailable failures, not proof of a changed membership. A REST
+timestamp may match a Gateway timestamp after omitting its subseconds, but any later
+positive timestamp—even later in the same Unix second—is replacement evidence. Exact
+stored enrollment IDs and timestamps remain the durable dispatch fence, so an observed
+replacement still cancels stale work instead of replaying it.
 If a guild-move fence races that repair, the old claim finishes as `guild_move_fenced`
 without dispatch. Other repair-storage failures use the existing unavailable outcome when
 a receipt can still be written; expiry remains the fallback when the database itself cannot
