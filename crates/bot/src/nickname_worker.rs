@@ -1,5 +1,9 @@
 //! Nickname side effects require a current request and matching Discord membership.
-use crate::{db, enrollment_repair::MembershipSource, state::BotState};
+use crate::{
+    db,
+    enrollment_repair::{MembershipSource, membership_joined_at_matches},
+    state::BotState,
+};
 use anyhow::{Context as _, Result};
 use serenity::builder::EditMember;
 use std::sync::Arc;
@@ -20,7 +24,7 @@ async fn dispatch_ready(
     .await
     .context("nickname membership verification timed out")??;
     anyhow::ensure!(joined > 0, "unsupported bot join timestamp");
-    if joined != job.joined_at_ns {
+    if !membership_joined_at_matches(job.joined_at_ns, joined) {
         db::finish_nickname_reconcile(
             db,
             job,

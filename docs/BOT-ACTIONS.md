@@ -93,10 +93,24 @@ bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activatio
 `jmodguard-bot`. The API uses only captured admission/read/cancel helpers. The
 service-boundary guard rejects unscoped API queue access and bot-token dispatch in the API.
 
-The executor consumes an immutable claim on the primary before any Discord operation.
-A copied/stale/modified claim cannot begin again. It checks the bot's own join timestamp
-through REST, then fetches the acting user's member record and guild roles. Unban requires
-BAN_MEMBERS; log configuration requires MANAGE_GUILD. Guild owner and administrator
+The executor first checks the bot's own join timestamp through REST. When that positive
+observation proves that a gateway rejoin was missed, it advances the enrolled membership
+and atomically cancels the old, still-unconsumed claim; later requests can bind to the
+repaired membership instead of repeating `bot_membership_changed`. Missing or unreadable
+REST timestamps remain unavailable failures, not proof of a changed membership. A REST
+timestamp may match a Gateway timestamp after omitting its subseconds, but any later
+positive timestamp—even later in the same Unix second—is replacement evidence. Exact
+stored enrollment IDs and timestamps remain the durable dispatch fence, so an observed
+replacement still cancels stale work instead of replaying it.
+If a guild-move fence races that repair, the old claim finishes as `guild_move_fenced`
+without dispatch. Other repair-storage failures use the existing unavailable outcome when
+a receipt can still be written; expiry remains the fallback when the database itself cannot
+persist that receipt.
+
+After that check, the executor consumes the immutable claim on the primary before any
+dispatch-capable operation. A copied/stale/modified claim cannot begin again. It then
+fetches the acting user's member record and guild roles. Unban requires BAN_MEMBERS; log
+configuration requires MANAGE_GUILD. Guild owner and administrator
 permissions are honored; installation-owner status grants no dispatch bypass. An active
 member timeout denies either action for non-owner, non-administrator actors, even when
 their roles retain the required permission; authorization resumes after expiry. No OAuth,
@@ -151,8 +165,9 @@ requirements. Bot-only `[action_worker]` configuration exposes these limits and 
 Claim and receipt SQL retain the existing database operation deadlines outside that block.
 
 Local worker tests cover duplicate/modified claims, cancellation/expiry, permission and
-membership changes, failed verification, current-role authorization, channel supersession,
-request timeouts, abandoned dispatch, receipt rollback, batch bounds and late local effects.
+membership changes, missed-rejoin repair, failed verification, current-role authorization,
+channel supersession, request timeouts, abandoned dispatch, receipt rollback, batch bounds
+and late local effects.
 The disposable remote-libSQL smoke exercises lost completion responses without resending
 and deadline-aware log completion. Mock outcomes do not validate live Discord behavior.
 

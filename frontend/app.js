@@ -539,10 +539,104 @@ function selectedGuild() {
   return state.guilds.find((g) => g.id === state.guildId);
 }
 
-/** Persist a mutation, reload this server's config, then toast. Errors go to handleEvent. */
+/** Apply the exact representation acknowledged by a configuration mutation.
+ *  This keeps ordinary saves to one request while preserving the server's
+ *  validated/normalized value. Complex multi-section writes still reload. */
+function applyConfigPatch(res) {
+  const patch = res?.config_patch;
+  const config = state.config;
+  if (!patch || !config) return false;
+  // Any snapshot requested before this acknowledged commit is now stale.
+  ++configRequest;
+  state.loading = false;
+  state.error = null;
+  if (patch.kind === "rule") {
+    const row = config.rules?.find((rule) => rule.rule_id === patch.id);
+    if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
+    if (patch.scope === "global") {
+      row.global = patch.value;
+      if (!row.guild_override) row.effective = patch.value;
+    } else {
+      row.guild_override = patch.value;
+      row.effective = patch.value ?? row.global;
+    }
+    return true;
+  }
+  if (patch.kind === "badword") {
+    if (!Array.isArray(config.badwords)) return false;
+    if (patch.operation === "add" && patch.value) config.badwords.push(patch.value);
+    else if (patch.operation === "delete") config.badwords = config.badwords.filter((word) => word.id !== patch.id);
+    else return false;
+    return true;
+  }
+  if (patch.kind === "command" && patch.value) {
+    config.commands ||= [];
+    let row = config.commands.find((command) => command.name === patch.name);
+    if (!row) {
+      row = { name: patch.name, scope: patch.scope, effective: patch.value, guild_override: null, global: null };
+      config.commands.push(row);
+    }
+    if (patch.scope === "global") {
+      row.global = patch.value;
+      if (!row.guild_override) {
+        row.scope = "global";
+        row.effective = patch.value;
+      }
+    } else {
+      row.scope = "guild";
+      row.guild_override = patch.value;
+      row.effective = patch.value;
+    }
+    return true;
+  }
+  if (patch.kind === "template") {
+    const row = config.templates?.find((template) => template.event === patch.event);
+    if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
+    if (patch.scope === "global") {
+      row.global = patch.value;
+      if (row.guild_override == null) row.effective = patch.value;
+    } else {
+      row.guild_override = patch.value;
+      row.effective = patch.value ?? row.global;
+    }
+    return true;
+  }
+  if (patch.kind === "settings" && !patch.sync_nickname && patch.settings) {
+    if (patch.bot_name_present && !patch.nickname_reconcile) return false;
+    const fields = [
+      ["prefix", patch.prefix_present],
+      ["bot_name", patch.bot_name_present],
+    ];
+    if (patch.scope === "global") {
+      config.global_settings = patch.settings;
+      config.global_settings_override ||= {};
+      for (const [field, present] of fields) {
+        if (!present) continue;
+        config.global_settings_override[field] = patch[field] ?? null;
+        if (config.settings_override?.[field] == null) config.settings[field] = patch.settings[field];
+      }
+    } else {
+      config.settings = patch.settings;
+      config.settings_override ||= {};
+      for (const [field, present] of fields) {
+        if (!present) continue;
+        const parent = config.global_settings?.[field];
+        config.settings_override[field] = patch[field] == null || patch.settings[field] === parent
+          ? null
+          : patch.settings[field];
+      }
+      if (patch.bot_name_present) config.nickname_reconcile = patch.nickname_reconcile;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** Persist a mutation, apply its authoritative representation when available,
+ *  otherwise reload this server's complete config. Errors go to handleEvent. */
 async function reloadAfter(work, onSuccess) {
   const res = await work();
-  if (!await loadConfig()) return;
+  if (!applyConfigPatch(res) && !await loadConfig()) return;
   if (onSuccess) onSuccess(res);
   renderTab();
 }
@@ -869,10 +963,12 @@ function editRule(r) {
         rule.whitelist_channels = splitIds(channelsText.value);
         rule.whitelist_users = splitIds(usersText.value);
         const scope = scopeSel.value;
-        await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope, data: rule });
+        const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope, data: rule });
+        const savedLocally = applyConfigPatch(saved);
         if (scope === "global") {
           try {
-            await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
+            const cleared = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "DELETE", { scope: "guild" });
+            applyConfigPatch(cleared);
           } catch (e) {
             // The global write already committed. A failed second request must
             // not leave the pre-save snapshot visible as current configuration.
@@ -883,7 +979,7 @@ function editRule(r) {
             return;
           }
         }
-        if (!await loadConfig()) return;
+        if (!savedLocally && !await loadConfig()) return;
         toast("Rule saved", "success");
         closeOverlay();
         renderTab();
@@ -957,8 +1053,9 @@ function tabBadwords() {
           if (!pattern.value.trim()) return toast("Enter a pattern", "error");
           await reloadAfter(
             async () => {
-              await api(`/api/guilds/${state.guildId}/badwords`, "POST", { scope: scope.value, pattern: pattern.value.trim(), note: note.value || null });
+              const res = await api(`/api/guilds/${state.guildId}/badwords`, "POST", { scope: scope.value, pattern: pattern.value.trim(), note: note.value || null });
               pattern.value = ""; note.value = "";
+              return res;
             },
             () => toast("Badword added", "success"),
           );

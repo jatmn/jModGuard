@@ -17,6 +17,15 @@ use std::time::Duration;
 pub use libsql::{Row, Value, params, params_from_iter};
 
 static RECEIPT_PRUNE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const INSERT_MUTATION_RECEIPT_SQL: &str = "
+    INSERT INTO mutation_receipts (receipt_id, created_at)
+    SELECT ?1, unixepoch()
+    WHERE COALESCE((SELECT value FROM meta WHERE key='restore_fence'), '0') != '1'
+    RETURNING receipt_id";
+const INSERT_UNFENCED_MUTATION_RECEIPT_SQL: &str = "
+    INSERT INTO mutation_receipts (receipt_id, created_at)
+    VALUES (?1, unixepoch())
+    RETURNING receipt_id";
 
 #[derive(Debug, thiserror::Error)]
 #[error("query returned no rows")]
@@ -436,22 +445,39 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    fn insert_remote_mutation_receipt(&mut self, receipt: &str) -> Result<String> {
+        match self.query_row(INSERT_MUTATION_RECEIPT_SQL, params![receipt], |row| {
+            Ok(row.get::<String>(0)?)
+        }) {
+            Ok(inserted) => Ok(inserted),
+            Err(error) if error.to_string().contains("no such table: meta") => self.query_row(
+                INSERT_UNFENCED_MUTATION_RECEIPT_SQL,
+                params![receipt],
+                |row| Ok(row.get::<String>(0)?),
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Enable remote commit recovery only once a primary snapshot needs a write.
     /// Call before executing mutations; read-only exits need no receipt or pruning.
     pub(crate) fn ensure_mutation_receipt(&mut self) -> Result<()> {
-        match self.query_row(
-            "SELECT value FROM meta WHERE key = 'restore_fence'",
-            (),
-            |r| Ok(r.get::<String>(0)?),
-        ) {
-            Ok(value) if value == "1" => anyhow::bail!("restore is in progress"),
-            Ok(_) => {}
-            Err(error)
-                if error.downcast_ref::<QueryReturnedNoRows>().is_some()
-                    || error.to_string().contains("no such table: meta") => {}
-            Err(error) => return Err(error),
+        if self.mutation_receipt.is_some() {
+            return Ok(());
         }
-        if !self.runtime.is_remote() || self.mutation_receipt.is_some() {
+        if !self.runtime.is_remote() {
+            match self.query_row(
+                "SELECT value FROM meta WHERE key = 'restore_fence'",
+                (),
+                |r| Ok(r.get::<String>(0)?),
+            ) {
+                Ok(value) if value == "1" => anyhow::bail!("restore is in progress"),
+                Ok(_) => {}
+                Err(error)
+                    if error.downcast_ref::<QueryReturnedNoRows>().is_some()
+                        || error.to_string().contains("no such table: meta") => {}
+                Err(error) => return Err(error),
+            }
             return Ok(());
         }
         let receipt = format!(
@@ -459,10 +485,16 @@ impl Transaction {
             rand::random::<u128>(),
             rand::random::<u128>()
         );
-        self.execute(
-            "INSERT INTO mutation_receipts (receipt_id, created_at) VALUES (?1, unixepoch())",
-            params![receipt.as_str()],
-        )?;
+        // One statement both checks the restore fence and creates the commit
+        // receipt. Remote libSQL otherwise pays a network round trip for each.
+        match self.insert_remote_mutation_receipt(&receipt) {
+            Ok(inserted) if inserted == receipt => {}
+            Ok(_) => anyhow::bail!("mutation receipt identity changed"),
+            Err(error) if error.downcast_ref::<QueryReturnedNoRows>().is_some() => {
+                anyhow::bail!("restore is in progress")
+            }
+            Err(error) => return Err(error),
+        }
         self.mutation_receipt = Some(receipt);
         // Keep the existing bounded cleanup rate for receipt-bearing writes.
         if RECEIPT_PRUNE_COUNTER.fetch_add(1, Ordering::Relaxed) & 255 == 0 {
@@ -739,6 +771,63 @@ impl SqlExecutor for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_insert_statement_checks_restore_fence_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_receipt_statement_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let runtime = DbRuntime::new().unwrap();
+        let database = runtime
+            .block_on(libsql::Builder::new_local(path.clone()).build())
+            .unwrap();
+        let connection = Connection::from_database(Arc::new(database), runtime.clone()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                 CREATE TABLE mutation_receipts(
+                   receipt_id TEXT PRIMARY KEY,
+                   created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO meta(key,value) VALUES('restore_fence','0');",
+            )
+            .unwrap();
+
+        let tx = connection.transaction_primary_read().unwrap();
+        let inserted = tx
+            .query_row(INSERT_MUTATION_RECEIPT_SQL, params!["receipt"], |row| {
+                Ok(row.get::<String>(0)?)
+            })
+            .unwrap();
+        assert_eq!(inserted, "receipt");
+        tx.commit().unwrap();
+
+        connection
+            .execute_batch("UPDATE meta SET value='1' WHERE key='restore_fence'")
+            .unwrap();
+        let tx = connection.transaction_primary_read().unwrap();
+        let error = tx
+            .query_row(INSERT_MUTATION_RECEIPT_SQL, params!["blocked"], |row| {
+                Ok(row.get::<String>(0)?)
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<QueryReturnedNoRows>().is_some());
+        tx.finish_read().unwrap();
+
+        connection.execute_batch("DROP TABLE meta").unwrap();
+        let mut tx = connection.transaction_primary_read().unwrap();
+        assert_eq!(
+            tx.insert_remote_mutation_receipt("guild-receipt").unwrap(),
+            "guild-receipt"
+        );
+        tx.commit().unwrap();
+
+        drop(connection);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[test]
     fn remote_database_call_has_a_deadline() {

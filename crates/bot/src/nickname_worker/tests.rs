@@ -1,6 +1,9 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const JOINED_AT_NS: i64 = 1_000_000_100;
+const REJOINED_AT_NS: i64 = 2_000_000_000;
+
 struct Fixture {
     db: db::Db,
     path: std::path::PathBuf,
@@ -17,7 +20,7 @@ impl Fixture {
         }
     }
     async fn job(&self) -> db::NicknameReconcileJob {
-        db::enroll_guild(&self.db, 10, 100).await.unwrap();
+        db::enroll_guild(&self.db, 10, JOINED_AT_NS).await.unwrap();
         db::patch_settings(&self.db, 10, None, Some(Some("new nickname".into())), None)
             .await
             .unwrap();
@@ -48,7 +51,7 @@ struct Source<'a> {
 impl Default for Source<'_> {
     fn default() -> Self {
         Self {
-            joined: 100,
+            joined: JOINED_AT_NS,
             fail: false,
             during: DuringRead::None,
             calls: AtomicUsize::new(0),
@@ -65,7 +68,7 @@ impl MembershipSource for Source<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.during {
             DuringRead::None => {}
-            DuringRead::Retire(db) => db::retire_guild_enrollment(db, 10, 100).await?,
+            DuringRead::Retire(db) => db::retire_guild_enrollment(db, 10, JOINED_AT_NS).await?,
             DuringRead::Replace(db) => {
                 db::patch_settings(
                     db,
@@ -97,6 +100,37 @@ async fn matching_membership_allows_current_request_only() {
         source.calls.load(Ordering::SeqCst),
         1,
         "stale jobs need no HTTP"
+    );
+}
+
+#[tokio::test]
+async fn second_only_rest_timestamp_matches_precise_gateway_membership() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let source = Source {
+        joined: 1_000_000_000,
+        ..Source::default()
+    };
+    assert!(dispatch_ready(&f.db, &job, &source).await.unwrap());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn later_same_second_timestamp_blocks_old_nickname_work() {
+    let f = Fixture::new();
+    let job = f.job().await;
+    let source = Source {
+        joined: JOINED_AT_NS + 100,
+        ..Source::default()
+    };
+    assert!(!dispatch_ready(&f.db, &job, &source).await.unwrap());
+    assert_eq!(
+        db::nickname_reconcile_status(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "dormant"
     );
 }
 
@@ -149,7 +183,7 @@ async fn changed_membership_blocks_work_without_retiring_or_rebinding() {
     let f = Fixture::new();
     let job = f.job().await;
     let source = Source {
-        joined: 101,
+        joined: REJOINED_AT_NS,
         ..Source::default()
     };
     assert!(!dispatch_ready(&f.db, &job, &source).await.unwrap());
@@ -165,7 +199,7 @@ async fn changed_membership_blocks_work_without_retiring_or_rebinding() {
             .state,
         "dormant"
     );
-    db::enroll_guild(&f.db, 10, 101).await.unwrap();
+    db::enroll_guild(&f.db, 10, REJOINED_AT_NS).await.unwrap();
     assert!(
         db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
             .await

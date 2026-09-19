@@ -692,10 +692,48 @@ async fn configuration_edits_reject_missing_and_replaced_page_memberships() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["config_patch"]["kind"], "settings");
+    assert_eq!(body["config_patch"]["scope"], "guild");
+    assert_eq!(body["config_patch"]["settings"]["prefix"], "fresh");
+    assert_eq!(body["config_patch"]["prefix_present"], true);
+    assert_eq!(body["config_patch"]["prefix"], "fresh");
     assert_eq!(
         db::get_settings(&f.app.db, 10).await.unwrap().prefix,
         "fresh"
     );
+    let (status, body) = f
+        .request_token(
+            "PUT",
+            "/api/guilds/10/settings",
+            r#"{"bot_name":"Fresh Guard"}"#,
+            fresh["enrollment_id"].as_str(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["config_patch"]["bot_name_present"], true);
+    assert_eq!(
+        body["config_patch"]["nickname_reconcile"]["state"],
+        "pending"
+    );
+    assert_eq!(
+        body["config_patch"]["nickname_reconcile"]["attempt_count"],
+        0
+    );
+    assert!(body["config_patch"]["nickname_reconcile"]["last_error"].is_null());
+    let rule = crate::defaults::default_rules().remove(0);
+    let (status, body) = f
+        .request_token(
+            "PUT",
+            "/api/guilds/10/rules/mention_spam",
+            &serde_json::json!({"scope":"guild","data":rule.clone()}).to_string(),
+            fresh["enrollment_id"].as_str(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["config_patch"]["kind"], "rule");
+    assert_eq!(body["config_patch"]["id"], "mention_spam");
+    assert_eq!(body["config_patch"]["scope"], "guild");
+    assert_eq!(body["config_patch"]["value"], serde_json::json!(rule));
 }
 
 #[tokio::test]
