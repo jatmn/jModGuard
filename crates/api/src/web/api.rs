@@ -212,6 +212,16 @@ pub async fn update_settings(
     // override. Values equal to the parent layer are stripped so global
     // inheritance keeps working.
     let nickname_queued = (body.bot_name.is_some() || body.sync_nickname) && guild_id != 0;
+    let nickname_reconcile_patch = nickname_queued.then(|| {
+        serde_json::json!({
+            "state": "pending",
+            "attempt_count": 0,
+            "next_attempt_at": 0,
+            "last_error_code": null,
+            "last_error": null,
+            "last_error_at": null,
+        })
+    });
     let prefix_present = body.prefix.is_some();
     let bot_name_present = body.bot_name.is_some();
     let prefix_patch = body.prefix.clone();
@@ -240,6 +250,7 @@ pub async fn update_settings(
             "bot_name_present": bot_name_present,
             "bot_name": bot_name_patch,
             "sync_nickname": body.sync_nickname,
+            "nickname_reconcile": nickname_reconcile_patch,
         }
     })))
 }

@@ -98,6 +98,10 @@ observation proves that a gateway rejoin was missed, it advances the enrolled me
 and atomically cancels the old, still-unconsumed claim; later requests can bind to the
 repaired membership instead of repeating `bot_membership_changed`. Missing or unreadable
 REST timestamps remain unavailable failures, not proof of a changed membership.
+If a guild-move fence races that repair, the old claim finishes as `guild_move_fenced`
+without dispatch. Other repair-storage failures use the existing unavailable outcome when
+a receipt can still be written; expiry remains the fallback when the database itself cannot
+persist that receipt.
 
 After that check, the executor consumes the immutable claim on the primary before any
 dispatch-capable operation. A copied/stale/modified claim cannot begin again. It then

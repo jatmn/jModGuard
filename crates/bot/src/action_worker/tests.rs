@@ -743,6 +743,81 @@ async fn live_membership_mismatch_repairs_missed_rejoin_before_consuming_claim()
 }
 
 #[tokio::test]
+async fn move_fence_racing_membership_repair_finishes_the_claim_without_dispatch() {
+    struct FencedRepair<'a> {
+        db: &'a Db,
+        destination: db::guild_stores::StoreId,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for FencedRepair<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            Ok(false)
+        }
+        async fn membership_joined_at_ns(&self, job: &BotAction) -> Result<Option<i64>> {
+            db::guild_stores::set_guild_write_fence(
+                self.db,
+                job.guild_id,
+                self.destination.clone(),
+                format!("{:032x}", 11u128),
+                "freeze",
+            )
+            .await?;
+            Ok(Some(2))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            panic!("a fenced repair must not reach actor authorization")
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            panic!("a fenced repair must not validate its target channel")
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("a fenced repair must not dispatch")
+        }
+    }
+
+    let f = Fixture::new();
+    let job = f
+        .enqueue(10, "fenced_membership_repair", log_channel(Some(123)))
+        .await;
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    let old = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    app.tenant.activate(old).await.unwrap();
+    let destination = db::guild_stores::StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        destination.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+
+    drain_with_state(
+        &app,
+        &FencedRepair {
+            db: &f.db,
+            destination,
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("failed".into(), Some("guild_move_fenced".into()))
+    );
+    assert_eq!(
+        db::guild_enrollment(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .joined_at_ns,
+        1
+    );
+    assert!(db::list_log_channels(&f.db, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn departure_during_authorization_blocks_dispatch() {
     struct DepartDuringCheck<'a>(&'a Db);
     #[serenity::async_trait]

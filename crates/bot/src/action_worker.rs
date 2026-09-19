@@ -194,17 +194,37 @@ async fn execute_inner(
             if let Some(tenant) = tenant
                 && let Some(joined_at_ns) = observed_joined_at_ns
                 && Some(joined_at_ns) != job.joined_at_ns
-                && let Some(enrollment) = db::enroll_guild(db, job.guild_id, joined_at_ns).await?
             {
-                tracing::warn!(
-                    action_id = %job.id,
-                    guild_id = job.guild_id,
-                    expected_joined_at_ns = ?job.joined_at_ns,
-                    observed_joined_at_ns = joined_at_ns,
-                    "repaired bot enrollment after action membership mismatch"
-                );
-                tenant.activate(enrollment).await?;
-                return Ok(());
+                match db::enroll_guild(db, job.guild_id, joined_at_ns).await {
+                    Ok(Some(enrollment)) => {
+                        tracing::warn!(
+                            action_id = %job.id,
+                            guild_id = job.guild_id,
+                            expected_joined_at_ns = ?job.joined_at_ns,
+                            observed_joined_at_ns = joined_at_ns,
+                            "repaired bot enrollment after action membership mismatch"
+                        );
+                        tenant.activate(enrollment).await?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            action_id = %job.id,
+                            guild_id = job.guild_id,
+                            "bot enrollment repair failed before dispatch: {error:#}"
+                        );
+                        let code = if error
+                            .downcast_ref::<db::guild_stores::GuildWriteFenced>()
+                            .is_some()
+                        {
+                            "guild_move_fenced"
+                        } else {
+                            "enrollment_check_unavailable"
+                        };
+                        return finish_validation_outcome(db, job, code).await;
+                    }
+                }
             }
             return finish_validation_outcome(db, job, "bot_membership_changed").await;
         }

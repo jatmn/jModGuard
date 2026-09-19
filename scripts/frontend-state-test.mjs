@@ -239,6 +239,51 @@ test('an older refresh cannot roll back an acknowledged mutation representation'
   assert.equal(app.state.loading, false);
 });
 
+test('default-backed rule and template resets fall back instead of applying null', () => {
+  const { app } = harness();
+  const rule = { enabled: true };
+  app.state.config = {
+    rules: [{ rule_id: 'mention_spam', global: null, guild_override: rule, effective: rule }],
+    templates: [{ event: 'member_join', global: null, guild_override: 'Guild text', effective: 'Guild text' }],
+  };
+  assert.equal(app.applyConfigPatch({
+    config_patch: { kind: 'rule', id: 'mention_spam', scope: 'guild', value: null },
+  }), false);
+  assert.equal(app.state.config.rules[0].effective, rule);
+  assert.equal(app.applyConfigPatch({
+    config_patch: { kind: 'template', event: 'member_join', scope: 'guild', value: null },
+  }), false);
+  assert.equal(app.state.config.templates[0].effective, 'Guild text');
+});
+
+test('bot-name settings patches replace stale nickname reconciliation status', () => {
+  const { app } = harness();
+  app.state.config = {
+    settings: { prefix: '!', bot_name: 'Old' },
+    settings_override: { bot_name: 'Old' },
+    global_settings: { prefix: '/', bot_name: '' },
+    nickname_reconcile: { state: 'terminal', last_error: 'old failure' },
+  };
+  assert.equal(app.applyConfigPatch({
+    config_patch: {
+      kind: 'settings',
+      scope: 'guild',
+      settings: { prefix: '!', bot_name: 'New' },
+      prefix_present: false,
+      bot_name_present: true,
+      bot_name: 'New',
+      sync_nickname: false,
+      nickname_reconcile: {
+        state: 'pending', attempt_count: 0, next_attempt_at: 0,
+        last_error_code: null, last_error: null, last_error_at: null,
+      },
+    },
+  }), true);
+  assert.equal(app.state.config.settings.bot_name, 'New');
+  assert.equal(app.state.config.nickname_reconcile.state, 'pending');
+  assert.equal(app.state.config.nickname_reconcile.last_error, null);
+});
+
 test('failed refresh clears stale settings and exposes a retryable error', async () => {
   const { app } = harness(async () => { throw new Error('offline'); });
   app.state.config = { settings: { prefix: 'stale' } };
@@ -279,6 +324,9 @@ function settingsHarness() {
           prefix_present: Object.hasOwn(body, 'prefix'), prefix: body.prefix,
           bot_name_present: Object.hasOwn(body, 'bot_name'), bot_name: body.bot_name,
           sync_nickname: false,
+          nickname_reconcile: Object.hasOwn(body, 'bot_name')
+            ? { state: 'pending', attempt_count: 0, next_attempt_at: 0, last_error_code: null, last_error: null, last_error_at: null }
+            : null,
         },
       });
     }

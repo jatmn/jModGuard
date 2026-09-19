@@ -552,7 +552,7 @@ function applyConfigPatch(res) {
   state.error = null;
   if (patch.kind === "rule") {
     const row = config.rules?.find((rule) => rule.rule_id === patch.id);
-    if (!row || (patch.scope === "global" && patch.value == null)) return false;
+    if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
     if (patch.scope === "global") {
       row.global = patch.value;
       if (!row.guild_override) row.effective = patch.value;
@@ -591,7 +591,7 @@ function applyConfigPatch(res) {
   }
   if (patch.kind === "template") {
     const row = config.templates?.find((template) => template.event === patch.event);
-    if (!row || (patch.scope === "global" && patch.value == null)) return false;
+    if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;
     if (patch.scope === "global") {
       row.global = patch.value;
       if (row.guild_override == null) row.effective = patch.value;
@@ -602,6 +602,7 @@ function applyConfigPatch(res) {
     return true;
   }
   if (patch.kind === "settings" && !patch.sync_nickname && patch.settings) {
+    if (patch.bot_name_present && !patch.nickname_reconcile) return false;
     const fields = [
       ["prefix", patch.prefix_present],
       ["bot_name", patch.bot_name_present],
@@ -624,6 +625,7 @@ function applyConfigPatch(res) {
           ? null
           : patch.settings[field];
       }
+      if (patch.bot_name_present) config.nickname_reconcile = patch.nickname_reconcile;
     }
     return true;
   }
