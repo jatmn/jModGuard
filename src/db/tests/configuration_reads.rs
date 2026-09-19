@@ -283,3 +283,112 @@ async fn configuration_layers_are_coherent_during_concurrent_updates() {
     }
     writer.await.unwrap();
 }
+
+#[tokio::test]
+async fn web_config_snapshot_matches_layer_helpers_without_receipts() {
+    let f = Fixture::new();
+    let scope = f.scope().await;
+    f.db.with_conn(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_config_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END",
+        )
+    })
+    .await
+    .unwrap();
+    let mut rule = crate::defaults::default_rules()[0].clone();
+    rule.enabled = false;
+    upsert_rule(&f.db, 0, "invite", &rule).await.unwrap();
+    rule.enabled = true;
+    upsert_rule(&f.db, 10, "invite", &rule).await.unwrap();
+    let mut command = crate::defaults::default_commands()[0].clone();
+    command.name = "snapshot".into();
+    command.description = "global".into();
+    upsert_command(&f.db, 0, "snapshot", &command)
+        .await
+        .unwrap();
+    command.description = "guild".into();
+    upsert_command(&f.db, 10, "snapshot", &command)
+        .await
+        .unwrap();
+    upsert_template(&f.db, 0, "warn", "global-warn")
+        .await
+        .unwrap();
+    upsert_template(&f.db, 10, "warn", "guild-warn")
+        .await
+        .unwrap();
+    add_badword(&f.db, 0, "global-word", Some("g"))
+        .await
+        .unwrap();
+    add_badword(&f.db, 10, "guild-word", Some("l"))
+        .await
+        .unwrap();
+    upsert_log_channel(&f.db, 10, "warn", 42).await.unwrap();
+    patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+
+    let snapshot = load_enrolled_web_config_snapshot(&f.db, scope.clone())
+        .await
+        .unwrap();
+    let settings = get_settings_web_bundle(&f.db, 10).await.unwrap();
+    assert_eq!(snapshot.settings.settings.prefix, "?");
+    assert_eq!(snapshot.settings.settings.prefix, settings.settings.prefix);
+    assert_eq!(
+        snapshot.settings.settings_override,
+        settings.settings_override
+    );
+    assert_eq!(
+        snapshot.settings.global_settings.prefix,
+        settings.global_settings.prefix
+    );
+    same_json(
+        snapshot.guild_rules.get("invite"),
+        get_rule(&f.db, 10, "invite").await.unwrap().as_ref(),
+    );
+    same_json(
+        snapshot.global_rules.get("invite"),
+        get_rule(&f.db, 0, "invite").await.unwrap().as_ref(),
+    );
+    same_json(
+        snapshot.guild_commands.get("snapshot"),
+        get_command_row(&f.db, 10, "snapshot")
+            .await
+            .unwrap()
+            .as_ref(),
+    );
+    same_json(
+        snapshot.global_commands.get("snapshot"),
+        get_command_row(&f.db, 0, "snapshot")
+            .await
+            .unwrap()
+            .as_ref(),
+    );
+    assert_eq!(
+        snapshot.guild_templates.get("warn").map(String::as_str),
+        Some("guild-warn")
+    );
+    assert_eq!(
+        snapshot.global_templates.get("warn").map(String::as_str),
+        Some("global-warn")
+    );
+    assert_eq!(snapshot.guild_log_channels.get("warn").copied(), Some(42));
+    assert_eq!(
+        snapshot
+            .badwords
+            .iter()
+            .map(|w| (w.guild_id, w.pattern.as_str(), w.note.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![(0, "global-word", Some("g")), (10, "guild-word", Some("l"))]
+    );
+    let (version, _, parts) = load_config_parts_with_version(&f.db, 10).await.unwrap();
+    assert_eq!(snapshot.version, version);
+    assert_eq!(parts.settings.prefix, "?");
+    assert!(parts.rules["invite"].enabled);
+    assert_eq!(parts.commands["snapshot"].description, "guild");
+    assert_eq!(parts.templates["warn"], "guild-warn");
+    assert_eq!(parts.log_channels["warn"], 42);
+    assert_eq!(
+        parts.badwords,
+        vec!["global-word".to_string(), "guild-word".to_string()]
+    );
+}

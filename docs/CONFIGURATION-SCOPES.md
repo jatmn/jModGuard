@@ -33,7 +33,7 @@ resolve a fresh membership immediately before writing an old browser request. Th
 
 | Captured operation | Transaction contract |
 |---|---|
-| `load_enrolled_web_config_snapshot` | Verify membership alongside configuration data in a primary read, preserving the API read floor. |
+| `load_enrolled_web_config_snapshot` | Verify membership alongside configuration data in a primary read, preserving the API read floor. Membership is checked, then every configuration collection is read in one SQL statement so Bunny Database interactive transactions stay inside the provider timeout. |
 | `patch_enrolled_settings` | Verify the captured scope before reading or changing settings, including empty patches and explicit nickname re-sync. |
 | `copy_enrolled_guild_config` | Verify both captured source and destination before reading/copying any section. |
 | `upsert_enrolled_rule`, `delete_enrolled_rule` | Verify request and target before the rule mutation and configuration version update. |
@@ -128,12 +128,18 @@ The primary read verifies membership even for empty results, captures the config
 version and reads only the needed section or key. Its version must satisfy the process's
 committed-version floor, as for the main configuration bundle. It adds no mutation receipt,
 version change, schema, dependency, pool, cache or polling. Shared SQL/decoding preserves bot
-helpers and response semantics. The primary writer lock spans verification and data queries;
-large configuration collections still need performance measurement. This change does not
-add pagination, resource limits or distributed scaling.
+helpers and response semantics. The primary writer lock spans verification and data. The
+WebUI/config-parts bundle uses one SQL statement for the collections so a remote Hrana
+interactive transaction is not a per-table round-trip loop. Individual section reads still
+select only the requested key. This change does not add pagination, resource limits or
+distributed scaling. Rollback after a successful read is not COMMIT; if the provider already
+dropped that stream (`TRANSACTION_TIMEOUT` / no active transaction), the collected snapshot
+stays determinate and reads may retry the whole snapshot.
 
 Local and disposable libSQL tests cover stale/forged scopes, global owner versus guild
 permissions, page tokens, empty/unavailable reads, read floors, receipt/version preservation,
-inheritance, exact keys, foreign-guild exclusion and wire values. Local tests also cover a
-read waiting behind a membership-changing writer and paired layers during concurrent
-updates. No live provider behavior or complete tenant isolation is established by these tests.
+inheritance, exact keys, foreign-guild exclusion, wire values, the one-statement WebUI/config-parts
+bundle matching layer helpers, and retrying `TRANSACTION_TIMEOUT` without retrying membership
+errors. Local tests also cover a read waiting behind a membership-changing writer and paired
+layers during concurrent updates. No live provider behavior or complete tenant isolation is
+established by these tests.
