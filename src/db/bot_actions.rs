@@ -177,6 +177,8 @@ async fn enqueue_bot_action_inner(
         if let Some(event) = resource.strip_prefix("log:") {
             // A newer queued log-channel intent is the same class as a direct
             // mapping write: occupying work for that event cannot block recovery.
+            // Supersede shares this transaction with the capacity and insert below;
+            // a failed admission rolls back the supersede as well.
             supersede_log_action_with(&tx, guild, event, "superseded_by_newer_request")?;
         }
         let count: i64 = tx.query_row(

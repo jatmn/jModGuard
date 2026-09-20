@@ -667,6 +667,61 @@ async fn running_and_uncertain_log_channels_can_be_force_cancelled() {
 }
 
 #[tokio::test]
+async fn full_guild_queue_rejects_log_enqueue_without_cancelling_unrelated_work() {
+    let f = Fixture::new().await;
+    let limits = Limits {
+        pending_per_guild: 2,
+        ..Limits::default()
+    };
+    let first = f.enqueue(10, "full_a", unban(98)).await;
+    let second = f.enqueue(10, "full_b", unban(99)).await;
+    assert_eq!(f.state(&first).await, "pending");
+    assert_eq!(f.state(&second).await, "pending");
+    assert!(
+        enqueue_bot_action(
+            &f.db,
+            10,
+            42,
+            "1000_log_when_full",
+            channel(Some(100)),
+            1000,
+            limits
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.state(&first).await, "pending");
+    assert_eq!(f.state(&second).await, "pending");
+}
+
+#[tokio::test]
+async fn log_supersede_on_admission_frees_the_occupying_slot_before_insert() {
+    let f = Fixture::new().await;
+    let limits = Limits {
+        pending_per_guild: 2,
+        ..Limits::default()
+    };
+    let stuck = f.enqueue(10, "stuck_log", channel(Some(100))).await;
+    let blocker = f.enqueue(10, "blocker_unban", unban(98)).await;
+    assert_eq!(f.state(&stuck).await, "pending");
+    assert_eq!(f.state(&blocker).await, "pending");
+    let replacement = enqueue_bot_action(
+        &f.db,
+        10,
+        42,
+        "1000_log_replacement",
+        channel(Some(200)),
+        1000,
+        limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replacement.state, "pending");
+    assert_eq!(f.state(&stuck).await, "cancelled");
+    assert_eq!(f.state(&blocker).await, "pending");
+}
+
+#[tokio::test]
 async fn queued_log_channel_admission_supersedes_occupying_work() {
     let f = Fixture::new().await;
     for state in ["pending", "claimed", "running", "uncertain"] {
