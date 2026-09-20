@@ -774,6 +774,7 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(calls.length,1);
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
+  assert.match(textOf(h.elements.find(n=>n.tag==='p')),/Force-cancel a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.tag==='button'&&n.textContent==='Cancel');
   await cancel.listeners.click({});
   assert.equal(calls[1].opts.method,'DELETE');
@@ -782,6 +783,37 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   const refresh=h.elements.find(n=>n.tag==='button'&&n.textContent==='Refresh');
   await refresh.listeners.click({});
   assert.equal(calls.length,4);
+});
+
+test('claimed and stuck log-channel actions expose recovery cancel', async () => {
+  const jobs = [
+    queuedAction('claimed'),
+    { ...queuedAction('running'), id: 'unban-run', action: { kind: 'unban', user_id: '99' } },
+    { ...queuedAction('running'), id: 'log-run', action: { kind: 'set_log_channel', event: 'member_join', channel_id: '1' } },
+    { ...queuedAction('uncertain'), id: 'log-unk', action: { kind: 'set_log_channel', event: 'member_ban', channel_id: null } },
+    { ...queuedAction('failed'), id: 'failed', action: { kind: 'set_log_channel', event: 'member_leave', channel_id: '1' } },
+  ];
+  let confirms = 0;
+  const calls = [];
+  const h = harness(
+    async (url, opts) => { calls.push({ url, opts }); return response(opts.method === 'GET' ? jobs : { ok: true }); },
+    new Map(),
+    new Map(),
+    () => { confirms += 1; return true; },
+  );
+  h.app.state.config = { enrollment_id: 'membership' };
+  h.app.tabActions();
+  await new Promise((resolve) => setImmediate(resolve));
+  const controls = h.elements.filter((n) => n.tag === 'button' && (n.textContent === 'Cancel' || n.textContent === 'Force cancel'));
+  assert.deepEqual(controls.map((n) => n.textContent), ['Cancel', 'Force cancel', 'Force cancel']);
+  await controls[0].listeners.click({});
+  assert.equal(confirms, 0);
+  assert.equal(calls[1].opts.method, 'DELETE');
+  assert.match(calls[1].url, /\/actions\/job$/);
+  await controls[1].listeners.click({});
+  assert.equal(confirms, 1);
+  assert.equal(calls[3].opts.method, 'DELETE');
+  assert.match(calls[3].url, /\/actions\/log-run$/);
 });
 
 test('moderation reads send the loaded page membership including query-string routes', async () => {

@@ -1494,6 +1494,24 @@ function tabBans() {
 // settings
 // ---------------------------------------------------------------------------
 
+function actionIsLogChannel(job) {
+  return job && job.action && job.action.kind === "set_log_channel";
+}
+
+function actionCanCancel(job) {
+  if (!job) return false;
+  if (job.state === "pending" || job.state === "claimed") return true;
+  return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
+}
+
+function actionCancelLabel(job) {
+  return job && (job.state === "running" || job.state === "uncertain") ? "Force cancel" : "Cancel";
+}
+
+function actionCancelNeedsConfirm(job) {
+  return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
+}
+
 function tabActions() {
   const guildId = state.guildId;
   const body = el("tbody", {});
@@ -1516,7 +1534,8 @@ function tabActions() {
           el("td", { text: target }), el("td", { text: job.actor_id }),
           el("td", { text: job.state === "uncertain" ? "Outcome unknown" : job.state }),
           el("td", { text: job.outcome || "—" }),
-          el("td", {}, job.state === "pending" ? el("button", { class: "btn small", text: "Cancel", onclick: async () => {
+          el("td", {}, actionCanCancel(job) ? el("button", { class: "btn small", text: actionCancelLabel(job), onclick: async () => {
+            if (actionCancelNeedsConfirm(job) && !confirm("Clear this stuck log-channel request? This does not change Discord. A new save can then run.")) return;
             await api(`/api/guilds/${guildId}/actions/${encodeURIComponent(job.id)}`, "DELETE");
             await run();
           } }) : null)));
@@ -1528,7 +1547,7 @@ function tabActions() {
   };
   run();
   return el("div", {}, el("h2", { text: "Bot actions" }),
-    el("p", { class: "muted", text: "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. You can cancel work that has not yet been claimed." }),
+    el("p", { class: "muted", text: "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. Cancel unstarted work, including claimed requests the bot has not dispatched. Force-cancel a stuck log-channel request that is running or unknown so a new save can run; this does not undo Discord." }),
     el("button", { class: "btn", text: "Refresh", onclick: run }), table);
 }
 

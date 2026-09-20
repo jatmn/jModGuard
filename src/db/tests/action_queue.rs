@@ -160,13 +160,13 @@ async fn claims_are_exclusive_and_execution_is_consumed_once() {
     assert_eq!(claims.len(), 1);
     let job = &claims[0];
     assert!(job.is_claimed());
-    assert!(!cancel_bot_action(&f.db, 10, &job.id).await.unwrap());
     assert!(
         !finish_bot_action(&f.db, job, "succeeded", "not_started")
             .await
             .unwrap()
     );
     assert!(begin_bot_action(&f.db, job, 1001).await.unwrap());
+    assert!(!cancel_bot_action(&f.db, 10, &job.id).await.unwrap());
     assert!(!begin_bot_action(&f.db, job, 1001).await.unwrap());
     assert!(
         finish_bot_action(&f.db, job, "failed", "permission_denied")
@@ -218,6 +218,8 @@ async fn expiry_never_retries_running_work_and_pending_cancellation_releases_tar
         .is_err()
     );
     assert!(!cancel_bot_action(&reopened, 10, &running.id).await.unwrap());
+    // Running unban work occupies the target until a known finish; recovery
+    // cancel must not pretend the Discord mutation never started.
     assert!(
         finish_bot_action(&reopened, &running, "failed", "confirmed_no_effect")
             .await
@@ -610,6 +612,113 @@ async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomicall
         );
         assert_eq!(get_version_state(&f.db).await.unwrap(), after);
     }
+}
+
+#[tokio::test]
+async fn claimed_unban_can_be_cancelled_and_releases_the_target() {
+    let f = Fixture::new().await;
+    let job = f.enqueue(10, "claimed_unban", unban(99)).await;
+    let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+    assert_eq!(claimed.id, job.id);
+    assert!(cancel_bot_action(&f.db, 10, &claimed.id).await.unwrap());
+    assert_eq!(f.state(&claimed).await, "cancelled");
+    assert!(!begin_bot_action(&f.db, &claimed, 1001).await.unwrap());
+    assert!(
+        !finish_bot_action(&f.db, &claimed, "succeeded", "late")
+            .await
+            .unwrap()
+    );
+    let replacement = f.enqueue(10, "claimed_unban_retry", unban(99)).await;
+    assert_eq!(replacement.state, "pending");
+    assert_ne!(replacement.id, claimed.id);
+}
+
+#[tokio::test]
+async fn running_and_uncertain_log_channels_can_be_force_cancelled() {
+    let f = Fixture::new().await;
+    for state in ["pending", "claimed", "running", "uncertain"] {
+        let mut job = f.enqueue(10, state, channel(Some(100))).await;
+        if state != "pending" {
+            job = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+        }
+        if matches!(state, "running" | "uncertain") {
+            assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        }
+        if state == "uncertain" {
+            assert!(
+                finish_bot_action(&f.db, &job, "uncertain", "unknown")
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(f.state(&job).await, state);
+        assert!(cancel_bot_action(&f.db, 10, &job.id).await.unwrap());
+        assert_eq!(f.state(&job).await, "cancelled");
+        assert!(!begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        assert!(
+            !finish_bot_action(&f.db, &job, "succeeded", "late")
+                .await
+                .unwrap()
+        );
+        f.enqueue(10, &format!("{state}_after"), channel(Some(200)))
+            .await;
+        delete_log_channel(&f.db, 10, "member_join").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn queued_log_channel_admission_supersedes_occupying_work() {
+    let f = Fixture::new().await;
+    for state in ["pending", "claimed", "running", "uncertain"] {
+        let mut job = f.enqueue(10, state, channel(Some(100))).await;
+        if state != "pending" {
+            job = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+        }
+        if matches!(state, "running" | "uncertain") {
+            assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        }
+        if state == "uncertain" {
+            assert!(
+                finish_bot_action(&f.db, &job, "uncertain", "unknown")
+                    .await
+                    .unwrap()
+            );
+        }
+        let replacement = f
+            .enqueue(10, &format!("{state}_newer"), channel(Some(200)))
+            .await;
+        assert_eq!(replacement.state, "pending");
+        assert_eq!(f.state(&job).await, "cancelled");
+        let stored = bot_action(&f.db, 10, &job.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.outcome.as_deref(),
+            Some("superseded_by_newer_request")
+        );
+        assert!(!begin_bot_action(&f.db, &job, 1001).await.unwrap());
+        assert!(
+            !finish_bot_action(&f.db, &job, "succeeded", "late")
+                .await
+                .unwrap()
+        );
+        delete_log_channel(&f.db, 10, "member_join").await.unwrap();
+    }
+    let blocking = f.enqueue(10, "unban_block", unban(99)).await;
+    let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+    assert_eq!(claimed.id, blocking.id);
+    assert!(
+        enqueue_bot_action(
+            &f.db,
+            10,
+            42,
+            "1000_unban_conflict",
+            unban(99),
+            1000,
+            Limits::default()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.state(&claimed).await, "claimed");
 }
 
 #[test]

@@ -489,20 +489,25 @@ async fn cancelled_and_expired_work_never_dispatches() {
     let claimed = f.enqueue(10, "claim", unban(101)).await;
     let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
     assert_eq!(claim.id, claimed.id);
-    assert!(!db::cancel_bot_action(&f.db, 10, &claim.id).await.unwrap());
+    assert!(db::cancel_bot_action(&f.db, 10, &claim.id).await.unwrap());
+    let mock = MockDiscord::default();
+    execute(&f.db, &mock, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.checks.load(Ordering::SeqCst), 0);
+    assert_eq!(f.status(&claimed).await.state, "cancelled");
+    assert_eq!(
+        f.status(&claimed).await.outcome.as_deref(),
+        Some("cancelled_before_execution")
+    );
     assert!(
         db::claim_bot_action(&f.db, now() + 1000)
             .await
             .unwrap()
             .is_none()
     );
-    let mock = MockDiscord::default();
-    execute(&f.db, &mock, &claim, &WorkerLimits::default())
-        .await
-        .unwrap();
-    assert_eq!(mock.checks.load(Ordering::SeqCst), 0);
     assert_eq!(f.status(&old).await.state, "expired");
-    assert_eq!(f.status(&claimed).await.state, "expired");
 }
 
 #[tokio::test]
