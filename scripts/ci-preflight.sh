@@ -48,6 +48,20 @@ if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.yml"; th
   exit 1
 fi
 
+required_pipeline_env=(
+  'CARGO_BUILD_JOBS: "1"'
+  'CARGO_PROFILE_DEV_DEBUG: "0"'
+  'CARGO_PROFILE_TEST_DEBUG: "0"'
+  'CARGO_PROFILE_TEST_CODEGEN_UNITS: "1"'
+  'CARGO_INCREMENTAL: "0"'
+)
+for setting in "${required_pipeline_env[@]}"; do
+  if ! grep -Fq "$setting" "$root/.buildkite/pipeline.yml"; then
+    echo "ci-preflight: .buildkite/pipeline.yml must retain the compiler memory bound: $setting" >&2
+    exit 1
+  fi
+done
+
 for hook in pre-commit pre-push; do
   hook_path="$root/.githooks/$hook"
   if [ ! -f "$hook_path" ]; then
