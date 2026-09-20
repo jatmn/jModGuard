@@ -104,7 +104,7 @@ not grant access. No installation-owner bypass or automatic enrollment adoption 
 and verify membership with their data. Individual configuration reads now follow the same
 captured membership contract described below. Case, evidence and case-removal-role routes
 use the same page token against the live guild store. Unban and log-channel operations
-use the page token and a stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status and cancellation
+use the page token and a stable request key for [queued bot dispatch](BOT-ACTIONS.md). Status, cancellation of unstarted work, and force-cancel of stuck log-channel requests
 retain captured membership and current action permissions.
 A missed Discord departure may leave an observation stale until reconciled. Live tenant
 isolation and guild erasure are described in [tenant runtime](TENANT-RUNTIME.md). The API

@@ -993,6 +993,108 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
 }
 
 #[tokio::test]
+async fn claimed_work_and_stuck_log_channels_can_be_cancelled_for_recovery() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let (_, unban) = f
+        .request(
+            "POST",
+            "/api/guilds/10/unban",
+            &serde_json::json!({"request_id":action_key("claimed"),"user_id":"99"}).to_string(),
+        )
+        .await;
+    let claimed = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, unban["id"].as_str().unwrap());
+    let path = format!("/api/guilds/10/actions/{}", claimed.id);
+    let (status, body) = f.request("DELETE", &path, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, again) = f
+        .request(
+            "POST",
+            "/api/guilds/10/unban",
+            &serde_json::json!({"request_id":action_key("claimed-retry"),"user_id":"99"})
+                .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["state"], "pending");
+    let pending_unban_path = format!("/api/guilds/10/actions/{}", again["id"].as_str().unwrap());
+    assert_eq!(
+        f.request("DELETE", &pending_unban_path, "").await.0,
+        StatusCode::OK
+    );
+
+    let (_, log) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/logchannels/message_edit",
+            &serde_json::json!({"request_id":action_key("log-run"),"channel_id":"123"}).to_string(),
+        )
+        .await;
+    let running = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.id, log["id"].as_str().unwrap());
+    assert!(
+        db::begin_bot_action(&f.app.db, &running, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+    );
+    let log_path = format!("/api/guilds/10/actions/{}", running.id);
+    let (status, body) = f.request("DELETE", &log_path, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, newer) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/logchannels/message_edit",
+            &serde_json::json!({"request_id":action_key("log-retry"),"channel_id":"124"})
+                .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{newer}");
+    assert_eq!(newer["state"], "pending");
+    assert_ne!(newer["id"], log["id"]);
+    let pending_log_path = format!("/api/guilds/10/actions/{}", newer["id"].as_str().unwrap());
+    assert_eq!(
+        f.request("DELETE", &pending_log_path, "").await.0,
+        StatusCode::OK
+    );
+
+    let (_, running_unban_job) = f
+        .request(
+            "POST",
+            "/api/guilds/10/unban",
+            &serde_json::json!({"request_id":action_key("running-unban"),"user_id":"99"})
+                .to_string(),
+        )
+        .await;
+    let running_unban = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running_unban.id, running_unban_job["id"].as_str().unwrap());
+    assert!(
+        db::begin_bot_action(&f.app.db, &running_unban, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+    );
+    let unban_running_path = format!("/api/guilds/10/actions/{}", running_unban.id);
+    let (status, body) = f.request("DELETE", &unban_running_path, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("only unstarted work can be cancelled"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn action_requests_require_ids_reject_forged_authority_and_report_expiry() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;

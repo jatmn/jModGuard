@@ -1145,7 +1145,7 @@ pub async fn cancel_action(
     }
     if !db::cancel_enrolled_bot_action(&app.db, &enrollment, &id).await? {
         return Err(ApiError(anyhow::anyhow!(
-            "only a pending action can be cancelled"
+            "only unstarted work can be cancelled; log-channel work can also be cleared while running or unknown"
         )));
     }
     Ok(Json(serde_json::json!({"ok":true})))

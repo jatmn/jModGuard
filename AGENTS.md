@@ -62,6 +62,8 @@ mutation outcomes. Reuse the bot HTTP client; no additional client/cache. One bo
 bounded batches, with skipped missed ticks. Worker limits/timers are bot-only config. Worker completion must use finish_dispatched_bot_action:
 local log changes check expiry inside the primary transaction; known remote unban results
 may be recorded late. Failed receipts or shutdown must never automatically resend Discord.
+Dashboard cancel may clear unstarted (`pending`/`claimed`) work and stuck log-channel
+`running`/`uncertain` rows; it must not treat a running unban as never dispatched.
 
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
 bind queue storage, the nickname outbox and API configuration scope.

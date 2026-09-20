@@ -2,7 +2,8 @@
 
 The API queues typed unban and log-channel requests and returns HTTP 202 with a receipt.
 The bot executes them using its existing Discord client. The WebUI reports pending work
-and provides an Actions tab for manual status refresh and pending cancellation. Acceptance
+and provides an Actions tab for manual status refresh, cancellation of unstarted work,
+and force-cancel of stuck log-channel requests. Acceptance
 is not completion. The API needs OAuth credentials but no bot token.
 The nickname outbox remains a separate active path; see
 [nickname membership checks](ENROLLMENTS.md#nickname-reconciliation).
@@ -34,9 +35,14 @@ The nickname outbox remains a separate active path; see
   Direct writes and queued completion share log-mapping/version semantics: a clear
   advances configuration versions/revisions only when a mapping is actually deleted.
   An absent-mapping queued clear still commits its completed action state atomically.
-- Pending work can be cancelled within its guild. A direct log-channel upsert/delete
-  supersedes active queued work for that guild/event and current membership atomically,
-  so late completion cannot overwrite the newer setting. It cannot undo a remote effect already performed.
+- Pending and claimed work can be cancelled within its guild. Claimed work has not
+  begun a Discord mutation. Running unban work cannot be cancelled as if Discord
+  never ran. Log-channel `running` and `uncertain` rows can be force-cancelled
+  because Discord is not mutated until local completion; that frees the event so a
+  newer save can run. A newer queued log-channel request supersedes active queued
+  work for that guild/event and current membership atomically, matching a direct
+  log-channel upsert/delete. Late completion cannot overwrite the newer setting.
+  It cannot undo a remote effect already performed.
   Clearing an absent mapping still supersedes queued changes, but does not advance
   configuration versions or revisions when no mapping was deleted.
 - Cleanup removes only a bounded batch of resolved operational history. Age uses the
@@ -164,7 +170,7 @@ These are implementation defaults/bounds, not measured capacity or active deploy
 requirements. Bot-only `[action_worker]` configuration exposes these limits and timers.
 Claim and receipt SQL retain the existing database operation deadlines outside that block.
 
-Local worker tests cover duplicate/modified claims, cancellation/expiry, permission and
+Local worker tests cover duplicate/modified claims, claimed cancellation before dispatch, cancellation/expiry, permission and
 membership changes, missed-rejoin repair, failed verification, current-role authorization,
 channel supersession, request timeouts, abandoned dispatch, receipt rollback, batch bounds
 and late local effects.
@@ -179,14 +185,18 @@ Unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and cl
 comes from the session, never the body. Every request rechecks Discord permissions.
 `GET .../actions` and `DELETE .../actions/{id}` also require the page membership; status
 returns up to the latest 50 receipts filtered to the caller's current action permissions.
-Only pending work can be cancelled. Global guild-0 paths do not admit actions.
+Unstarted (`pending`/`claimed`) work can be cancelled. Log-channel work that is `running`
+or `uncertain` can also be force-cancelled so a newer save can run; this does not undo
+Discord. Running unban work cannot be cancelled. Global guild-0 paths do not admit actions.
 
 The browser saves the request key, payload identity and membership in session storage
 before sending. A lost response retains that key across retries/reloads in the same tab.
 It clears it only after a valid receipt or explicit user confirmation. Old-membership,
 expired or invalid keys require explicit clearing and a separate reviewed submission;
 there is no automatic retry with a new key. Denied session storage prevents submission.
-The Actions tab uses manual refresh, with no background polling. Refresh log configuration
+The Actions tab uses manual refresh, with no background polling. Cancel unstarted work
+from that table, including claimed requests. Force-cancel a stuck log-channel request that
+is running or unknown so a new save can run; this does not undo Discord. Refresh log configuration
 or bans after completion to see the applied result. “Outcome unknown” requires inspection;
 submitting fresh work can repeat an effect already performed.
 

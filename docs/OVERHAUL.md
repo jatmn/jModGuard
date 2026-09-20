@@ -206,7 +206,8 @@ membership checks, returning HTTP202 receipts. Status/cancellation retain those 
 filter by current action authority. The frontend saves a request key and membership before
 sending, retains it after an unknown response, and requires explicit clearing before a
 separate new submission after expiry or membership change. The Actions tab refreshes on
-request and permits pending cancellation; it never treats admission as completed moderation.
+request and permits cancellation of unstarted work plus force-cancel of stuck log-channel
+requests; it never treats admission as completed moderation.
 
 One bot task sequentially drains bounded batches using the existing HTTP client and real
 Gateway identity. A second timer in that task prunes bounded resolved history; missed ticks

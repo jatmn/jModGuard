@@ -150,7 +150,8 @@ owner_id = 123456789012345678               # your Discord user ID
   The API logs a startup warning when `owner_id` is unset.
 - Only the bot needs the bot token (`JMODGUARD_DISCORD_TOKEN`); the API uses OAuth.
   Deploy matching bot/API/frontend builds. Administrative changes are queued; use the
-  Actions tab to refresh their status. See [action settings](BOT-ACTIONS.md#runtime-controls).
+  Actions tab to refresh their status and to cancel unstarted or stuck log-channel work.
+  See [action settings](BOT-ACTIONS.md#runtime-controls).
 
 ## 7. Run
 

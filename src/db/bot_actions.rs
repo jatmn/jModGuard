@@ -174,6 +174,13 @@ async fn enqueue_bot_action_inner(
         if request_time <= floor {
             return Err(crate::bot_actions::RequestKeyError::Expired.into());
         }
+        if let Some(event) = resource.strip_prefix("log:") {
+            // A newer queued log-channel intent is the same class as a direct
+            // mapping write: occupying work for that event cannot block recovery.
+            // Supersede shares this transaction with the capacity and insert below;
+            // a failed admission rolls back the supersede as well.
+            supersede_log_action_with(&tx, guild, event, "superseded_by_newer_request")?;
+        }
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM bot_actions WHERE guild_id=?1 AND enrollment_id=?2
              AND state IN ('pending','claimed','running','uncertain')",
@@ -495,7 +502,10 @@ async fn cancel_bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Resul
         let n = tx.execute(
             &format!(
                 "UPDATE bot_actions SET state='cancelled',outcome='cancelled_before_execution',
-             finished_at=unixepoch() WHERE guild_id=?1 AND id=?2 AND state='pending' AND {ACTIVE}"
+             finished_at=unixepoch() WHERE guild_id=?1 AND id=?2 AND {ACTIVE} AND (
+               state IN ('pending','claimed')
+               OR (state IN ('running','uncertain') AND resource LIKE 'log:%')
+             )"
             ),
             params![guild, id],
         )?;
@@ -507,13 +517,22 @@ async fn cancel_bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Resul
 
 /// Direct bot/config writers supersede queued log changes in the same transaction.
 pub(super) fn supersede_log_action(conn: &impl SqlExecutor, guild: i64, event: &str) -> Result<()> {
+    supersede_log_action_with(conn, guild, event, "superseded_by_config_write")
+}
+
+fn supersede_log_action_with(
+    conn: &impl SqlExecutor,
+    guild: i64,
+    event: &str,
+    outcome: &str,
+) -> Result<()> {
     conn.execute(
         &format!(
-            "UPDATE bot_actions SET state='cancelled',outcome='superseded_by_config_write',
+            "UPDATE bot_actions SET state='cancelled',outcome=?3,
          finished_at=unixepoch() WHERE guild_id=?1 AND resource=?2
          AND state IN ('pending','claimed','running','uncertain') AND {ACTIVE}"
         ),
-        params![guild, format!("log:{event}")],
+        params![guild, format!("log:{event}"), outcome],
     )?;
     Ok(())
 }
