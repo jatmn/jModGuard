@@ -208,6 +208,12 @@ pub(super) async fn refuse_fenced_discord_mutation(env: &CmdEnv<'_>) -> Result<(
 pub struct BehaviorOutcome {
     pub response: Option<String>,
     pub vars: BTreeMap<String, String>,
+    /// True when the behavior's visible effect already landed in the
+    /// invocation channel (e.g. `!say` posting there), so a confirmation
+    /// reply would be redundant. Prefix dispatch sends nothing; slash
+    /// dispatch withdraws the deferred answer (or answers ephemerally when
+    /// the defer failed — an interaction must always be answered).
+    pub suppress_response: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -598,17 +604,29 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
     };
     match run_command(env).await {
         Ok(outcome) => {
-            let text = render_outcome(&cmd, &outcome);
-            let ephemeral = outcome.response.is_none() && cmd.response.is_empty();
+            let answer = slash_answer(&cmd, &outcome);
             if deferred {
-                let _ = EditInteractionResponse::new()
-                    .content(text)
-                    .execute(&ctx.http, slash.token.as_str())
-                    .await;
+                match answer {
+                    SlashAnswer::Withdraw => {
+                        withdraw_deferred_slash_answer(ctx, &slash.token, &cmd.name).await;
+                    }
+                    // Ephemeral is fixed at the initial response; a deferred
+                    // answer is already public and can only be edited.
+                    SlashAnswer::Public | SlashAnswer::Ephemeral => {
+                        let _ = EditInteractionResponse::new()
+                            .content(render_outcome(&cmd, &outcome))
+                            .execute(&ctx.http, slash.token.as_str())
+                            .await;
+                    }
+                }
             } else {
+                // The defer failed, so there is no deferred answer to
+                // withdraw; an interaction must still be answered, and a
+                // suppressed confirmation must not become a public message.
+                let ephemeral = answer != SlashAnswer::Public;
                 let _ = serenity::builder::CreateInteractionResponse::Message(
                     serenity::builder::CreateInteractionResponseMessage::new()
-                        .content(text)
+                        .content(render_outcome(&cmd, &outcome))
                         .ephemeral(ephemeral),
                 )
                 .execute(&ctx.http, (slash.id, slash.token.as_str()))
@@ -691,6 +709,68 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     }
 }
 
+/// Text to post in the invocation channel after a prefix command, or None
+/// when there is nothing to post. A behavior whose visible effect already
+/// landed in the invocation channel (`suppress_response`, e.g. `!say`
+/// posting there) gets no confirmation reply — it would be redundant.
+fn prefix_response_text(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<String> {
+    if outcome.suppress_response {
+        return None;
+    }
+    let text = render_outcome(cmd, outcome);
+    (!text.is_empty()).then_some(text)
+}
+
+/// How the slash dispatcher answers a successful interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashAnswer {
+    /// Public reply: edit the deferred answer, or send a public initial
+    /// response when the defer failed.
+    Public,
+    /// Ephemeral initial response when the defer failed. A deferred answer is
+    /// already public (ephemeral is fixed at the initial response), so it is
+    /// edited in place like `Public`.
+    Ephemeral,
+    /// The behavior's visible effect already landed in the invocation channel
+    /// (e.g. same-channel `/say`): delete the deferred answer so no redundant
+    /// confirmation appears; when the defer failed, answer ephemerally
+    /// instead (an interaction must always be answered).
+    Withdraw,
+}
+
+fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
+    if outcome.suppress_response {
+        SlashAnswer::Withdraw
+    } else if outcome.response.is_none() && cmd.response.is_empty() {
+        SlashAnswer::Ephemeral
+    } else {
+        SlashAnswer::Public
+    }
+}
+
+/// When delete is rejected, edit the deferred placeholder to this instead of
+/// leaving the loading/"done" confirmation visible after same-channel say.
+const WITHDRAW_DEFERRED_FALLBACK_CONTENT: &str = "\u{200b}";
+
+/// Remove the public deferred interaction placeholder after a suppressed
+/// confirmation. Prefer delete; on failure log and edit to minimal content.
+async fn withdraw_deferred_slash_answer(ctx: &Context, token: &str, command_name: &str) {
+    if let Err(e) = ctx.http.delete_original_interaction_response(token).await {
+        tracing::warn!(
+            "failed to delete deferred slash answer for `{command_name}`: {e:#}; editing to minimal content"
+        );
+        if let Err(edit_err) = EditInteractionResponse::new()
+            .content(WITHDRAW_DEFERRED_FALLBACK_CONTENT)
+            .execute(&ctx.http, token)
+            .await
+        {
+            tracing::warn!(
+                "failed to edit deferred slash answer for `{command_name}` after delete failure: {edit_err:#}"
+            );
+        }
+    }
+}
+
 async fn send_outcome(
     app: &Arc<BotState>,
     ctx: &Context,
@@ -700,8 +780,7 @@ async fn send_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
-    let text = render_outcome(cmd, &outcome);
-    if !text.is_empty()
+    if let Some(text) = prefix_response_text(cmd, &outcome)
         && let Err(e) = channel_id.say(&ctx.http, text).await
     {
         tracing::warn!(
@@ -791,4 +870,103 @@ pub async fn resolve_user(
                     .unwrap_or(false)
         })
         .map(|(_, m)| m.user.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Behavior;
+
+    fn say_cmd(response: &str) -> CommandDef {
+        CommandDef {
+            name: "say".into(),
+            aliases: vec![],
+            category: String::new(),
+            description: String::new(),
+            usage: String::new(),
+            enabled: true,
+            permission: "mod".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Say,
+            response: response.into(),
+            log_event: String::new(),
+        }
+    }
+
+    fn outcome(response: Option<&str>, suppress_response: bool) -> BehaviorOutcome {
+        BehaviorOutcome {
+            response: response.map(str::to_string),
+            vars: BTreeMap::new(),
+            suppress_response,
+        }
+    }
+
+    #[test]
+    fn prefix_same_channel_say_sends_no_confirmation() {
+        // Default command falls back to "done" — suppressed same-channel.
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(None, true)),
+            None
+        );
+        // A custom response template (e.g. "✅ Done.") is also suppressed.
+        assert_eq!(
+            prefix_response_text(&say_cmd("✅ Done."), &outcome(None, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn prefix_cross_channel_say_keeps_confirmation() {
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(None, false)),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            prefix_response_text(&say_cmd("✅ Done."), &outcome(None, false)),
+            Some("✅ Done.".to_string())
+        );
+    }
+
+    #[test]
+    fn prefix_empty_rendered_response_still_sends_nothing() {
+        assert_eq!(
+            prefix_response_text(&say_cmd(""), &outcome(Some(""), false)),
+            None
+        );
+    }
+
+    #[test]
+    fn slash_suppressed_say_withdraws_the_answer() {
+        // Same-channel say suppresses the confirmation regardless of whether
+        // a custom response template (e.g. "✅ Done.") is configured.
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(None, true)),
+            SlashAnswer::Withdraw
+        );
+        assert_eq!(
+            slash_answer(&say_cmd("✅ Done."), &outcome(None, true)),
+            SlashAnswer::Withdraw
+        );
+    }
+
+    #[test]
+    fn slash_answer_rule_unchanged_without_suppression() {
+        // Default say (no template, no inline reply) keeps an ephemeral answer.
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(None, false)),
+            SlashAnswer::Ephemeral
+        );
+        // A custom template stays public for cross-channel confirmations.
+        assert_eq!(
+            slash_answer(&say_cmd("✅ Done."), &outcome(None, false)),
+            SlashAnswer::Public
+        );
+        // An inline behavior reply stays public.
+        assert_eq!(
+            slash_answer(&say_cmd(""), &outcome(Some("hi"), false)),
+            SlashAnswer::Public
+        );
+    }
 }

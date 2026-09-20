@@ -83,7 +83,10 @@ Each command's `response` field is a template rendered after success, e.g.
 `Banned {target} | {reason}`. Variables: `{user} {actor} {actor_id} {guild}
 {channel} {target} {target_id} {reason} {minutes} {count} {name} {prefix}
 {seconds} {response}`. Leave it empty and the behavior's built-in reply (if
-any) is used.
+any) is used. When `!say` posts into the invoking channel the reply is
+suppressed as redundant — the posted text is already visible there — so a
+prefix invocation sends nothing and the deferred slash answer is withdrawn.
+A post into another channel still confirms in the invoking channel.
 
 ## Alias notes
 
