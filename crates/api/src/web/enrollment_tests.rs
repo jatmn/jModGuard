@@ -1766,6 +1766,23 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(denied["code"], "preview_read_only");
+    let (status, me) = f.request_preview("POST", "/api/me", "", token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let (status, cases) = f
+        .request_preview("POST", "/api/guilds/10/cases", "", token)
+        .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "{cases}");
+    assert_ne!(cases["code"].as_str(), Some("preview_read_only"));
+    let (status, note) = f
+        .request_preview(
+            "POST",
+            "/api/guilds/10/cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/history",
+            r#"{"entry_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","text":"no"}"#,
+            token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{note}");
+    assert_eq!(note["code"], "preview_read_only");
     let (status, _global) = f
         .request_preview("PUT", "/api/guilds/0/settings", r#"{"prefix":"!"}"#, token)
         .await;
