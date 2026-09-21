@@ -696,6 +696,7 @@ pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<Strin
             .unwrap_or_else(|| env.guild_id.to_string()),
     );
     vars.insert("channel".into(), format!("<#{}>", env.channel_id));
+    vars.insert("source_channel_id".into(), env.channel_id.to_string());
     vars
 }
 
@@ -785,6 +786,7 @@ async fn log_mod(
         target_name,
         env.actor.get(),
         env.actor_member.display_name(),
+        env.channel_id.get(),
         reason,
     )
     .await;

@@ -58,6 +58,24 @@ fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
 }
 
 #[test]
+fn partial_fields_for_one_edit_are_one_observation() {
+    let dedup = EditReportDedup::default();
+    let content = update(serde_json::json!({"content":"edited"}));
+    let attachments = update(serde_json::json!({"attachments":[]}));
+    let combined = update(serde_json::json!({"content":"edited","attachments":[]}));
+    assert!(dedup.should_report(&content));
+    assert!(!dedup.should_report(&attachments));
+    assert!(!dedup.should_report(&combined));
+    assert!(dedup.should_report(&update(serde_json::json!({"content":"edited again"}))));
+
+    let reverse = EditReportDedup::default();
+    assert!(reverse.should_report(&attachments));
+    assert!(!reverse.should_report(&content));
+    assert!(!reverse.should_report(&combined));
+    assert!(reverse.should_report(&update(serde_json::json!({"content":"edited again"}))));
+}
+
+#[test]
 fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
     let filter = db::LogFilter {
         users: vec!["otherbot".into(), "123".into()],
@@ -67,13 +85,32 @@ fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
     assert!(excluded(&filter, &vars));
     vars = BTreeMap::from([("user_id".into(), "123".into())]);
     assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([("actor_id".into(), "123".into())]);
+    assert!(excluded(&filter, &vars));
     vars = BTreeMap::from([("channel_id".into(), "456".into())]);
     assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([
+        ("source_channel_id".into(), "456".into()),
+        ("channel".into(), "<#789>".into()),
+    ]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([
+        ("source_channel_id".into(), "789".into()),
+        ("channel".into(), "<#456>".into()),
+    ]);
+    assert!(!excluded(&filter, &vars));
     vars = BTreeMap::from([
         ("channel_id".into(), "789".into()),
         ("username".into(), "allowed".into()),
     ]);
     assert!(!excluded(&filter, &vars));
+
+    let unknown = db::LogFilter {
+        users: vec!["unavailable".into()],
+        channels: vec![],
+    };
+    vars = message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123));
+    assert!(!excluded(&unknown, &vars));
 }
 
 #[test]

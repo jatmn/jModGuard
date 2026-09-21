@@ -22,7 +22,11 @@ const SNIPPET_CHARS: usize = 1000;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 type EditKey = (u64, u64, u64);
-type EditObservation = (u64, Instant);
+struct EditObservation {
+    content: Option<u64>,
+    attachments: Option<u64>,
+    at: Instant,
+}
 
 #[derive(Default)]
 pub struct EditReportDedup {
@@ -36,35 +40,54 @@ impl EditReportDedup {
         let Some(guild) = event.guild_id else {
             return false;
         };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        event.content.hash(&mut hasher);
-        event
+        let content = event.content.as_ref().map(fingerprint);
+        let attachments = event
             .attachments
             .as_ref()
-            .map(|items| items.iter().map(|a| a.id.get()).collect::<Vec<_>>())
-            .hash(&mut hasher);
-        let fingerprint = hasher.finish();
+            .map(|items| fingerprint(&items.iter().map(|a| a.id.get()).collect::<Vec<_>>()));
         let key = (guild.get(), event.channel_id.get(), event.id.get());
         let mut entries = self.inner.lock();
-        entries.retain(|_, (_, at)| at.elapsed() < EDIT_REPORT_KEEP);
-        if entries
-            .get(&key)
-            .is_some_and(|(seen, _)| *seen == fingerprint)
-        {
-            return false;
+        entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
+        if let Some(seen) = entries.get_mut(&key) {
+            // Gateway updates may supply only one field at a time. A newly
+            // supplied field completes this observation; it is not a new edit.
+            let changed = content.is_some_and(|value| seen.content.is_some_and(|old| old != value))
+                || attachments
+                    .is_some_and(|value| seen.attachments.is_some_and(|old| old != value));
+            if content.is_some() {
+                seen.content = content;
+            }
+            if attachments.is_some() {
+                seen.attachments = attachments;
+            }
+            seen.at = Instant::now();
+            return changed;
         }
         if entries.len() >= EDIT_REPORT_LIMIT
             && !entries.contains_key(&key)
             && let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, (_, at))| *at)
+                .min_by_key(|(_, seen)| seen.at)
                 .map(|(key, _)| *key)
         {
             entries.remove(&oldest);
         }
-        entries.insert(key, (fingerprint, Instant::now()));
+        entries.insert(
+            key,
+            EditObservation {
+                content,
+                attachments,
+                at: Instant::now(),
+            },
+        );
         true
     }
+}
+
+fn fingerprint<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Default)]
@@ -214,19 +237,31 @@ pub(crate) async fn emit_to(
 }
 
 fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
-    let user_match = ["user_id", "username", "user"]
+    let known_user = vars.get("user_id").is_none_or(|id| id != "unavailable");
+    let user_match = ["user_id", "actor_id"]
         .iter()
         .filter_map(|key| vars.get(*key))
+        .filter(|value| value.parse::<u64>().is_ok_and(|id| id != 0))
+        .chain(
+            ["username", "user"]
+                .iter()
+                .filter_map(|key| vars.get(*key))
+                .filter(|_| known_user),
+        )
         .any(|value| {
             filter
                 .users
                 .iter()
                 .any(|ignored| ignored == &value.to_lowercase())
         });
-    let source = vars.get("channel_id").map(String::as_str).or_else(|| {
-        vars.get("channel")
-            .and_then(|value| value.strip_prefix("<#")?.strip_suffix('>'))
-    });
+    let source = vars
+        .get("source_channel_id")
+        .or_else(|| vars.get("channel_id"))
+        .map(String::as_str)
+        .or_else(|| {
+            vars.get("channel")
+                .and_then(|value| value.strip_prefix("<#")?.strip_suffix('>'))
+        });
     user_match || source.is_some_and(|source| filter.channels.iter().any(|id| id == source))
 }
 
@@ -377,10 +412,13 @@ pub async fn emit_mod_action(
     target_display: &str,
     actor_id: u64,
     actor_name: &str,
+    source_channel_id: u64,
     reason: &str,
 ) {
     let mut vars = templates::user_vars(target_id, target_name, target_display);
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
+    vars.insert("actor_id".into(), actor_id.to_string());
+    vars.insert("source_channel_id".into(), source_channel_id.to_string());
     vars.insert("action".into(), action.to_string());
     vars.insert("reason".into(), reason.to_string());
     emit(app, ctx, guild_id, "mod_action", vars).await;

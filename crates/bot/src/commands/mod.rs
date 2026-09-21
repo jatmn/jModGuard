@@ -632,7 +632,16 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
                 .execute(&ctx.http, (slash.id, slash.token.as_str()))
                 .await;
             }
-            log_outcome(app, ctx, &cmd, guild_id, actor_id, outcome).await;
+            log_outcome(
+                app,
+                ctx,
+                &cmd,
+                guild_id,
+                slash.channel_id,
+                actor_id,
+                outcome,
+            )
+            .await;
         }
         Err(e) => {
             let text = format!("error: {e:#}");
@@ -788,7 +797,7 @@ async fn send_outcome(
             cmd.name
         );
     }
-    log_outcome(app, ctx, cmd, guild_id, actor_id, outcome).await;
+    log_outcome(app, ctx, cmd, guild_id, channel_id, actor_id, outcome).await;
 }
 
 async fn log_outcome(
@@ -796,6 +805,7 @@ async fn log_outcome(
     ctx: &Context,
     cmd: &CommandDef,
     guild_id: GuildId,
+    source_channel_id: ChannelId,
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
@@ -810,6 +820,8 @@ async fn log_outcome(
         .map(|u| u.name.clone())
         .unwrap_or_else(|| actor_id.to_string());
     vars.insert("actor".into(), format!("{actor_name} (<@{actor_id}>)"));
+    vars.insert("actor_id".into(), actor_id.to_string());
+    vars.insert("source_channel_id".into(), source_channel_id.to_string());
     logging::emit(app, ctx, guild_id, &cmd.log_event, vars).await;
 }
 

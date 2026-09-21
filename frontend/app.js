@@ -1615,7 +1615,7 @@ function tabLogChannels() {
           el("label", {}, "Ignore users or bots", ignoredUsers),
           el("label", {}, "Ignore source channels", ignoredChannels),
           el("button", { class: "btn small", text: "Save ignores", savedInputs: [ignoredUsers, ignoredChannels], onclick: async () => {
-            const users = ignoredUsers.value.split(/\n|,/).map((name) => name.trim()).filter(Boolean);
+            const users = ignoredUsers.value.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
             const channels = ignoredChannels.value.split(/\n|,/).map((name) => name.trim()).filter(Boolean).map(parseSnowflake);
             if (channels.some((id) => !id)) return toast("Enter a valid source channel ID, <#id> mention, or channel URL", "error");
             const saved = await api(`/api/guilds/${guildId}/logfilters/${lc.event}`, "PUT", { users, channels });

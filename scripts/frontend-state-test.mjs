@@ -465,7 +465,7 @@ test('log channel ignore editor saves each event without numeric snowflake conve
   const calls = [];
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
-    return response({ ignore: { users: ['otherbot'], channels: ['9007199254740993'] } });
+    return response({ ignore: { users: ['reporter, inc.', 'otherbot'], channels: ['9007199254740993'] } });
   });
   h.app.state.config = {
     enrollment_id: 'membership', rules: [], commands: [], badwords: [],
@@ -475,13 +475,13 @@ test('log channel ignore editor saves each event without numeric snowflake conve
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
   const fields = h.elements.filter((node) => node.tag === 'textarea');
-  fields[0].value = 'OtherBot';
+  fields[0].value = 'Reporter, Inc.\nOtherBot';
   fields[1].value = '9007199254740993';
   const save = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Save ignores');
   await save.listeners.click({});
   assert.match(calls[0].url, /\/logfilters\/message_edit$/);
-  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['OtherBot'], channels: ['9007199254740993'] });
-  assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['otherbot'], channels: ['9007199254740993'] });
+  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['Reporter, Inc.', 'OtherBot'], channels: ['9007199254740993'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['reporter, inc.', 'otherbot'], channels: ['9007199254740993'] });
 });
 
 test('queued log-channel receipts reconcile without a configuration refresh', async () => {
