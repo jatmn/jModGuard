@@ -554,7 +554,6 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
     return;
   }
 
-  const previous = entry.previous;
   let authoritative;
   try {
     authoritative = await api(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
@@ -568,8 +567,8 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   if (!entry || entry.job.id !== original.id || !row?.pending_action ||
       original.guild_id !== state.guildId || original.enrollment_id !== state.config?.enrollment_id) return;
   if (row.pending_action?.id !== original.id) return;
-  row.effective = authoritative?.effective ?? previous.effective;
-  row.guild_override = authoritative?.guild_override ?? previous.guild_override;
+  row.effective = authoritative.effective;
+  row.guild_override = authoritative.guild_override;
   clearPendingLogChannelEntry(key);
   row.pending_action = null;
   renderLogChannelsPreservingDrafts();
@@ -2005,7 +2004,10 @@ function tabSettings() {
 
   const roleInput = el("input", { type: "text", placeholder: "role id, <@&id> mention, comma-separated" });
   const roleRevision = { value: "" };
+  let roleWriteGeneration = 0;
+  const initialRoleGeneration = roleWriteGeneration;
   apiRead(`/api/guilds/${state.guildId}/case-delete-roles`).then((roles) => {
+    if (initialRoleGeneration !== roleWriteGeneration) return;
     const loadedValue = (roles.roles || []).join(", ");
     if (roleInput._initialValue === undefined || roleInput.value === roleInput._initialValue) {
       roleInput.value = loadedValue;
@@ -2019,6 +2021,7 @@ function tabSettings() {
     el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
     el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
       const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles: splitIds(roleInput.value), revision: roleRevision.value });
+      roleWriteGeneration++;
       roleRevision.value = saved.revision;
       roleInput._initialValue = roleInput.value;
       dirty = currentDraftInputs().length > 0;

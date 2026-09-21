@@ -619,6 +619,31 @@ test('failed queued clears restore the authoritative mapping', async () => {
   assert.match(h.nodes.get('#toast').textContent, /failed: invalid_channel/);
 });
 
+test('failed queued sets preserve authoritative null mappings', async () => {
+  const pending = {
+    id: 'set-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url) => {
+    if (url.endsWith('/actions')) {
+      return response([{ ...pending, state: 'failed', outcome: 'invalid_channel' }]);
+    }
+    assert.match(url, /\/logchannels\/member_join$/);
+    return response({ effective: null, guild_override: null, global: null });
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  assert.equal(h.app.applyQueuedLogChannel(pending), true);
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  await h.app.reconcileQueuedLogChannel(pending);
+  assert.equal(h.app.state.config.log_channels[0].effective, null);
+  assert.equal(h.app.state.config.log_channels[0].guild_override, null);
+  assert.equal(h.app.state.config.log_channels[0].pending_action, null);
+});
+
 test('an older terminal log receipt cannot roll back its queued replacement', async () => {
   const first = {
     id: 'first', guild_id: '987654321098765432', actor_id: '123456789012345678',
@@ -664,6 +689,40 @@ test('case-delete-role save rejects invalid IDs instead of clearing roles', asyn
   await saveRoles.listeners.click({});
   assert.equal(calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles')).length, 0);
   assert.match(h.nodes.get('#toast').textContent, /digits, mentions, or channel URLs/);
+});
+
+test('late case-delete-role load cannot overwrite an acknowledged save', async () => {
+  const calls = [];
+  let resolveInitialRoles;
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const h = harness(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, method: options.method, body });
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+      return new Promise(resolve => { resolveInitialRoles = resolve; });
+    }
+    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+      return response({ revision: calls.filter(c => c.method === 'PUT').length === 1 ? 'revision-2' : 'revision-3' });
+    }
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+
+  const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
+  const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  roleInput.value = '2';
+  await saveRoles.listeners.click({});
+
+  resolveInitialRoles(response({ roles: ['1'], revision: 'revision-1' }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(roleInput.value, '2');
+
+  await saveRoles.listeners.click({});
+  const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
+  assert.equal(puts.length, 2);
+  assert.equal(puts[1].body.revision, 'revision-2');
 });
 
 test('settings keep clear-to-inherit and empty nickname distinct', async () => {
