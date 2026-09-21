@@ -1304,7 +1304,7 @@ function tabBadwords() {
 function tabCommands() {
   const cmds = state.config.commands;
   return el("div", {},
-    el("div", { class: "row", style: "justify-content:space-between" },
+    el("div", { class: "row title-row" },
       el("h2", { text: "Commands" }),
       el("button", { class: "btn good", text: "+ New custom command", onclick: () => editCommand(null) }),
     ),

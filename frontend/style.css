@@ -75,6 +75,8 @@ p { margin-bottom: 16px; }
 .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
 .row > * { min-width: 0; }
 .row > label { color: var(--muted); }
+.title-row { justify-content: space-between; margin-bottom: 24px; }
+.title-row > h2 { margin-bottom: 0; }
 /* Field groups align labels; action groups align controls below their labels. */
 .form-row { align-items: flex-start; margin-bottom: 18px; }
 .form-row > .field { flex: 1 1 200px; margin-bottom: 0; }
