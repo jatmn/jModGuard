@@ -309,6 +309,11 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
             ("DELETE", "rules/anything", r#"{}"#),
             ("DELETE", "templates/message_edit", r#"{}"#),
             (
+                "PUT",
+                "logfilters/message_edit",
+                r#"{"users":["OtherBot"],"channels":[]}"#,
+            ),
+            (
                 "DELETE",
                 "logchannels/message_edit",
                 r#"{"request_id":"1000_clear"}"#,
@@ -1372,6 +1377,45 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
         patterns.contains(&"guild")
             && patterns.contains(&"global")
             && !patterns.contains(&"foreign")
+    );
+}
+
+#[tokio::test]
+async fn per_event_log_ignores_are_saved_in_the_authorized_guild_bundle() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let body = serde_json::json!({"users":["  OtherBot  ","123"],"channels":["456"]}).to_string();
+    let (status, saved) = f
+        .request("PUT", "/api/guilds/10/logfilters/message_edit", &body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(
+        saved["ignore"],
+        serde_json::json!({"users":["123","otherbot"],"channels":["456"]})
+    );
+    let (_, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
+    let edit = bundle["log_channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["event"] == "message_edit")
+        .unwrap();
+    assert_eq!(edit["ignore"], saved["ignore"]);
+    let deleted = serde_json::json!({"users":[],"channels":[]}).to_string();
+    let (status, _) = f
+        .request("PUT", "/api/guilds/10/logfilters/message_edit", &deleted)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
+    let edit = bundle["log_channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["event"] == "message_edit")
+        .unwrap();
+    assert_eq!(
+        edit["ignore"],
+        serde_json::json!({"users":[],"channels":[]})
     );
 }
 

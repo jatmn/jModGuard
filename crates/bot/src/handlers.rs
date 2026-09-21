@@ -502,7 +502,9 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if let Some(report) = logging::message_update_report(&event) {
+        if let Some(report) = logging::message_update_report(&event)
+            && self.app.edit_reports.should_report(&event)
+        {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }

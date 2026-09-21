@@ -156,6 +156,7 @@ pub async fn guild_config(
             "effective": effective.to_string(),
             "guild_override": guild_row.map(|c| c.to_string()),
             "global": null,
+            "ignore": snapshot.guild_log_filters.get(event).cloned().unwrap_or_default(),
         }));
     }
 
@@ -734,6 +735,20 @@ pub async fn delete_template(
 // ---------------------------------------------------------------------------
 // log channels
 // ---------------------------------------------------------------------------
+
+pub async fn put_log_filter(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, event)): Path<(u64, String)>,
+    Json(filter): Json<db::LogFilter>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let scope = super::configuration_write_scope(&app, &auth, guild_id, guild_id as i64)?;
+    let filter = db::put_enrolled_log_filter(&app.db, scope, &event, filter).await?;
+    Ok(Json(serde_json::json!({ "ignore": filter })))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::BotProcessConfig;
 use crate::db::Db;
+use crate::db::SqlExecutor;
 use crate::state::BotState;
 use std::sync::Mutex;
 
@@ -35,6 +36,44 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
     let mut dm = update(serde_json::json!({"content":"private"}));
     dm.guild_id = None;
     assert!(message_update_report(&dm).is_none());
+}
+
+#[test]
+fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
+    let dedup = EditReportDedup::default();
+    let first = update(serde_json::json!({"content":"first"}));
+    assert!(dedup.should_report(&first));
+    assert!(!dedup.should_report(&first));
+    assert!(!dedup.should_report(&first));
+    let changed = update(serde_json::json!({"content":"second"}));
+    assert!(dedup.should_report(&changed));
+    assert!(!dedup.should_report(&changed));
+    assert!(
+        dedup.should_report(&first),
+        "a later distinct observation restores the first fingerprint"
+    );
+    let mut other_channel = first.clone();
+    other_channel.channel_id = ChannelId::new(999);
+    assert!(dedup.should_report(&other_channel));
+}
+
+#[test]
+fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
+    let filter = db::LogFilter {
+        users: vec!["otherbot".into(), "123".into()],
+        channels: vec!["456".into()],
+    };
+    let mut vars = BTreeMap::from([("username".into(), "OtherBot".into())]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([("user_id".into(), "123".into())]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([("channel_id".into(), "456".into())]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([
+        ("channel_id".into(), "789".into()),
+        ("username".into(), "allowed".into()),
+    ]);
+    assert!(!excluded(&filter, &vars));
 }
 
 #[test]
@@ -158,6 +197,62 @@ impl Drop for Fixture {
 #[derive(Default)]
 struct Sink {
     messages: Mutex<Vec<(ChannelId, serde_json::Value)>>,
+}
+
+#[tokio::test]
+async fn persisted_event_filter_blocks_matching_reports_only() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 456)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_edit',?1)",
+                db::params![r#"{"users":["otherbot"],"channels":["999"]}"#],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let guild = GuildId::new(789);
+    for vars in [
+        BTreeMap::from([("username".into(), "OtherBot".into())]),
+        BTreeMap::from([("channel_id".into(), "999".into())]),
+    ] {
+        assert_eq!(
+            emit_to(&f.app, &sink, guild, "message_edit", vars).await,
+            Delivery::Unconfigured
+        );
+    }
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            guild,
+            "message_edit",
+            BTreeMap::from([("username".into(), "another".into())])
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            guild,
+            "message_delete",
+            BTreeMap::from([("username".into(), "OtherBot".into())])
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(sink.messages.lock().unwrap().len(), 2);
 }
 #[serenity::async_trait]
 impl LogDelivery for Sink {

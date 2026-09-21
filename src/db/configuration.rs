@@ -1,4 +1,85 @@
 use super::*;
+use serde::Deserialize;
+
+/// Guild-local exclusions for one log event. User entries are case-insensitive
+/// names or decimal user IDs; channel entries are decimal source-channel IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFilter {
+    pub users: Vec<String>,
+    pub channels: Vec<String>,
+}
+
+impl LogFilter {
+    pub fn normalized(mut self) -> Result<Self> {
+        anyhow::ensure!(
+            self.users.len() <= 64 && self.channels.len() <= 64,
+            "too many log exclusions"
+        );
+        self.users = self
+            .users
+            .into_iter()
+            .map(|name| name.trim().trim_start_matches('@').to_lowercase())
+            .collect();
+        anyhow::ensure!(
+            self.users
+                .iter()
+                .all(|name| !name.is_empty() && name.len() <= 100),
+            "invalid ignored user name or ID"
+        );
+        self.users.sort();
+        self.users.dedup();
+        self.channels = self
+            .channels
+            .into_iter()
+            .map(|id| {
+                let id = id.trim().parse::<i64>()?;
+                anyhow::ensure!(id > 0, "ignored channel must be a positive Discord ID");
+                Ok(id.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.channels.sort();
+        self.channels.dedup();
+        Ok(self)
+    }
+}
+
+pub async fn put_enrolled_log_filter(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    event: &str,
+    filter: LogFilter,
+) -> Result<LogFilter> {
+    anyhow::ensure!(
+        crate::types::EVENT_TYPES.contains(&event),
+        "unknown log event type"
+    );
+    anyhow::ensure!(scope.guild_id() > 0, "log filters are guild-only");
+    let filter = filter.normalized()?;
+    let keys = vec![scope.guild_id().into(), event.to_owned().into()];
+    if filter.users.is_empty() && filter.channels.is_empty() {
+        delete_row(
+            db,
+            "log_filters",
+            "guild_id, event_type",
+            keys,
+            false,
+            Some(scope),
+        )
+        .await?;
+    } else {
+        upsert_row(
+            db,
+            "log_filters",
+            "guild_id, event_type",
+            keys,
+            filter.clone(),
+            false,
+            Some(scope),
+        )
+        .await?;
+    }
+    Ok(filter)
+}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -840,6 +921,7 @@ pub struct ConfigParts {
     pub commands: std::collections::HashMap<String, CommandDef>,
     pub templates: std::collections::HashMap<String, String>,
     pub log_channels: std::collections::HashMap<String, i64>,
+    pub log_filters: std::collections::HashMap<String, LogFilter>,
     pub badwords: Vec<String>,
 }
 
@@ -858,6 +940,7 @@ pub struct WebConfigSnapshot {
     pub guild_templates: std::collections::HashMap<String, String>,
     pub global_templates: std::collections::HashMap<String, String>,
     pub guild_log_channels: std::collections::HashMap<String, i64>,
+    pub guild_log_filters: std::collections::HashMap<String, LogFilter>,
 }
 
 /// Loads `(key, value)` rows where the value column holds JSON-serialized
@@ -916,6 +999,7 @@ SELECT
   (SELECT last_error_code FROM nickname_reconcile WHERE guild_id = ?1),
   (SELECT last_error FROM nickname_reconcile WHERE guild_id = ?1),
   (SELECT last_error_at FROM nickname_reconcile WHERE guild_id = ?1)
+  ,(SELECT json_group_object(event_type, data) FROM log_filters WHERE guild_id = ?1)
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -930,6 +1014,7 @@ struct ConfigurationSnapshotRows {
     guild_templates: std::collections::HashMap<String, String>,
     global_templates: std::collections::HashMap<String, String>,
     guild_log_channels: std::collections::HashMap<String, i64>,
+    guild_log_filters: std::collections::HashMap<String, LogFilter>,
     badwords: Vec<Badword>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
 }
@@ -1031,6 +1116,7 @@ fn load_configuration_snapshot_conn(
                 guild_templates: parse_json_map(row.get(11)?, "templates")?,
                 global_templates: parse_json_map(row.get(12)?, "templates")?,
                 guild_log_channels: parse_json_map(row.get(13)?, "log_channels")?,
+                guild_log_filters: parse_json_encoded_map(row.get(21)?, "log_filters")?,
                 badwords: parse_json_vec(row.get(14)?, "badwords")?,
                 nickname_reconcile,
             })
@@ -1073,6 +1159,7 @@ impl ConfigurationSnapshotRows {
             guild_templates: self.guild_templates,
             global_templates: self.global_templates,
             guild_log_channels: self.guild_log_channels,
+            guild_log_filters: self.guild_log_filters,
         }
     }
 
@@ -1144,6 +1231,7 @@ impl ConfigurationSnapshotRows {
                 commands,
                 templates,
                 log_channels,
+                log_filters: self.guild_log_filters,
                 badwords,
             },
         )

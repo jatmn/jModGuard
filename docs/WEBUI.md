@@ -125,7 +125,7 @@ the editor does not undo an acknowledged global write.
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
-| **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot |
+| **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot; save per-event ignored user/bot names or IDs and source channel IDs |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Bans** | ban history + unban via the bot token (API process) |
 | **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |

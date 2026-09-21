@@ -6,7 +6,7 @@ It is a library backend for a dedicated local filesystem. Bot and API now serve 
 objects through [tenant runtime](TENANT-RUNTIME.md). The bot captures proving Discord
 attachments for selected image-spam enforcement and streams them into this backend
 through that runtime after a ban case is recorded; the API does not perform that Discord
-re-fetch. There is no background capture worker. Core is at migration 0012; the current
+re-fetch. There is no background capture worker. Core is at migration 0013; the current
 guild schema is 8.
 
 ## Resource contract

@@ -45,7 +45,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0012_guild_moves.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0013_log_filters.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it
@@ -63,6 +63,7 @@ exits if that wait expires).
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
 | `log_channels` | event type → channel mapping (per server only) |
+| `log_filters` | ignored users/bots and source channels per event and server |
 | `legacy_global_log_channels` | transitional empty global-channel scaffolding; new mappings are per server |
 | `badwords` | regex patterns (server + global) |
 | `events` | selected moderation records and classified moderation-plan summaries; routine channel reports do not append here |

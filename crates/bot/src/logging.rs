@@ -13,11 +13,59 @@ use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
 const SNIPPET_CHARS: usize = 1000;
+const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
+const EDIT_REPORT_LIMIT: usize = 4096;
+type EditKey = (u64, u64, u64);
+type EditObservation = (u64, Instant);
+
+#[derive(Default)]
+pub struct EditReportDedup {
+    inner: Mutex<HashMap<EditKey, EditObservation>>,
+}
+
+impl EditReportDedup {
+    /// A Gateway update may repeat the same content/attachment observation.
+    /// Keep only a bounded fingerprint, never a second copy of message text.
+    pub fn should_report(&self, event: &MessageUpdateEvent) -> bool {
+        let Some(guild) = event.guild_id else {
+            return false;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        event.content.hash(&mut hasher);
+        event
+            .attachments
+            .as_ref()
+            .map(|items| items.iter().map(|a| a.id.get()).collect::<Vec<_>>())
+            .hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let key = (guild.get(), event.channel_id.get(), event.id.get());
+        let mut entries = self.inner.lock();
+        entries.retain(|_, (_, at)| at.elapsed() < EDIT_REPORT_KEEP);
+        if entries
+            .get(&key)
+            .is_some_and(|(seen, _)| *seen == fingerprint)
+        {
+            return false;
+        }
+        if entries.len() >= EDIT_REPORT_LIMIT
+            && !entries.contains_key(&key)
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| *key)
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert(key, (fingerprint, Instant::now()));
+        true
+    }
+}
 
 #[derive(Default)]
 pub struct SnippetCache {
@@ -135,6 +183,13 @@ pub(crate) async fn emit_to(
             let Some(channel_id) = channel_for(&cfg, event) else {
                 return Ok(Delivery::Unconfigured);
             };
+            if cfg
+                .log_filters
+                .get(event)
+                .is_some_and(|filter| excluded(filter, &vars))
+            {
+                return Ok(Delivery::Unconfigured);
+            }
             vars.insert("event".into(), event.to_owned());
             vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
             vars.insert("guild".into(), guild_id.get().to_string());
@@ -156,6 +211,23 @@ pub(crate) async fn emit_to(
             Delivery::Failed
         }
     }
+}
+
+fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
+    let user_match = ["user_id", "username", "user"]
+        .iter()
+        .filter_map(|key| vars.get(*key))
+        .any(|value| {
+            filter
+                .users
+                .iter()
+                .any(|ignored| ignored == &value.to_lowercase())
+        });
+    let source = vars.get("channel_id").map(String::as_str).or_else(|| {
+        vars.get("channel")
+            .and_then(|value| value.strip_prefix("<#")?.strip_suffix('>'))
+    });
+    user_match || source.is_some_and(|source| filter.channels.iter().any(|id| id == source))
 }
 
 fn record_delivery_failure(app: &BotState) {
@@ -209,6 +281,7 @@ pub(crate) struct MessageReport {
 fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("channel".into(), format!("<#{channel}>")),
+        ("channel_id".into(), channel.to_string()),
         ("message_id".into(), id.to_string()),
         (
             "message_url".into(),
@@ -250,7 +323,7 @@ pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<Messag
         vars.extend(templates::user_vars(
             author.id.get(),
             &author.name,
-            &author.name,
+            author.global_name.as_deref().unwrap_or(&author.name),
         ));
     }
     Some(MessageReport {

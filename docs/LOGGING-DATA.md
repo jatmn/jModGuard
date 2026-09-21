@@ -9,7 +9,13 @@ Basic Discord log delivery is independent of those retired history tables.
 - Updates use only supplied content/attachment fields, guild/channel/message references
   and supplied author identity. An absent field is unknown, not empty. Embed/pin-only
   refreshes are skipped. Reports say "updated"; they do not claim a verified before/after
-  diff or deduplicate repeated Gateway observations.
+  diff. A bounded 10-second fingerprint suppresses repeated observations of the same
+  message content and attachment IDs in one bot process; a changed observation reports again.
+- Each guild can save ignored user names, display/bot names or user IDs and ignored
+  source channel IDs separately for each event in Log Channels. Matching is based on
+  identity and source channel supplied with the event; an absent author cannot match
+  a name. The filter applies before Discord delivery and does not alter moderation
+  enforcement or retained moderation records.
 - Single deletions report channel/message ID and disclose unavailable author/content.
   Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.
 - Join/leave reports use the delivered user and optional cached member join timestamp.

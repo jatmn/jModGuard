@@ -168,7 +168,7 @@ acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve im
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core is at migration 0012. Local HTTP/SQL fixtures
+and backup-copy lifecycle remain before activation. Core is at migration 0013. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and
@@ -444,7 +444,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API)
-migrations/             0001_init through 0012_guild_moves
+migrations/             0001_init through 0013_log_filters
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```
