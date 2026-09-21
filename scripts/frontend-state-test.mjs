@@ -57,7 +57,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, tabActions, tabCases, tabTemplates, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -374,7 +374,9 @@ test('case-delete-role saves advance their revision token', async () => {
   const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
   const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
   roleInput.value = '1, 2';
+  h.app.markDirty();
   await saveRoles.listeners.click({});
+  assert.equal(h.app.isDirty(), false, 'an acknowledged role save must not remain unsaved');
   roleInput.value = '2';
   await saveRoles.listeners.click({});
 
@@ -382,6 +384,110 @@ test('case-delete-role saves advance their revision token', async () => {
   assert.equal(puts.length, 2);
   assert.equal(puts[0].body.revision, 'revision-1');
   assert.equal(puts[1].body.revision, 'revision-2');
+});
+
+test('queued log-channel saves clear dirty state and survive in-app navigation', async () => {
+  let confirmations = 0;
+  let appRef;
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT' && url.endsWith('/logchannels/member_join')) {
+      return response({
+        id: 'log-job', guild_id: appRef.state.guildId, actor_id: appRef.state.me.user.id,
+        enrollment_id: 'membership', state: 'pending',
+        action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+      });
+    }
+    return response([]);
+  }, new Map(), new Map(), () => { confirmations += 1; return false; });
+  appRef = h.app;
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    rules: [], commands: [], badwords: [],
+    settings: { prefix: '!', bot_name: '' },
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.state.tab = 'logchannels';
+  h.nodes.get('#content').append(h.app.tabLogChannels());
+  const input = h.elements.find((node) => node.tag === 'input' && node.attrs.placeholder === 'channel id');
+  const set = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Set');
+  input.value = '222';
+  h.app.markDirty();
+  await set.listeners.click({});
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'log-job');
+  assert.equal(h.app.isDirty(), false);
+  h.app.navigate('dashboard');
+  assert.equal(confirmations, 0);
+  h.app.navigate('logchannels');
+  assert.match(textOf(h.nodes.get('#content')), /queued/);
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+});
+
+test('queued log-channel receipts reconcile without a configuration refresh', async () => {
+  const pending = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url) => {
+    assert.match(url, /\/actions$/);
+    return response([{ ...pending, state: 'succeeded', outcome: 'log_channel_set' }]);
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.state.tab = 'dashboard';
+  assert.equal(h.app.applyQueuedLogChannel(pending), true);
+  await h.app.reconcileQueuedLogChannel(pending);
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  assert.equal(h.app.state.config.log_channels[0].pending_action, null);
+  assert.equal(h.nodes.get('#toast').textContent, 'Log channel saved');
+});
+
+test('failed queued clears restore the authoritative mapping', async () => {
+  const pending = {
+    id: 'clear-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: null },
+  };
+  const h = harness(async (url) => {
+    if (url.endsWith('/actions')) {
+      return response([{ ...pending, state: 'failed', outcome: 'invalid_channel' }]);
+    }
+    assert.match(url, /\/logchannels\/member_join$/);
+    return response({ effective: '111', guild_override: '111', global: null });
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  assert.equal(h.app.applyQueuedLogChannel(pending), true);
+  assert.equal(h.app.state.config.log_channels[0].effective, null);
+  await h.app.reconcileQueuedLogChannel(pending);
+  assert.equal(h.app.state.config.log_channels[0].effective, '111');
+  assert.equal(h.app.state.config.log_channels[0].pending_action, null);
+  assert.match(h.nodes.get('#toast').textContent, /failed: invalid_channel/);
+});
+
+test('an older terminal log receipt cannot roll back its queued replacement', async () => {
+  const first = {
+    id: 'first', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const second = { ...first, id: 'second', action: { ...first.action, channel_id: '333' } };
+  const h = harness(async () => response([{ ...first, state: 'cancelled', outcome: 'superseded_by_newer_request' }, second]));
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.applyQueuedLogChannel(first);
+  h.app.applyQueuedLogChannel(second);
+  await h.app.reconcileQueuedLogChannel(first);
+  assert.equal(h.app.state.config.log_channels[0].effective, '333');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'second');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.previous.effective, '111');
 });
 
 test('case-delete-role save rejects invalid IDs instead of clearing roles', async () => {

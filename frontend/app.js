@@ -23,6 +23,7 @@ let configRequest = 0;
 let busy = false;
 let dirty = false;
 let pendingDrafts = null;
+const actionReconcileDelays = [1000, 1500, 2500, 4000, 5000];
 const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "cases", "settings"];
 
 function workspaceKey() {
@@ -399,6 +400,89 @@ async function submitBotAction(path, method, body) {
       `Action ${job.state}: ${job.outcome || "Check Bot actions for details."}`,
     completed ? "success" : waiting ? "info" : "error");
   return job;
+}
+
+function logChannelRow(event) {
+  return state.config?.log_channels?.find((row) => row.event === event);
+}
+
+/** Reflect an acknowledged log-channel intent without claiming that queued bot
+ *  validation has completed. Replacements retain the last authoritative value
+ *  so a cancelled/failed newer request cannot resurrect an older queued value. */
+function applyQueuedLogChannel(job) {
+  if (!actionIsLogChannel(job) || job.guild_id !== state.guildId ||
+      job.enrollment_id !== state.config?.enrollment_id) return false;
+  const row = logChannelRow(job.action.event);
+  if (!row) return false;
+  const active = ["pending", "claimed", "running"].includes(job.state);
+  if (!active && job.state !== "succeeded") return false;
+  const previous = row.pending_action?.previous || {
+    effective: row.effective ?? null,
+    guild_override: row.guild_override ?? null,
+  };
+  const requested = job.action.channel_id ?? null;
+  row.effective = requested;
+  row.guild_override = requested;
+  row.pending_action = active ? { id: job.id, state: job.state, previous } : null;
+  // A snapshot started before this acknowledged request must not replace its
+  // queued representation after the button has already returned success.
+  ++configRequest;
+  state.loading = false;
+  state.error = null;
+  return true;
+}
+
+function scheduleLogChannelReconcile(job, attempt = 0) {
+  if (attempt >= actionReconcileDelays.length) {
+    toast("Log-channel validation is still pending. Its requested value remains marked queued; see Bot actions for details.", "info");
+    return;
+  }
+  setTimeout(() => {
+    reconcileQueuedLogChannel(job, attempt).catch((error) => {
+      if (!isUnauthenticated(error)) {
+        if (attempt + 1 < actionReconcileDelays.length) scheduleLogChannelReconcile(job, attempt + 1);
+        else toast("Could not confirm the log-channel result. See Bot actions for details.", "error");
+      }
+    });
+  }, actionReconcileDelays[attempt]);
+}
+
+/** Reconcile only the action the current page admitted. The Actions tab remains
+ *  manual; this bounded watcher exists so a save does not require a second
+ *  configuration refresh. */
+async function reconcileQueuedLogChannel(original, attempt = 0) {
+  const row = logChannelRow(original.action.event);
+  if (!row?.pending_action || row.pending_action.id !== original.id ||
+      original.guild_id !== state.guildId || original.enrollment_id !== state.config?.enrollment_id) return;
+  const jobs = await api(`/api/guilds/${original.guild_id}/actions`);
+  const job = jobs.find((candidate) => candidate.id === original.id);
+  if (!job || ["pending", "claimed", "running"].includes(job.state)) {
+    scheduleLogChannelReconcile(original, attempt + 1);
+    return;
+  }
+  // A newer request for this event owns the row now; never let an older
+  // terminal receipt overwrite or roll it back.
+  if (row.pending_action?.id !== original.id) return;
+  if (job.state === "succeeded") {
+    row.pending_action = null;
+    if (state.tab === "logchannels" && !dirty) renderTab();
+    toast("Log channel saved", "success");
+    return;
+  }
+
+  const previous = row.pending_action.previous;
+  let authoritative = null;
+  try {
+    authoritative = await api(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
+  } catch (error) {
+    if (isUnauthenticated(error)) return;
+  }
+  if (row.pending_action?.id !== original.id) return;
+  row.effective = authoritative?.effective ?? previous.effective;
+  row.guild_override = authoritative?.guild_override ?? previous.guild_override;
+  row.pending_action = null;
+  if (state.tab === "logchannels" && !dirty) renderTab();
+  toast(`Log-channel action ${job.state}: ${job.outcome || "the saved mapping was not changed"}`, "error");
 }
 
 /** CDN Storage can serve this page while the API origin is still binding or
@@ -1385,20 +1469,29 @@ function tabLogChannels() {
       if (await loadConfig()) renderTab();
     } }),
     el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes are queued for bot validation; check Bot actions for results, then refresh this page."),
+      "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes show as queued while the bot validates them, then reconcile automatically; Bot actions has the full receipt."),
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
       const scopeSel = scopeSelect("This server", "Global", false);
       return el("div", { class: "card row", style: "margin-bottom:8px" },
-        el("label", { style: "width:180px", text: lc.event }),
+        el("label", { style: "width:180px" }, lc.event,
+          lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px", text: "queued" }) : null),
         input, scopeSel,
         el("button", { class: "btn small primary", text: "Set", onclick: async () => {
           const v = parseSnowflake(input.value);
           if (!v) return toast("Enter a Discord channel ID, <#id> mention, or channel URL", "error");
-          await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
+          const job = await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
+          if (applyQueuedLogChannel(job)) {
+            renderTab();
+            if (job.state !== "succeeded") scheduleLogChannelReconcile(job);
+          }
         } }),
         el("button", { class: "btn small", text: "Clear", onclick: async () => {
-          await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
+          const job = await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
+          if (applyQueuedLogChannel(job)) {
+            renderTab();
+            if (job.state !== "succeeded") scheduleLogChannelReconcile(job);
+          }
         } }),
       );
     }),
@@ -1821,6 +1914,7 @@ function tabSettings() {
       const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles: splitIds(roleInput.value), revision: roleRevision.value });
       roleRevision.value = saved.revision;
       toast("Case-removal roles saved", "success");
+      renderTab();
     } }),
   ));
 

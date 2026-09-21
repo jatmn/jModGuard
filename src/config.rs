@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(bot.action_worker.limits.batch_size, 2);
         assert_eq!(bot.action_worker.limits.request_timeout_secs, 4);
         bot.action_worker.validate().unwrap();
-        assert_eq!(api.action_worker.poll_secs, 5);
+        assert_eq!(api.action_worker.poll_secs, 1);
         assert!(Config::parse_file("[action_worker]\npoll_secs='bad'", true).is_ok());
         assert!(Config::parse_file("[action_worker]\npoll_secs='bad'", false).is_err());
         assert!(Config::parse_file("[actions]\npending_per_guild='bad'", true).is_err());
@@ -1518,7 +1518,7 @@ pub struct ActionWorkerConfig {
 impl Default for ActionWorkerConfig {
     fn default() -> Self {
         Self {
-            poll_secs: 5,
+            poll_secs: 1,
             cleanup_interval_secs: 3600,
             limits: Default::default(),
         }

@@ -194,10 +194,13 @@ before sending. A lost response retains that key across retries/reloads in the s
 It clears it only after a valid receipt or explicit user confirmation. Old-membership,
 expired or invalid keys require explicit clearing and a separate reviewed submission;
 there is no automatic retry with a new key. Denied session storage prevents submission.
-The Actions tab uses manual refresh, with no background polling. Cancel unstarted work
+The Actions tab uses manual refresh, with no general background polling. A log-channel
+save is the exception: the edited row immediately shows its accepted queued value and a
+bounded receipt watcher removes that marker or restores the authoritative mapping when
+the action finishes, so normal saves do not require a configuration refresh. Cancel unstarted work
 from that table, including claimed requests. Force-cancel a stuck log-channel request that
-is running or unknown so a new save can run; this does not undo Discord. Refresh log configuration
-or bans after completion to see the applied result. “Outcome unknown” requires inspection;
+is running or unknown so a new save can run; this does not undo Discord. Refresh bans after
+completion to see the applied result. “Outcome unknown” requires inspection;
 submitting fresh work can repeat an effect already performed.
 
 Deploy matching bot, API and frontend builds, bot first, and reload old browser pages.
@@ -219,7 +222,7 @@ future work. All timers must be positive; protocol bounds remain validated in co
 | `actions.max_age_secs` | 300 | `JMODGUARD_ACTION_MAX_AGE_SECS` |
 | `actions.history_retention_secs` | 604800 | `JMODGUARD_ACTION_HISTORY_RETENTION_SECS` |
 | `actions.cleanup_batch_size` | 128 | `JMODGUARD_ACTION_CLEANUP_BATCH_SIZE` |
-| `action_worker.poll_secs` | 5 | `JMODGUARD_ACTION_POLL_SECS` |
+| `action_worker.poll_secs` | 1 | `JMODGUARD_ACTION_POLL_SECS` |
 | `action_worker.cleanup_interval_secs` | 3600 | `JMODGUARD_ACTION_CLEANUP_INTERVAL_SECS` |
 | `action_worker.batch_size` | 4 | `JMODGUARD_ACTION_BATCH_SIZE` |
 | `action_worker.request_timeout_secs` | 15 | `JMODGUARD_ACTION_REQUEST_TIMEOUT_SECS` |
