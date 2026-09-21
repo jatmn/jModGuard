@@ -468,6 +468,12 @@ function applyQueuedLogChannel(job) {
   if (!active && !terminal) return false;
   const key = logChannelActionKey(job);
   const existing = pendingLogChannelActions.get(key);
+  if (existing && existing.job.id !== job.id && terminal &&
+      ["pending", "claimed", "running"].includes(existing.job.state)) {
+    // A retained request key can replay an older terminal receipt after a
+    // newer request has become this row's active owner. Keep watching newer.
+    return true;
+  }
   if (existing && existing.job.id !== job.id && existing.timer !== null) clearTimeout(existing.timer);
   const previous = existing?.previous || row.pending_action?.previous || {
     effective: row.effective ?? null,
@@ -529,12 +535,16 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   let row = logChannelRow(original.action.event);
   if (!entry || entry.job.id !== original.id || !row?.pending_action || row.pending_action.id !== original.id ||
       original.guild_id !== state.guildId || original.enrollment_id !== state.config?.enrollment_id) return;
-  const jobs = await api(`/api/guilds/${original.guild_id}/actions`);
-  const job = jobs.find((candidate) => candidate.id === original.id);
-  entry = pendingLogChannelActions.get(key);
-  row = logChannelRow(original.action.event);
-  if (!entry || entry.job.id !== original.id || !row?.pending_action || row.pending_action.id !== original.id ||
-      original.guild_id !== state.guildId || original.enrollment_id !== state.config?.enrollment_id) return;
+  const originalTerminal = ["succeeded", "failed", "uncertain", "cancelled", "expired"].includes(original.state);
+  let job = original;
+  if (!originalTerminal) {
+    const jobs = await api(`/api/guilds/${original.guild_id}/actions`);
+    job = jobs.find((candidate) => candidate.id === original.id);
+    entry = pendingLogChannelActions.get(key);
+    row = logChannelRow(original.action.event);
+    if (!entry || entry.job.id !== original.id || !row?.pending_action || row.pending_action.id !== original.id ||
+        original.guild_id !== state.guildId || original.enrollment_id !== state.config?.enrollment_id) return;
+  }
   if (!job || ["pending", "claimed", "running"].includes(job.state)) {
     if (job) {
       entry.job = job;
@@ -546,6 +556,8 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   // A newer request for this event owns the row now; never let an older
   // terminal receipt overwrite or roll it back.
   if (row.pending_action?.id !== original.id) return;
+  entry.job = job;
+  row.pending_action.state = job.state;
   if (job.state === "succeeded") {
     clearPendingLogChannelEntry(key);
     row.pending_action = null;
@@ -559,7 +571,8 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
     authoritative = await api(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
   } catch (error) {
     if (isUnauthenticated(error)) return;
-    scheduleLogChannelReconcile(original, attempt + 1);
+    renderLogChannelsPreservingDrafts();
+    scheduleLogChannelReconcile(job, attempt + 1);
     return;
   }
   entry = pendingLogChannelActions.get(key);
@@ -1573,7 +1586,8 @@ function tabLogChannels() {
       const scopeSel = scopeSelect("This server", "Global", false);
       return el("div", { class: "card row", style: "margin-bottom:8px" },
         el("label", { style: "width:180px" }, lc.event,
-          lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px", text: "queued" }) : null),
+          lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px",
+            text: ["pending", "claimed", "running"].includes(lc.pending_action.state) ? "queued" : lc.pending_action.state }) : null),
         input, scopeSel,
         el("button", { class: "btn small primary", text: "Set", onclick: async () => {
           const v = parseSnowflake(input.value);

@@ -561,6 +561,7 @@ test('failed authoritative log read stays unresolved for retry', async () => {
   await h.app.reconcileQueuedLogChannel(pending);
   assert.equal(h.app.state.config.log_channels[0].effective, '222');
   assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'log-job');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
 });
 
 test('terminal request-key replay clears dirty state and restores authoritative mapping', async () => {
@@ -572,7 +573,7 @@ test('terminal request-key replay clears dirty state and restores authoritative 
   };
   const h = harness(async (url, options) => {
     if (options.method === 'PUT') return response(terminal);
-    if (url.endsWith('/actions')) return response([terminal]);
+    if (url.endsWith('/actions')) throw new Error('terminal acknowledgment must not be rediscovered');
     return response({ effective: '111', guild_override: '111', global: null });
   });
   appRef = h.app;
@@ -658,10 +659,40 @@ test('an older terminal log receipt cannot roll back its queued replacement', as
   };
   h.app.applyQueuedLogChannel(first);
   h.app.applyQueuedLogChannel(second);
+  assert.equal(h.app.applyQueuedLogChannel({ ...first, state: 'cancelled', outcome: 'superseded_by_newer_request' }), true);
+  assert.equal(h.app.state.config.log_channels[0].effective, '333');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'second');
   await h.app.reconcileQueuedLogChannel(first);
   assert.equal(h.app.state.config.log_channels[0].effective, '333');
   assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'second');
   assert.equal(h.app.state.config.log_channels[0].pending_action.previous.effective, '111');
+});
+
+test('known terminal log results are not labeled queued while mapping reconciliation retries', async () => {
+  const terminal = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'failed', outcome: 'invalid_channel',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url) => {
+    assert.doesNotMatch(url, /\/actions$/);
+    throw new Error('temporary mapping read failure');
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+    settings: { prefix: '!', bot_name: '' },
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.state.tab = 'logchannels';
+  h.app.applyQueuedLogChannel(terminal);
+  h.app.renderTab();
+  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  assert.equal(status.textContent, 'failed');
+
+  await h.app.reconcileQueuedLogChannel(terminal);
+  assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
+  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  assert.equal(status.textContent, 'failed');
 });
 
 test('case-delete-role save rejects invalid IDs instead of clearing roles', async () => {
