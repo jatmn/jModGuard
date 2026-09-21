@@ -238,7 +238,11 @@ bot owner).
   load with `POST /api/guilds/{id}/config` for the same reason. Log-channel
   receipt checks and the Bot actions table use `POST /api/guilds/{id}/actions`.
   A failed log-channel receipt reads
-  `POST /api/guilds/{id}/logchannels/{event}`. Expose
+  `POST /api/guilds/{id}/logchannels/{event}`. Rules, badwords, commands,
+  templates, and the Settings tab already render from that POST config
+  document. Dashboard counts, the audit log, bans, case lists, a case,
+  and its evidence list also use POST. Case history stays GET because
+  POST on that path adds a note. Evidence file download stays GET. Expose
   publicly only behind HTTPS (see SETUP.md §8). On Bunny, API-path edge
   rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
   see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).

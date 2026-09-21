@@ -324,7 +324,10 @@ cargo run -p jmodguard-api                         # waits ~30s locally / ~6m re
   so a cached GET settings document cannot populate a writable UI. It reads
   bot-action receipts with `POST /api/guilds/{id}/actions` and one log-channel
   mapping with `POST /api/guilds/{id}/logchannels/{event}` so a cached GET
-  cannot leave a finished log-channel save marked queued. Discord
+  cannot leave a finished log-channel save marked queued. Dashboard
+  counts, the audit log, bans, case lists, a case, and its evidence list
+  use the same POST read. Case history stays GET because POST on that
+  path adds a note. Discord
   snowflake fields on the WebUI (log channels, rule/command allowlists,
   case-removal roles, plan role steps) stay decimal strings — never JS
   `Number`. Bunny API-path edge rules must also **Override Cache Time = 0**
