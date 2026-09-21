@@ -465,8 +465,9 @@ test('queued log-channel receipts reconcile without a configuration refresh', as
     enrollment_id: 'membership', state: 'pending',
     action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
   };
-  const h = harness(async (url) => {
+  const h = harness(async (url, options) => {
     assert.match(url, /\/actions$/);
+    assert.equal(options.method, 'POST', 'receipt reads must not use a cacheable GET');
     return response([{ ...pending, state: 'succeeded', outcome: 'log_channel_set' }]);
   });
   h.app.state.config = {
@@ -601,7 +602,8 @@ test('failed queued clears restore the authoritative mapping', async () => {
     enrollment_id: 'membership', state: 'pending',
     action: { kind: 'set_log_channel', event: 'member_join', channel_id: null },
   };
-  const h = harness(async (url) => {
+  const h = harness(async (url, options) => {
+    assert.equal(options.method, 'POST', 'receipt reads must not use a cacheable GET');
     if (url.endsWith('/actions')) {
       return response([{ ...pending, state: 'failed', outcome: 'invalid_channel' }]);
     }
@@ -1113,18 +1115,19 @@ test('invalid action acknowledgments retain request identity; unavailable storag
 
 test('actions refresh only on demand and cancellation includes membership', async () => {
   const calls=[];
-  const h=harness(async(url,opts)=>{calls.push({url,opts});return response(opts.method==='GET'?[queuedAction()]:{ok:true});});
+  const h=harness(async(url,opts)=>{calls.push({url,opts});return response(opts.method==='DELETE'?{ok:true}:[queuedAction()]);});
   h.app.state.config={enrollment_id:'membership'};
   h.app.tabActions();
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(calls.length,1);
+  assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
   assert.match(textOf(h.elements.find(n=>n.tag==='p')),/Force-cancel a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.tag==='button'&&n.textContent==='Cancel');
   await cancel.listeners.click({});
   assert.equal(calls[1].opts.method,'DELETE');
   assert.equal(calls[1].opts.headers['x-jmodguard-enrollment'],'membership');
-  assert.equal(calls[2].opts.method,'GET');
+  assert.equal(calls[2].opts.method,'POST');
   const refresh=h.elements.find(n=>n.tag==='button'&&n.textContent==='Refresh');
   await refresh.listeners.click({});
   assert.equal(calls.length,4);
@@ -1141,7 +1144,7 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   let confirms = 0;
   const calls = [];
   const h = harness(
-    async (url, opts) => { calls.push({ url, opts }); return response(opts.method === 'GET' ? jobs : { ok: true }); },
+    async (url, opts) => { calls.push({ url, opts }); return response(opts.method === 'DELETE' ? { ok: true } : jobs); },
     new Map(),
     new Map(),
     () => { confirms += 1; return true; },

@@ -538,7 +538,7 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   const originalTerminal = ["succeeded", "failed", "uncertain", "cancelled", "expired"].includes(original.state);
   let job = original;
   if (!originalTerminal) {
-    const jobs = await api(`/api/guilds/${original.guild_id}/actions`);
+    const jobs = await apiRead(`/api/guilds/${original.guild_id}/actions`);
     job = jobs.find((candidate) => candidate.id === original.id);
     entry = pendingLogChannelActions.get(key);
     row = logChannelRow(original.action.event);
@@ -568,7 +568,7 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
 
   let authoritative;
   try {
-    authoritative = await api(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
+    authoritative = await apiRead(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
   } catch (error) {
     if (isUnauthenticated(error)) return;
     renderLogChannelsPreservingDrafts();
@@ -1729,7 +1729,7 @@ function tabActions() {
     const current = ++request;
     body.replaceChildren(el("tr", {}, el("td", { colspan: 6, text: "Loading…" })));
     try {
-      const jobs = await api(`/api/guilds/${guildId}/actions`);
+      const jobs = await apiRead(`/api/guilds/${guildId}/actions`);
       if (current !== request) return;
       body.replaceChildren();
       if (!jobs.length) body.append(el("tr", {}, el("td", { colspan: 6, text: "No bot actions yet." })));

@@ -884,6 +884,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route(
             "/api/guilds/{guild_id}/logchannels/{event}",
             get(api::get_logchannel)
+                .post(api::get_logchannel)
                 .put(api::put_logchannel)
                 .delete(api::delete_logchannel),
         )
@@ -901,7 +902,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             "/api/guilds/{guild_id}/unban",
             axum::routing::post(api::unban),
         )
-        .route("/api/guilds/{guild_id}/actions", get(api::actions))
+        .route("/api/guilds/{guild_id}/actions", get_post(api::actions))
         .route(
             "/api/guilds/{guild_id}/actions/{id}",
             axum::routing::delete(api::cancel_action),

@@ -321,7 +321,10 @@ cargo run -p jmodguard-api                         # waits ~30s locally / ~6m re
   and `Vary: Cookie`. The SPA bootstraps with `POST /api/me` so a CDN that
   cached `GET /api/me` cannot keep a signed-in workspace without a live
   session. It loads guild configuration with `POST /api/guilds/{id}/config`
-  so a cached GET settings document cannot populate a writable UI. Discord
+  so a cached GET settings document cannot populate a writable UI. It reads
+  bot-action receipts with `POST /api/guilds/{id}/actions` and one log-channel
+  mapping with `POST /api/guilds/{id}/logchannels/{event}` so a cached GET
+  cannot leave a finished log-channel save marked queued. Discord
   snowflake fields on the WebUI (log channels, rule/command allowlists,
   case-removal roles, plan role steps) stay decimal strings — never JS
   `Number`. Bunny API-path edge rules must also **Override Cache Time = 0**

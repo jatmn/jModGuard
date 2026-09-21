@@ -235,7 +235,10 @@ bot owner).
   `CDN-Cache-Control: no-store`, and `Vary: Cookie`. The page loads the
   signed-in workspace with `POST /api/me` so a CDN cannot reuse a cached
   `GET /api/me` identity after the in-memory session is gone. Guild settings
-  load with `POST /api/guilds/{id}/config` for the same reason. Expose
+  load with `POST /api/guilds/{id}/config` for the same reason. Log-channel
+  receipt checks and the Bot actions table use `POST /api/guilds/{id}/actions`.
+  A failed log-channel receipt reads
+  `POST /api/guilds/{id}/logchannels/{event}`. Expose
   publicly only behind HTTPS (see SETUP.md §8). On Bunny, API-path edge
   rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
   see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
