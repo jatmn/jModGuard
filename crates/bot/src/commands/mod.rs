@@ -220,6 +220,7 @@ struct LogActor {
     id: UserId,
     username: String,
     display: String,
+    global: Option<String>,
 }
 
 impl LogActor {
@@ -228,6 +229,7 @@ impl LogActor {
             id,
             username: member.user.name.clone(),
             display: member.display_name().to_string(),
+            global: member.user.global_name.clone(),
         }
     }
 }
@@ -833,6 +835,9 @@ async fn log_outcome(
     vars.insert("actor_id".into(), actor_id.to_string());
     vars.insert("actor_name".into(), actor.username.clone());
     vars.insert("actor_display".into(), actor.display.clone());
+    if let Some(global_name) = &actor.global {
+        vars.insert("actor_global_name".into(), global_name.clone());
+    }
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
     logging::emit(app, ctx, guild_id, &cmd.log_event, vars).await;
 }

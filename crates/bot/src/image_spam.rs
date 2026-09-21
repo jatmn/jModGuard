@@ -1454,6 +1454,9 @@ fn report_vars(
     if let Some(name) = &author_names.display {
         vars.insert("user".into(), name.clone());
     }
+    if let Some(name) = &author_names.global {
+        vars.insert("user_global_name".into(), name.clone());
+    }
     vars
 }
 
@@ -2114,6 +2117,7 @@ mod tests {
             &crate::spam_actions::ReportNames {
                 username: Some("OtherBot".into()),
                 display: Some("Other Bot".into()),
+                global: None,
             },
         );
         assert!(vars["action"].contains("no punishment"));

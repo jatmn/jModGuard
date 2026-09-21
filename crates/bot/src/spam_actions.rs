@@ -97,6 +97,7 @@ pub struct Match {
 pub struct ReportNames {
     pub username: Option<String>,
     pub display: Option<String>,
+    pub global: Option<String>,
 }
 
 impl ReportNames {
@@ -110,6 +111,7 @@ impl ReportNames {
                 .and_then(|member| member.nick.clone())
                 .or_else(|| user.global_name.clone())
                 .or_else(|| Some(user.name.clone())),
+            global: user.global_name.clone(),
         }
     }
 }
@@ -120,6 +122,9 @@ fn add_author_names(vars: &mut BTreeMap<String, String>, found: &Match) {
     }
     if let Some(name) = &found.author_names.display {
         vars.insert("user".into(), name.clone());
+    }
+    if let Some(name) = &found.author_names.global {
+        vars.insert("user_global_name".into(), name.clone());
     }
 }
 
@@ -689,6 +694,7 @@ mod tests {
             author_names: ReportNames {
                 username: Some("OtherBot".into()),
                 display: Some("Other Bot".into()),
+                global: None,
             },
             channel: 3,
             policy: MatchPolicy::Text(jmodguard::text_spam::Policy {

@@ -24,6 +24,7 @@ const EDIT_REPORT_LIMIT: usize = 4096;
 type EditKey = (u64, u64, u64);
 struct EditObservation {
     edited_at_ms: Option<i64>,
+    reported_timestamps: Vec<i64>,
     content: Option<u64>,
     attachments: Option<u64>,
     at: Instant,
@@ -56,12 +57,20 @@ impl EditReportDedup {
         entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
         if let Some(seen) = entries.get_mut(&key) {
             if let (Some(previous), Some(current)) = (seen.edited_at_ms, edited_at_ms) {
+                if previous != current && seen.reported_timestamps.contains(&current) {
+                    seen.at = Instant::now();
+                    return false;
+                }
                 let distinct_edit = previous != current;
                 // Discord's supplied edit timestamp groups partial updates.
                 // A new timestamp starts a new observation even when its first
                 // payload field was absent from the preceding edit.
                 seen.edited_at_ms = edited_at_ms;
                 if distinct_edit {
+                    if seen.reported_timestamps.len() >= 64 {
+                        seen.reported_timestamps.remove(0);
+                    }
+                    seen.reported_timestamps.push(current);
                     seen.content = content;
                     seen.attachments = attachments;
                 } else {
@@ -88,6 +97,11 @@ impl EditReportDedup {
             }
             if edited_at_ms.is_some() {
                 seen.edited_at_ms = edited_at_ms;
+                if let Some(current) = edited_at_ms
+                    && !seen.reported_timestamps.contains(&current)
+                {
+                    seen.reported_timestamps.push(current);
+                }
             }
             seen.at = Instant::now();
             return changed;
@@ -105,6 +119,7 @@ impl EditReportDedup {
             key,
             EditObservation {
                 edited_at_ms,
+                reported_timestamps: edited_at_ms.into_iter().collect(),
                 content,
                 attachments,
                 at: Instant::now(),
@@ -279,19 +294,19 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
         .filter_map(|key| vars.get(*key))
         .filter(|value| value.parse::<u64>().is_ok_and(|id| id != 0))
         .chain(
-            ["username", "user"]
+            ["username", "user", "user_global_name"]
                 .iter()
                 .filter_map(|key| vars.get(*key))
                 .filter(|_| known_user),
         )
         .chain(
-            ["actor_name", "actor_display"]
+            ["actor_name", "actor_display", "actor_global_name"]
                 .iter()
                 .filter_map(|key| vars.get(*key))
                 .filter(|_| known_actor),
         )
         .chain(
-            ["target", "target_name"]
+            ["target", "target_name", "target_global_name"]
                 .iter()
                 .filter_map(|key| vars.get(*key))
                 .filter(|_| known_target),
@@ -406,8 +421,17 @@ pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<Messag
         vars.extend(templates::user_vars(
             author.id.get(),
             &author.name,
-            author.global_name.as_deref().unwrap_or(&author.name),
+            event
+                .member
+                .as_ref()
+                .and_then(|member| member.as_deref())
+                .and_then(|member| member.nick.as_deref())
+                .or(author.global_name.as_deref())
+                .unwrap_or(&author.name),
         ));
+        if let Some(global_name) = &author.global_name {
+            vars.insert("user_global_name".into(), global_name.clone());
+        }
     }
     Some(MessageReport {
         guild_id,
@@ -458,17 +482,25 @@ pub async fn emit_mod_action(
     target_id: u64,
     target_name: &str,
     target_display: &str,
+    target_global_name: Option<&str>,
     actor_id: u64,
     actor_name: &str,
     actor_username: &str,
+    actor_global_name: Option<&str>,
     source_channel_id: u64,
     reason: &str,
 ) {
     let mut vars = templates::user_vars(target_id, target_name, target_display);
+    if let Some(global_name) = target_global_name {
+        vars.insert("user_global_name".into(), global_name.to_string());
+    }
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());
     vars.insert("actor_name".into(), actor_username.to_string());
     vars.insert("actor_display".into(), actor_name.to_string());
+    if let Some(global_name) = actor_global_name {
+        vars.insert("actor_global_name".into(), global_name.to_string());
+    }
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
     vars.insert("action".into(), action.to_string());
     vars.insert("reason".into(), reason.to_string());
@@ -492,6 +524,7 @@ pub async fn emit_member_event(
     guild_id: GuildId,
     event: &str,
     user: &serenity::model::user::User,
+    guild_nick: Option<&str>,
     extra: BTreeMap<String, String>,
 ) {
     let account_created = user.created_at();
@@ -501,8 +534,13 @@ pub async fn emit_member_event(
     let mut vars = templates::user_vars(
         user.id.get(),
         &user.name,
-        user.global_name.as_deref().unwrap_or(&user.name),
+        guild_nick
+            .or(user.global_name.as_deref())
+            .unwrap_or(&user.name),
     );
+    if let Some(global_name) = &user.global_name {
+        vars.insert("user_global_name".into(), global_name.clone());
+    }
     vars.insert("account_created".into(), account_created.to_string());
     vars.insert("account_age".into(), format!("{account_age_days} days"));
     vars.extend(extra);

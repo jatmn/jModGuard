@@ -323,6 +323,9 @@ pub async fn execute_pending(
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
+    if let Some(global_name) = &target.global_name {
+        vars.insert("user_global_name".into(), global_name.clone());
+    }
     if let Some(channel) = msg_channel {
         vars.insert("source_channel_id".into(), channel.to_string());
     }

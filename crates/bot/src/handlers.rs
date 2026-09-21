@@ -200,6 +200,7 @@ impl EventHandler for Handler {
             guild_id,
             "member_join",
             &new_member.user,
+            new_member.nick.as_deref(),
             BTreeMap::new(),
         )
         .await;
@@ -220,14 +221,27 @@ impl EventHandler for Handler {
             .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
         let mut extra = BTreeMap::new();
+        let guild_nick = member_data
+            .as_ref()
+            .and_then(|member| member.nick.as_deref());
         extra.insert(
             "duration".into(),
             member_data
+                .as_ref()
                 .and_then(|m| m.joined_at)
                 .map(|joined| format!("joined at {joined}"))
                 .unwrap_or_else(|| "unavailable".into()),
         );
-        logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra).await;
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_leave",
+            &user,
+            guild_nick,
+            extra,
+        )
+        .await;
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
@@ -261,7 +275,16 @@ impl EventHandler for Handler {
         }
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "banned".into());
-        logging::emit_member_event(&app, &ctx, guild_id, "member_ban", &banned_user, extra).await;
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_ban",
+            &banned_user,
+            None,
+            extra,
+        )
+        .await;
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
@@ -290,8 +313,16 @@ impl EventHandler for Handler {
         }
         let mut extra = BTreeMap::new();
         extra.insert("reason".into(), "unbanned".into());
-        logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)
-            .await;
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_unban",
+            &unbanned_user,
+            None,
+            extra,
+        )
+        .await;
     }
 
     async fn guild_audit_log_entry_create(
@@ -575,6 +606,9 @@ impl EventHandler for Handler {
             let enrollment = crate::cases::capture(&app, guild_id.get()).await;
             let mut vars =
                 templates::user_vars(new.user.id.get(), &new.user.name, new.display_name());
+            if let Some(global_name) = &new.user.global_name {
+                vars.insert("user_global_name".into(), global_name.clone());
+            }
             if new_to.is_some() {
                 vars.insert("duration".into(), "timed out".into());
                 vars.insert("reason".into(), "moderation action".into());
