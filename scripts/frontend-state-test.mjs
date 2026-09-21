@@ -35,11 +35,42 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       append(...children) { children.forEach((child) => { child.parent = this; this.children.push(child); }); },
       set innerHTML(_) { this.children.forEach((child) => { child.parent = null; }); this.children = []; },
       remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; },
+      replaceWith(replacement) {
+        if (!this.parent) return;
+        const index = this.parent.children.indexOf(this);
+        if (index >= 0) this.parent.children.splice(index, 1, replacement);
+        replacement.parent = this.parent;
+        this.parent = null;
+      },
+      contains(target) { for (let p = target; p; p = p.parent) if (p === this) return true; return false; },
+      closest(selector) {
+        const wanted = selector.split(',').map((part) => part.trim().replace(/^\./, ''));
+        for (let p = this; p; p = p.parent) {
+          const classes = String(p.className || '').split(/\s+/);
+          if (wanted.some((name) => classes.includes(name))) return p;
+        }
+        return null;
+      },
       setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
       removeAttribute(k) { delete this.attrs[k]; },
       addEventListener(k, v) { this.listeners[k] = v; },
-      querySelectorAll() { return []; },
-      querySelector() { return null; },
+      querySelectorAll(selector) {
+        const descendants = [];
+        const visit = (parent) => (parent.children || []).forEach((child) => {
+          if (child?.nodeType === 1) { descendants.push(child); visit(child); }
+        });
+        visit(this);
+        if (selector === 'input, select, textarea') return descendants.filter((n) => ['input', 'select', 'textarea'].includes(n.tag));
+        if (selector === '.field') return descendants.filter((n) => String(n.className || '').split(/\s+/).includes('field'));
+        return [];
+      },
+      querySelector(selector) {
+        const keyed = selector.match(/^\[data-input-key="([^"]+)"\]$/);
+        if (keyed) return this.querySelectorAll('input, select, textarea').find((n) => n.dataset.inputKey === keyed[1]) || null;
+        if (selector === 'label') return findNode(this, (n) => n !== this && n.tag === 'label');
+        if (selector === 'input, select, textarea') return findNode(this, (n) => n !== this && ['input', 'select', 'textarea'].includes(n.tag));
+        return null;
+      },
     };
   };
   const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link'].map((key) => [key, node('div')]));
@@ -57,7 +88,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -368,17 +399,22 @@ test('case-delete-role saves advance their revision token', async () => {
   });
   h.app.state.config = cfg;
   h.app.state.tab = 'settings';
-  h.app.tabSettings();
+  h.app.renderTab();
   await new Promise(resolve => setImmediate(resolve));
 
   const roleInput = h.elements.find(n => n.tag === 'input' && /role id/i.test(n.attrs.placeholder || ''));
   const saveRoles = h.elements.find(n => n.tag === 'button' && n.textContent === 'Save case-removal roles');
+  assert.equal(h.app.currentDrafts().length, 0, 'server-loaded roles must become the saved baseline');
   roleInput.value = '1, 2';
   h.app.markDirty();
   await saveRoles.listeners.click({});
   assert.equal(h.app.isDirty(), false, 'an acknowledged role save must not remain unsaved');
+  const prefix = h.elements.find(n => n.tag === 'input' && n.value === '!');
+  prefix.value = '?';
+  h.app.markDirty();
   roleInput.value = '2';
   await saveRoles.listeners.click({});
+  assert.equal(h.app.isDirty(), true, 'an unrelated settings draft must remain dirty');
 
   const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
   assert.equal(puts.length, 2);
@@ -443,6 +479,119 @@ test('queued log-channel receipts reconcile without a configuration refresh', as
   assert.equal(h.app.state.config.log_channels[0].effective, '222');
   assert.equal(h.app.state.config.log_channels[0].pending_action, null);
   assert.equal(h.nodes.get('#toast').textContent, 'Log channel saved');
+});
+
+test('targeted log-channel watcher spans the default action lifetime and dispatch timeout', () => {
+  const { app } = harness();
+  assert.ok(app.actionReconcileDelays.reduce((sum, delay) => sum + delay, 0) >= 420_000);
+  assert.ok(app.actionReconcileDelays[0] <= 1_000);
+});
+
+test('configuration reload preserves an admitted log-channel intent', async () => {
+  const pending = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url) => {
+    assert.match(url, /\/config$/);
+    return response({
+      enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+      settings: { prefix: '!', bot_name: '' },
+      log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+    });
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.applyQueuedLogChannel(pending);
+  assert.equal(await h.app.loadConfig(), true);
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'log-job');
+});
+
+test('terminal log receipt repaints while retaining an unrelated row draft', async () => {
+  const pending = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async () => response([{ ...pending, state: 'succeeded', outcome: 'log_channel_set' }]));
+  h.app.state.config = {
+    enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+    settings: { prefix: '!', bot_name: '' },
+    log_channels: [
+      { event: 'member_join', effective: '111', guild_override: '111', global: null },
+      { event: 'member_leave', effective: '444', guild_override: '444', global: null },
+    ],
+  };
+  h.app.state.tab = 'logchannels';
+  h.app.applyQueuedLogChannel(pending);
+  h.app.renderTab();
+  const inputs = h.nodes.get('#content').querySelectorAll('input, select, textarea')
+    .filter((node) => node.attrs.placeholder === 'channel id');
+  inputs[1].value = '555';
+  h.app.markDirty();
+
+  await h.app.reconcileQueuedLogChannel(pending);
+
+  const renderedInputs = h.nodes.get('#content').querySelectorAll('input, select, textarea')
+    .filter((node) => node.attrs.placeholder === 'channel id');
+  assert.equal(renderedInputs[1].value, '555');
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.textContent === 'queued'), null);
+});
+
+test('failed authoritative log read stays unresolved for retry', async () => {
+  const pending = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'pending',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url) => {
+    if (url.endsWith('/actions')) return response([{ ...pending, state: 'failed', outcome: 'invalid_channel' }]);
+    throw new Error('temporary mapping read failure');
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership',
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  h.app.applyQueuedLogChannel(pending);
+  await h.app.reconcileQueuedLogChannel(pending);
+  assert.equal(h.app.state.config.log_channels[0].effective, '222');
+  assert.equal(h.app.state.config.log_channels[0].pending_action.id, 'log-job');
+});
+
+test('terminal request-key replay clears dirty state and restores authoritative mapping', async () => {
+  let appRef;
+  const terminal = {
+    id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
+    enrollment_id: 'membership', state: 'failed', outcome: 'invalid_channel',
+    action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
+  };
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') return response(terminal);
+    if (url.endsWith('/actions')) return response([terminal]);
+    return response({ effective: '111', guild_override: '111', global: null });
+  });
+  appRef = h.app;
+  appRef.state.config = {
+    enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+    settings: { prefix: '!', bot_name: '' },
+    log_channels: [{ event: 'member_join', effective: '111', guild_override: '111', global: null }],
+  };
+  appRef.state.tab = 'logchannels';
+  appRef.renderTab();
+  const input = h.nodes.get('#content').querySelectorAll('input, select, textarea')
+    .find((node) => node.attrs.placeholder === 'channel id');
+  input.value = '222';
+  appRef.markDirty();
+  const set = findNode(h.nodes.get('#content'), (node) => node.tag === 'button' && node.textContent === 'Set');
+  await set.listeners.click({});
+  assert.equal(appRef.isDirty(), false);
+  assert.equal(appRef.state.config.log_channels[0].effective, '111');
+  assert.equal(appRef.state.config.log_channels[0].pending_action, null);
 });
 
 test('failed queued clears restore the authoritative mapping', async () => {
@@ -1092,6 +1241,29 @@ test('note retry retains intent after a lost response and blocks overlapping sub
   note.value = 'different note';
   await submit.listeners.click();
   assert.notEqual(posts[2].entry_id,posts[0].entry_id);
+});
+
+test('acknowledged case note no longer leaves a false unsaved warning', async () => {
+  const id = 'b'.repeat(32);
+  const h = harness(async (url, options) => {
+    if (options?.method === 'POST') return response({ ok: true });
+    if (url.includes('/history')) return response({ history: [] });
+    if (url.includes('/evidence')) return response({ evidence: [] });
+    if (url.includes('/cases?')) return response({ cases: [id] });
+    return response({ case: { action: 'warning', evidence: {} }, can_delete: true });
+  });
+  h.app.state.tab = 'cases';
+  const root = h.app.tabCases();
+  h.nodes.get('#content').append(root);
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(root, n => n.tag === 'button' && n.textContent === id.slice(0, 8)).listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  const note = findNode(root, n => n.tag === 'textarea');
+  note.value = 'saved note';
+  h.app.markDirty();
+  const submit = findNode(root, n => n.tag === 'button' && n.textContent === 'Add note');
+  await submit.listeners.click({});
+  assert.equal(h.app.isDirty(), false);
 });
 
 test('preview token is sent on API requests from this tab', async () => {

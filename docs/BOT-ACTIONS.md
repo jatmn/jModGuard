@@ -55,7 +55,7 @@ The nickname outbox remains a separate active path; see
 `bot_actions::Limits`, configured through `[actions]` in both services, supplies defaults: 32 active requests per guild,
 300-second maximum age, seven-day resolved-history retention and 128-row cleanup batch.
 The bot runs one sequential task with poll and cleanup timers, skipping missed ticks.
-Polling defaults to five seconds and cleanup to one hour. No new client or dependency is
+Polling defaults to one second and cleanup to one hour. No new client or dependency is
 added; the worker waits for a real Gateway bot identity before draining. Protocol forward clock tolerance is five minutes. Poll-time expiry processing
 is capped at 64 rows per state group and recent history reads at 50 rows.
 
