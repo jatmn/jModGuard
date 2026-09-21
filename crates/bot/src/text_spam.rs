@@ -612,6 +612,7 @@ pub fn observe(
         cfg,
         guild.get(),
         msg.author.id.get(),
+        spam_actions::ReportNames::from_user(&msg.author, msg.member.as_deref()),
         msg.channel_id.get(),
         msg.id.get(),
         Some(&roles),
@@ -658,6 +659,16 @@ pub(crate) fn observe_update(
         cfg,
         guild.get(),
         author,
+        event
+            .author
+            .as_ref()
+            .map(|user| {
+                spam_actions::ReportNames::from_user(
+                    user,
+                    event.member.as_ref().and_then(|member| member.as_deref()),
+                )
+            })
+            .unwrap_or_default(),
         event.channel_id.get(),
         event.id.get(),
         roles.as_deref(),
@@ -677,6 +688,7 @@ fn consider(
     cfg: &CachedGuildConfig,
     guild: u64,
     author: u64,
+    author_names: spam_actions::ReportNames,
     channel: u64,
     message: u64,
     roles: Option<&[u64]>,
@@ -789,6 +801,7 @@ fn consider(
                     kind: Kind::Text,
                     guild,
                     author,
+                    author_names,
                     channel,
                     policy: MatchPolicy::Text(policy.clone()),
                     token,

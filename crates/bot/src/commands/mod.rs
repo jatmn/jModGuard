@@ -216,6 +216,22 @@ pub struct BehaviorOutcome {
     pub suppress_response: bool,
 }
 
+struct LogActor {
+    id: UserId,
+    username: String,
+    display: String,
+}
+
+impl LogActor {
+    fn new(id: UserId, member: &serenity::model::guild::Member) -> Self {
+        Self {
+            id,
+            username: member.user.name.clone(),
+            display: member.display_name().to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // prefix dispatch
 // ---------------------------------------------------------------------------
@@ -300,6 +316,7 @@ pub async fn handle_prefix(
         return Ok(true);
     }
 
+    let log_actor = LogActor::new(msg.author.id, &member);
     let env = CmdEnv {
         app,
         ctx,
@@ -329,16 +346,7 @@ pub async fn handle_prefix(
             return Ok(true);
         }
     };
-    send_outcome(
-        app,
-        ctx,
-        &cmd,
-        guild_id,
-        msg.channel_id,
-        msg.author.id,
-        outcome,
-    )
-    .await;
+    send_outcome(app, ctx, &cmd, guild_id, msg.channel_id, log_actor, outcome).await;
     Ok(true)
 }
 
@@ -590,6 +598,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         return;
     }
 
+    let log_actor = LogActor::new(actor_id, &member);
     let args = Args::from_parts(options_to_args(&cmd, &slash.options));
     let env = CmdEnv {
         app,
@@ -638,7 +647,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
                 &cmd,
                 guild_id,
                 slash.channel_id,
-                actor_id,
+                &log_actor,
                 outcome,
             )
             .await;
@@ -786,7 +795,7 @@ async fn send_outcome(
     cmd: &CommandDef,
     guild_id: GuildId,
     channel_id: serenity::model::id::ChannelId,
-    actor_id: serenity::model::id::UserId,
+    actor: LogActor,
     outcome: BehaviorOutcome,
 ) {
     if let Some(text) = prefix_response_text(cmd, &outcome)
@@ -797,7 +806,7 @@ async fn send_outcome(
             cmd.name
         );
     }
-    log_outcome(app, ctx, cmd, guild_id, channel_id, actor_id, outcome).await;
+    log_outcome(app, ctx, cmd, guild_id, channel_id, &actor, outcome).await;
 }
 
 async fn log_outcome(
@@ -806,7 +815,7 @@ async fn log_outcome(
     cmd: &CommandDef,
     guild_id: GuildId,
     source_channel_id: ChannelId,
-    actor_id: serenity::model::id::UserId,
+    actor: &LogActor,
     outcome: BehaviorOutcome,
 ) {
     if cmd.log_event.is_empty() {
@@ -814,6 +823,7 @@ async fn log_outcome(
     }
     let mut vars = outcome.vars.clone();
     vars.insert("command".into(), cmd.name.clone());
+    let actor_id = actor.id;
     let actor_name = ctx
         .cache
         .user(actor_id)
@@ -821,6 +831,8 @@ async fn log_outcome(
         .unwrap_or_else(|| actor_id.to_string());
     vars.insert("actor".into(), format!("{actor_name} (<@{actor_id}>)"));
     vars.insert("actor_id".into(), actor_id.to_string());
+    vars.insert("actor_name".into(), actor.username.clone());
+    vars.insert("actor_display".into(), actor.display.clone());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
     logging::emit(app, ctx, guild_id, &cmd.log_event, vars).await;
 }

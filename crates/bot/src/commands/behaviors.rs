@@ -256,11 +256,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             discord?;
             if minutes == 0 {
                 let mut v = vars.clone();
+                v.insert("target_id".into(), target.to_string());
+                v.insert("target".into(), target_user.name.clone());
                 v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
                 let mut v = vars.clone();
+                v.insert("target_id".into(), target.to_string());
+                v.insert("target".into(), target_user.name.clone());
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
@@ -275,6 +279,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("minutes".into(), minutes.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
@@ -727,6 +732,14 @@ async fn user_lookup(env: &CmdEnv<'_>, id: serenity::model::id::UserId) -> Resul
         .cache
         .user(id)
         .map(|u| u.name.clone())
+        .or_else(|| {
+            env.ctx.cache.guild(env.guild_id).and_then(|guild| {
+                guild
+                    .members
+                    .get(&id)
+                    .map(|member| member.user.name.clone())
+            })
+        })
         .unwrap_or_else(|| id.to_string());
     Ok(UserInfo { id: id.get(), name })
 }
@@ -786,6 +799,7 @@ async fn log_mod(
         target_name,
         env.actor.get(),
         env.actor_member.display_name(),
+        &env.actor_member.user.name,
         env.channel_id.get(),
         reason,
     )

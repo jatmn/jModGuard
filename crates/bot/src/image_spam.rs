@@ -880,6 +880,7 @@ fn spawn_image_job(
     job: Job,
     policy: Policy,
     channel: u64,
+    author_names: crate::spam_actions::ReportNames,
 ) {
     let Ok(permit) = Arc::clone(&detector.slots).try_acquire_owned() else {
         detector.capacity_drop();
@@ -888,7 +889,7 @@ fn spawn_image_job(
     let app = Arc::clone(app);
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        run_job(&app, &ctx, job, policy, channel, permit).await;
+        run_job(&app, &ctx, job, policy, channel, author_names, permit).await;
     });
 }
 
@@ -1115,7 +1116,15 @@ pub fn observe(
         msg.id.get(),
         false,
     ) {
-        spawn_image_job(app, ctx, detector, job, policy, msg.channel_id.get());
+        spawn_image_job(
+            app,
+            ctx,
+            detector,
+            job,
+            policy,
+            msg.channel_id.get(),
+            crate::spam_actions::ReportNames::from_user(&msg.author, msg.member.as_deref()),
+        );
     }
 }
 
@@ -1237,7 +1246,24 @@ pub(crate) fn observe_update(
         true,
     );
     if let Some(job) = apply_admit_outcome(detector, outcome, guild_id, channel, message, true) {
-        spawn_image_job(app, ctx, detector, job, policy, event.channel_id.get());
+        spawn_image_job(
+            app,
+            ctx,
+            detector,
+            job,
+            policy,
+            event.channel_id.get(),
+            event
+                .author
+                .as_ref()
+                .map(|user| {
+                    crate::spam_actions::ReportNames::from_user(
+                        user,
+                        event.member.as_ref().and_then(|member| member.as_deref()),
+                    )
+                })
+                .unwrap_or_default(),
+        );
     }
 }
 
@@ -1247,6 +1273,7 @@ async fn run_job(
     mut job: Job,
     policy: Policy,
     channel: u64,
+    author_names: crate::spam_actions::ReportNames,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let detector = &app.image_spam;
@@ -1320,7 +1347,7 @@ async fn run_job(
     drop(permit);
     match report {
         Report::Unverified => {
-            let vars = report_vars(Report::Unverified, author, channel, &policy);
+            let vars = report_vars(Report::Unverified, author, channel, &policy, &author_names);
             crate::logging::emit(app, ctx, GuildId::new(guild), "automod", vars).await;
         }
         Report::Verified(image_match) => {
@@ -1353,6 +1380,7 @@ async fn run_job(
                     kind: crate::spam_actions::Kind::Image,
                     guild,
                     author,
+                    author_names,
                     channel,
                     policy: crate::spam_actions::MatchPolicy::Image(current_policy),
                     token,
@@ -1389,6 +1417,7 @@ fn report_vars(
     author: u64,
     channel: u64,
     policy: &Policy,
+    author_names: &crate::spam_actions::ReportNames,
 ) -> BTreeMap<String, String> {
     let (reason, content) = match report {
         Report::Verified(image_match) => (
@@ -1409,7 +1438,7 @@ fn report_vars(
             String::new(),
         ),
     };
-    BTreeMap::from([
+    let mut vars = BTreeMap::from([
         ("rule".into(), "Exact image spam test".into()),
         ("mention".into(), format!("<@{author}>")),
         ("user_id".into(), author.to_string()),
@@ -1418,7 +1447,14 @@ fn report_vars(
         ("action".into(), "log only; no punishment".into()),
         ("reason".into(), reason),
         ("content".into(), content),
-    ])
+    ]);
+    if let Some(name) = &author_names.username {
+        vars.insert("username".into(), name.clone());
+    }
+    if let Some(name) = &author_names.display {
+        vars.insert("user".into(), name.clone());
+    }
+    vars
 }
 
 #[cfg(test)]
@@ -2070,10 +2106,21 @@ mod tests {
             Some(Report::Unverified)
         );
         assert!(admit(&d, 13, 103, now).is_none());
-        let vars = report_vars(Report::Unverified, 2, 100, &policy());
+        let vars = report_vars(
+            Report::Unverified,
+            2,
+            100,
+            &policy(),
+            &crate::spam_actions::ReportNames {
+                username: Some("OtherBot".into()),
+                display: Some("Other Bot".into()),
+            },
+        );
         assert!(vars["action"].contains("no punishment"));
         assert!(vars["content"].is_empty());
         assert!(vars["reason"].contains("no match established"));
+        assert_eq!(vars["username"], "OtherBot");
+        assert_eq!(vars["user"], "Other Bot");
     }
     #[test]
     fn rate_and_memory_caps_fail_closed_without_reset_on_settings_change() {

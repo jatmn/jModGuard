@@ -23,6 +23,7 @@ const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 type EditKey = (u64, u64, u64);
 struct EditObservation {
+    edited_at_ms: Option<i64>,
     content: Option<u64>,
     attachments: Option<u64>,
     at: Instant,
@@ -41,14 +42,39 @@ impl EditReportDedup {
             return false;
         };
         let content = event.content.as_ref().map(fingerprint);
-        let attachments = event
-            .attachments
-            .as_ref()
-            .map(|items| fingerprint(&items.iter().map(|a| a.id.get()).collect::<Vec<_>>()));
+        let edited_at_ms = event.edited_timestamp.map(|time| time.timestamp_millis());
+        let attachments = event.attachments.as_ref().map(|items| {
+            fingerprint(
+                &items
+                    .iter()
+                    .map(|a| (a.id.get(), a.filename.as_str(), a.description.as_deref()))
+                    .collect::<Vec<_>>(),
+            )
+        });
         let key = (guild.get(), event.channel_id.get(), event.id.get());
         let mut entries = self.inner.lock();
         entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
         if let Some(seen) = entries.get_mut(&key) {
+            if let (Some(previous), Some(current)) = (seen.edited_at_ms, edited_at_ms) {
+                let distinct_edit = previous != current;
+                // Discord's supplied edit timestamp groups partial updates.
+                // A new timestamp starts a new observation even when its first
+                // payload field was absent from the preceding edit.
+                seen.edited_at_ms = edited_at_ms;
+                if distinct_edit {
+                    seen.content = content;
+                    seen.attachments = attachments;
+                } else {
+                    if content.is_some() {
+                        seen.content = content;
+                    }
+                    if attachments.is_some() {
+                        seen.attachments = attachments;
+                    }
+                }
+                seen.at = Instant::now();
+                return distinct_edit;
+            }
             // Gateway updates may supply only one field at a time. A newly
             // supplied field completes this observation; it is not a new edit.
             let changed = content.is_some_and(|value| seen.content.is_some_and(|old| old != value))
@@ -59,6 +85,9 @@ impl EditReportDedup {
             }
             if attachments.is_some() {
                 seen.attachments = attachments;
+            }
+            if edited_at_ms.is_some() {
+                seen.edited_at_ms = edited_at_ms;
             }
             seen.at = Instant::now();
             return changed;
@@ -75,6 +104,7 @@ impl EditReportDedup {
         entries.insert(
             key,
             EditObservation {
+                edited_at_ms,
                 content,
                 attachments,
                 at: Instant::now(),
@@ -238,7 +268,13 @@ pub(crate) async fn emit_to(
 
 fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
     let known_user = vars.get("user_id").is_none_or(|id| id != "unavailable");
-    let user_match = ["user_id", "actor_id"]
+    let known_actor = vars
+        .get("actor_id")
+        .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0));
+    let known_target = vars
+        .get("target_id")
+        .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0));
+    let user_match = ["user_id", "actor_id", "target_id"]
         .iter()
         .filter_map(|key| vars.get(*key))
         .filter(|value| value.parse::<u64>().is_ok_and(|id| id != 0))
@@ -247,6 +283,18 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
                 .iter()
                 .filter_map(|key| vars.get(*key))
                 .filter(|_| known_user),
+        )
+        .chain(
+            ["actor_name", "actor_display"]
+                .iter()
+                .filter_map(|key| vars.get(*key))
+                .filter(|_| known_actor),
+        )
+        .chain(
+            ["target", "target_name"]
+                .iter()
+                .filter_map(|key| vars.get(*key))
+                .filter(|_| known_target),
         )
         .any(|value| {
             filter
@@ -412,12 +460,15 @@ pub async fn emit_mod_action(
     target_display: &str,
     actor_id: u64,
     actor_name: &str,
+    actor_username: &str,
     source_channel_id: u64,
     reason: &str,
 ) {
     let mut vars = templates::user_vars(target_id, target_name, target_display);
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());
+    vars.insert("actor_name".into(), actor_username.to_string());
+    vars.insert("actor_display".into(), actor_name.to_string());
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
     vars.insert("action".into(), action.to_string());
     vars.insert("reason".into(), reason.to_string());

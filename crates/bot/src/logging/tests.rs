@@ -76,6 +76,59 @@ fn partial_fields_for_one_edit_are_one_observation() {
 }
 
 #[test]
+fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
+    let dedup = EditReportDedup::default();
+    let content = update(serde_json::json!({
+        "content":"edited",
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }));
+    let same_edit = update(serde_json::json!({
+        "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }));
+    let next_edit = update(serde_json::json!({
+        "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }));
+    assert!(dedup.should_report(&content));
+    assert!(!dedup.should_report(&same_edit));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "content":"edited field supplied again",
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(dedup.should_report(&next_edit));
+    assert!(!dedup.should_report(&next_edit));
+
+    let two_fields = EditReportDedup::default();
+    assert!(two_fields.should_report(&update(serde_json::json!({
+        "content":"before", "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(two_fields.should_report(&update(serde_json::json!({
+        "content":"after",
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(!two_fields.should_report(&update(serde_json::json!({
+        "attachments":[{"id":"555", "filename":"image.png", "description":"new",
+            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+            "size":100}],
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+
+    let attachment = |description: &str| {
+        update(serde_json::json!({"attachments":[{
+            "id":"555", "filename":"image.png", "description":description,
+            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+            "size":100
+        }]}))
+    };
+    let metadata = EditReportDedup::default();
+    assert!(metadata.should_report(&attachment("before")));
+    assert!(!metadata.should_report(&attachment("before")));
+    assert!(metadata.should_report(&attachment("after")));
+}
+
+#[test]
 fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
     let filter = db::LogFilter {
         users: vec!["otherbot".into(), "123".into()],
@@ -86,6 +139,19 @@ fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
     vars = BTreeMap::from([("user_id".into(), "123".into())]);
     assert!(excluded(&filter, &vars));
     vars = BTreeMap::from([("actor_id".into(), "123".into())]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([
+        ("actor_id".into(), "999".into()),
+        ("actor_name".into(), "OtherBot".into()),
+    ]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([
+        ("target_id".into(), "999".into()),
+        ("target".into(), "OtherBot".into()),
+        ("user".into(), "moderator".into()),
+    ]);
+    assert!(excluded(&filter, &vars));
+    vars = BTreeMap::from([("target_id".into(), "123".into())]);
     assert!(excluded(&filter, &vars));
     vars = BTreeMap::from([("channel_id".into(), "456".into())]);
     assert!(excluded(&filter, &vars));
