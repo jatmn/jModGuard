@@ -105,7 +105,10 @@ representation returned by that mutation instead of downloading the complete
 configuration bundle again. Multi-section copies and responses without a
 representation still reload the authoritative snapshot. Other edited fields stay
 marked **Unsaved changes**, including when a field-specific settings action runs or
-a failed refresh needs Retry. Drafts remain in memory only and are discarded when
+a failed refresh needs Retry. Log-channel saves immediately show the accepted queued
+value, clear the submitted row's dirty state, and reconcile the terminal bot-action
+receipt automatically; the queued badge does not claim bot validation has completed.
+Drafts remain in memory only and are discarded when
 you confirm leaving the workspace.
 
 A Global rule save writes the global rule before clearing the current server's

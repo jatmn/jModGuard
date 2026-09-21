@@ -133,7 +133,7 @@ cleanup_batch_size = 128
 
 # Bot-only sequential dispatch and bounded cleanup; API ignores this section.
 [action_worker]
-poll_secs = 5
+poll_secs = 1
 cleanup_interval_secs = 3600
 batch_size = 4
 request_timeout_secs = 15
