@@ -85,8 +85,13 @@ function tabStatus() {
   return root;
 }
 
+let fieldId = 0;
 function field(label, input) {
-  return el("div", { class: "field" }, el("label", { text: label }), input);
+  if (input.type === "checkbox") {
+    return el("label", { class: "checkbox-label" }, input, el("span", { text: label }));
+  }
+  input.id ||= `field-${++fieldId}`;
+  return el("div", { class: "field" }, el("label", { for: input.id, text: label }), input);
 }
 
 function tabInstallation() {
@@ -260,27 +265,28 @@ function tabNotifications() {
       field("Verbosity", verbosity),
       el("h3", { text: "Categories" }),
       ...categoryBoxes.map(({ name, box }) => field(name, box)),
-      el("button", { class: "btn primary", text: "Save notification settings", onclick: async () => {
-        try {
-          const body = {
-            revision: state.settings.revision,
-            notify_enabled: enabled.checked,
-            notify_mentions: mentions.checked,
-            notify_verbosity: verbosity.value,
-            notify_categories: categoryBoxes.filter((item) => item.box.checked).map((item) => item.name),
-          };
-          if (webhook.value.trim()) body.notify_webhook_url = webhook.value.trim();
-          state.settings = await api("/api/settings", "PATCH", body);
-          toast("Notification settings saved", "success");
-          render();
-        } catch (e) { toast(e.message, "error"); }
-      } }),
-      el("button", { class: "btn", text: "Send test notification", onclick: async () => {
-        try {
-          await api("/api/notifications/test", "POST", {});
-          toast("Test notification queued", "success");
-        } catch (e) { toast(e.message, "error"); }
-      } }),
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", text: "Save notification settings", onclick: async () => {
+          try {
+            const body = {
+              revision: state.settings.revision,
+              notify_enabled: enabled.checked,
+              notify_mentions: mentions.checked,
+              notify_verbosity: verbosity.value,
+              notify_categories: categoryBoxes.filter((item) => item.box.checked).map((item) => item.name),
+            };
+            if (webhook.value.trim()) body.notify_webhook_url = webhook.value.trim();
+            state.settings = await api("/api/settings", "PATCH", body);
+            toast("Notification settings saved", "success");
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+        el("button", { class: "btn", text: "Send test notification", onclick: async () => {
+          try {
+            await api("/api/notifications/test", "POST", {});
+            toast("Test notification queued", "success");
+          } catch (e) { toast(e.message, "error"); }
+        } })),
     ),
     el("div", { class: "card" }, el("h3", { text: "Delivery health" }), health),
   );
@@ -354,7 +360,7 @@ function tabUpdates() {
         el("p", { class: "muted", text: `commit ${row.source_commit} · ${row.published_at}` }),
         el("p", { class: "muted", text: (row.components || []).join(", ") }),
         el("p", { class: "muted", text: row.notes || "No notes." }),
-        ...actions,
+        el("div", { class: "row" }, ...actions),
       ));
     });
     jobsBox.replaceChildren();
@@ -387,7 +393,7 @@ function tabUpdates() {
           el("strong", { text: `${job.kind} · ${job.status}` }),
           el("p", { class: "muted", text: job.last_error || `phase ${payload.phase || "n/a"} · ${payload.release_id || ""}` }),
           el("p", { class: "muted", text: `id: ${job.id}` }),
-          ...buttons,
+          el("div", { class: "row" }, ...buttons),
         ));
       });
     }
@@ -428,31 +434,32 @@ function tabUpdates() {
       field("Stable channel", stable),
       field("Nightly channel", nightly),
       field("Poll interval (seconds, background worker)", interval),
-      el("button", { class: "btn primary", text: "Save discovery settings", onclick: async () => {
-        try {
-          const channels = [];
-          if (stable.checked) channels.push("stable");
-          if (nightly.checked) channels.push("nightly");
-          if (!channels.length) {
-            toast("Select at least one discovery channel (Stable or Nightly)", "error");
-            return;
-          }
-          state.settings = await api("/api/settings", "PATCH", {
-            revision: state.settings.revision,
-            discovery_channels: channels,
-            discovery_interval_secs: Number(interval.value),
-          });
-          toast("Discovery settings saved", "success");
-          render();
-        } catch (e) { toast(e.message, "error"); }
-      } }),
-      refreshBtn,
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", text: "Save discovery settings", onclick: async () => {
+          try {
+            const channels = [];
+            if (stable.checked) channels.push("stable");
+            if (nightly.checked) channels.push("nightly");
+            if (!channels.length) {
+              toast("Select at least one discovery channel (Stable or Nightly)", "error");
+              return;
+            }
+            state.settings = await api("/api/settings", "PATCH", {
+              revision: state.settings.revision,
+              discovery_channels: channels,
+              discovery_interval_secs: Number(interval.value),
+            });
+            toast("Discovery settings saved", "success");
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+        refreshBtn),
     ),
     el("div", { class: "card" },
       el("h3", { text: "Install" }),
       field("Pre-update checkpoint", preop),
       preopHint,
-      el("label", {}, confirm, el("span", { text: " I confirm the exclusive bot drain, local API restart, and that conductor recovery uses recover-update rather than the replacement process." })),
+      el("label", { class: "checkbox-label" }, confirm, el("span", { text: " I confirm the exclusive bot drain, local API restart, and that conductor recovery uses recover-update rather than the replacement process." })),
     ),
     el("div", { class: "card" }, el("h3", { text: "Installed and availability" }), catalog),
     el("div", { class: "card" }, el("h3", { text: "Complete publications" }), list),
@@ -534,7 +541,7 @@ function tabBackups() {
       el("h3", { text: "Create and download" }),
       el("p", { class: "muted", text: "A portable download is wrapped with the password you type here. The password is not stored. Destroying the old environment requires this file plus Discord/provider credentials supplied on the new install." }),
       captureNote,
-      el("button", { class: "btn primary", text: "Create backup now", onclick: async () => {
+      el("button", { class: "btn primary standalone-action", text: "Create backup now", onclick: async () => {
         try {
           await api("/api/backups", "POST", { kind: "manual" });
           toast("Backup queued", "success");
@@ -543,70 +550,72 @@ function tabBackups() {
       } }),
       field("Archive", archiveSelect),
       field("Portable password", password),
-      el("button", { class: "btn", text: "Download selected complete backup", onclick: async () => {
-        try {
-          const complete = await selectedArchive(["complete"]);
-          const res = await fetch(`/api/backups/${complete.id}/download`, { credentials: "include" });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const blob = await res.blob();
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `jmodguard-${complete.id}.jmb`;
-          a.click();
-          URL.revokeObjectURL(url);
-        } catch (e) { toast(e.message, "error"); }
-      } }),
-      el("button", { class: "btn", text: "Download selected complete backup (portable)", onclick: async () => {
-        try {
-          const complete = await selectedArchive(["complete"]);
-          const res = await fetch(`/api/backups/${complete.id}/portable`, {
-            method: "POST",
-            credentials: "include",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ password: password.value }),
-          });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const blob = await res.blob();
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `jmodguard-${complete.id}-portable.jmb`;
-          a.click();
-          URL.revokeObjectURL(url);
-        } catch (e) { toast(e.message, "error"); }
-      } }),
+      el("div", { class: "row" },
+        el("button", { class: "btn", text: "Download selected complete backup", onclick: async () => {
+          try {
+            const complete = await selectedArchive(["complete"]);
+            const res = await fetch(`/api/backups/${complete.id}/download`, { credentials: "include" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `jmodguard-${complete.id}.jmb`;
+            a.click();
+            URL.revokeObjectURL(url);
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+        el("button", { class: "btn", text: "Download selected complete backup (portable)", onclick: async () => {
+          try {
+            const complete = await selectedArchive(["complete"]);
+            const res = await fetch(`/api/backups/${complete.id}/portable`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ password: password.value }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `jmodguard-${complete.id}-portable.jmb`;
+            a.click();
+            URL.revokeObjectURL(url);
+          } catch (e) { toast(e.message, "error"); }
+        } })),
     ),
     el("div", { class: "card" },
       el("h3", { text: "Upload and restore" }),
       el("p", { class: "muted", text: "Uploads are quarantined after a format-prefix check and authenticated during restore. Select the exact archive above before restoring. Restoring after total loss can return later-deleted records; that requires the archive date/scope warning and this acknowledgment. Known remaining removals stay enforced. Pending Discord jobs are not replayed." }),
       field("Archive file", upload),
       field("I acknowledge this historical snapshot may restore later-deleted data", ack),
-      el("button", { class: "btn", text: "Upload archive", onclick: async () => {
-        try {
-          const file = upload.files && upload.files[0];
-          if (!file) throw new Error("choose a file");
-          const res = await fetch("/api/backups/upload", {
-            method: "POST",
-            credentials: "include",
-            body: file,
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-          toast(`Quarantined ${data.id}`, "success");
-          render();
-        } catch (e) { toast(e.message, "error"); }
-      } }),
-      el("button", { class: "btn primary", text: "Restore selected archive", onclick: async () => {
-        try {
-          const row = await selectedArchive(["complete", "quarantined"]);
-          await api(`/api/backups/${row.id}/restore`, "POST", {
-            password: password.value || null,
-            acknowledge_historical: ack.checked,
-          });
-          toast("Restore queued into the configured restore target", "success");
-        } catch (e) { toast(e.message, "error"); }
-      } }),
+      el("div", { class: "row" },
+        el("button", { class: "btn", text: "Upload archive", onclick: async () => {
+          try {
+            const file = upload.files && upload.files[0];
+            if (!file) throw new Error("choose a file");
+            const res = await fetch("/api/backups/upload", {
+              method: "POST",
+              credentials: "include",
+              body: file,
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+            toast(`Quarantined ${data.id}`, "success");
+            render();
+          } catch (e) { toast(e.message, "error"); }
+        } }),
+        el("button", { class: "btn primary", text: "Restore selected archive", onclick: async () => {
+          try {
+            const row = await selectedArchive(["complete", "quarantined"]);
+            await api(`/api/backups/${row.id}/restore`, "POST", {
+              password: password.value || null,
+              acknowledge_historical: ack.checked,
+            });
+            toast("Restore queued into the configured restore target", "success");
+          } catch (e) { toast(e.message, "error"); }
+        } })),
     ),
     el("div", { class: "card" }, el("h3", { text: "Failed backup jobs" }), failures),
     el("div", { class: "card" }, el("h3", { text: "Catalog" }), list),
@@ -614,8 +623,8 @@ function tabBackups() {
 }
 
 function tabMoves() {
-  const guild = el("input", { placeholder: "Guild snowflake" });
-  const dest = el("input", { placeholder: "Destination store id" });
+  const guild = el("input", { type: "text", placeholder: "Guild snowflake" });
+  const dest = el("input", { type: "text", placeholder: "Destination store id" });
   const confirm = el("input", { type: "checkbox" });
   const preop = el("select", {},
     el("option", { value: "fresh", text: "Fresh checkpoint" }),
@@ -673,7 +682,7 @@ function tabMoves() {
       field("Guild id", guild),
       field("Destination store id", dest),
       field("Pre-move checkpoint", preop),
-      el("label", {}, confirm, el("span", { text: " I confirm this guild will be interrupted, Discord actions will not be replayed, and bot/API already have the destination store." })),
+      el("label", { class: "checkbox-label" }, confirm, el("span", { text: " I confirm this guild will be interrupted, Discord actions will not be replayed, and bot/API already have the destination store." })),
       el("div", { class: "row" },
         el("button", { class: "btn", text: "Preview impact", onclick: async () => {
           try {

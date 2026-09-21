@@ -1223,7 +1223,8 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   calls[0].data.params.min_channels=1;
   assert.equal(h.app.spamConfigured('attachment_flood', calls[0].data),false);
   const punish=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,dry_run:true,params:{mode:'exact_image_test',min_channels:3,min_attachments:2,window_secs:60},actions:[{action:'log'}]}});
-  findNode(punish,n=>n.tag==='input' && n.attrs.type==='checkbox' && n.parent?.tag==='label').checked = true;
+  const enforcement = findNode(punish,n=>n.tag==='label' && textOf(n).includes('Delete matched messages and ban'));
+  findNode(enforcement,n=>n.tag==='input' && n.attrs.type==='checkbox').checked = true;
   await findNode(punish,n=>n.textContent === 'Save').listeners.click({});
   assert.equal(calls.at(-1).data.dry_run,false);
   assert.equal(calls.at(-1).data.params.mode,'exact_image');
