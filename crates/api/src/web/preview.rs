@@ -200,12 +200,41 @@ fn schedule_expiration(app: &Arc<ApiState>, token: String) {
 }
 
 fn is_preview_write(request: &Request<axum::body::Body>) -> bool {
+    match request.method() {
+        &axum::http::Method::POST => !is_preview_post_read(request.uri().path()),
+        &axum::http::Method::PUT | &axum::http::Method::PATCH | &axum::http::Method::DELETE => true,
+        _ => false,
+    }
+}
+
+/// SPA JSON reads use POST so a CDN cannot reuse GET. Those reads stay visible
+/// in a preview tab. Note creation, unban, and other POST mutations do not.
+fn is_preview_post_read(path: &str) -> bool {
+    if path == "/api/me" {
+        return true;
+    }
+    let mut parts = path.split('/').filter(|part| !part.is_empty());
+    if parts.next() != Some("api") || parts.next() != Some("guilds") {
+        return false;
+    }
+    let Some(guild) = parts.next() else {
+        return false;
+    };
+    if guild == "0" || !guild.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
     matches!(
-        request.method(),
-        &axum::http::Method::POST
-            | &axum::http::Method::PUT
-            | &axum::http::Method::PATCH
-            | &axum::http::Method::DELETE
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (
+            Some(
+                "config" | "case-delete-roles" | "actions" | "events" | "bans" | "stats" | "cases"
+            ),
+            None,
+            None,
+            None
+        ) | (Some("cases"), Some(_), None, None)
+            | (Some("cases"), Some(_), Some("evidence"), None)
+            | (Some("logchannels"), Some(_), None, None)
     )
 }
 
@@ -233,4 +262,41 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
     guild.permissions = Some(PermissionsField::Number(preview.profile.permissions()));
     auth.guilds = vec![guild];
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_preview_post_read;
+
+    #[test]
+    fn preview_allows_spa_post_reads_and_rejects_post_mutations() {
+        for path in [
+            "/api/me",
+            "/api/guilds/10/config",
+            "/api/guilds/10/case-delete-roles",
+            "/api/guilds/10/actions",
+            "/api/guilds/10/events",
+            "/api/guilds/10/bans",
+            "/api/guilds/10/stats",
+            "/api/guilds/10/cases",
+            "/api/guilds/10/cases/abc",
+            "/api/guilds/10/cases/abc/evidence",
+            "/api/guilds/10/logchannels/message_edit",
+        ] {
+            assert!(is_preview_post_read(path), "{path}");
+        }
+        for path in [
+            "/api/preview",
+            "/api/guilds/0/config",
+            "/api/guilds/10/unban",
+            "/api/guilds/10/badwords",
+            "/api/guilds/10/commands",
+            "/api/guilds/10/copy",
+            "/api/guilds/10/cases/abc/history",
+            "/api/guilds/10/cases/abc/evidence/file",
+            "/api/guilds/10/actions/job",
+        ] {
+            assert!(!is_preview_post_read(path), "{path}");
+        }
+    }
 }

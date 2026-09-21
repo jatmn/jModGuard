@@ -884,6 +884,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route(
             "/api/guilds/{guild_id}/logchannels/{event}",
             get(api::get_logchannel)
+                .post(api::get_logchannel)
                 .put(api::put_logchannel)
                 .delete(api::delete_logchannel),
         )
@@ -895,22 +896,24 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             "/api/guilds/{guild_id}/testregex",
             axum::routing::post(api::test_regex),
         )
-        .route("/api/guilds/{guild_id}/events", get(api::events))
-        .route("/api/guilds/{guild_id}/bans", get(api::bans))
+        .route("/api/guilds/{guild_id}/events", get_post(api::events))
+        .route("/api/guilds/{guild_id}/bans", get_post(api::bans))
         .route(
             "/api/guilds/{guild_id}/unban",
             axum::routing::post(api::unban),
         )
-        .route("/api/guilds/{guild_id}/actions", get(api::actions))
+        .route("/api/guilds/{guild_id}/actions", get_post(api::actions))
         .route(
             "/api/guilds/{guild_id}/actions/{id}",
             axum::routing::delete(api::cancel_action),
         )
-        .route("/api/guilds/{guild_id}/stats", get(api::stats))
-        .route("/api/guilds/{guild_id}/cases", get(cases::list_cases))
+        .route("/api/guilds/{guild_id}/stats", get_post(api::stats))
+        .route("/api/guilds/{guild_id}/cases", get_post(cases::list_cases))
         .route(
             "/api/guilds/{guild_id}/cases/{case_id}",
-            get(cases::get_case).delete(cases::delete_case),
+            get(cases::get_case)
+                .post(cases::get_case)
+                .delete(cases::delete_case),
         )
         .route(
             "/api/guilds/{guild_id}/cases/{case_id}/history",
@@ -918,7 +921,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         )
         .route(
             "/api/guilds/{guild_id}/cases/{case_id}/evidence",
-            get(cases::list_evidence),
+            get(cases::list_evidence).post(cases::list_evidence),
         )
         .route(
             "/api/guilds/{guild_id}/cases/{case_id}/evidence/{evidence_id}",

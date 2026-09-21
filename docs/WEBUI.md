@@ -207,12 +207,25 @@ GET    /api/guilds/{id}/badwords              POST (add) / DELETE /{word_id}
 GET    /api/guilds/{id}/commands              POST (create) / PUT|DELETE /{name}
 GET    /api/guilds/{id}/templates/{event}     PUT/DELETE …
 GET    /api/guilds/{id}/logchannels/{event}   PUT/DELETE …
+POST   /api/guilds/{id}/logchannels/{event}   # same body as GET; SPA receipt read
 POST   /api/guilds/{id}/copy
 POST   /api/guilds/{id}/testregex      # pattern/sample length + compile limits
 GET    /api/guilds/{id}/events?event=&user=&limit=
+POST   /api/guilds/{id}/events         # same query as GET; SPA audit log
 GET    /api/guilds/{id}/bans
+POST   /api/guilds/{id}/bans           # same query as GET; SPA bans list
 POST   /api/guilds/{id}/unban
 GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
+POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts
+GET    /api/guilds/{id}/actions
+POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
+GET    /api/guilds/{id}/cases
+POST   /api/guilds/{id}/cases          # same query as GET; SPA case list
+GET    /api/guilds/{id}/cases/{case}
+POST   /api/guilds/{id}/cases/{case}   # same body as GET
+GET    /api/guilds/{id}/cases/{case}/evidence
+POST   /api/guilds/{id}/cases/{case}/evidence  # same body as GET
+GET    /api/guilds/{id}/cases/{case}/history   # POST on this path adds a note
 GET    /api/guilds/{id}/case-delete-roles
 POST   /api/guilds/{id}/case-delete-roles  # same body as GET; SPA settings load
 PUT    /api/guilds/{id}/case-delete-roles
@@ -235,7 +248,14 @@ bot owner).
   `CDN-Cache-Control: no-store`, and `Vary: Cookie`. The page loads the
   signed-in workspace with `POST /api/me` so a CDN cannot reuse a cached
   `GET /api/me` identity after the in-memory session is gone. Guild settings
-  load with `POST /api/guilds/{id}/config` for the same reason. Expose
+  load with `POST /api/guilds/{id}/config` for the same reason. Log-channel
+  receipt checks and the Bot actions table use `POST /api/guilds/{id}/actions`.
+  A failed log-channel receipt reads
+  `POST /api/guilds/{id}/logchannels/{event}`. Rules, badwords, commands,
+  templates, and the Settings tab already render from that POST config
+  document. Dashboard counts, the audit log, bans, case lists, a case,
+  and its evidence list also use POST. Case history stays GET because
+  POST on that path adds a note. Evidence file download stays GET. Expose
   publicly only behind HTTPS (see SETUP.md §8). On Bunny, API-path edge
   rules must Override Cache Time = 0 in addition to Bypass Perma-Cache;
   see [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).

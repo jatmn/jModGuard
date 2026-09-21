@@ -360,7 +360,12 @@ On the Pull Zone from step 2 (Storage origin for the files):
    cache-time override, **purge the Pull Zone** so an already-cached
    `/api/me` cannot keep leaking. The SPA bootstraps with `POST /api/me`
    so leftover GET cache entries are not used for login. The SPA also loads
-   guild settings with `POST /api/guilds/{id}/config`.
+   guild settings with `POST /api/guilds/{id}/config`. Log-channel receipt
+   checks and the Bot actions table use `POST /api/guilds/{id}/actions`. A
+   failed log-channel receipt reads `POST /api/guilds/{id}/logchannels/{event}`.
+   Dashboard counts, the audit log, bans, case lists, a case, and its
+   evidence list use POST as well. Case history stays GET because POST
+   on that path adds a note.
 3. Trigger on request URL for `/api*`, `/login*`, `/logout*`, `/oauth*`,
    and `/health*`. Bunny allows **at most five** PatternMatches per
    trigger. If operators might open both an owned hostname and the system

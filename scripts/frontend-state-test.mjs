@@ -111,13 +111,15 @@ function textOf(root) {
 
 test('dashboard moderation counts stay with their requested server', async () => {
   const pending = [];
-  const { app } = harness((url) => new Promise(resolve => pending.push({ url, resolve })));
+  const { app } = harness((url, options) => new Promise(resolve => pending.push({ url, method: options.method, resolve })));
   app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
   const first = app.tabDashboard();
   app.state.guildId = app.state.guilds[1].id;
   const second = app.tabDashboard();
   assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/stats`);
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
+  assert.equal(pending[0].method, 'POST');
+  assert.equal(pending[1].method, 'POST');
   const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
   pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   await new Promise(resolve => setImmediate(resolve));
@@ -465,8 +467,9 @@ test('queued log-channel receipts reconcile without a configuration refresh', as
     enrollment_id: 'membership', state: 'pending',
     action: { kind: 'set_log_channel', event: 'member_join', channel_id: '222' },
   };
-  const h = harness(async (url) => {
+  const h = harness(async (url, options) => {
     assert.match(url, /\/actions$/);
+    assert.equal(options.method, 'POST', 'receipt reads must not use a cacheable GET');
     return response([{ ...pending, state: 'succeeded', outcome: 'log_channel_set' }]);
   });
   h.app.state.config = {
@@ -601,7 +604,8 @@ test('failed queued clears restore the authoritative mapping', async () => {
     enrollment_id: 'membership', state: 'pending',
     action: { kind: 'set_log_channel', event: 'member_join', channel_id: null },
   };
-  const h = harness(async (url) => {
+  const h = harness(async (url, options) => {
+    assert.equal(options.method, 'POST', 'receipt reads must not use a cacheable GET');
     if (url.endsWith('/actions')) {
       return response([{ ...pending, state: 'failed', outcome: 'invalid_channel' }]);
     }
@@ -1113,18 +1117,19 @@ test('invalid action acknowledgments retain request identity; unavailable storag
 
 test('actions refresh only on demand and cancellation includes membership', async () => {
   const calls=[];
-  const h=harness(async(url,opts)=>{calls.push({url,opts});return response(opts.method==='GET'?[queuedAction()]:{ok:true});});
+  const h=harness(async(url,opts)=>{calls.push({url,opts});return response(opts.method==='DELETE'?{ok:true}:[queuedAction()]);});
   h.app.state.config={enrollment_id:'membership'};
   h.app.tabActions();
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(calls.length,1);
+  assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
   assert.match(textOf(h.elements.find(n=>n.tag==='p')),/Force-cancel a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.tag==='button'&&n.textContent==='Cancel');
   await cancel.listeners.click({});
   assert.equal(calls[1].opts.method,'DELETE');
   assert.equal(calls[1].opts.headers['x-jmodguard-enrollment'],'membership');
-  assert.equal(calls[2].opts.method,'GET');
+  assert.equal(calls[2].opts.method,'POST');
   const refresh=h.elements.find(n=>n.tag==='button'&&n.textContent==='Refresh');
   await refresh.listeners.click({});
   assert.equal(calls.length,4);
@@ -1141,7 +1146,7 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   let confirms = 0;
   const calls = [];
   const h = harness(
-    async (url, opts) => { calls.push({ url, opts }); return response(opts.method === 'GET' ? jobs : { ok: true }); },
+    async (url, opts) => { calls.push({ url, opts }); return response(opts.method === 'DELETE' ? { ok: true } : jobs); },
     new Map(),
     new Map(),
     () => { confirms += 1; return true; },
@@ -1303,7 +1308,7 @@ test('note retry retains intent after a lost response and blocks overlapping sub
   const id = 'a'.repeat(32), posts = [];
   let resolveFirst;
   const h = harness(async (url, options) => {
-    if (options?.method === 'POST') {
+    if (options?.method === 'POST' && options.body) {
       posts.push(JSON.parse(options.body));
       if (posts.length === 1) return await new Promise((resolve, reject) => { resolveFirst = () => reject(new Error('response lost')); });
       throw new Error('response lost');
@@ -1336,7 +1341,7 @@ test('note retry retains intent after a lost response and blocks overlapping sub
 test('acknowledged case note no longer leaves a false unsaved warning', async () => {
   const id = 'b'.repeat(32);
   const h = harness(async (url, options) => {
-    if (options?.method === 'POST') return response({ ok: true });
+    if (options?.method === 'POST' && options.body) return response({ ok: true });
     if (url.includes('/history')) return response({ history: [] });
     if (url.includes('/evidence')) return response({ evidence: [] });
     if (url.includes('/cases?')) return response({ cases: [id] });

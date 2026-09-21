@@ -183,8 +183,9 @@ Unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and cl
 (`DELETE .../logchannels/{event}`) require a JSON `request_id` and the loaded page's
 `x-jmodguard-enrollment` header. Routes are under `/api/guilds/{guild_id}`. Actor identity
 comes from the session, never the body. Every request rechecks Discord permissions.
-`GET .../actions` and `DELETE .../actions/{id}` also require the page membership; status
+`GET` and `POST .../actions`, and `DELETE .../actions/{id}`, also require the page membership; status
 returns up to the latest 50 receipts filtered to the caller's current action permissions.
+The SPA reads that list with `POST` so a CDN cannot reuse a cached `GET`. `GET` and `POST .../logchannels/{event}` return one mapping; the receipt watcher reads it with `POST`.
 Unstarted (`pending`/`claimed`) work can be cancelled. Log-channel work that is `running`
 or `uncertain` can also be force-cancelled so a newer save can run; this does not undo
 Discord. Running unban work cannot be cancelled. Global guild-0 paths do not admit actions.
@@ -197,7 +198,8 @@ there is no automatic retry with a new key. Denied session storage prevents subm
 The Actions tab uses manual refresh, with no general background polling. A log-channel
 save is the exception: the edited row immediately shows its accepted queued value and a
 bounded receipt watcher removes that marker or restores the authoritative mapping when
-the action finishes, so normal saves do not require a configuration refresh. Cancel unstarted work
+the action finishes, so normal saves do not require a configuration refresh. The watcher
+reads `POST .../actions`, and a failed receipt reads `POST .../logchannels/{event}`. Cancel unstarted work
 from that table, including claimed requests. Force-cancel a stuck log-channel request that
 is running or unknown so a new save can run; this does not undo Discord. Refresh bans after
 completion to see the applied result. “Outcome unknown” requires inspection;

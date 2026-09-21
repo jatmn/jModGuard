@@ -538,7 +538,7 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
   const originalTerminal = ["succeeded", "failed", "uncertain", "cancelled", "expired"].includes(original.state);
   let job = original;
   if (!originalTerminal) {
-    const jobs = await api(`/api/guilds/${original.guild_id}/actions`);
+    const jobs = await apiRead(`/api/guilds/${original.guild_id}/actions`);
     job = jobs.find((candidate) => candidate.id === original.id);
     entry = pendingLogChannelActions.get(key);
     row = logChannelRow(original.action.event);
@@ -568,7 +568,7 @@ async function reconcileQueuedLogChannel(original, attempt = 0) {
 
   let authoritative;
   try {
-    authoritative = await api(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
+    authoritative = await apiRead(`/api/guilds/${original.guild_id}/logchannels/${encodeURIComponent(original.action.event)}`);
   } catch (error) {
     if (isUnauthenticated(error)) return;
     renderLogChannelsPreservingDrafts();
@@ -945,7 +945,7 @@ function tabDashboard() {
   const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans'], ['cases', 'Cases']]
     .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
   const guildId = state.guildId;
-  api(`/api/guilds/${guildId}/stats`).then(counts => {
+  apiRead(`/api/guilds/${guildId}/stats`).then(counts => {
     moderation.forEach(({ key, value }) => { value.textContent = counts[key] == null ? 'Unavailable' : String(counts[key]); });
   }).catch(() => {
     moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
@@ -1629,7 +1629,7 @@ function tabEvents() {
     tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
     try {
       const user = parseSnowflake(userIn.value);
-      const rows = await api(`/api/guilds/${guildId}/events?limit=100` +
+      const rows = await apiRead(`/api/guilds/${guildId}/events?limit=100` +
         (typeSel.value ? `&event=${encodeURIComponent(typeSel.value)}` : "") +
         (user ? `&user=${encodeURIComponent(user)}` : ""));
       if (current !== request) return;
@@ -1670,7 +1670,7 @@ function tabBans() {
     const current = ++request;
     tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
     try {
-      const rows = await api(`/api/guilds/${guildId}/bans?limit=200`);
+      const rows = await apiRead(`/api/guilds/${guildId}/bans?limit=200`);
       if (current !== request) return;
       tbody().innerHTML = "";
       if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No matching records." })));
@@ -1729,7 +1729,7 @@ function tabActions() {
     const current = ++request;
     body.replaceChildren(el("tr", {}, el("td", { colspan: 6, text: "Loading…" })));
     try {
-      const jobs = await api(`/api/guilds/${guildId}/actions`);
+      const jobs = await apiRead(`/api/guilds/${guildId}/actions`);
       if (current !== request) return;
       body.replaceChildren();
       if (!jobs.length) body.append(el("tr", {}, el("td", { colspan: 6, text: "No bot actions yet." })));
@@ -1785,7 +1785,7 @@ function tabCases() {
   const openCase = async (id) => {
     const currentDetail = ++detailRequest;
     try {
-      const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
+      const payload = await apiRead(`/api/guilds/${guildId}/cases/${id}`);
       const history = { history: [] };
       let sequence = "0";
       // The existing history contract admits at most 64 entries. Consume both
@@ -1797,7 +1797,7 @@ function tabCases() {
         if (entries.length < 32) break;
         sequence = entries[entries.length - 1].sequence;
       }
-      const evidence = await api(`/api/guilds/${guildId}/cases/${id}/evidence`);
+      const evidence = await apiRead(`/api/guilds/${guildId}/cases/${id}/evidence`);
       if (currentDetail !== detailRequest || state.guildId !== guildId) return;
       const c = payload.case || {};
       let noteIntent = null;
@@ -1858,7 +1858,7 @@ function tabCases() {
     try {
       const query = new URLSearchParams({ limit: String(pageSize), removed: String(removed) });
       if (after) query.set("after", after);
-      const payload = await api(`/api/guilds/${guildId}/cases?${query}`);
+      const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`);
       if (current !== request || state.guildId !== guildId) return;
       recovery.style.display = payload.can_delete ? "" : "none";
       const ids = payload.cases || [];
@@ -1879,7 +1879,7 @@ function tabCases() {
             } }))));
           continue;
         }
-        const payload = await api(`/api/guilds/${guildId}/cases/${id}`);
+        const payload = await apiRead(`/api/guilds/${guildId}/cases/${id}`);
         if (current !== request || state.guildId !== guildId) return;
         const c = payload.case || {};
         rows.push(el("tr", {},

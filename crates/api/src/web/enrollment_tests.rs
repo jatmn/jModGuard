@@ -842,6 +842,14 @@ async fn queued_log_change_is_applied_only_by_worker_and_receipt_is_replayable()
     let (status, history) = f.request("GET", "/api/guilds/10/actions", "").await;
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history[0]["state"], "succeeded");
+    let (status, posted) = f.request("POST", "/api/guilds/10/actions", "").await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    assert_eq!(posted, history);
+    let (status, mapping) = f
+        .request("POST", "/api/guilds/10/logchannels/message_edit", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{mapping}");
+    assert_eq!(mapping["guild_override"], "123");
     assert_eq!(
         db::list_log_channels(&f.app.db, 10).await.unwrap(),
         vec![("message_edit".into(), 123)]
@@ -1758,6 +1766,23 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(denied["code"], "preview_read_only");
+    let (status, me) = f.request_preview("POST", "/api/me", "", token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let (status, cases) = f
+        .request_preview("POST", "/api/guilds/10/cases", "", token)
+        .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "{cases}");
+    assert_ne!(cases["code"].as_str(), Some("preview_read_only"));
+    let (status, note) = f
+        .request_preview(
+            "POST",
+            "/api/guilds/10/cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/history",
+            r#"{"entry_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","text":"no"}"#,
+            token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{note}");
+    assert_eq!(note["code"], "preview_read_only");
     let (status, _global) = f
         .request_preview("PUT", "/api/guilds/0/settings", r#"{"prefix":"!"}"#, token)
         .await;
