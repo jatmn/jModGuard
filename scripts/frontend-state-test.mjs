@@ -1702,6 +1702,9 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.match(js, /esm\.sh/);
   assert.doesNotMatch(js, /node_modules/);
   assert.match(js, /function loadSearchSelectRuntime/);
+  assert.match(js, /function restoreNativeSelect/);
+  assert.match(js, /searchSelectId/);
+  assert.match(js, /anchor:\s*"bottom start"/);
   assert.doesNotMatch(js, /^import /m);
   assert.match(css, /--bg:\s*#f0f7ff/);
   assert.match(css, /--accent:\s*#2266c2/);

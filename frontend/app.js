@@ -282,6 +282,7 @@ function makeSearchSelect(React, Headless, select) {
     const selected = items.find((item) => item.value === select.value) || null;
     const q = query.trim().toLowerCase();
     const filtered = !q ? items : items.filter((item) => item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q));
+    const labeledId = select.dataset?.searchSelectId || "";
     return React.createElement(Combobox, {
       value: selected,
       by: "value",
@@ -295,14 +296,18 @@ function makeSearchSelect(React, Headless, select) {
     },
       React.createElement("div", { className: "search-select-control" },
         React.createElement(ComboboxInput, {
+          id: labeledId || undefined,
           className: "input input-bordered w-full search-select-input",
-          "aria-label": select.getAttribute("aria-label") || select.id || "Search options",
+          "aria-label": labeledId ? undefined : (select.getAttribute("aria-label") || "Search options"),
           displayValue: (item) => item?.label || "",
           onChange: (event) => setQuery(event.target.value),
         }),
         ComboboxButton ? React.createElement(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾") : null,
       ),
-      React.createElement(ComboboxOptions, { className: "search-select-options menu bg-base-100 rounded-box shadow" },
+      React.createElement(ComboboxOptions, {
+        className: "search-select-options menu bg-base-100 rounded-box shadow",
+        anchor: "bottom start",
+      },
         filtered.length
           ? filtered.map((item) => React.createElement(ComboboxOption, {
               key: `${item.value}:${item.label}`,
@@ -315,32 +320,52 @@ function makeSearchSelect(React, Headless, select) {
   };
 }
 
+function restoreNativeSelect(select, wrap, labeledId) {
+  select._vendorUnmount = null;
+  select._searchRefresh = null;
+  select.classList.remove("search-select-native");
+  select.removeAttribute("aria-hidden");
+  select.tabIndex = 0;
+  const id = labeledId || select.dataset?.searchSelectId || "";
+  if (id && !select.id) select.id = id;
+  if (select.dataset) {
+    delete select.dataset.searchSelectId;
+    select.dataset.searchEnhanced = "";
+  }
+  if (wrap && wrap.parentNode && select.parentNode === wrap) {
+    wrap.parentNode.insertBefore(select, wrap);
+    wrap.remove();
+  }
+}
+
 function mountSearchSelect(select, runtime) {
   if (typeof document === "undefined" || !select.parentNode) return;
   const wrap = document.createElement("div");
   wrap.className = "search-select";
   const host = document.createElement("div");
   host.className = "search-select-host";
-  select.parentNode.insertBefore(wrap, select);
-  wrap.append(select, host);
-  select.classList.add("search-select-native");
-  select.setAttribute("aria-hidden", "true");
-  select.tabIndex = -1;
-  const App = makeSearchSelect(runtime.React, runtime.Headless, select);
-  const root = runtime.ReactDOM.createRoot(host);
-  root.render(runtime.React.createElement(App));
-  select._vendorUnmount = () => {
-    try { root.unmount(); } catch (_) { /* already detached */ }
-    select._vendorUnmount = null;
-    select._searchRefresh = null;
-    select.classList.remove("search-select-native");
-    select.removeAttribute("aria-hidden");
-    select.tabIndex = 0;
-    if (wrap.parentNode) {
-      wrap.parentNode.insertBefore(select, wrap);
-      wrap.remove();
+  const labeledId = select.id || "";
+  try {
+    select.parentNode.insertBefore(wrap, select);
+    wrap.append(select, host);
+    select.classList.add("search-select-native");
+    select.setAttribute("aria-hidden", "true");
+    select.tabIndex = -1;
+    if (labeledId) {
+      select.dataset.searchSelectId = labeledId;
+      select.removeAttribute("id");
     }
-  };
+    const App = makeSearchSelect(runtime.React, runtime.Headless, select);
+    const root = runtime.ReactDOM.createRoot(host);
+    root.render(runtime.React.createElement(App));
+    select._vendorUnmount = () => {
+      try { root.unmount(); } catch (_) { /* already detached */ }
+      restoreNativeSelect(select, wrap, labeledId);
+    };
+  } catch (err) {
+    restoreNativeSelect(select, wrap, labeledId);
+    throw err;
+  }
 }
 
 function listedSelects(root) {
@@ -378,8 +403,15 @@ function enhanceVendorWidgets(root) {
     if (select.dataset) select.dataset.searchEnhanced = "1";
     loadSearchSelectRuntime().then((runtime) => {
       if (select.dataset?.searchEnhanced !== "1") return;
-      if (select.isConnected === false) return;
-      mountSearchSelect(select, runtime);
+      if (select.isConnected === false) {
+        if (select.dataset) select.dataset.searchEnhanced = "";
+        return;
+      }
+      try {
+        mountSearchSelect(select, runtime);
+      } catch (_) {
+        if (select.dataset) select.dataset.searchEnhanced = "";
+      }
     }).catch(() => {
       if (select.dataset) select.dataset.searchEnhanced = "";
       const unmount = select._vendorUnmount;

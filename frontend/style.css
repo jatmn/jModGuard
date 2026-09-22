@@ -64,7 +64,7 @@
 .search-select-input { padding-right: 28px; }
 .server-picker .search-select-input { background: var(--side-panel); border-color: var(--side-border); color: var(--side-text); }
 .search-select-native { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
-.search-select-options { position: absolute; left: 0; right: 0; z-index: 60; max-height: 16rem; overflow: auto; margin-top: 4px; padding: 4px 0; background: var(--panel); color: var(--text); border: 1px solid var(--input-border); border-radius: 8px; box-shadow: 0 8px 24px #071a3330; }
+.search-select-options { z-index: 80; min-width: 12rem; max-height: 16rem; overflow: auto; padding: 4px 0; background: var(--panel); color: var(--text); border: 1px solid var(--input-border); border-radius: 8px; box-shadow: 0 8px 24px #071a3330; }
 .search-select-option { padding: 8px 12px; cursor: pointer; }
 .search-select-option[data-focus], .search-select-option[data-selected] { background: var(--selected); color: var(--selected-text); }
 .search-select-empty { padding: 8px 12px; color: var(--muted); }
