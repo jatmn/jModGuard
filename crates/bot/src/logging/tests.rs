@@ -622,7 +622,7 @@ fn invalid_delivery_budgets_fail_before_building_runtime_state() {
 }
 
 fn audit_fixture(action: Action, target: u64, observed_ms: i64, reason: Option<&str>) -> AuditLogs {
-    let id = ((observed_ms as u64 - 1_420_070_400_000) << 22).to_string();
+    let id = (((observed_ms as u64 - 1_420_070_400_000) << 22) | action.num() as u64).to_string();
     serde_json::from_value(serde_json::json!({
         "audit_log_entries": [{"id":id,"target_id":target.to_string(),
             "user_id":"777", "action_type":action.num(), "reason":reason}],
@@ -639,18 +639,19 @@ fn member_audit_requires_unique_recent_target_and_action() {
     for event in ["member_ban", "member_unban"] {
         let action = member_audit_action(event).unwrap();
         let mut logs = audit_fixture(action, 123, observed, Some("actual reason"));
-        let vars = member_audit_vars(&logs, action, 123, observed).unwrap();
+        let vars = unclaimed_audit_vars(&logs, action, 123, observed).unwrap();
         assert_eq!(vars["actor"], "moderator (<@777>)");
         assert_eq!(vars["actor_id"], "777");
         assert_eq!(vars["reason"], "actual reason");
-        assert!(member_audit_vars(&logs, action, 999, observed).is_none());
+        assert!(unclaimed_audit_vars(&logs, action, 999, observed).is_none());
         assert!(
-            member_audit_vars(&logs, Action::Member(MemberAction::Kick), 123, observed).is_none()
+            unclaimed_audit_vars(&logs, Action::Member(MemberAction::Kick), 123, observed)
+                .is_none()
         );
-        assert!(member_audit_vars(&logs, action, 123, observed + 10_001).is_none());
-        assert!(member_audit_vars(&logs, action, 123, observed - 3_001).is_none());
+        assert!(unclaimed_audit_vars(&logs, action, 123, observed + 10_001).is_none());
+        assert!(unclaimed_audit_vars(&logs, action, 123, observed - 3_001).is_none());
         logs.entries.push(logs.entries[0].clone());
-        assert!(member_audit_vars(&logs, action, 123, observed).is_none());
+        assert!(unclaimed_audit_vars(&logs, action, 123, observed).is_none());
     }
 }
 
@@ -660,7 +661,7 @@ fn audit_without_reason_or_user_name_keeps_known_identity() {
     let action = member_audit_action("member_ban").unwrap();
     let mut logs = audit_fixture(action, 123, observed, None);
     logs.users.clear();
-    let vars = member_audit_vars(&logs, action, 123, observed).unwrap();
+    let vars = unclaimed_audit_vars(&logs, action, 123, observed).unwrap();
     assert_eq!(vars["actor"], "<@777>");
     assert_eq!(vars["reason"], "No reason provided");
 }
@@ -689,6 +690,11 @@ impl LogDelivery for AuditSink {
             123,
             chrono::Utc::now().timestamp_millis(),
             Some("spam"),
+        );
+        // Distinct calls in this fixture represent distinct mocked actions.
+        // Repeated audit responses are modeled explicitly by RepeatedAuditSink.
+        logs.entries[0].id = serenity::model::id::AuditLogEntryId::new(
+            logs.entries[0].id.get() + ((call as u64 + 1) << 8),
         );
         if self.missing_first && call == 0 {
             logs.entries.clear();
@@ -870,4 +876,119 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
             .unwrap()
             .contains("Reason: spam")
     );
+}
+
+fn unclaimed_audit_vars(
+    logs: &AuditLogs,
+    action: Action,
+    target: u64,
+    observed_ms: i64,
+) -> Option<BTreeMap<String, String>> {
+    super::member_audit_vars(logs, action, target, observed_ms, |_| false).map(|(_, vars)| vars)
+}
+
+struct RepeatedAuditSink {
+    sink: Sink,
+    responses: Mutex<std::collections::VecDeque<AuditLogs>>,
+    fail_first_send: bool,
+    sends: std::sync::atomic::AtomicUsize,
+}
+#[serenity::async_trait]
+impl LogDelivery for RepeatedAuditSink {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        if self
+            .sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0
+            && self.fail_first_send
+        {
+            anyhow::bail!("fixture delivery failed");
+        }
+        self.sink.send(channel, message).await
+    }
+    async fn member_audit(&self, _: GuildId, _: Action) -> anyhow::Result<AuditLogs> {
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("no response"))
+    }
+}
+
+#[tokio::test]
+async fn repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report() {
+    for event in ["member_ban", "member_unban"] {
+        for previous in [Delivery::Sent, Delivery::Unconfigured, Delivery::Failed] {
+            let f = Fixture::with_timeout(4);
+            db::upsert_log_channel(&f.app.db, 789, event, 456)
+                .await
+                .unwrap();
+            if previous == Delivery::Unconfigured {
+                f.app
+                    .db
+                    .with_conn(move |conn| {
+                        conn.execute(
+                            "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,?1,?2)",
+                            db::params![event, r#"{"users":["777"],"channels":[]}"#],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            let action = member_audit_action(event).unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            let old = audit_fixture(action, 123, now - 4_000, Some("previous action"));
+            let old_again = audit_fixture(action, 123, now - 4_000, Some("previous action"));
+            let mut current = audit_fixture(action, 123, now, Some("current action"));
+            current.entries[0].user_id = serenity::model::id::UserId::new(888);
+            current.entries.push(old.entries[0].clone());
+            let sink = RepeatedAuditSink {
+                sink: Sink::default(),
+                responses: Mutex::new([old, old_again, current].into()),
+                fail_first_send: previous == Delivery::Failed,
+                sends: Default::default(),
+            };
+            let vars = templates::user_vars(123, "username", "Display");
+            assert_eq!(
+                emit_to(&f.app, &sink, GuildId::new(789), event, vars.clone()).await,
+                previous
+            );
+            assert_eq!(
+                emit_to(&f.app, &sink, GuildId::new(789), event, vars).await,
+                Delivery::Sent
+            );
+            let messages = sink.sink.messages.lock().unwrap();
+            let last = messages.last().unwrap().1["content"].as_str().unwrap();
+            assert!(last.contains("Moderator: <@888>"), "{last}");
+            assert!(last.contains("Reason: current action"), "{last}");
+            assert!(!last.contains("previous action"));
+            assert!(sink.responses.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn audit_claims_are_scoped_atomic_and_bounded_without_live_eviction() {
+    let claims = MemberAuditClaims::default();
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = chrono::Utc::now().timestamp_millis();
+    let logs = audit_fixture(action, 123, observed, None);
+    assert!(claims.claim(1, &logs, action, 123, observed).is_some());
+    assert!(claims.claim(1, &logs, action, 123, observed).is_none());
+    assert!(claims.claim(2, &logs, action, 123, observed).is_some());
+    {
+        let mut entries = claims.inner.lock();
+        for id in 0..MEMBER_AUDIT_LIMIT as u64 - 2 {
+            entries.insert((3, id), Instant::now());
+        }
+        assert_eq!(entries.len(), MEMBER_AUDIT_LIMIT);
+    }
+    assert!(claims.claim(4, &logs, action, 123, observed).is_none());
+    assert!(claims.claim(1, &logs, action, 123, observed).is_none());
+    for at in claims.inner.lock().values_mut() {
+        *at = Instant::now() - MEMBER_AUDIT_KEEP;
+    }
+    assert!(claims.claim(4, &logs, action, 123, observed).is_some());
+    assert_eq!(claims.inner.lock().len(), 1);
 }

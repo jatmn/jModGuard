@@ -40,6 +40,10 @@ Basic Discord log delivery is independent of those retired history tables.
   inaccessible, late or ambiguous entry produces explicit unavailable fields.
   A matching entry with no reason says "No reason provided". These display lookups
   do not create or change retained case-source associations and do not recover old logs.
+  Matched audit IDs are consumed before actor filtering or delivery, so a rapid repeat
+  action cannot reuse an entry already assigned to a report in this process. Receipts
+  are kept for 30 seconds, capped at 4096; a full receipt cache leaves attribution
+  unavailable rather than evicting a still-live identity.
 - Startup, routine command-plan execution and test/log-only automod reports use Discord
   channels, without a generic SQL event copy. Delete-only automod reports are transient.
   Plans containing timeout/kick/ban steps retain their existing SQL execution summary;
