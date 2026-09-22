@@ -827,6 +827,40 @@ impl LogDelivery for Sink {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let content = shutdown_notice_content(3_661);
+    assert_eq!(
+        content,
+        format!(
+            "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(
+        emit_system_notice_to(&f.app, &sink, GuildId::new(789), content).await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        emit_system_notice_to(&f.app, &sink, GuildId::new(790), "not configured".into()).await,
+        Delivery::Unconfigured
+    );
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, ChannelId::new(456));
+    let rendered = messages[0].1["content"].as_str().unwrap();
+    assert!(rendered.starts_with("**:gear: System notice**\n\n**Time:** `"));
+    assert!(rendered.ends_with(&format!(
+        "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+        env!("CARGO_PKG_VERSION")
+    )));
+}
+
+#[tokio::test]
 async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_routes_separate() {
     let f = Fixture::new();
     for (guild, channel) in [(789, 456), (790, 457)] {

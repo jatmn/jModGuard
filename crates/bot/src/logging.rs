@@ -693,6 +693,40 @@ pub async fn emit(
     emit_to(app, ctx.http.as_ref(), guild_id, event, vars).await;
 }
 
+/// Sends a lifecycle notice through the configured system log channel.
+pub async fn emit_system_notice(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    content: String,
+) {
+    emit_system_notice_to(app, http, guild_id, content).await;
+}
+
+async fn emit_system_notice_to(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    content: String,
+) -> Delivery {
+    emit_to(
+        app,
+        sink,
+        guild_id,
+        "system",
+        BTreeMap::from([("content".into(), content)]),
+    )
+    .await
+}
+
+pub fn shutdown_notice_content(uptime_seconds: u64) -> String {
+    format!(
+        "Bot shutting down (v{}). Uptime: {}",
+        env!("CARGO_PKG_VERSION"),
+        templates::format_duration(uptime_seconds)
+    )
+}
+
 #[serenity::async_trait]
 pub(crate) trait LogDelivery: Sync {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()>;

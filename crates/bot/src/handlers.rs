@@ -130,12 +130,13 @@ impl EventHandler for Handler {
                     if !commands::sync_slash_commands(&app, &ctx, gid).await {
                         failed = true;
                     }
-                    let mut vars = BTreeMap::new();
-                    vars.insert(
-                        "content".into(),
+                    logging::emit_system_notice(
+                        &app,
+                        &ctx.http,
+                        gid,
                         format!("Bot started (v{})", env!("CARGO_PKG_VERSION")),
-                    );
-                    logging::emit(&app, &ctx, gid, "system", vars).await;
+                    )
+                    .await;
                 }
                 if failed {
                     app.retry_slash_registry_version();
