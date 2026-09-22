@@ -37,6 +37,8 @@ git and are **not** extra Bunny Storage files. Defaults are jsDelivr
 `window.JMODGUARD_API_BASE`) to a Bunny pull zone or other host that caches
 those same URLs. If that runtime load fails, native `<select>` controls stay
 usable. Pale blue light and navy dark colors stay the existing theme tokens.
+First-party layout classes (`.hero`, `.card`, `.btn`, `.stat`) keep the
+workspace layout; daisyUI styles the searchable select widgets.
 
 Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.
