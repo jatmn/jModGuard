@@ -38,7 +38,10 @@ git and are **not** extra Bunny Storage files. Defaults are jsDelivr
 those same URLs. If that runtime load fails, native `<select>` controls stay
 usable. Pale blue light and navy dark colors stay the existing theme tokens.
 First-party layout classes (`.hero`, `.card`, `.btn`, `.stat`) keep the
-workspace layout; daisyUI styles the searchable select widgets.
+workspace layout; daisyUI styles the searchable select widgets. The page
+itself is not a daisyUI drawer: `:root` overflow stays visible, and the
+workspace fills the viewport without a nested sidebar scroller or a 1440px
+content cap.
 
 Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.

@@ -1715,6 +1715,11 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.match(css, /\.card\s*\{[^}]*display:\s*block/);
   assert.match(css, /\.stat\s*\{[^}]*display:\s*block/);
   assert.match(css, /\.btn\s*\{[^}]*height:\s*auto/);
+  assert.match(css, /--page-overflow:\s*visible/);
+  assert.match(css, /#main-view\s*\{[^}]*display:\s*flex/);
+  assert.match(css, /\.sidebar\s*\{[^}]*overflow:\s*visible/);
+  assert.match(css, /#content\s*\{[^}]*max-width:\s*none/);
+  assert.doesNotMatch(css, /\.sidebar\s*\{[^}]*position:\s*fixed/);
   assert.equal(fs.existsSync(new URL('../frontend/package.json', import.meta.url)), false);
   assert.equal(fs.existsSync(new URL('../frontend/node_modules', import.meta.url)), false);
 });
