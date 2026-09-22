@@ -1482,7 +1482,7 @@ function editRule(r) {
     ),
     spam ? null : el("div", { class: "field" },
       el("label", { text: "Action escalation" }),
-      el("p", { class: "field-help", text: "At each strike count, the highest-severity eligible action runs. Timeout minutes apply to timeout; delete-history days apply to ban." }), actionsRows,
+      el("p", { class: "field-help", text: "Strike count is the threshold for an action. Timeout minutes apply to timeout; delete-history days apply to ban." }), actionsRows,
       el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
     el("div", { class: "row form-row" },
