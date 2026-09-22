@@ -83,7 +83,7 @@ body { background: var(--bg); color: var(--text); }
 .brand { display: flex; align-items: center; gap: 12px; font-size: 21px; font-weight: 750; letter-spacing: -.6px; padding: 0 8px; }
 .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 46px; flex-shrink: 0; background: var(--selected); color: var(--selected-text); border-radius: 13px 13px 18px 18px; font-size: 21px; font-weight: 800; letter-spacing: -1.5px; }
 .brand small { display: block; color: var(--side-muted); font-size: 8px; font-weight: 600; letter-spacing: 1.6px; }
-.server-picker { margin: 30px 0 12px; padding: 14px 10px; background: var(--side-panel); border: 1px solid var(--side-border); border-radius: var(--radius-box); }
+.server-picker { margin: 22px 0 4px; padding: 0 10px 8px; }
 .server-picker label, .nav-label { display: block; font-size: 10px; letter-spacing: 1.6px; font-weight: 650; color: var(--side-muted); }
 .nav-label { margin: 14px 12px 7px; }
 #tabs button span { width: 20px; text-align: center; font-size: 20px; line-height: 1; }
@@ -124,7 +124,15 @@ body { background: var(--bg); color: var(--text); }
 
 .search-select { position: relative; flex: 1 1 180px; min-width: min(180px, 100%); }
 .server-picker .search-select { width: 100%; margin-top: 6px; }
-.search-select-control { width: 100%; }
+.search-select-control { position: relative; width: 100%; }
+.search-select-control .search-select-input {
+  flex: 1; width: 100%; min-width: 0; min-height: 0; height: auto; padding: 0;
+  border: 0; outline: none; background: transparent; box-shadow: none; color: inherit; font: inherit;
+}
+.search-select-button {
+  position: absolute; inset-inline-end: 0; top: 0; bottom: 0; width: 1.75rem;
+  padding: 0; border: 0; background: transparent; box-shadow: none; color: transparent;
+}
 .search-select-native { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 .search-select-options { z-index: 80; min-width: 12rem; max-height: 16rem; overflow: auto; }
 .search-select-option { cursor: pointer; }
@@ -167,7 +175,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--border); border-ra
   #main-view { flex-direction: column; }
   .sidebar { position: static; width: 100%; flex-basis: auto; min-height: 0; padding: 18px 16px 12px; overflow: visible; }
   .brand { font-size: 19px; } .brand small { font-size: 8px; }
-  .server-picker { margin: 16px 0 10px; padding: 10px; }
+  .server-picker { margin: 16px 0 8px; padding: 0 10px 8px; }
   #tabs { flex-direction: row; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 6px; }
   #tabs li { flex-shrink: 0; }
   #tabs button span { display: none; } .nav-label { display: none; }

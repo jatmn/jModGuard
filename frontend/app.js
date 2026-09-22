@@ -340,15 +340,15 @@ function makeSearchSelect(React, Headless, select) {
       },
       onClose: () => setQuery(""),
     },
-      React.createElement("div", { className: "join w-full search-select-control" },
+      React.createElement("div", { className: `select select-bordered w-full search-select-control${select.closest(".server-picker") ? " select-sm" : ""}` },
         React.createElement(ComboboxInput, {
           id: labeledId || undefined,
-          className: "input input-bordered join-item w-full search-select-input",
+          className: "search-select-input",
           "aria-label": labeledId ? undefined : (select.getAttribute("aria-label") || "Search options"),
           displayValue: (item) => item?.label || "",
           onChange: (event) => setQuery(event.target.value),
         }),
-        ComboboxButton ? React.createElement(ComboboxButton, { className: "btn btn-neutral join-item search-select-button", "aria-label": "Show options" }, "▾") : null,
+        ComboboxButton ? React.createElement(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾") : null,
       ),
       React.createElement(ComboboxOptions, {
         className: "search-select-options menu bg-base-100 rounded-box shadow-lg",
