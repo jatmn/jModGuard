@@ -98,8 +98,10 @@ go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
 The browser loads daisyUI CSS and Headless UI from a CDN at runtime; do not
 upload those libraries into Storage. To serve them from your own pull zone
 instead of the public defaults, set `window.JMODGUARD_DAISYUI_HREF` and
-`window.JMODGUARD_ESM_BASE` in `index.html` (same override pattern as
-`window.JMODGUARD_API_BASE`).
+`window.JMODGUARD_ESM_BASE` before `app.js` (same override pattern as
+`window.JMODGUARD_API_BASE`). `app.js` writes the CSS href onto the daisyUI
+`<link>`; setting the CSS override above that link in `index.html` avoids a
+second stylesheet request.
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
 When creating the Storage Zone, select a **primary region and at least one replication region**.

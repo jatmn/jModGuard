@@ -246,6 +246,18 @@ function vendorCssHref() {
   return String(href || VENDOR.daisyuiCss);
 }
 
+function applyVendorCss() {
+  if (typeof document === "undefined" || typeof document.getElementById !== "function") return;
+  const link = document.getElementById("jmodguard-daisyui");
+  if (!link) return;
+  const href = vendorCssHref();
+  if (!href) return;
+  const current = typeof link.getAttribute === "function" ? link.getAttribute("href") : link.href;
+  if (current === href) return;
+  if (typeof link.setAttribute === "function") link.setAttribute("href", href);
+  else link.href = href;
+}
+
 function vendorEsmBase() {
   const base = typeof window !== "undefined" ? window.JMODGUARD_ESM_BASE : "";
   return String(base || VENDOR.esm).replace(/\/$/, "");
@@ -277,10 +289,11 @@ let vendorRuntimePromise = null;
 
 function vendorModule(mod, names) {
   if (!mod) return null;
-  const has = (obj) => obj && names.every((name) => obj[name] != null);
+  const usable = (value) => typeof value === "function" || (value && typeof value === "object");
+  const has = (obj) => obj && names.every((name) => usable(obj[name]));
   if (has(mod)) return mod;
-  if (has(mod.default)) return Object.assign({}, mod.default, mod);
-  return mod;
+  if (has(mod.default)) return Object.assign({}, mod, mod.default);
+  return null;
 }
 
 function loadSearchSelectRuntime() {
@@ -296,7 +309,7 @@ function loadSearchSelectRuntime() {
       const React = vendorModule(reactMod, ["createElement", "useState"]);
       const ReactDOM = vendorModule(reactDomMod, ["createRoot"]);
       const Headless = vendorModule(headlessMod, ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"]);
-      if (typeof React?.createElement !== "function" || typeof ReactDOM?.createRoot !== "function" || !Headless?.Combobox) {
+      if (!React || !ReactDOM || !Headless) {
         throw new Error("vendor runtime missing Combobox exports");
       }
       return { React, ReactDOM, Headless };
@@ -2496,6 +2509,7 @@ function initTheme() {
 
 function bootUi() {
   capturePreviewToken();
+  applyVendorCss();
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
@@ -2531,6 +2545,7 @@ function bootUi() {
   init().catch((e) => { toast("Init failed: " + e.message, "error"); });
 }
 
+if (typeof document !== "undefined") applyVendorCss();
 if (typeof document !== "undefined" && document.getElementById?.("app")) {
   bootUi();
 }

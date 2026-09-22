@@ -35,7 +35,10 @@ git and are **not** extra Bunny Storage files. Defaults are jsDelivr
 `@headlessui/react@2.2.10`). Set `window.JMODGUARD_DAISYUI_HREF` and
 `window.JMODGUARD_ESM_BASE` before `app.js` (the same pattern as
 `window.JMODGUARD_API_BASE`) to a Bunny pull zone or other host that caches
-those same URLs. If that runtime load fails, native `<select>` controls stay
+those same URLs. `app.js` applies the CSS href to the daisyUI `<link>` when it
+loads, so an override placed with the API base still replaces the default
+stylesheet. Putting the CSS override above that `<link>` in `index.html`
+avoids a second fetch. If that runtime load fails, native `<select>` controls stay
 usable. Pale blue light and navy dark colors stay the existing theme tokens.
 Buttons, cards, hero, stats, badges, tables, inputs, and the searchable
 select use daisyUI (and Headless Combobox) component classes mapped onto
@@ -82,7 +85,7 @@ bundle on every main SHA. To repeat an upload from a checkout, run
 (match the API revision when the page needs new endpoints; CSS/layout-only
 files can be newer). The page still fetches daisyUI and Headless UI from the
 runtime CDN unless you override `window.JMODGUARD_DAISYUI_HREF` and
-`window.JMODGUARD_ESM_BASE`. If the API is on a **different** hostname than the pages,
+`window.JMODGUARD_ESM_BASE` before `app.js` loads. If the API is on a **different** hostname than the pages,
 set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads,
 and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
 OAuth still happens on `web.base_url`: `/login` and `/oauth/callback`

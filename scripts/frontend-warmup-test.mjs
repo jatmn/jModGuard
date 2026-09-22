@@ -11,6 +11,9 @@ const src = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
 
 function loadFrontend(fetchImpl, clock, timers) {
   const document = {
+    getElementById() {
+      return null;
+    },
     querySelector() {
       return {
         classList: { toggle() {} },

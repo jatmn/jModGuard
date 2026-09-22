@@ -51,7 +51,8 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
         }
         return null;
       },
-      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
+      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); if (k === "href") this.href = String(v); },
+      getAttribute(k) { return this.attrs[k] ?? (k === "href" ? this.href : undefined); },
       removeAttribute(k) { delete this.attrs[k]; },
       addEventListener(k, v) { this.listeners[k] = v; },
       querySelectorAll(selector) {
@@ -73,7 +74,13 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       },
     };
   };
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link'].map((key) => [key, node('div')]));
+  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link', '#jmodguard-daisyui'].map((key) => [key, node('div')]));
+  const daisy = nodes.get('#jmodguard-daisyui');
+  daisy.tag = 'link';
+  daisy.tagName = 'LINK';
+  daisy.attrs.href = 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css';
+  daisy.href = daisy.attrs.href;
+  const win = { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } };
   for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
     nodes.get(key).classList.add('hidden');
   }
@@ -81,18 +88,19 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
+      getElementById: (id) => nodes.get('#' + id) || null,
       querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => String(n.className).split(/\s+/).includes('modal-overlay')) : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } },
+    window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -1698,6 +1706,26 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.equal(app.VENDOR.headless, '2.2.10');
   assert.equal(app.vendorCssHref(), app.VENDOR.daisyuiCss);
   assert.equal(app.vendorEsmBase(), 'https://esm.sh');
+  const names = ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"];
+  const incomplete = { Combobox() {} };
+  assert.equal(app.vendorModule(incomplete, names), null);
+  const complete = { Combobox() {}, ComboboxInput() {}, ComboboxOptions() {}, ComboboxOption() {} };
+  assert.equal(app.vendorModule(complete, names), complete);
+  const asObjects = { Combobox: { $$typeof: 1 }, ComboboxInput: { $$typeof: 1 }, ComboboxOptions: { $$typeof: 1 }, ComboboxOption: { $$typeof: 1 } };
+  assert.equal(app.vendorModule(asObjects, names), asObjects);
+  const fromDefault = { Combobox() {}, ComboboxInput: undefined, default: complete };
+  const merged = app.vendorModule(fromDefault, names);
+  assert.equal(typeof merged.Combobox, "function");
+  assert.equal(typeof merged.ComboboxInput, "function");
+  assert.equal(typeof merged.ComboboxOptions, "function");
+  assert.equal(typeof merged.ComboboxOption, "function");
+  const { app: cssApp, window: cssWindow, nodes: cssNodes } = harness();
+  cssWindow.JMODGUARD_DAISYUI_HREF = "https://cdn.example.test/daisyui.css";
+  assert.equal(cssApp.vendorCssHref(), "https://cdn.example.test/daisyui.css");
+  cssApp.applyVendorCss();
+  assert.equal(cssNodes.get("#jmodguard-daisyui").getAttribute("href"), "https://cdn.example.test/daisyui.css");
+  assert.match(js, /function applyVendorCss/);
+  assert.match(js, /vendorModule\(headlessMod, \["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"\]\)/);
   assert.match(js, /@headlessui\/react@/);
   assert.match(js, /esm\.sh/);
   assert.doesNotMatch(js, /node_modules/);
