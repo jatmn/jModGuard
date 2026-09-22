@@ -136,7 +136,7 @@ body { background: var(--bg); color: var(--text); }
   padding: 0; border: 0; background: transparent; box-shadow: none; color: transparent;
 }
 .search-select-native { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
-.search-select-options { z-index: 80; min-width: 12rem; max-height: 16rem; overflow: auto; }
+.search-select-options { z-index: 1100; min-width: 12rem; max-height: 16rem; overflow: auto; }
 .search-select-option { cursor: pointer; }
 .search-select-empty { padding: 8px 12px; color: var(--muted); }
 

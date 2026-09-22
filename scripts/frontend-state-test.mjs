@@ -1698,7 +1698,9 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
   const { app } = harness();
   assert.match(html, /cdn\.jsdelivr\.net\/npm\/daisyui@5\.7\.43\/daisyui\.css/);
-  assert.match(html, /id="jmodguard-daisyui"/);
+  assert.match(html, /link\.id = "jmodguard-daisyui"/);
+  assert.match(html, /link\.href = window\.JMODGUARD_DAISYUI_HREF/);
+  assert.doesNotMatch(html, /<link[^>]*id="jmodguard-daisyui"/);
   assert.ok(html.indexOf('jmodguard-daisyui') < html.indexOf('href="/style.css"'));
   assert.equal(app.VENDOR.daisyuiCss, 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css');
   assert.equal(app.VENDOR.esm, 'https://esm.sh');
@@ -1748,6 +1750,7 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.doesNotMatch(css, /\.hero\s*\{[^}]*background:/);
   assert.doesNotMatch(css, /\.stat-grid/);
   assert.doesNotMatch(css, /\.btn\.primary/);
+  assert.match(css, /\.search-select-options\s*\{[^}]*z-index:\s*1100/);
   assert.match(css, /--color-base-100:\s*var\(--panel\)/);
   assert.match(js, /hero-content/);
   assert.match(js, /stat-title/);

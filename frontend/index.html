@@ -19,14 +19,12 @@ try {
 <script>
 window.JMODGUARD_DAISYUI_HREF = window.JMODGUARD_DAISYUI_HREF || "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css";
 window.JMODGUARD_ESM_BASE = window.JMODGUARD_ESM_BASE || "https://esm.sh";
-</script>
-<link rel="stylesheet" id="jmodguard-daisyui" href="https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css">
-<script>
 (function () {
-  const link = document.getElementById("jmodguard-daisyui");
-  if (link && window.JMODGUARD_DAISYUI_HREF && link.getAttribute("href") !== window.JMODGUARD_DAISYUI_HREF) {
-    link.href = window.JMODGUARD_DAISYUI_HREF;
-  }
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.id = "jmodguard-daisyui";
+  link.href = window.JMODGUARD_DAISYUI_HREF;
+  document.head.appendChild(link);
 })();
 </script>
 <link rel="stylesheet" href="/style.css">
