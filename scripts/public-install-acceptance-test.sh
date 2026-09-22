@@ -108,6 +108,7 @@ import path from "node:path";
 
 const root = process.argv[2];
 const expected = [
+  "View Audit Log",
   "Kick Members",
   "Ban Members",
   "Manage Nicknames",

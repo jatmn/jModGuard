@@ -134,6 +134,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        self.app.member_joins.clear_guild(guild.id.get());
         let app = Arc::clone(self.app());
         let gid = guild.id;
         match crate::enrollment_repair::observe_gateway_membership(
@@ -167,6 +168,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());
         self.app.text_spam.invalidate_guild(incomplete.id.get());
         let joined = full
@@ -193,6 +195,7 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
+        app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
         logging::emit_member_event(
             &app,
@@ -200,7 +203,7 @@ impl EventHandler for Handler {
             guild_id,
             "member_join",
             &new_member.user,
-            BTreeMap::new(),
+            logging::member_join_vars(new_member.joined_at, chrono::Utc::now()),
         )
         .await;
     }
@@ -219,18 +222,16 @@ impl EventHandler for Handler {
             .text_spam
             .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
-        let mut extra = BTreeMap::new();
-        extra.insert(
-            "duration".into(),
-            member_data
-                .and_then(|m| m.joined_at)
-                .map(|joined| format!("joined at {joined}"))
-                .unwrap_or_else(|| "unavailable".into()),
+        let observed_join = app.member_joins.take(guild_id.get(), user.id.get());
+        let extra = logging::member_join_vars(
+            member_data.and_then(|m| m.joined_at).or(observed_join),
+            chrono::Utc::now(),
         );
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra).await;
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
+        let observed = chrono::Utc::now().to_rfc3339();
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ = db::record_enrolled_ban(
@@ -260,11 +261,12 @@ impl EventHandler for Handler {
             .await;
         }
         let mut extra = BTreeMap::new();
-        extra.insert("reason".into(), "banned".into());
+        extra.insert("time".into(), observed);
         logging::emit_member_event(&app, &ctx, guild_id, "member_ban", &banned_user, extra).await;
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
+        let observed = chrono::Utc::now().to_rfc3339();
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ =
@@ -289,7 +291,7 @@ impl EventHandler for Handler {
             .await;
         }
         let mut extra = BTreeMap::new();
-        extra.insert("reason".into(), "unbanned".into());
+        extra.insert("time".into(), observed);
         logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)
             .await;
     }
@@ -329,6 +331,11 @@ impl EventHandler for Handler {
         let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
+        app.member_joins.remember(
+            guild_id.get(),
+            msg.author.id.get(),
+            msg.member.as_ref().and_then(|member| member.joined_at),
+        );
 
         // Capture the already-delivered identity before configuration loading
         // yields, so a fast partial edit can still apply its user-ID filter.
@@ -476,6 +483,17 @@ impl EventHandler for Handler {
             })
         });
         if let Some(guild) = event.guild_id {
+            if let Some(author) = known_author_id {
+                self.app.member_joins.remember(
+                    guild.get(),
+                    author,
+                    event
+                        .member
+                        .as_ref()
+                        .and_then(|member| member.as_ref())
+                        .and_then(|member| member.joined_at),
+                );
+            }
             let channel = event.channel_id.get();
             let message = event.id.get();
             let update = UpdateObservation {

@@ -52,6 +52,7 @@ Use the **URL Generator** (OAuth2 → URL Generator):
 - Bot permissions (minimum set; add more if you want `!lockdown`-style power later).
   Tick them in this Discord URL Generator order:
   - **General:**
+    - `View Audit Log` (moderator/reason details in ban and unban logs)
     - `Kick Members`
     - `Ban Members`
     - `Manage Nicknames` (WebUI nickname apply/clear and `!setname` / `/setname`)
