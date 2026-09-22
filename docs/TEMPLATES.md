@@ -42,7 +42,7 @@ Unknown variables are left untouched so template mistakes are visible.
 - **member_leave** — left, cached join timestamp when available; no historical join count
 - **member_ban** / **member_unban** — hammer/unlock with actor + reason
 - **member_kick** — boot with actor + reason
-- **message_edit** — supplied current text, attachment count and message reference
+- **message_edit** — one Discord-identified edit (`edited_timestamp`); supplied current text, attachment count and message reference. Not embed/GIF unfurls, chat replies, or the bot's own log posts.
 - **message_delete** — message ID; author/content unavailable
 - **message_bulk_delete** — count in channel
 - **automod** — shield: rule, action, reason, evidence, channel

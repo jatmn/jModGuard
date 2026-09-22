@@ -43,8 +43,15 @@ impl EditReportDedup {
         let Some(guild) = event.guild_id else {
             return false;
         };
+        // Discord sets edited_timestamp only for an actual edit. Embed, GIF/link
+        // unfurl, reply-preview, pin, and flag refreshes omit it. Do not store
+        // those as a reported observation, or a later timestamped edit of the
+        // same text would be coalesced away.
+        let Some(edited_at) = event.edited_timestamp else {
+            return false;
+        };
         let content = event.content.as_ref().map(fingerprint);
-        let edited_at_ms = event.edited_timestamp.map(|time| time.timestamp_millis());
+        let edited_at_ms = Some(edited_at.timestamp_millis());
         let attachments = event.attachments.as_ref().map(|items| {
             fingerprint(
                 &items
@@ -458,13 +465,30 @@ fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<S
 }
 
 /// Use only fields in the delivered update; cache-filled values are not edit history.
-/// Embed/pin-only refreshes do not prove a content edit and produce no report.
+/// Discord sets `edited_timestamp` only for an actual edit. Embed, GIF/link unfurl,
+/// reply-preview, pin, and flag refreshes omit it and produce no report — even when
+/// the Gateway repeats the original content, a `message_reference`, or an empty
+/// attachment list. The bot never reports Gateway updates of its own messages, so a
+/// log post cannot stack into another `message_edit` report.
 pub(crate) fn message_update_report(
     event: &MessageUpdateEvent,
     known_author_id: Option<u64>,
+    bot_user_id: Option<u64>,
 ) -> Option<MessageReport> {
     let guild_id = event.guild_id?;
+    event.edited_timestamp?;
     if event.content.is_none() && event.attachments.is_none() {
+        return None;
+    }
+    let author_id = event
+        .author
+        .as_ref()
+        .map(|author| author.id.get())
+        .or(known_author_id)
+        .filter(|id| *id != 0);
+    if let (Some(author_id), Some(bot_user_id)) = (author_id, bot_user_id.filter(|id| *id != 0))
+        && author_id == bot_user_id
+    {
         return None;
     }
     let mut vars = message_vars(guild_id, event.channel_id, event.id);

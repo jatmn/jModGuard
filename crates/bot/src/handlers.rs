@@ -521,7 +521,9 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if let Some(report) = logging::message_update_report(&event, known_author_id)
+        let bot_user_id = ctx.cache.current_user().id.get();
+        if let Some(report) =
+            logging::message_update_report(&event, known_author_id, Some(bot_user_id))
             && self.app.edit_reports.should_report(&event)
         {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;

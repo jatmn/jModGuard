@@ -5,6 +5,8 @@ use crate::db::SqlExecutor;
 use crate::state::BotState;
 use std::sync::Mutex;
 
+const EDITED: &str = "2026-09-21T00:00:01.000Z";
+
 fn update(fields: serde_json::Value) -> MessageUpdateEvent {
     let mut value = serde_json::json!({"id":"123", "channel_id":"456", "guild_id":"789"});
     value
@@ -14,10 +16,25 @@ fn update(fields: serde_json::Value) -> MessageUpdateEvent {
     serde_json::from_value(value).unwrap()
 }
 
+fn edited(fields: serde_json::Value) -> MessageUpdateEvent {
+    edited_at(fields, EDITED)
+}
+
+fn edited_at(mut fields: serde_json::Value, timestamp: &str) -> MessageUpdateEvent {
+    fields.as_object_mut().unwrap().insert(
+        "edited_timestamp".into(),
+        serde_json::Value::String(timestamp.to_string()),
+    );
+    update(fields)
+}
+
+fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Option<MessageReport> {
+    message_update_report(event, known_author_id, None)
+}
+
 #[test]
 fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
-    let report =
-        message_update_report(&update(serde_json::json!({"content":"new text"})), None).unwrap();
+    let report = edit_report(&edited(serde_json::json!({"content":"new text"})), None).unwrap();
     assert_eq!(report.vars["after"], "new text");
     assert_eq!(report.vars["before"], "not retained");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -26,36 +43,115 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
         "https://discord.com/channels/789/456/123"
     );
     let attachment_only =
-        message_update_report(&update(serde_json::json!({"attachments":[]})), None).unwrap();
+        edit_report(&edited(serde_json::json!({"attachments":[]})), None).unwrap();
     assert_eq!(attachment_only.vars["attachments"], "0");
     assert_eq!(attachment_only.vars["after"], "not supplied in this update");
-    let emptied = message_update_report(&update(serde_json::json!({"content":""})), None).unwrap();
+    let emptied = edit_report(&edited(serde_json::json!({"content":""})), None).unwrap();
     assert_eq!(emptied.vars["after"], "");
     assert!(
-        message_update_report(
+        edit_report(
             &update(serde_json::json!({"embeds":[],"pinned":true})),
             None
         )
         .is_none()
     );
-    let mut dm = update(serde_json::json!({"content":"private"}));
+    let mut dm = edited(serde_json::json!({"content":"private"}));
     dm.guild_id = None;
-    assert!(message_update_report(&dm, None).is_none());
+    assert!(edit_report(&dm, None).is_none());
+}
+
+#[test]
+fn untimestamped_unfurls_and_empty_attachments_are_not_edits() {
+    let gif = update(serde_json::json!({
+        "content":"https://tenor.com/view/wtf-is-this-thomasvanhaecht-vubdiscord-walking-in-on-the-wrong-thing-walking-in-gif-21572821",
+        "attachments":[],
+        "embeds":[{"url":"https://tenor.com/view/example.gif"}]
+    }));
+    assert!(edit_report(&gif, None).is_none());
+    assert!(edit_report(&update(serde_json::json!({"content":"new text"})), None).is_none());
+    assert!(edit_report(&update(serde_json::json!({"attachments":[]})), None).is_none());
+    let dedup = EditReportDedup::default();
+    assert!(!dedup.should_report(&gif));
+    assert!(!dedup.should_report(&update(serde_json::json!({"content":"new text"}))));
+    let real = edited(serde_json::json!({"content":"actually edited"}));
+    assert_eq!(
+        edit_report(&real, None).unwrap().vars["after"],
+        "actually edited"
+    );
+    assert!(dedup.should_report(&real));
+}
+
+#[test]
+fn untimestamped_reply_refreshes_are_not_edits() {
+    let reply = update(serde_json::json!({
+        "content":"replying to that gif",
+        "attachments":[],
+        "type": 19,
+        "timestamp":"2026-09-22T14:52:00.000Z",
+        "message_reference": {
+            "message_id":"111",
+            "channel_id":"456",
+            "guild_id":"789"
+        }
+    }));
+    assert!(edit_report(&reply, None).is_none());
+    let dedup = EditReportDedup::default();
+    assert!(!dedup.should_report(&reply));
+    let edited_reply = edited(serde_json::json!({
+        "content":"edited the reply",
+        "type": 19,
+        "message_reference": {
+            "message_id":"111",
+            "channel_id":"456",
+            "guild_id":"789"
+        }
+    }));
+    assert_eq!(
+        edit_report(&edited_reply, None).unwrap().vars["after"],
+        "edited the reply"
+    );
+    assert!(dedup.should_report(&edited_reply));
+}
+
+#[test]
+fn bot_own_log_updates_do_not_stack_prior_reports() {
+    let nested =
+        "**:pencil2: Message updated in <#456>**\nCurrent text: https://tenor.com/view/example";
+    let mut log_update = edited(serde_json::json!({"content": nested}));
+    let mut author = serenity::model::user::User::default();
+    author.id = serenity::model::id::UserId::new(99);
+    author.name = "jModGuard".into();
+    log_update.author = Some(author);
+    assert!(message_update_report(&log_update, None, Some(99)).is_none());
+    let reported = message_update_report(&log_update, None, Some(1)).unwrap();
+    assert_eq!(reported.vars["after"], nested);
+    let mut anonymous = edited(serde_json::json!({"content": nested}));
+    anonymous.author = None;
+    assert!(message_update_report(&anonymous, Some(99), Some(99)).is_none());
+    assert_eq!(
+        message_update_report(&anonymous, Some(99), Some(1))
+            .unwrap()
+            .vars["user_id"],
+        "99"
+    );
 }
 
 #[test]
 fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
     let dedup = EditReportDedup::default();
-    let first = update(serde_json::json!({"content":"first"}));
+    let first = edited(serde_json::json!({"content":"first"}));
     assert!(dedup.should_report(&first));
     assert!(!dedup.should_report(&first));
     assert!(!dedup.should_report(&first));
-    let changed = update(serde_json::json!({"content":"second"}));
+    let changed = edited_at(
+        serde_json::json!({"content":"second"}),
+        "2026-09-21T00:00:02.000Z",
+    );
     assert!(dedup.should_report(&changed));
     assert!(!dedup.should_report(&changed));
     assert!(
-        dedup.should_report(&first),
-        "a later distinct observation restores the first fingerprint"
+        !dedup.should_report(&first),
+        "a replay of an earlier timestamp is still the same reported edit"
     );
     let mut other_channel = first.clone();
     other_channel.channel_id = ChannelId::new(999);
@@ -65,19 +161,25 @@ fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
 #[test]
 fn partial_fields_for_one_edit_are_one_observation() {
     let dedup = EditReportDedup::default();
-    let content = update(serde_json::json!({"content":"edited"}));
-    let attachments = update(serde_json::json!({"attachments":[]}));
-    let combined = update(serde_json::json!({"content":"edited","attachments":[]}));
+    let content = edited(serde_json::json!({"content":"edited"}));
+    let attachments = edited(serde_json::json!({"attachments":[]}));
+    let combined = edited(serde_json::json!({"content":"edited","attachments":[]}));
     assert!(dedup.should_report(&content));
     assert!(!dedup.should_report(&attachments));
     assert!(!dedup.should_report(&combined));
-    assert!(dedup.should_report(&update(serde_json::json!({"content":"edited again"}))));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"edited again"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
 
     let reverse = EditReportDedup::default();
     assert!(reverse.should_report(&attachments));
     assert!(!reverse.should_report(&content));
     assert!(!reverse.should_report(&combined));
-    assert!(reverse.should_report(&update(serde_json::json!({"content":"edited again"}))));
+    assert!(reverse.should_report(&edited_at(
+        serde_json::json!({"content":"edited again"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
 }
 
 #[test]
@@ -128,63 +230,48 @@ fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
         "edited_timestamp":"2026-09-21T00:00:02.000Z"
     }))));
 
-    let attachment = |description: &str| {
-        update(serde_json::json!({"attachments":[{
-            "id":"555", "filename":"image.png", "description":description,
-            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
-            "size":100
-        }]}))
+    let attachment = |description: &str, timestamp: &str| {
+        edited_at(
+            serde_json::json!({"attachments":[{
+                "id":"555", "filename":"image.png", "description":description,
+                "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+                "size":100
+            }]}),
+            timestamp,
+        )
     };
     let metadata = EditReportDedup::default();
-    assert!(metadata.should_report(&attachment("before")));
-    assert!(!metadata.should_report(&attachment("before")));
-    assert!(metadata.should_report(&attachment("after")));
+    assert!(metadata.should_report(&attachment("before", EDITED)));
+    assert!(!metadata.should_report(&attachment("before", EDITED)));
+    assert!(metadata.should_report(&attachment("after", "2026-09-21T00:00:02.000Z")));
 }
 
 #[test]
-fn timestamp_arriving_after_a_reported_untimestamped_edit_does_not_report_twice() {
+fn untimestamped_refresh_does_not_hide_a_later_timestamped_edit() {
     let dedup = EditReportDedup::default();
-    assert!(dedup.should_report(&update(serde_json::json!({
-        "content":"before", "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(dedup.should_report(&update(serde_json::json!({"content":"after"}))));
-    assert!(!dedup.should_report(&update(serde_json::json!({
-        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
-    assert!(!dedup.should_report(&update(serde_json::json!({
-        "attachments":[], "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
-    assert!(dedup.should_report(&update(serde_json::json!({
-        "content":"third", "edited_timestamp":"2026-09-21T00:00:03.000Z"
-    }))));
-
-    let partial = EditReportDedup::default();
-    let attachment = serde_json::json!({
-        "id":"555", "filename":"image.png", "description":"new",
-        "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
-        "size":100
-    });
-    assert!(partial.should_report(&update(serde_json::json!({
-        "content":"before", "attachments":[],
-        "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(partial.should_report(&update(serde_json::json!({"content":"after"}))));
-    assert!(!partial.should_report(&update(serde_json::json!({
-        "attachments":[attachment],
-    }))));
-    assert!(!partial.should_report(&update(serde_json::json!({
-        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
+    assert!(!dedup.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"after"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
+    assert!(!dedup.should_report(&edited_at(
+        serde_json::json!({"attachments":[]}),
+        "2026-09-21T00:00:02.000Z"
+    )));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"third"}),
+        "2026-09-21T00:00:03.000Z"
+    )));
 }
 
 #[test]
 fn supplied_author_id_reaches_message_edit_filter() {
-    let mut event = update(serde_json::json!({"content":"edited"}));
+    let mut event = edited(serde_json::json!({"content":"edited"}));
     let mut author = serenity::model::user::User::default();
     author.id = serenity::model::id::UserId::new(42);
     author.name = "otherbot".into();
     event.author = Some(author);
-    let report = message_update_report(&event, None).unwrap();
+    let report = edit_report(&event, None).unwrap();
     assert_eq!(report.vars["user_id"], "42");
     assert!(excluded(
         &db::LogFilter {
@@ -208,8 +295,8 @@ fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
     remember_message(&f.app, 789, 456, 123, Some(42), "the other bot's report");
     let known = known_message_author(&f.app, 789, 456, 123);
     assert_eq!(known, Some(42));
-    let event = update(serde_json::json!({"content":"edited report"}));
-    let report = message_update_report(&event, known).unwrap();
+    let event = edited(serde_json::json!({"content":"edited report"}));
+    let report = edit_report(&event, known).unwrap();
     assert_eq!(report.vars["user_id"], "42");
     assert_eq!(report.vars["user"], "unavailable");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -222,7 +309,7 @@ fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
         &report.vars,
     ));
     assert_eq!(known_message_author(&f.app, 789, 456, 999), None);
-    let cold = message_update_report(&event, None).unwrap();
+    let cold = edit_report(&event, None).unwrap();
     assert_eq!(cold.vars["user_id"], "unavailable");
 }
 
@@ -494,9 +581,9 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
         .unwrap();
     let sink = Sink::default();
     for guild in [789, 790] {
-        let mut event = update(serde_json::json!({"content":"hello"}));
+        let mut event = edited(serde_json::json!({"content":"hello"}));
         event.guild_id = Some(GuildId::new(guild));
-        let report = message_update_report(&event, None).unwrap();
+        let report = edit_report(&event, None).unwrap();
         assert_eq!(
             emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await,
             Delivery::Sent

@@ -10,13 +10,16 @@ Basic Discord log delivery is independent of those retired history tables.
   references. A supplied author sets the display name; for ID-only filtering, a
   recent observation of that exact message can supply its author ID when the edit
   omits the author. An unknown author remains unavailable. An absent field is
-  unknown, not empty. Embed/pin-only refreshes are skipped. Reports say
+  unknown, not empty. Discord sets `edited_timestamp` only for an actual edit;
+  Gateway refreshes that omit it (embed, GIF/link unfurl, reply preview, pin,
+  flags), including full objects that repeat the original content, a
+  `message_reference`, or an empty attachment list, are not reports. The bot does
+  not report Gateway updates of its own messages, so a log post cannot stack prior
+  reports as current text. Each report is one observed edit. Reports say
   "updated"; they do not claim a verified before/after
-  diff. A bounded 10-second fingerprint merges partial content/attachment updates for
-  the same message in one bot process. A later distinct edit timestamp reports
-  again; a timestamp that arrives after the same untimestamped observation is
-  coalesced. Without timestamps, a later change to a field already supplied for
-  that edit can trigger another report.
+  diff. A bounded 10-second fingerprint merges partial content/attachment updates
+  that share an edit timestamp for the same message in one bot process. A later
+  distinct edit timestamp reports again.
 - Each guild can save ignored Discord user IDs (including bot IDs) and source channel
   IDs separately for each event in Log Channels. Matching uses the IDs known to
   the report. If no user ID is known, only a source channel exclusion can apply.

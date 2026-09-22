@@ -34,7 +34,9 @@ family/version checks before bootstrap writes. Never adopt an unmarked old datab
 Routine collection of message text/attachments and member/user activity is retired.
 See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
 Basic events report to Discord using supplied fields, with bounded delivery and no
-history reconstruction. General message caching stays disabled. Keep selected moderation
+history reconstruction. Message-edit reports require Discord's `edited_timestamp`;
+embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
+report is that one event. General message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
 not create durable audit rows. Internal retention fields remain transitional with no
 collection effect. Unsupported databases are refused without changing application rows.
