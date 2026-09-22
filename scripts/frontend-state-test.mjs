@@ -1231,6 +1231,50 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
 });
 
+test('checkbox labels inside rows keep primary text color', () => {
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
+  const specificity = (selector) => {
+    const ids = (selector.match(/#[\w-]+/g) || []).length;
+    const classes = (selector.match(/\.[\w-]+/g) || []).length
+      + (selector.match(/\[[^\]]+\]/g) || []).length
+      + (selector.match(/:(?:not|is|where)\([^)]*\)/g) || []).length;
+    const withoutPseudos = selector.replace(/:(?:not|is|where)\([^)]*\)/g, '');
+    const elements = (withoutPseudos.match(/(^|[\s>+~])[a-zA-Z][\w-]*/g) || []).length;
+    return ids * 100 + classes * 10 + elements;
+  };
+  const matches = (selector, checkbox) => {
+    if (selector.includes(':not(.checkbox-label)') && checkbox) return false;
+    const normalized = selector.replace(/:not\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
+    if (checkbox) {
+      return normalized === '.checkbox-label'
+        || normalized === '.row > label'
+        || normalized === '.row > label.checkbox-label'
+        || normalized === '.row > .checkbox-label';
+    }
+    return normalized === '.row > label' || normalized === '.row label';
+  };
+  const winningColor = (checkbox) => {
+    let winner = null;
+    rules.forEach((match, index) => {
+      const declared = match[2].match(/(?:^|;)\s*color\s*:\s*([^;]+)/);
+      if (!declared) return;
+      for (const raw of match[1].split(',')) {
+        const selector = raw.trim();
+        if (!matches(selector, checkbox)) continue;
+        const rank = specificity(selector);
+        if (!winner || rank > winner.rank || (rank === winner.rank && index >= winner.index)) {
+          winner = { rank, index, color: declared[1].trim() };
+        }
+      }
+    });
+    return winner && winner.color;
+  };
+  assert.equal(winningColor(true), 'var(--text)');
+  assert.equal(winningColor(false), 'var(--muted)');
+});
+
 test('text rule UI can save independent thresholds without generic escalation', async () => {
   const calls=[];
   const h=harness(async (url, options) => {
