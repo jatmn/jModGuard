@@ -1894,7 +1894,7 @@ function tabTemplates() {
     el("details", { class: "reference-panel" },
       el("summary", { text: "Template variables & message data" }),
       el("p", { class: "muted" },
-      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed.")),
+      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Custom templates keep their wording. The readable-log upgrade updates exact previous defaults once; dates include whole seconds and UTC. Add fields to custom templates where needed.")),
     ...state.config.templates.map((t) => templateCard(t)),
   );
 }

@@ -814,7 +814,7 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
     for (_, message) in sink.sink.messages.lock().unwrap().iter() {
         let text = message["content"].as_str().unwrap();
         assert!(text.contains("moderator (<@777>)"));
-        assert!(text.contains("Reason: spam"));
+        assert!(text.contains("**Reason:** spam"));
         assert!(!text.contains("{actor}"));
     }
     f.app
@@ -866,8 +866,8 @@ async fn inaccessible_audit_renders_explicit_fallback_for_both_events() {
     }
     for (_, message) in sink.messages.lock().unwrap().iter() {
         let text = message["content"].as_str().unwrap();
-        assert!(text.contains("Moderator: unavailable"));
-        assert!(text.contains("Reason: unavailable"));
+        assert!(text.contains("**Moderator:** unavailable"));
+        assert!(text.contains("**Reason:** unavailable"));
         assert!(!text.contains("{actor}"));
     }
 }
@@ -905,12 +905,12 @@ fn leave_uses_supplied_join_time_and_explicit_missing_context() {
     let joined =
         serenity::model::Timestamp::from_unix_timestamp(observed.timestamp() - 90_060).unwrap();
     let vars = member_join_vars(Some(joined), observed);
-    assert!(vars["duration"].starts_with("1 days, 1 hours, 1 minutes"));
-    assert!(vars["joined"].starts_with("<t:"));
+    assert_eq!(vars["duration"], "1 day, 1 hour, 1 minute");
+    assert_eq!(vars["joined"], joined.to_string());
     let text = templates::render(default_template("member_leave"), &vars);
     assert!(!text.contains("{duration}"));
-    assert_eq!(member_join_vars(None, observed)["duration"], "unavailable");
-    assert_eq!(member_join_vars(None, observed)["joined"], "unavailable");
+    assert_eq!(member_join_vars(None, observed)["duration"], "Unavailable");
+    assert_eq!(member_join_vars(None, observed)["joined"], "Unavailable");
 }
 
 #[test]
@@ -969,7 +969,7 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
         sink.sink.messages.lock().unwrap()[0].1["content"]
             .as_str()
             .unwrap()
-            .contains("Reason: spam")
+            .contains("**Reason:** spam")
     );
 }
 
@@ -1055,8 +1055,8 @@ async fn repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report
             );
             let messages = sink.sink.messages.lock().unwrap();
             let last = messages.last().unwrap().1["content"].as_str().unwrap();
-            assert!(last.contains("Moderator: <@888>"), "{last}");
-            assert!(last.contains("Reason: current action"), "{last}");
+            assert!(last.contains("**Moderator:** <@888>"), "{last}");
+            assert!(last.contains("**Reason:** current action"), "{last}");
             assert!(!last.contains("previous action"));
             assert!(sink.responses.lock().unwrap().is_empty());
         }
@@ -1214,9 +1214,12 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             );
             let messages = sink.sink.messages.lock().unwrap();
             let text = messages[0].1["content"].as_str().unwrap();
-            assert!(text.contains("Moderator: <@888>"), "{event}/{mode}: {text}");
             assert!(
-                text.contains("Reason: current action"),
+                text.contains("**Moderator:** <@888>"),
+                "{event}/{mode}: {text}"
+            );
+            assert!(
+                text.contains("**Reason:** current action"),
                 "{event}/{mode}: {text}"
             );
             assert!(!text.contains("previous action"));
@@ -1295,4 +1298,50 @@ fn untracked_observation_temporarily_disables_attribution_without_evicting_uncer
     let fresh = claims.observe(1, action, 1, now);
     assert!(claims.claim(&fresh, &logs).is_some());
     assert_eq!(claims.inner.lock().subjects.len(), 1);
+}
+
+#[tokio::test]
+async fn readable_leave_preview_and_supplied_edit_timestamp_reach_discord() {
+    let f = Fixture::new();
+    for event in ["member_leave", "message_edit"] {
+        db::upsert_log_channel(&f.app.db, 789, event, 456)
+            .await
+            .unwrap();
+    }
+    let sink = Sink::default();
+    let observed = chrono::DateTime::parse_from_rfc3339("2026-09-22T18:02:22.758612736+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut vars = templates::user_vars(553144871846805504, "elgringo1092", "elgringo1092");
+    vars.extend(member_join_vars(None, observed));
+    assert_eq!(
+        emit_to(&f.app, &sink, GuildId::new(789), "member_leave", vars).await,
+        Delivery::Sent
+    );
+    let event = edited_at(
+        serde_json::json!({"content":"updated text"}),
+        "2026-09-22T18:02:22.758Z",
+    );
+    let report = edit_report(&event, None).unwrap();
+    assert_eq!(
+        emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await,
+        Delivery::Sent
+    );
+    let cfg = f.app.configs.get(&f.app.db, 789).await.unwrap();
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(
+        messages[0].1["content"].as_str().unwrap(),
+        "**:outbox_tray: elgringo1092 left the server**\n\n**User ID:** `553144871846805504`\n**Time in server:** `Unavailable`\n**Joined at:** `Unavailable`\n**Left at:** `Sep 22, 2026 • 18:02:22 UTC`"
+    );
+    assert!(
+        messages[1].1["content"]
+            .as_str()
+            .unwrap()
+            .contains("**Time:** `Sep 22, 2026 • 18:02:22 UTC`")
+    );
+    assert_eq!(cfg.find_command("status").unwrap().name, "stats");
+    assert!(std::ptr::eq(
+        cfg.find_command("stats").unwrap(),
+        cfg.find_command("STATUS").unwrap()
+    ));
 }

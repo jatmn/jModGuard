@@ -32,7 +32,7 @@ Basic Discord log delivery is independent of those retired history tables.
   the member cache is missing that user. This fallback retains only guild/user IDs
   and join timestamps in memory (at most 4096 entries, usable for one hour after
   observation), consumes them on leave and clears them on rejoin or guild reload/removal.
-  Reports show the join date and elapsed days/hours/minutes when known. Missing join
+  Reports show the join date and elapsed months/weeks/days/hours/minutes/seconds when known. Missing join
   context is unavailable; no roster is fetched and no historical join count is fabricated.
 - Ban/unban reports look up the recent Discord audit entry for the same target and
   action to display the moderator and actual reason. The bot needs **View Audit Log**.
@@ -66,7 +66,8 @@ delete reports may include a snippet this process recently observed; they do not
 reconstruct history from Discord or SQL. Routine reports are not retained for later
 recovery, and failed delivery is not reconstructed from Discord or SQL.
 
-Saved templates in a supported database keep their wording on restart. See
+Custom templates in a supported database keep their wording on restart; the readable-log
+upgrade updates exact previous defaults once. See
 [template customization](TEMPLATES.md#existing-saved-templates). Older installations
 require the [fresh database baseline](DATABASE-BASELINE.md); their databases are not adopted.
 

@@ -28,9 +28,9 @@ preview) or via `!template`.
 | `{count}` | bulk delete count / purge count / warn count |
 | `{duration}` | timeout length / time in server |
 | `{account_created}` | account creation timestamp |
-| `{account_age}` | account age in days |
-| `{joined}` | supplied/cached join timestamp in join/leave reports (Discord localized date), or unavailable |
-| `{time}` | event timestamp (UTC RFC3339) |
+| `{account_age}` | readable account age |
+| `{joined}` | supplied/cached join timestamp in join/leave reports (readable UTC date), or unavailable |
+| `{time}` | event timestamp (readable UTC date and time, including seconds) |
 | `{command}` | command name (command log events) |
 | `{response}` | behavior's inline reply (command response templates) |
 
@@ -83,17 +83,27 @@ the event. See [logging/data behavior](LOGGING-DATA.md).
 
 ## Existing saved templates
 
-Upgrades preserve all saved guild/global templates, including previously seeded defaults.
-The old edit/delete wording therefore remains until an operator edits it. To adopt the
-new basic reports, open **Templates**, select **This server**, and save these values:
+The first bot start with the readable-log upgrade replaces only exact matches
+to the previous shipped templates, in both global and guild scopes. Custom wording
+is preserved. The upgrade is recorded once, so later operator edits are not undone
+on restart. Configuration versioning makes the upgraded values visible to the bot
+and WebUI.
 
-```text
-message_edit: Message updated in {channel} — {message_url} — Author: {mention} — Current text: {after} — Attachments: {attachments}
-message_delete: Message `{message_id}` deleted in {channel}; author unavailable; content not retained.
-```
+All 14 built-in log templates use bold headings and labels, inline-code IDs,
+counts/durations/dates, and an absolute event time. Mentions and links remain
+outside code spans. Dates display as `Sep 22, 2026 • 18:02:22 UTC`: whole seconds
+and the UTC timezone remain; fractional seconds are omitted. Edit reports use
+Discord's supplied edit timestamp. Events without a supplied timestamp use report
+time. Date formatting also applies to the standard `{time}`, `{account_created}`
+and `{joined}` variables in custom templates; other content is not rewritten.
 
-The bot owner can instead save them with **Global** selected, then clear any unwanted
-guild overrides using **Reset to global**. Resetting a guild alone still inherits the
-saved global value; it does not replace that value with the compiled default. Existing
-custom wording can keep its useful variables and add the new fields. No bootstrap or
-database migration is needed. This does not recover older/deleted text.
+Durations list nonzero months, weeks, days, hours, minutes and seconds, using
+30-day months and 7-day weeks. Missing leave context says `Unavailable`.
+The leave template retains the supplied display name, user ID, time in server,
+join date (when known), and departure time; it does not depend on a resolved
+mention after departure.
+
+To change a preserved custom template, edit it in **Templates** or with
+`!template`. Resetting a guild override inherits the saved global value; the bot
+owner can edit the global template separately. Existing historical Discord posts
+are not rewritten, and no missing history is recovered.

@@ -2,6 +2,61 @@
 
 use std::collections::BTreeMap;
 
+/// Human-readable elapsed time: fixed 30-day months, then weeks down to seconds.
+pub fn format_duration(mut seconds: u64) -> String {
+    let mut parts = Vec::new();
+    for (unit, size) in [
+        ("month", 30 * 86400),
+        ("week", 7 * 86400),
+        ("day", 86400),
+        ("hour", 3600),
+        ("minute", 60),
+        ("second", 1),
+    ] {
+        let count = seconds / size;
+        seconds %= size;
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            parts.push(format!("{count} {unit}{plural}"));
+        }
+    }
+    if parts.is_empty() {
+        "0 seconds".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Absolute UTC timestamp for Discord display, without fractional-second noise.
+pub fn format_timestamp(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.format("%b %d, %Y • %H:%M:%S UTC").to_string()
+}
+
+/// Format known timestamp variables only at the presentation boundary.
+/// Raw event timestamps remain available to audit correlation before this call.
+pub fn format_log_timestamps(vars: &mut BTreeMap<String, String>) {
+    for key in ["time", "account_created", "joined"] {
+        if let Some(value) = vars.get_mut(key)
+            && let Ok(time) = chrono::DateTime::parse_from_rfc3339(value)
+        {
+            *value = format_timestamp(time.with_timezone(&chrono::Utc));
+        }
+    }
+}
+
+/// Default stats response, rendered through the same template engine as logs.
+pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) -> String {
+    render(
+        "**📊 Stats (this server)**\n\n**Uptime:** `{uptime}`\n**Moderation records:** `{records}`\n**Warns:** `{warns}`\n**Bans:** `{bans}`",
+        &BTreeMap::from([
+            ("uptime".into(), format_duration(uptime_seconds)),
+            ("records".into(), records.to_string()),
+            ("warns".into(), warns.to_string()),
+            ("bans".into(), bans.to_string()),
+        ]),
+    )
+}
+
 /// Renders a template, replacing `{variable}` tokens with values from `vars`.
 /// Unknown tokens are left untouched so template mistakes are visible.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
@@ -126,5 +181,64 @@ mod bounded_tests {
                 assert!(out.ends_with('…'));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn readable_elapsed_time_boundaries() {
+        for (seconds, expected) in [
+            (0, "0 seconds"),
+            (1, "1 second"),
+            (59, "59 seconds"),
+            (60, "1 minute"),
+            (61, "1 minute, 1 second"),
+            (3600, "1 hour"),
+            (86400, "1 day"),
+            (604800, "1 week"),
+            (2591999, "4 weeks, 1 day, 23 hours, 59 minutes, 59 seconds"),
+            (2592000, "1 month"),
+            (
+                6062706,
+                "2 months, 1 week, 3 days, 4 hours, 5 minutes, 6 seconds",
+            ),
+        ] {
+            assert_eq!(format_duration(seconds), expected, "{seconds}");
+        }
+    }
+
+    #[test]
+    fn screenshot_stats_preview() {
+        assert_eq!(
+            stats_response(
+                std::time::Duration::from_secs_f64(1361.499531819).as_secs(),
+                0,
+                0,
+                1
+            ),
+            "**📊 Stats (this server)**\n\n**Uptime:** `22 minutes, 41 seconds`\n**Moderation records:** `0`\n**Warns:** `0`\n**Bans:** `1`"
+        );
+    }
+
+    #[test]
+    fn log_dates_preserve_the_instant_and_do_not_rewrite_content() {
+        let raw = "2026-09-22T11:02:22.758612736-07:00";
+        let mut vars = BTreeMap::from([
+            ("time".into(), raw.into()),
+            ("account_created".into(), raw.into()),
+            ("joined".into(), "Unavailable".into()),
+            ("content".into(), raw.into()),
+        ]);
+        format_log_timestamps(&mut vars);
+        assert_eq!(vars["time"], "Sep 22, 2026 • 18:02:22 UTC");
+        assert_eq!(vars["account_created"], vars["time"]);
+        assert_eq!(vars["joined"], "Unavailable");
+        assert_eq!(vars["content"], raw);
+        vars.insert("time".into(), "operator-defined time".into());
+        format_log_timestamps(&mut vars);
+        assert_eq!(vars["time"], "operator-defined time");
     }
 }

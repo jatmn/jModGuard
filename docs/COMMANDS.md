@@ -30,7 +30,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
 | `!about` | Utility | everyone | Bot info |
-| `!stats` | Utility | everyone | Uptime + this server’s retained moderation counts |
+| `!stats` | Utility | everyone | Readable uptime + this server’s retained moderation counts (alias: `!status`) |
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,
@@ -92,3 +92,12 @@ A post into another channel still confirms in the invoking channel.
 
 Prefix aliases match exactly. Slash command names must be
 `[a-z0-9_-]` — the slash sync sanitizes names automatically.
+
+Stats uses bold labels and inline-code values. Uptime lists nonzero months, weeks,
+days, hours, minutes and seconds (30-day months, 7-day weeks), rounded down to
+whole seconds; a newly started process shows `0 seconds`. Prefix `!status`
+uses the same stats command, permissions and response; the slash name remains
+`/stats`. On upgrade, untouched saved stats definitions gain the alias once.
+Customized definitions remain unchanged; add `status` in the Commands editor if
+needed. If any saved command already uses that name or alias, automatic alias
+upgrade is skipped to preserve its routing.

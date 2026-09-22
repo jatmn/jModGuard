@@ -218,18 +218,9 @@ pub(crate) fn member_join_vars(
         match joined.filter(|time| time.unix_timestamp() <= observed.timestamp()) {
             Some(time) => {
                 let seconds = observed.timestamp() - time.unix_timestamp();
-                (
-                    format!("<t:{}:F>", time.unix_timestamp()),
-                    format!(
-                        "{} days, {} hours, {} minutes (joined <t:{}:F>)",
-                        seconds / 86400,
-                        seconds % 86400 / 3600,
-                        seconds % 3600 / 60,
-                        time.unix_timestamp()
-                    ),
-                )
+                (time.to_string(), templates::format_duration(seconds as u64))
             }
-            None => ("unavailable".into(), "unavailable".into()),
+            None => ("Unavailable".into(), "Unavailable".into()),
         };
     BTreeMap::from([
         ("joined".into(), joined),
@@ -640,6 +631,7 @@ async fn emit_to_observed(
                 .get(event)
                 .map(String::as_str)
                 .unwrap_or_else(|| default_template(event));
+            templates::format_log_timestamps(&mut vars);
             let rendered = templates::render_bounded(template, &vars, 2000);
             sink.send(channel_id, log_message(&rendered)).await?;
             Ok::<_, anyhow::Error>(Delivery::Sent)
@@ -809,7 +801,7 @@ pub(crate) fn message_update_report(
     bot_user_id: Option<u64>,
 ) -> Option<MessageReport> {
     let guild_id = event.guild_id?;
-    event.edited_timestamp?;
+    let edited_at = event.edited_timestamp?;
     if event.content.is_none() && event.attachments.is_none() {
         return None;
     }
@@ -825,6 +817,7 @@ pub(crate) fn message_update_report(
         return None;
     }
     let mut vars = message_vars(guild_id, event.channel_id, event.id);
+    vars.insert("time".into(), edited_at.to_string());
     vars.insert(
         "after".into(),
         event
@@ -936,8 +929,8 @@ pub(crate) async fn emit_member_event(
     observation: Option<MemberAuditObservation>,
 ) {
     let account_created = user.created_at();
-    let account_age_days =
-        (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64 / 86400;
+    let account_age_seconds =
+        (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
 
     let mut vars = templates::user_vars(
         user.id.get(),
@@ -945,7 +938,10 @@ pub(crate) async fn emit_member_event(
         user.global_name.as_deref().unwrap_or(&user.name),
     );
     vars.insert("account_created".into(), account_created.to_string());
-    vars.insert("account_age".into(), format!("{account_age_days} days"));
+    vars.insert(
+        "account_age".into(),
+        templates::format_duration(account_age_seconds),
+    );
     vars.extend(extra);
     emit_to_observed(app, ctx.http.as_ref(), guild_id, event, vars, observation).await;
 }
