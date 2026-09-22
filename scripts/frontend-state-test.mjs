@@ -1730,6 +1730,8 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.match(js, /class: "stats /);
   assert.match(html, /btn btn-primary/);
   assert.match(html, /class="navbar /);
+  assert.match(css, /\.workspace-header\s*\{[^}]*justify-content:\s*space-between/);
+  assert.match(html, /sidebar-footer[\s\S]*theme-picker[\s\S]*logout-btn/);
   assert.match(html, /class="menu w-full"/);
   assert.equal(app.uiClass("btn primary"), "btn btn-primary");
   assert.equal(app.uiClass("btn small danger"), "btn btn-sm btn-error");

@@ -64,7 +64,6 @@ window.JMODGUARD_ESM_BASE = window.JMODGUARD_ESM_BASE || "https://esm.sh";
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>MODERATION WORKSPACE</small></span></div>
       <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select" class="searchable select select-bordered select-sm w-full"></select></div>
-      <label class="theme-picker">Appearance <select class="theme-select select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
       <nav aria-label="Workspace navigation">
       <ul id="tabs" class="menu w-full">
         <li class="nav-label menu-title">Workspace</li>
@@ -83,12 +82,15 @@ window.JMODGUARD_ESM_BASE = window.JMODGUARD_ESM_BASE || "https://esm.sh";
       </ul>
       </nav>
       <div id="owner-tools" class="owner-tools hidden"></div>
-      <div class="sidebar-footer"><span id="user-chip"></span><button id="logout-btn" class="btn btn-sm btn-ghost">Sign out</button></div>
+      <div class="sidebar-footer">
+        <label class="theme-picker">Appearance <select class="theme-select select select-bordered select-sm" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+        <div class="sidebar-user"><span id="user-chip"></span><button id="logout-btn" class="btn btn-sm btn-ghost">Sign out</button></div>
+      </div>
     </aside>
     <div class="workspace">
       <header class="navbar bg-base-100 workspace-header">
-        <div class="flex-1"><span class="eyebrow">SERVER WORKSPACE</span><strong id="workspace-name">Your servers</strong></div>
-        <div class="flex-none"><span id="workspace-status">Changes saved with each action</span></div>
+        <div class="workspace-title"><span class="eyebrow">SERVER WORKSPACE</span><strong id="workspace-name">Your servers</strong></div>
+        <span id="workspace-status">Changes saved with each action</span>
       </header>
       <main id="content" tabindex="-1"></main>
       <footer class="workspace-footer">jModGuard <span>Built for better communities.</span></footer>
