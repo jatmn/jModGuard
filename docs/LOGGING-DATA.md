@@ -28,7 +28,33 @@ Basic Discord log delivery is independent of those retired history tables.
 - Single deletions report channel/message ID and disclose unavailable author/content.
   Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.
 - Join/leave reports use the delivered user and optional cached member join timestamp.
-  Missing join context is unavailable; no historical join count is fabricated.
+  Leave reports also use join timestamps already supplied with recent messages when
+  the member cache is missing that user. This fallback retains only guild/user IDs
+  and join timestamps in memory (at most 4096 entries, usable for one hour after
+  observation), consumes them on leave and clears them on rejoin or guild reload/removal.
+  Reports show the join date and elapsed days/hours/minutes when known. Missing join
+  context is unavailable; no roster is fetched and no historical join count is fabricated.
+- Ban/unban reports look up the recent Discord audit entry for the same target and
+  action to display the moderator and actual reason. The bot needs **View Audit Log**.
+  Lookup is best-effort: at most three reads of the latest 100 entries for that action,
+  inside the report concurrency/deadline limits, using at most half the deadline
+  (capped at three seconds). Entries must be within ten seconds before to three seconds
+  after the observed event; multiple matching entries are ambiguous. A missing,
+  inaccessible, late or ambiguous entry produces explicit unavailable fields.
+  A matching entry with no reason says "No reason provided". These display lookups
+  do not create or change retained case-source associations and do not recover old logs.
+  Matched audit IDs are consumed before actor filtering or delivery, so a rapid repeat
+  action cannot reuse an entry already assigned to a report in this process. Receipts
+  are kept for 30 seconds, capped at 4096; a full receipt cache leaves attribution
+  unavailable rather than evicting a still-live identity.
+  Observations are recorded before handler database work and report admission, so
+  skipped or unattributed earlier actions cannot donate delayed entries to a repeat
+  action. A later report excludes audit times that could fit an earlier unresolved
+  observation of the same guild/user/action; overlapping windows stay unavailable.
+  A newer observation also supersedes attribution by an older waiting handler.
+  Latest-observation records are process-only, capped at 4096 and kept for 30 seconds.
+  If an observation cannot be tracked at capacity, enrichment pauses for that interval;
+  report delivery continues with unavailable fields. No past reports are retried.
 - Startup, routine command-plan execution and test/log-only automod reports use Discord
   channels, without a generic SQL event copy. Delete-only automod reports are transient.
   Plans containing timeout/kick/ban steps retain their existing SQL execution summary;
@@ -68,7 +94,9 @@ Discord-channel copies have Discord's own lifecycle, separate from jModGuard sto
 Moderation/action records include warnings, bans, timeouts, kicks and reversals where
 already implemented. They still use the existing moderation tables and outcome
 handling; they are not the complete durable case/evidence system. External audit
-attribution, truthful partial-action outcomes and selected evidence capture remain work.
+attribution for retained records remains separate from the best-effort ban/unban
+display lookup above. Truthful partial-action outcomes and selected evidence capture
+remain work.
 
 The Members view/endpoint and message-retention UI/API field are removed. Guild stats
 report identified moderation counts only. Counts include moderation events and live

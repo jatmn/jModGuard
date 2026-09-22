@@ -36,7 +36,10 @@ See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
 Basic events report to Discord using supplied fields, with bounded delivery and no
 history reconstruction. Message-edit reports require Discord's `edited_timestamp`;
 embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
-report is that one event. General message caching stays disabled. Keep selected moderation
+report is that one event. Leave logs may use bounded join timestamps already received
+with messages; never fetch a roster. Ban/unban display may use bounded recent audit
+lookup inside report admission; this does not establish durable case-source identity.
+General message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
 not create durable audit rows. Internal retention fields remain transitional with no
 collection effect. Unsupported databases are refused without changing application rows.

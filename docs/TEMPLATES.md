@@ -15,8 +15,8 @@ preview) or via `!template`.
 | `{mention}` | `<@id>` mention of the target |
 | `{guild}` | server name |
 | `{channel}` | `<#id>` mention |
-| `{actor}` | moderator who performed the action (`name (<@id>)`) |
-| `{actor_id}` | actor's numeric ID |
+| `{actor}` | moderator who performed the action (`name (<@id>)`, ID mention if name unavailable); explicitly unavailable if ban/unban audit lookup fails |
+| `{actor_id}` | actor's numeric ID; unavailable for unattributed ban/unban reports |
 | `{reason}` | reason (rendered action reason for automod) |
 | `{rule}` | automod rule name |
 | `{action}` | automod action performed |
@@ -29,7 +29,7 @@ preview) or via `!template`.
 | `{duration}` | timeout length / time in server |
 | `{account_created}` | account creation timestamp |
 | `{account_age}` | account age in days |
-| `{joined}` | join timestamp |
+| `{joined}` | supplied/cached join timestamp in join/leave reports (Discord localized date), or unavailable |
 | `{time}` | event timestamp (UTC RFC3339) |
 | `{command}` | command name (command log events) |
 | `{response}` | behavior's inline reply (command response templates) |
@@ -39,8 +39,8 @@ Unknown variables are left untouched so template mistakes are visible.
 ## Default templates (all editable)
 
 - **member_join** — joined the server, account created/age
-- **member_leave** — left, cached join timestamp when available; no historical join count
-- **member_ban** / **member_unban** — hammer/unlock with actor + reason
+- **member_leave** — left, elapsed time and join date from cached member or recently received message member details; no historical join count
+- **member_ban** / **member_unban** — hammer/unlock with recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
 - **member_kick** — boot with actor + reason
 - **message_edit** — one Discord-identified edit (`edited_timestamp`); supplied current text, attachment count and message reference. Not embed/GIF unfurls, chat replies, or the bot's own log posts.
 - **message_delete** — message ID; author/content unavailable

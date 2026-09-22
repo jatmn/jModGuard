@@ -412,7 +412,7 @@ self-host.
 3. **Invite** with scopes `bot` and `applications.commands`. Tick bot
    permissions in this Discord URL Generator order (same list as
    [SETUP.md](SETUP.md#3-invite-the-bot-to-your-server)):
-   - **General:** Kick Members, Ban Members, Manage Nicknames, Manage Roles (only if you use role plan steps), Moderate Members
+   - **General:** View Audit Log (ban/unban moderator and reason details), Kick Members, Ban Members, Manage Nicknames, Manage Roles (only if you use role plan steps), Moderate Members
    - **Text:** View Channels, Send Messages, Manage Messages, Read Message History
 
 ## 7. Acceptance test
