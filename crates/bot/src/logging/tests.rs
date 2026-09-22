@@ -292,7 +292,15 @@ fn supplied_author_id_reaches_message_edit_filter() {
 #[test]
 fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
     let f = Fixture::new();
-    remember_message(&f.app, 789, 456, 123, Some(42), "the other bot's report");
+    remember_message(
+        &f.app,
+        789,
+        456,
+        123,
+        Some(42),
+        Some("the other bot's report"),
+        None,
+    );
     let known = known_message_author(&f.app, 789, 456, 123);
     assert_eq!(known, Some(42));
     let event = edited(serde_json::json!({"content":"edited report"}));
@@ -395,7 +403,7 @@ fn basic_delete_reports_ids_and_unavailable_content() {
 fn observed_delete_reports_can_include_a_recent_snippet() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    remember_message(&app, 789, 456, 123, Some(1), "hello there");
+    remember_message(&app, 789, 456, 123, Some(1), Some("hello there"), None);
     let report = message_delete_report(
         &app,
         GuildId::new(789),
@@ -414,11 +422,58 @@ fn observed_delete_reports_can_include_a_recent_snippet() {
 }
 
 #[test]
+fn attachment_only_delete_reports_observed_urls_and_empty_text() {
+    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let urls = vec![
+        "https://cdn.discordapp.com/attachments/456/1/image.jpg?ex=one".into(),
+        "https://cdn.discordapp.com/attachments/456/2/image.jpg?ex=two".into(),
+    ];
+    remember_message(&app, 789, 456, 123, Some(42), Some(""), Some(&urls));
+    // A content-only update must not erase the attachment observation.
+    remember_message(&app, 789, 456, 123, None, Some(""), None);
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "empty");
+    assert_eq!(report.vars["user_id"], "42");
+    assert!(report.vars["attachments"].contains(&urls[0]));
+    assert!(report.vars["attachments"].contains(&urls[1]));
+    let rendered = templates::render(default_template(report.event), &report.vars);
+    assert!(rendered.contains("**Text:** empty"));
+    assert!(rendered.contains("**Attachments:** 2 attachment(s)"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn attachment_update_replaces_urls_without_inventing_text() {
+    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let first = vec!["https://cdn.discordapp.com/attachments/456/1/old.jpg".into()];
+    let replacement = vec!["https://cdn.discordapp.com/attachments/456/2/new.jpg".into()];
+    remember_message(&app, 789, 456, 123, Some(42), None, Some(&first));
+    remember_message(&app, 789, 456, 123, None, None, Some(&replacement));
+    let report = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(report.vars["content"], "not supplied to this process");
+    assert!(report.vars["attachments"].contains(&replacement[0]));
+    assert!(!report.vars["attachments"].contains(&first[0]));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn partial_update_without_author_preserves_create_snippet_author() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    remember_message(&app, 789, 456, 123, Some(42), "hello there");
-    remember_message(&app, 789, 456, 123, None, "edited text");
+    remember_message(&app, 789, 456, 123, Some(42), Some("hello there"), None);
+    remember_message(&app, 789, 456, 123, None, Some("edited text"), None);
     let report = message_delete_report(
         &app,
         GuildId::new(789),
@@ -434,7 +489,7 @@ fn partial_update_without_author_preserves_create_snippet_author() {
 fn unattributed_update_does_not_create_a_snippet() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    remember_message(&app, 789, 456, 123, None, "orphan edit");
+    remember_message(&app, 789, 456, 123, None, Some("orphan edit"), None);
     let report = message_delete_report(
         &app,
         GuildId::new(789),

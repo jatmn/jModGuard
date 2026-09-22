@@ -1014,6 +1014,28 @@ fn may_admit(
         }
 }
 
+/// Discord may omit image dimensions or the media type. An explicit image media
+/// type is sufficient; without one, require dimensions and an image filename.
+fn is_image_attachment(
+    has_width: bool,
+    has_height: bool,
+    content_type: Option<&str>,
+    filename: &str,
+) -> bool {
+    match content_type {
+        Some(media_type) => media_type.starts_with("image/"),
+        None => {
+            has_width
+                && has_height
+                && filename.rsplit_once('.').is_some_and(|(_, extension)| {
+                    ["jpg", "jpeg", "png", "gif", "webp", "avif"]
+                        .iter()
+                        .any(|image| extension.eq_ignore_ascii_case(image))
+                })
+        }
+    }
+}
+
 /// Called before the generic automod bot-author exemption. Unknown membership and
 /// webhooks are skipped; no privileged role/bot exemption is inferred.
 pub fn observe(
@@ -1054,11 +1076,12 @@ pub fn observe(
         .attachments
         .iter()
         .filter(|a| {
-            a.width.is_some()
-                && a.height.is_some()
-                && a.content_type
-                    .as_deref()
-                    .is_some_and(|t| t.starts_with("image/"))
+            is_image_attachment(
+                a.width.is_some(),
+                a.height.is_some(),
+                a.content_type.as_deref(),
+                &a.filename,
+            )
         })
         .collect();
     if images.len() < policy.min_attachments {
@@ -1161,11 +1184,12 @@ pub(crate) fn observe_update(
     let images: Vec<_> = attachments
         .iter()
         .filter(|a| {
-            a.width.is_some()
-                && a.height.is_some()
-                && a.content_type
-                    .as_deref()
-                    .is_some_and(|t| t.starts_with("image/"))
+            is_image_attachment(
+                a.width.is_some(),
+                a.height.is_some(),
+                a.content_type.as_deref(),
+                &a.filename,
+            )
         })
         .collect();
     if images.len() < policy.min_attachments {
@@ -1424,6 +1448,32 @@ fn report_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn images_without_media_type_are_admitted_by_dimensions_and_filename() {
+        assert!(is_image_attachment(true, true, None, "image.jpg"));
+        assert!(is_image_attachment(true, true, None, "IMAGE.PNG"));
+        assert!(is_image_attachment(
+            true,
+            true,
+            Some("image/jpeg"),
+            "upload.bin"
+        ));
+        assert!(is_image_attachment(
+            false,
+            false,
+            Some("image/jpeg"),
+            "upload.bin"
+        ));
+        assert!(!is_image_attachment(
+            true,
+            true,
+            Some("video/mp4"),
+            "image.jpg"
+        ));
+        assert!(!is_image_attachment(true, true, None, "movie.mp4"));
+        assert!(!is_image_attachment(false, true, None, "image.jpg"));
+    }
+
     fn policy() -> Policy {
         Policy {
             mode: "exact_image_test".into(),

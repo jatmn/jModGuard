@@ -632,6 +632,18 @@ pub(super) fn seed_globals_conn(
         }
         write_meta_string_conn(conn, "readable_log_defaults_v1", "1")?;
     }
+    if meta_string_conn(conn, "attachment_delete_template_v1")?.is_none() {
+        let new = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "message_delete")
+            .unwrap()
+            .1;
+        changed += conn.execute(
+            "UPDATE templates SET template = ?1 WHERE event_type = 'message_delete' AND template = ?2",
+            params![new, crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
+        )?;
+        write_meta_string_conn(conn, "attachment_delete_template_v1", "1")?;
+    }
     for mut cmd in crate::defaults::default_commands() {
         if cmd.name == "stats" && status_taken {
             // INSERT OR IGNORE can also restore a deleted global default. Do not

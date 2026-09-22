@@ -24,7 +24,7 @@ preview) or via `!template`.
 | `{content}` | message content / evidence / plan detail |
 | `{before}` / `{after}` | `before` is not retained; `after` is supplied update text or explicitly unavailable |
 | `{message_id}` / `{message_url}` | single-message ID and Discord reference (edit/delete reports) |
-| `{attachments}` | supplied update attachment count, or explicitly unavailable |
+| `{attachments}` | supplied update attachment count; for a single deletion, bounded URLs from a recent observation, or explicitly unavailable |
 | `{count}` | bulk delete count / purge count / warn count |
 | `{duration}` | timeout length / time in server |
 | `{account_created}` | account creation timestamp |
@@ -43,7 +43,7 @@ Unknown variables are left untouched so template mistakes are visible.
 - **member_ban** / **member_unban** — hammer/unlock with recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
 - **member_kick** — boot with actor + reason
 - **message_edit** — one Discord-identified edit (`edited_timestamp`); supplied current text, attachment count and message reference. Not embed/GIF unfurls, chat replies, or the bot's own log posts.
-- **message_delete** — message ID; author/content unavailable
+- **message_delete** — message ID; recent observed author, text and attachment URLs when available
 - **message_bulk_delete** — count in channel
 - **automod** — shield: rule, action, reason, evidence, channel
 - **mod_action** — judge: action, user, moderator, reason
@@ -73,7 +73,7 @@ be shared as global defaults.
 ```
 member_join   →  📥 {user} joined! Say hi in #welcome ({mention})
 automod       →  ⛔ {rule} fired on {mention} → {action} | {reason} | {content}
-message_delete→  🗑 Message `{message_id}` deleted in {channel}; author/content unavailable.
+message_delete→  🗑 Message `{message_id}` deleted in {channel}; text: {content}; attachments: {attachments}.
 ```
 
 Discord reports are bounded to 2000 UTF-16 units, including truncation markers.
@@ -107,3 +107,6 @@ To change a preserved custom template, edit it in **Templates** or with
 `!template`. Resetting a guild override inherits the saved global value; the bot
 owner can edit the global template separately. Existing historical Discord posts
 are not rewritten, and no missing history is recovered.
+The attachment detail upgrade replaces only exact copies of the previous shipped
+single-delete template. Custom templates remain unchanged; add `{attachments}`
+to one if you want its deletion reports to show observed URLs.

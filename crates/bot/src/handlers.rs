@@ -375,7 +375,13 @@ impl EventHandler for Handler {
             msg.channel_id.get(),
             msg.id.get(),
             Some(msg.author.id.get()),
-            &msg.content,
+            Some(&msg.content),
+            Some(
+                &msg.attachments
+                    .iter()
+                    .map(|attachment| attachment.url.clone())
+                    .collect::<Vec<_>>(),
+            ),
         );
 
         if msg.content.is_empty() {
@@ -549,14 +555,21 @@ impl EventHandler for Handler {
                         &update,
                         text_revision,
                     );
-                    if let Some(content) = event.content.as_deref() {
+                    if event.content.is_some() || event.attachments.is_some() {
+                        let attachment_urls = event.attachments.as_ref().map(|attachments| {
+                            attachments
+                                .iter()
+                                .map(|attachment| attachment.url.clone())
+                                .collect::<Vec<_>>()
+                        });
                         crate::logging::remember_message(
                             &self.app,
                             guild.get(),
                             event.channel_id.get(),
                             event.id.get(),
                             update.author,
-                            content,
+                            event.content.as_deref(),
+                            attachment_urls.as_deref(),
                         );
                     }
                 }

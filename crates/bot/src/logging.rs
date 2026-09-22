@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
 const SNIPPET_CHARS: usize = 1000;
+const ATTACHMENT_PREVIEW_BYTES: usize = 1200;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
@@ -427,7 +428,42 @@ struct Snippet {
     at: Instant,
     guild: u64,
     author: u64,
-    text: String,
+    text: Option<String>,
+    attachments: Option<AttachmentPreview>,
+}
+
+struct AttachmentPreview {
+    count: usize,
+    urls: Vec<String>,
+}
+
+impl AttachmentPreview {
+    fn new(urls: &[String]) -> Self {
+        let mut remaining = ATTACHMENT_PREVIEW_BYTES;
+        let mut retained = Vec::new();
+        for url in urls {
+            if url.len() <= remaining {
+                retained.push(url.clone());
+                remaining -= url.len();
+            }
+        }
+        Self {
+            count: urls.len(),
+            urls: retained,
+        }
+    }
+
+    fn display(&self) -> String {
+        if self.count == 0 {
+            return "none".into();
+        }
+        let mut lines = vec![format!("{} attachment(s)", self.count)];
+        lines.extend(self.urls.iter().cloned());
+        if self.urls.len() < self.count {
+            lines.push(format!("{} URL(s) omitted", self.count - self.urls.len()));
+        }
+        lines.join("\n")
+    }
 }
 
 pub fn remember_message(
@@ -436,7 +472,8 @@ pub fn remember_message(
     channel: u64,
     message: u64,
     author: Option<u64>,
-    text: &str,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
 ) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
@@ -458,13 +495,19 @@ pub fn remember_message(
     {
         cache.remove(&oldest);
     }
+    let previous = cache.remove(&key);
     cache.insert(
         key,
         Snippet {
             at: Instant::now(),
             guild,
             author,
-            text: text.chars().take(SNIPPET_CHARS).collect(),
+            text: text
+                .map(|value| value.chars().take(SNIPPET_CHARS).collect())
+                .or_else(|| previous.as_ref().and_then(|value| value.text.clone())),
+            attachments: attachments
+                .map(AttachmentPreview::new)
+                .or_else(|| previous.and_then(|value| value.attachments)),
         },
     );
 }
@@ -483,12 +526,10 @@ pub(crate) fn known_message_author(
         .map(|snippet| snippet.author)
 }
 
-fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<(u64, String)> {
+fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    cache
-        .remove(&(guild, channel, message))
-        .map(|s| (s.author, s.text))
+    cache.remove(&(guild, channel, message))
 }
 
 /// Resolves the log channel for an event type from the cached config.
@@ -859,22 +900,30 @@ pub(crate) fn message_delete_report(
     id: MessageId,
 ) -> MessageReport {
     let mut vars = message_vars(guild_id, channel, id);
-    if let Some((author, text)) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
+    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
         vars.extend(templates::user_vars(
-            author,
-            &author.to_string(),
-            &author.to_string(),
+            snippet.author,
+            &snippet.author.to_string(),
+            &snippet.author.to_string(),
         ));
         vars.insert(
             "content".into(),
-            if text.is_empty() {
-                "empty".into()
-            } else {
-                clip(&text, 1000)
+            match snippet.text.as_deref() {
+                Some("") => "empty".into(),
+                Some(text) => clip(text, 1000),
+                None => "not supplied to this process".into(),
             },
+        );
+        vars.insert(
+            "attachments".into(),
+            snippet
+                .attachments
+                .map(|preview| preview.display())
+                .unwrap_or_else(|| "not supplied to this process".into()),
         );
     } else {
         vars.insert("content".into(), "not supplied to this process".into());
+        vars.insert("attachments".into(), "not supplied to this process".into());
     }
     MessageReport {
         guild_id,
