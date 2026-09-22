@@ -189,6 +189,7 @@ pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) 
         "DELETE FROM commands WHERE guild_id=?1",
         "DELETE FROM templates WHERE guild_id=?1",
         "DELETE FROM log_channels WHERE guild_id=?1",
+        "DELETE FROM log_filters WHERE guild_id=?1",
         "DELETE FROM badwords WHERE guild_id=?1",
         "DELETE FROM guild_settings WHERE guild_id=?1",
         "DELETE FROM events WHERE guild_id=?1",
@@ -201,9 +202,9 @@ pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) 
     .enumerate()
     {
         let changed = tx.execute(sql, params![guild])? > 0;
-        config_changed |= index < 6 && changed;
+        config_changed |= index < 7 && changed;
         commands_changed |= index == 1 && changed;
-        settings_changed |= index == 5 && changed;
+        settings_changed |= index == 6 && changed;
     }
     if config_changed {
         bump_config_version_conn(tx)?;

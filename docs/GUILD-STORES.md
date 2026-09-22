@@ -69,7 +69,7 @@ Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 Version8 allows closed-scope erasure after owned data is gone and stores delegated
 case-removal role IDs. There are no core configuration/default/enrollment tables or general
-event archives. Core bootstrap never applies this schema; the existing core version is 12.
+event archives. Core bootstrap never applies this schema; the existing core version is 13.
 
 | Operation | Contract |
 |---|---|

@@ -218,6 +218,8 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
         let vars = BTreeMap::from([
             ("rule".into(), format!("{name} test")),
             ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
             ("channel".into(), format!("<#{}>", found.channel)),
             ("action".into(), "log only; no punishment".into()),
             ("reason".into(), found.reason.clone()),
@@ -284,6 +286,8 @@ async fn enforce(
         let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
             ("channel".into(), format!("<#{}>", found.channel)),
             (
                 "action".into(),
@@ -307,6 +311,8 @@ async fn enforce(
         let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
             ("channel".into(), format!("<#{}>", found.channel)),
             (
                 "action".into(),
@@ -330,6 +336,8 @@ async fn enforce(
         let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
+            ("user_id".into(), found.author.to_string()),
+            ("source_channel_id".into(), found.channel.to_string()),
             ("channel".into(), format!("<#{}>", found.channel)),
             (
                 "action".into(),
@@ -463,6 +471,8 @@ async fn enforce(
     let vars = BTreeMap::from([
         ("rule".into(), name.into()),
         ("mention".into(), format!("<@{}>", found.author)),
+        ("user_id".into(), found.author.to_string()),
+        ("source_channel_id".into(), found.channel.to_string()),
         ("channel".into(), format!("<#{}>", found.channel)),
         ("action".into(), action),
         ("reason".into(), found.reason),

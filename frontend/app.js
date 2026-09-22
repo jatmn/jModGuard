@@ -289,7 +289,7 @@ function returnFromPreview() {
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
-  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|unban|actions|events|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/);
+  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|logfilters|unban|actions|events|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/);
   if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "bans", "stats", "cases", "case-delete-roles"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
     return state.config.enrollment_id;
   }
@@ -1203,6 +1203,14 @@ function parseSnowflake(raw) {
   return /^\d+$/.test(text) ? text : "";
 }
 
+function parseLogFilterId(raw, kind) {
+  const value = String(raw ?? "").trim();
+  const match = kind === "user" ? value.match(/^<@!?(\d+)>$/) : value.match(/^<#(\d+)>$/);
+  const url = kind === "channel" ? value.match(/^https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/\d+\/(\d+)\/?$/i) : null;
+  const id = match?.[1] || url?.[1] || (/^\d+$/.test(value) ? value : "");
+  return id && /[1-9]/.test(id) ? id : "";
+}
+
 function splitIds(s) {
   const ids = [];
   for (const raw of String(s ?? "").split(",")) {
@@ -1583,13 +1591,16 @@ function tabLogChannels() {
       "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes show as queued while the bot validates them, then reconcile automatically; Bot actions has the full receipt."),
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
+      const ignoredUsers = el("textarea", { placeholder: "One Discord user or bot ID per line", rows: 2 }, (lc.ignore?.users || []).join("\n"));
+      const ignoredChannels = el("textarea", { placeholder: "One source channel ID per line", rows: 2 }, (lc.ignore?.channels || []).join("\n"));
       const scopeSel = scopeSelect("This server", "Global", false);
-      return el("div", { class: "card row control-row", style: "margin-bottom:8px" },
+      return el("div", { class: "card", style: "margin-bottom:8px" },
+        el("div", { class: "row control-row" },
         el("label", { style: "width:180px" }, lc.event,
           lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px",
             text: ["pending", "claimed", "running"].includes(lc.pending_action.state) ? "queued" : lc.pending_action.state }) : null),
         input, scopeSel,
-        el("button", { class: "btn small primary", text: "Set", onclick: async () => {
+        el("button", { class: "btn small primary", text: "Set", savedInputs: [input], onclick: async () => {
           const v = parseSnowflake(input.value);
           if (!v) return toast("Enter a Discord channel ID, <#id> mention, or channel URL", "error");
           const job = await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "PUT", { scope: scopeSel.value, channel_id: v });
@@ -1599,7 +1610,7 @@ function tabLogChannels() {
             else if (job.state !== "succeeded") await reconcileQueuedLogChannel(job);
           }
         } }),
-        el("button", { class: "btn small", text: "Clear", onclick: async () => {
+        el("button", { class: "btn small", text: "Clear", savedInputs: [input], onclick: async () => {
           const job = await submitBotAction(`/api/guilds/${guildId}/logchannels/${lc.event}`, "DELETE", { scope: scopeSel.value });
           if (applyQueuedLogChannel(job)) {
             renderTab();
@@ -1607,6 +1618,21 @@ function tabLogChannels() {
             else if (job.state !== "succeeded") await reconcileQueuedLogChannel(job);
           }
         } }),
+        ),
+        el("div", { class: "row", style: "margin-top:8px" },
+          el("label", {}, "Ignore user or bot IDs", ignoredUsers),
+          el("label", {}, "Ignore source channel IDs", ignoredChannels),
+          el("button", { class: "btn small", text: "Save ignores", savedInputs: [ignoredUsers, ignoredChannels], onclick: async () => {
+            const users = ignoredUsers.value.split(/\r?\n|,/).map((id) => id.trim()).filter(Boolean).map((id) => parseLogFilterId(id, "user"));
+            if (users.some((id) => !id)) return toast("Enter valid Discord user or bot IDs", "error");
+            const channels = ignoredChannels.value.split(/\r?\n|,/).map((id) => id.trim()).filter(Boolean).map((id) => parseLogFilterId(id, "channel"));
+            if (channels.some((id) => !id)) return toast("Enter a valid source channel ID, <#id> mention, or channel URL", "error");
+            const saved = await api(`/api/guilds/${guildId}/logfilters/${lc.event}`, "PUT", { users, channels });
+            lc.ignore = saved.ignore;
+            toast("Ignore list saved", "success");
+            renderTab();
+          } }),
+        ),
       );
     }),
   );

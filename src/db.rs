@@ -57,6 +57,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_guild_store_catalog.sql"),
     include_str!("../migrations/0011_tenant_runtime.sql"),
     include_str!("../migrations/0012_guild_moves.sql"),
+    include_str!("../migrations/0013_log_filters.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.

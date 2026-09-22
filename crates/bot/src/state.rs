@@ -295,6 +295,7 @@ pub struct BotState {
     pub text_spam: crate::text_spam::Detector,
     pub spam_gate: crate::spam_actions::Gate,
     pub log_snippets: crate::logging::SnippetCache,
+    pub edit_reports: crate::logging::EditReportDedup,
     pub cooldowns: DashMap<(u64, u64, String), Instant>,
     pub log_delivery_slots: tokio::sync::Semaphore,
     pub log_delivery_failures: AtomicU64,
@@ -356,6 +357,7 @@ impl BotState {
             text_spam: crate::text_spam::Detector::default(),
             spam_gate: crate::spam_actions::Gate::default(),
             log_snippets: crate::logging::SnippetCache::default(),
+            edit_reports: crate::logging::EditReportDedup::default(),
             cooldowns: DashMap::new(),
             log_delivery_slots,
             log_delivery_failures: AtomicU64::new(0),
@@ -709,6 +711,7 @@ pub struct CachedGuildConfig {
     pub commands: HashMap<String, CommandDef>,
     pub templates: HashMap<String, String>,
     pub log_channels: HashMap<String, ChannelId>,
+    pub log_filters: HashMap<String, db::LogFilter>,
     pub regexes: Vec<Regex>,
 }
 
@@ -748,6 +751,7 @@ impl CachedGuildConfig {
                     }
                 })
                 .collect(),
+            log_filters: parts.log_filters,
             regexes,
         }
     }

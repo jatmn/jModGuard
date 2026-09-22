@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::BotProcessConfig;
 use crate::db::Db;
+use crate::db::SqlExecutor;
 use crate::state::BotState;
 use std::sync::Mutex;
 
@@ -15,7 +16,8 @@ fn update(fields: serde_json::Value) -> MessageUpdateEvent {
 
 #[test]
 fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
-    let report = message_update_report(&update(serde_json::json!({"content":"new text"}))).unwrap();
+    let report =
+        message_update_report(&update(serde_json::json!({"content":"new text"})), None).unwrap();
     assert_eq!(report.vars["after"], "new text");
     assert_eq!(report.vars["before"], "not retained");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -24,17 +26,262 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
         "https://discord.com/channels/789/456/123"
     );
     let attachment_only =
-        message_update_report(&update(serde_json::json!({"attachments":[]}))).unwrap();
+        message_update_report(&update(serde_json::json!({"attachments":[]})), None).unwrap();
     assert_eq!(attachment_only.vars["attachments"], "0");
     assert_eq!(attachment_only.vars["after"], "not supplied in this update");
-    let emptied = message_update_report(&update(serde_json::json!({"content":""}))).unwrap();
+    let emptied = message_update_report(&update(serde_json::json!({"content":""})), None).unwrap();
     assert_eq!(emptied.vars["after"], "");
     assert!(
-        message_update_report(&update(serde_json::json!({"embeds":[],"pinned":true}))).is_none()
+        message_update_report(
+            &update(serde_json::json!({"embeds":[],"pinned":true})),
+            None
+        )
+        .is_none()
     );
     let mut dm = update(serde_json::json!({"content":"private"}));
     dm.guild_id = None;
-    assert!(message_update_report(&dm).is_none());
+    assert!(message_update_report(&dm, None).is_none());
+}
+
+#[test]
+fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
+    let dedup = EditReportDedup::default();
+    let first = update(serde_json::json!({"content":"first"}));
+    assert!(dedup.should_report(&first));
+    assert!(!dedup.should_report(&first));
+    assert!(!dedup.should_report(&first));
+    let changed = update(serde_json::json!({"content":"second"}));
+    assert!(dedup.should_report(&changed));
+    assert!(!dedup.should_report(&changed));
+    assert!(
+        dedup.should_report(&first),
+        "a later distinct observation restores the first fingerprint"
+    );
+    let mut other_channel = first.clone();
+    other_channel.channel_id = ChannelId::new(999);
+    assert!(dedup.should_report(&other_channel));
+}
+
+#[test]
+fn partial_fields_for_one_edit_are_one_observation() {
+    let dedup = EditReportDedup::default();
+    let content = update(serde_json::json!({"content":"edited"}));
+    let attachments = update(serde_json::json!({"attachments":[]}));
+    let combined = update(serde_json::json!({"content":"edited","attachments":[]}));
+    assert!(dedup.should_report(&content));
+    assert!(!dedup.should_report(&attachments));
+    assert!(!dedup.should_report(&combined));
+    assert!(dedup.should_report(&update(serde_json::json!({"content":"edited again"}))));
+
+    let reverse = EditReportDedup::default();
+    assert!(reverse.should_report(&attachments));
+    assert!(!reverse.should_report(&content));
+    assert!(!reverse.should_report(&combined));
+    assert!(reverse.should_report(&update(serde_json::json!({"content":"edited again"}))));
+}
+
+#[test]
+fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
+    let dedup = EditReportDedup::default();
+    let content = update(serde_json::json!({
+        "content":"edited",
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }));
+    let same_edit = update(serde_json::json!({
+        "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }));
+    let next_edit = update(serde_json::json!({
+        "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }));
+    assert!(dedup.should_report(&content));
+    assert!(!dedup.should_report(&same_edit));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "content":"edited field supplied again",
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(dedup.should_report(&next_edit));
+    assert!(!dedup.should_report(&next_edit));
+    assert!(
+        !dedup.should_report(&content),
+        "a replay of T1 after T2 is still the same reported edit"
+    );
+    assert!(dedup.should_report(&update(serde_json::json!({
+        "content":"third edit",
+        "edited_timestamp":"2026-09-21T00:00:03.000Z"
+    }))));
+
+    let two_fields = EditReportDedup::default();
+    assert!(two_fields.should_report(&update(serde_json::json!({
+        "content":"before", "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(two_fields.should_report(&update(serde_json::json!({
+        "content":"after",
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(!two_fields.should_report(&update(serde_json::json!({
+        "attachments":[{"id":"555", "filename":"image.png", "description":"new",
+            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+            "size":100}],
+        "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+
+    let attachment = |description: &str| {
+        update(serde_json::json!({"attachments":[{
+            "id":"555", "filename":"image.png", "description":description,
+            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+            "size":100
+        }]}))
+    };
+    let metadata = EditReportDedup::default();
+    assert!(metadata.should_report(&attachment("before")));
+    assert!(!metadata.should_report(&attachment("before")));
+    assert!(metadata.should_report(&attachment("after")));
+}
+
+#[test]
+fn timestamp_arriving_after_a_reported_untimestamped_edit_does_not_report_twice() {
+    let dedup = EditReportDedup::default();
+    assert!(dedup.should_report(&update(serde_json::json!({
+        "content":"before", "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(dedup.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "attachments":[], "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(dedup.should_report(&update(serde_json::json!({
+        "content":"third", "edited_timestamp":"2026-09-21T00:00:03.000Z"
+    }))));
+
+    let partial = EditReportDedup::default();
+    let attachment = serde_json::json!({
+        "id":"555", "filename":"image.png", "description":"new",
+        "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+        "size":100
+    });
+    assert!(partial.should_report(&update(serde_json::json!({
+        "content":"before", "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(partial.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(!partial.should_report(&update(serde_json::json!({
+        "attachments":[attachment],
+    }))));
+    assert!(!partial.should_report(&update(serde_json::json!({
+        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+}
+
+#[test]
+fn supplied_author_id_reaches_message_edit_filter() {
+    let mut event = update(serde_json::json!({"content":"edited"}));
+    let mut author = serenity::model::user::User::default();
+    author.id = serenity::model::id::UserId::new(42);
+    author.name = "otherbot".into();
+    event.author = Some(author);
+    let report = message_update_report(&event, None).unwrap();
+    assert_eq!(report.vars["user_id"], "42");
+    assert!(excluded(
+        &db::LogFilter {
+            users: vec!["42".into()],
+            channels: vec![]
+        },
+        &report.vars
+    ));
+    assert!(!excluded(
+        &db::LogFilter {
+            users: vec!["otherbot".into()],
+            channels: vec![]
+        },
+        &report.vars
+    ));
+}
+
+#[test]
+fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
+    let f = Fixture::new();
+    remember_message(&f.app, 789, 456, 123, Some(42), "the other bot's report");
+    let known = known_message_author(&f.app, 789, 456, 123);
+    assert_eq!(known, Some(42));
+    let event = update(serde_json::json!({"content":"edited report"}));
+    let report = message_update_report(&event, known).unwrap();
+    assert_eq!(report.vars["user_id"], "42");
+    assert_eq!(report.vars["user"], "unavailable");
+    assert_eq!(report.vars["mention"], "unavailable");
+    assert_eq!(report.vars["after"], "edited report");
+    assert!(excluded(
+        &db::LogFilter {
+            users: vec!["42".into()],
+            channels: vec![],
+        },
+        &report.vars,
+    ));
+    assert_eq!(known_message_author(&f.app, 789, 456, 999), None);
+    let cold = message_update_report(&event, None).unwrap();
+    assert_eq!(cold.vars["user_id"], "unavailable");
+}
+
+#[test]
+fn log_filter_matches_known_ids_and_source_channels_only() {
+    let filter = db::LogFilter {
+        users: vec!["123".into(), "999".into()],
+        channels: vec!["456".into()],
+    };
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("user_id".into(), "123".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("actor_id".into(), "999".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("target_id".into(), "123".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("channel_id".into(), "456".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([
+            ("source_channel_id".into(), "456".into()),
+            ("channel".into(), "<#789>".into()),
+        ])
+    ));
+    assert!(!excluded(
+        &filter,
+        &BTreeMap::from([
+            ("source_channel_id".into(), "789".into()),
+            ("channel".into(), "<#456>".into()),
+        ])
+    ));
+    assert!(!excluded(
+        &filter,
+        &BTreeMap::from([
+            ("user_id".into(), "unavailable".into()),
+            ("username".into(), "123".into()),
+            ("user".into(), "999".into()),
+        ])
+    ));
+    // Render labels are not user identities, even if another user's ID is ignored.
+    assert!(!excluded(
+        &db::LogFilter {
+            users: vec!["555".into()],
+            channels: vec![]
+        },
+        &BTreeMap::from([
+            ("user_id".into(), "999".into()),
+            ("actor_id".into(), "999".into()),
+            ("user".into(), "messages".into()),
+        ])
+    ));
 }
 
 #[test]
@@ -159,6 +406,62 @@ impl Drop for Fixture {
 struct Sink {
     messages: Mutex<Vec<(ChannelId, serde_json::Value)>>,
 }
+
+#[tokio::test]
+async fn persisted_event_filter_blocks_matching_reports_only() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 456)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_edit',?1)",
+                db::params![r#"{"users":["123"],"channels":["999"]}"#],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let guild = GuildId::new(789);
+    for vars in [
+        BTreeMap::from([("user_id".into(), "123".into())]),
+        BTreeMap::from([("channel_id".into(), "999".into())]),
+    ] {
+        assert_eq!(
+            emit_to(&f.app, &sink, guild, "message_edit", vars).await,
+            Delivery::Unconfigured
+        );
+    }
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            guild,
+            "message_edit",
+            BTreeMap::from([("user_id".into(), "124".into())])
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            guild,
+            "message_delete",
+            BTreeMap::from([("user_id".into(), "123".into())])
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(sink.messages.lock().unwrap().len(), 2);
+}
 #[serenity::async_trait]
 impl LogDelivery for Sink {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
@@ -193,7 +496,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
     for guild in [789, 790] {
         let mut event = update(serde_json::json!({"content":"hello"}));
         event.guild_id = Some(GuildId::new(guild));
-        let report = message_update_report(&event).unwrap();
+        let report = message_update_report(&event, None).unwrap();
         assert_eq!(
             emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await,
             Delivery::Sent

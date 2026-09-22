@@ -330,6 +330,17 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
 
+        // Capture the already-delivered identity before configuration loading
+        // yields, so a fast partial edit can still apply its user-ID filter.
+        crate::logging::remember_message(
+            &app,
+            guild_id.get(),
+            msg.channel_id.get(),
+            msg.id.get(),
+            Some(msg.author.id.get()),
+            &msg.content,
+        );
+
         if msg.content.is_empty() {
             warn_empty_content_once();
         }
@@ -371,14 +382,6 @@ impl EventHandler for Handler {
             image_revision,
         );
         crate::text_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, text_revision);
-        crate::logging::remember_message(
-            &app,
-            guild_id.get(),
-            msg.channel_id.get(),
-            msg.id.get(),
-            Some(msg.author.id.get()),
-            &msg.content,
-        );
         // Generic rules and prefix commands retain their existing bot exemption.
         if msg.author.bot {
             return;
@@ -452,15 +455,31 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
+        let detector_author_id = event.guild_id.and_then(|guild| {
+            let guild = guild.get();
+            let channel = event.channel_id.get();
+            let message = event.id.get();
+            select_update_author(
+                event.author.as_ref().map(|user| user.id.get()),
+                self.app.text_spam.author_of(guild, channel, message),
+                self.app.image_spam.author_of(guild, channel, message),
+            )
+        });
+        let known_author_id = detector_author_id.or_else(|| {
+            event.guild_id.and_then(|guild| {
+                logging::known_message_author(
+                    &self.app,
+                    guild.get(),
+                    event.channel_id.get(),
+                    event.id.get(),
+                )
+            })
+        });
         if let Some(guild) = event.guild_id {
             let channel = event.channel_id.get();
             let message = event.id.get();
             let update = UpdateObservation {
-                author: select_update_author(
-                    event.author.as_ref().map(|user| user.id.get()),
-                    self.app.text_spam.author_of(guild.get(), channel, message),
-                    self.app.image_spam.author_of(guild.get(), channel, message),
-                ),
+                author: detector_author_id,
                 received,
                 received_at,
             };
@@ -502,7 +521,9 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if let Some(report) = logging::message_update_report(&event) {
+        if let Some(report) = logging::message_update_report(&event, known_author_id)
+            && self.app.edit_reports.should_report(&event)
+        {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }

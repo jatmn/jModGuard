@@ -256,11 +256,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             discord?;
             if minutes == 0 {
                 let mut v = vars.clone();
+                v.insert("target_id".into(), target.to_string());
                 v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
                 let mut v = vars.clone();
+                v.insert("target_id".into(), target.to_string());
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
@@ -275,6 +277,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("minutes".into(), minutes.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
@@ -336,6 +339,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
@@ -349,6 +353,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
+            vars.insert("target_id".into(), target.to_string());
             let warns =
                 db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
             if warns.is_empty() {
@@ -387,6 +392,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let n = db::clear_enrolled_warns(&env.app.db, enrollment.clone(), target.get() as i64)
                 .await?;
             vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("count".into(), n.to_string());
             log_mod(
                 env,
@@ -696,6 +702,7 @@ pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<Strin
             .unwrap_or_else(|| env.guild_id.to_string()),
     );
     vars.insert("channel".into(), format!("<#{}>", env.channel_id));
+    vars.insert("source_channel_id".into(), env.channel_id.to_string());
     vars
 }
 
@@ -727,12 +734,10 @@ async fn user_lookup(env: &CmdEnv<'_>, id: serenity::model::id::UserId) -> Resul
         .user(id)
         .map(|u| u.name.clone())
         .unwrap_or_else(|| id.to_string());
-    Ok(UserInfo { id: id.get(), name })
+    Ok(UserInfo { name })
 }
 
 struct UserInfo {
-    #[allow(dead_code)]
-    id: u64,
     name: String,
 }
 
@@ -785,6 +790,7 @@ async fn log_mod(
         target_name,
         env.actor.get(),
         env.actor_member.display_name(),
+        env.channel_id.get(),
         reason,
     )
     .await;

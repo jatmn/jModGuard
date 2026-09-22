@@ -889,6 +889,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
                 .delete(api::delete_logchannel),
         )
         .route(
+            "/api/guilds/{guild_id}/logfilters/{event}",
+            axum::routing::put(api::put_log_filter),
+        )
+        .route(
             "/api/guilds/{guild_id}/copy",
             axum::routing::post(api::copy_config),
         )

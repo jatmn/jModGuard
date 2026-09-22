@@ -1412,6 +1412,8 @@ fn report_vars(
     BTreeMap::from([
         ("rule".into(), "Exact image spam test".into()),
         ("mention".into(), format!("<@{author}>")),
+        ("user_id".into(), author.to_string()),
+        ("source_channel_id".into(), channel.to_string()),
         ("channel".into(), format!("<#{}>", channel)),
         ("action".into(), "log only; no punishment".into()),
         ("reason".into(), reason),

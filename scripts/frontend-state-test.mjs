@@ -461,6 +461,32 @@ test('queued log-channel saves clear dirty state and survive in-app navigation',
   assert.equal(h.app.state.config.log_channels[0].effective, '222');
 });
 
+test('log channel ignore editor saves user and channel IDs as strings', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    return response({ ignore: { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] } });
+  });
+  h.app.state.config = {
+    enrollment_id: 'membership', rules: [], commands: [], badwords: [],
+    settings: { prefix: '!', bot_name: '' },
+    log_channels: [{ event: 'message_edit', effective: '111', guild_override: '111', global: null, ignore: { users: [], channels: [] } }],
+  };
+  h.app.state.tab = 'logchannels';
+  h.nodes.get('#content').append(h.app.tabLogChannels());
+  const fields = h.elements.filter((node) => node.tag === 'textarea');
+  fields[0].value = '9007199254740993\n<@9007199254740995>';
+  fields[1].value = '<#9007199254740997>';
+  const save = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Save ignores');
+  await save.listeners.click({});
+  assert.match(calls[0].url, /\/logfilters\/message_edit$/);
+  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
+  fields[0].value = 'OtherBot';
+  await save.listeners.click({});
+  assert.equal(calls.length, 1, 'names must be rejected before calling the API');
+});
+
 test('queued log-channel receipts reconcile without a configuration refresh', async () => {
   const pending = {
     id: 'log-job', guild_id: '987654321098765432', actor_id: '123456789012345678',
@@ -1199,6 +1225,15 @@ test('individual configuration GETs retain loaded membership without rebinding g
   await h.app.api(`/api/guilds/${h.app.state.guildId}/commands`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
   assert.equal(calls.length, routes.length + 3);
+});
+
+test('log filter saves use the loaded guild enrollment', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => { calls.push({ url, opts }); return response({ ignore: { users: ['123'], channels: ['456'] } }); });
+  h.app.state.config = { enrollment_id: 'loaded-config-membership' };
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/logfilters/message_edit`, 'PUT', { users: ['123'], channels: ['456'] });
+  assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'], 'loaded-config-membership');
+  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['123'], channels: ['456'] });
 });
 
 
