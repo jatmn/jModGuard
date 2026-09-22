@@ -587,8 +587,57 @@ pub(super) fn seed_globals_conn(
             ],
         )?;
     }
+    // One-time presentation upgrade: only byte-for-byte shipped defaults.
+    // Custom templates and customized command definitions remain owned by operators.
+    let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
     let mut commands_changed = 0usize;
-    for cmd in crate::defaults::default_commands() {
+    // Conservatively preserve an existing status command/alias in any scope.
+    let mut stmt = conn.prepare("SELECT data FROM commands")?;
+    let rows = stmt.query_map((), |row| Ok(row.get::<String>(0)?))?;
+    let mut status_taken = false;
+    for row in rows {
+        if let Ok(command) = serde_json::from_str::<crate::types::CommandDef>(&row?)
+            && command.matches("status")
+        {
+            status_taken = true;
+        }
+    }
+    if upgrade_presentation {
+        let current_templates = crate::defaults::default_templates();
+        for (event, old) in crate::defaults::legacy_log_templates() {
+            let new = current_templates
+                .iter()
+                .find(|(name, _)| *name == event)
+                .unwrap()
+                .1;
+            changed += conn.execute(
+                "UPDATE templates SET template = ?1 WHERE event_type = ?2 AND template = ?3",
+                params![new, event, old],
+            )?;
+        }
+        let stats = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "stats")
+            .unwrap();
+        let mut legacy = stats.clone();
+        legacy.aliases.clear();
+        if !status_taken {
+            commands_changed += conn.execute(
+                "UPDATE commands SET data = ?1 WHERE name = 'stats' AND data = ?2",
+                params![
+                    serde_json::to_string(&stats)?,
+                    serde_json::to_string(&legacy)?
+                ],
+            )?;
+        }
+        write_meta_string_conn(conn, "readable_log_defaults_v1", "1")?;
+    }
+    for mut cmd in crate::defaults::default_commands() {
+        if cmd.name == "stats" && status_taken {
+            // INSERT OR IGNORE can also restore a deleted global default. Do not
+            // give that restored command an alias already owned by another row.
+            cmd.aliases.clear();
+        }
         if cmd.name == "setname" {
             let mut legacy = cmd.clone();
             legacy.description =

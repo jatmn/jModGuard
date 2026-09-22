@@ -103,12 +103,13 @@ Do **not** run a new API against a DB that has not been migrated by a new bot
 
 ### Adopt basic report templates
 
-Supported databases preserve saved templates and commands on subsequent starts.
-Edit the `message_edit` and `message_delete` templates using the
-[provided basic report values](TEMPLATES.md#existing-saved-templates) to display message
-references and supplied attachment counts. Resetting only a guild template inherits its
-saved global value. Existing custom templates are never overwritten automatically.
-The `stats` command reports moderation counts; customized descriptions should reflect that.
+The readable-log upgrade updates exact previous default templates once at bot
+startup, including copies in guild scopes. Custom templates stay intact.
+See [template upgrade behavior](TEMPLATES.md#existing-saved-templates).
+Untouched saved `stats` commands gain the `status` prefix alias unless a saved
+command already uses that name/alias; customized commands stay intact.
+Add the alias manually in the Commands editor where needed. Stats now shows
+readable uptime with bold labels and inline-code values.
 Publish matching frontend/API artifacts and reload older settings pages.
 
 ## 6. Verify

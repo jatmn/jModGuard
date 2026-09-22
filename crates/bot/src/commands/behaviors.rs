@@ -263,7 +263,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             } else {
                 let mut v = vars.clone();
                 v.insert("target_id".into(), target.to_string());
-                v.insert("duration".into(), format!("{minutes} minutes"));
+                v.insert(
+                    "duration".into(),
+                    crate::templates::format_duration(minutes.saturating_mul(60)),
+                );
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
             }
@@ -665,10 +668,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
             let s = db::guild_stats(&env.app.db, env.guild_id.get() as i64).await?;
-            let uptime = format!("{:?}", env.app.start.elapsed());
-            let response = format!(
-                "**Stats** (this server)\nUptime: {uptime}\nModeration records: {}\nWarns: {}\nBans: {}",
-                s.events, s.warns, s.bans
+            let response = crate::templates::stats_response(
+                env.app.start.elapsed().as_secs(),
+                s.events,
+                s.warns,
+                s.bans,
             );
             Ok(BehaviorOutcome {
                 response: Some(response),

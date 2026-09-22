@@ -370,6 +370,7 @@ fn aliases_for(name: &str) -> Vec<String> {
         "say" => vec!["echo".into()],
         "banlist" => vec!["bans".into()],
         "help" => vec!["commands".into(), "h".into()],
+        "stats" => vec!["status".into()],
         _ => vec![],
     }
 }
@@ -405,6 +406,68 @@ fn cmd(
 
 /// Default event templates (rendered into the configured log channels).
 pub fn default_templates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "member_join",
+            "**:inbox_tray: {user} joined the server**\n\n**User:** {mention} (`{user_id}`)\n**Account created:** `{account_created}`\n**Account age:** `{account_age}`\n**Joined at:** `{time}`",
+        ),
+        (
+            "member_leave",
+            "**:outbox_tray: {user} left the server**\n\n**User ID:** `{user_id}`\n**Time in server:** `{duration}`\n**Joined at:** `{joined}`\n**Left at:** `{time}`",
+        ),
+        (
+            "member_ban",
+            "**:hammer: {user} banned**\n\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "member_unban",
+            "**:unlock: {user} unbanned**\n\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "member_kick",
+            "**:boot: {user} kicked**\n\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "message_edit",
+            "**:pencil2: Message updated in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Attachments:** `{attachments}`\n**Current text:** {after}",
+        ),
+        (
+            "message_delete",
+            "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}",
+        ),
+        (
+            "message_bulk_delete",
+            "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Time:** `{time}`",
+        ),
+        (
+            "automod",
+            "**:shield: Automod: {rule}**\n\n**User:** {mention}\n**Action:** {action}\n**Reason:** {reason}\n**Channel:** {channel}\n**Time:** `{time}`\n**Evidence:** {content}",
+        ),
+        (
+            "mod_action",
+            "**:judge: {action}**\n\n**User:** {mention}\n**Moderator:** {actor}\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "timeout_add",
+            "**:timer: {user} timed out**\n\n**Moderator:** {actor}\n**Duration:** `{duration}`\n**Reason:** {reason}\n**Time:** `{time}`",
+        ),
+        (
+            "timeout_remove",
+            "**:alarm_clock: {user} timeout removed**\n\n**Moderator:** {actor}\n**Time:** `{time}`",
+        ),
+        (
+            "plan_executed",
+            "**:robot: Custom command executed**\n\n**Command:** `{command}`\n**Run by:** {actor}\n**Time:** `{time}`\n**Details:** {content}",
+        ),
+        (
+            "system",
+            "**:gear: System notice**\n\n**Time:** `{time}`\n{content}",
+        ),
+    ]
+}
+
+// Exact defaults from before the readable-log upgrade; used only for one-time migration.
+pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "member_join",

@@ -2708,3 +2708,137 @@ async fn placed_before_erasure(db: &Db, guild: i64) {
         .unwrap();
     assign_initial_placement(db, guild, store).await.unwrap();
 }
+
+#[test]
+fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
+    let tmp = tmp_db_path("readable_defaults");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute("DELETE FROM meta WHERE key = 'readable_log_defaults_v1'", ())?;
+        for (event, old) in crate::defaults::legacy_log_templates() {
+            for guild in [0, 123] {
+                conn.execute(
+                    "INSERT OR REPLACE INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)",
+                    params![guild, event, old],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO templates (guild_id, event_type, template) VALUES (456, ?1, ?2)",
+                params![event, format!("custom {old}")],
+            )?;
+        }
+        let mut stats = crate::defaults::default_commands().into_iter().find(|c| c.name == "stats").unwrap();
+        stats.aliases.clear();
+        for guild in [0, 123, 456] {
+            if guild == 456 { stats.permission = "admin".into(); }
+            conn.execute(
+                "INSERT OR REPLACE INTO commands (guild_id, name, data) VALUES (?1, 'stats', ?2)",
+                params![guild, serde_json::to_string(&stats)?],
+            )?;
+        }
+        Ok(())
+    })).unwrap();
+    let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash + 1
+    );
+    tokio_test_block_on(async {
+        for guild in [0, 123, 456] {
+            let parts = load_config_parts(&db, guild).await.unwrap();
+            for (event, new) in crate::defaults::default_templates() {
+                if guild == 456 {
+                    assert!(parts.templates[event].starts_with("custom "));
+                } else {
+                    assert_eq!(parts.templates[event], new);
+                }
+            }
+            if guild == 456 {
+                assert_eq!(parts.commands["stats"].permission, "admin");
+                assert!(parts.commands["stats"].aliases.is_empty());
+            } else {
+                assert!(parts.commands["stats"].matches("status"));
+            }
+        }
+        // Even a deliberate reversion to old wording is retained after the one-time upgrade.
+        db.with_conn(|conn| {
+            let (event, old) = crate::defaults::legacy_log_templates()[0];
+            conn.execute(
+                "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type=?2",
+                params![old, event],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash + 1
+    );
+    let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
+    let (event, old) = crate::defaults::legacy_log_templates()[0];
+    assert_eq!(parts.templates[event], old);
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
+    let tmp = tmp_db_path("readable_status_collision");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM meta WHERE key = 'readable_log_defaults_v1'",
+            (),
+        )?;
+        let mut stats = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "stats")
+            .unwrap();
+        stats.aliases.clear();
+        conn.execute(
+            "UPDATE commands SET data=?1 WHERE name='stats'",
+            params![serde_json::to_string(&stats)?],
+        )?;
+        stats.name = "custom".into();
+        stats.aliases = vec!["STATUS".into()];
+        conn.execute(
+            "INSERT INTO commands(guild_id,name,data) VALUES (123,'custom',?1)",
+            params![serde_json::to_string(&stats)?],
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
+    assert!(!parts.commands["stats"].matches("status"));
+    assert!(parts.commands["custom"].matches("status"));
+    // Restoring a deleted default on a later boot must not steal the alias either.
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute("DELETE FROM commands WHERE name='stats'", ())?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 123)).unwrap();
+    assert!(!parts.commands["stats"].matches("status"));
+    assert!(parts.commands["custom"].matches("status"));
+    drop(db);
+    cleanup_db(&tmp);
+}
