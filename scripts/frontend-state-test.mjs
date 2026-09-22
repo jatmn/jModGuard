@@ -1223,11 +1223,56 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   calls[0].data.params.min_channels=1;
   assert.equal(h.app.spamConfigured('attachment_flood', calls[0].data),false);
   const punish=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,dry_run:true,params:{mode:'exact_image_test',min_channels:3,min_attachments:2,window_secs:60},actions:[{action:'log'}]}});
-  findNode(punish,n=>n.tag==='input' && n.attrs.type==='checkbox' && n.parent?.tag==='label').checked = true;
+  const enforcement = findNode(punish,n=>n.tag==='label' && textOf(n).includes('Delete matched messages and ban'));
+  findNode(enforcement,n=>n.tag==='input' && n.attrs.type==='checkbox').checked = true;
   await findNode(punish,n=>n.textContent === 'Save').listeners.click({});
   assert.equal(calls.at(-1).data.dry_run,false);
   assert.equal(calls.at(-1).data.params.mode,'exact_image');
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
+});
+
+test('checkbox labels inside rows keep primary text color', () => {
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
+  const specificity = (selector) => {
+    const ids = (selector.match(/#[\w-]+/g) || []).length;
+    const classes = (selector.match(/\.[\w-]+/g) || []).length
+      + (selector.match(/\[[^\]]+\]/g) || []).length
+      + (selector.match(/:(?:not|is|where)\([^)]*\)/g) || []).length;
+    const withoutPseudos = selector.replace(/:(?:not|is|where)\([^)]*\)/g, '');
+    const elements = (withoutPseudos.match(/(^|[\s>+~])[a-zA-Z][\w-]*/g) || []).length;
+    return ids * 100 + classes * 10 + elements;
+  };
+  const matches = (selector, checkbox) => {
+    if (selector.includes(':not(.checkbox-label)') && checkbox) return false;
+    const normalized = selector.replace(/:not\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
+    if (checkbox) {
+      return normalized === '.checkbox-label'
+        || normalized === '.row > label'
+        || normalized === '.row > label.checkbox-label'
+        || normalized === '.row > .checkbox-label';
+    }
+    return normalized === '.row > label' || normalized === '.row label';
+  };
+  const winningColor = (checkbox) => {
+    let winner = null;
+    rules.forEach((match, index) => {
+      const declared = match[2].match(/(?:^|;)\s*color\s*:\s*([^;]+)/);
+      if (!declared) return;
+      for (const raw of match[1].split(',')) {
+        const selector = raw.trim();
+        if (!matches(selector, checkbox)) continue;
+        const rank = specificity(selector);
+        if (!winner || rank > winner.rank || (rank === winner.rank && index >= winner.index)) {
+          winner = { rank, index, color: declared[1].trim() };
+        }
+      }
+    });
+    return winner && winner.color;
+  };
+  assert.equal(winningColor(true), 'var(--text)');
+  assert.equal(winningColor(false), 'var(--muted)');
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {

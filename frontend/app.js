@@ -1092,8 +1092,8 @@ function editRule(r) {
       );
       const dur = el("input", { type: "number", min: 0, value: a.duration_minutes ?? 0, style: "width:80px", title: "minutes (timeout)" });
       const dd = el("input", { type: "number", min: 0, max: 7, value: a.delete_days ?? 0, style: "width:70px", title: "days of messages deleted (ban)" });
-      const reason = el("input", { type: "text", value: a.reason || "", style: "flex:1", placeholder: "reason template" });
-      actionsRows.append(el("div", { class: "row", style: "margin-bottom:6px" },
+      const reason = el("input", { type: "text", value: a.reason || "", placeholder: "reason template" });
+      actionsRows.append(el("div", { class: "row control-row action-row", style: "margin-bottom:6px" },
         el("span", { class: "muted", text: "at " }), at, action, dur, dd, reason,
         el("button", { class: "btn small danger", onclick: () => { rule.actions.splice(i, 1); markDirty(); renderActions(); } }, "✕"),
       ));
@@ -1108,11 +1108,11 @@ function editRule(r) {
 
   const box = el("div", { class: "modal-box" },
     el("h3", { text: `Edit rule: ${r.name}` }),
-    el("div", { class: "field" },
-      el("label", { text: "Enabled" }),
-      el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }),
-      spam ? el("label", {}, " Delete matched messages and ban", enforce) :
-        el("label", {}, " Dry-run (log only)", el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) })),
+    el("div", { class: "row checkbox-group" },
+      el("label", { class: "checkbox-label" },
+        el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }), "Enabled"),
+      spam ? el("label", { class: "checkbox-label" }, enforce, "Delete matched messages and ban") :
+        el("label", { class: "checkbox-label" }, el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) }), "Dry-run (log only)"),
     ),
     spam ? el("div", {},
       el("p", { text: textRule
@@ -1129,12 +1129,12 @@ function editRule(r) {
       el("label", { text: "Action escalation" }), actionsRows,
       el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
-    el("div", { class: "row" },
+    el("div", { class: "row form-row" },
       el("div", { class: "field" }, el("label", { text: "Whitelist roles (ids, comma)" }), whitelistText),
       el("div", { class: "field" }, el("label", { text: "Whitelist channels (ids)" }), channelsText),
       el("div", { class: "field" }, el("label", { text: "Whitelist users (ids)" }), usersText),
     ),
-    el("div", { class: "row", style: "margin-top:10px" },
+    el("div", { class: "row form-actions" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
@@ -1304,7 +1304,7 @@ function tabBadwords() {
 function tabCommands() {
   const cmds = state.config.commands;
   return el("div", {},
-    el("div", { class: "row", style: "justify-content:space-between" },
+    el("div", { class: "row title-row" },
       el("h2", { text: "Commands" }),
       el("button", { class: "btn good", text: "+ New custom command", onclick: () => editCommand(null) }),
     ),
@@ -1399,7 +1399,7 @@ function editCommand(c) {
         syncPlanJson();
       };
       stepsBox.append(el("div", { class: "step-card" },
-        el("div", { class: "row" }, type, field,
+        el("div", { class: "row control-row" }, type, field,
           el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); markDirty(); syncPlanJson(); renderSteps(); } })),
       ));
     });
@@ -1431,9 +1431,9 @@ function editCommand(c) {
 
   modal.append(el("div", { class: "modal-box" },
     el("h3", { text: isNew ? "New custom command" : `Edit command: ${c.name}` }),
-    el("div", { class: "row" },
-      el("div", { class: "field", style: "flex:1" }, el("label", { text: "Name" }), nameIn),
-      el("div", { class: "field", style: "flex:1" }, el("label", { text: "Aliases" }), aliasesIn),
+    el("div", { class: "row form-row" },
+      el("div", { class: "field" }, el("label", { text: "Name" }), nameIn),
+      el("div", { class: "field" }, el("label", { text: "Aliases" }), aliasesIn),
       el("div", { class: "field" }, el("label", { text: "Permission" }), permIn),
     ),
     el("div", { class: "field" }, el("label", { text: "Description" }), descIn),
@@ -1450,16 +1450,16 @@ function editCommand(c) {
       el("label", { text: "Behavior (advanced JSON)" }), behaviorArea,
     ),
     el("div", { class: "field" }, el("label", { text: "Response template (in-chat reply; {target} {reason} {response} …)" }), respIn),
-    el("div", { class: "row" },
+    el("div", { class: "row form-row" },
       el("div", { class: "field" }, el("label", { text: "Cooldown (secs)" }), cdIn),
       el("div", { class: "field" }, el("label", { text: "Role restriction (ids)" }), roleIn),
       el("div", { class: "field" }, el("label", { text: "Channel restriction (ids)" }), chanIn),
       el("div", { class: "field" }, el("label", { text: "Log event" }), logIn),
     ),
-    el("div", { class: "row", style: "margin-top:12px" },
+    el("div", { class: "row form-actions" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
-      el("label", { text: "Enabled" }),
-      el("input", { type: "checkbox", checked: data.enabled, onchange: (e) => (data.enabled = e.target.checked) }),
+      el("label", { class: "checkbox-label" },
+        el("input", { type: "checkbox", checked: data.enabled, onchange: (e) => (data.enabled = e.target.checked) }), "Enabled"),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
           const raw = JSON.parse(behaviorArea.value || "{}");
@@ -1544,9 +1544,9 @@ function templateCard(t) {
   text.oninput = () => (preview.textContent = text.value);
   const scopeSel = scopeSelect("This server", "Global");
   return el("div", { class: "card" },
-    el("div", { class: "row", style: "justify-content:space-between" },
+    el("div", { class: "row", style: "justify-content:space-between;margin-bottom:14px" },
       el("strong", { text: t.event }),
-      el("div", { class: "row" },
+      el("div", { class: "row control-row" },
         scopeSel,
         el("button", { class: "btn primary small", text: "Save", onclick: async () => {
           await reloadAfter(
@@ -1575,7 +1575,7 @@ function tabLogChannels() {
   const guildId = state.guildId;
   return el("div", {},
     el("h2", { text: "Log channels" }),
-    el("button", { class: "btn", text: "Refresh configuration", onclick: async () => {
+    el("button", { class: "btn standalone-action", text: "Refresh configuration", onclick: async () => {
       if (!canLeave()) return;
       if (await loadConfig()) renderTab();
     } }),
@@ -1584,7 +1584,7 @@ function tabLogChannels() {
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
       const scopeSel = scopeSelect("This server", "Global", false);
-      return el("div", { class: "card row", style: "margin-bottom:8px" },
+      return el("div", { class: "card row control-row", style: "margin-bottom:8px" },
         el("label", { style: "width:180px" }, lc.event,
           lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px",
             text: ["pending", "claimed", "running"].includes(lc.pending_action.state) ? "queued" : lc.pending_action.state }) : null),
@@ -1755,7 +1755,7 @@ function tabActions() {
   run();
   return el("div", {}, el("h2", { text: "Bot actions" }),
     el("p", { class: "muted", text: "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. Cancel unstarted work, including claimed requests the bot has not dispatched. Force-cancel a stuck log-channel request that is running or unknown so a new save can run; this does not undo Discord." }),
-    el("button", { class: "btn", text: "Refresh", onclick: run }), table);
+    el("button", { class: "btn standalone-action", text: "Refresh", onclick: run }), table);
 }
 
 function tabCases() {
@@ -1808,7 +1808,7 @@ function tabCases() {
         el("p", { text: `${c.action || "unknown"} · ${c.outcome || "unknown"} · subject ${c.subject_id || ""}` }),
         el("p", { class: "muted", text: c.reason || "No reason recorded." }),
         el("p", { class: "muted", text: "Removing a case deletes retained private records. It does not reverse a Discord ban, kick, timeout, or warning." }),
-        payload.can_delete ? el("button", { class: "btn small", text: "Remove case record", onclick: async () => {
+        payload.can_delete ? el("button", { class: "btn small standalone-action", text: "Remove case record", onclick: async () => {
           if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
           const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
           toast(result?.cleanup_pending
@@ -1901,7 +1901,8 @@ function tabCases() {
     el("h2", { text: "Cases" }),
     el("p", { class: "muted", text: "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord." }),
     el("p", { class: "muted", text: "Use removed records to retry cleanup. Their private content stays deleted, and retrying does not undo Discord actions." }),
-    el("button", { class: "btn", text: "Refresh", onclick: run }), first, next, recovery, table, detail);
+    el("div", { class: "row", style: "margin-bottom:12px" },
+      el("button", { class: "btn", text: "Refresh", onclick: run }), first, next, recovery), table, detail);
 }
 
 function tabSettings() {
@@ -1964,7 +1965,7 @@ function tabSettings() {
         : cfg.nickname_reconcile?.state === "dormant"
           ? el("p", { class: "muted", text: "Discord nickname work is paused. After confirming the bot is in this server, use Re-sync Discord nickname to submit a fresh request. Work from an earlier membership is never replayed." })
           : null,
-      el("div", { class: "row" },
+      el("div", { class: "row form-row" },
         settingsField(
           "Prefix",
           prefix,
@@ -1979,40 +1980,41 @@ function tabSettings() {
           false,
         ),
       ),
-      el("button", { class: "btn primary", text: "Save", onclick: async () => {
-        // Tri-state body: omit unchanged, null clears override, value sets.
-        // Only send fields the operator actually changed — always sending
-        // bot_name re-applied a stale input when global nick changed elsewhere.
-        // bot_name empty is special (AGENTS): persist "" to clear Discord nick — not inherit.
-        const body = {};
-        const rawPrefix = String(prefix.value ?? "").trim();
-        if (rawPrefix === "") {
-          if (ov.prefix != null) body.prefix = null;
-          else {
-            toast("Prefix cannot be empty (Use global to inherit)", "error");
+      el("div", { class: "row" },
+        el("button", { class: "btn primary", text: "Save", onclick: async () => {
+          // Tri-state body: omit unchanged, null clears override, value sets.
+          // Only send fields the operator actually changed — always sending
+          // bot_name re-applied a stale input when global nick changed elsewhere.
+          // bot_name empty is special (AGENTS): persist "" to clear Discord nick — not inherit.
+          const body = {};
+          const rawPrefix = String(prefix.value ?? "").trim();
+          if (rawPrefix === "") {
+            if (ov.prefix != null) body.prefix = null;
+            else {
+              toast("Prefix cannot be empty (Use global to inherit)", "error");
+              return;
+            }
+          } else if (rawPrefix !== cfg.settings.prefix) {
+            body.prefix = rawPrefix;
+          }
+          if (botName.value !== cfg.settings.bot_name) {
+            body.bot_name = botName.value;
+          }
+          if (body.prefix === undefined && body.bot_name === undefined) {
+            toast("No settings changes", "success");
             return;
           }
-        } else if (rawPrefix !== cfg.settings.prefix) {
-          body.prefix = rawPrefix;
-        }
-        if (botName.value !== cfg.settings.bot_name) {
-          body.bot_name = botName.value;
-        }
-        if (body.prefix === undefined && body.bot_name === undefined) {
-          toast("No settings changes", "success");
-          return;
-        }
-        await reloadAfter(
-          () => api(`/api/guilds/${state.guildId}/settings`, "PUT", body),
-          (res) => toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success"),
-        );
-      } }),
-      el("button", { class: "btn", text: "Re-sync Discord nickname", savedInputs: [], onclick: async () => {
-        await reloadAfter(
-          () => api(`/api/guilds/${state.guildId}/settings`, "PUT", { sync_nickname: true }),
-          (res) => toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success"),
-        );
-      } }),
+          await reloadAfter(
+            () => api(`/api/guilds/${state.guildId}/settings`, "PUT", body),
+            (res) => toast(res.nickname_queued ? "Settings saved — Discord nickname queued" : "Settings saved", "success"),
+          );
+        } }),
+        el("button", { class: "btn", text: "Re-sync Discord nickname", savedInputs: [], onclick: async () => {
+          await reloadAfter(
+            () => api(`/api/guilds/${state.guildId}/settings`, "PUT", { sync_nickname: true }),
+            (res) => toast(res.nickname_queued ? "Discord nickname reconciliation queued" : "No nickname work queued", "success"),
+          );
+        } })),
     ),
   ];
 
@@ -2049,7 +2051,7 @@ function tabSettings() {
       el("h3", { text: "Global defaults (applies to all servers)" }),
       el("p", { class: "muted", style: "margin-bottom:8px" },
         "Global settings apply to every server until that server overrides a field. Rules/templates/commands work the same way — choose 'Global' in any editor, or set the global prefix here."),
-      el("div", { class: "row" },
+      el("div", { class: "row form-actions" },
         el("div", { class: "field" }, el("label", { text: "Global prefix" }), globalPrefix),
         el("button", { class: "btn", text: "Save global prefix", onclick: async () => {
           const raw = String(globalPrefix.value ?? "").trim();
