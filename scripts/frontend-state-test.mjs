@@ -860,7 +860,7 @@ for (const kind of ['rule', 'command']) {
       assert.equal(app.isDirty(), false, 'opening the editor does not modify it');
       const button = action === 'add'
         ? elements.find(n => n.tag === 'button' && (n.textContent === '+ add step' || n.children.some(c => c.textContent === '+ add action')))
-        : elements.find(n => n.tag === 'button' && (n.textContent === '✕' || n.children.some(c => c.textContent === '✕')));
+        : elements.find(n => n.tag === 'button' && (n.attrs['aria-label'] === 'Remove action 1' || n.textContent === '✕' || n.children.some(c => c.textContent === '✕')));
       assert.ok(button);
       await button.listeners.click({});
       assert.equal(app.isDirty(), true);
@@ -1755,7 +1755,7 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.match(js, /hero-content/);
   assert.match(js, /stat-title/);
   assert.match(js, /btn-primary/);
-  assert.match(js, /join-item/);
+  assert.match(js, /dashboard-hero/);
   assert.match(js, /search-select-control/);
   assert.doesNotMatch(js, /btn-neutral/);
   assert.match(js, /class: "stats /);
@@ -1784,4 +1784,38 @@ test('unauthenticated log-channel mutation returns to login', async () => {
   const err = Object.assign(new Error('not authenticated'), { status: 400 });
   assert.equal(h.app.handleAuthLoss(err), true);
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
+});
+
+test('rule badges separate status from heading and preserve distinct semantic variants', () => {
+  const { app } = harness();
+  for (const [enabled, dry_run, variant] of [[true, false, 'badge-success'], [true, true, 'badge-warning'], [false, false, 'badge-error']]) {
+    const card = app.ruleCard({ name: 'Mention spam', rule_id: 'mention_spam', global: {}, guild_override: {}, effective: { enabled, dry_run } });
+    assert.equal(textOf(findNode(card, n => n.tag === 'h3')), 'Mention spam');
+    const badge = findNode(card, n => String(n.className).split(/\s+/).includes(variant));
+    assert.ok(badge, variant);
+    assert.doesNotMatch(badge.className, /badge-ghost/);
+    assert.ok(findNode(card, n => String(n.className).split(/\s+/).includes('scope-tag')));
+    assert.ok(findNode(card, n => String(n.className).split(/\s+/).includes('override-tag')));
+  }
+});
+
+test('escalation editor labels numeric fields and saves edited threshold, duration and reason values', async () => {
+  let submitted;
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') submitted = JSON.parse(options.body);
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  const modal = h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'ban', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
+  for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Delete history (days)', '2'], ['Reason template', 'Updated reason']]) {
+    const wrapper = findNode(modal, n => n.tag === 'label' && textOf(n).startsWith(label));
+    assert.ok(wrapper, label);
+    const input = findNode(wrapper, n => n.tag === 'input');
+    input.value = value;
+    input.onchange();
+  }
+  await findNode(modal, n => n.textContent === 'Save').listeners.click({});
+  assert.equal(submitted.data.actions[0].at, 3);
+  assert.equal(submitted.data.actions[0].duration_minutes, 15);
+  assert.equal(submitted.data.actions[0].delete_days, 2);
+  assert.equal(submitted.data.actions[0].reason, 'Updated reason');
 });

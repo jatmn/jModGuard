@@ -107,6 +107,14 @@ The sidebar keeps your server and all moderation sections within reach. On
 small screens, navigation becomes a horizontally scrollable bar. Tables scroll
 within the workspace, and editors support keyboard navigation.
 
+The dashboard separates setup guidance, protection settings and moderation counts.
+Rule badges distinguish enforcement state from global defaults and server overrides.
+The rule editor labels each escalation threshold, action and duration. Commands keep
+names separate from their scope badges. Template cards pair a full-width editor with
+a preview and put scope and save controls together below. Log-channel cards separate
+the destination from per-event ignore lists; each section keeps its own save action.
+These layouts adapt to narrow screens and use the selected light or dark theme.
+
 The selected server and section are remembered in this browser for each signed-in
 account and API origin. Restored server IDs are checked against your current
 manageable-server list. If a server is no longer available, the first accessible

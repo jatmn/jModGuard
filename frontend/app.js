@@ -15,7 +15,9 @@ function uiClass(value) {
     if (hasBtn && name === "good") { out.push("btn-success"); continue; }
     if (hasBtn && name === "outline") { out.push("btn-outline"); continue; }
     if (hasBtn && name === "ghost") { out.push("btn-ghost"); continue; }
-    if (name === "tag") { out.push("badge", "badge-ghost"); continue; }
+    if (name === "tag") { out.push("badge", "status-tag"); continue; }
+    if (hasTag && name === "scope") { out.push("badge-info", "scope-tag"); continue; }
+    if (hasTag && name === "override") { out.push("badge-secondary", "override-tag"); continue; }
     if (hasTag && name === "on") { out.push("badge-success"); continue; }
     if (hasTag && name === "off") { out.push("badge-error"); continue; }
     if (hasTag && name === "dry") { out.push("badge-warning"); continue; }
@@ -1169,7 +1171,8 @@ function renderTab() {
   } else {
     content.append(fn());
     content.querySelectorAll("table").forEach((table) => {
-      table.classList.add("table", "table-zebra");
+      table.classList.add("table");
+      if (!table.classList.contains("commands-table")) table.classList.add("table-zebra");
       const wrap = el("div", { class: "table-scroll rounded-box bg-base-100", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
       table.replaceWith(wrap); wrap.append(table);
     });
@@ -1248,6 +1251,17 @@ function emptyPanel(title, body, action, attrs) {
         action || null)));
 }
 
+function field(label, control) {
+  control.setAttribute("aria-label", label);
+  return el("div", { class: "field" }, el("label", {}, label, control));
+}
+
+function eventHeading(event) {
+  return el("div", { class: "event-heading" },
+    el("h3", { text: event.replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase()) }),
+    el("code", { class: "muted", text: event }));
+}
+
 function statsRow(...items) {
   return el("div", { class: "stats bg-base-100 shadow w-full" }, ...items);
 }
@@ -1267,37 +1281,43 @@ function tabDashboard() {
   }).catch(() => {
     moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
   });
-  const overview = [
-    stat("Prefix", cfg.settings.prefix),
-    stat("Bot name", cfg.settings.bot_name || "default"),
-    stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
-    stat("Rules in dry-run", rulesDry),
-    stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
-    stat("Log channels", chans),
-    stat("Badword patterns", cfg.badwords.length),
-    stat("Routine chat collection", "Off"),
-    ...moderation.map(({ value, label }) => el("div", { class: "stat" }, el("div", { class: "stat-title", text: label }), value)),
-  ];
-  const rows = [];
-  for (let i = 0; i < overview.length; i += 4) rows.push(statsRow(...overview.slice(i, i + 4)));
   return el("div", { class: "contents" },
-    el("section", { class: "hero bg-base-200 rounded-box" },
-      el("div", { class: "hero-content text-start" },
+    el("section", { class: "hero dashboard-hero" },
+      el("div", { class: "hero-content" },
         el("div", { class: "hero-copy" },
           el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
-          el("h2", { class: "text-3xl font-bold", text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
-          el("p", { class: "py-4", text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
-          el("div", { class: "join" },
-            el("button", { class: "btn primary join-item", text: "Review protection →", onclick: () => navigate("rules") }),
-            el("button", { class: "btn outline join-item", text: "View audit log", onclick: () => navigate("events") }))))),
-    ...rows,
-    el("p", { class: "muted", text: "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log." }),
-    el("div", { class: "alert" },
-      el("div", {},
-        el("div", { class: "font-bold", text: "Getting started" }),
-        el("p", { text: isBotOwner()
-          ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
-          : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }))),
+          el("h2", { text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
+          el("p", { text: "Review your server’s protection, configure your tools, and keep track of moderation activity." }),
+          el("div", { class: "row" },
+            el("button", { class: "btn primary", text: "Review protection →", onclick: () => navigate("rules") }),
+            el("button", { class: "btn outline", text: "View audit log", onclick: () => navigate("events") }))))),
+    el("section", { class: "card getting-started" },
+      el("h3", { text: "Getting started" }),
+      el("p", { class: "muted", text: "Set up protection, choose your tools, then decide where reports go." }),
+      el("div", { class: "setup-links" },
+        ...[["01", "Tune automod", "Review rules and test them in dry-run.", "rules"],
+          ["02", "Configure commands", "Choose commands and moderator permissions.", "commands"],
+          ["03", "Route your logs", "Connect event reports to Discord channels.", "logchannels"]].map(([number, title, description, tab]) =>
+          el("button", { class: "setup-link", onclick: () => navigate(tab) },
+            el("span", { class: "setup-number", text: number }),
+            el("span", {}, el("strong", { text: title }), el("span", { text: description })),
+            el("span", { "aria-hidden": "true", text: "→" })))),
+      el("p", { class: "setup-note", text: "Use each editor’s Save action to apply changes. The bot usually picks up configuration changes within a few seconds. " +
+        (isBotOwner() ? "As bot owner, you can also edit Global defaults for all servers." : "Global defaults can only be edited by the bot owner.") })),
+    el("section", { class: "dashboard-section" },
+      el("h3", { text: "Protection & tools" }),
+      statsRow(stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`), stat("Rules in dry-run", rulesDry),
+        stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`), stat("Log channels", chans))),
+    el("section", { class: "dashboard-section" },
+      el("h3", { text: "Moderation activity" }),
+      statsRow(...moderation.map(({ value, label }) => el("div", { class: "stat" }, el("div", { class: "stat-title", text: label }), value))),
+      el("aside", { class: "dashboard-note" },
+        el("strong", { text: "About these counts" }),
+        el("p", { text: "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log." }))),
+    el("section", { class: "dashboard-section" },
+      el("h3", { text: "Server configuration" }),
+      statsRow(stat("Prefix", cfg.settings.prefix), stat("Bot name", cfg.settings.bot_name || "default"),
+        stat("Badword patterns", cfg.badwords.length), stat("Routine chat collection", "Off"))),
   );
 }
 
@@ -1332,12 +1352,12 @@ function ruleCard(r) {
   const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : spam && rule.dry_run ? "log-only test" : spam ? "delete and ban" : rule.dry_run ? "dry-run" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
-      el("h3", {},
-        `${r.name} `,
-        el("span", { class: `tag ${badge}`, text: label }),
-        r.guild_override ? el("span", { class: "tag", text: "server override" }) : null,
-        r.global ? el("span", { class: "tag", text: "global" }) : null,
-      ),
+      el("div", { class: "rule-heading" },
+        el("h3", { text: r.name }),
+        el("div", { class: "tag-group", "aria-label": "Rule status and source" },
+          el("span", { class: `tag ${badge}`, text: label }),
+          r.guild_override ? el("span", { class: "tag override", text: "server override" }) : null,
+          r.global ? el("span", { class: "tag scope", text: "global" }) : null)),
       el("div", { class: "card-actions" },
         el("button", { class: "btn small", onclick: () => editRule(r) }, "Edit")),
     ),
@@ -1400,7 +1420,7 @@ function editRule(r) {
   const textLength = el("input", { type: "number", min: 1, max: 2000, value: rule.params?.min_length ?? 20 });
   const enforce = el("input", { type: "checkbox", checked: spamConfigured(r.rule_id, rule) && rule.dry_run === false });
   const modal = overlay();
-  const paramsText = el("textarea", { class: "mono" });
+  const paramsText = el("textarea", { class: "mono", rows: 7, spellcheck: "false" });
   paramsText.value = JSON.stringify(rule.params ?? {}, null, 2);
   const actionsRows = el("div", {});
   const whitelistText = el("input", { type: "text", value: (rule.whitelist_roles || []).join(",") });
@@ -1412,16 +1432,21 @@ function editRule(r) {
     unmountVendorWidgets(actionsRows);
     actionsRows.innerHTML = "";
     rule.actions.forEach((a, i) => {
-      const at = el("input", { type: "number", min: 1, value: a.at, style: "width:70px" });
+      const at = el("input", { type: "number", min: 1, value: a.at });
       const action = el("select", { class: "searchable" },
         ["log", "delete", "warn", "timeout", "kick", "ban"].map((x) => el("option", { value: x, text: x, selected: a.action === x })),
       );
-      const dur = el("input", { type: "number", min: 0, value: a.duration_minutes ?? 0, style: "width:80px", title: "minutes (timeout)" });
-      const dd = el("input", { type: "number", min: 0, max: 7, value: a.delete_days ?? 0, style: "width:70px", title: "days of messages deleted (ban)" });
+      const dur = el("input", { type: "number", min: 0, value: a.duration_minutes ?? 0, title: "minutes (timeout)" });
+      const dd = el("input", { type: "number", min: 0, max: 7, value: a.delete_days ?? 0, title: "days of messages deleted (ban)" });
       const reason = el("input", { type: "text", value: a.reason || "", placeholder: "reason template" });
-      actionsRows.append(el("div", { class: "row control-row action-row", style: "margin-bottom:6px" },
-        el("span", { class: "muted", text: "at " }), at, action, dur, dd, reason,
-        el("button", { class: "btn small danger", onclick: () => { rule.actions.splice(i, 1); markDirty(); renderActions(); } }, "✕"),
+      actionsRows.append(el("div", { class: "escalation-step" },
+        el("div", { class: "row title-row" },
+          el("strong", { text: `Action ${i + 1}` }),
+          el("button", { class: "btn small outline", "aria-label": `Remove action ${i + 1}`, onclick: () => { rule.actions.splice(i, 1); markDirty(); renderActions(); } }, "Remove")),
+        el("div", { class: "escalation-fields" },
+          field("Strike count", at), field("Action", action),
+          field("Timeout (minutes)", dur), field("Delete history (days)", dd)),
+        field("Reason template", reason),
       ));
       at.onchange = () => (rule.actions[i].at = Math.max(1, parseInt(at.value) || 1));
       action.onchange = () => { rule.actions[i].action = action.value; renderActions(); };
@@ -1433,8 +1458,11 @@ function editRule(r) {
   };
   if (!spam) renderActions();
 
-  const box = el("div", { class: "modal-box" },
-    el("h3", { text: `Edit rule: ${r.name}` }),
+  const box = el("div", { class: "modal-box rule-editor" },
+    el("div", { class: "editor-heading" },
+      el("span", { class: "eyebrow", text: "AUTOMOD RULE" }),
+      el("h3", { text: `Edit rule: ${r.name}` }),
+      el("p", { class: "muted", text: r.description || "Configure detection, actions and exemptions for this rule." })),
     el("div", { class: "row checkbox-group" },
       el("label", { class: "checkbox-label" },
         el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }), "Enabled"),
@@ -1453,7 +1481,8 @@ function editRule(r) {
       el("label", { text: "Parameters (JSON)" }), paramsText,
     ),
     spam ? null : el("div", { class: "field" },
-      el("label", { text: "Action escalation" }), actionsRows,
+      el("label", { text: "Action escalation" }),
+      el("p", { class: "field-help", text: "Strike count is the threshold for an action. Timeout minutes apply to timeout; delete-history days apply to ban." }), actionsRows,
       el("button", { class: "btn small", onclick: () => { rule.actions.push({ at: rule.actions.length + 1, action: "warn", duration_minutes: 0, delete_days: 0, reason: "" }); markDirty(); renderActions(); } }, "+ add action"),
     ),
     el("div", { class: "row form-row" },
@@ -1642,25 +1671,27 @@ function tabCommands() {
   return el("div", {},
     el("div", { class: "row title-row" },
       el("h2", { text: "Commands" }),
-      el("button", { class: "btn good", text: "+ New custom command", onclick: () => editCommand(null) }),
+      el("button", { class: "btn primary", text: "+ New custom command", onclick: () => editCommand(null) }),
     ),
     el("p", { class: "muted", style: "margin:6px 0 14px" },
       "Every command lives in config: rename, reword responses, change permissions or cooldowns. " +
       "Custom commands run multi-step action plans (reply, dm, log, roles, timeout, kick, ban…). " +
       "Enabled commands are synced to Discord as slash commands."),
-    el("table", {},
+    el("table", { class: "commands-table" },
       el("thead", {}, el("tr", {},
-        el("th", { text: "Name" }), el("th", { text: "Category" }), el("th", { text: "Description" }),
+        el("th", { text: "Command" }), el("th", { text: "Category" }), el("th", { text: "Description" }),
         el("th", { text: "Permission" }), el("th", { text: "State" }), el("th", {})),
       ),
       el("tbody", {}, ...cmds.map((c) => {
         const d = c.effective;
         return el("tr", {},
-          el("td", {}, el("strong", { text: d.name }),
-            c.guild_override ? el("span", { class: "tag", text: "override" }) : null,
-            c.scope === "global" ? el("span", { class: "tag", text: "global" }) : null),
+          el("td", {}, el("div", { class: "command-identity" },
+            el("strong", { class: "mono", text: d.name }),
+            el("div", { class: "tag-group" },
+              c.guild_override ? el("span", { class: "tag override", text: "server override" }) : null,
+              c.scope === "global" ? el("span", { class: "tag scope", text: "global" }) : null))),
           el("td", { text: d.category }),
-          el("td", { class: "muted", text: d.description }),
+          el("td", { class: "muted command-description", text: d.description }),
           el("td", { text: d.permission }),
           el("td", {}, el("span", { class: `tag ${d.enabled ? "on" : "off"}`, text: d.enabled ? "enabled" : "disabled" })),
           el("td", {}, el("button", { class: "btn small", text: "Edit", onclick: () => editCommand(c) })),
@@ -1859,14 +1890,17 @@ function editCommand(c) {
 function tabTemplates() {
   return el("div", {},
     el("h2", { text: "Event templates" }),
-    el("p", { class: "muted", style: "margin-bottom:12px" },
-      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed."),
+    el("p", { class: "muted", text: "Customize the messages sent to your log channels. Edit a template, review the sample, then save it for the selected scope." }),
+    el("details", { class: "reference-panel" },
+      el("summary", { text: "Template variables & message data" }),
+      el("p", { class: "muted" },
+      "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Saved templates keep their wording after upgrades; add the new fields where needed.")),
     ...state.config.templates.map((t) => templateCard(t)),
   );
 }
 
 function templateCard(t) {
-  const text = el("textarea", { class: "mono" });
+  const text = el("textarea", { class: "mono template-input", rows: 8, spellcheck: "false" });
   text.value = t.effective;
   const preview = el("pre", { class: "code" });
   preview.textContent = t.effective
@@ -1882,11 +1916,14 @@ function templateCard(t) {
     .replaceAll("{time}", new Date().toISOString());
   text.oninput = () => (preview.textContent = text.value);
   const scopeSel = scopeSelect("This server", "Global");
-  return el("div", { class: "card" },
-    el("div", { class: "row", style: "justify-content:space-between;margin-bottom:14px" },
-      el("strong", { text: t.event }),
-      el("div", { class: "row control-row" },
-        scopeSel,
+  return el("div", { class: "card template-card" },
+    eventHeading(t.event),
+    el("div", { class: "template-workspace" },
+      field("Message template", text),
+      el("div", { class: "template-preview" }, el("strong", { text: "Preview" }), preview)),
+    el("div", { class: "editor-footer" },
+      field("Save to", scopeSel),
+      el("div", { class: "row" },
         el("button", { class: "btn primary small", text: "Save", onclick: async () => {
           await reloadAfter(
             () => api(`/api/guilds/${state.guildId}/templates/${t.event}`, "PUT", { scope: scopeSel.value, template: text.value }),
@@ -1901,8 +1938,6 @@ function templateCard(t) {
         } }),
       ),
     ),
-    text,
-    el("div", { class: "muted", style: "margin:6px 0" }, el("strong", { text: "Preview: " }), preview),
   );
 }
 
@@ -1913,11 +1948,12 @@ function templateCard(t) {
 function tabLogChannels() {
   const guildId = state.guildId;
   return el("div", {},
-    el("h2", { text: "Log channels" }),
-    el("button", { class: "btn standalone-action", text: "Refresh configuration", onclick: async () => {
-      if (!canLeave()) return;
-      if (await loadConfig()) renderTab();
-    } }),
+    el("div", { class: "row title-row" },
+      el("h2", { text: "Log channels" }),
+      el("button", { class: "btn", text: "Refresh configuration", onclick: async () => {
+        if (!canLeave()) return;
+        if (await loadConfig()) renderTab();
+      } })),
     el("p", { class: "muted", style: "margin-bottom:12px" },
       "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes show as queued while the bot validates them, then reconcile automatically; Bot actions has the full receipt."),
     ...state.config.log_channels.map((lc) => {
@@ -1925,12 +1961,13 @@ function tabLogChannels() {
       const ignoredUsers = el("textarea", { placeholder: "One Discord user or bot ID per line", rows: 2 }, (lc.ignore?.users || []).join("\n"));
       const ignoredChannels = el("textarea", { placeholder: "One source channel ID per line", rows: 2 }, (lc.ignore?.channels || []).join("\n"));
       const scopeSel = scopeSelect("This server", "Global", false);
-      return el("div", { class: "card", style: "margin-bottom:8px" },
-        el("div", { class: "row control-row" },
-        el("label", { style: "width:180px" }, lc.event,
-          lc.pending_action ? el("span", { class: "tag", style: "margin-left:6px",
+      return el("div", { class: "card log-channel-card" },
+        el("div", { class: "row title-row" }, eventHeading(lc.event),
+          lc.pending_action ? el("span", { class: "tag dry",
             text: ["pending", "claimed", "running"].includes(lc.pending_action.state) ? "queued" : lc.pending_action.state }) : null),
-        input, scopeSel,
+        el("div", { class: "routing-fields" },
+        field("Destination channel", input), field("Applies to", scopeSel),
+        el("div", { class: "row routing-actions" },
         el("button", { class: "btn small primary", text: "Set", savedInputs: [input], onclick: async () => {
           const v = parseSnowflake(input.value);
           if (!v) return toast("Enter a Discord channel ID, <#id> mention, or channel URL", "error");
@@ -1949,10 +1986,13 @@ function tabLogChannels() {
             else if (job.state !== "succeeded") await reconcileQueuedLogChannel(job);
           }
         } }),
-        ),
-        el("div", { class: "row", style: "margin-top:8px" },
-          el("label", {}, "Ignore user or bot IDs", ignoredUsers),
-          el("label", {}, "Ignore source channel IDs", ignoredChannels),
+        )),
+        el("div", { class: "log-ignore-section" },
+          el("h4", { text: "Event ignores" }),
+          el("p", { class: "field-help", text: "Skip reports involving these users or source channels. Leave empty to report all." }),
+          el("div", { class: "ignore-fields" },
+            field("Ignore user or bot IDs", ignoredUsers),
+            field("Ignore source channel IDs", ignoredChannels)),
           el("button", { class: "btn small", text: "Save ignores", savedInputs: [ignoredUsers, ignoredChannels], onclick: async () => {
             const users = ignoredUsers.value.split(/\r?\n|,/).map((id) => id.trim()).filter(Boolean).map((id) => parseLogFilterId(id, "user"));
             if (users.some((id) => !id)) return toast("Enter valid Discord user or bot IDs", "error");
