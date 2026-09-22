@@ -82,12 +82,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "ban",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &reason,
             )
             .await;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
@@ -144,12 +143,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "unban",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &reason,
             )
             .await;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
@@ -187,12 +185,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "kick",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &reason,
             )
             .await;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
@@ -259,13 +256,13 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             discord?;
             if minutes == 0 {
                 let mut v = vars.clone();
-                add_target_vars(&mut v, &target_user);
+                v.insert("target_id".into(), target.to_string());
                 v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
                 let mut v = vars.clone();
-                add_target_vars(&mut v, &target_user);
+                v.insert("target_id".into(), target.to_string());
                 v.insert("duration".into(), format!("{minutes} minutes"));
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
@@ -276,12 +273,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "timeout",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &reason,
             )
             .await;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("minutes".into(), minutes.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
@@ -339,12 +335,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "warn",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &reason,
             )
             .await;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("reason".into(), reason);
             Ok(BehaviorOutcome {
                 response: None,
@@ -358,7 +353,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
                     .await?;
             let target_user = user_lookup(env, target).await?;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target_id".into(), target.to_string());
             let warns =
                 db::list_warns(&env.app.db, env.guild_id.get() as i64, target.get() as i64).await?;
             if warns.is_empty() {
@@ -396,7 +391,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let target_user = user_lookup(env, target).await?;
             let n = db::clear_enrolled_warns(&env.app.db, enrollment.clone(), target.get() as i64)
                 .await?;
-            add_target_vars(&mut vars, &target_user);
+            vars.insert("target".into(), target_user.name.clone());
+            vars.insert("target_id".into(), target.to_string());
             vars.insert("count".into(), n.to_string());
             log_mod(
                 env,
@@ -404,8 +400,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "warnclear",
                 target,
                 &target_user.name,
-                &target_user.display,
-                target_user.global.as_deref(),
                 &n.to_string(),
             )
             .await;
@@ -471,8 +465,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "purge",
                 env.actor,
                 "messages",
-                "messages",
-                None,
                 &format!("{n} deleted"),
             )
             .await;
@@ -515,8 +507,6 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 "slowmode",
                 env.actor,
                 "channel",
-                "channel",
-                None,
                 &format!("{seconds}s"),
             )
             .await;
@@ -703,14 +693,6 @@ pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<Strin
         format!("{} (<@{}>)", env.actor_member.display_name(), env.actor),
     );
     vars.insert("actor_id".into(), env.actor.to_string());
-    vars.insert("actor_name".into(), env.actor_member.user.name.clone());
-    vars.insert(
-        "actor_display".into(),
-        env.actor_member.display_name().to_string(),
-    );
-    if let Some(global_name) = &env.actor_member.user.global_name {
-        vars.insert("actor_global_name".into(), global_name.clone());
-    }
     vars.insert(
         "guild".into(),
         env.ctx
@@ -746,47 +728,17 @@ async fn target_and_reason(
 }
 
 async fn user_lookup(env: &CmdEnv<'_>, id: serenity::model::id::UserId) -> Result<UserInfo> {
-    let member = env
+    let name = env
         .ctx
         .cache
-        .guild(env.guild_id)
-        .and_then(|guild| guild.members.get(&id).cloned());
-    let user = env.ctx.cache.user(id);
-    let name = user
-        .as_ref()
-        .map(|user| user.name.clone())
-        .or_else(|| member.as_ref().map(|member| member.user.name.clone()))
+        .user(id)
+        .map(|u| u.name.clone())
         .unwrap_or_else(|| id.to_string());
-    let display = member
-        .as_ref()
-        .map(|member| member.display_name().to_string())
-        .or_else(|| user.as_ref().and_then(|user| user.global_name.clone()))
-        .unwrap_or_else(|| name.clone());
-    Ok(UserInfo {
-        id: id.get(),
-        name,
-        display,
-        global: member
-            .as_ref()
-            .and_then(|member| member.user.global_name.clone())
-            .or_else(|| user.as_ref().and_then(|user| user.global_name.clone())),
-    })
+    Ok(UserInfo { name })
 }
 
 struct UserInfo {
-    id: u64,
     name: String,
-    display: String,
-    global: Option<String>,
-}
-
-fn add_target_vars(vars: &mut std::collections::BTreeMap<String, String>, target: &UserInfo) {
-    vars.insert("target".into(), target.name.clone());
-    vars.insert("target_id".into(), target.id.to_string());
-    vars.insert("target_name".into(), target.display.clone());
-    if let Some(global_name) = &target.global {
-        vars.insert("target_global_name".into(), global_name.clone());
-    }
 }
 
 fn parse_channel_mention(token: &str) -> Option<ChannelId> {
@@ -819,15 +771,12 @@ fn say_target_and_text(args: &Args, invocation: ChannelId) -> Result<(ChannelId,
     Ok((target, text.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn log_mod(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
     action: &str,
     target: serenity::model::id::UserId,
     target_name: &str,
-    target_display: &str,
-    target_global_name: Option<&str>,
     reason: &str,
 ) {
     logging::emit_mod_action(
@@ -838,12 +787,9 @@ async fn log_mod(
         action,
         target.get(),
         target_name,
-        target_display,
-        target_global_name,
+        target_name,
         env.actor.get(),
         env.actor_member.display_name(),
-        &env.actor_member.user.name,
-        env.actor_member.user.global_name.as_deref(),
         env.channel_id.get(),
         reason,
     )

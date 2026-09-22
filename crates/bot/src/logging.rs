@@ -25,6 +25,7 @@ type EditKey = (u64, u64, u64);
 struct EditObservation {
     edited_at_ms: Option<i64>,
     reported_timestamps: Vec<i64>,
+    pending_without_timestamp: Option<(Option<u64>, Option<u64>)>,
     content: Option<u64>,
     attachments: Option<u64>,
     at: Instant,
@@ -62,15 +63,41 @@ impl EditReportDedup {
                     return false;
                 }
                 let distinct_edit = previous != current;
+                if !distinct_edit && seen.pending_without_timestamp.is_some() {
+                    // This is an older timestamp replay while a newer edit has
+                    // only been observed without its timestamp. Keep the newer
+                    // field fingerprints until its timestamp arrives.
+                    seen.at = Instant::now();
+                    return false;
+                }
+                if distinct_edit
+                    && let Some((pending_content, pending_attachments)) =
+                        seen.pending_without_timestamp
+                    && content.is_none_or(|value| pending_content.is_none_or(|old| old == value))
+                    && attachments
+                        .is_none_or(|value| pending_attachments.is_none_or(|old| old == value))
+                {
+                    // The changed fields were already reported without a
+                    // timestamp. This update supplies their edit identity.
+                    seen.edited_at_ms = Some(current);
+                    remember_edit_timestamp(seen, current);
+                    seen.pending_without_timestamp = None;
+                    if content.is_some() {
+                        seen.content = content;
+                    }
+                    if attachments.is_some() {
+                        seen.attachments = attachments;
+                    }
+                    seen.at = Instant::now();
+                    return false;
+                }
                 // Discord's supplied edit timestamp groups partial updates.
                 // A new timestamp starts a new observation even when its first
                 // payload field was absent from the preceding edit.
                 seen.edited_at_ms = edited_at_ms;
                 if distinct_edit {
-                    if seen.reported_timestamps.len() >= 64 {
-                        seen.reported_timestamps.remove(0);
-                    }
-                    seen.reported_timestamps.push(current);
+                    remember_edit_timestamp(seen, current);
+                    seen.pending_without_timestamp = None;
                     seen.content = content;
                     seen.attachments = attachments;
                 } else {
@@ -86,9 +113,43 @@ impl EditReportDedup {
             }
             // Gateway updates may supply only one field at a time. A newly
             // supplied field completes this observation; it is not a new edit.
-            let changed = content.is_some_and(|value| seen.content.is_some_and(|old| old != value))
-                || attachments
-                    .is_some_and(|value| seen.attachments.is_some_and(|old| old != value));
+            let changed_content =
+                content.is_some_and(|value| seen.content.is_some_and(|old| old != value));
+            let changed_attachments =
+                attachments.is_some_and(|value| seen.attachments.is_some_and(|old| old != value));
+            let changed = changed_content || changed_attachments;
+            let continuation = if edited_at_ms.is_none()
+                && let Some((pending_content, pending_attachments)) =
+                    seen.pending_without_timestamp.as_mut()
+            {
+                let continuation = if changed_content
+                    && !changed_attachments
+                    && pending_content.is_none()
+                {
+                    *pending_content = content;
+                    true
+                } else if changed_attachments && !changed_content && pending_attachments.is_none() {
+                    *pending_attachments = attachments;
+                    true
+                } else {
+                    false
+                };
+                // A field first supplied by a partial update is part of this
+                // edit even when there was no earlier value to compare with.
+                if pending_content.is_none() {
+                    *pending_content = content;
+                }
+                if pending_attachments.is_none() {
+                    *pending_attachments = attachments;
+                }
+                continuation
+            } else {
+                false
+            };
+            if changed && !continuation {
+                seen.pending_without_timestamp =
+                    edited_at_ms.is_none().then_some((content, attachments));
+            }
             if content.is_some() {
                 seen.content = content;
             }
@@ -97,14 +158,15 @@ impl EditReportDedup {
             }
             if edited_at_ms.is_some() {
                 seen.edited_at_ms = edited_at_ms;
+                seen.pending_without_timestamp = None;
                 if let Some(current) = edited_at_ms
                     && !seen.reported_timestamps.contains(&current)
                 {
-                    seen.reported_timestamps.push(current);
+                    remember_edit_timestamp(seen, current);
                 }
             }
             seen.at = Instant::now();
-            return changed;
+            return changed && !continuation;
         }
         if entries.len() >= EDIT_REPORT_LIMIT
             && !entries.contains_key(&key)
@@ -120,6 +182,7 @@ impl EditReportDedup {
             EditObservation {
                 edited_at_ms,
                 reported_timestamps: edited_at_ms.into_iter().collect(),
+                pending_without_timestamp: edited_at_ms.is_none().then_some((content, attachments)),
                 content,
                 attachments,
                 at: Instant::now(),
@@ -127,6 +190,13 @@ impl EditReportDedup {
         );
         true
     }
+}
+
+fn remember_edit_timestamp(seen: &mut EditObservation, timestamp: i64) {
+    if seen.reported_timestamps.len() >= 64 {
+        seen.reported_timestamps.remove(0);
+    }
+    seen.reported_timestamps.push(timestamp);
 }
 
 fn fingerprint<T: Hash>(value: &T) -> u64 {
@@ -282,40 +352,16 @@ pub(crate) async fn emit_to(
 }
 
 fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
-    let known_user = vars.get("user_id").is_none_or(|id| id != "unavailable");
-    let known_actor = vars
-        .get("actor_id")
-        .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0));
-    let known_target = vars
-        .get("target_id")
-        .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0));
     let user_match = ["user_id", "actor_id", "target_id"]
         .iter()
         .filter_map(|key| vars.get(*key))
-        .filter(|value| value.parse::<u64>().is_ok_and(|id| id != 0))
-        .chain(
-            ["username", "user", "user_global_name"]
-                .iter()
-                .filter_map(|key| vars.get(*key))
-                .filter(|_| known_user),
-        )
-        .chain(
-            ["actor_name", "actor_display", "actor_global_name"]
-                .iter()
-                .filter_map(|key| vars.get(*key))
-                .filter(|_| known_actor),
-        )
-        .chain(
-            ["target", "target_name", "target_global_name"]
-                .iter()
-                .filter_map(|key| vars.get(*key))
-                .filter(|_| known_target),
-        )
-        .any(|value| {
+        .filter_map(|value| value.parse::<u64>().ok())
+        .filter(|id| *id != 0)
+        .any(|id| {
             filter
                 .users
                 .iter()
-                .any(|ignored| ignored == &value.to_lowercase())
+                .any(|ignored| ignored == &id.to_string())
         });
     let source = vars
         .get("source_channel_id")
@@ -325,7 +371,11 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
             vars.get("channel")
                 .and_then(|value| value.strip_prefix("<#")?.strip_suffix('>'))
         });
-    user_match || source.is_some_and(|source| filter.channels.iter().any(|id| id == source))
+    user_match
+        || source
+            .and_then(|source| source.parse::<u64>().ok())
+            .filter(|id| *id != 0)
+            .is_some_and(|source| filter.channels.iter().any(|id| id == &source.to_string()))
 }
 
 fn record_delivery_failure(app: &BotState) {
@@ -421,17 +471,8 @@ pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<Messag
         vars.extend(templates::user_vars(
             author.id.get(),
             &author.name,
-            event
-                .member
-                .as_ref()
-                .and_then(|member| member.as_deref())
-                .and_then(|member| member.nick.as_deref())
-                .or(author.global_name.as_deref())
-                .unwrap_or(&author.name),
+            author.global_name.as_deref().unwrap_or(&author.name),
         ));
-        if let Some(global_name) = &author.global_name {
-            vars.insert("user_global_name".into(), global_name.clone());
-        }
     }
     Some(MessageReport {
         guild_id,
@@ -482,25 +523,14 @@ pub async fn emit_mod_action(
     target_id: u64,
     target_name: &str,
     target_display: &str,
-    target_global_name: Option<&str>,
     actor_id: u64,
     actor_name: &str,
-    actor_username: &str,
-    actor_global_name: Option<&str>,
     source_channel_id: u64,
     reason: &str,
 ) {
     let mut vars = templates::user_vars(target_id, target_name, target_display);
-    if let Some(global_name) = target_global_name {
-        vars.insert("user_global_name".into(), global_name.to_string());
-    }
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());
-    vars.insert("actor_name".into(), actor_username.to_string());
-    vars.insert("actor_display".into(), actor_name.to_string());
-    if let Some(global_name) = actor_global_name {
-        vars.insert("actor_global_name".into(), global_name.to_string());
-    }
     vars.insert("source_channel_id".into(), source_channel_id.to_string());
     vars.insert("action".into(), action.to_string());
     vars.insert("reason".into(), reason.to_string());
@@ -524,7 +554,6 @@ pub async fn emit_member_event(
     guild_id: GuildId,
     event: &str,
     user: &serenity::model::user::User,
-    guild_nick: Option<&str>,
     extra: BTreeMap<String, String>,
 ) {
     let account_created = user.created_at();
@@ -534,13 +563,8 @@ pub async fn emit_member_event(
     let mut vars = templates::user_vars(
         user.id.get(),
         &user.name,
-        guild_nick
-            .or(user.global_name.as_deref())
-            .unwrap_or(&user.name),
+        user.global_name.as_deref().unwrap_or(&user.name),
     );
-    if let Some(global_name) = &user.global_name {
-        vars.insert("user_global_name".into(), global_name.clone());
-    }
     vars.insert("account_created".into(), account_created.to_string());
     vars.insert("account_age".into(), format!("{account_age_days} days"));
     vars.extend(extra);

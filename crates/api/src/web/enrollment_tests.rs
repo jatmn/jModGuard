@@ -311,7 +311,7 @@ async fn retired_and_unregistered_guild_routes_deny_even_installation_owner() {
             (
                 "PUT",
                 "logfilters/message_edit",
-                r#"{"users":["OtherBot"],"channels":[]}"#,
+                r#"{"users":["123"],"channels":[]}"#,
             ),
             (
                 "DELETE",
@@ -1384,14 +1384,15 @@ async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wir
 async fn per_event_log_ignores_are_saved_in_the_authorized_guild_bundle() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
-    let body = serde_json::json!({"users":["  OtherBot  ","123"],"channels":["456"]}).to_string();
+    let body = serde_json::json!({"users":[" 000123 ","9007199254740993"],"channels":["000456"]})
+        .to_string();
     let (status, saved) = f
         .request("PUT", "/api/guilds/10/logfilters/message_edit", &body)
         .await;
     assert_eq!(status, StatusCode::OK, "{saved}");
     assert_eq!(
         saved["ignore"],
-        serde_json::json!({"users":["123","otherbot"],"channels":["456"]})
+        serde_json::json!({"users":["123","9007199254740993"],"channels":["456"]})
     );
     let (_, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
     let edit = bundle["log_channels"]
@@ -1401,6 +1402,21 @@ async fn per_event_log_ignores_are_saved_in_the_authorized_guild_bundle() {
         .find(|row| row["event"] == "message_edit")
         .unwrap();
     assert_eq!(edit["ignore"], saved["ignore"]);
+    for invalid in [
+        serde_json::json!({"users":["OtherBot"],"channels":[]}),
+        serde_json::json!({"users":["0"],"channels":[]}),
+        serde_json::json!({"users":[],"channels":["staff"]}),
+        serde_json::json!({"users":[],"channels":["18446744073709551616"]}),
+    ] {
+        let (status, _) = f
+            .request(
+                "PUT",
+                "/api/guilds/10/logfilters/message_edit",
+                &invalid.to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     let deleted = serde_json::json!({"users":[],"channels":[]}).to_string();
     let (status, _) = f
         .request("PUT", "/api/guilds/10/logfilters/message_edit", &deleted)

@@ -37,27 +37,14 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
     }
     if let Some(target) = target {
         vars.insert("target_id".into(), target.to_string());
-        if let Some(member) = env
-            .ctx
-            .cache
-            .guild(env.guild_id)
-            .and_then(|guild| guild.members.get(&target).cloned())
-        {
-            remember_target(&mut vars, &member);
-        } else if let Some(user) = env.ctx.cache.user(target) {
-            vars.insert("target".into(), user.name.clone());
-            vars.insert(
-                "target_name".into(),
-                user.global_name
-                    .clone()
-                    .unwrap_or_else(|| user.name.clone()),
-            );
-            if let Some(global_name) = &user.global_name {
-                vars.insert("target_global_name".into(), global_name.clone());
-            }
-        } else {
-            vars.insert("target".into(), target.to_string());
-        }
+        vars.insert(
+            "target".into(),
+            env.ctx
+                .cache
+                .user(target)
+                .map(|user| user.name.clone())
+                .unwrap_or_else(|| target.to_string()),
+        );
     }
     let mut responses: Vec<String> = Vec::new();
 
@@ -185,18 +172,6 @@ async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::mod
         .map_err(|e| anyhow!("target is not available in this server: {e}"))
 }
 
-fn remember_target(
-    vars: &mut std::collections::BTreeMap<String, String>,
-    member: &serenity::model::guild::Member,
-) {
-    vars.insert("target_id".into(), member.user.id.to_string());
-    vars.insert("target".into(), member.user.name.clone());
-    vars.insert("target_name".into(), member.display_name().to_string());
-    if let Some(global_name) = &member.user.global_name {
-        vars.insert("target_global_name".into(), global_name.clone());
-    }
-}
-
 async fn run_step(
     env: &CmdEnv<'_>,
     enrollment: Option<db::GuildEnrollment>,
@@ -230,9 +205,6 @@ async fn run_step(
         }
         PlanStep::AddRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
-            if target.is_some() {
-                remember_target(vars, &member);
-            }
             refuse_fenced_discord_mutation(env).await?;
             member
                 .add_role(&env.ctx.http, RoleId::new(*role_id))
@@ -240,9 +212,6 @@ async fn run_step(
         }
         PlanStep::RemoveRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
-            if target.is_some() {
-                remember_target(vars, &member);
-            }
             refuse_fenced_discord_mutation(env).await?;
             member
                 .remove_role(&env.ctx.http, RoleId::new(*role_id))
@@ -251,7 +220,6 @@ async fn run_step(
         PlanStep::Timeout { minutes } => {
             let target = target.expect("target-required plan steps are validated before execution");
             let mut member = target_member(env, target).await?;
-            remember_target(vars, &member);
             let until = serenity::model::Timestamp::from_unix_timestamp(
                 chrono::Utc::now().timestamp() + (*minutes as i64) * 60,
             )
@@ -274,7 +242,6 @@ async fn run_step(
         PlanStep::Kick => {
             let target = target.expect("target-required plan steps are validated before execution");
             let member = target_member(env, target).await?;
-            remember_target(vars, &member);
             refuse_fenced_discord_mutation(env).await?;
             let result = member
                 .kick_with_reason(&env.ctx.http, "custom command")

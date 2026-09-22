@@ -63,7 +63,7 @@ exits if that wait expires).
 | `commands` | every command — name, aliases, behavior, response, permissions (server + global) |
 | `templates` | log event templates (server + global) |
 | `log_channels` | event type → channel mapping (per server only) |
-| `log_filters` | ignored users/bots and source channels per event and server |
+| `log_filters` | ignored user/bot IDs and source channel IDs per event and server |
 | `legacy_global_log_channels` | transitional empty global-channel scaffolding; new mappings are per server |
 | `badwords` | regex patterns (server + global) |
 | `events` | selected moderation records and classified moderation-plan summaries; routine channel reports do not append here |

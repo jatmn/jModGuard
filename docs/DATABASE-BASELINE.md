@@ -100,8 +100,8 @@ workers are not activated.
 
 Migration 0012 adds `guild_write_fences` for populated shared/dedicated moves. See
 [guild moves](GUILD-MOVES.md).
-Migration 0013 adds per-guild, per-event `log_filters` for ignored users and
-source channels. Start the bot before the API so the new table exists.
+Migration 0013 adds per-guild, per-event `log_filters` for ignored user/bot IDs
+and source channel IDs. Start the bot before the API so the new table exists.
 
 ## Separate guild-store family
 

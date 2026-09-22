@@ -1203,6 +1203,14 @@ function parseSnowflake(raw) {
   return /^\d+$/.test(text) ? text : "";
 }
 
+function parseLogFilterId(raw, kind) {
+  const value = String(raw ?? "").trim();
+  const match = kind === "user" ? value.match(/^<@!?(\d+)>$/) : value.match(/^<#(\d+)>$/);
+  const url = kind === "channel" ? value.match(/^https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/\d+\/(\d+)\/?$/i) : null;
+  const id = match?.[1] || url?.[1] || (/^\d+$/.test(value) ? value : "");
+  return id && /[1-9]/.test(id) ? id : "";
+}
+
 function splitIds(s) {
   const ids = [];
   for (const raw of String(s ?? "").split(",")) {
@@ -1583,7 +1591,7 @@ function tabLogChannels() {
       "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes show as queued while the bot validates them, then reconcile automatically; Bot actions has the full receipt."),
     ...state.config.log_channels.map((lc) => {
       const input = el("input", { type: "text", value: (lc.effective && String(lc.effective) !== "0") ? String(lc.effective) : "", placeholder: "channel id" });
-      const ignoredUsers = el("textarea", { placeholder: "One username, bot name, or user ID per line", rows: 2 }, (lc.ignore?.users || []).join("\n"));
+      const ignoredUsers = el("textarea", { placeholder: "One Discord user or bot ID per line", rows: 2 }, (lc.ignore?.users || []).join("\n"));
       const ignoredChannels = el("textarea", { placeholder: "One source channel ID per line", rows: 2 }, (lc.ignore?.channels || []).join("\n"));
       const scopeSel = scopeSelect("This server", "Global", false);
       return el("div", { class: "card", style: "margin-bottom:8px" },
@@ -1612,11 +1620,12 @@ function tabLogChannels() {
         } }),
         ),
         el("div", { class: "row", style: "margin-top:8px" },
-          el("label", {}, "Ignore users or bots", ignoredUsers),
-          el("label", {}, "Ignore source channels", ignoredChannels),
+          el("label", {}, "Ignore user or bot IDs", ignoredUsers),
+          el("label", {}, "Ignore source channel IDs", ignoredChannels),
           el("button", { class: "btn small", text: "Save ignores", savedInputs: [ignoredUsers, ignoredChannels], onclick: async () => {
-            const users = ignoredUsers.value.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
-            const channels = ignoredChannels.value.split(/\n|,/).map((name) => name.trim()).filter(Boolean).map(parseSnowflake);
+            const users = ignoredUsers.value.split(/\r?\n|,/).map((id) => id.trim()).filter(Boolean).map((id) => parseLogFilterId(id, "user"));
+            if (users.some((id) => !id)) return toast("Enter valid Discord user or bot IDs", "error");
+            const channels = ignoredChannels.value.split(/\r?\n|,/).map((id) => id.trim()).filter(Boolean).map((id) => parseLogFilterId(id, "channel"));
             if (channels.some((id) => !id)) return toast("Enter a valid source channel ID, <#id> mention, or channel URL", "error");
             const saved = await api(`/api/guilds/${guildId}/logfilters/${lc.event}`, "PUT", { users, channels });
             lc.ignore = saved.ignore;

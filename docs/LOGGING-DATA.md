@@ -10,12 +10,14 @@ Basic Discord log delivery is independent of those retired history tables.
   and supplied author identity. An absent field is unknown, not empty. Embed/pin-only
   refreshes are skipped. Reports say "updated"; they do not claim a verified before/after
   diff. A bounded 10-second fingerprint merges partial content/attachment updates for
-  the same message in one bot process. A different supplied edit timestamp reports
-  again; when timestamps are absent, changed observed content or attachment details do.
-- Each guild can save ignored user names, display/bot names or user IDs and ignored
-  source channel IDs separately for each event in Log Channels. Matching is based on
-  identity and source channel supplied with the event; an absent author cannot match
-  a name. The filter applies before Discord delivery and does not alter moderation
+  the same message in one bot process. A later distinct edit timestamp reports
+  again; a timestamp that arrives after the same untimestamped observation is
+  coalesced. Without timestamps, a later change to a field already supplied for
+  that edit can trigger another report.
+- Each guild can save ignored Discord user IDs (including bot IDs) and source channel
+  IDs separately for each event in Log Channels. Matching uses the IDs known to
+  the report. If no user ID is known, only a source channel exclusion can apply.
+  The filter applies before Discord delivery and does not alter moderation
   enforcement or retained moderation records.
 - Single deletions report channel/message ID and disclose unavailable author/content.
   Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.

@@ -246,7 +246,7 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
    live.
 2. Set up **log channels** (Log Channels tab): at minimum `automod`,
    `mod_action`, `member_join`, `member_leave`, `message_delete`. For each event,
-   optionally save ignored user or bot names and source channel IDs to avoid
+   optionally save ignored user or bot IDs and source channel IDs to avoid
    duplicate bot reports or exclude staff channels.
 3. Add your **badwords** (Badwords tab) and test them with the live tester.
 4. Change the prefix / bot nickname if you like (Settings tab).

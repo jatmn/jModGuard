@@ -461,11 +461,11 @@ test('queued log-channel saves clear dirty state and survive in-app navigation',
   assert.equal(h.app.state.config.log_channels[0].effective, '222');
 });
 
-test('log channel ignore editor saves each event without numeric snowflake conversion', async () => {
+test('log channel ignore editor saves user and channel IDs as strings', async () => {
   const calls = [];
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
-    return response({ ignore: { users: ['reporter, inc.', 'otherbot'], channels: ['9007199254740993'] } });
+    return response({ ignore: { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] } });
   });
   h.app.state.config = {
     enrollment_id: 'membership', rules: [], commands: [], badwords: [],
@@ -475,13 +475,16 @@ test('log channel ignore editor saves each event without numeric snowflake conve
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
   const fields = h.elements.filter((node) => node.tag === 'textarea');
-  fields[0].value = 'Reporter, Inc.\nOtherBot';
-  fields[1].value = '9007199254740993';
+  fields[0].value = '9007199254740993\n<@9007199254740995>';
+  fields[1].value = '<#9007199254740997>';
   const save = h.elements.find((node) => node.tag === 'button' && node.textContent === 'Save ignores');
   await save.listeners.click({});
   assert.match(calls[0].url, /\/logfilters\/message_edit$/);
-  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['Reporter, Inc.', 'OtherBot'], channels: ['9007199254740993'] });
-  assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['reporter, inc.', 'otherbot'], channels: ['9007199254740993'] });
+  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.app.state.config.log_channels[0].ignore)), { users: ['9007199254740993', '9007199254740995'], channels: ['9007199254740997'] });
+  fields[0].value = 'OtherBot';
+  await save.listeners.click({});
+  assert.equal(calls.length, 1, 'names must be rejected before calling the API');
 });
 
 test('queued log-channel receipts reconcile without a configuration refresh', async () => {
@@ -1226,11 +1229,11 @@ test('individual configuration GETs retain loaded membership without rebinding g
 
 test('log filter saves use the loaded guild enrollment', async () => {
   const calls = [];
-  const h = harness(async (url, opts) => { calls.push({ url, opts }); return response({ ignore: { users: ['otherbot'], channels: ['456'] } }); });
+  const h = harness(async (url, opts) => { calls.push({ url, opts }); return response({ ignore: { users: ['123'], channels: ['456'] } }); });
   h.app.state.config = { enrollment_id: 'loaded-config-membership' };
-  await h.app.api(`/api/guilds/${h.app.state.guildId}/logfilters/message_edit`, 'PUT', { users: ['OtherBot'], channels: ['456'] });
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/logfilters/message_edit`, 'PUT', { users: ['123'], channels: ['456'] });
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'], 'loaded-config-membership');
-  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['OtherBot'], channels: ['456'] });
+  assert.deepEqual(JSON.parse(calls[0].opts.body), { users: ['123'], channels: ['456'] });
 });
 
 

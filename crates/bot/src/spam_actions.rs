@@ -83,7 +83,6 @@ pub struct Match {
     pub kind: Kind,
     pub guild: u64,
     pub author: u64,
-    pub author_names: ReportNames,
     pub channel: u64,
     pub policy: MatchPolicy,
     pub token: (u64, u64),
@@ -91,41 +90,6 @@ pub struct Match {
     pub excerpts: Vec<TextEvidence>,
     pub attachments: Vec<ProvingAttachment>,
     pub reason: String,
-}
-
-#[derive(Default)]
-pub struct ReportNames {
-    pub username: Option<String>,
-    pub display: Option<String>,
-    pub global: Option<String>,
-}
-
-impl ReportNames {
-    pub fn from_user(
-        user: &serenity::model::user::User,
-        member: Option<&serenity::model::guild::PartialMember>,
-    ) -> Self {
-        Self {
-            username: Some(user.name.clone()),
-            display: member
-                .and_then(|member| member.nick.clone())
-                .or_else(|| user.global_name.clone())
-                .or_else(|| Some(user.name.clone())),
-            global: user.global_name.clone(),
-        }
-    }
-}
-
-fn add_author_names(vars: &mut BTreeMap<String, String>, found: &Match) {
-    if let Some(name) = &found.author_names.username {
-        vars.insert("username".into(), name.clone());
-    }
-    if let Some(name) = &found.author_names.display {
-        vars.insert("user".into(), name.clone());
-    }
-    if let Some(name) = &found.author_names.global {
-        vars.insert("user_global_name".into(), name.clone());
-    }
 }
 
 #[derive(Clone)]
@@ -251,7 +215,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
         if !found.policy.still_proving(app, &found, Instant::now()) {
             return ReportDisposition::Retryable;
         }
-        let mut vars = BTreeMap::from([
+        let vars = BTreeMap::from([
             ("rule".into(), format!("{name} test")),
             ("mention".into(), format!("<@{}>", found.author)),
             ("user_id".into(), found.author.to_string()),
@@ -269,7 +233,6 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
                     .join("; "),
             ),
         ]);
-        add_author_names(&mut vars, &found);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
@@ -320,7 +283,7 @@ async fn enforce(
     .ok()
     .and_then(Result::ok);
     if member.is_none() {
-        let mut vars = BTreeMap::from([
+        let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
             ("user_id".into(), found.author.to_string()),
@@ -330,10 +293,9 @@ async fn enforce(
                 "action".into(),
                 "enforce skipped; membership could not be confirmed".into(),
             ),
-            ("reason".into(), found.reason.clone()),
+            ("reason".into(), found.reason),
             ("content".into(), "member lookup failed or timed out".into()),
         ]);
-        add_author_names(&mut vars, &found);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
@@ -346,7 +308,7 @@ async fn enforce(
         .iter()
         .any(|(channel, _)| !eligible(rule_def, found.author, *channel, &roles))
     {
-        let mut vars = BTreeMap::from([
+        let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
             ("user_id".into(), found.author.to_string()),
@@ -356,13 +318,12 @@ async fn enforce(
                 "action".into(),
                 "enforce skipped; exemption recheck failed".into(),
             ),
-            ("reason".into(), found.reason.clone()),
+            ("reason".into(), found.reason),
             (
                 "content".into(),
                 "matched channel/user/role is whitelisted".into(),
             ),
         ]);
-        add_author_names(&mut vars, &found);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
@@ -372,7 +333,7 @@ async fn enforce(
         return ReportDisposition::Consumed;
     }
     if !policy.still_proving(app, &found, now) {
-        let mut vars = BTreeMap::from([
+        let vars = BTreeMap::from([
             ("rule".into(), name.into()),
             ("mention".into(), format!("<@{}>", found.author)),
             ("user_id".into(), found.author.to_string()),
@@ -388,7 +349,6 @@ async fn enforce(
                 "one or more proving messages were edited, deleted, or expired".into(),
             ),
         ]);
-        add_author_names(&mut vars, &found);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
     }
@@ -508,17 +468,16 @@ async fn enforce(
         None => "delete remaining; ban already applied this window".into(),
         Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
     };
-    let mut vars = BTreeMap::from([
+    let vars = BTreeMap::from([
         ("rule".into(), name.into()),
         ("mention".into(), format!("<@{}>", found.author)),
         ("user_id".into(), found.author.to_string()),
         ("source_channel_id".into(), found.channel.to_string()),
         ("channel".into(), format!("<#{}>", found.channel)),
         ("action".into(), action),
-        ("reason".into(), found.reason.clone()),
+        ("reason".into(), found.reason),
         ("content".into(), delete_notes.join("; ")),
     ]);
-    add_author_names(&mut vars, &found);
     crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
     ReportDisposition::Consumed
 }
@@ -684,37 +643,6 @@ async fn capture_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn matched_text_author_names_reach_log_variables() {
-        let found = Match {
-            kind: Kind::Text,
-            guild: 1,
-            author: 2,
-            author_names: ReportNames {
-                username: Some("OtherBot".into()),
-                display: Some("Other Bot".into()),
-                global: None,
-            },
-            channel: 3,
-            policy: MatchPolicy::Text(jmodguard::text_spam::Policy {
-                mode: "exact_text".into(),
-                window_secs: 60,
-                min_channels: 2,
-                min_length: 20,
-                enforce: false,
-            }),
-            token: (1, 1),
-            messages: vec![],
-            excerpts: vec![],
-            attachments: vec![],
-            reason: String::new(),
-        };
-        let mut vars = BTreeMap::new();
-        add_author_names(&mut vars, &found);
-        assert_eq!(vars["username"], "OtherBot");
-        assert_eq!(vars["user"], "Other Bot");
-    }
 
     #[test]
     fn re_fetch_digest_must_match_proving_hash() {

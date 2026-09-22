@@ -137,30 +137,60 @@ fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
 }
 
 #[test]
-fn supplied_guild_nickname_reaches_message_edit_filter() {
+fn timestamp_arriving_after_a_reported_untimestamped_edit_does_not_report_twice() {
+    let dedup = EditReportDedup::default();
+    assert!(dedup.should_report(&update(serde_json::json!({
+        "content":"before", "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(dedup.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(!dedup.should_report(&update(serde_json::json!({
+        "attachments":[], "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+    assert!(dedup.should_report(&update(serde_json::json!({
+        "content":"third", "edited_timestamp":"2026-09-21T00:00:03.000Z"
+    }))));
+
+    let partial = EditReportDedup::default();
+    let attachment = serde_json::json!({
+        "id":"555", "filename":"image.png", "description":"new",
+        "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+        "size":100
+    });
+    assert!(partial.should_report(&update(serde_json::json!({
+        "content":"before", "attachments":[],
+        "edited_timestamp":"2026-09-21T00:00:01.000Z"
+    }))));
+    assert!(partial.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(!partial.should_report(&update(serde_json::json!({
+        "attachments":[attachment],
+    }))));
+    assert!(!partial.should_report(&update(serde_json::json!({
+        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
+    }))));
+}
+
+#[test]
+fn supplied_author_id_reaches_message_edit_filter() {
     let mut event = update(serde_json::json!({"content":"edited"}));
     let mut author = serenity::model::user::User::default();
     author.id = serenity::model::id::UserId::new(42);
     author.name = "otherbot".into();
-    author.global_name = Some("Other Bot".into());
     event.author = Some(author);
-    event.member = Some(Some(Box::new(
-        serde_json::from_value(serde_json::json!({"nick":"AdminRelay","roles":[]})).unwrap(),
-    )));
     let report = message_update_report(&event).unwrap();
-    assert_eq!(report.vars["username"], "otherbot");
-    assert_eq!(report.vars["user"], "AdminRelay");
-    assert_eq!(report.vars["user_global_name"], "Other Bot");
+    assert_eq!(report.vars["user_id"], "42");
     assert!(excluded(
         &db::LogFilter {
-            users: vec!["adminrelay".into()],
+            users: vec!["42".into()],
             channels: vec![]
         },
         &report.vars
     ));
-    assert!(excluded(
+    assert!(!excluded(
         &db::LogFilter {
-            users: vec!["other bot".into()],
+            users: vec!["otherbot".into()],
             channels: vec![]
         },
         &report.vars
@@ -168,64 +198,61 @@ fn supplied_guild_nickname_reaches_message_edit_filter() {
 }
 
 #[test]
-fn log_filter_matches_user_names_ids_and_source_channels_per_event() {
+fn log_filter_matches_known_ids_and_source_channels_only() {
     let filter = db::LogFilter {
-        users: vec!["otherbot".into(), "123".into()],
+        users: vec!["123".into(), "999".into()],
         channels: vec!["456".into()],
     };
-    let mut vars = BTreeMap::from([("username".into(), "OtherBot".into())]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([("user_id".into(), "123".into())]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([("actor_id".into(), "123".into())]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("actor_id".into(), "999".into()),
-        ("actor_name".into(), "OtherBot".into()),
-    ]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("actor_id".into(), "999".into()),
-        ("actor_global_name".into(), "OtherBot".into()),
-    ]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("target_id".into(), "999".into()),
-        ("target".into(), "OtherBot".into()),
-        ("user".into(), "moderator".into()),
-    ]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("target_id".into(), "999".into()),
-        ("target_global_name".into(), "OtherBot".into()),
-    ]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([("target_id".into(), "123".into())]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([("channel_id".into(), "456".into())]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("source_channel_id".into(), "456".into()),
-        ("channel".into(), "<#789>".into()),
-    ]);
-    assert!(excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("source_channel_id".into(), "789".into()),
-        ("channel".into(), "<#456>".into()),
-    ]);
-    assert!(!excluded(&filter, &vars));
-    vars = BTreeMap::from([
-        ("channel_id".into(), "789".into()),
-        ("username".into(), "allowed".into()),
-    ]);
-    assert!(!excluded(&filter, &vars));
-
-    let unknown = db::LogFilter {
-        users: vec!["unavailable".into()],
-        channels: vec![],
-    };
-    vars = message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123));
-    assert!(!excluded(&unknown, &vars));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("user_id".into(), "123".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("actor_id".into(), "999".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("target_id".into(), "123".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([("channel_id".into(), "456".into())])
+    ));
+    assert!(excluded(
+        &filter,
+        &BTreeMap::from([
+            ("source_channel_id".into(), "456".into()),
+            ("channel".into(), "<#789>".into()),
+        ])
+    ));
+    assert!(!excluded(
+        &filter,
+        &BTreeMap::from([
+            ("source_channel_id".into(), "789".into()),
+            ("channel".into(), "<#456>".into()),
+        ])
+    ));
+    assert!(!excluded(
+        &filter,
+        &BTreeMap::from([
+            ("user_id".into(), "unavailable".into()),
+            ("username".into(), "123".into()),
+            ("user".into(), "999".into()),
+        ])
+    ));
+    // Render labels are not user identities, even if another user's ID is ignored.
+    assert!(!excluded(
+        &db::LogFilter {
+            users: vec!["555".into()],
+            channels: vec![]
+        },
+        &BTreeMap::from([
+            ("user_id".into(), "999".into()),
+            ("actor_id".into(), "999".into()),
+            ("user".into(), "messages".into()),
+        ])
+    ));
 }
 
 #[test]
@@ -365,7 +392,7 @@ async fn persisted_event_filter_blocks_matching_reports_only() {
         .with_conn(|conn| {
             conn.execute(
                 "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_edit',?1)",
-                db::params![r#"{"users":["otherbot"],"channels":["999"]}"#],
+                db::params![r#"{"users":["123"],"channels":["999"]}"#],
             )?;
             Ok(())
         })
@@ -374,7 +401,7 @@ async fn persisted_event_filter_blocks_matching_reports_only() {
     let sink = Sink::default();
     let guild = GuildId::new(789);
     for vars in [
-        BTreeMap::from([("username".into(), "OtherBot".into())]),
+        BTreeMap::from([("user_id".into(), "123".into())]),
         BTreeMap::from([("channel_id".into(), "999".into())]),
     ] {
         assert_eq!(
@@ -388,7 +415,7 @@ async fn persisted_event_filter_blocks_matching_reports_only() {
             &sink,
             guild,
             "message_edit",
-            BTreeMap::from([("username".into(), "another".into())])
+            BTreeMap::from([("user_id".into(), "124".into())])
         )
         .await,
         Delivery::Sent
@@ -399,7 +426,7 @@ async fn persisted_event_filter_blocks_matching_reports_only() {
             &sink,
             guild,
             "message_delete",
-            BTreeMap::from([("username".into(), "OtherBot".into())])
+            BTreeMap::from([("user_id".into(), "123".into())])
         )
         .await,
         Delivery::Sent

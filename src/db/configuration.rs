@@ -1,8 +1,8 @@
 use super::*;
 use serde::Deserialize;
 
-/// Guild-local exclusions for one log event. User entries are case-insensitive
-/// names or decimal user IDs; channel entries are decimal source-channel IDs.
+/// Guild-local exclusions for one log event. Both lists contain canonical
+/// decimal Discord snowflake IDs, serialized as strings for the WebUI.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogFilter {
     pub users: Vec<String>,
@@ -18,29 +18,28 @@ impl LogFilter {
         self.users = self
             .users
             .into_iter()
-            .map(|name| name.trim().trim_start_matches('@').to_lowercase())
-            .collect();
-        anyhow::ensure!(
-            self.users
-                .iter()
-                .all(|name| !name.is_empty() && name.len() <= 100),
-            "invalid ignored user name or ID"
-        );
+            .map(|id| canonical_log_filter_id(&id, "user"))
+            .collect::<Result<Vec<_>>>()?;
         self.users.sort();
         self.users.dedup();
         self.channels = self
             .channels
             .into_iter()
-            .map(|id| {
-                let id = id.trim().parse::<i64>()?;
-                anyhow::ensure!(id > 0, "ignored channel must be a positive Discord ID");
-                Ok(id.to_string())
-            })
+            .map(|id| canonical_log_filter_id(&id, "source channel"))
             .collect::<Result<Vec<_>>>()?;
         self.channels.sort();
         self.channels.dedup();
         Ok(self)
     }
+}
+
+fn canonical_log_filter_id(raw: &str, kind: &str) -> Result<String> {
+    let id = raw
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid ignored {kind} ID"))?;
+    anyhow::ensure!(id > 0, "ignored {kind} ID must be positive");
+    Ok(id.to_string())
 }
 
 pub async fn put_enrolled_log_filter(
