@@ -3,7 +3,7 @@
   color-scheme: light;
   --bg: #f0f7ff; --panel: #ffffff; --panel2: #e8f2ff; --border: #cddff2;
   --text: #183553; --muted: #526c87; --accent: #2266c2; --accent-hover: #194f9a;
-  --accent-text: #ffffff; --focus: #4389e5; --input: #f8fbff; --input-border: #abc5e2;
+  --accent-text: #ffffff; --focus: #4389e5; --input: #f8fbff; --input-border: #728da9;
   --sidebar: #e0eeff; --side-text: #23456a; --side-muted: #4c6b90;
   --side-panel: #edf5ff; --side-border: #b5cde9; --side-hover: #cddfff;
   --selected: #bdd9ff; --selected-text: #173f72;
@@ -20,7 +20,7 @@
   color-scheme: dark;
   --bg: #0d1727; --panel: #142238; --panel2: #1c2e48; --border: #2b405d;
   --text: #e2eeff; --muted: #a1b7d2; --accent: #8bc1ff; --accent-hover: #add3ff;
-  --accent-text: #102b4d; --focus: #8bc1ff; --input: #101e32; --input-border: #435e80;
+  --accent-text: #102b4d; --focus: #8bc1ff; --input: #101e32; --input-border: #7899bd;
   --sidebar: #101e33; --side-text: #e2eeff; --side-muted: #a1b9d8;
   --side-panel: #172a44; --side-border: #385579; --side-hover: #233c5d;
   --selected: #284f7d; --selected-text: #dcecff;
@@ -116,6 +116,10 @@ body { background: var(--bg); color: var(--text); }
 .form-actions > .field { margin-bottom: 0; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 650; color: var(--text); }
 .checkbox-group { margin-bottom: 18px; }
+/* daisyUI's default 20%-opacity borders disappear against both of our themes. */
+.input, .select, .textarea { --input-color: var(--input-border); }
+.checkbox { --input-color: var(--accent); border-color: var(--input-border); background-color: var(--input); color: var(--accent-text); }
+.btn:not(.btn-primary, .btn-secondary, .btn-accent, .btn-neutral, .btn-info, .btn-success, .btn-warning, .btn-error, .btn-ghost, .btn-link, .btn-outline) { border-color: var(--input-border); }
 .standalone-action { margin-bottom: 14px; }
 .action-row > .search-select { flex: 0 1 180px; }
 .action-row > .select, .action-row > select { flex: 0 1 110px; }
