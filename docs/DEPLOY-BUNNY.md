@@ -95,6 +95,11 @@ private evidence resource.
 The files are `frontend/index.html`, `frontend/app.js`, and
 `frontend/style.css` in this repository. How to get them and where they
 go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
+The browser loads daisyUI CSS and Headless UI from a CDN at runtime; do not
+upload those libraries into Storage. To serve them from your own pull zone
+instead of the public defaults, set `window.JMODGUARD_DAISYUI_HREF` and
+`window.JMODGUARD_ESM_BASE` in `index.html` (same override pattern as
+`window.JMODGUARD_API_BASE`).
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
 When creating the Storage Zone, select a **primary region and at least one replication region**.
@@ -122,7 +127,8 @@ signed release manifest for the same tag) to the **root** so they are `/` (or `/
 `/app.js`, and `/style.css`. Start from the same git tag as the container
 images so the first login works. After that, CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
-the page needs new API endpoints.
+the page needs new API endpoints. daisyUI and Headless UI stay on the runtime
+CDN; they are not a fourth Storage object.
 
 **Later updates.** Upload the same three files again with **Browse Files**, or
 run [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
@@ -378,7 +384,8 @@ On the Pull Zone from step 2 (Storage origin for the files):
    stripped. If you update the zone via the Bunny API, send only the
    fields you are changing — posting the full GET body back fails
    (`model.invalid` on `id`).
-5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`).
+5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
+   Headless UI are fetched by the browser from the configured CDN, not Storage.
 
 After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
 the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you

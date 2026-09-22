@@ -1,4 +1,4 @@
-/* jModGuard WebUI — vanilla JS single-page app */
+/* jModGuard WebUI — vanilla JS single-page app; daisyUI/Headless load at runtime */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -185,6 +185,209 @@ function scopeSelect(guildLabel = "This server only", globalLabel = "Global (all
 
 function apiBase() {
   return ((typeof window !== "undefined" && window.JMODGUARD_API_BASE) || "").replace(/\/$/, "");
+}
+
+/** Runtime CDN pins. daisyUI / Headless / React are not stored in this repository. */
+const VENDOR = {
+  daisyuiCss: "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css",
+  esm: "https://esm.sh",
+  react: "19.3.0",
+  headless: "2.2.10",
+};
+
+function vendorCssHref() {
+  const href = typeof window !== "undefined" ? window.JMODGUARD_DAISYUI_HREF : "";
+  return String(href || VENDOR.daisyuiCss);
+}
+
+function vendorEsmBase() {
+  const base = typeof window !== "undefined" ? window.JMODGUARD_ESM_BASE : "";
+  return String(base || VENDOR.esm).replace(/\/$/, "");
+}
+
+function vendorWidgetsEnabled() {
+  try {
+    if (typeof window === "undefined" || window.JMODGUARD_VENDOR === "off") return false;
+    return typeof HTMLElement === "function" && document.createElement("div") instanceof HTMLElement;
+  } catch (_) {
+    return false;
+  }
+}
+
+function hasClass(node, name) {
+  if (node?.classList?.contains?.(name)) return true;
+  return String(node?.className || "").split(/\s+/).includes(name);
+}
+
+function shouldEnhanceSelect(select) {
+  if (!select) return false;
+  const tag = String(select.tagName || select.tag || "").toLowerCase();
+  if (tag !== "select") return false;
+  if (hasClass(select, "theme-select") || hasClass(select, "search-select-native")) return false;
+  return select.id === "guild-select" || hasClass(select, "searchable");
+}
+
+let vendorRuntimePromise = null;
+
+function vendorModule(mod, names) {
+  if (!mod) return null;
+  const has = (obj) => obj && names.every((name) => obj[name] != null);
+  if (has(mod)) return mod;
+  if (has(mod.default)) return Object.assign({}, mod.default, mod);
+  return mod;
+}
+
+function loadSearchSelectRuntime() {
+  if (!vendorRuntimePromise) {
+    const esm = vendorEsmBase();
+    const reactV = VENDOR.react;
+    const headlessV = VENDOR.headless;
+    vendorRuntimePromise = Promise.all([
+      import(`${esm}/react@${reactV}`),
+      import(`${esm}/react-dom@${reactV}/client?deps=react@${reactV}`),
+      import(`${esm}/@headlessui/react@${headlessV}?deps=react@${reactV},react-dom@${reactV}`),
+    ]).then(([reactMod, reactDomMod, headlessMod]) => {
+      const React = vendorModule(reactMod, ["createElement", "useState"]);
+      const ReactDOM = vendorModule(reactDomMod, ["createRoot"]);
+      const Headless = vendorModule(headlessMod, ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"]);
+      if (typeof React?.createElement !== "function" || typeof ReactDOM?.createRoot !== "function" || !Headless?.Combobox) {
+        throw new Error("vendor runtime missing Combobox exports");
+      }
+      return { React, ReactDOM, Headless };
+    });
+  }
+  return vendorRuntimePromise;
+}
+
+function selectOptions(select) {
+  return [...(select.options || [])].map((option) => ({
+    value: option.value,
+    label: option.textContent || option.label || option.value,
+  }));
+}
+
+function makeSearchSelect(React, Headless, select) {
+  const useState = React.useState;
+  const Combobox = Headless.Combobox;
+  const ComboboxInput = Headless.ComboboxInput;
+  const ComboboxButton = Headless.ComboboxButton;
+  const ComboboxOptions = Headless.ComboboxOptions;
+  const ComboboxOption = Headless.ComboboxOption;
+  return function SearchSelect() {
+    const [query, setQuery] = useState("");
+    const [rev, setRev] = useState(0);
+    select._searchRefresh = () => setRev((n) => n + 1);
+    const items = selectOptions(select);
+    void rev;
+    const selected = items.find((item) => item.value === select.value) || null;
+    const q = query.trim().toLowerCase();
+    const filtered = !q ? items : items.filter((item) => item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q));
+    return React.createElement(Combobox, {
+      value: selected,
+      by: "value",
+      onChange: (item) => {
+        if (!item) return;
+        select.value = item.value;
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      },
+      onClose: () => setQuery(""),
+    },
+      React.createElement("div", { className: "search-select-control" },
+        React.createElement(ComboboxInput, {
+          className: "input input-bordered w-full search-select-input",
+          "aria-label": select.getAttribute("aria-label") || select.id || "Search options",
+          displayValue: (item) => item?.label || "",
+          onChange: (event) => setQuery(event.target.value),
+        }),
+        ComboboxButton ? React.createElement(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾") : null,
+      ),
+      React.createElement(ComboboxOptions, { className: "search-select-options menu bg-base-100 rounded-box shadow" },
+        filtered.length
+          ? filtered.map((item) => React.createElement(ComboboxOption, {
+              key: `${item.value}:${item.label}`,
+              value: item,
+              className: "search-select-option",
+            }, item.label))
+          : React.createElement("div", { className: "search-select-empty" }, "No matches"),
+      ),
+    );
+  };
+}
+
+function mountSearchSelect(select, runtime) {
+  if (typeof document === "undefined" || !select.parentNode) return;
+  const wrap = document.createElement("div");
+  wrap.className = "search-select";
+  const host = document.createElement("div");
+  host.className = "search-select-host";
+  select.parentNode.insertBefore(wrap, select);
+  wrap.append(select, host);
+  select.classList.add("search-select-native");
+  select.setAttribute("aria-hidden", "true");
+  select.tabIndex = -1;
+  const App = makeSearchSelect(runtime.React, runtime.Headless, select);
+  const root = runtime.ReactDOM.createRoot(host);
+  root.render(runtime.React.createElement(App));
+  select._vendorUnmount = () => {
+    try { root.unmount(); } catch (_) { /* already detached */ }
+    select._vendorUnmount = null;
+    select._searchRefresh = null;
+    select.classList.remove("search-select-native");
+    select.removeAttribute("aria-hidden");
+    select.tabIndex = 0;
+    if (wrap.parentNode) {
+      wrap.parentNode.insertBefore(select, wrap);
+      wrap.remove();
+    }
+  };
+}
+
+function listedSelects(root) {
+  const selects = [];
+  if (!root) return selects;
+  const tag = String(root.tagName || root.tag || "").toLowerCase();
+  if (tag === "select") selects.push(root);
+  const listed = root.querySelectorAll?.("input, select, textarea");
+  if (listed) {
+    for (const node of listed) {
+      if (String(node.tagName || node.tag || "").toLowerCase() === "select") selects.push(node);
+    }
+  }
+  return selects;
+}
+
+function unmountVendorWidgets(root) {
+  listedSelects(root).forEach((select) => {
+    const unmount = select._vendorUnmount;
+    if (unmount) {
+      try { unmount(); } catch (_) { /* host already gone */ }
+    }
+    if (select.dataset) select.dataset.searchEnhanced = "";
+  });
+}
+
+function enhanceVendorWidgets(root) {
+  if (!vendorWidgetsEnabled() || !root) return;
+  listedSelects(root).forEach((select) => {
+    if (select.dataset?.searchEnhanced === "1" || select._vendorUnmount) {
+      if (select._searchRefresh) select._searchRefresh();
+      return;
+    }
+    if (!shouldEnhanceSelect(select)) return;
+    if (select.dataset) select.dataset.searchEnhanced = "1";
+    loadSearchSelectRuntime().then((runtime) => {
+      if (select.dataset?.searchEnhanced !== "1") return;
+      if (select.isConnected === false) return;
+      mountSearchSelect(select, runtime);
+    }).catch(() => {
+      if (select.dataset) select.dataset.searchEnhanced = "";
+      const unmount = select._vendorUnmount;
+      if (unmount) {
+        try { unmount(); } catch (_) { /* leave native select */ }
+      }
+    });
+  });
 }
 
 function apiUrl(path) {
@@ -668,7 +871,7 @@ async function init() {
     sel.value = state.guildId || "";
     if (!state.guildId) sel.append(el("option", { value: "", text: "No manageable servers" }));
     sel.addEventListener("change", async () => {
-      if (!canLeave()) { sel.value = state.guildId || ""; return; }
+      if (!canLeave()) { sel.value = state.guildId || ""; if (sel._searchRefresh) sel._searchRefresh(); return; }
       pendingDrafts = null;
       state.guildId = sel.value;
       state.config = null;
@@ -677,6 +880,7 @@ async function init() {
       if (!await loadConfig()) return;
       renderTab();
     });
+    enhanceVendorWidgets(sel);
     if (!await loadConfig()) return;
     renderTab();
     bindOwnerTools();
@@ -853,6 +1057,7 @@ function renderTab() {
   });
   const fn = map[state.tab] || tabDashboard;
   const content = $("#content");
+  unmountVendorWidgets(content);
   content.innerHTML = "";
   dirty = false;
   const guild = selectedGuild();
@@ -882,6 +1087,8 @@ function renderTab() {
     });
   }
   restoreDrafts();
+  enhanceVendorWidgets(content);
+  enhanceVendorWidgets($("#guild-select"));
   updateWorkspaceStatus();
   const banner = $("#preview-banner");
   if (banner) banner.classList.toggle("hidden", !isPreview());
@@ -1084,10 +1291,11 @@ function editRule(r) {
   const scopeSel = scopeSelect();
 
   const renderActions = () => {
+    unmountVendorWidgets(actionsRows);
     actionsRows.innerHTML = "";
     rule.actions.forEach((a, i) => {
       const at = el("input", { type: "number", min: 1, value: a.at, style: "width:70px" });
-      const action = el("select", {},
+      const action = el("select", { class: "searchable" },
         ["log", "delete", "warn", "timeout", "kick", "ban"].map((x) => el("option", { value: x, text: x, selected: a.action === x })),
       );
       const dur = el("input", { type: "number", min: 0, value: a.duration_minutes ?? 0, style: "width:80px", title: "minutes (timeout)" });
@@ -1103,6 +1311,7 @@ function editRule(r) {
       dd.onchange = () => { rule.actions[i].delete_days = Math.min(7, Math.max(0, parseInt(dd.value) || 0)); };
       reason.onchange = () => (rule.actions[i].reason = reason.value);
     });
+    enhanceVendorWidgets(actionsRows);
   };
   if (!spam) renderActions();
 
@@ -1189,6 +1398,7 @@ function editRule(r) {
     ),
   );
   modal.append(box);
+  enhanceVendorWidgets(modal);
   return modal;
 }
 
@@ -1384,10 +1594,11 @@ function editCommand(c) {
 
   const renderSteps = () => {
     if (!isPlan) return;
+    unmountVendorWidgets(stepsBox);
     stepsBox.innerHTML = "";
     const steps = data.behavior.params.steps;
     steps.forEach((s, i) => {
-      const type = el("select", {},
+      const type = el("select", { class: "searchable" },
         ["reply", "dm", "log", "add_role", "remove_role", "timeout", "kick", "ban", "delete_command_message", "react", "wait"].map((t) =>
           el("option", { value: t, text: t, selected: s.type === t })),
       );
@@ -1411,6 +1622,7 @@ function editCommand(c) {
           el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); markDirty(); syncPlanJson(); renderSteps(); } })),
       ));
     });
+    enhanceVendorWidgets(stepsBox);
   };
   const typePlaceholder = (t) => ({
     reply: "message template, e.g. Hi {user}!", dm: "DM template", log: "log template",
@@ -1519,6 +1731,7 @@ function editCommand(c) {
       el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   ));
+  enhanceVendorWidgets(modal);
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +1856,7 @@ function tabLogChannels() {
 // ---------------------------------------------------------------------------
 
 function tabEvents() {
-  const typeSel = el("select", {}, el("option", { value: "", text: "all types" }),
+  const typeSel = el("select", { class: "searchable" }, el("option", { value: "", text: "all types" }),
     ...state.config.event_types.map((t) => el("option", { value: t, text: t })));
   const userIn = el("input", { type: "text", placeholder: "user id" });
   const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Time", "Event", "User ID", "Actor ID", "Details"].map((text) => el("th", { text })))), el("tbody", {}));
@@ -1938,7 +2151,7 @@ function tabSettings() {
   const botName = el("input", { type: "text", value: cfg.settings.bot_name });
 
   let sourceEnrollment = null;
-  const srcSel = el("select", { onchange: async () => {
+  const srcSel = el("select", { class: "searchable", onchange: async () => {
     sourceEnrollment = null;
     const guildId = srcSel.value;
     if (!guildId) return;
@@ -2139,7 +2352,7 @@ function overlay() {
   modal.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && canLeave()) closeOverlay();
     if (event.key === "Tab") {
-      const controls = [...modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")];
+      const controls = [...modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]):not(.search-select-native), select:not([disabled]):not(.search-select-native), textarea:not([disabled])")];
       const first = controls[0], last = controls.at(-1);
       if (event.shiftKey && (document.activeElement === first || document.activeElement === modal)) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && (document.activeElement === last || document.activeElement === modal)) { event.preventDefault(); first?.focus(); }
@@ -2151,7 +2364,7 @@ function overlay() {
 }
 function closeOverlay() {
   const m = $(".modal-overlay");
-  if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
+  if (m) { unmountVendorWidgets(m); m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
 }
 
 function initTheme() {
@@ -2179,7 +2392,7 @@ function bootUi() {
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !["events", "bans"].includes(state.tab)) markDirty();
+    if (event.target.matches("input, textarea, select") && !event.target.classList.contains("search-select-input") && !["events", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }

@@ -144,7 +144,7 @@ crates/api/tests/          actual API startup regression
 crates/integration-tests/  shared-DB, cross-service and optional remote-libSQL regressions
 crates/runtime/            shared process health/shutdown utilities
 crates/conductor/          independent control service (owner Administration and local backups)
-frontend/                  static dashboard (Bunny Storage/CDN or local API embed)
+frontend/                  static dashboard (Bunny Storage/CDN or local API embed; daisyUI/Headless at runtime)
 migrations/                jmodguard-core-1, steps 0001–0009
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 ```

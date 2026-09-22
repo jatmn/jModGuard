@@ -88,7 +88,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -1673,6 +1673,43 @@ test('unauthenticated settings save returns to login', async () => {
   inputs[0].value = '?';
   await save.listeners.click({});
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
+});
+
+test('vendor widgets stay off in the vm harness so tests do not fetch CDN modules', () => {
+  const { app } = harness();
+  assert.equal(app.vendorWidgetsEnabled(), false);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: 'guild-select', className: '', classList: { contains: () => false } }), true);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'searchable', classList: { contains: (n) => n === 'searchable' } }), true);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'theme-select', classList: { contains: (n) => n === 'theme-select' } }), false);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: '', classList: { contains: () => false }, options: { length: 20 } }), false);
+});
+
+test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blue tokens', () => {
+  const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
+  const js = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const { app } = harness();
+  assert.match(html, /cdn\.jsdelivr\.net\/npm\/daisyui@5\.7\.43\/daisyui\.css/);
+  assert.match(html, /id="jmodguard-daisyui"/);
+  assert.ok(html.indexOf('jmodguard-daisyui') < html.indexOf('href="/style.css"'));
+  assert.equal(app.VENDOR.daisyuiCss, 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css');
+  assert.equal(app.VENDOR.esm, 'https://esm.sh');
+  assert.equal(app.VENDOR.react, '19.3.0');
+  assert.equal(app.VENDOR.headless, '2.2.10');
+  assert.equal(app.vendorCssHref(), app.VENDOR.daisyuiCss);
+  assert.equal(app.vendorEsmBase(), 'https://esm.sh');
+  assert.match(js, /@headlessui\/react@/);
+  assert.match(js, /esm\.sh/);
+  assert.doesNotMatch(js, /node_modules/);
+  assert.match(js, /function loadSearchSelectRuntime/);
+  assert.doesNotMatch(js, /^import /m);
+  assert.match(css, /--bg:\s*#f0f7ff/);
+  assert.match(css, /--accent:\s*#2266c2/);
+  assert.match(css, /\[data-theme="dark"\][\s\S]*--bg:\s*#0d1727/);
+  assert.match(css, /\[data-theme="dark"\][\s\S]*--accent:\s*#8bc1ff/);
+  assert.match(css, /--color-primary:\s*var\(--accent\)/);
+  assert.equal(fs.existsSync(new URL('../frontend/package.json', import.meta.url)), false);
+  assert.equal(fs.existsSync(new URL('../frontend/node_modules', import.meta.url)), false);
 });
 
 test('unauthenticated log-channel mutation returns to login', async () => {

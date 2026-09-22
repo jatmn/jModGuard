@@ -216,7 +216,7 @@ crates/bot/src/state.rs               BotState, compiled config cache and slash-
 crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
-frontend/                  admin SPA (Bunny CDN; local embed-ui)
+frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless loaded at runtime, not vendored)
 migrations/                0001_init through 0013_log_filters
 Dockerfile.bot
 Dockerfile.api

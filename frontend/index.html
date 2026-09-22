@@ -16,6 +16,19 @@ try {
   document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 </script>
+<script>
+window.JMODGUARD_DAISYUI_HREF = window.JMODGUARD_DAISYUI_HREF || "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css";
+window.JMODGUARD_ESM_BASE = window.JMODGUARD_ESM_BASE || "https://esm.sh";
+</script>
+<link rel="stylesheet" id="jmodguard-daisyui" href="https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css">
+<script>
+(function () {
+  const link = document.getElementById("jmodguard-daisyui");
+  if (link && window.JMODGUARD_DAISYUI_HREF && link.getAttribute("href") !== window.JMODGUARD_DAISYUI_HREF) {
+    link.href = window.JMODGUARD_DAISYUI_HREF;
+  }
+})();
+</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -46,7 +59,7 @@ try {
   <div id="main-view" class="hidden">
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark" aria-hidden="true">jG</span><span>jModGuard<small>MODERATION WORKSPACE</small></span></div>
-      <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select"></select></div>
+      <div class="server-picker"><label for="guild-select">YOUR SERVER</label><select id="guild-select" class="searchable"></select></div>
       <label class="theme-picker">Appearance <select class="theme-select" aria-label="Appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
       <nav id="tabs" aria-label="Workspace navigation">
         <span class="nav-label">WORKSPACE</span>

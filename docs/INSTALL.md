@@ -33,6 +33,8 @@ Use a git tag or the matching Buildkite image digests:
   Buildkite builds only (`ghcr.io/jatmn/jmodguard-conductor`); on main SHA build
   from source (`cargo build --locked -p jmodguard-conductor`) or pin a tagged release
 - admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`
+  (the browser also fetches daisyUI CSS and Headless UI from a CDN at runtime;
+  those libraries are not extra files in this repository)
   (from source or release manifest; Buildkite does not upload a separate frontend
   artifact bundle—see [BUILDKITE.md](BUILDKITE.md))
 - license: `LICENSE.md`

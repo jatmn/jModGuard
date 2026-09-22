@@ -1,4 +1,6 @@
-/* jModGuard: a focused, responsive moderation workspace. No external assets. */
+/* jModGuard: a focused, responsive moderation workspace.
+   daisyUI CSS is loaded at runtime from CDN (not vendored in git). These
+   tokens remain the operator-visible pale-blue / navy theme. */
 :root {
   color-scheme: light;
   --bg: #f0f7ff; --panel: #ffffff; --panel2: #e8f2ff; --border: #cddff2;
@@ -31,6 +33,41 @@
   --toast: #254363; --toast-text: #eef6ff; --overlay: #040b18cc;
   --welcome-glow: #244a76;
 }
+:root, :root[data-theme="light"], [data-theme="light"] {
+  --color-base-100: var(--bg); --color-base-200: var(--panel); --color-base-300: var(--panel2);
+  --color-base-content: var(--text); --color-primary: var(--accent); --color-primary-content: var(--accent-text);
+  --color-secondary: var(--selected); --color-secondary-content: var(--selected-text);
+  --color-accent: var(--focus); --color-accent-content: var(--accent-text);
+  --color-neutral: var(--sidebar); --color-neutral-content: var(--side-text);
+  --color-info: var(--focus); --color-info-content: var(--accent-text);
+  --color-success: var(--good); --color-success-content: var(--accent-text);
+  --color-warning: var(--warn); --color-warning-content: var(--text);
+  --color-error: var(--bad); --color-error-content: var(--accent-text);
+  --radius-field: 0.4375rem; --radius-box: 0.875rem; --radius-selector: 0.5rem;
+}
+:root[data-theme="dark"], [data-theme="dark"] {
+  --color-base-100: var(--bg); --color-base-200: var(--panel); --color-base-300: var(--panel2);
+  --color-base-content: var(--text); --color-primary: var(--accent); --color-primary-content: var(--accent-text);
+  --color-secondary: var(--selected); --color-secondary-content: var(--selected-text);
+  --color-accent: var(--focus); --color-accent-content: var(--accent-text);
+  --color-neutral: var(--sidebar); --color-neutral-content: var(--side-text);
+  --color-info: var(--focus); --color-info-content: var(--accent-text);
+  --color-success: var(--good); --color-success-content: var(--accent-text);
+  --color-warning: var(--warn); --color-warning-content: var(--text);
+  --color-error: var(--bad); --color-error-content: var(--accent-text);
+}
+.search-select { position: relative; flex: 1 1 180px; min-width: min(180px, 100%); }
+.action-row > .search-select { flex: 0 1 180px; }
+.server-picker .search-select { width: 100%; margin-top: 6px; }
+.search-select-control { position: relative; }
+.search-select-button { position: absolute; right: 8px; top: 0; bottom: 0; border: 0; background: transparent; color: var(--muted); padding: 0 4px; min-height: 0; }
+.search-select-input { padding-right: 28px; }
+.server-picker .search-select-input { background: var(--side-panel); border-color: var(--side-border); color: var(--side-text); }
+.search-select-native { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+.search-select-options { position: absolute; left: 0; right: 0; z-index: 60; max-height: 16rem; overflow: auto; margin-top: 4px; padding: 4px 0; background: var(--panel); color: var(--text); border: 1px solid var(--input-border); border-radius: 8px; box-shadow: 0 8px 24px #071a3330; }
+.search-select-option { padding: 8px 12px; cursor: pointer; }
+.search-select-option[data-focus], .search-select-option[data-selected] { background: var(--selected); color: var(--selected-text); }
+.search-select-empty { padding: 8px 12px; color: var(--muted); }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.6; }
 button, input, select, textarea { font: inherit; }
