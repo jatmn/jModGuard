@@ -13,7 +13,9 @@ exclusion/cutover is not claimed by these local tests.
   backup, evidence, restore, capture or guild-store paths.
 - Optional `JMODGUARD_CONDUCTOR_ARTIFACT_ROOT` (defaults to `update_root/cache`).
   Process artifacts are files keyed by digest; frontend artifacts are directories
-  containing `index.html`, `app.js` and `style.css`. Custom artifact roots must stay
+  containing `index.html`, `app.js` and `style.css`. The Guild WebUI still loads
+  daisyUI and Headless UI from a CDN at runtime; those libraries are not extra
+  files in the frontend artifact directory. Custom artifact roots must stay
   disjoint from backup, evidence, restore, capture, guild-store, and update roots.
 - Optional `JMODGUARD_CONDUCTOR_UPDATE_PROVIDER` — HTTP fixture that records
   desired/observed/ready. It is not live Bunny proof.

@@ -19,7 +19,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const node = (tag) => {
     const classes = new Set();
     return {
-      tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
       classList: {
         toggle(name, force) {
           const enabled = force === undefined ? !classes.has(name) : !!force;
@@ -51,7 +51,8 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
         }
         return null;
       },
-      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); },
+      setAttribute(k, v) { this.attrs[k] = v; if (k === "value") this.value = String(v); if (k === "href") this.href = String(v); },
+      getAttribute(k) { return this.attrs[k] ?? (k === "href" ? this.href : undefined); },
       removeAttribute(k) { delete this.attrs[k]; },
       addEventListener(k, v) { this.listeners[k] = v; },
       querySelectorAll(selector) {
@@ -73,7 +74,13 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
       },
     };
   };
-  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link'].map((key) => [key, node('div')]));
+  const nodes = new Map(['#content', '#toast', '#workspace-name', '#workspace-status', '#owner-tools', '#startup-view', '#login-view', '#main-view', '#startup-status', '#preview-return-link', '#jmodguard-daisyui'].map((key) => [key, node('div')]));
+  const daisy = nodes.get('#jmodguard-daisyui');
+  daisy.tag = 'link';
+  daisy.tagName = 'LINK';
+  daisy.attrs.href = 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css';
+  daisy.href = daisy.attrs.href;
+  const win = { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } };
   for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
     nodes.get(key).classList.add('hidden');
   }
@@ -81,18 +88,19 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
-      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
+      getElementById: (id) => nodes.get('#' + id) || null,
+      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => String(n.className).split(/\s+/).includes('modal-overlay')) : null), querySelectorAll: () => [],
     },
-    window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } },
+    window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -120,7 +128,7 @@ test('dashboard moderation counts stay with their requested server', async () =>
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
   assert.equal(pending[0].method, 'POST');
   assert.equal(pending[1].method, 'POST');
-  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
+  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children.find((c) => c.className === 'stat-value').textContent;
   pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(second, 'Moderation records'), '7');
@@ -140,7 +148,7 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   await new Promise(resolve => setImmediate(resolve));
   for (const label of ['Moderation records', 'Warns', 'Bans', 'Cases']) {
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
-    assert.equal(card.children[0].textContent, 'Unavailable');
+    assert.equal(card.children.find((c) => c.className === 'stat-value').textContent, 'Unavailable');
   }
 });
 
@@ -716,12 +724,12 @@ test('known terminal log results are not labeled queued while mapping reconcilia
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(terminal);
   h.app.renderTab();
-  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 
   await h.app.reconcileQueuedLogChannel(terminal);
   assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
-  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 });
 
@@ -891,7 +899,7 @@ function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   h.app.navigate('rules');
   h.app.editRule(h.app.state.config.rules[0]);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
   const scopeInput = findNode(modal, (n) => n.tag === 'select' && n.children.some((c) => c.attrs?.value === 'global'));
   scopeInput.value = scope;
   const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
@@ -990,7 +998,7 @@ test('a refused command save retains its checkbox value for the next save', asyn
   h.app.navigate('commands');
   h.app.editCommand(null);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
   const name = findNode(modal, (n) => n.attrs?.placeholder === 'command name');
   name.value = 'hello';
   const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
@@ -1673,6 +1681,95 @@ test('unauthenticated settings save returns to login', async () => {
   inputs[0].value = '?';
   await save.listeners.click({});
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
+});
+
+test('vendor widgets stay off in the vm harness so tests do not fetch CDN modules', () => {
+  const { app } = harness();
+  assert.equal(app.vendorWidgetsEnabled(), false);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: 'guild-select', className: '', classList: { contains: () => false } }), true);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'searchable', classList: { contains: (n) => n === 'searchable' } }), true);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: 'theme-select', classList: { contains: (n) => n === 'theme-select' } }), false);
+  assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: '', classList: { contains: () => false }, options: { length: 20 } }), false);
+});
+
+test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blue tokens', () => {
+  const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
+  const js = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const { app } = harness();
+  assert.match(html, /cdn\.jsdelivr\.net\/npm\/daisyui@5\.7\.43\/daisyui\.css/);
+  assert.match(html, /link\.id = "jmodguard-daisyui"/);
+  assert.match(html, /link\.href = window\.JMODGUARD_DAISYUI_HREF/);
+  assert.doesNotMatch(html, /<link[^>]*id="jmodguard-daisyui"/);
+  assert.ok(html.indexOf('jmodguard-daisyui') < html.indexOf('href="/style.css"'));
+  assert.equal(app.VENDOR.daisyuiCss, 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css');
+  assert.equal(app.VENDOR.esm, 'https://esm.sh');
+  assert.equal(app.VENDOR.react, '19.3.0');
+  assert.equal(app.VENDOR.headless, '2.2.10');
+  assert.equal(app.vendorCssHref(), app.VENDOR.daisyuiCss);
+  assert.equal(app.vendorEsmBase(), 'https://esm.sh');
+  const names = ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"];
+  const incomplete = { Combobox() {} };
+  assert.equal(app.vendorModule(incomplete, names), null);
+  const complete = { Combobox() {}, ComboboxInput() {}, ComboboxOptions() {}, ComboboxOption() {} };
+  assert.equal(app.vendorModule(complete, names), complete);
+  const asObjects = { Combobox: { $$typeof: 1 }, ComboboxInput: { $$typeof: 1 }, ComboboxOptions: { $$typeof: 1 }, ComboboxOption: { $$typeof: 1 } };
+  assert.equal(app.vendorModule(asObjects, names), asObjects);
+  const fromDefault = { Combobox() {}, ComboboxInput: undefined, default: complete };
+  const merged = app.vendorModule(fromDefault, names);
+  assert.equal(typeof merged.Combobox, "function");
+  assert.equal(typeof merged.ComboboxInput, "function");
+  assert.equal(typeof merged.ComboboxOptions, "function");
+  assert.equal(typeof merged.ComboboxOption, "function");
+  const { app: cssApp, window: cssWindow, nodes: cssNodes } = harness();
+  cssWindow.JMODGUARD_DAISYUI_HREF = "https://cdn.example.test/daisyui.css";
+  assert.equal(cssApp.vendorCssHref(), "https://cdn.example.test/daisyui.css");
+  cssApp.applyVendorCss();
+  assert.equal(cssNodes.get("#jmodguard-daisyui").getAttribute("href"), "https://cdn.example.test/daisyui.css");
+  assert.match(js, /function applyVendorCss/);
+  assert.match(js, /vendorModule\(headlessMod, \["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"\]\)/);
+  assert.match(js, /@headlessui\/react@/);
+  assert.match(js, /esm\.sh/);
+  assert.doesNotMatch(js, /node_modules/);
+  assert.match(js, /function loadSearchSelectRuntime/);
+  assert.match(js, /function restoreNativeSelect/);
+  assert.match(js, /searchSelectId/);
+  assert.match(js, /anchor:\s*"bottom start"/);
+  assert.doesNotMatch(js, /^import /m);
+  assert.match(css, /--bg:\s*#f0f7ff/);
+  assert.match(css, /--accent:\s*#2266c2/);
+  assert.match(css, /\[data-theme="dark"\][\s\S]*--bg:\s*#0d1727/);
+  assert.match(css, /\[data-theme="dark"\][\s\S]*--accent:\s*#8bc1ff/);
+  assert.match(css, /--color-primary:\s*var\(--accent\)/);
+  assert.match(css, /--page-overflow:\s*visible/);
+  assert.match(css, /#main-view\s*\{[^}]*display:\s*flex/);
+  assert.match(css, /\.sidebar\s*\{[^}]*overflow:\s*visible/);
+  assert.match(css, /#content\s*\{[^}]*max-width:\s*none/);
+  assert.doesNotMatch(css, /\.sidebar\s*\{[^}]*position:\s*fixed/);
+  assert.doesNotMatch(css, /\.hero\s*\{[^}]*display:\s*block/);
+  assert.doesNotMatch(css, /\.hero\s*\{[^}]*background:/);
+  assert.doesNotMatch(css, /\.stat-grid/);
+  assert.doesNotMatch(css, /\.btn\.primary/);
+  assert.match(css, /\.search-select-options\s*\{[^}]*z-index:\s*1100/);
+  assert.match(css, /--color-base-100:\s*var\(--panel\)/);
+  assert.match(js, /hero-content/);
+  assert.match(js, /stat-title/);
+  assert.match(js, /btn-primary/);
+  assert.match(js, /join-item/);
+  assert.match(js, /search-select-control/);
+  assert.doesNotMatch(js, /btn-neutral/);
+  assert.match(js, /class: "stats /);
+  assert.match(html, /btn btn-primary/);
+  assert.match(html, /class="navbar /);
+  assert.match(css, /\.workspace-header\s*\{[^}]*justify-content:\s*space-between/);
+  assert.match(html, /sidebar-footer[\s\S]*theme-picker[\s\S]*logout-btn/);
+  assert.match(html, /class="menu w-full"/);
+  assert.equal(app.uiClass("btn primary"), "btn btn-primary");
+  assert.equal(app.uiClass("btn small danger"), "btn btn-sm btn-error");
+  assert.equal(app.uiClass("btn outline"), "btn btn-outline");
+  assert.match(app.uiClass("card"), /card-border/);
+  assert.equal(fs.existsSync(new URL('../frontend/package.json', import.meta.url)), false);
+  assert.equal(fs.existsSync(new URL('../frontend/node_modules', import.meta.url)), false);
 });
 
 test('unauthenticated log-channel mutation returns to login', async () => {

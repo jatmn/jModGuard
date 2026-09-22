@@ -1,20 +1,66 @@
-/* jModGuard WebUI — vanilla JS single-page app */
+/* jModGuard WebUI — vanilla JS single-page app; daisyUI/Headless load at runtime */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
+
+function uiClass(value) {
+  const names = String(value || "").split(/\s+/).filter(Boolean);
+  const hasBtn = names.includes("btn");
+  const hasTag = names.includes("tag");
+  const out = [];
+  for (const name of names) {
+    if (hasBtn && name === "primary") { out.push("btn-primary"); continue; }
+    if (hasBtn && name === "small") { out.push("btn-sm"); continue; }
+    if (hasBtn && name === "danger") { out.push("btn-error"); continue; }
+    if (hasBtn && name === "good") { out.push("btn-success"); continue; }
+    if (hasBtn && name === "outline") { out.push("btn-outline"); continue; }
+    if (hasBtn && name === "ghost") { out.push("btn-ghost"); continue; }
+    if (name === "tag") { out.push("badge", "badge-ghost"); continue; }
+    if (hasTag && name === "on") { out.push("badge-success"); continue; }
+    if (hasTag && name === "off") { out.push("badge-error"); continue; }
+    if (hasTag && name === "dry") { out.push("badge-warning"); continue; }
+    if (name === "modal-overlay") { out.push("modal", "modal-open", "modal-overlay"); continue; }
+    if (name === "card") { out.push("card", "bg-base-100", "card-border", "shadow-sm"); continue; }
+    out.push(name);
+  }
+  return [...new Set(out)].join(" ");
+}
+
+function decorateControl(n) {
+  const tag = n.tagName;
+  if (tag === "INPUT") {
+    const type = n.type || "text";
+    if (type === "checkbox") n.classList.add("checkbox");
+    else if (type !== "hidden" && type !== "file") n.classList.add("input", "input-bordered");
+  } else if (tag === "SELECT" && !n.classList.contains("search-select-native")) {
+    n.classList.add("select", "select-bordered");
+  } else if (tag === "TEXTAREA") {
+    n.classList.add("textarea", "textarea-bordered");
+  } else if (tag === "H3") {
+    n.classList.add("card-title");
+  }
+}
+
 const el = (tag, attrs, ...children) => {
   const n = document.createElement(tag);
   if (attrs) Object.entries(attrs).forEach(([k, v]) => {
-    if (k === "class") n.className = v;
+    if (k === "class") n.className = uiClass(v);
     else if (k === "text") n.textContent = v;
     else if (k === "savedInputs") n._savedInputs = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), (event) => handleEvent(n, v, event));
     else if (k === "checked" || k === "selected" || k === "hidden" || k === "disabled") n[k] = Boolean(v);
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   });
+  decorateControl(n);
   children.flat(Infinity).forEach((c) => {
     if (c !== null && c !== undefined) n.append(c.nodeType ? c : document.createTextNode(c));
   });
+  if (n.classList.contains("card") && ![...n.children].some((child) => child.classList?.contains("card-body"))) {
+    const body = document.createElement("div");
+    body.className = "card-body";
+    while (n.firstChild) body.append(n.firstChild);
+    n.append(body);
+  }
   return n;
 };
 
@@ -185,6 +231,254 @@ function scopeSelect(guildLabel = "This server only", globalLabel = "Global (all
 
 function apiBase() {
   return ((typeof window !== "undefined" && window.JMODGUARD_API_BASE) || "").replace(/\/$/, "");
+}
+
+/** Runtime CDN pins. daisyUI / Headless / React are not stored in this repository. */
+const VENDOR = {
+  daisyuiCss: "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css",
+  esm: "https://esm.sh",
+  react: "19.3.0",
+  headless: "2.2.10",
+};
+
+function vendorCssHref() {
+  const href = typeof window !== "undefined" ? window.JMODGUARD_DAISYUI_HREF : "";
+  return String(href || VENDOR.daisyuiCss);
+}
+
+function applyVendorCss() {
+  if (typeof document === "undefined" || typeof document.getElementById !== "function") return;
+  const link = document.getElementById("jmodguard-daisyui");
+  if (!link) return;
+  const href = vendorCssHref();
+  if (!href) return;
+  const current = typeof link.getAttribute === "function" ? link.getAttribute("href") : link.href;
+  if (current === href) return;
+  if (typeof link.setAttribute === "function") link.setAttribute("href", href);
+  else link.href = href;
+}
+
+function vendorEsmBase() {
+  const base = typeof window !== "undefined" ? window.JMODGUARD_ESM_BASE : "";
+  return String(base || VENDOR.esm).replace(/\/$/, "");
+}
+
+function vendorWidgetsEnabled() {
+  try {
+    if (typeof window === "undefined" || window.JMODGUARD_VENDOR === "off") return false;
+    return typeof HTMLElement === "function" && document.createElement("div") instanceof HTMLElement;
+  } catch (_) {
+    return false;
+  }
+}
+
+function hasClass(node, name) {
+  if (node?.classList?.contains?.(name)) return true;
+  return String(node?.className || "").split(/\s+/).includes(name);
+}
+
+function shouldEnhanceSelect(select) {
+  if (!select) return false;
+  const tag = String(select.tagName || select.tag || "").toLowerCase();
+  if (tag !== "select") return false;
+  if (hasClass(select, "theme-select") || hasClass(select, "search-select-native")) return false;
+  return select.id === "guild-select" || hasClass(select, "searchable");
+}
+
+let vendorRuntimePromise = null;
+
+function vendorModule(mod, names) {
+  if (!mod) return null;
+  const usable = (value) => typeof value === "function" || (value && typeof value === "object");
+  const has = (obj) => obj && names.every((name) => usable(obj[name]));
+  if (has(mod)) return mod;
+  if (has(mod.default)) return Object.assign({}, mod, mod.default);
+  return null;
+}
+
+function loadSearchSelectRuntime() {
+  if (!vendorRuntimePromise) {
+    const esm = vendorEsmBase();
+    const reactV = VENDOR.react;
+    const headlessV = VENDOR.headless;
+    vendorRuntimePromise = Promise.all([
+      import(`${esm}/react@${reactV}`),
+      import(`${esm}/react-dom@${reactV}/client?deps=react@${reactV}`),
+      import(`${esm}/@headlessui/react@${headlessV}?deps=react@${reactV},react-dom@${reactV}`),
+    ]).then(([reactMod, reactDomMod, headlessMod]) => {
+      const React = vendorModule(reactMod, ["createElement", "useState"]);
+      const ReactDOM = vendorModule(reactDomMod, ["createRoot"]);
+      const Headless = vendorModule(headlessMod, ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"]);
+      if (!React || !ReactDOM || !Headless) {
+        throw new Error("vendor runtime missing Combobox exports");
+      }
+      return { React, ReactDOM, Headless };
+    });
+  }
+  return vendorRuntimePromise;
+}
+
+function selectOptions(select) {
+  return [...(select.options || [])].map((option) => ({
+    value: option.value,
+    label: option.textContent || option.label || option.value,
+  }));
+}
+
+function makeSearchSelect(React, Headless, select) {
+  const useState = React.useState;
+  const Combobox = Headless.Combobox;
+  const ComboboxInput = Headless.ComboboxInput;
+  const ComboboxButton = Headless.ComboboxButton;
+  const ComboboxOptions = Headless.ComboboxOptions;
+  const ComboboxOption = Headless.ComboboxOption;
+  return function SearchSelect() {
+    const [query, setQuery] = useState("");
+    const [rev, setRev] = useState(0);
+    select._searchRefresh = () => setRev((n) => n + 1);
+    const items = selectOptions(select);
+    void rev;
+    const selected = items.find((item) => item.value === select.value) || null;
+    const q = query.trim().toLowerCase();
+    const filtered = !q ? items : items.filter((item) => item.label.toLowerCase().includes(q) || item.value.toLowerCase().includes(q));
+    const labeledId = select.dataset?.searchSelectId || "";
+    return React.createElement(Combobox, {
+      value: selected,
+      by: "value",
+      onChange: (item) => {
+        if (!item) return;
+        select.value = item.value;
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      },
+      onClose: () => setQuery(""),
+    },
+      React.createElement("div", { className: `select select-bordered w-full search-select-control${select.closest(".server-picker") ? " select-sm" : ""}` },
+        React.createElement(ComboboxInput, {
+          id: labeledId || undefined,
+          className: "search-select-input",
+          "aria-label": labeledId ? undefined : (select.getAttribute("aria-label") || "Search options"),
+          displayValue: (item) => item?.label || "",
+          onChange: (event) => setQuery(event.target.value),
+        }),
+        ComboboxButton ? React.createElement(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾") : null,
+      ),
+      React.createElement(ComboboxOptions, {
+        className: "search-select-options menu bg-base-100 rounded-box shadow-lg",
+        anchor: "bottom start",
+      },
+        filtered.length
+          ? filtered.map((item) => React.createElement(ComboboxOption, {
+              key: `${item.value}:${item.label}`,
+              value: item,
+              className: "search-select-option",
+            }, item.label))
+          : React.createElement("div", { className: "search-select-empty" }, "No matches"),
+      ),
+    );
+  };
+}
+
+function restoreNativeSelect(select, wrap, labeledId) {
+  select._vendorUnmount = null;
+  select._searchRefresh = null;
+  select.classList.remove("search-select-native");
+  select.removeAttribute("aria-hidden");
+  select.tabIndex = 0;
+  const id = labeledId || select.dataset?.searchSelectId || "";
+  if (id && !select.id) select.id = id;
+  if (select.dataset) {
+    delete select.dataset.searchSelectId;
+    select.dataset.searchEnhanced = "";
+  }
+  if (wrap && wrap.parentNode && select.parentNode === wrap) {
+    wrap.parentNode.insertBefore(select, wrap);
+    wrap.remove();
+  }
+}
+
+function mountSearchSelect(select, runtime) {
+  if (typeof document === "undefined" || !select.parentNode) return;
+  const wrap = document.createElement("div");
+  wrap.className = "search-select";
+  const host = document.createElement("div");
+  host.className = "search-select-host";
+  const labeledId = select.id || "";
+  try {
+    select.parentNode.insertBefore(wrap, select);
+    wrap.append(select, host);
+    select.classList.add("search-select-native");
+    select.setAttribute("aria-hidden", "true");
+    select.tabIndex = -1;
+    if (labeledId) {
+      select.dataset.searchSelectId = labeledId;
+      select.removeAttribute("id");
+    }
+    const App = makeSearchSelect(runtime.React, runtime.Headless, select);
+    const root = runtime.ReactDOM.createRoot(host);
+    root.render(runtime.React.createElement(App));
+    select._vendorUnmount = () => {
+      try { root.unmount(); } catch (_) { /* already detached */ }
+      restoreNativeSelect(select, wrap, labeledId);
+    };
+  } catch (err) {
+    restoreNativeSelect(select, wrap, labeledId);
+    throw err;
+  }
+}
+
+function listedSelects(root) {
+  const selects = [];
+  if (!root) return selects;
+  const tag = String(root.tagName || root.tag || "").toLowerCase();
+  if (tag === "select") selects.push(root);
+  const listed = root.querySelectorAll?.("input, select, textarea");
+  if (listed) {
+    for (const node of listed) {
+      if (String(node.tagName || node.tag || "").toLowerCase() === "select") selects.push(node);
+    }
+  }
+  return selects;
+}
+
+function unmountVendorWidgets(root) {
+  listedSelects(root).forEach((select) => {
+    const unmount = select._vendorUnmount;
+    if (unmount) {
+      try { unmount(); } catch (_) { /* host already gone */ }
+    }
+    if (select.dataset) select.dataset.searchEnhanced = "";
+  });
+}
+
+function enhanceVendorWidgets(root) {
+  if (!vendorWidgetsEnabled() || !root) return;
+  listedSelects(root).forEach((select) => {
+    if (select.dataset?.searchEnhanced === "1" || select._vendorUnmount) {
+      if (select._searchRefresh) select._searchRefresh();
+      return;
+    }
+    if (!shouldEnhanceSelect(select)) return;
+    if (select.dataset) select.dataset.searchEnhanced = "1";
+    loadSearchSelectRuntime().then((runtime) => {
+      if (select.dataset?.searchEnhanced !== "1") return;
+      if (select.isConnected === false) {
+        if (select.dataset) select.dataset.searchEnhanced = "";
+        return;
+      }
+      try {
+        mountSearchSelect(select, runtime);
+      } catch (_) {
+        if (select.dataset) select.dataset.searchEnhanced = "";
+      }
+    }).catch(() => {
+      if (select.dataset) select.dataset.searchEnhanced = "";
+      const unmount = select._vendorUnmount;
+      if (unmount) {
+        try { unmount(); } catch (_) { /* leave native select */ }
+      }
+    });
+  });
 }
 
 function apiUrl(path) {
@@ -668,7 +962,7 @@ async function init() {
     sel.value = state.guildId || "";
     if (!state.guildId) sel.append(el("option", { value: "", text: "No manageable servers" }));
     sel.addEventListener("change", async () => {
-      if (!canLeave()) { sel.value = state.guildId || ""; return; }
+      if (!canLeave()) { sel.value = state.guildId || ""; if (sel._searchRefresh) sel._searchRefresh(); return; }
       pendingDrafts = null;
       state.guildId = sel.value;
       state.config = null;
@@ -677,6 +971,7 @@ async function init() {
       if (!await loadConfig()) return;
       renderTab();
     });
+    enhanceVendorWidgets(sel);
     if (!await loadConfig()) return;
     renderTab();
     bindOwnerTools();
@@ -847,28 +1142,35 @@ function renderTab() {
     events: tabEvents, bans: tabBans, actions: tabActions, cases: tabCases, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
-    b.classList.toggle("active", b.dataset.tab === state.tab);
-    if (b.dataset.tab === state.tab) b.setAttribute("aria-current", "page");
+    const on = b.dataset.tab === state.tab;
+    b.classList.toggle("active", on);
+    b.classList.toggle("menu-active", on);
+    b.classList.toggle("btn-active", on);
+    if (on) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   });
   const fn = map[state.tab] || tabDashboard;
   const content = $("#content");
+  unmountVendorWidgets(content);
   content.innerHTML = "";
   dirty = false;
   const guild = selectedGuild();
   const name = $("#workspace-name");
   if (name) name.textContent = guild?.name || "Your servers";
   if (!state.guildId) {
-    content.append(el("div", { class: "empty-state" }, el("h2", { text: "No servers to manage yet" }), el("p", { text: "Sign in with an account that has Manage Server permission in a server using jModGuard." })));
+    content.append(emptyPanel("No servers to manage yet", "Sign in with an account that has Manage Server permission in a server using jModGuard."));
   } else if (!state.config) {
-    content.append(el("div", { class: "empty-state", role: "status" },
-      el("h2", { text: state.loading ? "Loading your workspace…" : "Configuration unavailable" }),
-      el("p", { text: state.error || "Fetching saved settings for this server." }),
-      !state.loading ? el("button", { class: "btn primary", text: "Retry", onclick: async () => { if (!await loadConfig()) return; renderTab(); } }) : null));
+    content.append(emptyPanel(
+      state.loading ? "Loading your workspace…" : "Configuration unavailable",
+      state.error || "Fetching saved settings for this server.",
+      !state.loading ? el("button", { class: "btn primary", text: "Retry", onclick: async () => { if (!await loadConfig()) return; renderTab(); } }) : null,
+      { role: "status" },
+    ));
   } else {
     content.append(fn());
     content.querySelectorAll("table").forEach((table) => {
-      const wrap = el("div", { class: "table-scroll", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
+      table.classList.add("table", "table-zebra");
+      const wrap = el("div", { class: "table-scroll rounded-box bg-base-100", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
       table.replaceWith(wrap); wrap.append(table);
     });
     content.querySelectorAll("input, select, textarea").forEach((input, i) => {
@@ -882,6 +1184,8 @@ function renderTab() {
     });
   }
   restoreDrafts();
+  enhanceVendorWidgets(content);
+  enhanceVendorWidgets($("#guild-select"));
   updateWorkspaceStatus();
   const banner = $("#preview-banner");
   if (banner) banner.classList.toggle("hidden", !isPreview());
@@ -935,6 +1239,19 @@ function bindTabButtons() {
   }));
 }
 
+function emptyPanel(title, body, action, attrs) {
+  return el("div", { class: "hero bg-base-200 rounded-box", ...(attrs || {}) },
+    el("div", { class: "hero-content text-center" },
+      el("div", { class: "hero-copy" },
+        el("h2", { text: title }),
+        el("p", { text: body }),
+        action || null)));
+}
+
+function statsRow(...items) {
+  return el("div", { class: "stats bg-base-100 shadow w-full" }, ...items);
+}
+
 function tabDashboard() {
   const g = selectedGuild();
   const cfg = state.config;
@@ -943,44 +1260,51 @@ function tabDashboard() {
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
   const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans'], ['cases', 'Cases']]
-    .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
+    .map(([key, label]) => ({ key, value: el("div", { class: "stat-value", text: "Loading…" }), label }));
   const guildId = state.guildId;
   apiRead(`/api/guilds/${guildId}/stats`).then(counts => {
     moderation.forEach(({ key, value }) => { value.textContent = counts[key] == null ? 'Unavailable' : String(counts[key]); });
   }).catch(() => {
     moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
   });
-  return el("div", {},
-    el("section", { class: "hero" },
-      el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
-      el("h2", { text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
-      el("p", { text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
-      el("div", { class: "row" },
-        el("button", { class: "btn primary", text: "Review protection →", onclick: () => navigate("rules") }),
-        el("button", { class: "btn", text: "View audit log", onclick: () => navigate("events") }))),
-    el("div", { class: "stat-grid" },
-      stat("Prefix", cfg.settings.prefix),
-      stat("Bot name", cfg.settings.bot_name || "default"),
-      stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
-      stat("Rules in dry-run", rulesDry),
-      stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
-      stat("Log channels", chans),
-      stat("Badword patterns", cfg.badwords.length),
-      stat("Routine chat collection", "Off"),
-      ...moderation.map(({ value, label }) => el('div', { class: 'stat' }, value, el('div', { class: 'label', text: label }))),
-    ),
-    el('p', { class: 'muted', text: 'Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.' }),
-    el("div", { class: "card", style: "margin-top:16px" },
-      el("h3", { text: "Getting started" }),
-      el("p", { class: "muted", text: isBotOwner()
-        ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
-        : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }),
-    ),
+  const overview = [
+    stat("Prefix", cfg.settings.prefix),
+    stat("Bot name", cfg.settings.bot_name || "default"),
+    stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
+    stat("Rules in dry-run", rulesDry),
+    stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
+    stat("Log channels", chans),
+    stat("Badword patterns", cfg.badwords.length),
+    stat("Routine chat collection", "Off"),
+    ...moderation.map(({ value, label }) => el("div", { class: "stat" }, el("div", { class: "stat-title", text: label }), value)),
+  ];
+  const rows = [];
+  for (let i = 0; i < overview.length; i += 4) rows.push(statsRow(...overview.slice(i, i + 4)));
+  return el("div", { class: "contents" },
+    el("section", { class: "hero bg-base-200 rounded-box" },
+      el("div", { class: "hero-content text-start" },
+        el("div", { class: "hero-copy" },
+          el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
+          el("h2", { class: "text-3xl font-bold", text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
+          el("p", { class: "py-4", text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
+          el("div", { class: "join" },
+            el("button", { class: "btn primary join-item", text: "Review protection →", onclick: () => navigate("rules") }),
+            el("button", { class: "btn outline join-item", text: "View audit log", onclick: () => navigate("events") }))))),
+    ...rows,
+    el("p", { class: "muted", text: "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log." }),
+    el("div", { class: "alert" },
+      el("div", {},
+        el("div", { class: "font-bold", text: "Getting started" }),
+        el("p", { text: isBotOwner()
+          ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
+          : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }))),
   );
 }
 
 function stat(label, value) {
-  return el("div", { class: "stat" }, el("div", { class: "value", text: value }), el("div", { class: "label", text: label }));
+  return el("div", { class: "stat" },
+    el("div", { class: "stat-title", text: label }),
+    el("div", { class: "stat-value", text: value }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,15 +1332,16 @@ function ruleCard(r) {
   const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : spam && rule.dry_run ? "log-only test" : spam ? "delete and ban" : rule.dry_run ? "dry-run" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
-      el("div", {},
-        el("strong", { text: `${r.name} ` }),
+      el("h3", {},
+        `${r.name} `,
         el("span", { class: `tag ${badge}`, text: label }),
         r.guild_override ? el("span", { class: "tag", text: "server override" }) : null,
         r.global ? el("span", { class: "tag", text: "global" }) : null,
       ),
-      el("button", { class: "btn small", onclick: () => editRule(r) }, "Edit"),
+      el("div", { class: "card-actions" },
+        el("button", { class: "btn small", onclick: () => editRule(r) }, "Edit")),
     ),
-    el("p", { class: "muted", style: "margin-top:6px", text: r.description }),
+    el("p", { text: r.description }),
   );
 }
 
@@ -1084,10 +1409,11 @@ function editRule(r) {
   const scopeSel = scopeSelect();
 
   const renderActions = () => {
+    unmountVendorWidgets(actionsRows);
     actionsRows.innerHTML = "";
     rule.actions.forEach((a, i) => {
       const at = el("input", { type: "number", min: 1, value: a.at, style: "width:70px" });
-      const action = el("select", {},
+      const action = el("select", { class: "searchable" },
         ["log", "delete", "warn", "timeout", "kick", "ban"].map((x) => el("option", { value: x, text: x, selected: a.action === x })),
       );
       const dur = el("input", { type: "number", min: 0, value: a.duration_minutes ?? 0, style: "width:80px", title: "minutes (timeout)" });
@@ -1103,6 +1429,7 @@ function editRule(r) {
       dd.onchange = () => { rule.actions[i].delete_days = Math.min(7, Math.max(0, parseInt(dd.value) || 0)); };
       reason.onchange = () => (rule.actions[i].reason = reason.value);
     });
+    enhanceVendorWidgets(actionsRows);
   };
   if (!spam) renderActions();
 
@@ -1134,7 +1461,7 @@ function editRule(r) {
       el("div", { class: "field" }, el("label", { text: "Whitelist channels (ids)" }), channelsText),
       el("div", { class: "field" }, el("label", { text: "Whitelist users (ids)" }), usersText),
     ),
-    el("div", { class: "row form-actions" },
+    el("div", { class: "modal-action" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
@@ -1185,10 +1512,11 @@ function editRule(r) {
           () => { toast("Rule reset", "success"); closeOverlay(); },
         );
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
+      el("button", { class: "btn outline", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   );
   modal.append(box);
+  enhanceVendorWidgets(modal);
   return modal;
 }
 
@@ -1384,10 +1712,11 @@ function editCommand(c) {
 
   const renderSteps = () => {
     if (!isPlan) return;
+    unmountVendorWidgets(stepsBox);
     stepsBox.innerHTML = "";
     const steps = data.behavior.params.steps;
     steps.forEach((s, i) => {
-      const type = el("select", {},
+      const type = el("select", { class: "searchable" },
         ["reply", "dm", "log", "add_role", "remove_role", "timeout", "kick", "ban", "delete_command_message", "react", "wait"].map((t) =>
           el("option", { value: t, text: t, selected: s.type === t })),
       );
@@ -1411,6 +1740,7 @@ function editCommand(c) {
           el("button", { class: "btn small danger", text: "✕", onclick: () => { steps.splice(i, 1); markDirty(); syncPlanJson(); renderSteps(); } })),
       ));
     });
+    enhanceVendorWidgets(stepsBox);
   };
   const typePlaceholder = (t) => ({
     reply: "message template, e.g. Hi {user}!", dm: "DM template", log: "log template",
@@ -1464,7 +1794,7 @@ function editCommand(c) {
       el("div", { class: "field" }, el("label", { text: "Channel restriction (ids)" }), chanIn),
       el("div", { class: "field" }, el("label", { text: "Log event" }), logIn),
     ),
-    el("div", { class: "row form-actions" },
+    el("div", { class: "modal-action" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("label", { class: "checkbox-label" },
         el("input", { type: "checkbox", checked: data.enabled, onchange: (e) => (data.enabled = e.target.checked) }), "Enabled"),
@@ -1516,9 +1846,10 @@ function editCommand(c) {
           () => { toast(c.guild_override ? "Override cleared" : "Deleted", "success"); closeOverlay(); },
         );
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
+      el("button", { class: "btn outline", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   ));
+  enhanceVendorWidgets(modal);
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +1974,7 @@ function tabLogChannels() {
 // ---------------------------------------------------------------------------
 
 function tabEvents() {
-  const typeSel = el("select", {}, el("option", { value: "", text: "all types" }),
+  const typeSel = el("select", { class: "searchable" }, el("option", { value: "", text: "all types" }),
     ...state.config.event_types.map((t) => el("option", { value: t, text: t })));
   const userIn = el("input", { type: "text", placeholder: "user id" });
   const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Time", "Event", "User ID", "Actor ID", "Details"].map((text) => el("th", { text })))), el("tbody", {}));
@@ -1938,7 +2269,7 @@ function tabSettings() {
   const botName = el("input", { type: "text", value: cfg.settings.bot_name });
 
   let sourceEnrollment = null;
-  const srcSel = el("select", { onchange: async () => {
+  const srcSel = el("select", { class: "searchable", onchange: async () => {
     sourceEnrollment = null;
     const guildId = srcSel.value;
     if (!guildId) return;
@@ -2061,7 +2392,8 @@ function tabSettings() {
     el("h3", { text: "Case removal" }),
     el("p", { class: "muted", text: "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action." }),
     el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
-    el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
+    el("div", { class: "card-actions" },
+      el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
       const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles: splitIds(roleInput.value), revision: roleRevision.value });
       roleWriteGeneration++;
       roleRevision.value = saved.revision;
@@ -2070,6 +2402,7 @@ function tabSettings() {
       updateWorkspaceStatus();
       toast("Case-removal roles saved", "success");
     } }),
+    ),
   ));
 
   if (isBotOwner()) {
@@ -2139,7 +2472,7 @@ function overlay() {
   modal.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && canLeave()) closeOverlay();
     if (event.key === "Tab") {
-      const controls = [...modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")];
+      const controls = [...modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]):not(.search-select-native), select:not([disabled]):not(.search-select-native), textarea:not([disabled])")];
       const first = controls[0], last = controls.at(-1);
       if (event.shiftKey && (document.activeElement === first || document.activeElement === modal)) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && (document.activeElement === last || document.activeElement === modal)) { event.preventDefault(); first?.focus(); }
@@ -2151,7 +2484,7 @@ function overlay() {
 }
 function closeOverlay() {
   const m = $(".modal-overlay");
-  if (m) { m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
+  if (m) { unmountVendorWidgets(m); m.remove(); m._returnFocus?.focus(); dirty = false; updateWorkspaceStatus(); }
 }
 
 function initTheme() {
@@ -2176,10 +2509,11 @@ function initTheme() {
 
 function bootUi() {
   capturePreviewToken();
+  applyVendorCss();
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !["events", "bans"].includes(state.tab)) markDirty();
+    if (event.target.matches("input, textarea, select") && !event.target.classList.contains("search-select-input") && !["events", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }
@@ -2211,6 +2545,7 @@ function bootUi() {
   init().catch((e) => { toast("Init failed: " + e.message, "error"); });
 }
 
+if (typeof document !== "undefined") applyVendorCss();
 if (typeof document !== "undefined" && document.getElementById?.("app")) {
   bootUi();
 }

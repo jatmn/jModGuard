@@ -20,13 +20,30 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 
 ## Getting and hosting the files
 
-The website is three files in this repository, in the `frontend/` folder:
+The website is three first-party files in this repository, in the `frontend/` folder:
 
 | File | What it is |
 |---|---|
 | `frontend/index.html` | the page |
 | `frontend/app.js` | the app |
 | `frontend/style.css` | the look |
+
+The browser also loads **daisyUI CSS** and **Headless UI** (with React) at
+runtime from a CDN so searchable selects work. Those libraries are **not** in
+git and are **not** extra Bunny Storage files. Defaults are jsDelivr
+(`daisyui@5.7.43/daisyui.css`) and esm.sh (`react@19.3.0`,
+`@headlessui/react@2.2.10`). Set `window.JMODGUARD_DAISYUI_HREF` and
+`window.JMODGUARD_ESM_BASE` before `app.js` (the same pattern as
+`window.JMODGUARD_API_BASE`) to a Bunny pull zone or other host that caches
+those same URLs. `app.js` applies the CSS href to the daisyUI `<link>` when it
+loads, so an override placed with the API base still replaces the default
+stylesheet. Putting the CSS override above that `<link>` in `index.html`
+avoids a second fetch. If that runtime load fails, native `<select>` controls stay
+usable. Pale blue light and navy dark colors stay the existing theme tokens.
+Buttons, cards, hero, stats, badges, tables, inputs, and the searchable
+select use daisyUI (and Headless Combobox) component classes mapped onto
+those tokens. First-party CSS is the workspace shell and theme, not a
+restyle of daisyUI widgets back into the previous custom controls.
 
 Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.
@@ -64,9 +81,11 @@ bundle on every main SHA. To repeat an upload from a checkout, run
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
  selects a non-default `frontend/` directory. A private ops repo is **not required** to install.
 
-**Another host or CDN.** Copy the same three files to the site root
+**Another host or CDN.** Copy the same three first-party files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
-files can be newer). If the API is on a **different** hostname than the pages,
+files can be newer). The page still fetches daisyUI and Headless UI from the
+runtime CDN unless you override `window.JMODGUARD_DAISYUI_HREF` and
+`window.JMODGUARD_ESM_BASE` before `app.js` loads. If the API is on a **different** hostname than the pages,
 set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads,
 and set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
 OAuth still happens on `web.base_url`: `/login` and `/oauth/callback`
@@ -262,4 +281,4 @@ bot owner).
 
 ### Appearance
 
-Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page.
+Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page. daisyUI widgets reuse those same tokens: cards and stats use `--panel`, hero and tinted surfaces use `--hero`, and primary actions use `--accent`. They do not switch the workspace to daisyUI’s default palette.
