@@ -410,7 +410,7 @@ async fn main() -> Result<()> {
             let http = Arc::clone(&shutdown_http);
             let content = content.clone();
             notices.spawn(async move {
-                logging::emit_system_notice(&app, &http, guild_id, content).await;
+                logging::emit_shutdown_notice(&app, &http, guild_id, content).await;
             });
         }
         while let Some(result) = notices.join_next().await {

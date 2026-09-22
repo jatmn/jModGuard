@@ -92,10 +92,13 @@ The bot admits up to `log.discord_concurrency` reports (default 8), with a total
 of `log.discord_timeout_secs` (default 10). Both have environment overrides documented
 in `config.example.toml`. Conductor Administration can store owner-notification and
 monitoring budgets after operator login; bot Discord report concurrency remains a bot
-process setting until a later credential-delivery feature. Admission never waits,
-so overload drops reports rather than building a content backlog. There is no application
-retry or replay queue; Serenity retains its normal request/rate-limit behavior within
-the deadline. The current shared limit does not establish per-guild fairness.
+process setting until a later credential-delivery feature. Routine and startup
+report admission never waits, so overload drops those reports rather than building
+a content backlog. On graceful shutdown, the one system notice per configured
+server may wait for a delivery slot within that same per-notice deadline before
+the bot closes its Discord shards. There is no application retry or replay queue;
+Serenity retains its normal request/rate-limit behavior within the deadline.
+The current shared limit does not establish per-guild fairness.
 
 A valid warm configuration cache permits delivery during database failure. An expired,
 missing or invalidated configuration still needs SQL; it fails within the deadline.

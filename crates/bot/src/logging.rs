@@ -700,7 +700,17 @@ pub async fn emit_system_notice(
     guild_id: GuildId,
     content: String,
 ) {
-    emit_system_notice_to(app, http, guild_id, content).await;
+    emit_system_notice_to(app, http, guild_id, content, Admission::Immediate).await;
+}
+
+/// Gives a graceful-shutdown notice bounded access to the normal log route.
+pub async fn emit_shutdown_notice(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    content: String,
+) {
+    emit_system_notice_to(app, http, guild_id, content, Admission::WaitForShutdown).await;
 }
 
 async fn emit_system_notice_to(
@@ -708,13 +718,16 @@ async fn emit_system_notice_to(
     sink: &impl LogDelivery,
     guild_id: GuildId,
     content: String,
+    admission: Admission,
 ) -> Delivery {
-    emit_to(
+    emit_to_observed(
         app,
         sink,
         guild_id,
         "system",
         BTreeMap::from([("content".into(), content)]),
+        None,
+        admission,
     )
     .await
 }
@@ -755,6 +768,12 @@ pub(crate) enum Delivery {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+enum Admission {
+    Immediate,
+    WaitForShutdown,
+}
+
 pub(crate) async fn emit_to(
     app: &Arc<BotState>,
     sink: &impl LogDelivery,
@@ -762,7 +781,7 @@ pub(crate) async fn emit_to(
     event: &str,
     vars: BTreeMap<String, String>,
 ) -> Delivery {
-    emit_to_observed(app, sink, guild_id, event, vars, None).await
+    emit_to_observed(app, sink, guild_id, event, vars, None, Admission::Immediate).await
 }
 
 async fn emit_to_observed(
@@ -772,8 +791,9 @@ async fn emit_to_observed(
     event: &str,
     vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
+    admission: Admission,
 ) -> Delivery {
-    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation)
+    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation, admission)
         .await
         .0
 }
@@ -785,6 +805,7 @@ async fn emit_to_observed_with_audit(
     event: &str,
     mut vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
+    admission: Admission,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -798,14 +819,32 @@ async fn emit_to_observed_with_audit(
         app.member_audits
             .observe_event(guild_id.get(), target, event, observed)
     });
-    // Admission never waits or creates a backlog holding raw event content.
-    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
-        record_delivery_failure(app);
-        return (Delivery::Dropped, None);
+    let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
+    let started = Instant::now();
+    let _permit = match admission {
+        Admission::Immediate => {
+            // Routine and startup reports never queue raw event content.
+            let Ok(permit) = app.log_delivery_slots.try_acquire() else {
+                record_delivery_failure(app);
+                return (Delivery::Dropped, None);
+            };
+            permit
+        }
+        Admission::WaitForShutdown => {
+            // A stop notice gets the same total deadline for admission and
+            // delivery. It does not retry a failed Discord request.
+            let Ok(Ok(permit)) =
+                tokio::time::timeout(deadline, app.log_delivery_slots.acquire()).await
+            else {
+                record_delivery_failure(app);
+                return (Delivery::Failed, None);
+            };
+            permit
+        }
     };
     let mut matched_audit = None;
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(app.cfg.log.discord_timeout_secs),
+        deadline.saturating_sub(started.elapsed()),
         async {
             let cfg = app.configs.get(&app.db, guild_id.get()).await?;
             let Some(channel_id) = channel_for(&cfg, event) else {
@@ -1176,9 +1215,17 @@ pub(crate) async fn emit_member_event(
         templates::format_duration(account_age_seconds),
     );
     vars.extend(extra);
-    emit_to_observed_with_audit(app, ctx.http.as_ref(), guild_id, event, vars, observation)
-        .await
-        .1
+    emit_to_observed_with_audit(
+        app,
+        ctx.http.as_ref(),
+        guild_id,
+        event,
+        vars,
+        observation,
+        Admission::Immediate,
+    )
+    .await
+    .1
 }
 
 fn default_template(event: &str) -> &'static str {

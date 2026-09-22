@@ -842,11 +842,25 @@ async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
         )
     );
     assert_eq!(
-        emit_system_notice_to(&f.app, &sink, GuildId::new(789), content).await,
+        emit_system_notice_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            content,
+            Admission::Immediate
+        )
+        .await,
         Delivery::Sent
     );
     assert_eq!(
-        emit_system_notice_to(&f.app, &sink, GuildId::new(790), "not configured".into()).await,
+        emit_system_notice_to(
+            &f.app,
+            &sink,
+            GuildId::new(790),
+            "not configured".into(),
+            Admission::Immediate,
+        )
+        .await,
         Delivery::Unconfigured
     );
     let messages = sink.messages.lock().unwrap();
@@ -858,6 +872,43 @@ async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
         "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
         env!("CARGO_PKG_VERSION")
     )));
+}
+
+#[tokio::test]
+async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
+    use std::future::Future;
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+    let mut notice = Box::pin(emit_system_notice_to(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        shutdown_notice_content(61),
+        Admission::WaitForShutdown,
+    ));
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(notice.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    assert!(sink.messages.lock().unwrap().is_empty());
+    drop(permit);
+    assert_eq!(notice.await, Delivery::Sent);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, ChannelId::new(456));
+    assert!(
+        messages[0].1["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "Bot shutting down (v{}). Uptime: 1 minute, 1 second",
+                env!("CARGO_PKG_VERSION")
+            ))
+    );
 }
 
 #[tokio::test]
