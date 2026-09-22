@@ -255,6 +255,20 @@ pub fn remember_message(
     );
 }
 
+pub(crate) fn known_message_author(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+) -> Option<u64> {
+    app.log_snippets
+        .inner
+        .lock()
+        .get(&(guild, channel, message))
+        .filter(|snippet| snippet.at.elapsed() < SNIPPET_KEEP)
+        .map(|snippet| snippet.author)
+}
+
 fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<(u64, String)> {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
@@ -445,7 +459,10 @@ fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<S
 
 /// Use only fields in the delivered update; cache-filled values are not edit history.
 /// Embed/pin-only refreshes do not prove a content edit and produce no report.
-pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<MessageReport> {
+pub(crate) fn message_update_report(
+    event: &MessageUpdateEvent,
+    known_author_id: Option<u64>,
+) -> Option<MessageReport> {
     let guild_id = event.guild_id?;
     if event.content.is_none() && event.attachments.is_none() {
         return None;
@@ -473,6 +490,10 @@ pub(crate) fn message_update_report(event: &MessageUpdateEvent) -> Option<Messag
             &author.name,
             author.global_name.as_deref().unwrap_or(&author.name),
         ));
+    } else if let Some(author_id) = known_author_id.filter(|id| *id != 0) {
+        // A message-create observation can identify an author without
+        // supplying an author name or any earlier message content.
+        vars.insert("user_id".into(), author_id.to_string());
     }
     Some(MessageReport {
         guild_id,

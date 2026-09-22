@@ -6,9 +6,12 @@ Basic Discord log delivery is independent of those retired history tables.
 
 ## Basic reports
 
-- Updates use only supplied content/attachment fields, guild/channel/message references
-  and supplied author identity. An absent field is unknown, not empty. Embed/pin-only
-  refreshes are skipped. Reports say "updated"; they do not claim a verified before/after
+- Updates use only supplied content/attachment fields and guild/channel/message
+  references. A supplied author sets the display name; for ID-only filtering, a
+  recent observation of that exact message can supply its author ID when the edit
+  omits the author. An unknown author remains unavailable. An absent field is
+  unknown, not empty. Embed/pin-only refreshes are skipped. Reports say
+  "updated"; they do not claim a verified before/after
   diff. A bounded 10-second fingerprint merges partial content/attachment updates for
   the same message in one bot process. A later distinct edit timestamp reports
   again; a timestamp that arrives after the same untimestamped observation is

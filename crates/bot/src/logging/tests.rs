@@ -16,7 +16,8 @@ fn update(fields: serde_json::Value) -> MessageUpdateEvent {
 
 #[test]
 fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
-    let report = message_update_report(&update(serde_json::json!({"content":"new text"}))).unwrap();
+    let report =
+        message_update_report(&update(serde_json::json!({"content":"new text"})), None).unwrap();
     assert_eq!(report.vars["after"], "new text");
     assert_eq!(report.vars["before"], "not retained");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -25,17 +26,21 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
         "https://discord.com/channels/789/456/123"
     );
     let attachment_only =
-        message_update_report(&update(serde_json::json!({"attachments":[]}))).unwrap();
+        message_update_report(&update(serde_json::json!({"attachments":[]})), None).unwrap();
     assert_eq!(attachment_only.vars["attachments"], "0");
     assert_eq!(attachment_only.vars["after"], "not supplied in this update");
-    let emptied = message_update_report(&update(serde_json::json!({"content":""}))).unwrap();
+    let emptied = message_update_report(&update(serde_json::json!({"content":""})), None).unwrap();
     assert_eq!(emptied.vars["after"], "");
     assert!(
-        message_update_report(&update(serde_json::json!({"embeds":[],"pinned":true}))).is_none()
+        message_update_report(
+            &update(serde_json::json!({"embeds":[],"pinned":true})),
+            None
+        )
+        .is_none()
     );
     let mut dm = update(serde_json::json!({"content":"private"}));
     dm.guild_id = None;
-    assert!(message_update_report(&dm).is_none());
+    assert!(message_update_report(&dm, None).is_none());
 }
 
 #[test]
@@ -179,7 +184,7 @@ fn supplied_author_id_reaches_message_edit_filter() {
     author.id = serenity::model::id::UserId::new(42);
     author.name = "otherbot".into();
     event.author = Some(author);
-    let report = message_update_report(&event).unwrap();
+    let report = message_update_report(&event, None).unwrap();
     assert_eq!(report.vars["user_id"], "42");
     assert!(excluded(
         &db::LogFilter {
@@ -195,6 +200,30 @@ fn supplied_author_id_reaches_message_edit_filter() {
         },
         &report.vars
     ));
+}
+
+#[test]
+fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
+    let f = Fixture::new();
+    remember_message(&f.app, 789, 456, 123, Some(42), "the other bot's report");
+    let known = known_message_author(&f.app, 789, 456, 123);
+    assert_eq!(known, Some(42));
+    let event = update(serde_json::json!({"content":"edited report"}));
+    let report = message_update_report(&event, known).unwrap();
+    assert_eq!(report.vars["user_id"], "42");
+    assert_eq!(report.vars["user"], "unavailable");
+    assert_eq!(report.vars["mention"], "unavailable");
+    assert_eq!(report.vars["after"], "edited report");
+    assert!(excluded(
+        &db::LogFilter {
+            users: vec!["42".into()],
+            channels: vec![],
+        },
+        &report.vars,
+    ));
+    assert_eq!(known_message_author(&f.app, 789, 456, 999), None);
+    let cold = message_update_report(&event, None).unwrap();
+    assert_eq!(cold.vars["user_id"], "unavailable");
 }
 
 #[test]
@@ -467,7 +496,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
     for guild in [789, 790] {
         let mut event = update(serde_json::json!({"content":"hello"}));
         event.guild_id = Some(GuildId::new(guild));
-        let report = message_update_report(&event).unwrap();
+        let report = message_update_report(&event, None).unwrap();
         assert_eq!(
             emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await,
             Delivery::Sent
