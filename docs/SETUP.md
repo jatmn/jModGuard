@@ -246,9 +246,11 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
    without acting. Run it a few days, watch the audit log, then switch rules
    live.
 2. Set up **log channels** (Log Channels tab): at minimum `automod`,
-   `mod_action`, `member_join`, `member_leave`, `message_delete`. For each event,
-   optionally save ignored user or bot IDs and source channel IDs to avoid
-   duplicate bot reports or exclude staff channels.
+   `mod_action`, `member_join`, `member_leave`, `message_delete`. `message_edit`
+   reports only Discord-identified edits (`edited_timestamp`), not GIF/link
+   unfurls, chat replies, or the bot's own log posts. For each event, optionally save ignored
+   user or bot IDs and source channel IDs to avoid duplicate bot reports or
+   exclude staff channels.
 3. Add your **badwords** (Badwords tab) and test them with the live tester.
 4. Change the prefix / bot nickname if you like (Settings tab).
 5. Point the slash commands at your mods and try `/ban`, `/kick`, `/warn`.

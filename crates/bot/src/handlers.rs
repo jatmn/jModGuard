@@ -204,6 +204,7 @@ impl EventHandler for Handler {
             "member_join",
             &new_member.user,
             logging::member_join_vars(new_member.joined_at, chrono::Utc::now()),
+            None,
         )
         .await;
     }
@@ -227,11 +228,17 @@ impl EventHandler for Handler {
             member_data.and_then(|m| m.joined_at).or(observed_join),
             chrono::Utc::now(),
         );
-        logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra).await;
+        logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra, None).await;
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
-        let observed = chrono::Utc::now().to_rfc3339();
+        let observed = chrono::Utc::now();
+        let observation = self.app.member_audits.observe_event(
+            guild_id.get(),
+            banned_user.id.get(),
+            "member_ban",
+            observed.timestamp_millis(),
+        );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ = db::record_enrolled_ban(
@@ -261,12 +268,27 @@ impl EventHandler for Handler {
             .await;
         }
         let mut extra = BTreeMap::new();
-        extra.insert("time".into(), observed);
-        logging::emit_member_event(&app, &ctx, guild_id, "member_ban", &banned_user, extra).await;
+        extra.insert("time".into(), observed.to_rfc3339());
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_ban",
+            &banned_user,
+            extra,
+            observation,
+        )
+        .await;
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
-        let observed = chrono::Utc::now().to_rfc3339();
+        let observed = chrono::Utc::now();
+        let observation = self.app.member_audits.observe_event(
+            guild_id.get(),
+            unbanned_user.id.get(),
+            "member_unban",
+            observed.timestamp_millis(),
+        );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let _ =
@@ -291,9 +313,17 @@ impl EventHandler for Handler {
             .await;
         }
         let mut extra = BTreeMap::new();
-        extra.insert("time".into(), observed);
-        logging::emit_member_event(&app, &ctx, guild_id, "member_unban", &unbanned_user, extra)
-            .await;
+        extra.insert("time".into(), observed.to_rfc3339());
+        logging::emit_member_event(
+            &app,
+            &ctx,
+            guild_id,
+            "member_unban",
+            &unbanned_user,
+            extra,
+            observation,
+        )
+        .await;
     }
 
     async fn guild_audit_log_entry_create(
@@ -539,7 +569,9 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if let Some(report) = logging::message_update_report(&event, known_author_id)
+        let bot_user_id = ctx.cache.current_user().id.get();
+        if let Some(report) =
+            logging::message_update_report(&event, known_author_id, Some(bot_user_id))
             && self.app.edit_reports.should_report(&event)
         {
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;

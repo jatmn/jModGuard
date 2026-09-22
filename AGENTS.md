@@ -34,7 +34,9 @@ family/version checks before bootstrap writes. Never adopt an unmarked old datab
 Routine collection of message text/attachments and member/user activity is retired.
 See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
 Basic events report to Discord using supplied fields, with bounded delivery and no
-history reconstruction. Leave logs may use bounded join timestamps already received
+history reconstruction. Message-edit reports require Discord's `edited_timestamp`;
+embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
+report is that one event. Leave logs may use bounded join timestamps already received
 with messages; never fetch a roster. Ban/unban display may use bounded recent audit
 lookup inside report admission; this does not establish durable case-source identity.
 General message caching stays disabled. Keep selected moderation

@@ -5,6 +5,8 @@ use crate::db::SqlExecutor;
 use crate::state::BotState;
 use std::sync::Mutex;
 
+const EDITED: &str = "2026-09-21T00:00:01.000Z";
+
 fn update(fields: serde_json::Value) -> MessageUpdateEvent {
     let mut value = serde_json::json!({"id":"123", "channel_id":"456", "guild_id":"789"});
     value
@@ -14,10 +16,25 @@ fn update(fields: serde_json::Value) -> MessageUpdateEvent {
     serde_json::from_value(value).unwrap()
 }
 
+fn edited(fields: serde_json::Value) -> MessageUpdateEvent {
+    edited_at(fields, EDITED)
+}
+
+fn edited_at(mut fields: serde_json::Value, timestamp: &str) -> MessageUpdateEvent {
+    fields.as_object_mut().unwrap().insert(
+        "edited_timestamp".into(),
+        serde_json::Value::String(timestamp.to_string()),
+    );
+    update(fields)
+}
+
+fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Option<MessageReport> {
+    message_update_report(event, known_author_id, None)
+}
+
 #[test]
 fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
-    let report =
-        message_update_report(&update(serde_json::json!({"content":"new text"})), None).unwrap();
+    let report = edit_report(&edited(serde_json::json!({"content":"new text"})), None).unwrap();
     assert_eq!(report.vars["after"], "new text");
     assert_eq!(report.vars["before"], "not retained");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -26,36 +43,115 @@ fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
         "https://discord.com/channels/789/456/123"
     );
     let attachment_only =
-        message_update_report(&update(serde_json::json!({"attachments":[]})), None).unwrap();
+        edit_report(&edited(serde_json::json!({"attachments":[]})), None).unwrap();
     assert_eq!(attachment_only.vars["attachments"], "0");
     assert_eq!(attachment_only.vars["after"], "not supplied in this update");
-    let emptied = message_update_report(&update(serde_json::json!({"content":""})), None).unwrap();
+    let emptied = edit_report(&edited(serde_json::json!({"content":""})), None).unwrap();
     assert_eq!(emptied.vars["after"], "");
     assert!(
-        message_update_report(
+        edit_report(
             &update(serde_json::json!({"embeds":[],"pinned":true})),
             None
         )
         .is_none()
     );
-    let mut dm = update(serde_json::json!({"content":"private"}));
+    let mut dm = edited(serde_json::json!({"content":"private"}));
     dm.guild_id = None;
-    assert!(message_update_report(&dm, None).is_none());
+    assert!(edit_report(&dm, None).is_none());
+}
+
+#[test]
+fn untimestamped_unfurls_and_empty_attachments_are_not_edits() {
+    let gif = update(serde_json::json!({
+        "content":"https://tenor.com/view/wtf-is-this-thomasvanhaecht-vubdiscord-walking-in-on-the-wrong-thing-walking-in-gif-21572821",
+        "attachments":[],
+        "embeds":[{"url":"https://tenor.com/view/example.gif"}]
+    }));
+    assert!(edit_report(&gif, None).is_none());
+    assert!(edit_report(&update(serde_json::json!({"content":"new text"})), None).is_none());
+    assert!(edit_report(&update(serde_json::json!({"attachments":[]})), None).is_none());
+    let dedup = EditReportDedup::default();
+    assert!(!dedup.should_report(&gif));
+    assert!(!dedup.should_report(&update(serde_json::json!({"content":"new text"}))));
+    let real = edited(serde_json::json!({"content":"actually edited"}));
+    assert_eq!(
+        edit_report(&real, None).unwrap().vars["after"],
+        "actually edited"
+    );
+    assert!(dedup.should_report(&real));
+}
+
+#[test]
+fn untimestamped_reply_refreshes_are_not_edits() {
+    let reply = update(serde_json::json!({
+        "content":"replying to that gif",
+        "attachments":[],
+        "type": 19,
+        "timestamp":"2026-09-22T14:52:00.000Z",
+        "message_reference": {
+            "message_id":"111",
+            "channel_id":"456",
+            "guild_id":"789"
+        }
+    }));
+    assert!(edit_report(&reply, None).is_none());
+    let dedup = EditReportDedup::default();
+    assert!(!dedup.should_report(&reply));
+    let edited_reply = edited(serde_json::json!({
+        "content":"edited the reply",
+        "type": 19,
+        "message_reference": {
+            "message_id":"111",
+            "channel_id":"456",
+            "guild_id":"789"
+        }
+    }));
+    assert_eq!(
+        edit_report(&edited_reply, None).unwrap().vars["after"],
+        "edited the reply"
+    );
+    assert!(dedup.should_report(&edited_reply));
+}
+
+#[test]
+fn bot_own_log_updates_do_not_stack_prior_reports() {
+    let nested =
+        "**:pencil2: Message updated in <#456>**\nCurrent text: https://tenor.com/view/example";
+    let mut log_update = edited(serde_json::json!({"content": nested}));
+    let mut author = serenity::model::user::User::default();
+    author.id = serenity::model::id::UserId::new(99);
+    author.name = "jModGuard".into();
+    log_update.author = Some(author);
+    assert!(message_update_report(&log_update, None, Some(99)).is_none());
+    let reported = message_update_report(&log_update, None, Some(1)).unwrap();
+    assert_eq!(reported.vars["after"], nested);
+    let mut anonymous = edited(serde_json::json!({"content": nested}));
+    anonymous.author = None;
+    assert!(message_update_report(&anonymous, Some(99), Some(99)).is_none());
+    assert_eq!(
+        message_update_report(&anonymous, Some(99), Some(1))
+            .unwrap()
+            .vars["user_id"],
+        "99"
+    );
 }
 
 #[test]
 fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
     let dedup = EditReportDedup::default();
-    let first = update(serde_json::json!({"content":"first"}));
+    let first = edited(serde_json::json!({"content":"first"}));
     assert!(dedup.should_report(&first));
     assert!(!dedup.should_report(&first));
     assert!(!dedup.should_report(&first));
-    let changed = update(serde_json::json!({"content":"second"}));
+    let changed = edited_at(
+        serde_json::json!({"content":"second"}),
+        "2026-09-21T00:00:02.000Z",
+    );
     assert!(dedup.should_report(&changed));
     assert!(!dedup.should_report(&changed));
     assert!(
-        dedup.should_report(&first),
-        "a later distinct observation restores the first fingerprint"
+        !dedup.should_report(&first),
+        "a replay of an earlier timestamp is still the same reported edit"
     );
     let mut other_channel = first.clone();
     other_channel.channel_id = ChannelId::new(999);
@@ -65,19 +161,25 @@ fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
 #[test]
 fn partial_fields_for_one_edit_are_one_observation() {
     let dedup = EditReportDedup::default();
-    let content = update(serde_json::json!({"content":"edited"}));
-    let attachments = update(serde_json::json!({"attachments":[]}));
-    let combined = update(serde_json::json!({"content":"edited","attachments":[]}));
+    let content = edited(serde_json::json!({"content":"edited"}));
+    let attachments = edited(serde_json::json!({"attachments":[]}));
+    let combined = edited(serde_json::json!({"content":"edited","attachments":[]}));
     assert!(dedup.should_report(&content));
     assert!(!dedup.should_report(&attachments));
     assert!(!dedup.should_report(&combined));
-    assert!(dedup.should_report(&update(serde_json::json!({"content":"edited again"}))));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"edited again"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
 
     let reverse = EditReportDedup::default();
     assert!(reverse.should_report(&attachments));
     assert!(!reverse.should_report(&content));
     assert!(!reverse.should_report(&combined));
-    assert!(reverse.should_report(&update(serde_json::json!({"content":"edited again"}))));
+    assert!(reverse.should_report(&edited_at(
+        serde_json::json!({"content":"edited again"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
 }
 
 #[test]
@@ -128,63 +230,48 @@ fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
         "edited_timestamp":"2026-09-21T00:00:02.000Z"
     }))));
 
-    let attachment = |description: &str| {
-        update(serde_json::json!({"attachments":[{
-            "id":"555", "filename":"image.png", "description":description,
-            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
-            "size":100
-        }]}))
+    let attachment = |description: &str, timestamp: &str| {
+        edited_at(
+            serde_json::json!({"attachments":[{
+                "id":"555", "filename":"image.png", "description":description,
+                "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+                "size":100
+            }]}),
+            timestamp,
+        )
     };
     let metadata = EditReportDedup::default();
-    assert!(metadata.should_report(&attachment("before")));
-    assert!(!metadata.should_report(&attachment("before")));
-    assert!(metadata.should_report(&attachment("after")));
+    assert!(metadata.should_report(&attachment("before", EDITED)));
+    assert!(!metadata.should_report(&attachment("before", EDITED)));
+    assert!(metadata.should_report(&attachment("after", "2026-09-21T00:00:02.000Z")));
 }
 
 #[test]
-fn timestamp_arriving_after_a_reported_untimestamped_edit_does_not_report_twice() {
+fn untimestamped_refresh_does_not_hide_a_later_timestamped_edit() {
     let dedup = EditReportDedup::default();
-    assert!(dedup.should_report(&update(serde_json::json!({
-        "content":"before", "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(dedup.should_report(&update(serde_json::json!({"content":"after"}))));
-    assert!(!dedup.should_report(&update(serde_json::json!({
-        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
-    assert!(!dedup.should_report(&update(serde_json::json!({
-        "attachments":[], "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
-    assert!(dedup.should_report(&update(serde_json::json!({
-        "content":"third", "edited_timestamp":"2026-09-21T00:00:03.000Z"
-    }))));
-
-    let partial = EditReportDedup::default();
-    let attachment = serde_json::json!({
-        "id":"555", "filename":"image.png", "description":"new",
-        "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
-        "size":100
-    });
-    assert!(partial.should_report(&update(serde_json::json!({
-        "content":"before", "attachments":[],
-        "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(partial.should_report(&update(serde_json::json!({"content":"after"}))));
-    assert!(!partial.should_report(&update(serde_json::json!({
-        "attachments":[attachment],
-    }))));
-    assert!(!partial.should_report(&update(serde_json::json!({
-        "content":"after", "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
+    assert!(!dedup.should_report(&update(serde_json::json!({"content":"after"}))));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"after"}),
+        "2026-09-21T00:00:02.000Z"
+    )));
+    assert!(!dedup.should_report(&edited_at(
+        serde_json::json!({"attachments":[]}),
+        "2026-09-21T00:00:02.000Z"
+    )));
+    assert!(dedup.should_report(&edited_at(
+        serde_json::json!({"content":"third"}),
+        "2026-09-21T00:00:03.000Z"
+    )));
 }
 
 #[test]
 fn supplied_author_id_reaches_message_edit_filter() {
-    let mut event = update(serde_json::json!({"content":"edited"}));
+    let mut event = edited(serde_json::json!({"content":"edited"}));
     let mut author = serenity::model::user::User::default();
     author.id = serenity::model::id::UserId::new(42);
     author.name = "otherbot".into();
     event.author = Some(author);
-    let report = message_update_report(&event, None).unwrap();
+    let report = edit_report(&event, None).unwrap();
     assert_eq!(report.vars["user_id"], "42");
     assert!(excluded(
         &db::LogFilter {
@@ -208,8 +295,8 @@ fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
     remember_message(&f.app, 789, 456, 123, Some(42), "the other bot's report");
     let known = known_message_author(&f.app, 789, 456, 123);
     assert_eq!(known, Some(42));
-    let event = update(serde_json::json!({"content":"edited report"}));
-    let report = message_update_report(&event, known).unwrap();
+    let event = edited(serde_json::json!({"content":"edited report"}));
+    let report = edit_report(&event, known).unwrap();
     assert_eq!(report.vars["user_id"], "42");
     assert_eq!(report.vars["user"], "unavailable");
     assert_eq!(report.vars["mention"], "unavailable");
@@ -222,7 +309,7 @@ fn authorless_edit_uses_an_observed_bot_id_for_exclusion_only() {
         &report.vars,
     ));
     assert_eq!(known_message_author(&f.app, 789, 456, 999), None);
-    let cold = message_update_report(&event, None).unwrap();
+    let cold = edit_report(&event, None).unwrap();
     assert_eq!(cold.vars["user_id"], "unavailable");
 }
 
@@ -497,9 +584,9 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
         .unwrap();
     let sink = Sink::default();
     for guild in [789, 790] {
-        let mut event = update(serde_json::json!({"content":"hello"}));
+        let mut event = edited(serde_json::json!({"content":"hello"}));
         event.guild_id = Some(GuildId::new(guild));
-        let report = message_update_report(&event, None).unwrap();
+        let report = edit_report(&event, None).unwrap();
         assert_eq!(
             emit_to(&f.app, &sink, report.guild_id, report.event, report.vars).await,
             Delivery::Sent
@@ -855,7 +942,14 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
         missing_first: true,
         stalled: false,
     };
-    let vars = templates::user_vars(123, "username", "Display");
+    let now = chrono::Utc::now();
+    let mut vars = templates::user_vars(123, "username", "Display");
+    // The disabled predecessor is a distinct observation, outside the new
+    // action's audit-time ambiguity window.
+    vars.insert(
+        "time".into(),
+        (now - chrono::Duration::seconds(6)).to_rfc3339(),
+    );
     assert_eq!(
         emit_to(&f.app, &sink, GuildId::new(789), "member_ban", vars.clone()).await,
         Delivery::Unconfigured
@@ -865,6 +959,7 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
         .await
         .unwrap();
     f.app.invalidate_configs();
+    vars.insert("time".into(), now.to_rfc3339());
     assert_eq!(
         emit_to(&f.app, &sink, GuildId::new(789), "member_ban", vars).await,
         Delivery::Sent
@@ -974,21 +1069,230 @@ fn audit_claims_are_scoped_atomic_and_bounded_without_live_eviction() {
     let action = member_audit_action("member_ban").unwrap();
     let observed = chrono::Utc::now().timestamp_millis();
     let logs = audit_fixture(action, 123, observed, None);
-    assert!(claims.claim(1, &logs, action, 123, observed).is_some());
-    assert!(claims.claim(1, &logs, action, 123, observed).is_none());
-    assert!(claims.claim(2, &logs, action, 123, observed).is_some());
+    let first = claims.observe(1, action, 123, observed);
+    assert!(claims.claim(&first, &logs).is_some());
+    assert!(claims.claim(&first, &logs).is_none());
+    let other_guild = claims.observe(2, action, 123, observed);
+    assert!(claims.claim(&other_guild, &logs).is_some());
     {
-        let mut entries = claims.inner.lock();
+        let mut state = claims.inner.lock();
         for id in 0..MEMBER_AUDIT_LIMIT as u64 - 2 {
-            entries.insert((3, id), Instant::now());
+            state.claimed.insert((3, id), Instant::now());
         }
-        assert_eq!(entries.len(), MEMBER_AUDIT_LIMIT);
+        assert_eq!(state.claimed.len(), MEMBER_AUDIT_LIMIT);
     }
-    assert!(claims.claim(4, &logs, action, 123, observed).is_none());
-    assert!(claims.claim(1, &logs, action, 123, observed).is_none());
-    for at in claims.inner.lock().values_mut() {
+    let full = claims.observe(4, action, 123, observed);
+    assert!(claims.claim(&full, &logs).is_none());
+    assert!(claims.claim(&first, &logs).is_none());
+    for at in claims.inner.lock().claimed.values_mut() {
         *at = Instant::now() - MEMBER_AUDIT_KEEP;
     }
-    assert!(claims.claim(4, &logs, action, 123, observed).is_some());
-    assert_eq!(claims.inner.lock().len(), 1);
+    assert!(claims.claim(&full, &logs).is_some());
+    assert_eq!(claims.inner.lock().claimed.len(), 1);
+}
+
+struct UnavailableAuditSink {
+    mode: &'static str,
+    observed: i64,
+}
+#[serenity::async_trait]
+impl LogDelivery for UnavailableAuditSink {
+    async fn send(&self, _: ChannelId, _: CreateMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn member_audit(&self, _: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+        match self.mode {
+            "error" => anyhow::bail!("audit unavailable"),
+            "stalled" => std::future::pending::<()>().await,
+            "disabled" | "filtered" | "dropped" => panic!("skipped report queried audit"),
+            _ => {}
+        }
+        let mut logs = audit_fixture(action, 123, self.observed, Some("previous action"));
+        if self.mode == "ambiguous" {
+            logs.entries.push(logs.entries[0].clone());
+        } else {
+            logs.entries.clear();
+        }
+        Ok(logs)
+    }
+}
+
+#[tokio::test]
+async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_action() {
+    for event in ["member_ban", "member_unban"] {
+        for mode in [
+            "empty",
+            "error",
+            "stalled",
+            "ambiguous",
+            "disabled",
+            "filtered",
+            "dropped",
+        ] {
+            let f = Fixture::with_timeout(4);
+            if mode != "disabled" {
+                db::upsert_log_channel(&f.app.db, 789, event, 456)
+                    .await
+                    .unwrap();
+            }
+            if mode == "filtered" {
+                f.app
+                    .db
+                    .with_conn(move |conn| {
+                        conn.execute(
+                            "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,?1,?2)",
+                            db::params![event, r#"{"users":["123"],"channels":[]}"#],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            let now = chrono::Utc::now();
+            let prior = now - chrono::Duration::seconds(6);
+            let mut vars = templates::user_vars(123, "username", "Display");
+            vars.insert("time".into(), prior.to_rfc3339());
+            let permit = if mode == "dropped" {
+                Some(f.app.log_delivery_slots.acquire().await.unwrap())
+            } else {
+                None
+            };
+            let delivery = emit_to(
+                &f.app,
+                &UnavailableAuditSink {
+                    mode,
+                    observed: prior.timestamp_millis(),
+                },
+                GuildId::new(789),
+                event,
+                vars.clone(),
+            )
+            .await;
+            drop(permit);
+            assert_eq!(
+                delivery,
+                match mode {
+                    "disabled" | "filtered" => Delivery::Unconfigured,
+                    "dropped" => Delivery::Dropped,
+                    _ => Delivery::Sent,
+                },
+                "{event}/{mode}"
+            );
+            db::upsert_log_channel(&f.app.db, 789, event, 456)
+                .await
+                .unwrap();
+            f.app
+                .db
+                .with_conn(|conn| {
+                    conn.execute("DELETE FROM log_filters", db::params![])?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            f.app.invalidate_configs();
+            let action = member_audit_action(event).unwrap();
+            let old = audit_fixture(
+                action,
+                123,
+                prior.timestamp_millis(),
+                Some("previous action"),
+            );
+            let mut current =
+                audit_fixture(action, 123, now.timestamp_millis(), Some("current action"));
+            current.entries[0].user_id = serenity::model::id::UserId::new(888);
+            current.entries.push(old.entries[0].clone());
+            let sink = RepeatedAuditSink {
+                sink: Sink::default(),
+                responses: Mutex::new([old, current].into()),
+                fail_first_send: false,
+                sends: Default::default(),
+            };
+            vars.insert("time".into(), now.to_rfc3339());
+            assert_eq!(
+                emit_to(&f.app, &sink, GuildId::new(789), event, vars).await,
+                Delivery::Sent
+            );
+            let messages = sink.sink.messages.lock().unwrap();
+            let text = messages[0].1["content"].as_str().unwrap();
+            assert!(text.contains("Moderator: <@888>"), "{event}/{mode}: {text}");
+            assert!(
+                text.contains("Reason: current action"),
+                "{event}/{mode}: {text}"
+            );
+            assert!(!text.contains("previous action"));
+            assert!(sink.responses.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn unresolved_observations_fence_old_handlers_and_overlapping_audit_windows() {
+    for event in ["member_ban", "member_unban"] {
+        let claims = MemberAuditClaims::default();
+        let action = member_audit_action(event).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let previous = claims.observe(1, action, 123, now - 6_000);
+        let current = claims.observe(1, action, 123, now);
+        let old_logs = audit_fixture(action, 123, now - 6_000, None);
+        assert!(claims.claim(&previous, &old_logs).is_none());
+        assert!(claims.claim(&current, &old_logs).is_none());
+        // A candidate at the end of the unresolved predecessor's window is unsafe.
+        let overlap = audit_fixture(action, 123, now - 3_000, None);
+        assert!(claims.claim(&current, &overlap).is_none());
+        let logs = audit_fixture(action, 123, now, None);
+        assert!(claims.claim(&current, &logs).is_some());
+        // A successful intervening action does not erase earlier uncertainty.
+        let next = claims.observe(1, action, 123, now + 1_000);
+        assert!(claims.claim(&next, &overlap).is_none());
+        let other_target = claims.observe(1, action, 456, now);
+        assert!(
+            claims
+                .claim(
+                    &other_target,
+                    &audit_fixture(action, 456, now - 3_000, None)
+                )
+                .is_some()
+        );
+        let other_guild = claims.observe(2, action, 123, now);
+        assert!(claims.claim(&other_guild, &overlap).is_some());
+        let other_action = member_audit_action(if event == "member_ban" {
+            "member_unban"
+        } else {
+            "member_ban"
+        })
+        .unwrap();
+        let other = claims.observe(1, other_action, 123, now);
+        assert!(
+            claims
+                .claim(&other, &audit_fixture(other_action, 123, now - 3_000, None))
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn untracked_observation_temporarily_disables_attribution_without_evicting_uncertainty() {
+    let claims = MemberAuditClaims::default();
+    let action = member_audit_action("member_ban").unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let first = claims.observe(1, action, 1, now);
+    for target in 2..=MEMBER_AUDIT_LIMIT as u64 {
+        claims.observe(1, action, target, now);
+    }
+    let overflow = claims.observe(1, action, MEMBER_AUDIT_LIMIT as u64 + 1, now);
+    assert!(overflow.generation.is_none());
+    let logs = audit_fixture(action, 1, now, None);
+    assert!(claims.claim(&first, &logs).is_none());
+    assert_eq!(claims.inner.lock().subjects.len(), MEMBER_AUDIT_LIMIT);
+    {
+        let mut state = claims.inner.lock();
+        for subject in state.subjects.values_mut() {
+            subject.at = Instant::now() - MEMBER_AUDIT_KEEP;
+        }
+        state.saturated_until = Some(Instant::now() - Duration::from_secs(1));
+    }
+    assert!(claims.claim(&first, &logs).is_none());
+    let fresh = claims.observe(1, action, 1, now);
+    assert!(claims.claim(&fresh, &logs).is_some());
+    assert_eq!(claims.inner.lock().subjects.len(), 1);
 }
