@@ -37,11 +37,10 @@ git and are **not** extra Bunny Storage files. Defaults are jsDelivr
 `window.JMODGUARD_API_BASE`) to a Bunny pull zone or other host that caches
 those same URLs. If that runtime load fails, native `<select>` controls stay
 usable. Pale blue light and navy dark colors stay the existing theme tokens.
-First-party layout classes (`.hero`, `.card`, `.btn`, `.stat`) keep the
-workspace layout; daisyUI styles the searchable select widgets. The page
-itself is not a daisyUI drawer: `:root` overflow stays visible, and the
-workspace fills the viewport without a nested sidebar scroller or a 1440px
-content cap.
+Buttons, cards, hero, stats, badges, tables, inputs, and the searchable
+select use daisyUI (and Headless Combobox) component classes mapped onto
+those tokens. First-party CSS is the workspace shell and theme, not a
+restyle of daisyUI widgets back into the previous custom controls.
 
 Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.
@@ -279,4 +278,4 @@ bot owner).
 
 ### Appearance
 
-Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page. daisyUI widgets reuse those same tokens (`--bg`, `--accent`, and the rest); they do not switch the workspace to daisyUI’s default palette.
+Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page. daisyUI widgets reuse those same tokens: cards and stats use `--panel`, hero and tinted surfaces use `--hero`, and primary actions use `--accent`. They do not switch the workspace to daisyUI’s default palette.

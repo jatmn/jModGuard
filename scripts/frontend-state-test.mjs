@@ -19,7 +19,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const node = (tag) => {
     const classes = new Set();
     return {
-      tag, nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
       classList: {
         toggle(name, force) {
           const enabled = force === undefined ? !classes.has(name) : !!force;
@@ -81,14 +81,14 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     document: {
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
-      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => n.className === 'modal-overlay') : null), querySelectorAll: () => [],
+      querySelector: (key) => nodes.get(key) || (key === '.modal-overlay' ? findNode(nodes.get('#content'), (n) => String(n.className).split(/\s+/).includes('modal-overlay')) : null), querySelectorAll: () => [],
     },
     window: { localStorage: { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) }, sessionStorage: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, location, open(...args) { opened.push(args); } },
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -120,7 +120,7 @@ test('dashboard moderation counts stay with their requested server', async () =>
   assert.equal(pending[1].url, `/api/guilds/${app.state.guilds[1].id}/stats`);
   assert.equal(pending[0].method, 'POST');
   assert.equal(pending[1].method, 'POST');
-  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children[0].textContent;
+  const value = (root, label) => findNode(root, n => n.className === 'stat' && textOf(n).includes(label)).children.find((c) => c.className === 'stat-value').textContent;
   pending[1].resolve(response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(value(second, 'Moderation records'), '7');
@@ -140,7 +140,7 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   await new Promise(resolve => setImmediate(resolve));
   for (const label of ['Moderation records', 'Warns', 'Bans', 'Cases']) {
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
-    assert.equal(card.children[0].textContent, 'Unavailable');
+    assert.equal(card.children.find((c) => c.className === 'stat-value').textContent, 'Unavailable');
   }
 });
 
@@ -716,12 +716,12 @@ test('known terminal log results are not labeled queued while mapping reconcilia
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(terminal);
   h.app.renderTab();
-  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  let status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 
   await h.app.reconcileQueuedLogChannel(terminal);
   assert.equal(h.app.state.config.log_channels[0].pending_action.state, 'failed');
-  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && node.className === 'tag');
+  status = findNode(h.nodes.get('#content'), (node) => node.tag === 'span' && String(node.className).split(/\s+/).includes('badge'));
   assert.equal(status.textContent, 'failed');
 });
 
@@ -891,7 +891,7 @@ function ruleSaveHarness({ scope = 'global', override = false } = {}) {
   h.app.navigate('rules');
   h.app.editRule(h.app.state.config.rules[0]);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
   const scopeInput = findNode(modal, (n) => n.tag === 'select' && n.children.some((c) => c.attrs?.value === 'global'));
   scopeInput.value = scope;
   const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
@@ -990,7 +990,7 @@ test('a refused command save retains its checkbox value for the next save', asyn
   h.app.navigate('commands');
   h.app.editCommand(null);
   const content = h.nodes.get('#content');
-  const modal = findNode(content, (n) => n.className === 'modal-overlay');
+  const modal = findNode(content, (n) => String(n.className).split(/\s+/).includes('modal-overlay'));
   const name = findNode(modal, (n) => n.attrs?.placeholder === 'command name');
   name.value = 'hello';
   const enabled = findNode(modal, (n) => n.attrs?.type === 'checkbox');
@@ -1711,15 +1711,28 @@ test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blu
   assert.match(css, /\[data-theme="dark"\][\s\S]*--bg:\s*#0d1727/);
   assert.match(css, /\[data-theme="dark"\][\s\S]*--accent:\s*#8bc1ff/);
   assert.match(css, /--color-primary:\s*var\(--accent\)/);
-  assert.match(css, /\.hero\s*\{[^}]*display:\s*block/);
-  assert.match(css, /\.card\s*\{[^}]*display:\s*block/);
-  assert.match(css, /\.stat\s*\{[^}]*display:\s*block/);
-  assert.match(css, /\.btn\s*\{[^}]*height:\s*auto/);
   assert.match(css, /--page-overflow:\s*visible/);
   assert.match(css, /#main-view\s*\{[^}]*display:\s*flex/);
   assert.match(css, /\.sidebar\s*\{[^}]*overflow:\s*visible/);
   assert.match(css, /#content\s*\{[^}]*max-width:\s*none/);
   assert.doesNotMatch(css, /\.sidebar\s*\{[^}]*position:\s*fixed/);
+  assert.doesNotMatch(css, /\.hero\s*\{[^}]*display:\s*block/);
+  assert.doesNotMatch(css, /\.hero\s*\{[^}]*background:/);
+  assert.doesNotMatch(css, /\.stat-grid/);
+  assert.doesNotMatch(css, /\.btn\.primary/);
+  assert.match(css, /--color-base-100:\s*var\(--panel\)/);
+  assert.match(js, /hero-content/);
+  assert.match(js, /stat-title/);
+  assert.match(js, /btn-primary/);
+  assert.match(js, /join-item/);
+  assert.match(js, /class: "stats /);
+  assert.match(html, /btn btn-primary/);
+  assert.match(html, /class="navbar /);
+  assert.match(html, /class="menu w-full"/);
+  assert.equal(app.uiClass("btn primary"), "btn btn-primary");
+  assert.equal(app.uiClass("btn small danger"), "btn btn-sm btn-error");
+  assert.equal(app.uiClass("btn outline"), "btn btn-outline");
+  assert.match(app.uiClass("card"), /card-border/);
   assert.equal(fs.existsSync(new URL('../frontend/package.json', import.meta.url)), false);
   assert.equal(fs.existsSync(new URL('../frontend/node_modules', import.meta.url)), false);
 });

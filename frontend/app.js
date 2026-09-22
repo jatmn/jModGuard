@@ -2,19 +2,65 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
+
+function uiClass(value) {
+  const names = String(value || "").split(/\s+/).filter(Boolean);
+  const hasBtn = names.includes("btn");
+  const hasTag = names.includes("tag");
+  const out = [];
+  for (const name of names) {
+    if (hasBtn && name === "primary") { out.push("btn-primary"); continue; }
+    if (hasBtn && name === "small") { out.push("btn-sm"); continue; }
+    if (hasBtn && name === "danger") { out.push("btn-error"); continue; }
+    if (hasBtn && name === "good") { out.push("btn-success"); continue; }
+    if (hasBtn && name === "outline") { out.push("btn-outline"); continue; }
+    if (hasBtn && name === "ghost") { out.push("btn-ghost"); continue; }
+    if (name === "tag") { out.push("badge", "badge-ghost"); continue; }
+    if (hasTag && name === "on") { out.push("badge-success"); continue; }
+    if (hasTag && name === "off") { out.push("badge-error"); continue; }
+    if (hasTag && name === "dry") { out.push("badge-warning"); continue; }
+    if (name === "modal-overlay") { out.push("modal", "modal-open", "modal-overlay"); continue; }
+    if (name === "card") { out.push("card", "bg-base-100", "card-border", "shadow-sm"); continue; }
+    out.push(name);
+  }
+  return [...new Set(out)].join(" ");
+}
+
+function decorateControl(n) {
+  const tag = n.tagName;
+  if (tag === "INPUT") {
+    const type = n.type || "text";
+    if (type === "checkbox") n.classList.add("checkbox");
+    else if (type !== "hidden" && type !== "file") n.classList.add("input", "input-bordered");
+  } else if (tag === "SELECT" && !n.classList.contains("search-select-native")) {
+    n.classList.add("select", "select-bordered");
+  } else if (tag === "TEXTAREA") {
+    n.classList.add("textarea", "textarea-bordered");
+  } else if (tag === "H3") {
+    n.classList.add("card-title");
+  }
+}
+
 const el = (tag, attrs, ...children) => {
   const n = document.createElement(tag);
   if (attrs) Object.entries(attrs).forEach(([k, v]) => {
-    if (k === "class") n.className = v;
+    if (k === "class") n.className = uiClass(v);
     else if (k === "text") n.textContent = v;
     else if (k === "savedInputs") n._savedInputs = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), (event) => handleEvent(n, v, event));
     else if (k === "checked" || k === "selected" || k === "hidden" || k === "disabled") n[k] = Boolean(v);
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   });
+  decorateControl(n);
   children.flat(Infinity).forEach((c) => {
     if (c !== null && c !== undefined) n.append(c.nodeType ? c : document.createTextNode(c));
   });
+  if (n.classList.contains("card") && ![...n.children].some((child) => child.classList?.contains("card-body"))) {
+    const body = document.createElement("div");
+    body.className = "card-body";
+    while (n.firstChild) body.append(n.firstChild);
+    n.append(body);
+  }
   return n;
 };
 
@@ -294,18 +340,18 @@ function makeSearchSelect(React, Headless, select) {
       },
       onClose: () => setQuery(""),
     },
-      React.createElement("div", { className: "search-select-control" },
+      React.createElement("div", { className: "join w-full search-select-control" },
         React.createElement(ComboboxInput, {
           id: labeledId || undefined,
-          className: "input input-bordered w-full search-select-input",
+          className: "input input-bordered join-item w-full search-select-input",
           "aria-label": labeledId ? undefined : (select.getAttribute("aria-label") || "Search options"),
           displayValue: (item) => item?.label || "",
           onChange: (event) => setQuery(event.target.value),
         }),
-        ComboboxButton ? React.createElement(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾") : null,
+        ComboboxButton ? React.createElement(ComboboxButton, { className: "btn btn-neutral join-item search-select-button", "aria-label": "Show options" }, "▾") : null,
       ),
       React.createElement(ComboboxOptions, {
-        className: "search-select-options menu bg-base-100 rounded-box shadow",
+        className: "search-select-options menu bg-base-100 rounded-box shadow-lg",
         anchor: "bottom start",
       },
         filtered.length
@@ -1083,8 +1129,11 @@ function renderTab() {
     events: tabEvents, bans: tabBans, actions: tabActions, cases: tabCases, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
-    b.classList.toggle("active", b.dataset.tab === state.tab);
-    if (b.dataset.tab === state.tab) b.setAttribute("aria-current", "page");
+    const on = b.dataset.tab === state.tab;
+    b.classList.toggle("active", on);
+    b.classList.toggle("menu-active", on);
+    b.classList.toggle("btn-active", on);
+    if (on) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   });
   const fn = map[state.tab] || tabDashboard;
@@ -1096,16 +1145,19 @@ function renderTab() {
   const name = $("#workspace-name");
   if (name) name.textContent = guild?.name || "Your servers";
   if (!state.guildId) {
-    content.append(el("div", { class: "empty-state" }, el("h2", { text: "No servers to manage yet" }), el("p", { text: "Sign in with an account that has Manage Server permission in a server using jModGuard." })));
+    content.append(emptyPanel("No servers to manage yet", "Sign in with an account that has Manage Server permission in a server using jModGuard."));
   } else if (!state.config) {
-    content.append(el("div", { class: "empty-state", role: "status" },
-      el("h2", { text: state.loading ? "Loading your workspace…" : "Configuration unavailable" }),
-      el("p", { text: state.error || "Fetching saved settings for this server." }),
-      !state.loading ? el("button", { class: "btn primary", text: "Retry", onclick: async () => { if (!await loadConfig()) return; renderTab(); } }) : null));
+    content.append(emptyPanel(
+      state.loading ? "Loading your workspace…" : "Configuration unavailable",
+      state.error || "Fetching saved settings for this server.",
+      !state.loading ? el("button", { class: "btn primary", text: "Retry", onclick: async () => { if (!await loadConfig()) return; renderTab(); } }) : null,
+      { role: "status" },
+    ));
   } else {
     content.append(fn());
     content.querySelectorAll("table").forEach((table) => {
-      const wrap = el("div", { class: "table-scroll", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
+      table.classList.add("table", "table-zebra");
+      const wrap = el("div", { class: "table-scroll rounded-box bg-base-100", tabindex: "0", role: "region", "aria-label": "Scrollable data table" });
       table.replaceWith(wrap); wrap.append(table);
     });
     content.querySelectorAll("input, select, textarea").forEach((input, i) => {
@@ -1174,6 +1226,19 @@ function bindTabButtons() {
   }));
 }
 
+function emptyPanel(title, body, action, attrs) {
+  return el("div", { class: "hero bg-base-200 rounded-box", ...(attrs || {}) },
+    el("div", { class: "hero-content text-center" },
+      el("div", { class: "hero-copy" },
+        el("h2", { text: title }),
+        el("p", { text: body }),
+        action || null)));
+}
+
+function statsRow(...items) {
+  return el("div", { class: "stats bg-base-100 shadow w-full" }, ...items);
+}
+
 function tabDashboard() {
   const g = selectedGuild();
   const cfg = state.config;
@@ -1182,44 +1247,51 @@ function tabDashboard() {
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
   const moderation = [['events', 'Moderation records'], ['warns', 'Warns'], ['bans', 'Bans'], ['cases', 'Cases']]
-    .map(([key, label]) => ({ key, value: el('div', { class: 'value', text: 'Loading…' }), label }));
+    .map(([key, label]) => ({ key, value: el("div", { class: "stat-value", text: "Loading…" }), label }));
   const guildId = state.guildId;
   apiRead(`/api/guilds/${guildId}/stats`).then(counts => {
     moderation.forEach(({ key, value }) => { value.textContent = counts[key] == null ? 'Unavailable' : String(counts[key]); });
   }).catch(() => {
     moderation.forEach(({ value }) => { value.textContent = 'Unavailable'; });
   });
-  return el("div", {},
-    el("section", { class: "hero" },
-      el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
-      el("h2", { text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
-      el("p", { text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
-      el("div", { class: "row" },
-        el("button", { class: "btn primary", text: "Review protection →", onclick: () => navigate("rules") }),
-        el("button", { class: "btn", text: "View audit log", onclick: () => navigate("events") }))),
-    el("div", { class: "stat-grid" },
-      stat("Prefix", cfg.settings.prefix),
-      stat("Bot name", cfg.settings.bot_name || "default"),
-      stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
-      stat("Rules in dry-run", rulesDry),
-      stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
-      stat("Log channels", chans),
-      stat("Badword patterns", cfg.badwords.length),
-      stat("Routine chat collection", "Off"),
-      ...moderation.map(({ value, label }) => el('div', { class: 'stat' }, value, el('div', { class: 'label', text: label }))),
-    ),
-    el('p', { class: 'muted', text: 'Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.' }),
-    el("div", { class: "card", style: "margin-top:16px" },
-      el("h3", { text: "Getting started" }),
-      el("p", { class: "muted", text: isBotOwner()
-        ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
-        : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }),
-    ),
+  const overview = [
+    stat("Prefix", cfg.settings.prefix),
+    stat("Bot name", cfg.settings.bot_name || "default"),
+    stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
+    stat("Rules in dry-run", rulesDry),
+    stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
+    stat("Log channels", chans),
+    stat("Badword patterns", cfg.badwords.length),
+    stat("Routine chat collection", "Off"),
+    ...moderation.map(({ value, label }) => el("div", { class: "stat" }, el("div", { class: "stat-title", text: label }), value)),
+  ];
+  const rows = [];
+  for (let i = 0; i < overview.length; i += 4) rows.push(statsRow(...overview.slice(i, i + 4)));
+  return el("div", { class: "contents" },
+    el("section", { class: "hero bg-base-200 rounded-box" },
+      el("div", { class: "hero-content text-start" },
+        el("div", { class: "hero-copy" },
+          el("span", { class: "eyebrow", text: "COMMUNITY AT A GLANCE" }),
+          el("h2", { class: "text-3xl font-bold", text: g ? `${g.name}, under your care.` : "Your moderation workspace" }),
+          el("p", { class: "py-4", text: "A clear view of your server’s protection. Fine-tune the rules, review activity, and make room for a better community." }),
+          el("div", { class: "join" },
+            el("button", { class: "btn primary join-item", text: "Review protection →", onclick: () => navigate("rules") }),
+            el("button", { class: "btn outline join-item", text: "View audit log", onclick: () => navigate("events") }))))),
+    ...rows,
+    el("p", { class: "muted", text: "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log." }),
+    el("div", { class: "alert" },
+      el("div", {},
+        el("div", { class: "font-bold", text: "Getting started" }),
+        el("p", { text: isBotOwner()
+          ? `Use the tabs to configure automod rules, badwords, commands, and log channels. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). As bot owner you can also edit Global defaults that apply to every server.`
+          : `Use the tabs to configure automod rules, badwords, commands, and log channels for this server. Use each editor’s Save action to apply changes; the Discord bot usually picks them up within a few seconds (config poll). Global defaults are owner-only.` }))),
   );
 }
 
 function stat(label, value) {
-  return el("div", { class: "stat" }, el("div", { class: "value", text: value }), el("div", { class: "label", text: label }));
+  return el("div", { class: "stat" },
+    el("div", { class: "stat-title", text: label }),
+    el("div", { class: "stat-value", text: value }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,15 +1319,16 @@ function ruleCard(r) {
   const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : spam && rule.dry_run ? "log-only test" : spam ? "delete and ban" : rule.dry_run ? "dry-run" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
-      el("div", {},
-        el("strong", { text: `${r.name} ` }),
+      el("h3", {},
+        `${r.name} `,
         el("span", { class: `tag ${badge}`, text: label }),
         r.guild_override ? el("span", { class: "tag", text: "server override" }) : null,
         r.global ? el("span", { class: "tag", text: "global" }) : null,
       ),
-      el("button", { class: "btn small", onclick: () => editRule(r) }, "Edit"),
+      el("div", { class: "card-actions" },
+        el("button", { class: "btn small", onclick: () => editRule(r) }, "Edit")),
     ),
-    el("p", { class: "muted", style: "margin-top:6px", text: r.description }),
+    el("p", { text: r.description }),
   );
 }
 
@@ -1375,7 +1448,7 @@ function editRule(r) {
       el("div", { class: "field" }, el("label", { text: "Whitelist channels (ids)" }), channelsText),
       el("div", { class: "field" }, el("label", { text: "Whitelist users (ids)" }), usersText),
     ),
-    el("div", { class: "row form-actions" },
+    el("div", { class: "modal-action" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
@@ -1426,7 +1499,7 @@ function editRule(r) {
           () => { toast("Rule reset", "success"); closeOverlay(); },
         );
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
+      el("button", { class: "btn outline", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   );
   modal.append(box);
@@ -1708,7 +1781,7 @@ function editCommand(c) {
       el("div", { class: "field" }, el("label", { text: "Channel restriction (ids)" }), chanIn),
       el("div", { class: "field" }, el("label", { text: "Log event" }), logIn),
     ),
-    el("div", { class: "row form-actions" },
+    el("div", { class: "modal-action" },
       el("div", { class: "field" }, el("label", { text: "Applies to" }), scopeSel),
       el("label", { class: "checkbox-label" },
         el("input", { type: "checkbox", checked: data.enabled, onchange: (e) => (data.enabled = e.target.checked) }), "Enabled"),
@@ -1760,7 +1833,7 @@ function editCommand(c) {
           () => { toast(c.guild_override ? "Override cleared" : "Deleted", "success"); closeOverlay(); },
         );
       } }),
-      el("button", { class: "btn", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
+      el("button", { class: "btn outline", text: "Cancel", onclick: () => { if (canLeave()) closeOverlay(); } }),
     ),
   ));
   enhanceVendorWidgets(modal);
@@ -2306,7 +2379,8 @@ function tabSettings() {
     el("h3", { text: "Case removal" }),
     el("p", { class: "muted", text: "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action." }),
     el("div", { class: "field" }, el("label", { text: "Delegated case-removal role IDs" }), roleInput),
-    el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
+    el("div", { class: "card-actions" },
+      el("button", { class: "btn", text: "Save case-removal roles", onclick: async () => {
       const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", { roles: splitIds(roleInput.value), revision: roleRevision.value });
       roleWriteGeneration++;
       roleRevision.value = saved.revision;
@@ -2315,6 +2389,7 @@ function tabSettings() {
       updateWorkspaceStatus();
       toast("Case-removal roles saved", "success");
     } }),
+    ),
   ));
 
   if (isBotOwner()) {
