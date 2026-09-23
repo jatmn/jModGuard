@@ -4,7 +4,8 @@
 restore the retired attachment-count trigger and never call the generic automod
 punishment executor. Other automod rules keep their own configured behavior.
 
-Each rule can run in **test** (log only) or **delete-and-ban** mode. Test mode uses
+Each rule can run in **dry-run** (log-only test) or **normal** (delete-and-ban)
+mode. Dry-run uses
 the same matcher and never deletes, bans, queues later punishment or creates cases.
 Switching to enforcement does not replay old test results. Defaults remain three
 distinct channels and a 60-second window. Images also default to two common distinct
@@ -18,7 +19,8 @@ as `ok`/`thanks` do not match while a typical paste does.
 {"mode":"exact_text","min_channels":3,"window_secs":60,"min_length":20}
 ```
 
-`exact_image_test` remains log-only. `exact_image` with `dry_run` false requires
+`exact_image_test` is the stored mode for image dry-run and remains log-only.
+`exact_image` with `dry_run` false requires
 delete and ban actions (log is optional). The runtime still executes those through
 the dedicated spam path. Legacy count-rule rows without a mode stay **inactive**.
 

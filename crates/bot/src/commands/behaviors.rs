@@ -872,15 +872,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
 
 async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
-    let mut action = args
-        .next_arg()
-        .unwrap_or_else(|| default_action.to_string());
-    let mut rule_id = args.next_arg().unwrap_or_default();
-    // Slash options arrive as (name, action); prefix as (action, name).
-    // Accept both orders.
-    if crate::types::RULE_IDS.contains(&action.as_str()) {
-        std::mem::swap(&mut action, &mut rule_id);
-    }
+    let (action, rule_id) = rule_action_and_id(&mut args, default_action);
     let vars = std::collections::BTreeMap::new();
     let guild = env.guild_id.get() as i64;
     match action.as_str() {
@@ -912,7 +904,9 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             })
         }
         "toggle" => {
-            let rule_id = args.next_arg().ok_or_else(|| anyhow!("missing rule"))?;
+            if rule_id.is_empty() {
+                return Err(anyhow!("missing rule"));
+            }
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let mut rule = cfg
                 .rules
@@ -932,7 +926,9 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             })
         }
         "dryrun" => {
-            let rule_id = args.next_arg().ok_or_else(|| anyhow!("missing rule"))?;
+            if rule_id.is_empty() {
+                return Err(anyhow!("missing rule"));
+            }
             let on = match args.next_arg().as_deref() {
                 Some("on") | Some("true") => true,
                 Some("off") | Some("false") => false,
@@ -944,7 +940,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 .get(&rule_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown rule `{rule_id}`"))?;
-            rule.dry_run = on;
+            set_rule_dry_run(&rule_id, &mut rule, on)?;
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
@@ -955,6 +951,56 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
         }
         other => Err(anyhow!("unknown rule action `{other}`")),
     }
+}
+
+fn rule_action_and_id(args: &mut Args, default_action: &str) -> (String, String) {
+    let mut action = args
+        .next_arg()
+        .unwrap_or_else(|| default_action.to_string());
+    let mut rule_id = args.next_arg().unwrap_or_default();
+    // Slash options arrive as (name, action); prefix as (action, name).
+    if crate::types::RULE_IDS.contains(&action.as_str()) {
+        std::mem::swap(&mut action, &mut rule_id);
+    }
+    (action, rule_id)
+}
+
+fn set_rule_dry_run(rule_id: &str, rule: &mut crate::types::RuleDef, on: bool) -> Result<()> {
+    if rule_id == "attachment_flood" {
+        let mode = rule.params.get("mode").and_then(|value| value.as_str());
+        if !matches!(mode, Some("exact_image_test" | "exact_image")) {
+            return Err(anyhow!("convert the legacy image rule in the WebUI first"));
+        }
+    }
+    if !matches!(rule_id, "attachment_flood" | "repeat_text") || rule.dry_run == on {
+        rule.dry_run = on;
+        return Ok(());
+    }
+    if rule_id == "attachment_flood" {
+        rule.params["mode"] = if on {
+            "exact_image_test"
+        } else {
+            "exact_image"
+        }
+        .into();
+    }
+    let actions = if on {
+        &["log"][..]
+    } else {
+        &["delete", "ban"][..]
+    };
+    rule.actions = actions
+        .iter()
+        .map(|action| crate::types::ActionDef {
+            at: 1,
+            action: (*action).into(),
+            duration_minutes: 0,
+            delete_days: 0,
+            reason: "spam match".into(),
+        })
+        .collect();
+    rule.dry_run = on;
+    Ok(())
 }
 
 async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutcome> {
@@ -1118,6 +1164,59 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_command_keeps_the_rule_id_for_prefix_and_slash_order() {
+        let mut prefix = Args::new("dryrun attachment_flood off");
+        assert_eq!(
+            rule_action_and_id(&mut prefix, "list"),
+            ("dryrun".into(), "attachment_flood".into())
+        );
+        assert_eq!(prefix.next_arg().as_deref(), Some("off"));
+
+        let mut slash = Args::new("repeat_text dryrun on");
+        assert_eq!(
+            rule_action_and_id(&mut slash, "list"),
+            ("dryrun".into(), "repeat_text".into())
+        );
+        assert_eq!(slash.next_arg().as_deref(), Some("on"));
+    }
+
+    #[test]
+    fn dedicated_rules_switch_between_dry_run_and_enforcement() {
+        for (id, index) in [("attachment_flood", 1), ("repeat_text", 2)] {
+            let mut rule = crate::defaults::default_rules().remove(index);
+            set_rule_dry_run(id, &mut rule, false).unwrap();
+            jmodguard::image_spam::validate_rule(id, &rule).unwrap();
+            assert!(!rule.dry_run);
+            assert_eq!(
+                rule.actions
+                    .iter()
+                    .map(|a| a.action.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["delete", "ban"]
+            );
+            set_rule_dry_run(id, &mut rule, true).unwrap();
+            jmodguard::image_spam::validate_rule(id, &rule).unwrap();
+            assert!(rule.dry_run);
+            assert_eq!(
+                rule.actions
+                    .iter()
+                    .map(|a| a.action.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["log"]
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_image_rule_requires_explicit_conversion() {
+        let mut rule = crate::defaults::default_rules().remove(1);
+        rule.params = serde_json::json!({"window_secs": 60, "min_channels": 3});
+        assert!(set_rule_dry_run("attachment_flood", &mut rule, false).is_err());
+        assert!(set_rule_dry_run("attachment_flood", &mut rule, true).is_err());
+        assert!(rule.params.get("mode").is_none());
+    }
     use crate::types::Behavior;
 
     #[test]

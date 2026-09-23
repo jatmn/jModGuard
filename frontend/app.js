@@ -1338,8 +1338,8 @@ function tabRules() {
     el("p", { class: "muted", style: "margin-bottom:14px" },
       "Each rule has its own parameters, whitelists, and an escalation table " +
       "(`at` = strike count at which the action fires; the highest-severity fired action is executed). " +
-      "Exact image and repeated-text rules have a separate matcher with test or delete-and-ban mode. " +
-      "Dry-run logs what would have happened without acting — use it while tuning."),
+      "Exact image and repeated-text rules use separate matchers: dry-run logs matches only, " +
+      "while normal mode deletes matched messages and bans. Use dry-run while tuning."),
     ...rules.map((r) => ruleCard(r)),
   );
 }
@@ -1349,7 +1349,7 @@ function ruleCard(r) {
   const spam = spamRule(r.rule_id);
   const supported = !spam || spamConfigured(r.rule_id, rule);
   const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
-  const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : spam && rule.dry_run ? "log-only test" : spam ? "delete and ban" : rule.dry_run ? "dry-run" : "enabled";
+  const label = !rule.enabled ? "disabled" : !supported ? "inactive — convert this rule" : rule.dry_run ? "dry-run" : spam ? "delete and ban" : "enabled";
   return el("div", { class: "card" },
     el("div", { class: "row", style: "justify-content:space-between" },
       el("div", { class: "rule-heading" },
@@ -1418,7 +1418,9 @@ function editRule(r) {
   const imageCount = el("input", { type: "number", min: 1, max: 10, value: rule.params?.min_attachments ?? 2 });
   const imageWindow = el("input", { type: "number", min: 1, max: 600, value: rule.params?.window_secs ?? 60 });
   const textLength = el("input", { type: "number", min: 1, max: 2000, value: rule.params?.min_length ?? 20 });
-  const enforce = el("input", { type: "checkbox", checked: spamConfigured(r.rule_id, rule) && rule.dry_run === false });
+  // Inactive legacy image rows should convert to the safe dry-run mode by default.
+  const dryRun = el("input", { type: "checkbox", checked: spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run,
+    onchange: (e) => (rule.dry_run = e.target.checked) });
   const modal = overlay();
   const paramsText = el("textarea", { class: "mono", rows: 7, spellcheck: "false" });
   paramsText.value = JSON.stringify(rule.params ?? {}, null, 2);
@@ -1466,8 +1468,7 @@ function editRule(r) {
     el("div", { class: "row checkbox-group" },
       el("label", { class: "checkbox-label" },
         el("input", { type: "checkbox", checked: rule.enabled, onchange: (e) => (rule.enabled = e.target.checked) }), "Enabled"),
-      spam ? el("label", { class: "checkbox-label" }, enforce, "Delete matched messages and ban") :
-        el("label", { class: "checkbox-label" }, el("input", { type: "checkbox", checked: rule.dry_run, onchange: (e) => (rule.dry_run = e.target.checked) }), "Dry-run (log only)"),
+      el("label", { class: "checkbox-label" }, dryRun, "Dry-run (log only)"),
     ),
     spam ? el("div", {},
       el("p", { text: textRule
@@ -1495,7 +1496,7 @@ function editRule(r) {
       el("button", { class: "btn primary", text: "Save", onclick: async () => {
         try {
           if (spam) {
-            const punish = enforce.checked;
+            const punish = !dryRun.checked;
             if (textRule) {
               rule.params = { mode: "exact_text", min_channels: Number(imageChannels.value), window_secs: Number(imageWindow.value), min_length: Number(textLength.value) };
             } else {

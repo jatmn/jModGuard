@@ -23,13 +23,13 @@ fn rule(id: &str) -> RuleDef {
         ),
         "attachment_flood" => (
             "Exact image spam",
-            "The same distinct image files posted by one author across channels. Test mode logs only; enforcement deletes the matched messages and bans. Extra images are allowed. Configure an automod log channel.",
+            "The same distinct image files posted by one author across channels. Dry-run logs only; normal mode deletes the matched messages and bans. Extra images are allowed. Configure an automod log channel.",
             json!({"mode":"exact_image_test", "window_secs": 60, "min_attachments": 2, "min_channels": 3}),
             vec![action(1, "log", "Exact image spam test", 0, 0)],
         ),
         "repeat_text" => (
             "Repeated text",
-            "The same trimmed text posted by one author across channels. Matching is exact after leading/trailing whitespace only. Test mode logs only; enforcement deletes the matched messages and bans.",
+            "The same trimmed text posted by one author across channels. Matching is exact after leading/trailing whitespace only. Dry-run logs only; normal mode deletes the matched messages and bans.",
             json!({"mode":"exact_text", "window_secs": 60, "min_channels": 3, "min_length": 20}),
             vec![action(1, "log", "Repeated text test", 0, 0)],
         ),
@@ -285,8 +285,8 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "rule",
         "Admin",
-        "Automod rule controls: !rule <list|toggle|dryrun> [rule]",
-        "!rule <list|toggle|dryrun> [rule]",
+        "Automod rule controls: !rule <list|toggle|dryrun> [rule] [on|off]",
+        "!rule <list|toggle|dryrun> [rule] [on|off]",
         "admin",
         Behavior::Rule {
             action: "list".into(),

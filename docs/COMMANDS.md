@@ -25,7 +25,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!setname <name>` | Admin | admin | Queue the bot's nickname for application in this server |
 | `!prefix <prefix>` | Admin | admin | Change this server's command prefix |
 | `!template <list\|get\|set\|reset> [event] [text]` | Admin | admin | Edit log event templates |
-| `!rule <list\|toggle\|dryrun> [rule]` | Admin | admin | Toggle rules / dry-run mode |
+| `!rule <list\|toggle\|dryrun> [rule] [on\|off]` | Admin | admin | Toggle rules or set dry-run mode (including exact-image and repeated-text rules) |
 | `!logchannel <list\|set\|unset> [event] [#channel]` | Admin | admin | Route events to channels |
 | `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
