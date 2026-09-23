@@ -116,6 +116,9 @@ test("owner update controls require a current installable candidate", () => {
   webui.installed = { source_sha: webui.candidate.source_sha, digest: "sha256:" + "d".repeat(64) };
   render(view, webui);
   assert.equal(updateButton(view, "webui").disabled, true);
+  const warning = textOf(view.elements.get("update-cards"));
+  assert.match(warning, /different image digest/);
+  assert.doesNotMatch(warning, /has different bytes/);
 });
 
 test("signed-out Administration offers Discord sign-in on the existing API response", async () => {

@@ -9,7 +9,9 @@ use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_sessions::Session;
 
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -105,33 +107,90 @@ pub async fn check_one(app: &Arc<ApiState>, component: &str) -> anyhow::Result<(
     if !db::claim_update_lease(&app.db, component, &lease, now, 240).await? {
         anyhow::bail!("another update operation is running");
     }
-    let checked = async {
+    with_update_lease(&app.db, component, &lease, 240, async {
         let state = db::component_update(&app.db, component).await?;
         let registry = Registry::ghcr()?;
-        match registry.discover(component, &state.channel).await {
+        let checked = match registry.discover(component, &state.channel).await {
             Ok(candidate) => {
-                db::record_update_check(&app.db, component, Some(candidate), None, now).await
+                db::record_update_check(
+                    &app.db,
+                    component,
+                    &state.channel,
+                    Some(candidate),
+                    None,
+                    now,
+                )
+                .await
             }
             Err(error) => {
-                db::record_update_check(&app.db, component, None, Some(format!("{error:#}")), now)
-                    .await?;
+                db::record_update_check(
+                    &app.db,
+                    component,
+                    &state.channel,
+                    None,
+                    Some(format!("{error:#}")),
+                    now,
+                )
+                .await?;
                 Err(error)
             }
+        };
+        if component == "webui" {
+            match reconcile_webui(app).await {
+                Ok(()) => {
+                    if let Some(desired) = db::component_update(&app.db, "webui").await?.desired {
+                        db::settle_interrupted_webui(&app.db, &desired).await?;
+                    }
+                }
+                Err(error) => tracing::warn!("WebUI Storage reconciliation failed: {error:#}"),
+            }
+            if let Ok(storage) = storage()
+                && let Err(error) = cleanup_webui_assets(app, &storage).await
+            {
+                tracing::warn!("WebUI managed asset cleanup failed: {error:#}");
+            }
         }
-    }
-    .await;
-    if component == "webui" {
-        if let Err(error) = reconcile_webui(app).await {
-            tracing::warn!("WebUI Storage reconciliation failed: {error:#}");
+        checked
+    })
+    .await
+}
+
+async fn with_update_lease<T, F>(
+    db: &Db,
+    component: &str,
+    lease: &str,
+    ttl: i64,
+    work: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    anyhow::ensure!(
+        db::renew_update_lease(db, component, lease, chrono::Utc::now().timestamp(), ttl).await?,
+        "update lease expired before work began"
+    );
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs((ttl / 4).max(1) as u64)).await;
+            let now = chrono::Utc::now().timestamp();
+            anyhow::ensure!(
+                db::renew_update_lease(db, component, lease, now, ttl).await?,
+                "update lease expired or changed"
+            );
         }
-        if let Ok(storage) = storage()
-            && let Err(error) = cleanup_webui_assets(app, &storage).await
-        {
-            tracing::warn!("WebUI managed asset cleanup failed: {error:#}");
-        }
-    }
-    db::release_update_lease(&app.db, component, &lease).await?;
-    checked
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = tokio::select! {
+        biased;
+        failure = watchdog => { failure?; unreachable!() },
+        result = work => result,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let owned = db::renew_update_lease(db, component, lease, now, ttl).await?;
+    db::release_update_lease(db, component, lease).await?;
+    anyhow::ensure!(owned, "update lease expired or changed");
+    result
 }
 
 async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
@@ -307,16 +366,8 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
         let worker = Arc::clone(app);
         let lease = lease.expect("WebUI install owns its lease");
         tokio::spawn(async move {
-            if let Err(error) = apply_webui(&worker, release.clone(), &lease).await {
+            if let Err(error) = run_webui_install(&worker, release, &lease).await {
                 tracing::error!("automatic WebUI install failed: {error:#}");
-                let _ = db::record_component_failure(
-                    &worker.db,
-                    "webui",
-                    &release,
-                    &format!("{error:#}"),
-                )
-                .await;
-                let _ = reconcile_webui(&worker).await;
             }
         });
     }
@@ -441,7 +492,7 @@ pub async fn install(
     {
         return Err(error(
             StatusCode::CONFLICT,
-            "WebUI source SHA was republished with different bytes; use a new source commit",
+            "WebUI source SHA was republished with a different image digest; file bytes may differ, so use a new source commit",
         ));
     }
     jmodguard_updater::compatible(&app.db, &candidate, now)
@@ -508,16 +559,8 @@ pub async fn install(
         let worker = Arc::clone(&app);
         let lease = lease.expect("WebUI install owns its lease");
         tokio::spawn(async move {
-            if let Err(error) = apply_webui(&worker, release.clone(), &lease).await {
+            if let Err(error) = run_webui_install(&worker, release, &lease).await {
                 tracing::error!("WebUI install failed: {error:#}");
-                let _ = db::record_component_failure(
-                    &worker.db,
-                    "webui",
-                    &release,
-                    &format!("{error:#}"),
-                )
-                .await;
-                let _ = reconcile_webui(&worker).await;
             }
         });
     }
@@ -526,23 +569,31 @@ pub async fn install(
     ))
 }
 
-async fn apply_webui(
+async fn run_webui_install(
     app: &Arc<ApiState>,
     release: ComponentRelease,
     lease: &str,
 ) -> anyhow::Result<()> {
-    let storage = match storage() {
-        Ok(storage) => storage,
-        Err(error) => {
-            db::release_update_lease(&app.db, "webui", lease).await?;
-            return Err(error);
+    with_update_lease(&app.db, "webui", lease, 600, async {
+        let result = apply_webui(app, &release).await;
+        if let Err(error) = &result {
+            db::record_component_failure(&app.db, "webui", &release, &format!("{error:#}")).await?;
+            if let Err(reconcile_error) = reconcile_webui(app).await {
+                tracing::warn!("WebUI failure reconciliation deferred: {reconcile_error:#}");
+            }
         }
-    };
+        result
+    })
+    .await
+}
+
+async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow::Result<()> {
+    let storage = storage()?;
     let now = chrono::Utc::now().timestamp();
     let result = async {
         db::track_webui_assets(&app.db, &release.source_sha, now).await?;
         let registry = Registry::ghcr()?;
-        let _files = storage.publish(&registry, &release).await?;
+        let _files = storage.publish(&registry, release).await?;
         let index = storage
             .get("index.html")
             .await?
@@ -577,13 +628,58 @@ async fn apply_webui(
     if let Err(error) = cleanup_webui_assets(app, &storage).await {
         tracing::warn!("WebUI managed asset cleanup deferred: {error:#}");
     }
-    db::release_update_lease(&app.db, "webui", lease).await?;
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_webui_worker_renews_lease_through_slow_work() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_webui_renew_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let first = "a".repeat(32);
+        let second = "b".repeat(32);
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            db::claim_update_lease(&db, "webui", &first, now, 4)
+                .await
+                .unwrap()
+        );
+        with_update_lease(&db, "webui", &first, 4, async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert!(
+                !db::claim_update_lease(&db, "webui", &second, chrono::Utc::now().timestamp(), 4,)
+                    .await?
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db::claim_update_lease(&db, "webui", &second, chrono::Utc::now().timestamp(), 4,)
+                .await
+                .unwrap()
+        );
+        let started = std::cell::Cell::new(false);
+        assert!(
+            with_update_lease(&db, "webui", &first, 4, async {
+                started.set(true);
+                Ok(())
+            })
+            .await
+            .is_err()
+        );
+        assert!(!started.get());
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[tokio::test]
     async fn check_lease_blocks_webui_queue_before_acknowledgement() {
@@ -608,9 +704,16 @@ mod tests {
             launcher_protocol: 1,
             base_abi: "static-webui-v1".into(),
         };
-        db::record_update_check(&db, "webui", Some(release.clone()), None, 100)
-            .await
-            .unwrap();
+        db::record_update_check(
+            &db,
+            "webui",
+            &release.channel,
+            Some(release.clone()),
+            None,
+            100,
+        )
+        .await
+        .unwrap();
         let check_lease = "c".repeat(32);
         assert!(
             db::claim_update_lease(&db, "webui", &check_lease, 100, 240)

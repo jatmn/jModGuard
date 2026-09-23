@@ -86,7 +86,7 @@ function render() {
     const candidateCurrent = checked && record.candidate?.channel === record.channel;
     const webuiRepacked = record.component === "webui" && record.installed?.source_sha === record.candidate?.source_sha && record.installed?.digest !== record.candidate?.digest;
     line(content, "Available release", candidateCurrent ? releaseText(record.candidate) : "Check now to confirm this channel");
-    if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has different bytes; publish a new source commit");
+    if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
     const compatibility = snapshot.compatibility?.[record.component];
     if (candidateCurrent) line(content, "Compatibility", compatibility?.installable ? "Ready for this deployment" : compatibility?.reason || "Unable to verify");
     line(content, "Last check", record.checked_at ? age(record.checked_at) : "never");

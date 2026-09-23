@@ -183,6 +183,7 @@ pub async fn component_update(db: &Db, component: &str) -> Result<ComponentUpdat
 pub async fn record_update_check(
     db: &Db,
     component: &str,
+    channel: &str,
     candidate: Option<ComponentRelease>,
     error: Option<String>,
     now: i64,
@@ -191,19 +192,20 @@ pub async fn record_update_check(
     if let Some(release) = &candidate {
         release.validate()?;
         anyhow::ensure!(
-            release.component == component,
-            "candidate component mismatch"
+            release.component == component && release.channel == channel,
+            "candidate component or channel mismatch"
         );
     }
-    let component = component.to_owned();
+    let (component, channel) = (component.to_owned(), channel.to_owned());
     let candidate = candidate.map(|r| serde_json::to_string(&r)).transpose()?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        if let Some(error) = error {
-            tx.execute("UPDATE component_updates SET checked_at=?2,check_error=?3 WHERE component=?1", params![component,now,error])?;
+        let changed = if let Some(error) = error {
+            tx.execute("UPDATE component_updates SET checked_at=?2,check_error=?3 WHERE component=?1 AND channel=?4", params![component,now,error,channel])?
         } else {
-            tx.execute("UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1", params![component,candidate,now])?;
-        }
+            tx.execute("UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1 AND channel=?4", params![component,candidate,now,channel])?
+        };
+        anyhow::ensure!(changed == 1, "release channel changed during check; check again");
         tx.commit()?;
         Ok(())
     }).await
@@ -249,6 +251,7 @@ pub async fn request_component_install(
         let candidate = checked_install_candidate(candidate, &channel, checked_at, check_error, &digest, now)?;
         let installed = parse_release(installed)?;
         anyhow::ensure!(component == "webui" || installed.as_ref().is_none_or(|release| release.digest != digest), "application release is already installed");
+        anyhow::ensure!(component != "webui" || installed.as_ref().is_none_or(|release| release.source_sha != candidate.source_sha || release.digest == candidate.digest), "WebUI source SHA was republished with a different image digest; use a new source commit");
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?])?;
         tx.commit()?;
         Ok(candidate)
@@ -550,7 +553,7 @@ pub async fn set_update_policy(
         (component.to_owned(), channel.to_owned(), cadence.to_owned());
     db.with_conn(move |conn| {
         conn.execute(
-            "UPDATE component_updates SET channel=?2,cadence=?3 WHERE component=?1",
+            "UPDATE component_updates SET channel=?2,cadence=?3,candidate=CASE WHEN channel=?2 THEN candidate ELSE NULL END,checked_at=CASE WHEN channel=?2 THEN checked_at ELSE NULL END,check_error=CASE WHEN channel=?2 THEN check_error ELSE NULL END WHERE component=?1",
             params![component, channel, cadence],
         )?;
         Ok(())
@@ -576,23 +579,24 @@ pub async fn request_due_automatic_install(
     let expected_digest = expected_digest.to_owned();
     db.with_conn(move |conn| {
         struct AutoState {
-            cadence:String,candidate:Option<String>,installed:Option<String>,checked_at:Option<i64>,
+            channel:String,cadence:String,candidate:Option<String>,installed:Option<String>,checked_at:Option<i64>,
             check_error:Option<String>,last_digest:Option<String>,last_window:Option<String>,
         }
         let tx=conn.transaction_immediate()?;
         let state:AutoState = tx.query_row(
-            "SELECT cadence,candidate,installed,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
+            "SELECT channel,cadence,candidate,installed,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
             params![component.clone()],|row| Ok(AutoState {
-                cadence:row.get(0)?,candidate:row.get(1)?,installed:row.get(2)?,checked_at:row.get(3)?,
-                check_error:row.get(4)?,last_digest:row.get(5)?,last_window:row.get(6)?,
+                channel:row.get(0)?,cadence:row.get(1)?,candidate:row.get(2)?,installed:row.get(3)?,checked_at:row.get(4)?,
+                check_error:row.get(5)?,last_digest:row.get(6)?,last_window:row.get(7)?,
             }))?;
         let Some(window)=automatic_window(&state.cadence,now) else { tx.commit()?; return Ok(None); };
-        if state.check_error.is_some() || state.checked_at.is_none_or(|at| now-at>7200) || state.last_window.as_deref()==Some(window.as_str()) {
+        if state.check_error.is_some() || state.checked_at.is_none_or(|at| at>now || now.saturating_sub(at)>=7200) || state.last_window.as_deref()==Some(window.as_str()) {
             tx.commit()?; return Ok(None);
         }
         let Some(candidate)=state.candidate else { tx.commit()?; return Ok(None); };
         let release:ComponentRelease=serde_json::from_str(&candidate)?;
-        if release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || state.installed.as_deref()==Some(candidate.as_str()) {
+        let installed=parse_release(state.installed)?;
+        if release.channel!=state.channel || release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || installed.as_ref().is_some_and(|current| current.digest==release.digest || component=="webui" && current.source_sha==release.source_sha) {
             tx.commit()?; return Ok(None);
         }
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL,auto_last_digest=?3,auto_last_window=?4 WHERE component=?1",params![component,candidate,release.digest.clone(),window])?;
@@ -651,6 +655,39 @@ pub async fn release_update_lease(db: &Db, component: &str, owner: &str) -> Resu
     }).await
 }
 
+/// Extend only a live lease still owned by this worker. A stopped worker must
+/// not reclaim an expired token after another process has begun recovery.
+pub async fn renew_update_lease(
+    db: &Db,
+    component: &str,
+    owner: &str,
+    now: i64,
+    ttl: i64,
+) -> Result<bool> {
+    validate_component(component)?;
+    anyhow::ensure!((1..=3600).contains(&ttl), "invalid update lease");
+    let (component, owner) = (component.to_owned(), owner.to_owned());
+    db.with_conn(move |conn| {
+        Ok(conn.execute(
+            "UPDATE component_updates SET lease_until=?3 WHERE component=?1 AND lease_owner=?2 AND lease_until>?4",
+            params![component,owner,now+ttl,now],
+        )? == 1)
+    }).await
+}
+
+/// A recovered WebUI check holds the lease after any abandoned apply lease has
+/// expired. Settle only a still-queued request; preserve drift and newer work.
+pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Result<()> {
+    let desired = serde_json::to_string(release)?;
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE component_updates SET state='failed',last_error='WebUI installation was interrupted; check Storage and retry' WHERE component='webui' AND desired=?1 AND state='queued'",
+            params![desired],
+        )?;
+        Ok(())
+    }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +738,155 @@ mod tests {
             automatic_window("monthly", at("2026-10-01T00:00:00Z")),
             Some("2026-10".into())
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_admission_uses_current_channel_digest_and_webui_source_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_auto_identity_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-23T01:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut stable = candidate('a');
+        stable.channel = "stable".into();
+        set_update_policy(&db, "api", "stable", "daily", true)
+            .await
+            .unwrap();
+        record_update_check(&db, "api", "stable", Some(stable.clone()), None, now)
+            .await
+            .unwrap();
+        set_update_policy(&db, "api", "nightly", "daily", true)
+            .await
+            .unwrap();
+        assert!(
+            component_update(&db, "api")
+                .await
+                .unwrap()
+                .candidate
+                .is_none()
+        );
+        assert!(
+            record_update_check(&db, "api", "stable", Some(stable.clone()), None, now)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_due_automatic_install(&db, "api", &stable.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut nightly = stable.clone();
+        nightly.channel = "nightly".into();
+        record_update_check(&db, "api", "nightly", Some(nightly.clone()), None, now)
+            .await
+            .unwrap();
+        let installed = serde_json::to_string(&nightly).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE component_updates SET installed=?1 WHERE component='api'",
+                params![installed],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        nightly.release_id = "different metadata, same image".into();
+        record_update_check(&db, "api", "nightly", Some(nightly.clone()), None, now)
+            .await
+            .unwrap();
+        assert!(
+            request_due_automatic_install(&db, "api", &nightly.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut webui = candidate('b');
+        webui.component = "webui".into();
+        webui.image = "ghcr.io/jatmn/jmodguard-webui".into();
+        webui.base_abi = "static-webui-v1".into();
+        webui.channel = "stable".into();
+        let mut repack = webui.clone();
+        repack.digest = format!("sha256:{}", "c".repeat(64));
+        set_update_policy(&db, "webui", "stable", "daily", true)
+            .await
+            .unwrap();
+        record_update_check(&db, "webui", "stable", Some(repack.clone()), None, now)
+            .await
+            .unwrap();
+        let installed = serde_json::to_string(&webui).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE component_updates SET installed=?1 WHERE component='webui'",
+                params![installed],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            request_due_automatic_install(&db, "webui", &repack.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            request_component_install(&db, "webui", &repack.digest, now)
+                .await
+                .is_err()
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_and_interrupted_webui_settlement_keep_owner_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_lease_recovery_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        assert!(claim_update_lease(&db, "webui", &a, 100, 10).await.unwrap());
+        assert!(renew_update_lease(&db, "webui", &a, 105, 10).await.unwrap());
+        assert!(!claim_update_lease(&db, "webui", &b, 110, 10).await.unwrap());
+        assert!(claim_update_lease(&db, "webui", &b, 115, 10).await.unwrap());
+        assert!(!renew_update_lease(&db, "webui", &a, 116, 10).await.unwrap());
+
+        let mut release = candidate('c');
+        release.component = "webui".into();
+        release.image = "ghcr.io/jatmn/jmodguard-webui".into();
+        release.base_abi = "static-webui-v1".into();
+        record_update_check(&db, "webui", "latest", Some(release.clone()), None, 116)
+            .await
+            .unwrap();
+        request_component_install(&db, "webui", &release.digest, 116)
+            .await
+            .unwrap();
+        settle_interrupted_webui(&db, &release).await.unwrap();
+        let state = component_update(&db, "webui").await.unwrap();
+        assert_eq!(state.state, "failed");
+        assert!(state.last_error.unwrap().contains("interrupted"));
+        assert_eq!(state.desired.unwrap().digest, release.digest);
+        let mut other = release.clone();
+        other.digest = format!("sha256:{}", "d".repeat(64));
+        settle_interrupted_webui(&db, &other).await.unwrap();
+        assert_eq!(
+            component_update(&db, "webui").await.unwrap().state,
+            "failed"
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[tokio::test]
@@ -776,7 +962,7 @@ mod tests {
         ));
         let db = Db::open(&path, 2).unwrap();
         let first = candidate('a');
-        record_update_check(&db, "api", Some(first.clone()), None, 100)
+        record_update_check(&db, "api", &first.channel, Some(first.clone()), None, 100)
             .await
             .unwrap();
         assert!(
@@ -826,7 +1012,7 @@ mod tests {
             .await
             .unwrap();
         let second = candidate('b');
-        record_update_check(&db, "api", Some(second.clone()), None, 120)
+        record_update_check(&db, "api", &second.channel, Some(second.clone()), None, 120)
             .await
             .unwrap();
         request_component_install(&db, "api", &second.digest, 120)
@@ -869,7 +1055,7 @@ mod tests {
         set_update_policy(&db, "api", "stable", "daily", true)
             .await
             .unwrap();
-        record_update_check(&db, "api", Some(first.clone()), None, now)
+        record_update_check(&db, "api", &first.channel, Some(first.clone()), None, now)
             .await
             .unwrap();
         assert!(
@@ -925,9 +1111,16 @@ mod tests {
         );
         let mut next = candidate('c');
         next.channel = "stable".into();
-        record_update_check(&db, "api", Some(next.clone()), None, now + 86400)
-            .await
-            .unwrap();
+        record_update_check(
+            &db,
+            "api",
+            &next.channel,
+            Some(next.clone()),
+            None,
+            now + 86400,
+        )
+        .await
+        .unwrap();
         assert!(
             request_due_automatic_install(&db, "api", &next.digest, now + 86400, true)
                 .await
@@ -949,13 +1142,13 @@ mod tests {
         let db = Db::open(&path, 2).unwrap();
         let first = candidate('a');
         let next = candidate('b');
-        record_update_check(&db, "api", Some(first.clone()), None, 100)
+        record_update_check(&db, "api", &first.channel, Some(first.clone()), None, 100)
             .await
             .unwrap();
         request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
-        record_update_check(&db, "api", Some(next.clone()), None, 101)
+        record_update_check(&db, "api", &next.channel, Some(next.clone()), None, 101)
             .await
             .unwrap();
         request_component_install(&db, "api", &next.digest, 101)
@@ -1014,7 +1207,7 @@ mod tests {
             self_update_enabled: true,
             base_abi: "debian-bookworm-amd64".into(),
         };
-        record_update_check(&db, "api", Some(first.clone()), None, 100)
+        record_update_check(&db, "api", &first.channel, Some(first.clone()), None, 100)
             .await
             .unwrap();
         request_component_install(&db, "api", &first.digest, 100)
@@ -1043,7 +1236,7 @@ mod tests {
         assert_eq!(current.state, "running");
         assert_eq!(current.desired.unwrap().digest, first.digest);
 
-        record_update_check(&db, "api", Some(second.clone()), None, 102)
+        record_update_check(&db, "api", &second.channel, Some(second.clone()), None, 102)
             .await
             .unwrap();
         request_component_install(&db, "api", &second.digest, 102)
@@ -1103,7 +1296,7 @@ mod tests {
         ));
         let db = Db::open(&path, 2).unwrap();
         let api = candidate('a');
-        record_update_check(&db, "api", Some(api.clone()), None, 100)
+        record_update_check(&db, "api", &api.channel, Some(api.clone()), None, 100)
             .await
             .unwrap();
         assert!(
@@ -1124,7 +1317,7 @@ mod tests {
                 .is_none()
         );
 
-        record_update_check(&db, "api", Some(api.clone()), None, 7310)
+        record_update_check(&db, "api", &api.channel, Some(api.clone()), None, 7310)
             .await
             .unwrap();
         set_update_policy(&db, "api", "nightly", "off", false)
@@ -1143,9 +1336,16 @@ mod tests {
         set_update_policy(&db, "api", "latest", "off", false)
             .await
             .unwrap();
-        record_update_check(&db, "api", None, Some("registry unavailable".into()), 7311)
-            .await
-            .unwrap();
+        record_update_check(
+            &db,
+            "api",
+            &api.channel,
+            None,
+            Some("registry unavailable".into()),
+            7311,
+        )
+        .await
+        .unwrap();
         assert!(
             request_component_install(&db, "api", &api.digest, 7311)
                 .await
@@ -1156,7 +1356,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        record_update_check(&db, "api", Some(api.clone()), None, 7312)
+        record_update_check(&db, "api", &api.channel, Some(api.clone()), None, 7312)
             .await
             .unwrap();
         request_component_install(&db, "api", &api.digest, 7312)
@@ -1170,7 +1370,7 @@ mod tests {
         webui.component = "webui".into();
         webui.image = "ghcr.io/jatmn/jmodguard-webui".into();
         webui.base_abi = "static-webui-v1".into();
-        record_update_check(&db, "webui", Some(webui.clone()), None, 200)
+        record_update_check(&db, "webui", &webui.channel, Some(webui.clone()), None, 200)
             .await
             .unwrap();
         assert!(
@@ -1178,9 +1378,16 @@ mod tests {
                 .await
                 .is_err()
         );
-        record_update_check(&db, "webui", Some(webui.clone()), None, 7401)
-            .await
-            .unwrap();
+        record_update_check(
+            &db,
+            "webui",
+            &webui.channel,
+            Some(webui.clone()),
+            None,
+            7401,
+        )
+        .await
+        .unwrap();
         request_component_install(&db, "webui", &webui.digest, 7401)
             .await
             .unwrap();
