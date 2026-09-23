@@ -118,7 +118,7 @@ body { background: var(--bg); color: var(--text); }
 .checkbox-group { margin-bottom: 18px; }
 /* daisyUI's default 20%-opacity borders disappear against both of our themes. */
 .input, .select, .textarea { --input-color: var(--input-border); }
-.checkbox { --input-color: var(--accent); border-color: var(--input-border); background-color: var(--input); color: var(--accent-text); }
+.checkbox { --input-color: var(--accent); border-color: var(--input-border); color: var(--accent-text); }
 .btn:not(.btn-primary, .btn-secondary, .btn-accent, .btn-neutral, .btn-info, .btn-success, .btn-warning, .btn-error, .btn-ghost, .btn-link, .btn-outline) { border-color: var(--input-border); }
 .standalone-action { margin-bottom: 14px; }
 .action-row > .search-select { flex: 0 1 180px; }

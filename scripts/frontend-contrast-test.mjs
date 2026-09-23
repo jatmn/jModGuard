@@ -40,6 +40,10 @@ for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme=
 
 test("component borders use the contrast-tested theme colors", () => {
   assert.match(css, /\.input, \.select, \.textarea\s*\{\s*--input-color:\s*var\(--input-border\)/);
-  assert.match(css, /\.checkbox\s*\{[^}]*border-color:\s*var\(--input-border\)/);
+  const checkbox = css.match(/\.checkbox\s*\{([^}]*)\}/)?.[1];
+  assert.ok(checkbox, "missing checkbox theme rule");
+  assert.match(checkbox, /border-color:\s*var\(--input-border\)/);
+  // daisyUI owns the checked fill inside a CSS layer; an unlayered fill here hides its check mark.
+  assert.doesNotMatch(checkbox, /background-color\s*:/);
   assert.match(css, /\.btn:not\([^}]*\)\s*\{\s*border-color:\s*var\(--input-border\)/);
 });
