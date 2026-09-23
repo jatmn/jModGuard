@@ -120,8 +120,8 @@ function render() {
     content.append(row);
     const channel = node("select");
     channel.setAttribute("aria-label", `${record.component} release channel`);
-    for (const value of ["stable", "nightly"]) {
-      const option = node("option", value === "stable" ? "Stable releases" : "Nightly releases");
+    for (const value of ["latest", "stable", "nightly"]) {
+      const option = node("option", value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases");
       option.value = value;
       channel.append(option);
     }
@@ -136,7 +136,7 @@ function render() {
     for (const value of ["off", "daily", "weekly", "monthly"]) {
       const option = node("option", value === "off" ? "Automatic install off" : value);
       option.value = value;
-      option.disabled = value !== "off" && !snapshot.unattended_enabled;
+      option.disabled = value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest");
       cadence.append(option);
     }
     cadence.value = record.cadence;

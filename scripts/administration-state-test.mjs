@@ -66,8 +66,8 @@ function textOf(element) {
 function record(component = "api") {
   const sha = "a".repeat(40);
   return {
-    component, channel: "stable", cadence: "off",
-    candidate: { component, channel: "stable", source_sha: "b".repeat(40),
+    component, channel: "latest", cadence: "off",
+    candidate: { component, channel: "latest", source_sha: "b".repeat(40),
       digest: "sha256:" + "b".repeat(64), release_id: "v1", published_at: "2026-09-23T00:00:00Z" },
     installed: null, checked_at: Math.floor(Date.now() / 1000), check_error: null,
     observed_at: Math.floor(Date.now() / 1000), state: "running", last_error: null,
@@ -107,7 +107,7 @@ test("owner update controls require a current installable candidate", () => {
   render(view, api);
   assert.equal(updateButton(view, "api").disabled, true);
 
-  api.channel = "stable";
+  api.channel = "latest";
   api.checked_at = Math.floor(Date.now() / 1000) - 7201;
   render(view, api);
   assert.equal(updateButton(view, "api").disabled, true);

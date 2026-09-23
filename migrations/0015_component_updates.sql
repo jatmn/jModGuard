@@ -2,7 +2,7 @@
 -- migration; the API and service launchers open with migrate=false.
 CREATE TABLE component_updates (
     component TEXT PRIMARY KEY CHECK (component IN ('bot', 'api', 'webui')),
-    channel TEXT NOT NULL DEFAULT 'stable' CHECK (channel IN ('stable', 'nightly')),
+    channel TEXT NOT NULL DEFAULT 'latest' CHECK (channel IN ('latest', 'stable', 'nightly')),
     cadence TEXT NOT NULL DEFAULT 'off' CHECK (cadence IN ('off', 'daily', 'weekly', 'monthly')),
     candidate TEXT,
     checked_at INTEGER,

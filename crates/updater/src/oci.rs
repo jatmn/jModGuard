@@ -224,7 +224,7 @@ impl Registry {
     /// metadata. Old images missing these labels are observation-only.
     pub async fn discover(&self, component: &str, channel: &str) -> Result<ComponentRelease> {
         ensure!(
-            matches!(channel, "stable" | "nightly"),
+            matches!(channel, "latest" | "stable" | "nightly"),
             "invalid release channel"
         );
         let repo = repository(component)?;
@@ -245,8 +245,13 @@ impl Registry {
             label("io.jmodguard.component")? == component,
             "component label mismatch"
         );
+        let published_channel = label("io.jmodguard.channel")?;
         ensure!(
-            label("io.jmodguard.channel")? == channel,
+            if channel == "latest" {
+                matches!(published_channel.as_str(), "development" | "stable")
+            } else {
+                published_channel == channel
+            },
             "channel label mismatch"
         );
         let release = ComponentRelease {

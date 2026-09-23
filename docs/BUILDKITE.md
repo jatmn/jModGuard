@@ -9,9 +9,11 @@ pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
 tests and image jobs. This repository has no GitHub Actions frontend publisher.
 
 The `publish-webui` job creates an independent static WebUI GHCR image from
-`frontend/` on trusted publication builds. Stable and Nightly registry pointer
-tags on bot/API/WebUI images support the owner Administration update page;
-their exact digest is pinned before install. See [independent Bunny updates](BUNNY-UPDATES.md).
+`frontend/` on trusted publication builds. Main builds publish each changed
+component under its source SHA and `latest`; the owner Administration update
+page defaults to `latest` and pins its exact digest before installation.
+Stable and Nightly pointers remain optional for future promotion policy.
+See [independent Bunny updates](BUNNY-UPDATES.md).
 
 ## Pipeline and agents
 

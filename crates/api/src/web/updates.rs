@@ -594,7 +594,7 @@ mod tests {
         let db = Db::open(&path, 2).unwrap();
         let release = ComponentRelease {
             component: "webui".into(),
-            channel: "stable".into(),
+            channel: "latest".into(),
             release_id: "v1.0.0".into(),
             source_sha: "a".repeat(40),
             published_at: "2026-09-23T00:00:00Z".into(),

@@ -25,7 +25,7 @@ impl ComponentRelease {
     pub fn validate(&self) -> Result<()> {
         validate_component(&self.component)?;
         anyhow::ensure!(
-            matches!(self.channel.as_str(), "stable" | "nightly"),
+            matches!(self.channel.as_str(), "latest" | "stable" | "nightly"),
             "invalid channel"
         );
         anyhow::ensure!(
@@ -530,7 +530,10 @@ pub async fn set_update_policy(
     unattended_allowed: bool,
 ) -> Result<()> {
     validate_component(component)?;
-    anyhow::ensure!(matches!(channel, "stable" | "nightly"), "invalid channel");
+    anyhow::ensure!(
+        matches!(channel, "latest" | "stable" | "nightly"),
+        "invalid channel"
+    );
     anyhow::ensure!(
         matches!(cadence, "off" | "daily" | "weekly" | "monthly"),
         "invalid cadence"
@@ -538,6 +541,10 @@ pub async fn set_update_policy(
     anyhow::ensure!(
         unattended_allowed || cadence == "off",
         "automatic installation is disabled for this deployment"
+    );
+    anyhow::ensure!(
+        channel != "latest" || cadence == "off",
+        "automatic installation requires a promoted release channel"
     );
     let (component, channel, cadence) =
         (component.to_owned(), channel.to_owned(), cadence.to_owned());
@@ -651,7 +658,7 @@ mod tests {
     fn candidate(sha: char) -> ComponentRelease {
         ComponentRelease {
             component: "api".into(),
-            channel: "stable".into(),
+            channel: "latest".into(),
             release_id: format!("v1.0.{sha}"),
             source_sha: sha.to_string().repeat(40),
             published_at: "2026-09-23T00:00:00Z".into(),
@@ -707,10 +714,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(
             rows.iter()
-                .all(|row| row.cadence == "off" && row.channel == "stable")
+                .all(|row| row.cadence == "off" && row.channel == "latest")
         );
         assert!(
             set_update_policy(&db, "api", "stable", "daily", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_update_policy(&db, "api", "latest", "daily", true)
                 .await
                 .is_err()
         );
@@ -723,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             component_update(&db, "bot").await.unwrap().channel,
-            "stable"
+            "latest"
         );
         let owner = "a".repeat(32);
         assert!(
@@ -849,7 +861,8 @@ mod tests {
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let first = candidate('a');
+        let mut first = candidate('a');
+        first.channel = "stable".into();
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-23T01:00:00Z")
             .unwrap()
             .timestamp();
@@ -910,7 +923,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let next = candidate('c');
+        let mut next = candidate('c');
+        next.channel = "stable".into();
         record_update_check(&db, "api", Some(next.clone()), None, now + 86400)
             .await
             .unwrap();
@@ -1126,7 +1140,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        set_update_policy(&db, "api", "stable", "off", false)
+        set_update_policy(&db, "api", "latest", "off", false)
             .await
             .unwrap();
         record_update_check(&db, "api", None, Some("registry unavailable".into()), 7311)

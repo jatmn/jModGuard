@@ -21,7 +21,7 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
     let path = uri.path();
     let fixture = state.read().await;
     let reference = path.rsplit('/').next().unwrap_or("");
-    let key = if reference == "stable" {
+    let key = if matches!(reference, "latest" | "stable") {
         &fixture.tag
     } else {
         reference
@@ -42,11 +42,11 @@ fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
 
-fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8]) -> String {
+fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &str) -> String {
     let sha = source.to_string().repeat(40);
     let config = serde_json::to_vec(&json!({
         "architecture":"amd64","os":"linux","config":{"Labels":{
-            "io.jmodguard.component":"api","io.jmodguard.channel":"stable",
+            "io.jmodguard.component":"api","io.jmodguard.channel":channel,
             "io.jmodguard.release-id":format!("v1.0.{source}"),
             "io.jmodguard.published-at":"2026-09-23T00:00:00Z",
             "io.jmodguard.min-schema":"15","io.jmodguard.max-schema":"15",
@@ -88,8 +88,10 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8]) -> String {
 #[tokio::test]
 async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     let mut fixture = RegistryFixture::default();
-    let old = image(&mut fixture, 'a', b"\x7fELFfirst");
-    let new = image(&mut fixture, 'b', b"\x7fELFsecond");
+    let old = image(&mut fixture, 'a', b"\x7fELFfirst", "development");
+    let new = image(&mut fixture, 'b', b"\x7fELFsecond", "development");
+    let stable = image(&mut fixture, 'c', b"\x7fELFstable", "stable");
+    let nightly = image(&mut fixture, 'd', b"\x7fELFnightly", "nightly");
     fixture.tag = old.clone();
     let state = Arc::new(RwLock::new(fixture));
     let router = Router::new()
@@ -99,13 +101,25 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let registry = Registry::new(&format!("http://{addr}")).unwrap();
-    let approved = registry.discover("api", "stable").await.unwrap();
+    let approved = registry.discover("api", "latest").await.unwrap();
+    assert_eq!(approved.channel, "latest");
     assert_eq!(approved.digest, old);
     state.write().await.tag = new.clone();
     assert_eq!(
-        registry.discover("api", "stable").await.unwrap().digest,
+        registry.discover("api", "latest").await.unwrap().digest,
         new
     );
+    state.write().await.tag = stable.clone();
+    assert_eq!(
+        registry.discover("api", "latest").await.unwrap().digest,
+        stable
+    );
+    assert_eq!(
+        registry.discover("api", "stable").await.unwrap().digest,
+        stable
+    );
+    state.write().await.tag = nightly;
+    assert!(registry.discover("api", "latest").await.is_err());
     assert_eq!(
         registry
             .files(&approved, &["usr/local/bin/jmodguard-api"])

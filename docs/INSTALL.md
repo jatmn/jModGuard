@@ -19,24 +19,24 @@ AWS proof. Eight merged overhaul PRs do not prove production cutover.
 | AWS | [DEPLOY-AWS.md](DEPLOY-AWS.md) | EC2 with the local adapter and SQLite or compatible libSQL. Not RDS/Postgres. |
 | Cost | [COST.md](COST.md) | Formulas from local measurements plus current provider list prices |
 
-Buildkite publishes bot and API images from this repository on every main SHA.
+Buildkite publishes changed bot, API, and WebUI images from this repository on main SHAs.
 Conductor images and a complete signed `JMODGUARD-RELEASE-1` manifest ship only on
 scheduled Nightly, Stable tag, and manual builds ([BUILDKITE.md](BUILDKITE.md)).
 
 ## Public artifacts
 
-Use a git tag or the matching Buildkite image digests:
+Use a source commit SHA or the matching Buildkite image digests:
 
 - source: `https://github.com/jatmn/jModGuard`
-- images on every main SHA: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`
+- independently published images on main: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui` (source SHA and `latest` tags for each changed component)
 - conductor image and installable release manifest: Nightly / Stable tag / manual
   Buildkite builds only (`ghcr.io/jatmn/jmodguard-conductor`); on main SHA build
   from source (`cargo build --locked -p jmodguard-conductor`) or pin a tagged release
-- admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`
+- admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`, `frontend/administration/index.html`, `frontend/administration.js`
   (the browser also fetches daisyUI CSS and Headless UI from a CDN at runtime;
   those libraries are not extra files in this repository)
-  (from source or release manifest; Buildkite does not upload a separate frontend
-  artifact bundle—see [BUILDKITE.md](BUILDKITE.md))
+  (from source or the independent WebUI GHCR package; Buildkite does not upload
+  the files to Bunny Storage—see [BUILDKITE.md](BUILDKITE.md))
 - license: `LICENSE.md`
 
 Do not copy secrets into git. Bunny Storage passwords, Discord tokens, OAuth
