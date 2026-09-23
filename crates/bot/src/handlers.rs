@@ -46,12 +46,24 @@ fn audit_case_action(
     }
 }
 
-fn select_update_author(
+fn select_update_authors(
     event_author: Option<u64>,
     text_author: Option<u64>,
     image_author: Option<u64>,
-) -> Option<u64> {
-    event_author.or(text_author).or(image_author)
+    snippet_author: Option<u64>,
+    snippet_webhook: bool,
+    edited: bool,
+) -> (Option<u64>, Option<u64>) {
+    let detector_author = event_author.or(text_author).or(image_author);
+    let known_author = detector_author.or(snippet_author);
+    // A cached author identifies a message for logging, but an untimestamped
+    // refresh cannot turn an untracked old message into a new spam candidate.
+    let update_author = if edited && !snippet_webhook {
+        known_author
+    } else {
+        detector_author
+    };
+    (known_author, update_author)
 }
 
 pub(crate) struct UpdateObservation {
@@ -430,13 +442,20 @@ impl EventHandler for Handler {
 
         // Capture the already-delivered identity before configuration loading
         // yields, so a fast partial edit can still apply its user-ID filter.
-        crate::logging::remember_message(
+        crate::logging::remember_message_create(
             &app,
             guild_id.get(),
             msg.channel_id.get(),
             msg.id.get(),
             Some(msg.author.id.get()),
-            &msg.content,
+            Some(&msg.content),
+            Some(
+                &msg.attachments
+                    .iter()
+                    .map(|attachment| attachment.url.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            msg.webhook_id.is_some(),
         );
 
         if msg.content.is_empty() {
@@ -553,26 +572,23 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
-        let detector_author_id = event.guild_id.and_then(|guild| {
-            let guild = guild.get();
-            let channel = event.channel_id.get();
-            let message = event.id.get();
-            select_update_author(
-                event.author.as_ref().map(|user| user.id.get()),
-                self.app.text_spam.author_of(guild, channel, message),
-                self.app.image_spam.author_of(guild, channel, message),
-            )
-        });
-        let known_author_id = detector_author_id.or_else(|| {
-            event.guild_id.and_then(|guild| {
-                logging::known_message_author(
-                    &self.app,
-                    guild.get(),
-                    event.channel_id.get(),
-                    event.id.get(),
+        let (known_author_id, detector_update_author_id) = event
+            .guild_id
+            .map(|guild| {
+                let guild = guild.get();
+                let channel = event.channel_id.get();
+                let message = event.id.get();
+                select_update_authors(
+                    event.author.as_ref().map(|user| user.id.get()),
+                    self.app.text_spam.author_of(guild, channel, message),
+                    self.app.image_spam.author_of(guild, channel, message),
+                    logging::known_message_author(&self.app, guild, channel, message),
+                    logging::known_message_webhook(&self.app, guild, channel, message),
+                    event.edited_timestamp.is_some(),
                 )
             })
-        });
+            .unwrap_or_default();
+        logging::remember_message_update(&self.app, &event, known_author_id);
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
                 self.app.member_joins.remember(
@@ -588,7 +604,7 @@ impl EventHandler for Handler {
             let channel = event.channel_id.get();
             let message = event.id.get();
             let update = UpdateObservation {
-                author: detector_author_id,
+                author: detector_update_author_id,
                 received,
                 received_at,
             };
@@ -610,16 +626,6 @@ impl EventHandler for Handler {
                         &update,
                         text_revision,
                     );
-                    if let Some(content) = event.content.as_deref() {
-                        crate::logging::remember_message(
-                            &self.app,
-                            guild.get(),
-                            event.channel_id.get(),
-                            event.id.get(),
-                            update.author,
-                            content,
-                        );
-                    }
                 }
                 Err(e) => {
                     tracing::warn!("message_update: config load failed: {e:#}");
@@ -746,15 +752,68 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_case_action, select_update_author};
+    use super::{audit_case_action, select_update_authors};
+    use crate::{db::Db, logging, state::BotState};
+    use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
 
     #[test]
-    fn update_author_prefers_event_then_text_then_image_observation() {
-        assert_eq!(select_update_author(Some(1), Some(2), Some(3)), Some(1));
-        assert_eq!(select_update_author(None, Some(2), Some(3)), Some(2));
-        assert_eq!(select_update_author(None, None, Some(3)), Some(3));
-        assert_eq!(select_update_author(None, None, None), None);
+    fn update_author_prefers_event_then_detector_and_only_uses_snippet_for_real_edits() {
+        assert_eq!(
+            select_update_authors(Some(1), Some(2), Some(3), Some(4), false, false),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            select_update_authors(None, Some(2), Some(3), Some(4), false, false),
+            (Some(2), Some(2))
+        );
+        assert_eq!(
+            select_update_authors(None, None, Some(3), Some(4), false, false),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, Some(4), false, false),
+            (Some(4), None)
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, Some(4), false, true),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, None, false, true),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn webhook_snippet_author_stays_available_to_logging_but_not_detectors() {
+        let path =
+            std::env::temp_dir().join(format!("webhook_snip_{:032x}.db", rand::random::<u128>()));
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        logging::remember_message_create(&app, 789, 456, 123, Some(42), Some(""), None, true);
+        // A partial edit can omit webhook_id, including while changing attachments.
+        let update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+            "id":"123", "channel_id":"456", "guild_id":"789",
+            "edited_timestamp":"2026-09-21T00:00:01.000Z",
+            "attachments":[{
+                "id":"1", "filename":"image.jpg", "url":"https://cdn.discordapp.com/attachments/456/1/image.jpg",
+                "proxy_url":"https://cdn.discordapp.com/attachments/456/1/image.jpg", "size":100
+            }]
+        })).unwrap();
+        logging::remember_message_update(&app, &update, Some(42));
+        let author = logging::known_message_author(&app, 789, 456, 123);
+        let webhook = logging::known_message_webhook(&app, 789, 456, 123);
+        assert_eq!(author, Some(42));
+        assert!(webhook);
+        assert_eq!(
+            select_update_authors(None, None, None, author, webhook, true),
+            (Some(42), None)
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, author, webhook, false),
+            (Some(42), None)
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

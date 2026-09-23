@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
 const SNIPPET_CHARS: usize = 1000;
+const ATTACHMENT_PREVIEW_BYTES: usize = 1200;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
@@ -427,7 +428,46 @@ struct Snippet {
     at: Instant,
     guild: u64,
     author: u64,
-    text: String,
+    webhook: bool,
+    text: Option<String>,
+    attachments: Option<AttachmentPreview>,
+}
+
+struct AttachmentPreview {
+    count: usize,
+    urls: Vec<String>,
+    // None is the create observation; edits use Discord's source timestamp.
+    edited_ms: Option<i64>,
+}
+
+impl AttachmentPreview {
+    fn new(urls: &[String], edited_ms: Option<i64>) -> Self {
+        let mut remaining = ATTACHMENT_PREVIEW_BYTES;
+        let mut retained = Vec::new();
+        for url in urls {
+            if url.len() <= remaining {
+                retained.push(url.clone());
+                remaining -= url.len();
+            }
+        }
+        Self {
+            count: urls.len(),
+            urls: retained,
+            edited_ms,
+        }
+    }
+
+    fn display(&self) -> String {
+        if self.count == 0 {
+            return "none".into();
+        }
+        let mut lines = vec![format!("{} attachment(s)", self.count)];
+        lines.extend(self.urls.iter().cloned());
+        if self.urls.len() < self.count {
+            lines.push(format!("{} URL(s) omitted", self.count - self.urls.len()));
+        }
+        lines.join("\n")
+    }
 }
 
 pub fn remember_message(
@@ -436,7 +476,56 @@ pub fn remember_message(
     channel: u64,
     message: u64,
     author: Option<u64>,
-    text: &str,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
+) {
+    remember_message_create(
+        app,
+        guild,
+        channel,
+        message,
+        author,
+        text,
+        attachments,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // Create identity travels with the message observation.
+pub(crate) fn remember_message_create(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
+    webhook: bool,
+) {
+    remember_message_with_attachment_edit(
+        app,
+        guild,
+        channel,
+        message,
+        author,
+        text,
+        attachments,
+        None,
+        webhook,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source edit identity beside the attachment field.
+fn remember_message_with_attachment_edit(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
+    attachment_edit_ms: Option<i64>,
+    webhook: bool,
 ) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
@@ -458,15 +547,83 @@ pub fn remember_message(
     {
         cache.remove(&oldest);
     }
+    let previous = cache.remove(&key);
+    let webhook = webhook || previous.as_ref().is_some_and(|value| value.webhook);
+    let previous_text = previous.as_ref().and_then(|value| value.text.clone());
+    let previous_attachments = previous.and_then(|value| value.attachments);
+    let replace_attachments =
+        previous_attachments
+            .as_ref()
+            .is_none_or(|old| match (old.edited_ms, attachment_edit_ms) {
+                (Some(old), Some(new)) => new >= old,
+                (Some(_), None) => false,
+                (None, _) => true,
+            });
     cache.insert(
         key,
         Snippet {
             at: Instant::now(),
             guild,
             author,
-            text: text.chars().take(SNIPPET_CHARS).collect(),
+            webhook,
+            text: text
+                .map(|value| value.chars().take(SNIPPET_CHARS).collect())
+                .or(previous_text),
+            attachments: attachments
+                .filter(|_| replace_attachments)
+                .map(|urls| AttachmentPreview::new(urls, attachment_edit_ms))
+                .or(previous_attachments),
         },
     );
+}
+
+/// Refresh the delete preview at Gateway receipt time. Only an actual edit can
+/// replace attachment URLs; an untimestamped Gateway refresh may carry an empty
+/// attachment list even while the original attachments still exist.
+pub(crate) fn remember_message_update(
+    app: &BotState,
+    event: &MessageUpdateEvent,
+    author: Option<u64>,
+) {
+    let Some(guild) = event.guild_id else { return };
+    let attachment_edit_ms = event
+        .edited_timestamp
+        .map(|timestamp| timestamp.timestamp_millis());
+    let attachment_urls = attachment_edit_ms
+        .and(event.attachments.as_ref())
+        .map(|attachments| {
+            attachments
+                .iter()
+                .map(|attachment| attachment.url.clone())
+                .collect::<Vec<_>>()
+        });
+    if event.content.is_none() && attachment_urls.is_none() {
+        return;
+    }
+    remember_message_with_attachment_edit(
+        app,
+        guild.get(),
+        event.channel_id.get(),
+        event.id.get(),
+        author,
+        event.content.as_deref(),
+        attachment_urls.as_deref(),
+        attachment_edit_ms,
+        matches!(event.webhook_id, Some(Some(_))),
+    );
+}
+
+pub(crate) fn known_message_webhook(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+) -> bool {
+    let mut cache = app.log_snippets.inner.lock();
+    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
+    cache
+        .get(&(guild, channel, message))
+        .is_some_and(|snippet| snippet.webhook)
 }
 
 pub(crate) fn known_message_author(
@@ -483,12 +640,10 @@ pub(crate) fn known_message_author(
         .map(|snippet| snippet.author)
 }
 
-fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<(u64, String)> {
+fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    cache
-        .remove(&(guild, channel, message))
-        .map(|s| (s.author, s.text))
+    cache.remove(&(guild, channel, message))
 }
 
 /// Resolves the log channel for an event type from the cached config.
@@ -895,22 +1050,30 @@ pub(crate) fn message_delete_report(
     id: MessageId,
 ) -> MessageReport {
     let mut vars = message_vars(guild_id, channel, id);
-    if let Some((author, text)) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
+    if let Some(snippet) = take_snippet(app, guild_id.get(), channel.get(), id.get()) {
         vars.extend(templates::user_vars(
-            author,
-            &author.to_string(),
-            &author.to_string(),
+            snippet.author,
+            &snippet.author.to_string(),
+            &snippet.author.to_string(),
         ));
         vars.insert(
             "content".into(),
-            if text.is_empty() {
-                "empty".into()
-            } else {
-                clip(&text, 1000)
+            match snippet.text.as_deref() {
+                Some("") => "empty".into(),
+                Some(text) => clip(text, 1000),
+                None => "not supplied to this process".into(),
             },
+        );
+        vars.insert(
+            "attachments".into(),
+            snippet
+                .attachments
+                .map(|preview| preview.display())
+                .unwrap_or_else(|| "not supplied to this process".into()),
         );
     } else {
         vars.insert("content".into(), "not supplied to this process".into());
+        vars.insert("attachments".into(), "not supplied to this process".into());
     }
     MessageReport {
         guild_id,

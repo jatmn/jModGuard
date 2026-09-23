@@ -2797,6 +2797,45 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
 }
 
 #[test]
+fn attachment_delete_template_upgrade_preserves_customizations() {
+    let tmp = tmp_db_path("attachment_delete_template");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute("DELETE FROM meta WHERE key = 'attachment_delete_template_v1'", ())?;
+        conn.execute(
+            "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type='message_delete'",
+            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO templates (guild_id,event_type,template) VALUES (123,'message_delete',?1)",
+            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO templates (guild_id,event_type,template) VALUES (456,'message_delete','custom {content}')",
+            (),
+        )?;
+        Ok(())
+    })).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    let new = crate::defaults::default_templates()
+        .into_iter()
+        .find(|(event, _)| *event == "message_delete")
+        .unwrap()
+        .1;
+    tokio_test_block_on(async {
+        for guild in [0, 123] {
+            let parts = load_config_parts(&db, guild).await.unwrap();
+            assert_eq!(parts.templates["message_delete"], new);
+        }
+        let custom = load_config_parts(&db, 456).await.unwrap();
+        assert_eq!(custom.templates["message_delete"], "custom {content}");
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     let tmp = tmp_db_path("readable_status_collision");
     let db = Db::open(&tmp, 2).unwrap();

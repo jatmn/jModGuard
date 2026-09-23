@@ -35,8 +35,12 @@ skip and does not punish.
 ## Matching
 
 **Images:** one author in one guild posts the same common set of distinct SHA-256
-image hashes across the configured number of distinct channels. Extra images, order
-and filenames do not matter. Creates and attachment-changing edits participate.
+image hashes across the configured number of distinct channels. Once attachments
+are admitted as images, extra images, order and filenames do not affect byte
+matching. Creates and attachment-changing edits participate.
+An explicit image media type is enough even when Discord omits dimensions. When
+the optional media type is absent, dimensions and a recognized image filename
+are required; an explicit non-image media type is not admitted.
 Unchanged or attachment-omitted updates do not refresh an image window. A text-only
 edit does not reset an image candidate.
 
@@ -87,7 +91,8 @@ Text matching uses independent bounded RAM (512 authors, 64 per guild, 16 posts,
 ## Logging
 
 Basic Discord log delivery remains. This process may remember a bounded recent
-snippet of observed message text (64 per guild, 10 minutes, 1000 characters) so a
-delete report can include supplied content when this process saw the create or
-content update. It is not a general message cache, SQL archive or REST history fetch.
+snippet of observed message text (64 per guild, 10 minutes, 1000 characters)
+and up to 1200 bytes of attachment URLs so a delete report can show what this
+process saw on create or update. It is not a general message cache, SQL archive
+or REST history fetch.
 Missing snippets report that content was not supplied to this process.

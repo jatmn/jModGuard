@@ -25,7 +25,13 @@ Basic Discord log delivery is independent of those retired history tables.
   the report. If no user ID is known, only a source channel exclusion can apply.
   The filter applies before Discord delivery and does not alter moderation
   enforcement or retained moderation records.
-- Single deletions report channel/message ID and disclose unavailable author/content.
+- Single deletions report channel/message ID and use a bounded recent observation
+  for author, text and attachment URLs when available. Empty text remains empty;
+  omitted fields remain unavailable. At most 1200 URL bytes are retained per
+  message, in the existing 64-entry-per-guild, ten-minute process-only cache.
+  An actual edit can replace the retained attachment URLs; an untimestamped
+  Gateway refresh does not clear them.
+  Links may expire under Discord's signed CDN URL policy.
   Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.
 - Join/leave reports use the delivered user and optional cached member join timestamp.
   Leave reports also use join timestamps already supplied with recent messages when

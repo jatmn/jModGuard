@@ -433,7 +433,7 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "message_delete",
-            "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}",
+            "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}\n**Attachments:** {attachments}",
         ),
         (
             "message_bulk_delete",
@@ -465,6 +465,9 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
     ]
 }
+
+/// Exact shipped delete template before attachment details were added.
+pub(crate) const PRE_ATTACHMENT_DELETE_TEMPLATE: &str = "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}";
 
 // Exact defaults from before the readable-log upgrade; used only for one-time migration.
 pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {
