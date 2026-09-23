@@ -887,13 +887,36 @@ async fn emit_to_observed_with_audit(
         }
     };
     let mut matched_audit = None;
-    let result = tokio::time::timeout(
-        deadline.saturating_sub(started.elapsed()),
-        async {
-            let cfg = app.configs.get(&app.db, guild_id.get()).await?;
-            let Some(channel_id) = channel_for(&cfg, event) else {
-                return Ok(Delivery::Unconfigured);
-            };
+    let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+        let cfg = app.configs.get(&app.db, guild_id.get()).await?;
+        let Some(channel_id) = channel_for(&cfg, event) else {
+            return Ok(Delivery::Unconfigured);
+        };
+        if cfg
+            .log_filters
+            .get(event)
+            .is_some_and(|filter| excluded(filter, &vars))
+        {
+            return Ok(Delivery::Unconfigured);
+        }
+        if member_audit_action(event).is_some() {
+            // Lookup is part of the admitted report, never an unbounded
+            // Gateway task or a history-recovery queue. Reserve delivery time.
+            let already_attributed = vars.contains_key("actor_id");
+            vars.entry("actor".into())
+                .or_insert_with(|| "unavailable".into());
+            vars.entry("actor_id".into())
+                .or_insert_with(|| "unavailable".into());
+            vars.entry("reason".into())
+                .or_insert_with(|| "unavailable".into());
+            if !already_attributed
+                && let Some(observation) = observation.as_ref()
+                && let Some(context) = lookup_member_audit(app, sink, guild_id, observation).await
+            {
+                matched_audit = Some(context.clone());
+                vars.extend(context);
+            }
+            // Moderator-ID exclusions can only be evaluated after attribution.
             if cfg
                 .log_filters
                 .get(event)
@@ -901,48 +924,21 @@ async fn emit_to_observed_with_audit(
             {
                 return Ok(Delivery::Unconfigured);
             }
-            if member_audit_action(event).is_some() {
-                // Lookup is part of the admitted report, never an unbounded
-                // Gateway task or a history-recovery queue. Reserve delivery time.
-                let already_attributed = vars.contains_key("actor_id");
-                vars.entry("actor".into())
-                    .or_insert_with(|| "unavailable".into());
-                vars.entry("actor_id".into())
-                    .or_insert_with(|| "unavailable".into());
-                vars.entry("reason".into())
-                    .or_insert_with(|| "unavailable".into());
-                if !already_attributed
-                    && let Some(observation) = observation.as_ref()
-                    && let Some(context) =
-                        lookup_member_audit(app, sink, guild_id, observation).await
-                {
-                    matched_audit = Some(context.clone());
-                    vars.extend(context);
-                }
-                // Moderator-ID exclusions can only be evaluated after attribution.
-                if cfg
-                    .log_filters
-                    .get(event)
-                    .is_some_and(|filter| excluded(filter, &vars))
-                {
-                    return Ok(Delivery::Unconfigured);
-                }
-            }
-            vars.insert("event".into(), event.to_owned());
-            vars.entry("time".into())
-                .or_insert_with(|| chrono::Utc::now().to_rfc3339());
-            vars.insert("guild".into(), guild_id.get().to_string());
-            let template = cfg
-                .templates
-                .get(event)
-                .map(String::as_str)
-                .unwrap_or_else(|| default_template(event));
-            templates::format_log_timestamps(&mut vars);
-            let rendered = templates::render_bounded(template, &vars, 2000);
-            sink.send(channel_id, log_message(&rendered)).await?;
-            Ok::<_, anyhow::Error>(Delivery::Sent)
-        },
-    )
+        }
+        vars.insert("event".into(), event.to_owned());
+        vars.entry("time".into())
+            .or_insert_with(|| chrono::Utc::now().to_rfc3339());
+        vars.insert("guild".into(), guild_id.get().to_string());
+        let template = cfg
+            .templates
+            .get(event)
+            .map(String::as_str)
+            .unwrap_or_else(|| default_template(event));
+        templates::format_log_timestamps(&mut vars);
+        let rendered = templates::render_bounded(template, &vars, 2000);
+        sink.send(channel_id, log_message(&rendered)).await?;
+        Ok::<_, anyhow::Error>(Delivery::Sent)
+    })
     .await;
     let delivery = match result {
         Ok(Ok(delivery)) => delivery,

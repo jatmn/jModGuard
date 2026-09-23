@@ -1334,7 +1334,8 @@ async fn gateway_ban_reuses_claimed_audit_for_report() {
             GuildId::new(789),
             "member_ban",
             vars,
-            Some(observation)
+            Some(observation),
+            Admission::Immediate,
         )
         .await,
         Delivery::Sent
@@ -1377,6 +1378,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         "member_ban",
         templates::user_vars(123, "username", "Display"),
         Some(observation),
+        Admission::Immediate,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);
