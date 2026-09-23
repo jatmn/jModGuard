@@ -110,8 +110,12 @@ function render() {
     row.append(action("Check now", () => request("/api/updates/check", { component: record.component }), false));
     const canApply = snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
     if (record.candidate) {
-      row.append(action(record.component === "webui" ? "Update WebUI" : "Update application", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest }), !canApply));
-      if (record.component !== "webui") row.append(action("Update launcher", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest, launcher: true }), !canApply));
+      const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate.digest;
+      row.append(action(record.component === "webui" ? "Update WebUI" : "Update application", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest }), !canApply || applicationCurrent));
+      if (record.component !== "webui") {
+        const launcherCurrent = record.installed_launcher?.digest === record.candidate.digest;
+        row.append(action("Update launcher", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest, launcher: true }), !canApply || launcherCurrent));
+      }
     }
     content.append(row);
     const channel = node("select");

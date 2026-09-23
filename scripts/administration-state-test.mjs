@@ -76,13 +76,12 @@ function record(component = "api") {
   };
 }
 
-function updateButton(pageState, component) {
+function updateButton(pageState, component, launcher = false) {
   const cards = pageState.elements.get("update-cards");
   const card = cards.children.find((item) =>
     find(item, (child) => child.tag === "h2")?.textContent === component.toUpperCase());
   assert.ok(card);
-  return find(card, (item) => item.tag === "button" && item.textContent.startsWith("Update application")
-    || item.tag === "button" && item.textContent === "Update WebUI");
+  return find(card, (item) => item.tag === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update application"));
 }
 
 function render(pageState, item) {
@@ -137,4 +136,28 @@ test("owner availability distinguishes baked source parity from channel mismatch
   api.channel = "nightly";
   render(view, api);
   assert.match(availability(), /unknown/);
+});
+
+test("owner cannot queue an already installed service release", () => {
+  const view = page();
+  const api = record();
+  api.installed = { ...api.candidate };
+  api.installed_launcher = { ...api.candidate };
+  render(view, api);
+  assert.equal(updateButton(view, "api").disabled, true);
+  assert.equal(updateButton(view, "api", true).disabled, true);
+
+  // A baked process with the same source SHA has no verified install digest.
+  api.installed = null;
+  api.installed_launcher = null;
+  api.candidate.source_sha = api.observed.source_sha;
+  render(view, api);
+  assert.equal(updateButton(view, "api").disabled, false);
+  assert.equal(updateButton(view, "api", true).disabled, false);
+
+  // A WebUI owner can retry a same-digest publication to repair Storage.
+  const webui = record("webui");
+  webui.installed = { ...webui.candidate };
+  render(view, webui);
+  assert.equal(updateButton(view, "webui").disabled, false);
 });

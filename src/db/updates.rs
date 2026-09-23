@@ -219,9 +219,11 @@ pub async fn request_component_install(
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let candidate: Option<String> = tx.query_row("SELECT candidate FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok(row.get(0)?))?;
+        let (candidate, installed): (Option<String>, Option<String>) = tx.query_row("SELECT candidate,installed FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok((row.get(0)?,row.get(1)?)))?;
         let candidate: ComponentRelease = serde_json::from_str(&candidate.context("no checked candidate")?)?;
         anyhow::ensure!(candidate.digest == digest, "candidate changed; check again");
+        let installed = parse_release(installed)?;
+        anyhow::ensure!(component == "webui" || installed.as_ref().is_none_or(|release| release.digest != digest), "application release is already installed");
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?])?;
         tx.commit()?;
         Ok(candidate)
@@ -241,14 +243,21 @@ pub async fn request_launcher_install(
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let candidate: Option<String> = tx.query_row(
-            "SELECT candidate FROM component_updates WHERE component=?1",
+        let (candidate, installed): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT candidate,installed_launcher FROM component_updates WHERE component=?1",
             params![component.clone()],
-            |row| Ok(row.get(0)?),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let candidate: ComponentRelease =
             serde_json::from_str(&candidate.context("no checked candidate")?)?;
         anyhow::ensure!(candidate.digest == digest, "candidate changed; check again");
+        let installed = parse_release(installed)?;
+        anyhow::ensure!(
+            installed
+                .as_ref()
+                .is_none_or(|release| release.digest != digest),
+            "launcher release is already installed"
+        );
         tx.execute(
             "UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
             params![component, serde_json::to_string(&candidate)?],
@@ -356,6 +365,29 @@ pub async fn record_component_running(
             tx.execute("UPDATE component_updates SET observed=?2,observed_at=?3 WHERE component=?1", params![component,observation,now])?;
         }
         tx.commit()?;
+        Ok(())
+    }).await
+}
+
+/// A container restart always starts the baked child first. Its source SHA may
+/// match an earlier managed release, but the old OCI digest is not verified for
+/// the baked executable. Keep a pending request so the launcher can restage it.
+pub async fn record_baked_component_running(
+    db: &Db,
+    component: &str,
+    observation: ComponentObservation,
+    now: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!(component, "bot" | "api"),
+        "invalid baked component"
+    );
+    let (component, observation) = (component.to_owned(), serde_json::to_string(&observation)?);
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE component_updates SET installed=NULL,installed_at=NULL,previous=NULL,observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE 'queued' END,last_error=NULL WHERE component=?1",
+            params![component,observation,now],
+        )?;
         Ok(())
     }).await
 }
@@ -917,6 +949,108 @@ mod tests {
         assert_eq!(state.desired.unwrap().digest, next.digest);
         assert_eq!(state.state, "queued");
         assert!(state.last_error.is_none());
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn baked_restart_clears_managed_identity_but_preserves_pending_install() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_updates_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let first = candidate('a');
+        let second = candidate('b');
+        let observed = ComponentObservation {
+            source_sha: first.source_sha.clone(),
+            executable_sha256: "c".repeat(64),
+            admin_sha256: None,
+            base_image_sha: first.source_sha.clone(),
+            started_at: 100,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "debian-bookworm-amd64".into(),
+        };
+        record_update_check(&db, "api", Some(first.clone()), None, 100)
+            .await
+            .unwrap();
+        request_component_install(&db, "api", &first.digest)
+            .await
+            .unwrap();
+        request_launcher_install(&db, "api", &first.digest)
+            .await
+            .unwrap();
+        record_component_running(&db, "api", Some(first.clone()), observed.clone(), 101)
+            .await
+            .unwrap();
+        record_launcher_running(&db, "api", &first, &"d".repeat(64), 101)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "api", &first.digest)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_launcher_install(&db, "api", &first.digest)
+                .await
+                .is_err()
+        );
+        let current = component_update(&db, "api").await.unwrap();
+        assert_eq!(current.state, "running");
+        assert_eq!(current.desired.unwrap().digest, first.digest);
+
+        record_update_check(&db, "api", Some(second.clone()), None, 102)
+            .await
+            .unwrap();
+        request_component_install(&db, "api", &second.digest)
+            .await
+            .unwrap();
+        let baked = ComponentObservation {
+            started_at: 200,
+            executable_sha256: "e".repeat(64),
+            ..observed.clone()
+        };
+        record_baked_component_running(&db, "api", baked.clone(), 201)
+            .await
+            .unwrap();
+        record_baked_launcher(&db, "api", &"f".repeat(64), 201)
+            .await
+            .unwrap();
+        let state = component_update(&db, "api").await.unwrap();
+        assert!(state.installed.is_none() && state.installed_at.is_none());
+        assert!(state.previous.is_none() && state.installed_launcher.is_none());
+        assert_eq!(state.desired.unwrap().digest, second.digest);
+        assert_eq!(state.state, "queued");
+        assert_eq!(state.observed.unwrap().started_at, 200);
+        assert_eq!(state.observed_at, Some(201));
+
+        // A normal heartbeat must not clear a managed release after it runs.
+        let managed_second = ComponentObservation {
+            source_sha: second.source_sha.clone(),
+            started_at: 202,
+            ..observed
+        };
+        record_component_running(
+            &db,
+            "api",
+            Some(second.clone()),
+            managed_second.clone(),
+            202,
+        )
+        .await
+        .unwrap();
+        record_component_running(&db, "api", None, managed_second, 203)
+            .await
+            .unwrap();
+        let state = component_update(&db, "api").await.unwrap();
+        assert_eq!(state.installed.unwrap().digest, second.digest);
+        assert_eq!(state.installed_at, Some(202));
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

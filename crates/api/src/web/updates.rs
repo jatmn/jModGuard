@@ -411,6 +411,19 @@ pub async fn install(
             "candidate changed; check again",
         ));
     }
+    let already_installed = if input.launcher {
+        record.installed_launcher.as_ref()
+    } else {
+        record.installed.as_ref()
+    };
+    if input.component != "webui"
+        && already_installed.is_some_and(|installed| installed.digest == candidate.digest)
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "selected release is already installed",
+        ));
+    }
     if input.component == "webui"
         && record.installed.as_ref().is_some_and(|installed| {
             installed.source_sha == candidate.source_sha && installed.digest != candidate.digest
@@ -461,14 +474,24 @@ pub async fn install(
         (
             db::request_launcher_install(&app.db, &input.component, &input.digest)
                 .await
-                .map_err(|_| error(StatusCode::CONFLICT, "candidate changed; check again"))?,
+                .map_err(|_| {
+                    error(
+                        StatusCode::CONFLICT,
+                        "candidate changed or launcher already installed; check again",
+                    )
+                })?,
             None,
         )
     } else {
         (
             db::request_component_install(&app.db, &input.component, &input.digest)
                 .await
-                .map_err(|_| error(StatusCode::CONFLICT, "candidate changed; check again"))?,
+                .map_err(|_| {
+                    error(
+                        StatusCode::CONFLICT,
+                        "candidate changed or application already installed; check again",
+                    )
+                })?,
             None,
         )
     };

@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
         exited=running.child.wait() => bail!("baked service exited before database opened: {}",exited?),
     };
     wait_ready(&mut running).await?;
+    db::record_baked_component_running(&db, &role, observation(&running, &base_sha), now()).await?;
     let registry = Registry::ghcr()?;
     let mut standby: Option<(PathBuf, String, Option<ComponentRelease>)> = None;
     if let Ok(digest) = std::env::var("JMODGUARD_LAUNCHER_RELEASE") {
