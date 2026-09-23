@@ -133,7 +133,8 @@ async fn stage(registry: &Registry, release: &ComponentRelease, name: &str) -> R
             .any(|line| line == format!("{hash}  bin/{name}")),
         "executable does not match image file inventory"
     );
-    let dir = std::env::temp_dir().join("jmodguard-updates");
+    // PID 1 reads only this fixed directory; TMPDIR is allowed to differ.
+    let dir = PathBuf::from("/tmp/jmodguard-updates");
     tokio::fs::create_dir_all(&dir).await?;
     let target = dir.join(format!("{}-{hash}", release.component));
     let temp = dir.join(format!(".stage-{:032x}", rand::random::<u128>()));
@@ -195,7 +196,7 @@ async fn maybe_update_launcher(
     compatible(db, release, now()).await?;
     let path = stage(registry, release, "jmodguard-launcher").await?;
     let hash = sha256_hex(&tokio::fs::read(&path).await?);
-    let control = std::env::temp_dir().join("jmodguard-launcher-next");
+    let control = PathBuf::from("/tmp/jmodguard-launcher-next");
     let contents = format!("{}\n{}\n{}\n", path.display(), hash, release.digest);
     tokio::fs::write(&control, contents).await?;
     Ok(true)
@@ -247,10 +248,11 @@ async fn main() -> Result<()> {
             result=running.child.wait() => {
                 let status=result?;
                 if running.release.is_some() {
+                    let failed=running.release.clone().expect("updated child has release");
                     let (path,sha,release)=standby.take().unwrap_or_else(||(baked.clone(),base_sha.clone(),None));
                     running=launch(&path,&sha,release.clone()).await?;
                     wait_ready(&mut running).await?;
-                    db::record_component_rollback(&db,&role,release,observation(&running,&base_sha),&format!("updated child exited: {status}"),now()).await?;
+                    db::record_component_rollback(&db,&role,&failed,release,observation(&running,&base_sha),&format!("updated child exited: {status}"),now()).await?;
                 } else { bail!("baked service exited: {status}"); }
             }
             _=tick.tick() => {
@@ -275,16 +277,16 @@ async fn main() -> Result<()> {
                 if state.installed.as_ref().is_some_and(|release| release.digest==candidate.digest)
                     && running.release.as_ref().is_some_and(|release| release.digest==candidate.digest) { continue; }
                 if candidate.component!=role || candidate.launcher_protocol!=1 {
-                    db::record_component_failure(&db,&role,"incompatible release role or launcher protocol").await?;
+                    db::record_component_failure(&db,&role,&candidate,"incompatible release role or launcher protocol").await?;
                     continue;
                 }
                 if let Err(error)=compatible(&db,&candidate,now()).await {
-                    db::record_component_failure(&db,&role,&format!("compatibility check: {error:#}")).await?;
+                    db::record_component_failure(&db,&role,&candidate,&format!("compatibility check: {error:#}")).await?;
                     continue;
                 }
                 let new_path=match stage(&registry,&candidate,&format!("jmodguard-{role}")).await {
                     Ok(path)=>path,
-                    Err(error)=>{db::record_component_failure(&db,&role,&format!("download: {error:#}")).await?;continue;}
+                    Err(error)=>{db::record_component_failure(&db,&role,&candidate,&format!("download: {error:#}")).await?;continue;}
                 };
                 let previous_path=running.path.clone();
                 let previous_sha=running.source_sha.clone();
@@ -301,11 +303,11 @@ async fn main() -> Result<()> {
                 match switched {
                     Ok(child)=>{
                         running=child;
-                        if let Err(error)=db::record_component_running(&db,&role,Some(candidate),observation(&running,&base_sha),now()).await {
+                        if let Err(error)=db::record_component_running(&db,&role,Some(candidate.clone()),observation(&running,&base_sha),now()).await {
                             stop(&mut running).await?;
                             running=launch(&previous_path,&previous_sha,previous_release).await?;
                             wait_ready(&mut running).await?;
-                            db::record_component_rollback(&db,&role,running.release.clone(),observation(&running,&base_sha),&format!("activation record: {error:#}"),now()).await?;
+                            db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("activation record: {error:#}"),now()).await?;
                         } else {
                             standby=Some((previous_path,previous_sha,previous_release));
                         }
@@ -313,7 +315,7 @@ async fn main() -> Result<()> {
                     Err(error)=>{
                         running=launch(&previous_path,&previous_sha,previous_release).await?;
                         wait_ready(&mut running).await?;
-                        db::record_component_rollback(&db,&role,running.release.clone(),observation(&running,&base_sha),&format!("readiness: {error:#}"),now()).await?;
+                        db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("readiness: {error:#}"),now()).await?;
                     }
                 }
             }

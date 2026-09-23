@@ -360,14 +360,21 @@ pub async fn record_component_running(
     }).await
 }
 
-pub async fn record_component_failure(db: &Db, component: &str, error: &str) -> Result<()> {
+pub async fn record_component_failure(
+    db: &Db,
+    component: &str,
+    failed: &ComponentRelease,
+    error: &str,
+) -> Result<()> {
     validate_component(component)?;
+    anyhow::ensure!(failed.component == component, "failed component mismatch");
     let component = component.to_owned();
+    let failed = serde_json::to_string(failed)?;
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         conn.execute(
-            "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?2 WHERE component=?1",
-            params![component, error],
+            "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?3 WHERE component=?1 AND desired=?2",
+            params![component, failed, error],
         )?;
         Ok(())
     })
@@ -379,13 +386,16 @@ pub async fn record_component_failure(db: &Db, component: &str, error: &str) -> 
 pub async fn record_component_rollback(
     db: &Db,
     component: &str,
+    failed: &ComponentRelease,
     previous: Option<ComponentRelease>,
     observation: ComponentObservation,
     error: &str,
     now: i64,
 ) -> Result<()> {
     validate_component(component)?;
+    anyhow::ensure!(failed.component == component, "failed component mismatch");
     let component = component.to_owned();
+    let failed = serde_json::to_string(failed)?;
     let previous = previous
         .map(|release| serde_json::to_string(&release))
         .transpose()?;
@@ -393,7 +403,7 @@ pub async fn record_component_rollback(
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute("UPDATE component_updates SET installed=?2,installed_at=?3,desired=NULL,observed=?4,observed_at=?3,state='failed',last_error=?5 WHERE component=?1",params![component,previous,now,observation,error])?;
+        tx.execute("UPDATE component_updates SET installed=?2,installed_at=?3,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed])?;
         tx.commit()?;
         Ok(())
     }).await
@@ -769,6 +779,7 @@ mod tests {
         assert_eq!(state.installed.unwrap().digest, second.digest);
         assert_eq!(state.previous.unwrap().digest, first.digest);
         assert_eq!(state.installed_at, Some(122));
+        assert_eq!(state.observed_at, Some(123));
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -822,6 +833,7 @@ mod tests {
         record_component_rollback(
             &db,
             "api",
+            &first,
             None,
             ComponentObservation {
                 source_sha: "b".repeat(40),
@@ -851,6 +863,59 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_failure_and_rollback_preserve_newer_accepted_request() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_updates_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let first = candidate('a');
+        let next = candidate('b');
+        record_update_check(&db, "api", Some(first.clone()), None, 100)
+            .await
+            .unwrap();
+        request_component_install(&db, "api", &first.digest)
+            .await
+            .unwrap();
+        record_update_check(&db, "api", Some(next.clone()), None, 101)
+            .await
+            .unwrap();
+        request_component_install(&db, "api", &next.digest)
+            .await
+            .unwrap();
+        record_component_failure(&db, "api", &first, "stale download failure")
+            .await
+            .unwrap();
+        let state = component_update(&db, "api").await.unwrap();
+        assert_eq!(state.desired.unwrap().digest, next.digest);
+        assert_eq!(state.state, "queued");
+
+        let observation = ComponentObservation {
+            source_sha: "c".repeat(40),
+            executable_sha256: "d".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "c".repeat(40),
+            started_at: 102,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "debian-bookworm-amd64".into(),
+        };
+        record_component_rollback(&db, "api", &first, None, observation, "stale rollback", 103)
+            .await
+            .unwrap();
+        let state = component_update(&db, "api").await.unwrap();
+        assert_eq!(state.desired.unwrap().digest, next.digest);
+        assert_eq!(state.state, "queued");
+        assert!(state.last_error.is_none());
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

@@ -148,8 +148,6 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create discord client")?;
 
-    jmodguard::mark_child_ready().context("failed to signal bot readiness")?;
-
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
 

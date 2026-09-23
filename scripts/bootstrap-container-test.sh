@@ -26,6 +26,7 @@ cat >"$scratch/updates/next" <<'SH'
 exit 42
 SH
 chmod 700 "$scratch/baked" "$scratch/updates/next"
-JMODGUARD_TEST_ROOT="$scratch" /bin/sh "$scratch/bootstrap"
+mkdir -p "$scratch/alternate-tmp"
+TMPDIR="$scratch/alternate-tmp" JMODGUARD_TEST_ROOT="$scratch" /bin/sh "$scratch/bootstrap"
 [ -f "$scratch/fallback" ] || { echo 'bootstrap fallback was not reached' >&2; exit 1; }
 echo 'bootstrap-container-test: ok'

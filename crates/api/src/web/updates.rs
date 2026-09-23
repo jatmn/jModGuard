@@ -4,7 +4,7 @@ use super::{is_bot_owner, require_auth, trusted_web_origin};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use jmodguard::db::{self, ComponentObservation, ComponentRelease};
+use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
@@ -139,7 +139,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
     let storage = storage()?;
     let root = storage.get("index.html").await?;
     let admin = storage.get("administration/index.html").await?;
-    if state.observed.as_ref().is_some_and(|observed| {
+    let matches_observed_html = state.observed.as_ref().is_some_and(|observed| {
         root.as_ref()
             .is_some_and(|bytes| sha256_hex(bytes) == observed.executable_sha256)
             && observed.admin_sha256.as_ref().is_none_or(|hash| {
@@ -147,8 +147,29 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                     .as_ref()
                     .is_some_and(|bytes| sha256_hex(bytes) == *hash)
             })
-    }) {
-        return Ok(());
+    });
+    if matches_observed_html
+        && let (Some(observed), Some(installed)) = (&state.observed, &state.installed)
+        && observed.source_sha == installed.source_sha
+    {
+        let registry = Registry::ghcr()?;
+        if storage
+            .verify_release(&registry, installed)
+            .await?
+            .is_some()
+        {
+            // A successful hourly check renews the observation only after the
+            // HTML and all immutable assets still match the installed digest.
+            db::record_component_running(
+                &app.db,
+                "webui",
+                None,
+                observed.clone(),
+                chrono::Utc::now().timestamp(),
+            )
+            .await?;
+            return Ok(());
+        }
     }
     if let Some(release) = state.desired.as_ref() {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
@@ -189,7 +210,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
         }
     }
     if state.observed.is_some() {
-        db::record_webui_drift(&app.db, "Storage HTML differs from the installed release").await?;
+        db::record_webui_drift(&app.db, "Storage files differ from the installed release").await?;
     }
     Ok(())
 }
@@ -256,18 +277,45 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
     }
     let now = chrono::Utc::now().timestamp();
     jmodguard_updater::compatible(&app.db, &candidate, now).await?;
-    let Some(release) =
-        db::request_due_automatic_install(&app.db, component, &candidate.digest, now, true).await?
-    else {
-        return Ok(());
+    let lease = if component == "webui" {
+        let lease = format!("{:032x}", rand::random::<u128>());
+        if !db::claim_update_lease(&app.db, component, &lease, now, 600).await? {
+            return Ok(());
+        }
+        Some(lease)
+    } else {
+        None
+    };
+    let requested =
+        db::request_due_automatic_install(&app.db, component, &candidate.digest, now, true).await;
+    let release = match requested {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            if let Some(lease) = &lease {
+                db::release_update_lease(&app.db, component, lease).await?;
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            if let Some(lease) = &lease {
+                db::release_update_lease(&app.db, component, lease).await?;
+            }
+            return Err(error);
+        }
     };
     if component == "webui" {
         let worker = Arc::clone(app);
+        let lease = lease.expect("WebUI install owns its lease");
         tokio::spawn(async move {
-            if let Err(error) = apply_webui(&worker, release).await {
+            if let Err(error) = apply_webui(&worker, release.clone(), &lease).await {
                 tracing::error!("automatic WebUI install failed: {error:#}");
-                let _ =
-                    db::record_component_failure(&worker.db, "webui", &format!("{error:#}")).await;
+                let _ = db::record_component_failure(
+                    &worker.db,
+                    "webui",
+                    &release,
+                    &format!("{error:#}"),
+                )
+                .await;
                 let _ = reconcile_webui(&worker).await;
             }
         });
@@ -308,6 +356,25 @@ pub struct InstallRequest {
     digest: String,
     #[serde(default)]
     launcher: bool,
+}
+
+async fn queue_webui_install(
+    db: &Db,
+    digest: &str,
+    now: i64,
+) -> anyhow::Result<(ComponentRelease, String)> {
+    let lease = format!("{:032x}", rand::random::<u128>());
+    anyhow::ensure!(
+        db::claim_update_lease(db, "webui", &lease, now, 600).await?,
+        "another WebUI operation is running"
+    );
+    match db::request_component_install(db, "webui", digest).await {
+        Ok(release) => Ok((release, lease)),
+        Err(error) => {
+            db::release_update_lease(db, "webui", &lease).await?;
+            Err(error)
+        }
+    }
 }
 
 pub async fn install(
@@ -380,19 +447,44 @@ pub async fn install(
             "service self-update is disabled or unobserved",
         ));
     }
-    let release = if input.launcher {
-        db::request_launcher_install(&app.db, &input.component, &input.digest).await
+    let (release, lease) = if input.component == "webui" {
+        let (release, lease) = queue_webui_install(&app.db, &input.digest, now)
+            .await
+            .map_err(|_| {
+                error(
+                    StatusCode::CONFLICT,
+                    "another WebUI operation is running or candidate changed",
+                )
+            })?;
+        (release, Some(lease))
+    } else if input.launcher {
+        (
+            db::request_launcher_install(&app.db, &input.component, &input.digest)
+                .await
+                .map_err(|_| error(StatusCode::CONFLICT, "candidate changed; check again"))?,
+            None,
+        )
     } else {
-        db::request_component_install(&app.db, &input.component, &input.digest).await
-    }
-    .map_err(|_| error(StatusCode::CONFLICT, "candidate changed; check again"))?;
+        (
+            db::request_component_install(&app.db, &input.component, &input.digest)
+                .await
+                .map_err(|_| error(StatusCode::CONFLICT, "candidate changed; check again"))?,
+            None,
+        )
+    };
     if input.component == "webui" {
         let worker = Arc::clone(&app);
+        let lease = lease.expect("WebUI install owns its lease");
         tokio::spawn(async move {
-            if let Err(error) = apply_webui(&worker, release).await {
+            if let Err(error) = apply_webui(&worker, release.clone(), &lease).await {
                 tracing::error!("WebUI install failed: {error:#}");
-                let _ =
-                    db::record_component_failure(&worker.db, "webui", &format!("{error:#}")).await;
+                let _ = db::record_component_failure(
+                    &worker.db,
+                    "webui",
+                    &release,
+                    &format!("{error:#}"),
+                )
+                .await;
                 let _ = reconcile_webui(&worker).await;
             }
         });
@@ -402,13 +494,19 @@ pub async fn install(
     ))
 }
 
-async fn apply_webui(app: &Arc<ApiState>, release: ComponentRelease) -> anyhow::Result<()> {
-    let storage = storage()?;
-    let lease = format!("{:032x}", rand::random::<u128>());
+async fn apply_webui(
+    app: &Arc<ApiState>,
+    release: ComponentRelease,
+    lease: &str,
+) -> anyhow::Result<()> {
+    let storage = match storage() {
+        Ok(storage) => storage,
+        Err(error) => {
+            db::release_update_lease(&app.db, "webui", lease).await?;
+            return Err(error);
+        }
+    };
     let now = chrono::Utc::now().timestamp();
-    if !db::claim_update_lease(&app.db, "webui", &lease, now, 600).await? {
-        anyhow::bail!("another WebUI operation is running");
-    }
     let result = async {
         db::track_webui_assets(&app.db, &release.source_sha, now).await?;
         let registry = Registry::ghcr()?;
@@ -447,6 +545,80 @@ async fn apply_webui(app: &Arc<ApiState>, release: ComponentRelease) -> anyhow::
     if let Err(error) = cleanup_webui_assets(app, &storage).await {
         tracing::warn!("WebUI managed asset cleanup deferred: {error:#}");
     }
-    db::release_update_lease(&app.db, "webui", &lease).await?;
+    db::release_update_lease(&app.db, "webui", lease).await?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn check_lease_blocks_webui_queue_before_acknowledgement() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_webui_queue_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let release = ComponentRelease {
+            component: "webui".into(),
+            channel: "stable".into(),
+            release_id: "v1.0.0".into(),
+            source_sha: "a".repeat(40),
+            published_at: "2026-09-23T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-webui".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            base_abi: "static-webui-v1".into(),
+        };
+        db::record_update_check(&db, "webui", Some(release.clone()), None, 100)
+            .await
+            .unwrap();
+        let check_lease = "c".repeat(32);
+        assert!(
+            db::claim_update_lease(&db, "webui", &check_lease, 100, 240)
+                .await
+                .unwrap()
+        );
+        assert!(
+            queue_webui_install(&db, &release.digest, 101)
+                .await
+                .is_err()
+        );
+        assert!(
+            db::component_update(&db, "webui")
+                .await
+                .unwrap()
+                .desired
+                .is_none()
+        );
+        db::release_update_lease(&db, "webui", &check_lease)
+            .await
+            .unwrap();
+        let (queued, lease) = queue_webui_install(&db, &release.digest, 102)
+            .await
+            .unwrap();
+        assert_eq!(queued.digest, release.digest);
+        assert_eq!(
+            db::component_update(&db, "webui")
+                .await
+                .unwrap()
+                .desired
+                .unwrap()
+                .digest,
+            release.digest
+        );
+        db::release_update_lease(&db, "webui", &lease)
+            .await
+            .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
