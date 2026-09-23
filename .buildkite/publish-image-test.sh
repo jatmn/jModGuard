@@ -198,12 +198,16 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}" "${nightly_args[@]}" \
   || fail 'nightly must tag the SHA'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly-20260915-${HEAD_SHA:0:12}" "${nightly_args[@]}" \
   || fail 'nightly must tag the unique label'
+contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly" "${nightly_args[@]}" \
+  && fail 'Nightly pointer must move only after verification'
 
 readarray -d '' -t stable_args < <(build_args bot "$HEAD_SHA" v1.2.3 . stable)
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${stable_args[@]}" \
   || fail 'stable must move latest'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
   || fail 'stable must tag the release'
+contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
+  && fail 'Stable pointer must move only after verification'
 
 # shellcheck disable=SC1091
 JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
@@ -261,6 +265,10 @@ mock_publish_helpers() {
   GITHUB_TOKEN_SEEN=""
   TRACE_FILE="$(mktemp "${PUBLISH_TEST_TRACE_DIR}/publish-trace-XXXXXX")"
 
+  verify_published_image() {
+    printf 'verify %s %s\n' "$1" "$2" >>"$TRACE_FILE"
+  }
+
   run_git() {
     printf 'git %s\n' "$*" >>"$TRACE_FILE"
     case "$1" in
@@ -284,6 +292,10 @@ mock_publish_helpers() {
       return 0
     fi
     if [[ "$1" == buildx ]]; then
+      if [[ "$2" == imagetools ]]; then
+        printf '{"digest":"sha256:%064d","size":10}\n' 0
+        return 0
+      fi
       printf '%s\n' "$*" >"${TRACE_FILE}.build"
       printf '%s' "${GITHUB_TOKEN:-}" >"${TRACE_FILE}.gtoken"
       if [[ "$FAIL_BUILD" == 1 ]]; then
@@ -741,6 +753,7 @@ run_bk() {
 }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi
   if [[ "$1" == buildx ]]; then
     EXPORTS=$((EXPORTS + 1))
     REGISTRY["${image}:latest"]="$manifest"
@@ -752,6 +765,7 @@ run_docker() {
   fi
   return 0
 }
+verify_published_image() { :; }
 if ( publish_component bot ) >/dev/null 2>&1; then
   fail 'first partial build must fail'
 fi
@@ -767,6 +781,7 @@ publish_component bot
 
 # Retried job must republish its planned SHA even if latest now points at a newer commit.
 reload_publisher
+verify_published_image() { :; }
 EXPORTS=0
 PLAN_JSON="$(plan_json main "" "$base" "$base" "")"
 export PLAN_JSON
@@ -813,6 +828,7 @@ run_bk() {
 }
 run_docker() {
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
+  if [[ "$1 $2" == 'buildx imagetools' ]]; then printf '{"digest":"sha256:%064d","size":10}\n' 0; return 0; fi
   if [[ "$1" == buildx ]]; then
     EXPORTS=$((EXPORTS + 1))
     return 0

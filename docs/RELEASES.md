@@ -1,5 +1,10 @@
 # Releases and update discovery
 
+The Bunny owner Administration page uses independent bot/API/WebUI GHCR image
+tags and exact digests, with no signed feed dependency. See
+[independent Bunny updates](BUNNY-UPDATES.md). The signed manifests below
+remain the legacy self-host conductor publication format.
+
 Public source produces signed Stable and Nightly publications. The conductor can
 browse complete manifests by channel and exact build. Selecting a build never
 deploys it automatically. Point-and-click apply/install is owner-selected when

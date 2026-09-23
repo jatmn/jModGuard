@@ -621,6 +621,9 @@ pub(super) fn seed_globals_conn(
             .unwrap();
         let mut legacy = stats.clone();
         legacy.aliases.clear();
+        legacy.permission = "everyone".into();
+        legacy.description =
+            "This server's retained moderation counts (records, warns, bans).".into();
         if !status_taken {
             commands_changed += conn.execute(
                 "UPDATE commands SET data = ?1 WHERE name = 'stats' AND data = ?2",
@@ -649,6 +652,32 @@ pub(super) fn seed_globals_conn(
             // INSERT OR IGNORE can also restore a deleted global default. Do not
             // give that restored command an alias already owned by another row.
             cmd.aliases.clear();
+        }
+        if cmd.name == "stats" {
+            // Change only byte-for-byte shipped definitions. An operator who
+            // deliberately selected `everyone` or edited any other field owns
+            // that definition, even if its permission matches the old default.
+            for had_alias in [false, true] {
+                let mut old = cmd.clone();
+                old.permission = "everyone".into();
+                old.description =
+                    "This server's retained moderation counts (records, warns, bans).".into();
+                old.aliases = if had_alias {
+                    vec!["status".into()]
+                } else {
+                    vec![]
+                };
+                let mut upgraded = cmd.clone();
+                upgraded.aliases = old.aliases.clone();
+                commands_changed += conn.execute(
+                    "UPDATE commands SET data=?1 WHERE guild_id=?2 AND name='stats' AND data=?3",
+                    params![
+                        serde_json::to_string(&upgraded)?,
+                        GLOBAL_SCOPE,
+                        serde_json::to_string(&old)?
+                    ],
+                )?;
+            }
         }
         if cmd.name == "setname" {
             let mut legacy = cmd.clone();

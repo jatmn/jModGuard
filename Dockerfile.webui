@@ -1,0 +1,4 @@
+# syntax=docker/dockerfile:1
+# Static release package only. The API remains a JSON/OAuth image without UI.
+FROM scratch
+COPY dist/webui/ /webui/

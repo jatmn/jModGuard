@@ -250,7 +250,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch("DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';")?;
+        conn.execute_batch("DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';")?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -2730,7 +2730,13 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
         let mut stats = crate::defaults::default_commands().into_iter().find(|c| c.name == "stats").unwrap();
         stats.aliases.clear();
         for guild in [0, 123, 456] {
-            if guild == 456 { stats.permission = "admin".into(); }
+            if guild == 456 {
+                stats.permission = "everyone".into();
+                stats.description = "Custom stats wording".into();
+            } else {
+                stats.permission = "everyone".into();
+                stats.description = "This server's retained moderation counts (records, warns, bans).".into();
+            }
             conn.execute(
                 "INSERT OR REPLACE INTO commands (guild_id, name, data) VALUES (?1, 'stats', ?2)",
                 params![guild, serde_json::to_string(&stats)?],
@@ -2761,9 +2767,10 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                 }
             }
             if guild == 456 {
-                assert_eq!(parts.commands["stats"].permission, "admin");
+                assert_eq!(parts.commands["stats"].permission, "everyone");
                 assert!(parts.commands["stats"].aliases.is_empty());
             } else {
+                assert_eq!(parts.commands["stats"].permission, "admin");
                 assert!(parts.commands["stats"].matches("status"));
             }
         }

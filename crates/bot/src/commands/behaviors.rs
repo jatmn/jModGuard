@@ -672,11 +672,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
             let s = db::guild_stats(&env.app.db, env.guild_id.get() as i64).await?;
-            let response = crate::templates::stats_response(
+            let updates = db::component_updates(&env.app.db).await.unwrap_or_default();
+            let response = crate::templates::stats_response_with_updates(
                 env.app.start.elapsed().as_secs(),
                 s.events,
                 s.warns,
                 s.bans,
+                &updates,
+                chrono::Utc::now().timestamp(),
             );
             Ok(BehaviorOutcome {
                 response: Some(response),

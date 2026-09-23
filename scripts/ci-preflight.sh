@@ -200,6 +200,9 @@ whitespace_check
 echo 'ci-preflight: bash .buildkite/publish-image-test.sh'
 bash .buildkite/publish-image-test.sh
 
+echo 'ci-preflight: bash scripts/bootstrap-container-test.sh'
+bash scripts/bootstrap-container-test.sh
+
 echo 'ci-preflight: cargo test --locked --workspace'
 cargo test --locked --workspace
 
@@ -235,6 +238,9 @@ node --test scripts/frontend-warmup-test.mjs
 
 echo 'ci-preflight: node --test scripts/publish-frontend-test.mjs'
 node --test scripts/publish-frontend-test.mjs
+
+echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
+node --test scripts/package-webui-test.mjs
 
 echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
 cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture

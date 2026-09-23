@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#e0eeff">
+  <title>Administration · jModGuard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to updates</a>
+  <main id="content" class="workspace" style="max-width:1000px;margin:auto;padding:32px">
+    <header class="workspace-header" style="display:flex;justify-content:space-between;align-items:center;gap:16px">
+      <div><span class="eyebrow">OWNER ADMINISTRATION</span><h1>Updates</h1></div>
+      <a class="btn btn-sm" href="/">Back to workspace</a>
+    </header>
+    <p id="update-status" role="status">Checking your access and release state…</p>
+    <div id="sign-in" class="hidden"><a class="btn btn-primary" href="/login?return_to=%2Fadministration%2Findex.html">Sign in with Discord</a></div>
+    <div id="updates" class="hidden">
+      <p>Release checks run hourly. You can check now or install a compatible release when on-demand updates are enabled.</p>
+      <p id="automatic-state"></p>
+      <p id="browser-version"></p>
+      <div id="update-cards" class="grid" style="display:grid;gap:16px"></div>
+    </div>
+  </main>
+  <script src="/administration.js"></script>
+</body>
+</html>

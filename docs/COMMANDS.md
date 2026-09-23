@@ -30,7 +30,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
 | `!about` | Utility | everyone | Bot info |
-| `!stats` | Utility | everyone | Readable uptime + this server’s retained moderation counts (alias: `!status`) |
+| `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, and bot/API/WebUI release state (alias: `!status`) |
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,

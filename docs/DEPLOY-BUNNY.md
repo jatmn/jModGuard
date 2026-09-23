@@ -16,15 +16,15 @@ workers: they talk to Bunny Database and (outbound) to Discord. They do not
 contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
-Publish the three `frontend/` files from **this public repository** or the
-`frontend/` paths in a signed Nightly/Stable/manual release manifest (Buildkite
-does not upload a separate frontend bundle on main). A private ops repository is
-**not required** for a Bunny install. See [INSTALL.md](INSTALL.md).
+Publish the five `frontend/` files for an initial manual setup, including the
+Administration page. New trusted Buildkite publications also create an independent
+WebUI GHCR package; the owner update path is described in
+[BUNNY-UPDATES.md](BUNNY-UPDATES.md). A private ops repository is not required.
 
 ```text
 Browser  →  Bunny CDN (Pull Zone)
               │
-              ├─ /  /app.js  /style.css   ← Storage Zone (frontend/)
+              ├─ /  /administration/  /assets/releases/   ← Storage Zone
               └─ /api  /login  /oauth/*   ← API Magic Container (origin only)
                                               │
 Discord  ←  bot Magic Container               │
@@ -92,8 +92,9 @@ private evidence resource.
 
 ## 2. Publish the admin UI to Storage + CDN
 
-The files are `frontend/index.html`, `frontend/app.js`, and
-`frontend/style.css` in this repository. How to get them and where they
+The files for a first manual upload are `frontend/index.html`, `frontend/app.js`,
+`frontend/style.css`, `frontend/administration/index.html`, and
+`frontend/administration.js`. How to get them and where they
 go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
 The browser loads daisyUI CSS and Headless UI from a CDN at runtime; do not
 upload those libraries into Storage. To serve them from your own pull zone
@@ -124,17 +125,21 @@ On the admin Pull Zone, Caching → General, **Strip Response Cookies** must
 be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual, public source).** In the Storage Zone, **Browse Files**,
-and upload those three files from this repository (or the same paths from a
+and upload those five files from this repository (or the same paths from a
 signed release manifest for the same tag) to the **root** so they are `/` (or `/index.html`),
-`/app.js`, and `/style.css`. Start from the same git tag as the container
+`/app.js`, `/style.css`, `/administration/index.html`, and
+`/administration.js`. Start from the same git tag as the container
 images so the first login works. After that, CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
 the page needs new API endpoints. daisyUI and Headless UI stay on the runtime
 CDN; they are not a fourth Storage object.
 
-**Later updates.** Upload the same three files again with **Browse Files**, or
-run [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
-with the environment variables below (never git). CSS/layout-only revisions can
+**Later updates.** The owner Administration page can install a WebUI package
+from GHCR using the Storage Zone password after the rollout gates in
+[BUNNY-UPDATES.md](BUNNY-UPDATES.md). The older
+[scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh)
+only handles the three legacy root files and still requires the account API key
+for cache purge; it is not part of the managed update path. CSS/layout-only revisions can
 publish without a new image; match the container revision again only when the
 page needs new API endpoints. That script backs up existing Storage objects,
 restores them if an upload fails, and records completion only after a

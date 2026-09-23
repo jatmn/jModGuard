@@ -20,13 +20,18 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 
 ## Getting and hosting the files
 
-The website is three first-party files in this repository, in the `frontend/` folder:
+The website has five first-party files in the `frontend/` folder:
 
 | File | What it is |
 |---|---|
 | `frontend/index.html` | the page |
 | `frontend/app.js` | the app |
 | `frontend/style.css` | the look |
+| `frontend/administration/index.html` | owner Administration and Updates page |
+| `frontend/administration.js` | update controls and version display |
+
+Buildkite also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
+The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
 
 The browser also loads **daisyUI CSS** and **Headless UI** (with React) at
 runtime from a CDN so searchable selects work. Those libraries are **not** in
@@ -56,8 +61,9 @@ serves them at `http://localhost:8080`.
 
 1. Create a Bunny **Storage Zone**. The create form requires a primary
    region and at least one replication region; do not skip replication.
-2. Put the three files in the **root** of that zone so they are `/index.html`
-   (or `/`), `/app.js`, and `/style.css`.
+2. Put the five first-party files at their paths in that zone so the root has
+   `/index.html` (or `/`), `/app.js`, `/style.css`, and `/administration.js`,
+   with `/administration/index.html` in its subdirectory.
 3. Create a **Pull Zone** whose origin is that Storage Zone. The public
    admin site is either the Pull Zone `*.b-cdn.net` hostname or an owned domain/subdomain
    you add on that zone. Use that same host for `JMODGUARD_WEB_BASE_URL` and
@@ -71,17 +77,14 @@ serves them at `http://localhost:8080`.
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
 
-You can upload by hand in the Bunny dashboard (**Browse Files**) from this
-public `frontend/` directory or the `frontend/` paths in a Nightly, Stable
-tag, or manual release manifest. Buildkite does not upload a separate frontend
-bundle on every main SHA. To repeat an upload from a checkout, run
+For an initial manual install, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. Buildkite publishes an independent WebUI package on trusted publication builds; it does not upload it to Bunny directly. The owner update action uses only a Storage Zone password after rollout. The older manual publisher handles only the three legacy root files and does not publish Administration. To repeat that legacy upload from a checkout, run
 [scripts/publish-frontend-bunny.sh](../scripts/publish-frontend-bunny.sh) with
 `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
 `BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
  selects a non-default `frontend/` directory. A private ops repo is **not required** to install.
 
-**Another host or CDN.** Copy the same three first-party files to the site root
+**Another host or CDN.** Copy the five first-party files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
 files can be newer). The page still fetches daisyUI and Headless UI from the
 runtime CDN unless you override `window.JMODGUARD_DAISYUI_HREF` and
@@ -197,11 +200,8 @@ owner tab keeps write access. The bearer is handed to the new tab in a URL fragm
 and expires after one hour. Administrator, Moderator, and
 Member apply distinct synthetic permission masks to permission-dependent responses;
 the owner's live Manage Server permission is still rechecked before every guild read.
-Preview never makes `is_bot_owner` true. An
-Administration link appears only when `web.conductor_url` / `JMODGUARD_CONDUCTOR_URL`
-is set; that origin uses a separate conductor login. When the conductor has a
-backup root configured, that Administration UI can create, download, upload and
-restore local archives. Guild API sessions cannot authenticate it.
+Preview never makes `is_bot_owner` true.
+The same-origin **Administration** link appears whenever `/api/me` identifies the bot owner. It opens `/administration/index.html` and uses the existing session. An optional `web.conductor_url` still opens the older, separate self-host conductor UI under **Legacy conductor**.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / settings) from
