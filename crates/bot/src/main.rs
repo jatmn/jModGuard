@@ -396,6 +396,7 @@ async fn main() -> Result<()> {
     let shutdown_cache = Arc::clone(&cache);
     tokio::spawn(async move {
         shutdown_signal().await;
+        shutdown_app.stop_startup_notice_task().await;
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
         let attempted = guild_ids.len();

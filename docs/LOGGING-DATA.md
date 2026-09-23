@@ -94,8 +94,9 @@ in `config.example.toml`. Conductor Administration can store owner-notification 
 monitoring budgets after operator login; bot Discord report concurrency remains a bot
 process setting until a later credential-delivery feature. Routine and startup
 report admission never waits, so overload drops those reports rather than building
-a content backlog. On graceful shutdown, the one system notice per configured
-server may wait for a delivery slot within that same per-notice deadline. All
+a content backlog. On graceful shutdown, the bot attempts one system notice
+for each cached server with a configured system channel. That notice may wait
+for a delivery slot within the same per-notice deadline. All
 shutdown notices share a three-second process budget; unfinished sends are
 cancelled so the bot can close its Discord shards within the updater's drain
 window. There is no application retry or replay queue;

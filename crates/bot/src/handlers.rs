@@ -113,7 +113,7 @@ impl EventHandler for Handler {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             let app = Arc::clone(self.app());
-            tokio::spawn(async move {
+            let startup = async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
                 tracing::info!(
                     "connected as {} — {} guilds; commands are live. If commands do not respond, \
@@ -142,7 +142,8 @@ impl EventHandler for Handler {
                     app.retry_slash_registry_version();
                 }
                 tracing::info!("startup slash sync complete");
-            });
+            };
+            self.app.spawn_startup_notice_task(startup).await;
         }
     }
 

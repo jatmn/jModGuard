@@ -961,6 +961,67 @@ async fn shutdown_phase_expires_even_when_all_delivery_slots_stay_busy() {
 }
 
 #[tokio::test]
+async fn shutdown_stops_pending_start_notices_before_sending_stop() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Arc::new(Sink::default());
+    let release_sync = Arc::new(tokio::sync::Notify::new());
+    let (sync_started, sync_started_rx) = tokio::sync::oneshot::channel();
+    let app = Arc::clone(&f.app);
+    let startup_sink = Arc::clone(&sink);
+    let startup_release = Arc::clone(&release_sync);
+    f.app
+        .spawn_startup_notice_task(async move {
+            let _ = sync_started.send(());
+            startup_release.notified().await;
+            emit_system_notice_to(
+                &app,
+                startup_sink.as_ref(),
+                GuildId::new(789),
+                "Bot started".into(),
+                Admission::Immediate,
+            )
+            .await;
+        })
+        .await;
+    sync_started_rx.await.unwrap();
+
+    f.app.stop_startup_notice_task().await;
+    release_sync.notify_waiters();
+    assert_eq!(
+        emit_shutdown_notices_to(
+            &f.app,
+            Arc::clone(&sink),
+            vec![GuildId::new(789)],
+            shutdown_notice_content(61),
+            Duration::from_secs(1),
+        )
+        .await,
+        1
+    );
+    let late_task_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran = Arc::clone(&late_task_ran);
+    f.app
+        .spawn_startup_notice_task(async move {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+    tokio::task::yield_now().await;
+    assert!(!late_task_ran.load(std::sync::atomic::Ordering::SeqCst));
+
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].1["content"]
+            .as_str()
+            .unwrap()
+            .contains("Bot shutting down")
+    );
+}
+
+#[tokio::test]
 async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_routes_separate() {
     let f = Fixture::new();
     for (guild, channel) in [(789, 456), (790, 457)] {
