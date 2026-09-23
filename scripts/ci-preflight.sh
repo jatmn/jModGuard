@@ -227,6 +227,9 @@ bash scripts/dependabot-config-test.sh
 echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
 node --test scripts/frontend-state-test.mjs
 
+echo 'ci-preflight: node --test scripts/frontend-contrast-test.mjs'
+node --test scripts/frontend-contrast-test.mjs
+
 echo 'ci-preflight: node --test scripts/frontend-warmup-test.mjs'
 node --test scripts/frontend-warmup-test.mjs
 
