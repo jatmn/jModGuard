@@ -397,27 +397,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
-        let mut notices = tokio::task::JoinSet::new();
-        for guild_id in shutdown_cache.guilds() {
-            // Each send uses the existing bounded log-delivery path. Avoid
-            // dropping excess guilds at its try-acquire concurrency limit.
-            while notices.len() >= shutdown_app.cfg.log.discord_concurrency {
-                if let Some(Err(error)) = notices.join_next().await {
-                    tracing::warn!("shutdown notice task failed: {error}");
-                }
-            }
-            let app = Arc::clone(&shutdown_app);
-            let http = Arc::clone(&shutdown_http);
-            let content = content.clone();
-            notices.spawn(async move {
-                logging::emit_shutdown_notice(&app, &http, guild_id, content).await;
-            });
-        }
-        while let Some(result) = notices.join_next().await {
-            if let Err(error) = result {
-                tracing::warn!("shutdown notice task failed: {error}");
-            }
-        }
+        let guild_ids = shutdown_cache.guilds();
+        let attempted = guild_ids.len();
+        let sent =
+            logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
+        tracing::info!(sent, attempted, "shutdown notice phase complete");
         tracing::info!("stopping Discord shards");
         shard_manager.shutdown_all().await;
     });

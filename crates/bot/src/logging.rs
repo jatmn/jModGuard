@@ -27,6 +27,7 @@ const MEMBER_JOINS_LIMIT: usize = 4096;
 const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
+const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
 /// Display-only correlation state. No entry may explain two reports, and an
 /// unresolved observation must not donate a delayed entry to a later action.
@@ -703,14 +704,57 @@ pub async fn emit_system_notice(
     emit_system_notice_to(app, http, guild_id, content, Admission::Immediate).await;
 }
 
-/// Gives a graceful-shutdown notice bounded access to the normal log route.
-pub async fn emit_shutdown_notice(
+/// Attempts one notice per cached guild within the process shutdown budget.
+pub async fn emit_shutdown_notices(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
-    guild_id: GuildId,
+    http: Arc<serenity::http::Http>,
+    guild_ids: Vec<GuildId>,
     content: String,
-) {
-    emit_system_notice_to(app, http, guild_id, content, Admission::WaitForShutdown).await;
+) -> usize {
+    emit_shutdown_notices_to(app, http, guild_ids, content, SHUTDOWN_NOTICE_PHASE).await
+}
+
+async fn emit_shutdown_notices_to<S: LogDelivery + Send + Sync + 'static>(
+    app: &Arc<BotState>,
+    sink: Arc<S>,
+    guild_ids: Vec<GuildId>,
+    content: String,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut notices = tokio::task::JoinSet::new();
+    for guild_id in guild_ids {
+        let app = Arc::clone(app);
+        let sink = Arc::clone(&sink);
+        let content = content.clone();
+        notices.spawn(async move {
+            emit_system_notice_to(
+                &app,
+                sink.as_ref(),
+                guild_id,
+                content,
+                Admission::WaitForShutdown,
+            )
+            .await
+        });
+    }
+    let mut sent = 0;
+    if tokio::time::timeout_at(deadline, async {
+        while let Some(result) = notices.join_next().await {
+            match result {
+                Ok(Delivery::Sent) => sent += 1,
+                Err(error) => tracing::warn!("shutdown notice task failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(pending = notices.len(), "shutdown notice phase timed out");
+        notices.abort_all();
+    }
+    sent
 }
 
 async fn emit_system_notice_to(

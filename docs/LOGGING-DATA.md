@@ -95,8 +95,10 @@ monitoring budgets after operator login; bot Discord report concurrency remains 
 process setting until a later credential-delivery feature. Routine and startup
 report admission never waits, so overload drops those reports rather than building
 a content backlog. On graceful shutdown, the one system notice per configured
-server may wait for a delivery slot within that same per-notice deadline before
-the bot closes its Discord shards. There is no application retry or replay queue;
+server may wait for a delivery slot within that same per-notice deadline. All
+shutdown notices share a three-second process budget; unfinished sends are
+cancelled so the bot can close its Discord shards within the updater's drain
+window. There is no application retry or replay queue;
 Serenity retains its normal request/rate-limit behavior within the deadline.
 The current shared limit does not establish per-guild fairness.
 

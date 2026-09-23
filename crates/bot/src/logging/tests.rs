@@ -912,6 +912,55 @@ async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
 }
 
 #[tokio::test]
+async fn shutdown_phase_attempts_all_guilds_with_shared_send_capacity() {
+    let f = Fixture::new();
+    for guild in 789..793 {
+        db::upsert_log_channel(&f.app.db, guild, "system", guild + 100)
+            .await
+            .unwrap();
+    }
+    let sink = Arc::new(Sink::default());
+    let sent = emit_shutdown_notices_to(
+        &f.app,
+        Arc::clone(&sink),
+        (789..793).map(GuildId::new).collect(),
+        shutdown_notice_content(61),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(sent, 4);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 4);
+    for channel in 889..893 {
+        assert!(
+            messages
+                .iter()
+                .any(|(id, _)| *id == ChannelId::new(channel))
+        );
+    }
+}
+
+#[tokio::test]
+async fn shutdown_phase_expires_even_when_all_delivery_slots_stay_busy() {
+    let f = Fixture::new();
+    let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+    let sent = tokio::time::timeout(
+        Duration::from_millis(500),
+        emit_shutdown_notices_to(
+            &f.app,
+            Arc::new(Sink::default()),
+            (789..793).map(GuildId::new).collect(),
+            shutdown_notice_content(61),
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("whole shutdown phase must expire before a stuck per-notice deadline");
+    assert_eq!(sent, 0);
+    drop(permit);
+}
+
+#[tokio::test]
 async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_routes_separate() {
     let f = Fixture::new();
     for (guild, channel) in [(789, 456), (790, 457)] {
