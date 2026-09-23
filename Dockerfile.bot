@@ -37,9 +37,9 @@ RUN apt-get update \
     && useradd --system --uid 10001 --home /data --shell /usr/sbin/nologin jmodguard \
     && mkdir -p /data \
     && chown jmodguard:jmodguard /data
+WORKDIR /data
 COPY --from=builder /app/release/ /usr/local/
 ARG SOURCE_SHA=unknown
-WORKDIR /data
 VOLUME ["/data"]
 USER 10001
 ENV JMODGUARD_DB_PATH=/data/jmodguard.db

@@ -403,7 +403,7 @@ pub async fn record_component_rollback(
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute("UPDATE component_updates SET installed=?2,installed_at=?3,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed])?;
+        tx.execute("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed])?;
         tx.commit()?;
         Ok(())
     }).await
@@ -846,6 +846,7 @@ mod tests {
         .unwrap();
         let state = component_update(&db, "api").await.unwrap();
         assert!(state.installed.is_none() && state.desired.is_none());
+        assert!(state.installed_at.is_none());
         assert_eq!(state.state, "failed");
         assert!(
             request_due_automatic_install(&db, "api", &first.digest, now + 86400, true)

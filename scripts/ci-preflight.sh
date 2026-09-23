@@ -242,6 +242,9 @@ node --test scripts/publish-frontend-test.mjs
 echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
 node --test scripts/package-webui-test.mjs
 
+echo 'ci-preflight: node --test scripts/administration-state-test.mjs'
+node --test scripts/administration-state-test.mjs
+
 echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
 cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture
 

@@ -338,6 +338,7 @@ exercise_publish() {
   local mode="${3:-main}"
   local source_token="${4:-}"
   local plan="${5:-}"
+  local component="${6:-api}"
   local ref="" sha="$HEAD_SHA"
   with_main
   GHCR_USERNAME=publisher
@@ -376,11 +377,11 @@ exercise_publish() {
     printf '%s\t\n' "$BASE_SHA"
   }
   if [[ "$FAIL_BUILD" == 1 ]]; then
-    if ( publish_component api ) >/dev/null 2>&1; then
+    if ( publish_component "$component" ) >/dev/null 2>&1; then
       fail 'failed build must not succeed'
     fi
   else
-    publish_component api
+    publish_component "$component"
   fi
   load_trace
   [[ -z "$(ls -A "$scratch" 2>/dev/null || true)" ]] || fail "scratch leftover: $(ls -A "$scratch")"
@@ -506,6 +507,12 @@ done
 exercise_publish 0 0 manual
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${BASE_SHA}" \
   || fail 'manual publication must build the planned SHA even when compare would skip'
+
+exercise_publish 0 0 manual '' '' conductor
+printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-conductor:${BASE_SHA}" \
+  || fail 'manual conductor publication must still build'
+printf '%s\n' "${CALLS[@]}" | grep -q '^verify ' \
+  && fail 'legacy conductor must not enter bot/API/WebUI image verification'
 
 reload_publisher
 run_git() {

@@ -523,7 +523,12 @@ publish_component() {
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel")
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
-  verify_published_image "$component" "${image}:${sha}" "$context"
+  # The legacy conductor image has no launcher or file inventory. Preserve its
+  # existing publication path; only the three independent update packages use
+  # the new final-image verifier.
+  if [[ "$component" != "conductor" ]]; then
+    verify_published_image "$component" "${image}:${sha}" "$context"
+  fi
   if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:${channel}" "${image}@${published_digest}" >/dev/null
     IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:${channel}")"
