@@ -435,10 +435,12 @@ struct Snippet {
 struct AttachmentPreview {
     count: usize,
     urls: Vec<String>,
+    // None is the create observation; edits use Discord's source timestamp.
+    edited_ms: Option<i64>,
 }
 
 impl AttachmentPreview {
-    fn new(urls: &[String]) -> Self {
+    fn new(urls: &[String], edited_ms: Option<i64>) -> Self {
         let mut remaining = ATTACHMENT_PREVIEW_BYTES;
         let mut retained = Vec::new();
         for url in urls {
@@ -450,6 +452,7 @@ impl AttachmentPreview {
         Self {
             count: urls.len(),
             urls: retained,
+            edited_ms,
         }
     }
 
@@ -475,6 +478,29 @@ pub fn remember_message(
     text: Option<&str>,
     attachments: Option<&[String]>,
 ) {
+    remember_message_with_attachment_edit(
+        app,
+        guild,
+        channel,
+        message,
+        author,
+        text,
+        attachments,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the source edit identity beside the attachment field.
+fn remember_message_with_attachment_edit(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
+    attachment_edit_ms: Option<i64>,
+) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
     let key = (guild, channel, message);
@@ -496,6 +522,16 @@ pub fn remember_message(
         cache.remove(&oldest);
     }
     let previous = cache.remove(&key);
+    let previous_text = previous.as_ref().and_then(|value| value.text.clone());
+    let previous_attachments = previous.and_then(|value| value.attachments);
+    let replace_attachments =
+        previous_attachments
+            .as_ref()
+            .is_none_or(|old| match (old.edited_ms, attachment_edit_ms) {
+                (Some(old), Some(new)) => new >= old,
+                (Some(_), None) => false,
+                (None, _) => true,
+            });
     cache.insert(
         key,
         Snippet {
@@ -504,10 +540,11 @@ pub fn remember_message(
             author,
             text: text
                 .map(|value| value.chars().take(SNIPPET_CHARS).collect())
-                .or_else(|| previous.as_ref().and_then(|value| value.text.clone())),
+                .or(previous_text),
             attachments: attachments
-                .map(AttachmentPreview::new)
-                .or_else(|| previous.and_then(|value| value.attachments)),
+                .filter(|_| replace_attachments)
+                .map(|urls| AttachmentPreview::new(urls, attachment_edit_ms))
+                .or(previous_attachments),
         },
     );
 }
@@ -521,20 +558,21 @@ pub(crate) fn remember_message_update(
     author: Option<u64>,
 ) {
     let Some(guild) = event.guild_id else { return };
-    let attachment_urls =
-        event
-            .edited_timestamp
-            .and(event.attachments.as_ref())
-            .map(|attachments| {
-                attachments
-                    .iter()
-                    .map(|attachment| attachment.url.clone())
-                    .collect::<Vec<_>>()
-            });
+    let attachment_edit_ms = event
+        .edited_timestamp
+        .map(|timestamp| timestamp.timestamp_millis());
+    let attachment_urls = attachment_edit_ms
+        .and(event.attachments.as_ref())
+        .map(|attachments| {
+            attachments
+                .iter()
+                .map(|attachment| attachment.url.clone())
+                .collect::<Vec<_>>()
+        });
     if event.content.is_none() && attachment_urls.is_none() {
         return;
     }
-    remember_message(
+    remember_message_with_attachment_edit(
         app,
         guild.get(),
         event.channel_id.get(),
@@ -542,6 +580,7 @@ pub(crate) fn remember_message_update(
         author,
         event.content.as_deref(),
         attachment_urls.as_deref(),
+        attachment_edit_ms,
     );
 }
 
