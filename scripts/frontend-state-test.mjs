@@ -1271,7 +1271,8 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   assert.match(textOf(h.app.ruleCard(legacy)), /inactive/);
   const modal=h.app.editRule(legacy);
   assert.doesNotMatch(textOf(modal), /Action escalation/);
-  assert.match(textOf(modal), /Delete matched messages and ban/);
+  const dryRun = findNode(modal,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(dryRun,n=>n.tag==='input').checked,true);
   const save=findNode(modal,n=>n.textContent === 'Save');
   await save.listeners.click({});
   assert.equal(calls.length,1);
@@ -1279,15 +1280,25 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   assert.deepEqual(calls[0].data.params,{mode:'exact_image_test',min_channels:2,min_attachments:2,window_secs:60});
   assert.deepEqual(calls[0].data.actions.map(a=>a.action),['log']);
   assert.equal(h.app.spamConfigured('attachment_flood', calls[0].data),true);
+  assert.match(textOf(h.app.ruleCard({name:'Images',rule_id:'attachment_flood',effective:calls[0].data})), /dry-run/);
+  assert.doesNotMatch(textOf(h.app.ruleCard({name:'Images',rule_id:'attachment_flood',effective:calls[0].data})), /log-only test/);
   calls[0].data.params.min_channels=1;
   assert.equal(h.app.spamConfigured('attachment_flood', calls[0].data),false);
   const punish=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,dry_run:true,params:{mode:'exact_image_test',min_channels:3,min_attachments:2,window_secs:60},actions:[{action:'log'}]}});
-  const enforcement = findNode(punish,n=>n.tag==='label' && textOf(n).includes('Delete matched messages and ban'));
-  findNode(enforcement,n=>n.tag==='input' && n.attrs.type==='checkbox').checked = true;
+  const dryRunToggle = findNode(punish,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
+  findNode(dryRunToggle,n=>n.tag==='input' && n.attrs.type==='checkbox').checked = false;
   await findNode(punish,n=>n.textContent === 'Save').listeners.click({});
   assert.equal(calls.at(-1).data.dry_run,false);
   assert.equal(calls.at(-1).data.params.mode,'exact_image');
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
+  const back=h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:calls.at(-1).data});
+  const backToggle = findNode(back,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(backToggle,n=>n.tag==='input').checked,false);
+  findNode(backToggle,n=>n.tag==='input').checked=true;
+  await findNode(back,n=>n.textContent==='Save').listeners.click({});
+  assert.equal(calls.at(-1).data.dry_run,true);
+  assert.equal(calls.at(-1).data.params.mode,'exact_image_test');
+  assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['log']);
 });
 
 test('checkbox labels inside rows keep primary text color', () => {
@@ -1347,6 +1358,19 @@ test('text rule UI can save independent thresholds without generic escalation', 
   assert.equal(calls[0].data.params.mode,'exact_text');
   assert.equal(calls[0].data.params.min_length,20);
   assert.equal(h.app.spamConfigured('repeat_text', calls[0].data),true);
+  assert.match(textOf(h.app.ruleCard({name:'Text',rule_id:'repeat_text',effective:calls[0].data})), /dry-run/);
+  const toggle=findNode(modal,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
+  findNode(toggle,n=>n.tag==='input').checked=false;
+  await findNode(modal,n=>n.textContent==='Save').listeners.click({});
+  assert.equal(calls.at(-1).data.dry_run,false);
+  assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['delete','ban']);
+  const back=h.app.editRule({name:'Text',rule_id:'repeat_text',effective:calls.at(-1).data});
+  const backToggle=findNode(back,n=>n.tag==='label' && textOf(n).includes('Dry-run (log only)'));
+  assert.equal(findNode(backToggle,n=>n.tag==='input').checked,false);
+  findNode(backToggle,n=>n.tag==='input').checked=true;
+  await findNode(back,n=>n.textContent==='Save').listeners.click({});
+  assert.equal(calls.at(-1).data.dry_run,true);
+  assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['log']);
 });
 
 test('image test UI rejects invalid thresholds before the API request', async () => {

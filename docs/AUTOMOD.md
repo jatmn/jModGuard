@@ -1,7 +1,8 @@
 # Automod
 
 jModGuard ships 8 rule entries. Exact-image and repeated-text spam use dedicated
-matchers with test or delete-and-ban mode. The other rules support:
+matchers. Their dry-run setting is the log-only test mode; turning it off selects
+delete-and-ban mode. The other rules support:
 
 - **parameters** (rule-specific, JSON),
 - an **action escalation table** — `at` = strike count at which an action
@@ -85,10 +86,12 @@ never trigger.
 
 ## Dry-run mode
 
-With dry-run on, the rule evaluates normally but instead of acting it posts a
-`[DRY RUN] would <action>` entry to the configured automod log channel. It does
-not create a SQL audit row. **Recommended workflow:** enable the bot, set all rules to dry-run,
-watch for a few days, then switch them live one by one.
+With dry-run on, generic rules evaluate normally but instead of acting post a
+`[DRY RUN] would <action>` entry to the configured automod log channel.
+Exact-image and repeated-text rules report their matched messages there without
+deleting or banning. Neither path creates a SQL audit row. **Recommended workflow:**
+enable the bot, set all rules to dry-run, watch for a few days, then switch them
+live one by one.
 
 ## Evidence
 
