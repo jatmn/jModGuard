@@ -50,8 +50,12 @@ fn select_update_author(
     event_author: Option<u64>,
     text_author: Option<u64>,
     image_author: Option<u64>,
+    snippet_author: Option<u64>,
 ) -> Option<u64> {
-    event_author.or(text_author).or(image_author)
+    event_author
+        .or(text_author)
+        .or(image_author)
+        .or(snippet_author)
 }
 
 pub(crate) struct UpdateObservation {
@@ -498,7 +502,7 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
-        let detector_author_id = event.guild_id.and_then(|guild| {
+        let known_author_id = event.guild_id.and_then(|guild| {
             let guild = guild.get();
             let channel = event.channel_id.get();
             let message = event.id.get();
@@ -506,18 +510,10 @@ impl EventHandler for Handler {
                 event.author.as_ref().map(|user| user.id.get()),
                 self.app.text_spam.author_of(guild, channel, message),
                 self.app.image_spam.author_of(guild, channel, message),
+                logging::known_message_author(&self.app, guild, channel, message),
             )
         });
-        let known_author_id = detector_author_id.or_else(|| {
-            event.guild_id.and_then(|guild| {
-                logging::known_message_author(
-                    &self.app,
-                    guild.get(),
-                    event.channel_id.get(),
-                    event.id.get(),
-                )
-            })
-        });
+        logging::remember_message_update(&self.app, &event, known_author_id);
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
                 self.app.member_joins.remember(
@@ -533,7 +529,7 @@ impl EventHandler for Handler {
             let channel = event.channel_id.get();
             let message = event.id.get();
             let update = UpdateObservation {
-                author: detector_author_id,
+                author: known_author_id,
                 received,
                 received_at,
             };
@@ -555,23 +551,6 @@ impl EventHandler for Handler {
                         &update,
                         text_revision,
                     );
-                    if event.content.is_some() || event.attachments.is_some() {
-                        let attachment_urls = event.attachments.as_ref().map(|attachments| {
-                            attachments
-                                .iter()
-                                .map(|attachment| attachment.url.clone())
-                                .collect::<Vec<_>>()
-                        });
-                        crate::logging::remember_message(
-                            &self.app,
-                            guild.get(),
-                            event.channel_id.get(),
-                            event.id.get(),
-                            update.author,
-                            event.content.as_deref(),
-                            attachment_urls.as_deref(),
-                        );
-                    }
                 }
                 Err(e) => {
                     tracing::warn!("message_update: config load failed: {e:#}");
@@ -702,11 +681,18 @@ mod tests {
     use serenity::model::guild::audit_log::{Action, MemberAction};
 
     #[test]
-    fn update_author_prefers_event_then_text_then_image_observation() {
-        assert_eq!(select_update_author(Some(1), Some(2), Some(3)), Some(1));
-        assert_eq!(select_update_author(None, Some(2), Some(3)), Some(2));
-        assert_eq!(select_update_author(None, None, Some(3)), Some(3));
-        assert_eq!(select_update_author(None, None, None), None);
+    fn update_author_prefers_event_then_detector_then_exact_message_snippet() {
+        assert_eq!(
+            select_update_author(Some(1), Some(2), Some(3), Some(4)),
+            Some(1)
+        );
+        assert_eq!(
+            select_update_author(None, Some(2), Some(3), Some(4)),
+            Some(2)
+        );
+        assert_eq!(select_update_author(None, None, Some(3), Some(4)), Some(3));
+        assert_eq!(select_update_author(None, None, None, Some(4)), Some(4));
+        assert_eq!(select_update_author(None, None, None, None), None);
     }
 
     #[test]

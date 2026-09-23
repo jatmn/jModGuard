@@ -512,6 +512,39 @@ pub fn remember_message(
     );
 }
 
+/// Refresh the delete preview at Gateway receipt time. Only an actual edit can
+/// replace attachment URLs; an untimestamped Gateway refresh may carry an empty
+/// attachment list even while the original attachments still exist.
+pub(crate) fn remember_message_update(
+    app: &BotState,
+    event: &MessageUpdateEvent,
+    author: Option<u64>,
+) {
+    let Some(guild) = event.guild_id else { return };
+    let attachment_urls =
+        event
+            .edited_timestamp
+            .and(event.attachments.as_ref())
+            .map(|attachments| {
+                attachments
+                    .iter()
+                    .map(|attachment| attachment.url.clone())
+                    .collect::<Vec<_>>()
+            });
+    if event.content.is_none() && attachment_urls.is_none() {
+        return;
+    }
+    remember_message(
+        app,
+        guild.get(),
+        event.channel_id.get(),
+        event.id.get(),
+        author,
+        event.content.as_deref(),
+        attachment_urls.as_deref(),
+    );
+}
+
 pub(crate) fn known_message_author(
     app: &BotState,
     guild: u64,

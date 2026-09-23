@@ -469,6 +469,92 @@ fn attachment_update_replaces_urls_without_inventing_text() {
 }
 
 #[test]
+fn gateway_refresh_keeps_attachment_preview_but_real_edits_replace_or_remove_it() {
+    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+    let original = "https://cdn.discordapp.com/attachments/456/1/original.jpg";
+    let replacement = "https://cdn.discordapp.com/attachments/456/2/replacement.jpg";
+    remember_message(
+        &app,
+        789,
+        456,
+        123,
+        Some(42),
+        Some(""),
+        Some(&[original.into()]),
+    );
+
+    // A refresh can contain an empty attachment list without being an edit.
+    remember_message_update(
+        &app,
+        &update(serde_json::json!({"content":"", "attachments":[]})),
+        Some(42),
+    );
+    remember_message_update(
+        &app,
+        &edited(serde_json::json!({"attachments":[{
+            "id":"555", "filename":"replacement.jpg",
+            "proxy_url":replacement, "url":replacement, "size":100
+        }]})),
+        Some(42),
+    );
+    let replaced = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(replaced.vars["content"], "empty");
+    assert!(replaced.vars["attachments"].contains(replacement));
+    assert!(!replaced.vars["attachments"].contains(original));
+
+    remember_message(
+        &app,
+        789,
+        456,
+        123,
+        Some(42),
+        Some(""),
+        Some(&[original.into()]),
+    );
+    remember_message_update(
+        &app,
+        &update(serde_json::json!({"attachments":[]})),
+        Some(42),
+    );
+    let refreshed = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert!(refreshed.vars["attachments"].contains(original));
+
+    remember_message(
+        &app,
+        789,
+        456,
+        123,
+        Some(42),
+        Some(""),
+        Some(&[original.into()]),
+    );
+    remember_message_update(
+        &app,
+        &edited(serde_json::json!({"attachments":[]})),
+        Some(42),
+    );
+    let removed = message_delete_report(
+        &app,
+        GuildId::new(789),
+        ChannelId::new(456),
+        MessageId::new(123),
+    );
+    assert_eq!(removed.vars["attachments"], "none");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn partial_update_without_author_preserves_create_snippet_author() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();

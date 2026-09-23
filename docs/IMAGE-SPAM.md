@@ -35,8 +35,9 @@ skip and does not punish.
 ## Matching
 
 **Images:** one author in one guild posts the same common set of distinct SHA-256
-image hashes across the configured number of distinct channels. Extra images, order
-and filenames do not matter. Creates and attachment-changing edits participate.
+image hashes across the configured number of distinct channels. Once attachments
+are admitted as images, extra images, order and filenames do not affect byte
+matching. Creates and attachment-changing edits participate.
 An explicit image media type is enough even when Discord omits dimensions. When
 the optional media type is absent, dimensions and a recognized image filename
 are required; an explicit non-image media type is not admitted.
