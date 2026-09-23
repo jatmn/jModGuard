@@ -39,9 +39,15 @@ for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme=
 }
 
 test("component borders use the contrast-tested theme colors", () => {
+  // daisyUI 5 uses --border as a width in its border shorthand. Defining it as
+  // a theme color invalidates that shorthand and makes unchecked boxes invisible.
+  assert.doesNotMatch(css, /(?:^|[;{\s])--border\s*:/m);
+  assert.match(css, /--shell-border:\s*#[\da-fA-F]{6}/);
+  assert.match(css, /border:\s*1px solid var\(--shell-border\)/);
   assert.match(css, /\.input, \.select, \.textarea\s*\{\s*--input-color:\s*var\(--input-border\)/);
   const checkbox = css.match(/\.checkbox\s*\{([^}]*)\}/)?.[1];
   assert.ok(checkbox, "missing checkbox theme rule");
+  assert.match(checkbox, /border-width:\s*2px/);
   assert.match(checkbox, /border-color:\s*var\(--input-border\)/);
   // daisyUI owns the checked fill inside a CSS layer; an unlayered fill here hides its check mark.
   assert.doesNotMatch(checkbox, /background-color\s*:/);
