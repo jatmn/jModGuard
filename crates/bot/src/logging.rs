@@ -428,6 +428,7 @@ struct Snippet {
     at: Instant,
     guild: u64,
     author: u64,
+    webhook: bool,
     text: Option<String>,
     attachments: Option<AttachmentPreview>,
 }
@@ -478,6 +479,29 @@ pub fn remember_message(
     text: Option<&str>,
     attachments: Option<&[String]>,
 ) {
+    remember_message_create(
+        app,
+        guild,
+        channel,
+        message,
+        author,
+        text,
+        attachments,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // Create identity travels with the message observation.
+pub(crate) fn remember_message_create(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
+    text: Option<&str>,
+    attachments: Option<&[String]>,
+    webhook: bool,
+) {
     remember_message_with_attachment_edit(
         app,
         guild,
@@ -487,6 +511,7 @@ pub fn remember_message(
         text,
         attachments,
         None,
+        webhook,
     );
 }
 
@@ -500,6 +525,7 @@ fn remember_message_with_attachment_edit(
     text: Option<&str>,
     attachments: Option<&[String]>,
     attachment_edit_ms: Option<i64>,
+    webhook: bool,
 ) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
@@ -522,6 +548,7 @@ fn remember_message_with_attachment_edit(
         cache.remove(&oldest);
     }
     let previous = cache.remove(&key);
+    let webhook = webhook || previous.as_ref().is_some_and(|value| value.webhook);
     let previous_text = previous.as_ref().and_then(|value| value.text.clone());
     let previous_attachments = previous.and_then(|value| value.attachments);
     let replace_attachments =
@@ -538,6 +565,7 @@ fn remember_message_with_attachment_edit(
             at: Instant::now(),
             guild,
             author,
+            webhook,
             text: text
                 .map(|value| value.chars().take(SNIPPET_CHARS).collect())
                 .or(previous_text),
@@ -581,7 +609,21 @@ pub(crate) fn remember_message_update(
         event.content.as_deref(),
         attachment_urls.as_deref(),
         attachment_edit_ms,
+        matches!(event.webhook_id, Some(Some(_))),
     );
+}
+
+pub(crate) fn known_message_webhook(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+) -> bool {
+    let mut cache = app.log_snippets.inner.lock();
+    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
+    cache
+        .get(&(guild, channel, message))
+        .is_some_and(|snippet| snippet.webhook)
 }
 
 pub(crate) fn known_message_author(
