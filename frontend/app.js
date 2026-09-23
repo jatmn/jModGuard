@@ -2075,7 +2075,7 @@ function tabBans() {
         el("td", {}, r.user_display_name ? `${r.user_display_name} (${r.user_name ? `${r.user_name}, ` : ""}${r.user_id})` : (r.user_name ? `${r.user_name} (${r.user_id})` : r.user_id)),
         el("td", { text: r.active ? "banned" : "unbanned" }),
         el("td", {}, r.moderator_id ? (r.moderator_name ? `${r.moderator_name} (${r.moderator_id})` : r.moderator_id) : "Unavailable"),
-        el("td", { text: r.reason || "" }),
+        el("td", { text: r.reason || "Reason unavailable" }),
         el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
         el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
           if (!confirm(`Unban ${r.user_id}?`)) return;

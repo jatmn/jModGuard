@@ -241,6 +241,22 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
+        let observed_at = observed.to_rfc3339();
+        // Record the supplied identity before any audit HTTP wait. An unban
+        // observed during that wait must be able to mark this row inactive.
+        let ban_row_id = db::record_enrolled_ban_with_identity(
+            &app.db,
+            enrollment.clone(),
+            banned_user.id.get() as i64,
+            Some(&banned_user.name),
+            banned_user.global_name.as_deref(),
+            None,
+            None,
+            "Reason unavailable",
+            Some(&observed_at),
+        )
+        .await
+        .ok();
         // Resolve the audit context even when no dedicated ban log channel is
         // configured, so the WebUI can retain the known moderator and reason.
         let audit = if let (Some(observation), Ok(_permit)) =
@@ -250,32 +266,26 @@ impl EventHandler for Handler {
         } else {
             None
         };
-        let moderator_id = audit
-            .as_ref()
-            .and_then(|vars| vars.get("actor_id"))
-            .and_then(|id| id.parse::<i64>().ok());
-        let reason = audit
-            .as_ref()
-            .and_then(|vars| vars.get("reason"))
-            .map(String::as_str)
-            .unwrap_or("banned (audit)");
-        let observed_at = observed.to_rfc3339();
-        let ban_row_id = db::record_enrolled_ban_with_identity(
-            &app.db,
-            enrollment.clone(),
-            banned_user.id.get() as i64,
-            Some(&banned_user.name),
-            banned_user.global_name.as_deref(),
-            moderator_id,
-            audit
-                .as_ref()
-                .and_then(|vars| vars.get("actor_name"))
-                .map(String::as_str),
-            reason,
-            Some(&observed_at),
-        )
-        .await
-        .ok();
+        if let (Some(row_id), Some(context)) = (ban_row_id, audit.as_ref()) {
+            let moderator_id = context
+                .get("actor_id")
+                .and_then(|id| id.parse::<i64>().ok());
+            if let Some(moderator_id) = moderator_id {
+                let _ = db::attribute_enrolled_ban(
+                    &app.db,
+                    enrollment.clone(),
+                    row_id,
+                    banned_user.id.get() as i64,
+                    moderator_id,
+                    context.get("actor_name").map(String::as_str),
+                    context
+                        .get("reason")
+                        .map(String::as_str)
+                        .unwrap_or("No reason provided"),
+                )
+                .await;
+            }
+        }
         if !app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Ban,
             guild_id.get(),

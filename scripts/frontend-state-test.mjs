@@ -121,7 +121,7 @@ function textOf(root) {
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
   const h = harness(async () => response([
     { user_id: '172697277964615681', user_name: 'wavingwalker', user_display_name: 'Wavingwalker', moderator_id: '1800882749273538599', moderator_name: 'ikaika44', active: true, reason: 'No reason provided', created_at: '2026-09-22T23:16:28Z' },
-    { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: 'banned (audit)', created_at: '2026-09-22T07:43:34Z' },
+    { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2026-09-22T07:43:34Z' },
   ]));
   const panel = h.app.tabBans();
   await new Promise(resolve => setImmediate(resolve));
@@ -130,6 +130,7 @@ test('Bans shows known names and actor with exact IDs and honest unknown fallbac
   assert.match(text, /ikaika44 \(1800882749273538599\)/);
   assert.match(text, /823826232020959242/);
   assert.match(text, /Unavailable/);
+  assert.match(text, /Reason unavailable/);
 });
 
 test('dashboard moderation counts stay with their requested server', async () => {

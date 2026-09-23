@@ -91,7 +91,7 @@ ban-mirror and event writes if a move fence was raised after dispatch.
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
-bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage now runs through step 0013.
+bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage now runs through step 0014.
 
 ## Dispatch library
 

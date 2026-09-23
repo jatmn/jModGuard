@@ -113,7 +113,7 @@ database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress and tenant settings. Initialize verifies and upgrades a matching version1–7
 store atomically; open requires 8. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0013. Each opener refuses the other family. No records are moved by startup.
+migration 0014. Each opener refuses the other family. No records are moved by startup.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
 Selected case payload removal, replay-key cleanup and live guild erasure are described in

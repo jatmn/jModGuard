@@ -38,8 +38,8 @@ Basic Discord log delivery is independent of those retired history tables.
   action to display the moderator and actual reason. The bot needs **View Audit Log**.
   Lookup is best-effort: each attempt group makes at most three reads of the latest
   100 entries for that action under the report concurrency limit, using at most half
-  the configured deadline (capped at three seconds). A gateway ban tries before
-  saving its row; the report reuses a match or may try again if none was found.
+  the configured deadline (capped at three seconds). A gateway ban saves its
+  row first, then tries; the report reuses a match or may try again if none was found.
   If the report finds the audit entry later, it updates only that saved ban row
   under the same membership and write-fence checks.
   Entries must be within ten seconds before to three seconds
@@ -59,10 +59,11 @@ Basic Discord log delivery is independent of those retired history tables.
   Latest-observation records are process-only, capped at 4096 and kept for 30 seconds.
   If an observation cannot be tracked at capacity, enrichment pauses for that interval;
   report delivery continues with unavailable fields. No past reports are retried.
-  On a Gateway ban, the same bounded audit match supplies the moderator ID and
-  reason saved with the Bans row. The supplied banned-user name is saved with
-  that row. Older rows and actions without a known name or reliable audit match
-  show the ID or unavailable moderator in the WebUI.
+  On a Gateway ban, the supplied banned-user name is saved before the bounded
+  audit lookup. A matching entry adds the moderator ID and actual reason to
+  that same row. Without a reliable match, a new row says "Reason unavailable";
+  older rows keep their recorded text. Rows without a known name or reliable
+  moderator show the ID or unavailable moderator in the WebUI.
 - Startup, routine command-plan execution and test/log-only automod reports use Discord
   channels, without a generic SQL event copy. Delete-only automod reports are transient.
   Plans containing timeout/kick/ban steps retain their existing SQL execution summary;

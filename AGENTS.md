@@ -39,7 +39,7 @@ embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. 
 report is that one event. Leave logs may use bounded join timestamps already received
 with messages; never fetch a roster. Ban/unban display may use bounded recent audit
 lookup inside report admission; a gateway ban may use the same bounded lookup
-under the report concurrency limit before saving its row. Neither establishes
+under the report concurrency limit after saving its row. Neither establishes
 durable case-source identity.
 General message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do

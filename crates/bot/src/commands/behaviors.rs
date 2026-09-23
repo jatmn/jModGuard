@@ -59,12 +59,16 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             .await;
             match outcome {
                 crate::db::guild_data::CaseOutcome::Succeeded => {
-                    db::record_enrolled_ban(
+                    db::record_enrolled_ban_with_identity(
                         &env.app.db,
                         enrollment.clone(),
                         target.get() as i64,
+                        target_user.known_name.as_deref(),
+                        target_user.global_name.as_deref(),
                         Some(env.actor.get() as i64),
+                        Some(&env.actor_member.user.name),
                         &reason,
+                        None,
                     )
                     .await?;
                 }
@@ -732,17 +736,21 @@ async fn target_and_reason(
 }
 
 async fn user_lookup(env: &CmdEnv<'_>, id: serenity::model::id::UserId) -> Result<UserInfo> {
-    let name = env
-        .ctx
-        .cache
-        .user(id)
-        .map(|u| u.name.clone())
-        .unwrap_or_else(|| id.to_string());
-    Ok(UserInfo { name })
+    let known_user = env.ctx.cache.user(id);
+    let known_name = known_user.as_ref().map(|u| u.name.clone());
+    let global_name = known_user.as_ref().and_then(|u| u.global_name.clone());
+    let name = known_name.clone().unwrap_or_else(|| id.to_string());
+    Ok(UserInfo {
+        name,
+        known_name,
+        global_name,
+    })
 }
 
 struct UserInfo {
     name: String,
+    known_name: Option<String>,
+    global_name: Option<String>,
 }
 
 fn parse_channel_mention(token: &str) -> Option<ChannelId> {

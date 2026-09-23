@@ -208,11 +208,18 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
         None,
         None,
         None,
-        "banned (audit)",
+        "Reason unavailable",
         None,
     )
     .await
     .unwrap();
+    assert_eq!(
+        list_bans(&api, 10, 10).await.unwrap()[0].reason.as_deref(),
+        Some("Reason unavailable")
+    );
+    mark_enrolled_unbanned(&f.db, Some(scope.clone()), user_id + 1)
+        .await
+        .unwrap();
     attribute_enrolled_ban(
         &f.db,
         Some(scope.clone()),
@@ -226,6 +233,7 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
     .unwrap();
     let later = list_bans(&api, 10, 10).await.unwrap();
     assert_eq!(later[0].moderator_id, Some(777));
+    assert!(!later[0].active, "a late audit must not undo an unban");
     assert_eq!(later[0].moderator_name.as_deref(), Some("late-moderator"));
     assert_eq!(later[0].reason.as_deref(), Some("late audit reason"));
     assert_eq!(later[1].moderator_name.as_deref(), Some("ikaika44"));
