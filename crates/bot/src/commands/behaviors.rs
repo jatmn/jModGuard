@@ -1140,6 +1140,7 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
         Behavior::Rule { .. } => vec![
             opt("name", Str, true, "Rule name"),
             opt("action", Str, false, "toggle | dryrun"),
+            opt("value", Str, false, "on | off (dryrun)"),
         ],
         Behavior::Logchannel { .. } => vec![
             opt("action", Str, true, "list | set | unset"),
@@ -1174,12 +1175,21 @@ mod tests {
         );
         assert_eq!(prefix.next_arg().as_deref(), Some("off"));
 
-        let mut slash = Args::new("repeat_text dryrun on");
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|command| matches!(command.behavior, Behavior::Rule { .. }))
+            .unwrap();
+        let options = [
+            ("name".into(), "repeat_text".into()),
+            ("action".into(), "dryrun".into()),
+            ("value".into(), "off".into()),
+        ];
+        let mut slash = Args::from_parts(super::super::options_to_args(&command, &options));
         assert_eq!(
             rule_action_and_id(&mut slash, "list"),
             ("dryrun".into(), "repeat_text".into())
         );
-        assert_eq!(slash.next_arg().as_deref(), Some("on"));
+        assert_eq!(slash.next_arg().as_deref(), Some("off"));
     }
 
     #[test]

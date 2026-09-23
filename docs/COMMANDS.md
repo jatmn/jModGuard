@@ -37,6 +37,10 @@ Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/setname`, `/prefix`, `/template`, `/rule`, `/testregex`, `/help`, `/about`,
 `/stats`).
 
+For `/rule`, set `name` to the rule ID, `action` to `dryrun`, and `value` to
+`on` or `off`. `off` switches exact-image and repeated-text rules to normal
+delete-and-ban mode.
+
 ## Permission levels
 
 Checked before a command runs; the *caller's* level decides access:
