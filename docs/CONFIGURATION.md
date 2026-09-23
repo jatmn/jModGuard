@@ -136,9 +136,13 @@ the exact limitation and the restore drill required before production.
 
 `log.discord_concurrency` (default 8, environment `JMODGUARD_LOG_DISCORD_CONCURRENCY`)
 and `log.discord_timeout_secs` (default 10, environment `JMODGUARD_LOG_DISCORD_TIMEOUT_SECS`)
-are positive bot bootstrap controls. Admission never waits; the deadline includes config
-lookup and delivery. Saturated/failed reports are dropped without a persistent queue or
-replay. A cumulative counter produces sparse process warnings without raw report content.
+are positive bot bootstrap controls. Routine and startup report admission never
+waits; saturation drops those reports. A graceful-shutdown system notice may
+wait for a delivery slot, but all shutdown notices share a three-second process
+budget before shard closure. The per-report deadline includes admission (for
+shutdown), config lookup and delivery. Failed or unfinished reports have no
+persistent queue or replay. A cumulative counter produces sparse process warnings
+without raw report content.
 Operator UI controls and per-guild fairness remain pending. These defaults are tunable,
 not measured throughput budgets. See [logging/data status](LOGGING-DATA.md).
 

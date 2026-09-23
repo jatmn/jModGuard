@@ -827,6 +827,201 @@ impl LogDelivery for Sink {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let content = shutdown_notice_content(3_661);
+    assert_eq!(
+        content,
+        format!(
+            "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(
+        emit_system_notice_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            content,
+            Admission::Immediate
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(
+        emit_system_notice_to(
+            &f.app,
+            &sink,
+            GuildId::new(790),
+            "not configured".into(),
+            Admission::Immediate,
+        )
+        .await,
+        Delivery::Unconfigured
+    );
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, ChannelId::new(456));
+    let rendered = messages[0].1["content"].as_str().unwrap();
+    assert!(rendered.starts_with("**:gear: System notice**\n\n**Time:** `"));
+    assert!(rendered.ends_with(&format!(
+        "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+        env!("CARGO_PKG_VERSION")
+    )));
+}
+
+#[tokio::test]
+async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
+    use std::future::Future;
+
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Sink::default();
+    let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+    let mut notice = Box::pin(emit_system_notice_to(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        shutdown_notice_content(61),
+        Admission::WaitForShutdown,
+    ));
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(notice.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    assert!(sink.messages.lock().unwrap().is_empty());
+    drop(permit);
+    assert_eq!(notice.await, Delivery::Sent);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, ChannelId::new(456));
+    assert!(
+        messages[0].1["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "Bot shutting down (v{}). Uptime: 1 minute, 1 second",
+                env!("CARGO_PKG_VERSION")
+            ))
+    );
+}
+
+#[tokio::test]
+async fn shutdown_phase_attempts_all_guilds_with_shared_send_capacity() {
+    let f = Fixture::new();
+    for guild in 789..793 {
+        db::upsert_log_channel(&f.app.db, guild, "system", guild + 100)
+            .await
+            .unwrap();
+    }
+    let sink = Arc::new(Sink::default());
+    let sent = emit_shutdown_notices_to(
+        &f.app,
+        Arc::clone(&sink),
+        (789..793).map(GuildId::new).collect(),
+        shutdown_notice_content(61),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(sent, 4);
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 4);
+    for channel in 889..893 {
+        assert!(
+            messages
+                .iter()
+                .any(|(id, _)| *id == ChannelId::new(channel))
+        );
+    }
+}
+
+#[tokio::test]
+async fn shutdown_phase_expires_even_when_all_delivery_slots_stay_busy() {
+    let f = Fixture::new();
+    let permit = f.app.log_delivery_slots.acquire().await.unwrap();
+    let sent = tokio::time::timeout(
+        Duration::from_millis(500),
+        emit_shutdown_notices_to(
+            &f.app,
+            Arc::new(Sink::default()),
+            (789..793).map(GuildId::new).collect(),
+            shutdown_notice_content(61),
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("whole shutdown phase must expire before a stuck per-notice deadline");
+    assert_eq!(sent, 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn shutdown_stops_pending_start_notices_before_sending_stop() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Arc::new(Sink::default());
+    let release_sync = Arc::new(tokio::sync::Notify::new());
+    let (sync_started, sync_started_rx) = tokio::sync::oneshot::channel();
+    let app = Arc::clone(&f.app);
+    let startup_sink = Arc::clone(&sink);
+    let startup_release = Arc::clone(&release_sync);
+    f.app
+        .spawn_startup_notice_task(async move {
+            let _ = sync_started.send(());
+            startup_release.notified().await;
+            emit_system_notice_to(
+                &app,
+                startup_sink.as_ref(),
+                GuildId::new(789),
+                "Bot started".into(),
+                Admission::Immediate,
+            )
+            .await;
+        })
+        .await;
+    sync_started_rx.await.unwrap();
+
+    f.app.stop_startup_notice_task().await;
+    release_sync.notify_waiters();
+    assert_eq!(
+        emit_shutdown_notices_to(
+            &f.app,
+            Arc::clone(&sink),
+            vec![GuildId::new(789)],
+            shutdown_notice_content(61),
+            Duration::from_secs(1),
+        )
+        .await,
+        1
+    );
+    let late_task_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran = Arc::clone(&late_task_ran);
+    f.app
+        .spawn_startup_notice_task(async move {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+    tokio::task::yield_now().await;
+    assert!(!late_task_ran.load(std::sync::atomic::Ordering::SeqCst));
+
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].1["content"]
+            .as_str()
+            .unwrap()
+            .contains("Bot shutting down")
+    );
+}
+
+#[tokio::test]
 async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_routes_separate() {
     let f = Fixture::new();
     for (guild, channel) in [(789, 456), (790, 457)] {
@@ -1139,7 +1334,8 @@ async fn gateway_ban_reuses_claimed_audit_for_report() {
             GuildId::new(789),
             "member_ban",
             vars,
-            Some(observation)
+            Some(observation),
+            Admission::Immediate,
         )
         .await,
         Delivery::Sent
@@ -1182,6 +1378,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         "member_ban",
         templates::user_vars(123, "username", "Display"),
         Some(observation),
+        Admission::Immediate,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);

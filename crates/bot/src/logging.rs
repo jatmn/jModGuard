@@ -27,6 +27,7 @@ const MEMBER_JOINS_LIMIT: usize = 4096;
 const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
+const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
 /// Display-only correlation state. No entry may explain two reports, and an
 /// unresolved observation must not donate a delayed entry to a later action.
@@ -693,6 +694,96 @@ pub async fn emit(
     emit_to(app, ctx.http.as_ref(), guild_id, event, vars).await;
 }
 
+/// Sends a lifecycle notice through the configured system log channel.
+pub async fn emit_system_notice(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    content: String,
+) {
+    emit_system_notice_to(app, http, guild_id, content, Admission::Immediate).await;
+}
+
+/// Attempts one notice per cached guild within the process shutdown budget.
+pub async fn emit_shutdown_notices(
+    app: &Arc<BotState>,
+    http: Arc<serenity::http::Http>,
+    guild_ids: Vec<GuildId>,
+    content: String,
+) -> usize {
+    emit_shutdown_notices_to(app, http, guild_ids, content, SHUTDOWN_NOTICE_PHASE).await
+}
+
+async fn emit_shutdown_notices_to<S: LogDelivery + Send + Sync + 'static>(
+    app: &Arc<BotState>,
+    sink: Arc<S>,
+    guild_ids: Vec<GuildId>,
+    content: String,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut notices = tokio::task::JoinSet::new();
+    for guild_id in guild_ids {
+        let app = Arc::clone(app);
+        let sink = Arc::clone(&sink);
+        let content = content.clone();
+        notices.spawn(async move {
+            emit_system_notice_to(
+                &app,
+                sink.as_ref(),
+                guild_id,
+                content,
+                Admission::WaitForShutdown,
+            )
+            .await
+        });
+    }
+    let mut sent = 0;
+    if tokio::time::timeout_at(deadline, async {
+        while let Some(result) = notices.join_next().await {
+            match result {
+                Ok(Delivery::Sent) => sent += 1,
+                Err(error) => tracing::warn!("shutdown notice task failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(pending = notices.len(), "shutdown notice phase timed out");
+        notices.abort_all();
+    }
+    sent
+}
+
+async fn emit_system_notice_to(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    content: String,
+    admission: Admission,
+) -> Delivery {
+    emit_to_observed(
+        app,
+        sink,
+        guild_id,
+        "system",
+        BTreeMap::from([("content".into(), content)]),
+        None,
+        admission,
+    )
+    .await
+}
+
+pub fn shutdown_notice_content(uptime_seconds: u64) -> String {
+    format!(
+        "Bot shutting down (v{}). Uptime: {}",
+        env!("CARGO_PKG_VERSION"),
+        templates::format_duration(uptime_seconds)
+    )
+}
+
 #[serenity::async_trait]
 pub(crate) trait LogDelivery: Sync {
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()>;
@@ -721,6 +812,12 @@ pub(crate) enum Delivery {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+enum Admission {
+    Immediate,
+    WaitForShutdown,
+}
+
 pub(crate) async fn emit_to(
     app: &Arc<BotState>,
     sink: &impl LogDelivery,
@@ -728,7 +825,7 @@ pub(crate) async fn emit_to(
     event: &str,
     vars: BTreeMap<String, String>,
 ) -> Delivery {
-    emit_to_observed(app, sink, guild_id, event, vars, None).await
+    emit_to_observed(app, sink, guild_id, event, vars, None, Admission::Immediate).await
 }
 
 async fn emit_to_observed(
@@ -738,8 +835,9 @@ async fn emit_to_observed(
     event: &str,
     vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
+    admission: Admission,
 ) -> Delivery {
-    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation)
+    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation, admission)
         .await
         .0
 }
@@ -751,6 +849,7 @@ async fn emit_to_observed_with_audit(
     event: &str,
     mut vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
+    admission: Admission,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -764,19 +863,60 @@ async fn emit_to_observed_with_audit(
         app.member_audits
             .observe_event(guild_id.get(), target, event, observed)
     });
-    // Admission never waits or creates a backlog holding raw event content.
-    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
-        record_delivery_failure(app);
-        return (Delivery::Dropped, None);
+    let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
+    let started = Instant::now();
+    let _permit = match admission {
+        Admission::Immediate => {
+            // Routine and startup reports never queue raw event content.
+            let Ok(permit) = app.log_delivery_slots.try_acquire() else {
+                record_delivery_failure(app);
+                return (Delivery::Dropped, None);
+            };
+            permit
+        }
+        Admission::WaitForShutdown => {
+            // A stop notice gets the same total deadline for admission and
+            // delivery. It does not retry a failed Discord request.
+            let Ok(Ok(permit)) =
+                tokio::time::timeout(deadline, app.log_delivery_slots.acquire()).await
+            else {
+                record_delivery_failure(app);
+                return (Delivery::Failed, None);
+            };
+            permit
+        }
     };
     let mut matched_audit = None;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(app.cfg.log.discord_timeout_secs),
-        async {
-            let cfg = app.configs.get(&app.db, guild_id.get()).await?;
-            let Some(channel_id) = channel_for(&cfg, event) else {
-                return Ok(Delivery::Unconfigured);
-            };
+    let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+        let cfg = app.configs.get(&app.db, guild_id.get()).await?;
+        let Some(channel_id) = channel_for(&cfg, event) else {
+            return Ok(Delivery::Unconfigured);
+        };
+        if cfg
+            .log_filters
+            .get(event)
+            .is_some_and(|filter| excluded(filter, &vars))
+        {
+            return Ok(Delivery::Unconfigured);
+        }
+        if member_audit_action(event).is_some() {
+            // Lookup is part of the admitted report, never an unbounded
+            // Gateway task or a history-recovery queue. Reserve delivery time.
+            let already_attributed = vars.contains_key("actor_id");
+            vars.entry("actor".into())
+                .or_insert_with(|| "unavailable".into());
+            vars.entry("actor_id".into())
+                .or_insert_with(|| "unavailable".into());
+            vars.entry("reason".into())
+                .or_insert_with(|| "unavailable".into());
+            if !already_attributed
+                && let Some(observation) = observation.as_ref()
+                && let Some(context) = lookup_member_audit(app, sink, guild_id, observation).await
+            {
+                matched_audit = Some(context.clone());
+                vars.extend(context);
+            }
+            // Moderator-ID exclusions can only be evaluated after attribution.
             if cfg
                 .log_filters
                 .get(event)
@@ -784,48 +924,21 @@ async fn emit_to_observed_with_audit(
             {
                 return Ok(Delivery::Unconfigured);
             }
-            if member_audit_action(event).is_some() {
-                // Lookup is part of the admitted report, never an unbounded
-                // Gateway task or a history-recovery queue. Reserve delivery time.
-                let already_attributed = vars.contains_key("actor_id");
-                vars.entry("actor".into())
-                    .or_insert_with(|| "unavailable".into());
-                vars.entry("actor_id".into())
-                    .or_insert_with(|| "unavailable".into());
-                vars.entry("reason".into())
-                    .or_insert_with(|| "unavailable".into());
-                if !already_attributed
-                    && let Some(observation) = observation.as_ref()
-                    && let Some(context) =
-                        lookup_member_audit(app, sink, guild_id, observation).await
-                {
-                    matched_audit = Some(context.clone());
-                    vars.extend(context);
-                }
-                // Moderator-ID exclusions can only be evaluated after attribution.
-                if cfg
-                    .log_filters
-                    .get(event)
-                    .is_some_and(|filter| excluded(filter, &vars))
-                {
-                    return Ok(Delivery::Unconfigured);
-                }
-            }
-            vars.insert("event".into(), event.to_owned());
-            vars.entry("time".into())
-                .or_insert_with(|| chrono::Utc::now().to_rfc3339());
-            vars.insert("guild".into(), guild_id.get().to_string());
-            let template = cfg
-                .templates
-                .get(event)
-                .map(String::as_str)
-                .unwrap_or_else(|| default_template(event));
-            templates::format_log_timestamps(&mut vars);
-            let rendered = templates::render_bounded(template, &vars, 2000);
-            sink.send(channel_id, log_message(&rendered)).await?;
-            Ok::<_, anyhow::Error>(Delivery::Sent)
-        },
-    )
+        }
+        vars.insert("event".into(), event.to_owned());
+        vars.entry("time".into())
+            .or_insert_with(|| chrono::Utc::now().to_rfc3339());
+        vars.insert("guild".into(), guild_id.get().to_string());
+        let template = cfg
+            .templates
+            .get(event)
+            .map(String::as_str)
+            .unwrap_or_else(|| default_template(event));
+        templates::format_log_timestamps(&mut vars);
+        let rendered = templates::render_bounded(template, &vars, 2000);
+        sink.send(channel_id, log_message(&rendered)).await?;
+        Ok::<_, anyhow::Error>(Delivery::Sent)
+    })
     .await;
     let delivery = match result {
         Ok(Ok(delivery)) => delivery,
@@ -1142,9 +1255,17 @@ pub(crate) async fn emit_member_event(
         templates::format_duration(account_age_seconds),
     );
     vars.extend(extra);
-    emit_to_observed_with_audit(app, ctx.http.as_ref(), guild_id, event, vars, observation)
-        .await
-        .1
+    emit_to_observed_with_audit(
+        app,
+        ctx.http.as_ref(),
+        guild_id,
+        event,
+        vars,
+        observation,
+        Admission::Immediate,
+    )
+    .await
+    .1
 }
 
 fn default_template(event: &str) -> &'static str {

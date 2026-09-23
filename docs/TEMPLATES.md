@@ -49,7 +49,8 @@ Unknown variables are left untouched so template mistakes are visible.
 - **mod_action** — judge: action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
 - **plan_executed** — custom command runs
-- **system** — general notices
+- **system** — general notices, including one start notice per process and a
+  graceful-shutdown notice with readable uptime
 
 ## Log channel routing
 

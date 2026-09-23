@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result};
 use jmodguard_bot::config::BotProcessConfig;
 use jmodguard_bot::db::Db;
 use jmodguard_bot::handlers::Handler;
+use jmodguard_bot::logging;
 use jmodguard_bot::nickname_worker::reconcile_nickname_job;
 use jmodguard_bot::state::BotState;
 use jmodguard_bot::{db, init_tracing, shutdown_signal};
@@ -390,8 +391,18 @@ async fn main() -> Result<()> {
 
     tracing::info!("starting shards (bot process; no public HTTP API)");
     let shard_manager = client.shard_manager.clone();
+    let shutdown_app = Arc::clone(&app);
+    let shutdown_http = Arc::clone(&http);
+    let shutdown_cache = Arc::clone(&cache);
     tokio::spawn(async move {
         shutdown_signal().await;
+        shutdown_app.stop_startup_notice_task().await;
+        let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
+        let guild_ids = shutdown_cache.guilds();
+        let attempted = guild_ids.len();
+        let sent =
+            logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
+        tracing::info!(sent, attempted, "shutdown notice phase complete");
         tracing::info!("stopping Discord shards");
         shard_manager.shutdown_all().await;
     });

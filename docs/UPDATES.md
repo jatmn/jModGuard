@@ -93,7 +93,9 @@ HTTP health is not mutation authority.
 5. **Deploy** drains the previous process, confirms it is dead, then activates the
    replacement and waits for health. Bot is exclusive: the old worker must be dead
    before the new one starts. Local API is one-replica stop/start. Frontend is a
-   file switch.
+   file switch. The local updater allows the bot ten seconds after SIGTERM for
+   its bounded shutdown notice phase and shard closure; other processes retain
+   a five-second drain. A process that needs SIGKILL still makes Apply uncertain.
 6. **Conductor last.** Before replacing conductor, the adapter writes sidecar
    `update_root/recover.json`. Independent `jmodguard-conductor recover-update`
    reads that file and restores previous code. It does not use the replacement
