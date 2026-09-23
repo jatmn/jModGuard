@@ -257,6 +257,26 @@ impl EventHandler for Handler {
         )
         .await
         .ok();
+        // Decide whether this Gateway event is the bot's own echo before the
+        // best-effort audit lookup can outlive its bounded suppression token.
+        if !app.consume_gateway_case_suppression(
+            crate::state::GatewayCaseAction::Ban,
+            guild_id.get(),
+            banned_user.id.get(),
+        ) {
+            crate::cases::record(
+                &app,
+                enrollment.clone(),
+                crate::db::guild_data::CaseAction::Ban,
+                crate::db::guild_data::CaseOutcome::Succeeded,
+                banned_user.id.get(),
+                None,
+                Some("banned".into()),
+                crate::db::guild_data::CaseEvidence::Unavailable,
+                crate::cases::application_source(),
+            )
+            .await;
+        }
         // Resolve the audit context even when no dedicated ban log channel is
         // configured, so the WebUI can retain the known moderator and reason.
         let audit = if let (Some(observation), Ok(_permit)) =
@@ -285,24 +305,6 @@ impl EventHandler for Handler {
                 )
                 .await;
             }
-        }
-        if !app.consume_gateway_case_suppression(
-            crate::state::GatewayCaseAction::Ban,
-            guild_id.get(),
-            banned_user.id.get(),
-        ) {
-            crate::cases::record(
-                &app,
-                enrollment.clone(),
-                crate::db::guild_data::CaseAction::Ban,
-                crate::db::guild_data::CaseOutcome::Succeeded,
-                banned_user.id.get(),
-                None,
-                Some("banned".into()),
-                crate::db::guild_data::CaseEvidence::Unavailable,
-                crate::cases::application_source(),
-            )
-            .await;
         }
         let mut extra = audit.unwrap_or_default();
         extra.insert("time".into(), observed_at);

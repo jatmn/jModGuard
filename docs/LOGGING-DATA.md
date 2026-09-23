@@ -103,10 +103,10 @@ Discord-channel copies have Discord's own lifecycle, separate from jModGuard sto
 
 Moderation/action records include warnings, bans, timeouts, kicks and reversals where
 already implemented. They still use the existing moderation tables and outcome
-handling; they are not the complete durable case/evidence system. External audit
-attribution for retained records remains separate from the best-effort ban/unban
-display lookup above. Truthful partial-action outcomes and selected evidence capture
-remain work.
+handling; they are not the complete durable case/evidence system. The best-effort
+ban lookup above can save moderator and reason on a retained ban row, but it does
+not establish a durable Discord audit source for a selected case. Truthful
+partial-action outcomes and selected evidence capture remain work.
 
 The Members view/endpoint and message-retention UI/API field are removed. Guild stats
 report identified moderation counts only. Counts include moderation events and live

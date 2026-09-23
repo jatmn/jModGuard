@@ -120,6 +120,15 @@ for event in guild_ban_addition guild_ban_removal; do
 done
 echo 'Gateway ban events suppress bot echoes and retain external cases'
 
+# Audit enrichment may wait for Discord. Decide whether BanAdd is a bot echo
+# and record an external case before that wait can expire the suppression.
+extract_handler guild_ban_addition | awk '
+  /consume_gateway_case_suppression/ { suppression = NR }
+  /crate::cases::record\(/ { external_case = NR }
+  /logging::lookup_member_audit\(/ { audit = NR }
+  END { exit !(suppression && external_case && audit && suppression < audit && external_case < audit) }
+' || fail 'Gateway ban case routing must precede audit lookup'
+
 check_tree() {
   local package="$1"
   shift
