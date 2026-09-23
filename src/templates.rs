@@ -111,6 +111,10 @@ pub fn stats_response_with_updates(
             || item
                 .checked_at
                 .is_none_or(|checked| now.saturating_sub(checked) > 7200)
+            || item
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.channel != item.channel)
         {
             "unknown"
         } else if let Some(candidate) = &item.candidate {
@@ -121,6 +125,15 @@ pub fn stats_response_with_updates(
                 && sha == candidate.source_sha
             {
                 "up to date"
+            } else if component != "webui"
+                && item.installed.is_none()
+                && item
+                    .observed
+                    .as_ref()
+                    .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
+                && sha == candidate.source_sha
+            {
+                "no source update (image digest unverified)"
             } else if sha != "unknown" && sha != candidate.source_sha {
                 "update available"
             } else {
@@ -365,6 +378,19 @@ mod presentation_tests {
         let fresh = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
         assert!(fresh.contains(&format!("`{}`", "a".repeat(40))));
         assert!(fresh.contains("update available"));
+        row.channel = "nightly".into();
+        let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(!wrong_channel.contains("update available"));
+        assert!(wrong_channel.contains("unknown"));
+        row.channel = "stable".into();
+        row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
+        row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
+        let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(baked_current.contains("no source update (image digest unverified)"));
+        row.channel = "nightly".into();
+        let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(!wrong_channel_current.contains("no source update"));
+        row.channel = "stable".into();
         row.observed_at = Some(1);
         let stale = stats_response_with_updates(20, 1, 2, 3, &[row], 9000);
         assert!(!stale.contains(&"a".repeat(40)));

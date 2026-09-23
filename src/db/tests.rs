@@ -2843,6 +2843,82 @@ fn attachment_delete_template_upgrade_preserves_customizations() {
 }
 
 #[test]
+fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
+    let tmp = tmp_db_path("stats_guild_defaults");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        let marker: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='readable_log_defaults_v1'",
+            (),
+            |row| Ok(row.get::<String>(0)?),
+        )?;
+        assert_eq!(marker, "1");
+        let mut stats = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "stats")
+            .unwrap();
+        stats.permission = "everyone".into();
+        stats.description =
+            "This server's retained moderation counts (records, warns, bans).".into();
+        for guild in [123, 124] {
+            if guild == 123 {
+                stats.aliases.clear();
+            } else {
+                stats.aliases = vec!["status".into()];
+            }
+            conn.execute(
+                "INSERT INTO commands(guild_id,name,data) VALUES (?1,'stats',?2)",
+                params![guild, serde_json::to_string(&stats)?],
+            )?;
+        }
+        stats.description = "Operator customized Stats".into();
+        conn.execute(
+            "INSERT INTO commands(guild_id,name,data) VALUES (125,'stats',?1)",
+            params![serde_json::to_string(&stats)?],
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let config_before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    for guild in [123, 124] {
+        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
+        assert_eq!(parts.commands["stats"].permission, "admin");
+        assert!(parts.commands["stats"].matches("status"));
+    }
+    let custom = tokio_test_block_on(load_config_parts(&db, 125)).unwrap();
+    assert_eq!(custom.commands["stats"].permission, "everyone");
+    assert_eq!(
+        custom.commands["stats"].description,
+        "Operator customized Stats"
+    );
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        config_before + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1
+    );
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        config_before + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     let tmp = tmp_db_path("readable_status_collision");
     let db = Db::open(&tmp, 2).unwrap();

@@ -597,6 +597,7 @@ pub(super) fn seed_globals_conn(
     let mut status_taken = false;
     for row in rows {
         if let Ok(command) = serde_json::from_str::<crate::types::CommandDef>(&row?)
+            && command.name != "stats"
             && command.matches("status")
         {
             status_taken = true;
@@ -668,12 +669,18 @@ pub(super) fn seed_globals_conn(
                     vec![]
                 };
                 let mut upgraded = cmd.clone();
-                upgraded.aliases = old.aliases.clone();
+                // An untouched old default without an alias gains the shipped
+                // alias unless another command already owns it. An old Stats
+                // alias is the same command, not a collision.
+                upgraded.aliases = if had_alias {
+                    old.aliases.clone()
+                } else {
+                    cmd.aliases.clone()
+                };
                 commands_changed += conn.execute(
-                    "UPDATE commands SET data=?1 WHERE guild_id=?2 AND name='stats' AND data=?3",
+                    "UPDATE commands SET data=?1 WHERE name='stats' AND data=?2",
                     params![
                         serde_json::to_string(&upgraded)?,
-                        GLOBAL_SCOPE,
                         serde_json::to_string(&old)?
                     ],
                 )?;

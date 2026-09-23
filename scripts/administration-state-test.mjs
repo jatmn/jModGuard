@@ -11,7 +11,12 @@ class Element {
     this.children = [];
     this.textContent = "";
     this.disabled = false;
-    this.classList = { add() {}, remove() {} };
+    const classes = new Set();
+    this.classList = {
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    };
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
@@ -21,19 +26,23 @@ class Element {
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
-function page() {
+function page(fetchImpl = () => new Promise(() => {})) {
   const elements = new Map();
   const document = {
     createElement: (tag) => new Element(tag),
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, new Element());
+      if (!elements.has(id)) {
+        const element = new Element();
+        if (["sign-in", "updates"].includes(id)) element.classList.add("hidden");
+        elements.set(id, element);
+      }
       return elements.get(id);
     },
   };
   const context = vm.createContext({
     document,
     window: { JMODGUARD_WEBUI_SHA: "a".repeat(40) },
-    fetch: () => new Promise(() => {}),
+    fetch: fetchImpl,
     setInterval() {},
     Date,
   });
@@ -48,6 +57,10 @@ function find(element, predicate) {
     if (result) return result;
   }
   return null;
+}
+
+function textOf(element) {
+  return element.textContent + element.children.map(textOf).join("");
 }
 
 function record(component = "api") {
@@ -99,4 +112,29 @@ test("owner update controls require a current installable candidate", () => {
   webui.installed = { source_sha: webui.candidate.source_sha, digest: "sha256:" + "d".repeat(64) };
   render(view, webui);
   assert.equal(updateButton(view, "webui").disabled, true);
+});
+
+test("signed-out Administration offers Discord sign-in on the existing API response", async () => {
+  const view = page(async () => ({
+    status: 400, ok: false, json: async () => ({ error: "not authenticated" }),
+  }));
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(view.elements.get("sign-in").classList.contains("hidden"), false);
+  assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+  assert.match(view.elements.get("update-status").textContent, /Sign in again/);
+});
+
+test("owner availability distinguishes baked source parity from channel mismatch", () => {
+  const view = page();
+  const api = record();
+  api.candidate.source_sha = api.observed.source_sha;
+  render(view, api);
+  const availability = () => {
+    const card = view.elements.get("update-cards").children[0];
+    return textOf(find(card, (element) => element.tag === "p" && textOf(element).startsWith("Availability:")));
+  };
+  assert.match(availability(), /no source update \(image digest unverified\)/);
+  api.channel = "nightly";
+  render(view, api);
+  assert.match(availability(), /unknown/);
 });

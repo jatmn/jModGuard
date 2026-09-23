@@ -20,12 +20,13 @@ async function request(path, body) {
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (response.status === 401) {
+  const value = await response.json().catch(() => ({}));
+  if (response.status === 401 || (path === "/api/me" && response.status === 400) ||
+      (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
     signIn.classList.remove("hidden");
     updateView.classList.add("hidden");
     throw new Error("Sign in again to manage updates.");
   }
-  const value = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
   return value;
 }
@@ -89,7 +90,19 @@ function render() {
     const compatibility = snapshot.compatibility?.[record.component];
     if (candidateCurrent) line(content, "Compatibility", compatibility?.installable ? "Ready for this deployment" : compatibility?.reason || "Unable to verify");
     line(content, "Last check", record.checked_at ? age(record.checked_at) : "never");
-    line(content, "Availability", !candidateCurrent || !observed || webuiRepacked ? "unknown" : record.installed?.digest === record.candidate?.digest && observed.source_sha === record.candidate?.source_sha ? "up to date" : record.candidate && observed.source_sha !== record.candidate.source_sha ? "update available" : "unknown");
+    const bakedSourceCurrent = record.component !== "webui" && !record.installed && observed &&
+      observed.source_sha === observed.base_image_sha && observed.source_sha === record.candidate?.source_sha;
+    let availability = "unknown";
+    if (candidateCurrent && observed && !webuiRepacked) {
+      if (record.installed?.digest === record.candidate?.digest && observed.source_sha === record.candidate?.source_sha) {
+        availability = "up to date";
+      } else if (bakedSourceCurrent) {
+        availability = "no source update (image digest unverified)";
+      } else if (record.candidate && observed.source_sha !== record.candidate.source_sha) {
+        availability = "update available";
+      }
+    }
+    line(content, "Availability", availability);
     line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? `Install failed: ${record.last_error}` : record.state);
     line(content, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
     line(content, "Launcher SHA-256", record.launcher_sha256 || "unknown");
