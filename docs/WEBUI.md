@@ -94,10 +94,12 @@ in `index.html`, and set the same value before `administration.js` loads
 in `administration/index.html`. Each HTML page needs its own setting;
 the value from `index.html` does not carry to the Administration page.
 Set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
-OAuth still happens on `web.base_url`: `/login` and `/oauth/callback`
-must be that same hostname so the CSRF cookies Discord cannot set are
-sent back on the redirect. Bunny’s designed shape does not need that
-split: the Pull Zone is one hostname for both the files and `/api`.
+OAuth still happens on `web.base_url`: for this separate-host setup, set
+`JMODGUARD_WEB_BASE_URL` to the same public API origin as `JMODGUARD_API_BASE`
+and register that API origin's `/oauth/callback` with Discord. `/login`
+and `/oauth/callback` must share that hostname so the CSRF cookies Discord
+cannot set are sent back on the redirect. Bunny’s designed shape does not
+need that split: the Pull Zone is one hostname for both the files and `/api`.
 
 Never put a database URL or token in these files.
 
