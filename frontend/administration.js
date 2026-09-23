@@ -6,6 +6,15 @@ const updateView = document.getElementById("updates");
 const signIn = document.getElementById("sign-in");
 let snapshot = null;
 
+function apiBase() {
+  return (window.JMODGUARD_API_BASE || "").replace(/\/$/, "");
+}
+
+const base = apiBase();
+document.getElementById("sign-in-link").href = base
+  ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}`
+  : "/login?return_to=%2Fadministration%2Findex.html";
+
 function node(tag, text, className) {
   const element = document.createElement(tag);
   if (text != null) element.textContent = text;
@@ -14,9 +23,9 @@ function node(tag, text, className) {
 }
 
 async function request(path, body) {
-  const response = await fetch(path, {
+  const response = await fetch(apiBase() + path, {
     method: body === undefined ? "GET" : "POST",
-    credentials: "same-origin", cache: "no-store",
+    credentials: "include", cache: "no-store",
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

@@ -26,7 +26,7 @@ class Element {
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
-function page(fetchImpl = () => new Promise(() => {})) {
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test" } = {}) {
   const elements = new Map();
   const document = {
     createElement: (tag) => new Element(tag),
@@ -41,7 +41,7 @@ function page(fetchImpl = () => new Promise(() => {})) {
   };
   const context = vm.createContext({
     document,
-    window: { JMODGUARD_WEBUI_SHA: "a".repeat(40) },
+    window: { JMODGUARD_WEBUI_SHA: "a".repeat(40), JMODGUARD_API_BASE: apiBase, location: { origin } },
     fetch: fetchImpl,
     setInterval() {},
     Date,
@@ -137,6 +137,33 @@ test("signed-out Administration offers Discord sign-in on the existing API respo
   assert.equal(view.elements.get("sign-in").classList.contains("hidden"), false);
   assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
   assert.match(view.elements.get("update-status").textContent, /Sign in again/);
+});
+
+test("Administration carries the configured API origin through reads, controls, and sign-in", () => {
+  const calls = [];
+  const fetchImpl = (url, options) => {
+    calls.push({ url, method: options.method, credentials: options.credentials });
+    return new Promise(() => {});
+  };
+  const remote = page(fetchImpl, { apiBase: "https://api.example.test/" });
+  for (const path of ["/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"]) {
+    vm.runInContext(`request(${JSON.stringify(path)}, {})`, remote.context);
+  }
+  assert.deepEqual(calls, ["/api/me", "/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"].map((path) => ({
+    url: `https://api.example.test${path}`, method: "POST", credentials: "include",
+  })));
+  assert.equal(remote.elements.get("sign-in-link").href,
+    "https://api.example.test/login?return_to=https%3A%2F%2Fui.example.test");
+
+  const localCalls = [];
+  const local = page((url, options) => {
+    localCalls.push({ url, credentials: options.credentials });
+    return new Promise(() => {});
+  });
+  assert.deepEqual(localCalls, [{ url: "/api/me", credentials: "include" }]);
+  assert.equal(local.elements.get("sign-in-link").href, "/login?return_to=%2Fadministration%2Findex.html");
+  assert.match(fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration/index.html"), "utf8"),
+    /id="sign-in-link"/);
 });
 
 test("owner availability distinguishes baked source parity from channel mismatch", () => {
