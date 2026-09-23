@@ -6,6 +6,7 @@ use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use jmodguard_updater::compatible;
 use jmodguard_updater::oci::{Registry, sha256_hex};
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,6 +14,12 @@ use tokio::process::{Child, Command};
 
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceReadiness {
+    Ready,
+    Shutdown,
+}
 
 struct Running {
     child: Child,
@@ -73,21 +80,40 @@ async fn launch(
     })
 }
 
-async fn wait_ready(running: &mut Running) -> Result<()> {
+async fn wait_ready(running: &mut Running, timeout: Option<Duration>) -> Result<()> {
     let start = Instant::now();
     loop {
         if let Some(status) = running.child.try_wait()? {
-            bail!("replacement child exited before readiness: {status}");
+            bail!("child exited before readiness: {status}");
         }
         if tokio::fs::metadata(&running.ready_file).await.is_ok() {
             return Ok(());
         }
-        ensure!(
-            start.elapsed() < READY_TIMEOUT,
-            "replacement child readiness timed out"
-        );
+        if let Some(limit) = timeout {
+            ensure!(
+                start.elapsed() < limit,
+                "replacement child readiness timed out"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// The baked or prior service already owns the container's process-local
+/// health listener. Wait for its real readiness without a cutover deadline;
+/// a delayed Discord Gateway Ready must not kill an otherwise live bot.
+async fn wait_service_ready(
+    running: &mut Running,
+    shutdown: impl Future<Output = ()>,
+) -> Result<ServiceReadiness> {
+    let outcome = tokio::select! {
+        result = wait_ready(running, None) => { result?; ServiceReadiness::Ready },
+        _ = shutdown => ServiceReadiness::Shutdown,
+    };
+    if outcome == ServiceReadiness::Shutdown {
+        stop(running).await?;
+    }
+    Ok(outcome)
 }
 
 async fn stop(running: &mut Running) -> Result<()> {
@@ -211,8 +237,13 @@ async fn main() -> Result<()> {
     let db = tokio::select! {
         opened=database(&role) => opened?,
         exited=running.child.wait() => bail!("baked service exited before database opened: {}",exited?),
+        _=jmodguard::shutdown_signal() => { stop(&mut running).await?; return Ok(()); },
     };
-    wait_ready(&mut running).await?;
+    if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await?
+        == ServiceReadiness::Shutdown
+    {
+        return Ok(());
+    }
     db::record_baked_component_running(&db, &role, observation(&running, &base_sha), now()).await?;
     let registry = Registry::ghcr()?;
     let mut standby: Option<(PathBuf, String, Option<ComponentRelease>)> = None;
@@ -252,7 +283,7 @@ async fn main() -> Result<()> {
                     let failed=running.release.clone().expect("updated child has release");
                     let (path,sha,release)=standby.take().unwrap_or_else(||(baked.clone(),base_sha.clone(),None));
                     running=launch(&path,&sha,release.clone()).await?;
-                    wait_ready(&mut running).await?;
+                    if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
                     db::record_component_rollback(&db,&role,&failed,release,observation(&running,&base_sha),&format!("updated child exited: {status}"),now()).await?;
                 } else { bail!("baked service exited: {status}"); }
             }
@@ -295,7 +326,7 @@ async fn main() -> Result<()> {
                 stop(&mut running).await?;
                 let replacement=launch(&new_path,&candidate.source_sha,Some(candidate.clone())).await;
                 let switched=match replacement {
-                    Ok(mut child)=>match wait_ready(&mut child).await {
+                    Ok(mut child)=>match wait_ready(&mut child, Some(READY_TIMEOUT)).await {
                         Ok(())=>Ok(child),
                         Err(error)=>{let _=stop(&mut child).await;Err(error)}
                     },
@@ -307,7 +338,7 @@ async fn main() -> Result<()> {
                         if let Err(error)=db::record_component_running(&db,&role,Some(candidate.clone()),observation(&running,&base_sha),now()).await {
                             stop(&mut running).await?;
                             running=launch(&previous_path,&previous_sha,previous_release).await?;
-                            wait_ready(&mut running).await?;
+                            if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
                             db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("activation record: {error:#}"),now()).await?;
                         } else {
                             standby=Some((previous_path,previous_sha,previous_release));
@@ -315,7 +346,7 @@ async fn main() -> Result<()> {
                     }
                     Err(error)=>{
                         running=launch(&previous_path,&previous_sha,previous_release).await?;
-                        wait_ready(&mut running).await?;
+                        if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
                         db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("readiness: {error:#}"),now()).await?;
                     }
                 }
@@ -343,7 +374,7 @@ mod tests {
             .await
             .unwrap();
         let mut first = launch(&bad, "test", None).await.unwrap();
-        assert!(wait_ready(&mut first).await.is_err());
+        assert!(wait_ready(&mut first, Some(READY_TIMEOUT)).await.is_err());
         let good = dir.join("good");
         tokio::fs::write(
             &good,
@@ -355,9 +386,99 @@ mod tests {
             .await
             .unwrap();
         let mut second = launch(&good, "test", None).await.unwrap();
-        wait_ready(&mut second).await.unwrap();
+        wait_ready(&mut second, Some(READY_TIMEOUT)).await.unwrap();
         stop(&mut second).await.unwrap();
         assert!(second.child.try_wait().unwrap().is_some());
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn baked_wait_survives_delayed_ready_but_replacement_has_a_deadline() {
+        let dir = std::env::temp_dir().join(format!(
+            "jmodguard-delayed-ready-{:032x}",
+            rand::random::<u128>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let delayed = dir.join("delayed");
+        let allow_ready = dir.join("allow-ready");
+        tokio::fs::write(
+            &delayed,
+            format!(
+                "#!/bin/sh\nwhile [ ! -f \"{}\" ]; do sleep 0.05; done\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 10\n",
+                allow_ready.display()
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&delayed, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+
+        let mut replacement = launch(&delayed, "test", None).await.unwrap();
+        assert!(
+            wait_ready(&mut replacement, Some(Duration::from_millis(100)))
+                .await
+                .is_err()
+        );
+        stop(&mut replacement).await.unwrap();
+
+        let mut baked = launch(&delayed, "test", None).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(350),
+                wait_service_ready(&mut baked, std::future::pending::<()>())
+            )
+            .await
+            .is_err()
+        );
+        assert!(baked.child.try_wait().unwrap().is_none());
+        tokio::fs::write(&allow_ready, b"go").await.unwrap();
+        assert_eq!(
+            wait_service_ready(&mut baked, std::future::pending::<()>())
+                .await
+                .unwrap(),
+            ServiceReadiness::Ready
+        );
+        stop(&mut baked).await.unwrap();
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn baked_wait_reaps_on_shutdown_and_reports_child_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "jmodguard-baked-wait-{:032x}",
+            rand::random::<u128>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let sleeping = dir.join("sleeping");
+        tokio::fs::write(&sleeping, b"#!/bin/sh\nexec sleep 10\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&sleeping, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mut baked = launch(&sleeping, "test", None).await.unwrap();
+        assert_eq!(
+            wait_service_ready(&mut baked, tokio::time::sleep(Duration::from_millis(50)))
+                .await
+                .unwrap(),
+            ServiceReadiness::Shutdown
+        );
+        assert!(baked.child.try_wait().unwrap().is_some());
+
+        let exiting = dir.join("exiting");
+        tokio::fs::write(&exiting, b"#!/bin/sh\nexit 1\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&exiting, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let mut failed = launch(&exiting, "test", None).await.unwrap();
+        assert!(
+            wait_service_ready(&mut failed, std::future::pending::<()>())
+                .await
+                .is_err()
+        );
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }
