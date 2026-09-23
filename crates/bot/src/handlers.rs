@@ -241,14 +241,41 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let _ = db::record_enrolled_ban(
+        // Resolve the audit context even when no dedicated ban log channel is
+        // configured, so the WebUI can retain the known moderator and reason.
+        let audit = if let (Some(observation), Ok(_permit)) =
+            (observation.as_ref(), app.log_delivery_slots.try_acquire())
+        {
+            logging::lookup_member_audit(&app, ctx.http.as_ref(), guild_id, observation).await
+        } else {
+            None
+        };
+        let moderator_id = audit
+            .as_ref()
+            .and_then(|vars| vars.get("actor_id"))
+            .and_then(|id| id.parse::<i64>().ok());
+        let reason = audit
+            .as_ref()
+            .and_then(|vars| vars.get("reason"))
+            .map(String::as_str)
+            .unwrap_or("banned (audit)");
+        let observed_at = observed.to_rfc3339();
+        let ban_row_id = db::record_enrolled_ban_with_identity(
             &app.db,
             enrollment.clone(),
             banned_user.id.get() as i64,
-            None,
-            "banned (audit)",
+            Some(&banned_user.name),
+            banned_user.global_name.as_deref(),
+            moderator_id,
+            audit
+                .as_ref()
+                .and_then(|vars| vars.get("actor_name"))
+                .map(String::as_str),
+            reason,
+            Some(&observed_at),
         )
-        .await;
+        .await
+        .ok();
         if !app.consume_gateway_case_suppression(
             crate::state::GatewayCaseAction::Ban,
             guild_id.get(),
@@ -256,7 +283,7 @@ impl EventHandler for Handler {
         ) {
             crate::cases::record(
                 &app,
-                enrollment,
+                enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
                 crate::db::guild_data::CaseOutcome::Succeeded,
                 banned_user.id.get(),
@@ -267,9 +294,9 @@ impl EventHandler for Handler {
             )
             .await;
         }
-        let mut extra = BTreeMap::new();
-        extra.insert("time".into(), observed.to_rfc3339());
-        logging::emit_member_event(
+        let mut extra = audit.unwrap_or_default();
+        extra.insert("time".into(), observed_at);
+        let late_audit = logging::emit_member_event(
             &app,
             &ctx,
             guild_id,
@@ -279,6 +306,28 @@ impl EventHandler for Handler {
             observation,
         )
         .await;
+        // If the audit entry appeared during the report's bounded retry, keep
+        // the displayed ban row consistent with the report that used it.
+        if let (Some(row_id), Some(context)) = (ban_row_id, late_audit) {
+            let moderator_id = context
+                .get("actor_id")
+                .and_then(|id| id.parse::<i64>().ok());
+            if let Some(moderator_id) = moderator_id {
+                let _ = db::attribute_enrolled_ban(
+                    &app.db,
+                    enrollment,
+                    row_id,
+                    banned_user.id.get() as i64,
+                    moderator_id,
+                    context.get("actor_name").map(String::as_str),
+                    context
+                        .get("reason")
+                        .map(String::as_str)
+                        .unwrap_or("No reason provided"),
+                )
+                .await;
+            }
+        }
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {

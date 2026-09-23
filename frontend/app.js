@@ -2059,21 +2059,22 @@ function tabEvents() {
 }
 
 function tabBans() {
-  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["User ID", "Status", "Reason", "Time", "Actions"].map((text) => el("th", { text })))), el("tbody", {}));
+  const table = el("table", {}, el("thead", {}, el("tr", {}, ...["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"].map((text) => el("th", { text })))), el("tbody", {}));
   const guildId = state.guildId;
   let request = 0;
   const tbody = () => table.querySelector("tbody");
   const run = async () => {
     const current = ++request;
-    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading…" })));
+    tbody().replaceChildren(el("tr", {}, el("td", { colspan: 6, text: "Loading…" })));
     try {
       const rows = await apiRead(`/api/guilds/${guildId}/bans?limit=200`);
       if (current !== request) return;
       tbody().innerHTML = "";
-      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No matching records." })));
+      if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 6, class: "muted", text: "No matching records." })));
       rows.forEach((r) => tbody().append(el("tr", {},
-        el("td", { class: "mono", text: r.user_id }),
+        el("td", {}, r.user_display_name ? `${r.user_display_name} (${r.user_name ? `${r.user_name}, ` : ""}${r.user_id})` : (r.user_name ? `${r.user_name} (${r.user_id})` : r.user_id)),
         el("td", { text: r.active ? "banned" : "unbanned" }),
+        el("td", {}, r.moderator_id ? (r.moderator_name ? `${r.moderator_name} (${r.moderator_id})` : r.moderator_id) : "Unavailable"),
         el("td", { text: r.reason || "" }),
         el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),
         el("td", {}, r.active ? el("button", { class: "btn small", text: "Unban", onclick: async () => {
@@ -2083,13 +2084,13 @@ function tabBans() {
       )));
     } catch (e) {
       if (current !== request) return;
-      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
+      tbody().replaceChildren(el("tr", {}, el("td", { colspan: 6, class: "err", text: "Could not load records: " + (e.message || String(e)) })));
     }
   };
   run().catch((e) => reportApiError(e));
   return el("div", {},
     el("h2", { text: "Bans" }),
-    el("p", { class: "muted", style: "margin-bottom:12px" }, "Bans performed by the bot (automod + commands). Request an unban here or unban in Discord. Check Bot actions for queued results."),
+    el("p", { class: "muted", style: "margin-bottom:12px" }, "Recorded bans include bot actions and observed Discord bans. Names and moderators appear when known. Request an unban here or unban in Discord. Check Bot actions for queued results."),
     table,
   );
 }

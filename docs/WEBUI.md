@@ -154,7 +154,7 @@ the editor does not undo an acknowledged global write.
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
 | **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot; save per-event ignored user/bot IDs and source channel IDs |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
-| **Bans** | ban history + unban via the bot token (API process) |
+| **Bans** | recorded bot and observed Discord bans with known user name, exact ID, and audit-attributed moderator when available; unknown details remain unavailable; unban is queued for the bot |
 | **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
