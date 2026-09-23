@@ -125,11 +125,12 @@ On the admin Pull Zone, Caching → General, **Strip Response Cookies** must
 be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual, public source).** In the Storage Zone, **Browse Files**,
-and upload those five files from this repository (or the same paths from a
-signed release manifest for the same tag) to the **root** so they are `/` (or `/index.html`),
+and upload those five files from the source commit selected for the deployed
+API image to the **root** so they are `/` (or `/index.html`),
 `/app.js`, `/style.css`, `/administration/index.html`, and
-`/administration.js`. Start from the same git tag as the container
-images so the first login works. After that, CSS/layout-only revisions can
+`/administration.js`. A trusted `main` image published under its full source
+SHA is sufficient; no Stable or Nightly release tag is required. After that,
+CSS/layout-only revisions can
 publish without a new image; match the container revision again only when
 the page needs new API endpoints. daisyUI and Headless UI stay on the runtime
 CDN; they are not a fourth Storage object.
