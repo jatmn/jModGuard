@@ -506,12 +506,16 @@ pub async fn execute_pending(
                 app.release_gateway_case_suppression(suppression);
             }
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Succeeded) {
-                let _ = db::record_enrolled_ban(
+                let _ = db::record_enrolled_ban_with_identity(
                     &app.db,
                     enrollment.clone(),
                     target.id.get() as i64,
+                    Some(&target.name),
+                    target.global_name.as_deref(),
+                    None,
                     None,
                     &format!("[automod:{}] {}", pending.rule_id, reason),
+                    None,
                 )
                 .await;
             }

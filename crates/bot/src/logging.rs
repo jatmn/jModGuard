@@ -499,6 +499,34 @@ fn channel_for(
     cfg.log_channels.get(event).copied()
 }
 
+/// Resolve one observed ban/unban against Discord's bounded recent audit window.
+/// The claim is shared by persisted gateway-ban details and the Discord report.
+pub(crate) async fn lookup_member_audit(
+    app: &BotState,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    observation: &MemberAuditObservation,
+) -> Option<BTreeMap<String, String>> {
+    let budget = Duration::from_secs(app.cfg.log.discord_timeout_secs)
+        .div_f64(2.0)
+        .min(Duration::from_secs(3));
+    tokio::time::timeout(budget, async {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let logs = sink.member_audit(guild_id, observation.action).await.ok()?;
+            if let Some(context) = app.member_audits.claim(observation, &logs) {
+                return Some(context);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Sends one best-effort Discord log report. No message history or retry queue.
 pub async fn emit(
     app: &Arc<BotState>,
@@ -553,9 +581,22 @@ async fn emit_to_observed(
     sink: &impl LogDelivery,
     guild_id: GuildId,
     event: &str,
-    mut vars: BTreeMap<String, String>,
+    vars: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
 ) -> Delivery {
+    emit_to_observed_with_audit(app, sink, guild_id, event, vars, observation)
+        .await
+        .0
+}
+
+async fn emit_to_observed_with_audit(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    mut vars: BTreeMap<String, String>,
+    observation: Option<MemberAuditObservation>,
+) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
     let observation = observation.or_else(|| {
@@ -571,8 +612,9 @@ async fn emit_to_observed(
     // Admission never waits or creates a backlog holding raw event content.
     let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
         record_delivery_failure(app);
-        return Delivery::Dropped;
+        return (Delivery::Dropped, None);
     };
+    let mut matched_audit = None;
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(app.cfg.log.discord_timeout_secs),
         async {
@@ -587,30 +629,22 @@ async fn emit_to_observed(
             {
                 return Ok(Delivery::Unconfigured);
             }
-            if let Some(action) = member_audit_action(event) {
+            if member_audit_action(event).is_some() {
                 // Lookup is part of the admitted report, never an unbounded
                 // Gateway task or a history-recovery queue. Reserve delivery time.
-                vars.insert("actor".into(), "unavailable".into());
-                vars.insert("actor_id".into(), "unavailable".into());
-                vars.insert("reason".into(), "unavailable".into());
-                let budget = Duration::from_secs(app.cfg.log.discord_timeout_secs)
-                    .div_f64(2.0)
-                    .min(Duration::from_secs(3));
-                if let Some(observation) = observation.as_ref()
-                    && let Ok(Some(context)) = tokio::time::timeout(budget, async {
-                        for attempt in 0..3 {
-                            if attempt > 0 {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                            }
-                            let logs = sink.member_audit(guild_id, action).await.ok()?;
-                            if let Some(context) = app.member_audits.claim(observation, &logs) {
-                                return Some(context);
-                            }
-                        }
-                        None
-                    })
-                    .await
+                let already_attributed = vars.contains_key("actor_id");
+                vars.entry("actor".into())
+                    .or_insert_with(|| "unavailable".into());
+                vars.entry("actor_id".into())
+                    .or_insert_with(|| "unavailable".into());
+                vars.entry("reason".into())
+                    .or_insert_with(|| "unavailable".into());
+                if !already_attributed
+                    && let Some(observation) = observation.as_ref()
+                    && let Some(context) =
+                        lookup_member_audit(app, sink, guild_id, observation).await
                 {
+                    matched_audit = Some(context.clone());
                     vars.extend(context);
                 }
                 // Moderator-ID exclusions can only be evaluated after attribution.
@@ -638,13 +672,14 @@ async fn emit_to_observed(
         },
     )
     .await;
-    match result {
+    let delivery = match result {
         Ok(Ok(delivery)) => delivery,
         _ => {
             record_delivery_failure(app);
             Delivery::Failed
         }
-    }
+    };
+    (delivery, matched_audit)
 }
 
 fn member_audit_action(event: &str) -> Option<Action> {
@@ -675,26 +710,27 @@ fn member_audit_vars(
     if matches.next().is_some() {
         return None;
     }
-    let actor = logs
-        .users
-        .get(&entry.user_id)
-        .map(|user| format!("{} (<@{}>)", user.name, user.id))
+    let actor_name = logs.users.get(&entry.user_id).map(|user| user.name.clone());
+    let actor = actor_name
+        .as_ref()
+        .map(|name| format!("{} (<@{}>)", name, entry.user_id))
         .unwrap_or_else(|| format!("<@{}>", entry.user_id));
-    Some((
-        entry.id.get(),
-        BTreeMap::from([
-            ("actor".into(), actor),
-            ("actor_id".into(), entry.user_id.to_string()),
-            (
-                "reason".into(),
-                entry
-                    .reason
-                    .clone()
-                    .filter(|reason| !reason.trim().is_empty())
-                    .unwrap_or_else(|| "No reason provided".into()),
-            ),
-        ]),
-    ))
+    let mut vars = BTreeMap::from([
+        ("actor".into(), actor),
+        ("actor_id".into(), entry.user_id.to_string()),
+        (
+            "reason".into(),
+            entry
+                .reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "No reason provided".into()),
+        ),
+    ]);
+    if let Some(name) = actor_name {
+        vars.insert("actor_name".into(), name);
+    }
+    Some((entry.id.get(), vars))
 }
 
 fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
@@ -927,7 +963,7 @@ pub(crate) async fn emit_member_event(
     user: &serenity::model::user::User,
     extra: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
-) {
+) -> Option<BTreeMap<String, String>> {
     let account_created = user.created_at();
     let account_age_seconds =
         (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
@@ -943,7 +979,9 @@ pub(crate) async fn emit_member_event(
         templates::format_duration(account_age_seconds),
     );
     vars.extend(extra);
-    emit_to_observed(app, ctx.http.as_ref(), guild_id, event, vars, observation).await;
+    emit_to_observed_with_audit(app, ctx.http.as_ref(), guild_id, event, vars, observation)
+        .await
+        .1
 }
 
 fn default_template(event: &str) -> &'static str {

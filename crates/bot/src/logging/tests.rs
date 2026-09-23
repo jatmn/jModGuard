@@ -844,6 +844,90 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
 }
 
 #[tokio::test]
+async fn gateway_ban_reuses_claimed_audit_for_report() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
+        .await
+        .unwrap();
+    let sink = AuditSink {
+        sink: Sink::default(),
+        calls: Default::default(),
+        missing_first: false,
+        stalled: false,
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let observation = f
+        .app
+        .member_audits
+        .observe_event(789, 123, "member_ban", now)
+        .unwrap();
+    let context = lookup_member_audit(&f.app, &sink, GuildId::new(789), &observation)
+        .await
+        .unwrap();
+    assert_eq!(context["actor_id"], "777");
+    assert_eq!(context["actor_name"], "moderator");
+    assert_eq!(context["reason"], "spam");
+    let mut vars = templates::user_vars(123, "username", "Display");
+    vars.extend(context);
+    assert_eq!(
+        emit_to_observed(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "member_ban",
+            vars,
+            Some(observation)
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(
+        sink.sink.messages.lock().unwrap()[0].1["content"]
+            .as_str()
+            .unwrap()
+            .contains("moderator (<@777>)")
+    );
+}
+
+#[tokio::test]
+async fn ban_report_returns_late_audit_for_its_stored_row() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
+        .await
+        .unwrap();
+    let sink = AuditSink {
+        sink: Sink::default(),
+        calls: Default::default(),
+        missing_first: false,
+        stalled: false,
+    };
+    let observation = f
+        .app
+        .member_audits
+        .observe_event(
+            789,
+            123,
+            "member_ban",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+    let (delivery, audit) = emit_to_observed_with_audit(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        "member_ban",
+        templates::user_vars(123, "username", "Display"),
+        Some(observation),
+    )
+    .await;
+    assert_eq!(delivery, Delivery::Sent);
+    let audit = audit.unwrap();
+    assert_eq!(audit["actor_id"], "777");
+    assert_eq!(audit["reason"], "spam");
+}
+
+#[tokio::test]
 async fn inaccessible_audit_renders_explicit_fallback_for_both_events() {
     let f = Fixture::new();
     let sink = Sink::default();

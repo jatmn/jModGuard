@@ -157,6 +157,105 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
 }
 
 #[tokio::test]
+async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let user_id = 1_726_972_779_646_156_581i64;
+    record_enrolled_ban_with_identity(
+        &f.db,
+        Some(scope.clone()),
+        user_id,
+        Some("wavingwalker"),
+        Some("Wavingwalker"),
+        Some(1_800_882_749_273_538_599),
+        Some("ikaika44"),
+        "No reason provided",
+        Some("2026-09-22T23:16:28Z"),
+    )
+    .await
+    .unwrap();
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].user_name.as_deref(), Some("wavingwalker"));
+    assert_eq!(rows[0].user_display_name.as_deref(), Some("Wavingwalker"));
+    assert_eq!(rows[0].moderator_name.as_deref(), Some("ikaika44"));
+    assert_eq!(rows[0].created_at, "2026-09-22T23:16:28Z");
+    let json = serde_json::to_value(&rows[0]).unwrap();
+    assert_eq!(json["user_id"], user_id.to_string());
+    assert_eq!(json["moderator_id"], "1800882749273538599");
+    assert_eq!(json["reason"], "No reason provided");
+    let api = Db::open_with(DbOpenOptions {
+        path: f.path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    })
+    .unwrap();
+    assert_eq!(
+        list_bans(&api, 10, 10).await.unwrap()[0]
+            .user_name
+            .as_deref(),
+        Some("wavingwalker")
+    );
+    let later_id = record_enrolled_ban_with_identity(
+        &f.db,
+        Some(scope.clone()),
+        user_id + 1,
+        Some("other-user"),
+        None,
+        None,
+        None,
+        "Reason unavailable",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_bans(&api, 10, 10).await.unwrap()[0].reason.as_deref(),
+        Some("Reason unavailable")
+    );
+    mark_enrolled_unbanned(&f.db, Some(scope.clone()), user_id + 1)
+        .await
+        .unwrap();
+    attribute_enrolled_ban(
+        &f.db,
+        Some(scope.clone()),
+        later_id,
+        user_id + 1,
+        777,
+        Some("late-moderator"),
+        "late audit reason",
+    )
+    .await
+    .unwrap();
+    let later = list_bans(&api, 10, 10).await.unwrap();
+    assert_eq!(later[0].moderator_id, Some(777));
+    assert!(!later[0].active, "a late audit must not undo an unban");
+    assert_eq!(later[0].moderator_name.as_deref(), Some("late-moderator"));
+    assert_eq!(later[0].reason.as_deref(), Some("late audit reason"));
+    assert_eq!(later[1].moderator_name.as_deref(), Some("ikaika44"));
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    enroll_guild(&f.db, 10, 101).await.unwrap();
+    assert!(
+        attribute_enrolled_ban(
+            &f.db,
+            Some(scope),
+            later_id,
+            user_id + 1,
+            778,
+            None,
+            "wrong membership",
+        )
+        .await
+        .unwrap_err()
+        .is::<EnrollmentChanged>()
+    );
+}
+
+#[tokio::test]
 async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();

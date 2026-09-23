@@ -69,6 +69,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
         const keyed = selector.match(/^\[data-input-key="([^"]+)"\]$/);
         if (keyed) return this.querySelectorAll('input, select, textarea').find((n) => n.dataset.inputKey === keyed[1]) || null;
         if (selector === 'label') return findNode(this, (n) => n !== this && n.tag === 'label');
+        if (selector === 'tbody') return findNode(this, (n) => n !== this && n.tag === 'tbody');
         if (selector === 'input, select, textarea') return findNode(this, (n) => n !== this && ['input', 'select', 'textarea'].includes(n.tag));
         return null;
       },
@@ -96,7 +97,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -116,6 +117,21 @@ function findNode(root, predicate) {
 function textOf(root) {
   return (root.textContent || '') + (root.children || []).map(textOf).join('');
 }
+
+test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
+  const h = harness(async () => response([
+    { user_id: '172697277964615681', user_name: 'wavingwalker', user_display_name: 'Wavingwalker', moderator_id: '1800882749273538599', moderator_name: 'ikaika44', active: true, reason: 'No reason provided', created_at: '2026-09-22T23:16:28Z' },
+    { user_id: '823826232020959242', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2026-09-22T07:43:34Z' },
+  ]));
+  const panel = h.app.tabBans();
+  await new Promise(resolve => setImmediate(resolve));
+  const text = textOf(panel);
+  assert.match(text, /Wavingwalker \(wavingwalker, 172697277964615681\)/);
+  assert.match(text, /ikaika44 \(1800882749273538599\)/);
+  assert.match(text, /823826232020959242/);
+  assert.match(text, /Unavailable/);
+  assert.match(text, /Reason unavailable/);
+});
 
 test('dashboard moderation counts stay with their requested server', async () => {
   const pending = [];

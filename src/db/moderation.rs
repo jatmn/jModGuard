@@ -218,12 +218,15 @@ pub struct BanRow {
         deserialize_with = "crate::ids::de_i64"
     )]
     pub user_id: i64,
+    pub user_name: Option<String>,
+    pub user_display_name: Option<String>,
     #[serde(
         default,
         serialize_with = "crate::ids::ser_opt_i64_str",
         deserialize_with = "crate::ids::de_opt_i64"
     )]
     pub moderator_id: Option<i64>,
+    pub moderator_name: Option<String>,
     pub reason: Option<String>,
     pub created_at: String,
     pub active: bool,
@@ -270,7 +273,7 @@ pub async fn list_bans(db: &Db, guild_id: i64, limit: i64) -> Result<Vec<BanRow>
 fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<Vec<BanRow>> {
     let limit = limit.clamp(1, 200);
     let mut stmt = conn.prepare(
-        "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active
+        "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name
              FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![guild_id, limit], |r| {
@@ -282,6 +285,9 @@ fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<
             reason: r.get(4)?,
             created_at: r.get(5)?,
             active: r.get::<i64>(6)? != 0,
+            user_name: r.get(7)?,
+            user_display_name: r.get(8)?,
+            moderator_name: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -466,7 +472,40 @@ pub async fn record_enrolled_ban(
     moderator_id: Option<i64>,
     reason: &str,
 ) -> Result<()> {
-    let (now, reason) = (now_str(), reason.to_string());
+    record_enrolled_ban_with_identity(
+        db,
+        enrollment,
+        user_id,
+        None,
+        None,
+        moderator_id,
+        None,
+        reason,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn record_enrolled_ban_with_identity(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    user_id: i64,
+    user_name: Option<&str>,
+    user_display_name: Option<&str>,
+    moderator_id: Option<i64>,
+    moderator_name: Option<&str>,
+    reason: &str,
+    occurred_at: Option<&str>,
+) -> Result<i64> {
+    let (now, reason) = (
+        occurred_at.map(str::to_owned).unwrap_or_else(now_str),
+        reason.to_string(),
+    );
+    let user_name = user_name.map(str::to_owned);
+    let user_display_name = user_display_name.map(str::to_owned);
+    let moderator_name = moderator_name.map(str::to_owned);
     let enrollment = enrollment.ok_or(EnrollmentChanged)?;
     let guild_id = enrollment.guild_id;
     db.with_conn(move |conn| {
@@ -475,9 +514,46 @@ pub async fn record_enrolled_ban(
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
         tx.execute(
-            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-            params![guild_id, user_id, moderator_id, reason, now],
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name],
+        )?;
+        let row_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(row_id)
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn attribute_enrolled_ban(
+    db: &Db,
+    enrollment: Option<GuildEnrollment>,
+    row_id: i64,
+    user_id: i64,
+    moderator_id: i64,
+    moderator_name: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let enrollment = enrollment.ok_or(EnrollmentChanged)?;
+    let moderator_name = moderator_name.map(str::to_owned);
+    let reason = reason.to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        tx.ensure_mutation_receipt()?;
+        tx.execute(
+            "UPDATE bans SET moderator_id = ?1, moderator_name = ?2, reason = ?3
+             WHERE id = ?4 AND guild_id = ?5 AND user_id = ?6 AND moderator_id IS NULL",
+            params![
+                moderator_id,
+                moderator_name,
+                reason,
+                row_id,
+                enrollment.guild_id,
+                user_id
+            ],
         )?;
         tx.commit()?;
         Ok(())

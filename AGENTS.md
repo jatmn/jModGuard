@@ -38,7 +38,9 @@ history reconstruction. Message-edit reports require Discord's `edited_timestamp
 embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
 report is that one event. Leave logs may use bounded join timestamps already received
 with messages; never fetch a roster. Ban/unban display may use bounded recent audit
-lookup inside report admission; this does not establish durable case-source identity.
+lookup inside report admission; a gateway ban may use the same bounded lookup
+under the report concurrency limit after saving its row. Neither establishes
+durable case-source identity.
 General message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
 not create durable audit rows. Internal retention fields remain transitional with no
@@ -173,7 +175,7 @@ acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve im
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core is at migration 0013. Local HTTP/SQL fixtures
+and backup-copy lifecycle remain before activation. Core is at migration 0014. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and
@@ -449,7 +451,7 @@ crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless from runtime CDN, not git)
-migrations/             0001_init through 0013_log_filters
+migrations/             0001_init through 0014_ban_display_identity
 Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```
