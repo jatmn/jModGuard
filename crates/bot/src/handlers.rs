@@ -46,16 +46,23 @@ fn audit_case_action(
     }
 }
 
-fn select_update_author(
+fn select_update_authors(
     event_author: Option<u64>,
     text_author: Option<u64>,
     image_author: Option<u64>,
     snippet_author: Option<u64>,
-) -> Option<u64> {
-    event_author
-        .or(text_author)
-        .or(image_author)
-        .or(snippet_author)
+    edited: bool,
+) -> (Option<u64>, Option<u64>) {
+    let detector_author = event_author.or(text_author).or(image_author);
+    let known_author = detector_author.or(snippet_author);
+    // A cached author identifies a message for logging, but an untimestamped
+    // refresh cannot turn an untracked old message into a new spam candidate.
+    let update_author = if edited {
+        known_author
+    } else {
+        detector_author
+    };
+    (known_author, update_author)
 }
 
 pub(crate) struct UpdateObservation {
@@ -502,17 +509,21 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
-        let known_author_id = event.guild_id.and_then(|guild| {
-            let guild = guild.get();
-            let channel = event.channel_id.get();
-            let message = event.id.get();
-            select_update_author(
-                event.author.as_ref().map(|user| user.id.get()),
-                self.app.text_spam.author_of(guild, channel, message),
-                self.app.image_spam.author_of(guild, channel, message),
-                logging::known_message_author(&self.app, guild, channel, message),
-            )
-        });
+        let (known_author_id, detector_update_author_id) = event
+            .guild_id
+            .map(|guild| {
+                let guild = guild.get();
+                let channel = event.channel_id.get();
+                let message = event.id.get();
+                select_update_authors(
+                    event.author.as_ref().map(|user| user.id.get()),
+                    self.app.text_spam.author_of(guild, channel, message),
+                    self.app.image_spam.author_of(guild, channel, message),
+                    logging::known_message_author(&self.app, guild, channel, message),
+                    event.edited_timestamp.is_some(),
+                )
+            })
+            .unwrap_or_default();
         logging::remember_message_update(&self.app, &event, known_author_id);
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
@@ -529,7 +540,7 @@ impl EventHandler for Handler {
             let channel = event.channel_id.get();
             let message = event.id.get();
             let update = UpdateObservation {
-                author: known_author_id,
+                author: detector_update_author_id,
                 received,
                 received_at,
             };
@@ -677,22 +688,35 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_case_action, select_update_author};
+    use super::{audit_case_action, select_update_authors};
     use serenity::model::guild::audit_log::{Action, MemberAction};
 
     #[test]
-    fn update_author_prefers_event_then_detector_then_exact_message_snippet() {
+    fn update_author_prefers_event_then_detector_and_only_uses_snippet_for_real_edits() {
         assert_eq!(
-            select_update_author(Some(1), Some(2), Some(3), Some(4)),
-            Some(1)
+            select_update_authors(Some(1), Some(2), Some(3), Some(4), false),
+            (Some(1), Some(1))
         );
         assert_eq!(
-            select_update_author(None, Some(2), Some(3), Some(4)),
-            Some(2)
+            select_update_authors(None, Some(2), Some(3), Some(4), false),
+            (Some(2), Some(2))
         );
-        assert_eq!(select_update_author(None, None, Some(3), Some(4)), Some(3));
-        assert_eq!(select_update_author(None, None, None, Some(4)), Some(4));
-        assert_eq!(select_update_author(None, None, None, None), None);
+        assert_eq!(
+            select_update_authors(None, None, Some(3), Some(4), false),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, Some(4), false),
+            (Some(4), None)
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, Some(4), true),
+            (Some(4), Some(4))
+        );
+        assert_eq!(
+            select_update_authors(None, None, None, None, true),
+            (None, None)
+        );
     }
 
     #[test]
