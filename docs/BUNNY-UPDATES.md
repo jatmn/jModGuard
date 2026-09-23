@@ -14,6 +14,8 @@ For a dashboard-selected bot/API image, the running source SHA can match the che
 
 The update policy supports Off, Daily, Weekly, and Monthly UTC windows. A missed hourly poll may run once in its current window. The same failed digest is never retried unattended; the owner can request it again. **Automatic installation is disabled by default** (`JMODGUARD_UNATTENDED_UPDATES` unset or `0`) and remains off while this repository is private. The separate `JMODGUARD_UPDATE_APPLY_ENABLED` and per-container `JMODGUARD_SELF_UPDATE` gates also default off. Do not enable them until the controlled Bunny rollout has passed. Stable/Nightly Git branches and their promotion policy are future work.
 
+An owner install request requires a successful release check for the currently selected channel within the last two hours. If the last check failed or expired, use **Check now** before installing; this applies to the service application, launcher, and WebUI controls.
+
 ## Storage Zone publication
 
 The API needs `BUNNY_STORAGE_ENDPOINT` (regional Storage hostname, default `storage.bunnycdn.com`), `BUNNY_STORAGE_ZONE`, and that **zone's Storage password** as `BUNNY_STORAGE_PASSWORD`. The password can read/write/delete within the entire zone. Keep it in Bunny's container environment, not source or browser code. The updater restricts operations to `index.html`, `administration/index.html`, and exact filenames under `assets/releases/<40-character source SHA>/`. It never deletes a directory or a legacy root file. A missing password disables WebUI installation while discovery remains available.

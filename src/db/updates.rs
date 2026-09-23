@@ -209,19 +209,44 @@ pub async fn record_update_check(
     }).await
 }
 
+fn checked_install_candidate(
+    raw: Option<String>,
+    channel: &str,
+    checked_at: Option<i64>,
+    check_error: Option<String>,
+    digest: &str,
+    now: i64,
+) -> Result<ComponentRelease> {
+    anyhow::ensure!(
+        check_error.is_none(),
+        "last release check failed; check again"
+    );
+    anyhow::ensure!(
+        checked_at.is_some_and(|at| at <= now && now.saturating_sub(at) < 7200),
+        "candidate check is stale; check again"
+    );
+    let candidate: ComponentRelease = serde_json::from_str(&raw.context("no checked candidate")?)?;
+    anyhow::ensure!(candidate.digest == digest, "candidate changed; check again");
+    anyhow::ensure!(
+        candidate.channel == channel,
+        "release channel changed; check again"
+    );
+    Ok(candidate)
+}
+
 pub async fn request_component_install(
     db: &Db,
     component: &str,
     digest: &str,
+    now: i64,
 ) -> Result<ComponentRelease> {
     validate_component(component)?;
     let component = component.to_owned();
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let (candidate, installed): (Option<String>, Option<String>) = tx.query_row("SELECT candidate,installed FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok((row.get(0)?,row.get(1)?)))?;
-        let candidate: ComponentRelease = serde_json::from_str(&candidate.context("no checked candidate")?)?;
-        anyhow::ensure!(candidate.digest == digest, "candidate changed; check again");
+        let (candidate, installed, channel, checked_at, check_error): (Option<String>, Option<String>, String, Option<i64>, Option<String>) = tx.query_row("SELECT candidate,installed,channel,checked_at,check_error FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let candidate = checked_install_candidate(candidate, &channel, checked_at, check_error, &digest, now)?;
         let installed = parse_release(installed)?;
         anyhow::ensure!(component == "webui" || installed.as_ref().is_none_or(|release| release.digest != digest), "application release is already installed");
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?])?;
@@ -234,6 +259,7 @@ pub async fn request_launcher_install(
     db: &Db,
     component: &str,
     digest: &str,
+    now: i64,
 ) -> Result<ComponentRelease> {
     anyhow::ensure!(
         matches!(component, "bot" | "api"),
@@ -243,14 +269,12 @@ pub async fn request_launcher_install(
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let (candidate, installed): (Option<String>, Option<String>) = tx.query_row(
-            "SELECT candidate,installed_launcher FROM component_updates WHERE component=?1",
+        let (candidate, installed, channel, checked_at, check_error): (Option<String>, Option<String>, String, Option<i64>, Option<String>) = tx.query_row(
+            "SELECT candidate,installed_launcher,channel,checked_at,check_error FROM component_updates WHERE component=?1",
             params![component.clone()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
-        let candidate: ComponentRelease =
-            serde_json::from_str(&candidate.context("no checked candidate")?)?;
-        anyhow::ensure!(candidate.digest == digest, "candidate changed; check again");
+        let candidate = checked_install_candidate(candidate, &channel, checked_at, check_error, &digest, now)?;
         let installed = parse_release(installed)?;
         anyhow::ensure!(
             installed
@@ -744,14 +768,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            request_component_install(&db, "api", &candidate('b').digest)
+            request_component_install(&db, "api", &candidate('b').digest, 100)
                 .await
                 .is_err()
         );
-        request_component_install(&db, "api", &first.digest)
+        request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
-        request_launcher_install(&db, "api", &first.digest)
+        request_launcher_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
         record_launcher_failure(&db, "api", &candidate('b').digest, "wrong request")
@@ -793,7 +817,7 @@ mod tests {
         record_update_check(&db, "api", Some(second.clone()), None, 120)
             .await
             .unwrap();
-        request_component_install(&db, "api", &second.digest)
+        request_component_install(&db, "api", &second.digest, 120)
             .await
             .unwrap();
         let next = ComponentObservation {
@@ -914,13 +938,13 @@ mod tests {
         record_update_check(&db, "api", Some(first.clone()), None, 100)
             .await
             .unwrap();
-        request_component_install(&db, "api", &first.digest)
+        request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
         record_update_check(&db, "api", Some(next.clone()), None, 101)
             .await
             .unwrap();
-        request_component_install(&db, "api", &next.digest)
+        request_component_install(&db, "api", &next.digest, 101)
             .await
             .unwrap();
         record_component_failure(&db, "api", &first, "stale download failure")
@@ -979,10 +1003,10 @@ mod tests {
         record_update_check(&db, "api", Some(first.clone()), None, 100)
             .await
             .unwrap();
-        request_component_install(&db, "api", &first.digest)
+        request_component_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
-        request_launcher_install(&db, "api", &first.digest)
+        request_launcher_install(&db, "api", &first.digest, 100)
             .await
             .unwrap();
         record_component_running(&db, "api", Some(first.clone()), observed.clone(), 101)
@@ -992,12 +1016,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            request_component_install(&db, "api", &first.digest)
+            request_component_install(&db, "api", &first.digest, 101)
                 .await
                 .is_err()
         );
         assert!(
-            request_launcher_install(&db, "api", &first.digest)
+            request_launcher_install(&db, "api", &first.digest, 101)
                 .await
                 .is_err()
         );
@@ -1008,7 +1032,7 @@ mod tests {
         record_update_check(&db, "api", Some(second.clone()), None, 102)
             .await
             .unwrap();
-        request_component_install(&db, "api", &second.digest)
+        request_component_install(&db, "api", &second.digest, 102)
             .await
             .unwrap();
         let baked = ComponentObservation {
@@ -1051,6 +1075,101 @@ mod tests {
         let state = component_update(&db, "api").await.unwrap();
         assert_eq!(state.installed.unwrap().digest, second.digest);
         assert_eq!(state.installed_at, Some(202));
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_install_transaction_requires_a_current_successful_channel_check() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_updates_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let api = candidate('a');
+        record_update_check(&db, "api", Some(api.clone()), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "api", &api.digest, 7300)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_launcher_install(&db, "api", &api.digest, 7300)
+                .await
+                .is_err()
+        );
+        assert!(
+            component_update(&db, "api")
+                .await
+                .unwrap()
+                .desired
+                .is_none()
+        );
+
+        record_update_check(&db, "api", Some(api.clone()), None, 7310)
+            .await
+            .unwrap();
+        set_update_policy(&db, "api", "nightly", "off", false)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "api", &api.digest, 7310)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_launcher_install(&db, "api", &api.digest, 7310)
+                .await
+                .is_err()
+        );
+        set_update_policy(&db, "api", "stable", "off", false)
+            .await
+            .unwrap();
+        record_update_check(&db, "api", None, Some("registry unavailable".into()), 7311)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "api", &api.digest, 7311)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_launcher_install(&db, "api", &api.digest, 7311)
+                .await
+                .is_err()
+        );
+        record_update_check(&db, "api", Some(api.clone()), None, 7312)
+            .await
+            .unwrap();
+        request_component_install(&db, "api", &api.digest, 7312)
+            .await
+            .unwrap();
+        request_launcher_install(&db, "api", &api.digest, 7312)
+            .await
+            .unwrap();
+
+        let mut webui = candidate('b');
+        webui.component = "webui".into();
+        webui.image = "ghcr.io/jatmn/jmodguard-webui".into();
+        webui.base_abi = "static-webui-v1".into();
+        record_update_check(&db, "webui", Some(webui.clone()), None, 200)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "webui", &webui.digest, 7400)
+                .await
+                .is_err()
+        );
+        record_update_check(&db, "webui", Some(webui.clone()), None, 7401)
+            .await
+            .unwrap();
+        request_component_install(&db, "webui", &webui.digest, 7401)
+            .await
+            .unwrap();
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

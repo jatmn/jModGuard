@@ -368,7 +368,7 @@ async fn queue_webui_install(
         db::claim_update_lease(db, "webui", &lease, now, 600).await?,
         "another WebUI operation is running"
     );
-    match db::request_component_install(db, "webui", digest).await {
+    match db::request_component_install(db, "webui", digest, now).await {
         Ok(release) => Ok((release, lease)),
         Err(error) => {
             db::release_update_lease(db, "webui", &lease).await?;
@@ -411,6 +411,16 @@ pub async fn install(
             "candidate changed; check again",
         ));
     }
+    let now = chrono::Utc::now().timestamp();
+    if record
+        .checked_at
+        .is_none_or(|checked| checked > now || now.saturating_sub(checked) >= 7200)
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "release check is stale; check again",
+        ));
+    }
     let already_installed = if input.launcher {
         record.installed_launcher.as_ref()
     } else {
@@ -434,7 +444,6 @@ pub async fn install(
             "WebUI source SHA was republished with different bytes; use a new source commit",
         ));
     }
-    let now = chrono::Utc::now().timestamp();
     jmodguard_updater::compatible(&app.db, &candidate, now)
         .await
         .map_err(|_| {
@@ -466,30 +475,30 @@ pub async fn install(
             .map_err(|_| {
                 error(
                     StatusCode::CONFLICT,
-                    "another WebUI operation is running or candidate changed",
+                    "another WebUI operation is running or candidate check changed; check again",
                 )
             })?;
         (release, Some(lease))
     } else if input.launcher {
         (
-            db::request_launcher_install(&app.db, &input.component, &input.digest)
+            db::request_launcher_install(&app.db, &input.component, &input.digest, now)
                 .await
                 .map_err(|_| {
                     error(
                         StatusCode::CONFLICT,
-                        "candidate changed or launcher already installed; check again",
+                        "candidate check changed or launcher already installed; check again",
                     )
                 })?,
             None,
         )
     } else {
         (
-            db::request_component_install(&app.db, &input.component, &input.digest)
+            db::request_component_install(&app.db, &input.component, &input.digest, now)
                 .await
                 .map_err(|_| {
                     error(
                         StatusCode::CONFLICT,
-                        "candidate changed or application already installed; check again",
+                        "candidate check changed or application already installed; check again",
                     )
                 })?,
             None,

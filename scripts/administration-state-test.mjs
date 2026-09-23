@@ -107,6 +107,11 @@ test("owner update controls require a current installable candidate", () => {
   render(view, api);
   assert.equal(updateButton(view, "api").disabled, true);
 
+  api.channel = "stable";
+  api.checked_at = Math.floor(Date.now() / 1000) - 7201;
+  render(view, api);
+  assert.equal(updateButton(view, "api").disabled, true);
+
   const webui = record("webui");
   webui.installed = { source_sha: webui.candidate.source_sha, digest: "sha256:" + "d".repeat(64) };
   render(view, webui);
