@@ -236,6 +236,24 @@ fn checked_install_candidate(
     Ok(candidate)
 }
 
+/// Asset URLs contain only the source SHA. A reserved SHA with no matching
+/// retained release has an unknown historical digest, so it cannot be reused.
+fn webui_source_reusable(
+    candidate: &ComponentRelease,
+    releases: &[Option<ComponentRelease>],
+    reserved: bool,
+) -> bool {
+    let matching = releases
+        .iter()
+        .flatten()
+        .filter(|release| release.source_sha == candidate.source_sha)
+        .collect::<Vec<_>>();
+    matching
+        .iter()
+        .all(|release| release.digest == candidate.digest)
+        && (!reserved || !matching.is_empty())
+}
+
 pub async fn request_component_install(
     db: &Db,
     component: &str,
@@ -246,12 +264,25 @@ pub async fn request_component_install(
     let component = component.to_owned();
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
+        struct InstallState {
+            candidate: Option<String>,
+            installed: Option<String>,
+            previous: Option<String>,
+            desired: Option<String>,
+            channel: String,
+            checked_at: Option<i64>,
+            check_error: Option<String>,
+        }
         let tx = conn.transaction_immediate()?;
-        let (candidate, installed, channel, checked_at, check_error): (Option<String>, Option<String>, String, Option<i64>, Option<String>) = tx.query_row("SELECT candidate,installed,channel,checked_at,check_error FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
-        let candidate = checked_install_candidate(candidate, &channel, checked_at, check_error, &digest, now)?;
-        let installed = parse_release(installed)?;
+        let state: InstallState = tx.query_row("SELECT candidate,installed,previous,desired,channel,checked_at,check_error FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok(InstallState {candidate:row.get(0)?,installed:row.get(1)?,previous:row.get(2)?,desired:row.get(3)?,channel:row.get(4)?,checked_at:row.get(5)?,check_error:row.get(6)?}))?;
+        let candidate = checked_install_candidate(state.candidate, &state.channel, state.checked_at, state.check_error, &digest, now)?;
+        let installed = parse_release(state.installed)?;
         anyhow::ensure!(component == "webui" || installed.as_ref().is_none_or(|release| release.digest != digest), "application release is already installed");
-        anyhow::ensure!(component != "webui" || installed.as_ref().is_none_or(|release| release.source_sha != candidate.source_sha || release.digest == candidate.digest), "WebUI source SHA was republished with a different image digest; use a new source commit");
+        if component == "webui" {
+            let reserved: i64 = tx.query_row("SELECT EXISTS(SELECT 1 FROM webui_managed_assets WHERE source_sha=?1)", params![candidate.source_sha.clone()], |row| Ok(row.get(0)?))?;
+            anyhow::ensure!(webui_source_reusable(&candidate, &[installed.clone(),parse_release(state.previous)?,parse_release(state.desired)?],reserved != 0), "WebUI source SHA already has a different or unknown image digest; use a new source commit");
+            tx.execute("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![candidate.source_sha.clone(),now])?;
+        }
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?])?;
         tx.commit()?;
         Ok(candidate)
@@ -471,7 +502,26 @@ pub async fn record_component_rollback(
 pub async fn record_webui_drift(db: &Db, error: &str) -> Result<()> {
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute("UPDATE component_updates SET observed=NULL,observed_at=NULL,state='drift',last_error=?1 WHERE component='webui'", params![error])?;
+        conn.execute("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state='failed' THEN last_error ELSE ?1 END WHERE component='webui'", params![error])?;
+        Ok(())
+    }).await
+}
+
+/// Restore the installed observation only after all five Storage objects
+/// match its digest-pinned package. Preserve a separate failed desired request.
+pub async fn record_webui_installed_verified(
+    db: &Db,
+    release: &ComponentRelease,
+    observation: ComponentObservation,
+    now: i64,
+) -> Result<()> {
+    let installed = serde_json::to_string(release)?;
+    let observation = serde_json::to_string(&observation)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        let changed = tx.execute("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now])?;
+        anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
+        tx.commit()?;
         Ok(())
     }).await
 }
@@ -484,7 +534,7 @@ pub async fn track_webui_assets(db: &Db, sha: &str, now: i64) -> Result<()> {
     let sha = sha.to_owned();
     db.with_conn(move |conn| {
         conn.execute(
-            "INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",
+            "INSERT INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2) ON CONFLICT(source_sha) DO UPDATE SET created_at=excluded.created_at WHERE webui_managed_assets.created_at<0",
             params![sha, now],
         )?;
         Ok(())
@@ -495,8 +545,9 @@ pub async fn track_webui_assets(db: &Db, sha: &str, now: i64) -> Result<()> {
 pub async fn managed_webui_assets(db: &Db) -> Result<Vec<String>> {
     db.with_conn(|conn| {
         let tx = conn.transaction_primary_read()?;
-        let mut stmt =
-            tx.prepare("SELECT source_sha FROM webui_managed_assets ORDER BY created_at")?;
+        let mut stmt = tx.prepare(
+            "SELECT source_sha FROM webui_managed_assets WHERE created_at>=0 ORDER BY created_at",
+        )?;
         let assets = stmt
             .query_map((), |row| Ok(row.get(0)?))?
             .collect::<Result<Vec<String>>>()?;
@@ -515,7 +566,7 @@ pub async fn untrack_webui_assets(db: &Db, sha: &str) -> Result<()> {
     let sha = sha.to_owned();
     db.with_conn(move |conn| {
         conn.execute(
-            "DELETE FROM webui_managed_assets WHERE source_sha=?1",
+            "UPDATE webui_managed_assets SET created_at=-1 WHERE source_sha=?1",
             params![sha],
         )?;
         Ok(())
@@ -579,15 +630,15 @@ pub async fn request_due_automatic_install(
     let expected_digest = expected_digest.to_owned();
     db.with_conn(move |conn| {
         struct AutoState {
-            channel:String,cadence:String,candidate:Option<String>,installed:Option<String>,checked_at:Option<i64>,
+            channel:String,cadence:String,candidate:Option<String>,installed:Option<String>,previous:Option<String>,desired:Option<String>,checked_at:Option<i64>,
             check_error:Option<String>,last_digest:Option<String>,last_window:Option<String>,
         }
         let tx=conn.transaction_immediate()?;
         let state:AutoState = tx.query_row(
-            "SELECT channel,cadence,candidate,installed,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
+            "SELECT channel,cadence,candidate,installed,previous,desired,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
             params![component.clone()],|row| Ok(AutoState {
-                channel:row.get(0)?,cadence:row.get(1)?,candidate:row.get(2)?,installed:row.get(3)?,checked_at:row.get(4)?,
-                check_error:row.get(5)?,last_digest:row.get(6)?,last_window:row.get(7)?,
+                channel:row.get(0)?,cadence:row.get(1)?,candidate:row.get(2)?,installed:row.get(3)?,previous:row.get(4)?,desired:row.get(5)?,checked_at:row.get(6)?,
+                check_error:row.get(7)?,last_digest:row.get(8)?,last_window:row.get(9)?,
             }))?;
         let Some(window)=automatic_window(&state.cadence,now) else { tx.commit()?; return Ok(None); };
         if state.check_error.is_some() || state.checked_at.is_none_or(|at| at>now || now.saturating_sub(at)>=7200) || state.last_window.as_deref()==Some(window.as_str()) {
@@ -596,8 +647,15 @@ pub async fn request_due_automatic_install(
         let Some(candidate)=state.candidate else { tx.commit()?; return Ok(None); };
         let release:ComponentRelease=serde_json::from_str(&candidate)?;
         let installed=parse_release(state.installed)?;
-        if release.channel!=state.channel || release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || installed.as_ref().is_some_and(|current| current.digest==release.digest || component=="webui" && current.source_sha==release.source_sha) {
+        if release.channel!=state.channel || release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || installed.as_ref().is_some_and(|current| current.digest==release.digest) {
             tx.commit()?; return Ok(None);
+        }
+        if component=="webui" {
+            let reserved:i64=tx.query_row("SELECT EXISTS(SELECT 1 FROM webui_managed_assets WHERE source_sha=?1)",params![release.source_sha.clone()],|row| Ok(row.get(0)?))?;
+            if !webui_source_reusable(&release,&[installed,parse_release(state.previous)?,parse_release(state.desired)?],reserved!=0) {
+                tx.commit()?; return Ok(None);
+            }
+            tx.execute("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![release.source_sha.clone(),now])?;
         }
         tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL,auto_last_digest=?3,auto_last_window=?4 WHERE component=?1",params![component,candidate,release.digest.clone(),window])?;
         tx.commit()?;
@@ -676,12 +734,13 @@ pub async fn renew_update_lease(
 }
 
 /// A recovered WebUI check holds the lease after any abandoned apply lease has
-/// expired. Settle only a still-queued request; preserve drift and newer work.
+/// expired. Reconciliation preserves a queued request even when Storage is
+/// partially switched. Preserve completed adoption, prior failure, and newer work.
 pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Result<()> {
     let desired = serde_json::to_string(release)?;
     db.with_conn(move |conn| {
         conn.execute(
-            "UPDATE component_updates SET state='failed',last_error='WebUI installation was interrupted; check Storage and retry' WHERE component='webui' AND desired=?1 AND state='queued'",
+            "UPDATE component_updates SET state='failed',last_error='WebUI installation was interrupted; Storage may be partially switched. Check Storage and retry' WHERE component='webui' AND desired=?1 AND state='queued'",
             params![desired],
         )?;
         Ok(())
@@ -840,6 +899,78 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // A's URLs remain cacheable when B replaces it. A repack must not
+        // overwrite those URLs through either admission path.
+        let mut replacement = candidate('d');
+        replacement.component = "webui".into();
+        replacement.image = webui.image.clone();
+        replacement.base_abi = webui.base_abi.clone();
+        replacement.channel = "stable".into();
+        let old = serde_json::to_string(&webui).unwrap();
+        let current = serde_json::to_string(&replacement).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE component_updates SET installed=?1,previous=?2 WHERE component='webui'",
+                params![current, old],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            request_due_automatic_install(&db, "webui", &repack.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            request_component_install(&db, "webui", &repack.digest, now)
+                .await
+                .is_err()
+        );
+
+        // A matching digest can repair a retained release, but a retired SHA
+        // without a known matching digest must stay reserved.
+        track_webui_assets(&db, &webui.source_sha, now)
+            .await
+            .unwrap();
+        record_update_check(&db, "webui", "stable", Some(webui.clone()), None, now)
+            .await
+            .unwrap();
+        request_component_install(&db, "webui", &webui.digest, now)
+            .await
+            .unwrap();
+        let orphan = candidate('e');
+        track_webui_assets(&db, &orphan.source_sha, now)
+            .await
+            .unwrap();
+        untrack_webui_assets(&db, &orphan.source_sha).await.unwrap();
+        assert!(
+            !managed_webui_assets(&db)
+                .await
+                .unwrap()
+                .contains(&orphan.source_sha)
+        );
+        let mut orphan = orphan;
+        orphan.component = "webui".into();
+        orphan.image = webui.image.clone();
+        orphan.base_abi = webui.base_abi.clone();
+        orphan.channel = "stable".into();
+        record_update_check(&db, "webui", "stable", Some(orphan.clone()), None, now)
+            .await
+            .unwrap();
+        assert!(
+            request_component_install(&db, "webui", &orphan.digest, now)
+                .await
+                .is_err()
+        );
+        assert!(
+            request_due_automatic_install(&db, "webui", &orphan.digest, now, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -883,6 +1014,89 @@ mod tests {
             component_update(&db, "webui").await.unwrap().state,
             "failed"
         );
+        // A crash after the admin HTML switch can clear the observation. The
+        // request still needs the interrupted result, not an unrelated drift.
+        request_component_install(&db, "webui", &release.digest, 117)
+            .await
+            .unwrap();
+        record_webui_drift(&db, "Storage files differ")
+            .await
+            .unwrap();
+        assert_eq!(
+            component_update(&db, "webui").await.unwrap().state,
+            "queued"
+        );
+        settle_interrupted_webui(&db, &release).await.unwrap();
+        let partial = component_update(&db, "webui").await.unwrap();
+        assert_eq!(partial.state, "failed");
+        assert!(partial.last_error.unwrap().contains("partially switched"));
+        record_webui_drift(&db, "Storage still differs")
+            .await
+            .unwrap();
+        assert_eq!(
+            component_update(&db, "webui").await.unwrap().state,
+            "failed"
+        );
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_installed_webui_keeps_interrupted_request_failed() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_webui_restore_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let mut old = candidate('a');
+        old.component = "webui".into();
+        old.image = "ghcr.io/jatmn/jmodguard-webui".into();
+        old.base_abi = "static-webui-v1".into();
+        let mut next = candidate('b');
+        next.component = "webui".into();
+        next.image = old.image.clone();
+        next.base_abi = old.base_abi.clone();
+        let observation = ComponentObservation {
+            source_sha: old.source_sha.clone(),
+            executable_sha256: "c".repeat(64),
+            admin_sha256: Some("d".repeat(64)),
+            base_image_sha: "Storage Zone".into(),
+            started_at: 100,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "static-webui-v1".into(),
+        };
+        record_update_check(&db, "webui", "latest", Some(old.clone()), None, 100)
+            .await
+            .unwrap();
+        request_component_install(&db, "webui", &old.digest, 100)
+            .await
+            .unwrap();
+        record_component_running(&db, "webui", Some(old.clone()), observation.clone(), 101)
+            .await
+            .unwrap();
+        record_update_check(&db, "webui", "latest", Some(next.clone()), None, 110)
+            .await
+            .unwrap();
+        request_component_install(&db, "webui", &next.digest, 110)
+            .await
+            .unwrap();
+        record_webui_drift(&db, "Storage files differ")
+            .await
+            .unwrap();
+        settle_interrupted_webui(&db, &next).await.unwrap();
+        record_webui_installed_verified(&db, &old, observation.clone(), 120)
+            .await
+            .unwrap();
+        let state = component_update(&db, "webui").await.unwrap();
+        assert_eq!(state.state, "failed");
+        assert_eq!(state.observed.unwrap().source_sha, old.source_sha);
+        assert_eq!(state.desired.unwrap().digest, next.digest);
+        assert!(state.last_error.unwrap().contains("interrupted"));
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

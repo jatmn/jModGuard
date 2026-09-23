@@ -198,38 +198,6 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
     let storage = storage()?;
     let root = storage.get("index.html").await?;
     let admin = storage.get("administration/index.html").await?;
-    let matches_observed_html = state.observed.as_ref().is_some_and(|observed| {
-        root.as_ref()
-            .is_some_and(|bytes| sha256_hex(bytes) == observed.executable_sha256)
-            && observed.admin_sha256.as_ref().is_none_or(|hash| {
-                admin
-                    .as_ref()
-                    .is_some_and(|bytes| sha256_hex(bytes) == *hash)
-            })
-    });
-    if matches_observed_html
-        && let (Some(observed), Some(installed)) = (&state.observed, &state.installed)
-        && observed.source_sha == installed.source_sha
-    {
-        let registry = Registry::ghcr()?;
-        if storage
-            .verify_release(&registry, installed)
-            .await?
-            .is_some()
-        {
-            // A successful hourly check renews the observation only after the
-            // HTML and all immutable assets still match the installed digest.
-            db::record_component_running(
-                &app.db,
-                "webui",
-                None,
-                observed.clone(),
-                chrono::Utc::now().timestamp(),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
     if let Some(release) = state.desired.as_ref() {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
         if root.as_ref().is_some_and(|bytes| {
@@ -266,6 +234,31 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 .await?;
                 return Ok(());
             }
+        }
+    }
+    if let Some(installed) = state.installed.as_ref() {
+        let registry = Registry::ghcr()?;
+        if let Some((root_hash, admin_hash)) = storage.verify_release(&registry, installed).await? {
+            let now = chrono::Utc::now().timestamp();
+            db::record_webui_installed_verified(
+                &app.db,
+                installed,
+                ComponentObservation {
+                    source_sha: installed.source_sha.clone(),
+                    executable_sha256: root_hash,
+                    admin_sha256: Some(admin_hash),
+                    base_image_sha: "Storage Zone".into(),
+                    started_at: state.observed.as_ref().map_or(now, |seen| seen.started_at),
+                    min_schema: installed.min_schema,
+                    max_schema: installed.max_schema,
+                    api_capability: 1,
+                    self_update_enabled: true,
+                    base_abi: "static-webui-v1".into(),
+                },
+                now,
+            )
+            .await?;
+            return Ok(());
         }
     }
     if state.observed.is_some() {
@@ -486,9 +479,12 @@ pub async fn install(
         ));
     }
     if input.component == "webui"
-        && record.installed.as_ref().is_some_and(|installed| {
-            installed.source_sha == candidate.source_sha && installed.digest != candidate.digest
-        })
+        && [&record.installed, &record.previous, &record.desired]
+            .into_iter()
+            .flatten()
+            .any(|release| {
+                release.source_sha == candidate.source_sha && release.digest != candidate.digest
+            })
     {
         return Err(error(
             StatusCode::CONFLICT,
@@ -526,7 +522,7 @@ pub async fn install(
             .map_err(|_| {
                 error(
                     StatusCode::CONFLICT,
-                    "another WebUI operation is running or candidate check changed; check again",
+                    "another WebUI operation is running, candidate check changed, or this source SHA has a different or unknown image digest; check again",
                 )
             })?;
         (release, Some(lease))

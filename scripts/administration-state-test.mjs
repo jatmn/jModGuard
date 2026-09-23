@@ -119,6 +119,14 @@ test("owner update controls require a current installable candidate", () => {
   const warning = textOf(view.elements.get("update-cards"));
   assert.match(warning, /different image digest/);
   assert.doesNotMatch(warning, /has different bytes/);
+  webui.installed = { source_sha: "d".repeat(40), digest: "sha256:" + "d".repeat(64) };
+  webui.previous = { source_sha: webui.candidate.source_sha, digest: "sha256:" + "e".repeat(64) };
+  render(view, webui);
+  assert.equal(updateButton(view, "webui").disabled, true);
+  webui.state = "drift";
+  webui.last_error = "Storage files differ";
+  render(view, webui);
+  assert.match(textOf(view.elements.get("update-cards")), /Storage drift: Storage files differ/);
 });
 
 test("signed-out Administration offers Discord sign-in on the existing API response", async () => {

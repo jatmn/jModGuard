@@ -84,7 +84,7 @@ function render() {
     line(content, "Managed release installed", age(record.installed_at));
     const checked = record.checked_at && Date.now() / 1000 - record.checked_at < 7200 && !record.check_error;
     const candidateCurrent = checked && record.candidate?.channel === record.channel;
-    const webuiRepacked = record.component === "webui" && record.installed?.source_sha === record.candidate?.source_sha && record.installed?.digest !== record.candidate?.digest;
+    const webuiRepacked = record.component === "webui" && [record.installed, record.previous, record.desired].some((release) => release?.source_sha === record.candidate?.source_sha && release.digest !== record.candidate?.digest);
     line(content, "Available release", candidateCurrent ? releaseText(record.candidate) : "Check now to confirm this channel");
     if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
     const compatibility = snapshot.compatibility?.[record.component];
@@ -103,7 +103,7 @@ function render() {
       }
     }
     line(content, "Availability", availability);
-    line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? `Install failed: ${record.last_error}` : record.state);
+    line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
     line(content, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
     line(content, "Launcher SHA-256", record.launcher_sha256 || "unknown");
     const row = node("div", null, "card-actions");
