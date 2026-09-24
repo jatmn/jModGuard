@@ -387,6 +387,26 @@ fn bounded_name(name: Option<String>) -> Result<Option<String>> {
     Ok(name)
 }
 
+fn update_ban_identity(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    user_id: i64,
+    username: &str,
+    global_name: &Option<String>,
+) -> Result<()> {
+    let nickname: Option<String> = conn.query_row(
+        "SELECT nickname FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+        |r| Ok(r.get(0)?),
+    )?;
+    let search_text = normalized_name(&Some(username.to_owned()), global_name, &nickname);
+    conn.execute(
+        "UPDATE guild_member_directory SET username=?4,global_name=?5,search_text=?6 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), user_id, username, global_name.clone(), search_text],
+    )?;
+    Ok(())
+}
+
 fn random_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
@@ -1037,7 +1057,8 @@ impl GuildDataStore {
         user_id: i64,
         observed_at_ms: i64,
     ) -> Result<bool> {
-        self.set_ban(scope, user_id, observed_at_ms, true).await
+        self.set_ban(scope, user_id, observed_at_ms, true, None)
+            .await
     }
     pub async fn observe_unban(
         &self,
@@ -1045,7 +1066,42 @@ impl GuildDataStore {
         user_id: i64,
         observed_at_ms: i64,
     ) -> Result<bool> {
-        self.set_ban(scope, user_id, observed_at_ms, false).await
+        self.set_ban(scope, user_id, observed_at_ms, false, None)
+            .await
+    }
+    pub async fn observe_ban_with_identity(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+        observed_at_ms: i64,
+        username: String,
+        global_name: Option<String>,
+    ) -> Result<bool> {
+        self.set_ban(
+            scope,
+            user_id,
+            observed_at_ms,
+            true,
+            Some((username, global_name)),
+        )
+        .await
+    }
+    pub async fn observe_unban_with_identity(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+        observed_at_ms: i64,
+        username: String,
+        global_name: Option<String>,
+    ) -> Result<bool> {
+        self.set_ban(
+            scope,
+            user_id,
+            observed_at_ms,
+            false,
+            Some((username, global_name)),
+        )
+        .await
     }
     async fn set_ban(
         &self,
@@ -1053,9 +1109,19 @@ impl GuildDataStore {
         user_id: i64,
         observed_at_ms: i64,
         banned: bool,
+        identity: Option<(String, Option<String>)>,
     ) -> Result<bool> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(user_id > 0 && observed_at_ms > 0, MemberSyncError::Invalid);
+        let identity = identity
+            .map(|(username, global_name)| {
+                anyhow::ensure!(
+                    !username.is_empty() && username.len() <= 256,
+                    MemberSyncError::Invalid
+                );
+                Ok((username, bounded_name(global_name)?))
+            })
+            .transpose()?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| { let mut tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
@@ -1070,6 +1136,7 @@ impl GuildDataStore {
                 if state==banned {
                     tx.ensure_mutation_receipt()?;
                     tx.execute("UPDATE guild_member_directory SET ban_observed_at_ms=?4,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
+                    if let Some((username,global_name))=&identity { update_ban_identity(&tx,&scope,user_id,username,global_name)?; }
                     if banned { close_current_for_ban(&tx,&scope,user_id,observed_at_ms)?; }
                     bump_revision(&tx,&scope)?;tx.commit()?;return Ok(true)
                 }
@@ -1077,6 +1144,7 @@ impl GuildDataStore {
             tx.ensure_mutation_receipt()?;
             tx.execute("INSERT OR IGNORE INTO guild_member_directory(guild_id,enrollment_id,user_id,observed_at_ms,ever_banned) VALUES(?1,?2,?3,?4,1)",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
             tx.execute("UPDATE guild_member_directory SET is_banned=?4,ever_banned=1,current_ban_reason=CASE WHEN ?4 THEN current_ban_reason ELSE NULL END,cleanup_after_ms=NULL,observed_at_ms=MAX(observed_at_ms,?5),ban_observed_at_ms=?5,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,banned,observed_at_ms])?;
+            if let Some((username,global_name))=&identity { update_ban_identity(&tx,&scope,user_id,username,global_name)?; }
             if banned { close_current_for_ban(&tx,&scope,user_id,observed_at_ms)?; }
             if banned {tx.execute("DELETE FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id])?;}
             bump_revision(&tx,&scope)?; tx.commit()?;Ok(true)

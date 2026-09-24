@@ -4136,3 +4136,137 @@ async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
         .unwrap();
     assert_eq!(unresolved_table, 1);
 }
+
+#[tokio::test]
+async fn gateway_ban_identity_updates_saved_names_without_losing_nickname_or_order() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let query = |q: &str, status| MemberQuery {
+        q: Some(q.into()),
+        status,
+        joined_from_ms: None,
+        joined_to_ms: None,
+        sort: MemberSort::JoinedNewest,
+        after: None,
+        limit: 10,
+    };
+
+    // The user was absent from the seed. A later Gateway ban supplies real
+    // identity even though the directory has no prior member row to enrich.
+    store
+        .observe_ban_with_identity(
+            scope.clone(),
+            501,
+            2_000,
+            "BanUser".into(),
+            Some("Ban Display".into()),
+        )
+        .await
+        .unwrap();
+    let banned = store.get_member(scope.clone(), 501).await.unwrap().unwrap();
+    assert_eq!(banned.username.as_deref(), Some("BanUser"));
+    assert_eq!(banned.global_name.as_deref(), Some("Ban Display"));
+    assert!(banned.is_banned && banned.ever_banned);
+    for name in ["banuser", "ban display", "501"] {
+        assert_eq!(
+            store
+                .list_members(scope.clone(), query(name, MemberStatusFilter::Banned))
+                .await
+                .unwrap()
+                .members
+                .len(),
+            1,
+            "ban identity must be searchable by name and ID"
+        );
+    }
+    store
+        .observe_unban_with_identity(scope.clone(), 501, 3_000, "UnbanUser".into(), None)
+        .await
+        .unwrap();
+    let unbanned = store.get_member(scope.clone(), 501).await.unwrap().unwrap();
+    assert_eq!(unbanned.username.as_deref(), Some("UnbanUser"));
+    assert_eq!(unbanned.global_name, None);
+    assert!(!unbanned.is_banned && unbanned.ever_banned);
+    assert_eq!(
+        store
+            .list_members(
+                scope.clone(),
+                query("unbanuser", MemberStatusFilter::PreviouslyBanned)
+            )
+            .await
+            .unwrap()
+            .members
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .list_members(scope.clone(), query("ban display", MemberStatusFilter::All))
+            .await
+            .unwrap()
+            .members
+            .is_empty()
+    );
+
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: 502,
+                username: Some(Some("MemberUser".into())),
+                global_name: Some(Some("Member Display".into())),
+                nickname: Some(Some("Favorite Nick".into())),
+                joined_at_ms: Some(1_200),
+                observed_at_ms: 1_500,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .observe_ban_with_identity(
+            scope.clone(),
+            502,
+            2_000,
+            "Current Ban".into(),
+            Some("Current Global".into()),
+        )
+        .await
+        .unwrap();
+    let known = store.get_member(scope.clone(), 502).await.unwrap().unwrap();
+    assert_eq!(known.nickname.as_deref(), Some("Favorite Nick"));
+    assert_eq!(known.username.as_deref(), Some("Current Ban"));
+    assert_eq!(known.global_name.as_deref(), Some("Current Global"));
+    assert_eq!(
+        store
+            .list_members(
+                scope.clone(),
+                query("favorite nick", MemberStatusFilter::Banned)
+            )
+            .await
+            .unwrap()
+            .members
+            .len(),
+        1
+    );
+    // An older opposite event must be verified and must not overwrite names.
+    store
+        .observe_unban_with_identity(scope.clone(), 502, 1_900, "Stale Name".into(), None)
+        .await
+        .unwrap();
+    let after_stale = store.get_member(scope.clone(), 502).await.unwrap().unwrap();
+    assert!(after_stale.is_banned);
+    assert_eq!(after_stale.username.as_deref(), Some("Current Ban"));
+    assert_eq!(after_stale.global_name.as_deref(), Some("Current Global"));
+    store
+        .observe_ban_with_identity(scope.clone(), 502, 2_100, "Fresh Ban".into(), None)
+        .await
+        .unwrap();
+    let refreshed = store.get_member(scope.clone(), 502).await.unwrap().unwrap();
+    assert_eq!(refreshed.username.as_deref(), Some("Fresh Ban"));
+    assert_eq!(refreshed.global_name, None);
+    assert_eq!(refreshed.nickname.as_deref(), Some("Favorite Nick"));
+}

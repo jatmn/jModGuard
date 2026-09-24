@@ -150,7 +150,8 @@ Require an already-bound anchor and reject conflicts; never infer matches or mer
 Preserve original facts and both source replay keys after removal, including late explicit
 links to removed parents. Closed cleanup removes owned keys atomically. Bot-owned
 Ban/Unban/Kick now link Discord audit entries from the same process dispatch using that
-application identity; unmarked gateway cases and foreign executors stay application-only.
+application identity. Unmarked gateway cases and foreign audit actions other than Ban/Unban stay
+application-only; foreign Ban/Unban audit entries use their exact Discord audit ID as source.
 Deferred matched pairs stay quarantined for that same 30s/4096 window so a later
 same-subject dispatch cannot reuse those halves; expired pending links stay application-only.
 

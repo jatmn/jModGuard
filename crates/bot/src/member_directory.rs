@@ -379,7 +379,13 @@ pub async fn observe_ban(
     )
     .await?;
     match store
-        .observe_ban(scope.clone(), user.id.get() as i64, observed_at_ms)
+        .observe_ban_with_identity(
+            scope.clone(),
+            user.id.get() as i64,
+            observed_at_ms,
+            user.name.clone(),
+            user.global_name.clone(),
+        )
         .await
     {
         Ok(changed) => Some(changed),
@@ -416,7 +422,13 @@ pub async fn observe_unban(
     )
     .await?;
     match store
-        .observe_unban(scope.clone(), user.id.get() as i64, observed_at_ms)
+        .observe_unban_with_identity(
+            scope.clone(),
+            user.id.get() as i64,
+            observed_at_ms,
+            user.name.clone(),
+            user.global_name.clone(),
+        )
         .await
     {
         Ok(changed) => Some(changed),

@@ -81,8 +81,8 @@ action without creating a duplicate case.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version11, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version11 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version12, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version12 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 
@@ -117,7 +117,7 @@ tables belong to separate guild-store databases. The directory/global-policy dat
 case/evidence records or credentials are copied into these tables; historical guild data
 and membership are unchanged. This is not the final tenant schema or removal/purge mechanism.
 
-Start matching bot/API binaries with bot migration first. Version10 binaries reject version11;
+Start matching bot/API binaries with bot migration first. Version10 and version11 binaries reject version12;
 rollback needs the pre-upgrade database and matching binaries. No backup automation, live
 Bunny validation or distributed consistency certification is supplied. The local
 SQLite [member-directory sizing fixtures](MEMBERS.md#storage-sizing) estimate
