@@ -38,7 +38,7 @@ impl ApiState {
             client_secret: cfg.web.oauth_client_secret.clone(),
             redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
             http,
-            guild_list: tokio::sync::Mutex::new(super::oauth::GuildListGate::new()),
+            guild_list: std::sync::Mutex::new(super::oauth::GuildListGate::new()),
             guild_flights: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             guilds_endpoint: None,

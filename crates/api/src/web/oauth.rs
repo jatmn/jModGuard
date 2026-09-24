@@ -8,8 +8,8 @@ pub struct OAuthClient {
     pub client_secret: String,
     pub redirect_uri: String,
     pub http: reqwest::Client,
-    /// Token cooldown map. Held only while reading or updating that map.
-    pub(crate) guild_list: tokio::sync::Mutex<GuildListGate>,
+    /// Token cooldown map. A standard mutex so recording a 429 cannot be cancelled.
+    pub(crate) guild_list: std::sync::Mutex<GuildListGate>,
     /// One in-flight guild-list fetch per access token. Unrelated tokens do not share it.
     pub(crate) guild_flights:
         tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
@@ -52,10 +52,18 @@ impl GuildListGate {
     }
 
     fn block_until(&mut self, token: &str, retry_after: Duration) {
-        self.cooldowns.insert(
-            token.to_owned(),
-            cooldown_deadline(Instant::now(), retry_after),
-        );
+        let next = cooldown_deadline(Instant::now(), retry_after);
+        let replace = match self.cooldowns.get(token).copied() {
+            Some(Cooldown::RestOfProcess) => false,
+            Some(Cooldown::Until(existing)) => match next {
+                Cooldown::RestOfProcess => true,
+                Cooldown::Until(until) => until > existing,
+            },
+            None => true,
+        };
+        if replace {
+            self.cooldowns.insert(token.to_owned(), next);
+        }
     }
 }
 
@@ -276,14 +284,14 @@ impl OAuthClient {
         &self,
         access_token: &str,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
-        if let Some(retry_after) = self.guild_list.lock().await.remaining(access_token) {
+        if let Some(retry_after) = self.cooldown_remaining(access_token) {
             return Err(GuildListError::RateLimited { retry_after });
         }
         // Same-token callers share one fetch. The cooldown map is not held
         // across Discord I/O, so another token is not stalled behind this one.
         let flight = self.guild_flight(access_token).await;
         let _same_token = flight.lock().await;
-        if let Some(retry_after) = self.guild_list.lock().await.remaining(access_token) {
+        if let Some(retry_after) = self.cooldown_remaining(access_token) {
             return Err(GuildListError::RateLimited { retry_after });
         }
         // Discord paginates at 200 guilds; a single GET silently drops every
@@ -318,12 +326,13 @@ impl OAuthClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
+                // Record before reading the body. Cancellation during that read
+                // must not forget that Discord already rate-limited this token.
+                let provisional = discord_retry_after(header.as_deref(), b"{}");
+                self.remember_cooldown(access_token, provisional);
                 let bytes = resp.bytes().await.unwrap_or_default();
                 let retry_after = discord_retry_after(header.as_deref(), &bytes);
-                self.guild_list
-                    .lock()
-                    .await
-                    .block_until(access_token, retry_after);
+                self.remember_cooldown(access_token, retry_after);
                 return Err(GuildListError::RateLimited { retry_after });
             }
             if !status.is_success() {
@@ -351,6 +360,20 @@ impl OAuthClient {
             }
         }
         Ok(all)
+    }
+
+    fn cooldown_remaining(&self, access_token: &str) -> Option<Duration> {
+        self.guild_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remaining(access_token)
+    }
+
+    fn remember_cooldown(&self, access_token: &str, retry_after: Duration) {
+        self.guild_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .block_until(access_token, retry_after);
     }
 
     async fn guild_flight(&self, access_token: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -500,7 +523,7 @@ mod tests {
             client_secret: String::new(),
             redirect_uri: String::new(),
             http: reqwest::Client::new(),
-            guild_list: tokio::sync::Mutex::new(GuildListGate::new()),
+            guild_list: std::sync::Mutex::new(GuildListGate::new()),
             guild_flights: tokio::sync::Mutex::new(HashMap::new()),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
