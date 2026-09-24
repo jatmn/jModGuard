@@ -445,6 +445,22 @@ CI’s `tests/remote_database_smoke.rs` proves bot bootstrap and API
 schema-open against a local libSQL server, not Bunny TLS.
 `tests/dual_process_smoke.rs` covers the local SQLite process contract.
 
+## Expired database streams
+
+The bot and API reset the saved remote autocommit stream before each pooled
+database operation. This prevents an idle connection from reusing a Bunny
+Hrana stream that has expired. It needs no environment setting or manual SQL.
+The reset does not retry the database operation or any Discord action.
+
+If `bot action queue unavailable` continues after installing this correction,
+retain the full error chain, including the `remote database ... failed`
+operation name. An expired stream during an active transaction is distinct
+from an idle pooled stream; this change does not extend Bunny transaction
+lifetimes. The accompanying `while no runtime was available` warning can come
+from libSQL's best-effort cleanup of a discarded stream and does not by itself
+mean the database runtime stopped. Discord connectivity and `/health` alone
+do not prove that the action queue is working.
+
 ## Operating constraints
 
 - Bunny Database is Public Preview. Internal snapshots are not an

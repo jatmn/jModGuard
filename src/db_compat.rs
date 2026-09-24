@@ -209,7 +209,9 @@ impl DbRuntime {
         match self.operation_timeout {
             Some(timeout) => {
                 match self.block_on(async move { tokio::time::timeout(timeout, future).await }) {
-                    Ok(result) => result.map_err(Into::into),
+                    Ok(result) => result
+                        .map_err(Into::into)
+                        .with_context(|| format!("remote database {operation} failed")),
                     Err(_) => Err(database_operation_timed_out(operation, timeout)),
                 }
             }
@@ -268,6 +270,18 @@ impl Connection {
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Start a pooled remote operation without the previous operation's
+    /// autocommit cursor baton. The server may expire it while the lease is
+    /// idle. libSQL reset clears local stream state without sending SQL or
+    /// replaying a failed request; explicit transactions use separate streams.
+    pub(crate) fn reset_remote_stream(&self) -> Result<()> {
+        self.runtime
+            .block_on_database("reset pooled stream", async {
+                self.inner.reset().await;
+                Ok::<_, anyhow::Error>(())
+            })
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
@@ -450,11 +464,17 @@ impl Transaction {
             Ok(row.get::<String>(0)?)
         }) {
             Ok(inserted) => Ok(inserted),
-            Err(error) if error.to_string().contains("no such table: meta") => self.query_row(
-                INSERT_UNFENCED_MUTATION_RECEIPT_SQL,
-                params![receipt],
-                |row| Ok(row.get::<String>(0)?),
-            ),
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("no such table: meta")) =>
+            {
+                self.query_row(
+                    INSERT_UNFENCED_MUTATION_RECEIPT_SQL,
+                    params![receipt],
+                    |row| Ok(row.get::<String>(0)?),
+                )
+            }
             Err(error) => Err(error),
         }
     }
@@ -778,7 +798,9 @@ mod tests {
             "jmodguard_receipt_statement_{:032x}.db",
             rand::random::<u128>()
         ));
-        let runtime = DbRuntime::new().unwrap();
+        // Exercise the remote deadline/error-context path against real SQLite
+        // SQL semantics, including guild stores that have no core meta table.
+        let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_secs(3))).unwrap();
         let database = runtime
             .block_on(libsql::Builder::new_local(path.clone()).build())
             .unwrap();
