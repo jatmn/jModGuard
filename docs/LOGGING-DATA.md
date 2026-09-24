@@ -24,8 +24,12 @@ persistent member/user roster or activity counters.
   reports as current text. Each report is one observed edit. Reports say
   "updated"; they do not claim a verified complete revision diff. A bounded
   10-second fingerprint merges partial content/attachment updates
-  that share an edit timestamp for the same message in one bot process. A later
-  distinct edit timestamp reports again.
+  that share an edit timestamp for the same message in one bot process. The
+  stored snapshot does the same: a field inherited from an earlier observation
+  is not treated as already supplied at the new timestamp, so a complementary
+  partial can fill it. A different value for a field already supplied at that
+  timestamp does not replace the first. A later distinct edit timestamp reports
+  again.
 - Each guild can save ignored Discord user IDs (including bot IDs) and source channel
   IDs separately for each event in Log Channels. Matching uses the IDs known to
   the report. If no user ID is known, only a source channel exclusion can apply.

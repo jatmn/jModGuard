@@ -23,6 +23,8 @@ fn bulk_transcript_reports_omissions_within_attachment_limit() {
         generation: 1,
         coverage_epoch: 1,
         continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
     };
     let mut transcript = BulkTranscript::new(1000);
     for id in 1..=1000 {
@@ -122,6 +124,8 @@ fn retained_edit_and_delete_reports_distinguish_empty_missing_and_gap() {
         generation: 1,
         coverage_epoch: 1,
         continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
     };
     let mut after = before.clone();
     after.fields.content = Some("B".into());
@@ -163,6 +167,8 @@ fn refused_edit_uses_retained_author_for_existing_user_filter() {
         generation: 1,
         coverage_epoch: 1,
         continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
     };
     let mut report = MessageReport {
         guild_id: GuildId::new(789),
@@ -201,6 +207,8 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
         generation: 1,
         coverage_epoch: 1,
         continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
     };
     let mut after = before.clone();
     after.fields.content = Some("🌕".repeat(700));

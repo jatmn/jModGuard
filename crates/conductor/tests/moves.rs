@@ -506,6 +506,9 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     for (guild, enrollment) in [(10, ENROLL_10), (20, ENROLL_20)] {
         conn.execute("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes) VALUES(?,?,30,40,'transient',1000,1001,1001,86401000,1,9)", libsql::params![guild,enrollment]).await.unwrap();
     }
+    for message_id in 41..141 {
+        conn.execute("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes) VALUES(?,?,30,?,'transient',1000,1001,1001,86401000,1,9)", libsql::params![10_i64, ENROLL_10, message_id]).await.unwrap();
+    }
     drop(conn);
     drop(db);
     let cookie = login(&h).await;
@@ -523,6 +526,14 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("confirm"), "{body}");
+    assert_eq!(
+        scalar(
+            &h.root.join("shared.guild.db"),
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        101
+    );
 
     let (status, plan, _) = call(
         &h.router,

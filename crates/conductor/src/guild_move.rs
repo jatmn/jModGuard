@@ -900,18 +900,35 @@ async fn bunny_binding(
 }
 
 async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
-    let conn = open(path).await?;
-    conn.execute("BEGIN IMMEDIATE", ()).await?;
-    let cleaned: Result<()> = async {
-        let before = allocated_bytes(&conn).await?;
-        ensure_cleanup_budget(&conn, guild).await?;
-        if table_exists(&conn, "guild_message_snapshots").await? {
+    loop {
+        let conn = open(path).await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let cleaned: Result<bool> = async {
+            let before = allocated_bytes(&conn).await?;
+            ensure_cleanup_budget(&conn, guild).await?;
+            if table_exists(&conn, "guild_message_snapshots").await? {
+                let left = scalar(
+                    &conn,
+                    "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?",
+                    libsql::params![guild],
+                )
+                .await?;
+                if left > 0 {
+                    let removed = conn
+                        .execute(
+                            "DELETE FROM guild_message_snapshots WHERE (guild_id,enrollment_id,channel_id,message_id) IN (SELECT guild_id,enrollment_id,channel_id,message_id FROM guild_message_snapshots WHERE guild_id=?1 LIMIT 100)",
+                            libsql::params![guild],
+                        )
+                        .await?;
+                    ensure!(removed > 0, "snapshot cleanup made no progress");
+                    ensure!(
+                        allocated_bytes(&conn).await? <= before,
+                        "source cleanup allocated database pages"
+                    );
+                    return Ok(false);
+                }
+            }
             conn.execute(
-                "DELETE FROM guild_message_snapshots WHERE guild_id=?",
-                libsql::params![guild],
-            ).await?;
-        }
-        conn.execute(
             "DELETE FROM guild_log_channels WHERE guild_id=?",
             libsql::params![guild],
         )
@@ -961,17 +978,20 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
             allocated_bytes(&conn).await? <= before,
             "source cleanup allocated database pages"
         );
-        Ok(())
+        Ok(true)
     }
     .await;
-    match cleaned {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(error)
+        match cleaned {
+            Ok(finished) => {
+                conn.execute("COMMIT", ()).await?;
+                if finished {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
         }
     }
 }

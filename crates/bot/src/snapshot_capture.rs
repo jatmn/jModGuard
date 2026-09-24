@@ -1613,6 +1613,8 @@ mod tests {
             generation: 1,
             coverage_epoch: 10,
             continuous: true,
+            content_supplied: false,
+            attachments_supplied: false,
         };
         let mut report = MessageReport {
             guild_id: GuildId::new(1),

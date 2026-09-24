@@ -695,7 +695,7 @@ impl TenantRuntime {
                 .await?
                 > 0
             {}
-            handle.erase_closed_scope(scope.clone()).await?;
+            while !handle.erase_closed_scope(scope.clone()).await? {}
         }
         record_backup_cleanup_intent(
             &self.core,

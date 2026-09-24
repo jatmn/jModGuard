@@ -69,7 +69,9 @@ Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 Version8 allows closed-scope erasure after owned data is gone and stores delegated
 case-removal role IDs. Version9 adds bounded, latest-observed message snapshots with
-fixed 24-hour expiry and store-level capture health. There are no core
+fixed 24-hour expiry and store-level capture health. Departure erasure deletes
+those rows in transactions of at most 100 and removes membership only after
+they are gone. There are no core
 configuration/default/enrollment tables or general event archives. Core bootstrap
 never applies this schema; the existing core version is 13.
 

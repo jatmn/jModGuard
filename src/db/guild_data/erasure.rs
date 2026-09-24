@@ -60,11 +60,22 @@ impl GuildDataStore {
                 let mut tx = conn.transaction_primary_read()?;
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
                 anyhow::ensure!(!active, CaseError::Active);
-                tx.prepare_reclaim()?;
-                tx.execute_reclaim(
-                    "DELETE FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2",
+                let snapshots: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |r| Ok(r.get(0)?),
                 )?;
+                if snapshots > 0 {
+                    tx.prepare_reclaim()?;
+                    let removed = tx.execute_reclaim(
+                        "DELETE FROM guild_message_snapshots WHERE (guild_id,enrollment_id,channel_id,message_id) IN (SELECT guild_id,enrollment_id,channel_id,message_id FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 LIMIT 100)",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    )?;
+                    anyhow::ensure!(removed > 0, SnapshotError::Invalid);
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                tx.prepare_reclaim()?;
                 tx.execute_reclaim(
                     "DELETE FROM guild_tenant_settings WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],

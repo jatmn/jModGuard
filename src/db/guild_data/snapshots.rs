@@ -74,6 +74,10 @@ pub struct MessageSnapshot {
     pub coverage_epoch: u64,
     /// True only while the accepted observation sequence is known continuous.
     pub continuous: bool,
+    /// True when content was supplied at `edit_at_ms`, not inherited.
+    pub content_supplied: bool,
+    /// True when attachments were supplied at `edit_at_ms`, not inherited.
+    pub attachments_supplied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +219,7 @@ fn write_time_ms() -> Result<i64> {
     Ok(i64::try_from(elapsed.as_millis())?)
 }
 
-const SELECT: &str = "SELECT author_id,author_name,content,content_truncated,attachments,attachments_truncated,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,content_original_bytes,attachments_omitted FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 AND channel_id=?3 AND message_id=?4";
+const SELECT: &str = "SELECT author_id,author_name,content,content_truncated,attachments,attachments_truncated,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,content_original_bytes,attachments_omitted,content_supplied,attachments_supplied FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 AND channel_id=?3 AND message_id=?4";
 
 fn decode(row: &Row, guild_id: i64, channel_id: i64, message_id: i64) -> Result<MessageSnapshot> {
     let attachments: Option<String> = row.get(4)?;
@@ -245,6 +249,8 @@ fn decode(row: &Row, guild_id: i64, channel_id: i64, message_id: i64) -> Result<
         generation: row.get(11)?,
         coverage_epoch: epoch as u64,
         continuous: row.get(13)?,
+        content_supplied: row.get::<i64>(16)? != 0,
+        attachments_supplied: row.get::<i64>(17)? != 0,
     })
 }
 
@@ -267,17 +273,29 @@ fn load(
     .optional()
 }
 
-fn merged(old: &SnapshotFields, incoming: SnapshotFields, equal_version: bool) -> SnapshotFields {
+fn merged(
+    old: &SnapshotFields,
+    incoming: SnapshotFields,
+    mut content_supplied: bool,
+    mut attachments_supplied: bool,
+    equal_version: bool,
+) -> (SnapshotFields, bool, bool) {
     let mut fields = old.clone();
-    if incoming.content.is_some() && (!equal_version || fields.content.is_none()) {
+    if !equal_version {
+        content_supplied = false;
+        attachments_supplied = false;
+    }
+    if incoming.content.is_some() && !content_supplied {
         fields.content = incoming.content;
         fields.content_truncated = incoming.content_truncated;
         fields.content_original_bytes = incoming.content_original_bytes;
+        content_supplied = true;
     }
-    if incoming.attachments.is_some() && (!equal_version || fields.attachments.is_none()) {
+    if incoming.attachments.is_some() && !attachments_supplied {
         fields.attachments = incoming.attachments;
         fields.attachments_truncated = incoming.attachments_truncated;
         fields.attachments_omitted = incoming.attachments_omitted;
+        attachments_supplied = true;
     }
     if incoming.author_id.is_some() && fields.author_id.is_none() {
         fields.author_id = incoming.author_id;
@@ -285,7 +303,7 @@ fn merged(old: &SnapshotFields, incoming: SnapshotFields, equal_version: bool) -
     if incoming.author_name.is_some() && fields.author_name.is_none() {
         fields.author_name = incoming.author_name;
     }
-    fields
+    (fields, content_supplied, attachments_supplied)
 }
 
 fn insert(
@@ -301,7 +319,7 @@ fn insert(
         .map(serde_json::to_string)
         .transpose()?;
     let reserve = growth_reserve(tx)?;
-    tx.execute_bounded("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,author_id,author_name,content,content_truncated,content_original_bytes,attachments,attachments_truncated,attachments_omitted,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,encoded_bytes,reservation_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)", params![scope.guild_id(),scope.enrollment.id.as_str(),row.channel_id,row.message_id,row.fields.author_id,row.fields.author_name.as_deref(),row.fields.content.as_deref(),row.fields.content_truncated,row.fields.content_original_bytes,attachments.as_deref(),row.fields.attachments_truncated,row.fields.attachments_omitted,row.created_at_ms,row.first_observed_at_ms,row.last_observed_at_ms,row.edit_at_ms,row.expires_at_ms,row.generation,row.coverage_epoch as i64,row.continuous,bytes as i64,reserve as i64], reserve)?;
+    tx.execute_bounded("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,author_id,author_name,content,content_truncated,content_original_bytes,attachments,attachments_truncated,attachments_omitted,content_supplied,attachments_supplied,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,encoded_bytes,reservation_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)", params![scope.guild_id(),scope.enrollment.id.as_str(),row.channel_id,row.message_id,row.fields.author_id,row.fields.author_name.as_deref(),row.fields.content.as_deref(),row.fields.content_truncated,row.fields.content_original_bytes,attachments.as_deref(),row.fields.attachments_truncated,row.fields.attachments_omitted,row.content_supplied,row.attachments_supplied,row.created_at_ms,row.first_observed_at_ms,row.last_observed_at_ms,row.edit_at_ms,row.expires_at_ms,row.generation,row.coverage_epoch as i64,row.continuous,bytes as i64,reserve as i64], reserve)?;
     Ok(())
 }
 
@@ -318,7 +336,7 @@ fn update(
         .map(serde_json::to_string)
         .transpose()?;
     let reserve = growth_reserve(tx)?;
-    tx.execute_bounded("UPDATE guild_message_snapshots SET author_id=?1,author_name=?2,content=?3,content_truncated=?4,content_original_bytes=?5,attachments=?6,attachments_truncated=?7,attachments_omitted=?8,last_observed_at_ms=?9,edit_at_ms=?10,generation=?11,coverage_epoch=?12,continuous=?13,encoded_bytes=?14,reservation_bytes=?15 WHERE guild_id=?16 AND enrollment_id=?17 AND channel_id=?18 AND message_id=?19", params![row.fields.author_id,row.fields.author_name.as_deref(),row.fields.content.as_deref(),row.fields.content_truncated,row.fields.content_original_bytes,attachments.as_deref(),row.fields.attachments_truncated,row.fields.attachments_omitted,row.last_observed_at_ms,row.edit_at_ms,row.generation,row.coverage_epoch as i64,row.continuous,bytes as i64,reserve as i64,scope.guild_id(),scope.enrollment.id.as_str(),row.channel_id,row.message_id], reserve)?;
+    tx.execute_bounded("UPDATE guild_message_snapshots SET author_id=?1,author_name=?2,content=?3,content_truncated=?4,content_original_bytes=?5,attachments=?6,attachments_truncated=?7,attachments_omitted=?8,content_supplied=?9,attachments_supplied=?10,last_observed_at_ms=?11,edit_at_ms=?12,generation=?13,coverage_epoch=?14,continuous=?15,encoded_bytes=?16,reservation_bytes=?17 WHERE guild_id=?18 AND enrollment_id=?19 AND channel_id=?20 AND message_id=?21", params![row.fields.author_id,row.fields.author_name.as_deref(),row.fields.content.as_deref(),row.fields.content_truncated,row.fields.content_original_bytes,attachments.as_deref(),row.fields.attachments_truncated,row.fields.attachments_omitted,row.content_supplied,row.attachments_supplied,row.last_observed_at_ms,row.edit_at_ms,row.generation,row.coverage_epoch as i64,row.continuous,bytes as i64,reserve as i64,scope.guild_id(),scope.enrollment.id.as_str(),row.channel_id,row.message_id], reserve)?;
     Ok(())
 }
 
@@ -418,6 +436,8 @@ impl GuildDataStore {
                     generation: 1,
                     coverage_epoch: observation.coverage_epoch,
                     continuous: true,
+                    content_supplied: false,
+                    attachments_supplied: false,
                 };
                 insert(&tx, &scope, &row, bytes)?;
                 tx.commit()?;
@@ -475,9 +495,11 @@ impl GuildDataStore {
                 if prior.edit_at_ms.is_some_and(|at| edit < at) { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Stale, before: None, after: Some(prior.clone()) }); }
             }
             let equal = old.as_ref().is_some_and(|prior| prior.edit_at_ms == Some(edit));
-            let fields = match &old {
-                Some(prior) => merged(&prior.fields, observation.fields, equal),
-                None => observation.fields,
+            let inserted_content = observation.fields.content.is_some();
+            let inserted_attachments = observation.fields.attachments.is_some();
+            let (fields, content_supplied, attachments_supplied) = match &old {
+                Some(prior) => merged(&prior.fields, observation.fields, prior.content_supplied, prior.attachments_supplied, equal),
+                None => (observation.fields, inserted_content, inserted_attachments),
             };
             let mut bounded = fields;
             let bytes = bound_fields(&mut bounded)?;
@@ -492,7 +514,7 @@ impl GuildDataStore {
             }
             tx.ensure_mutation_receipt()?;
             let before = if equal { None } else { old.clone().map(|mut row| { row.continuous &= row.coverage_epoch == observation.coverage_epoch; row }) };
-            let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuous && r.coverage_epoch == observation.coverage_epoch) };
+            let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuous && r.coverage_epoch == observation.coverage_epoch), content_supplied, attachments_supplied };
             if old.is_some() { update(&tx, &scope, &row, bytes)?; } else { insert(&tx, &scope, &row, incoming_bytes)?; }
             tx.commit()?;
             Ok(SnapshotTransition { outcome: if equal { SnapshotOutcome::Duplicate } else { SnapshotOutcome::Stored }, before, after: Some(row) })
@@ -566,10 +588,10 @@ impl GuildDataStore {
             let where_sql = format!("guild_id=?1 AND enrollment_id=?2 AND channel_id=?3 AND message_id IN ({placeholders})");
             let mut args = vec![Value::Integer(scope.guild_id()), Value::Text(scope.enrollment.id.clone()), Value::Integer(channel_id)];
             args.extend(unique.into_iter().map(Value::Integer));
-            let sql = format!("SELECT author_id,author_name,content,content_truncated,attachments,attachments_truncated,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,content_original_bytes,attachments_omitted,message_id FROM guild_message_snapshots WHERE {where_sql}");
+            let sql = format!("SELECT author_id,author_name,content,content_truncated,attachments,attachments_truncated,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,content_original_bytes,attachments_omitted,content_supplied,attachments_supplied,message_id FROM guild_message_snapshots WHERE {where_sql}");
             let mut stmt = tx.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(args.clone()), |row| {
-                let id: i64 = row.get(16)?;
+                let id: i64 = row.get(18)?;
                 decode(row, scope.guild_id(), channel_id, id)
             })?;
             let mut found = HashMap::with_capacity(ids.len());

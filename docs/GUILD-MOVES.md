@@ -53,7 +53,9 @@ retries. A destination that already has a different binding is refused.
 
 Rolling message snapshots are transient and are not copied to the destination.
 The source retains them until successful cutover and source cleanup; a failed
-copy must not erase them early. Destination capture starts with a history gap.
+copy must not erase them early. Source cleanup deletes that guild's snapshots
+in transactions of at most 100 rows and removes membership only after none
+remain. The write fence stays until that cleanup finishes. Destination capture starts with a history gap.
 Required configuration and moderation rows must fit the application database
 budget before copying begins. Its conservative copy reserve measures only this
 guild’s durable SQL rows, including their indexes and transaction margin; it

@@ -256,6 +256,7 @@ async fn expiry_scope_and_erasure_keep_other_guild_rows() {
         .await
         .unwrap();
     store.close_membership(scope.clone()).await.unwrap();
+    assert!(!store.erase_closed_scope(scope.clone()).await.unwrap());
     assert!(store.erase_closed_scope(scope.clone()).await.unwrap());
     assert!(
         store
@@ -916,4 +917,179 @@ async fn measure_sustained_snapshot_workload_and_cleanup_reuse() {
         cpu_start,
     )
     .await;
+}
+
+#[tokio::test]
+async fn equal_version_partials_merge_supplied_fields_and_keep_conflicts() {
+    let (f, reg, store, scope) = ready().await;
+    let mut created = observation(70, Some("A"), None, 1);
+    created.fields.attachments = Some(vec![SnapshotAttachment {
+        id: 1,
+        filename: "x.txt".into(),
+        size: 4,
+        content_type: None,
+        url: "https://cdn.example/x".into(),
+    }]);
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), created)
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    let mut text = observation(70, Some("B"), Some(at(100)), 1);
+    text.fields.content_truncated = true;
+    text.fields.content_original_bytes = Some(99);
+    text.fields.attachments = None;
+    let first = store
+        .apply_snapshot_edit(scope.clone(), text)
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, SnapshotOutcome::Stored);
+    assert_eq!(
+        first.after.as_ref().unwrap().fields.content.as_deref(),
+        Some("B")
+    );
+    assert_eq!(
+        first
+            .after
+            .as_ref()
+            .unwrap()
+            .fields
+            .attachments
+            .as_ref()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut attachments = observation(70, None, Some(at(100)), 1);
+    attachments.fields.attachments = Some(vec![]);
+    attachments.fields.attachments_omitted = Some(2);
+    let second = store
+        .apply_snapshot_edit_existing(scope.clone(), attachments)
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, SnapshotOutcome::Duplicate);
+    assert!(second.before.is_none());
+    let merged = second.after.unwrap();
+    assert_eq!(merged.fields.content.as_deref(), Some("B"));
+    assert!(merged.fields.content_truncated);
+    assert_eq!(merged.fields.content_original_bytes, Some(99));
+    assert_eq!(merged.fields.attachments, Some(vec![]));
+    assert_eq!(merged.fields.attachments_omitted, Some(2));
+
+    let mut conflict = observation(70, Some("C"), Some(at(100)), 1);
+    conflict.fields.attachments = None;
+    let kept = store
+        .apply_snapshot_edit(scope.clone(), conflict)
+        .await
+        .unwrap();
+    assert_eq!(kept.outcome, SnapshotOutcome::Duplicate);
+    assert_eq!(kept.after.unwrap().fields.content.as_deref(), Some("B"));
+
+    let mut reversed = observation(71, Some("A"), None, 1);
+    reversed.fields.attachments = Some(vec![SnapshotAttachment {
+        id: 2,
+        filename: "y.txt".into(),
+        size: 1,
+        content_type: None,
+        url: "https://cdn.example/y".into(),
+    }]);
+    store
+        .observe_snapshot(scope.clone(), reversed)
+        .await
+        .unwrap();
+    let mut clear = observation(71, None, Some(at(100)), 1);
+    clear.fields.attachments = Some(vec![]);
+    store
+        .apply_snapshot_edit_existing(scope.clone(), clear)
+        .await
+        .unwrap();
+    let restored = store
+        .apply_snapshot_edit(scope.clone(), observation(71, Some("B"), Some(at(100)), 1))
+        .await
+        .unwrap();
+    assert_eq!(restored.outcome, SnapshotOutcome::Duplicate);
+    assert_eq!(restored.after.unwrap().fields.content.as_deref(), Some("B"));
+    assert_eq!(
+        store
+            .take_snapshot(scope.clone(), 20, 71, at(150))
+            .await
+            .unwrap()
+            .unwrap()
+            .fields
+            .attachments,
+        Some(vec![])
+    );
+
+    drop(store);
+    let reopened = GuildDataStore::open(f.options(), reg).unwrap();
+    let next = reopened
+        .apply_snapshot_edit(scope.clone(), observation(70, Some("D"), Some(at(200)), 1))
+        .await
+        .unwrap();
+    let before = next.before.unwrap();
+    assert_eq!(before.fields.content.as_deref(), Some("B"));
+    assert_eq!(before.fields.attachments, Some(vec![]));
+    let single = reopened
+        .take_snapshot(scope.clone(), 20, 70, at(300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(single.fields.content.as_deref(), Some("D"));
+    assert_eq!(single.fields.attachments, Some(vec![]));
+}
+
+#[tokio::test]
+async fn closed_scope_erasure_deletes_snapshots_in_batches() {
+    let (f, reg, store, scope) = ready().await;
+    let other_placement = f.placement(&reg, 11).await;
+    store
+        .bind_initial_placement(other_placement.clone())
+        .await
+        .unwrap();
+    let other = GuildDataScope::new(
+        other_placement,
+        GuildEnrollment {
+            guild_id: 11,
+            id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            joined_at_ns: 200,
+        },
+    )
+    .unwrap();
+    store.bind_initial_membership(other.clone()).await.unwrap();
+    store
+        .observe_snapshot(other.clone(), observation(42, Some("neighbor"), None, 1))
+        .await
+        .unwrap();
+    for id in 1..=101 {
+        store
+            .observe_snapshot(scope.clone(), observation(1_000 + id, Some("row"), None, 1))
+            .await
+            .unwrap();
+    }
+    assert!(store.erase_closed_scope(scope.clone()).await.is_err());
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(!store.erase_closed_scope(scope.clone()).await.unwrap());
+    let left: i64 = store
+        .db
+        .with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .unwrap();
+    assert_eq!(left, 1);
+    assert!(!store.erase_closed_scope(scope.clone()).await.unwrap());
+    assert!(store.erase_closed_scope(scope).await.unwrap());
+    assert!(
+        store
+            .take_snapshot(other, 20, 42, at(5))
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

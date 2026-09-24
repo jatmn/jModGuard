@@ -13,6 +13,8 @@ CREATE TABLE guild_message_snapshots (
     attachments TEXT,
     attachments_truncated INTEGER NOT NULL DEFAULT 0 CHECK(attachments_truncated IN (0,1)),
     attachments_omitted INTEGER,
+    content_supplied INTEGER NOT NULL DEFAULT 0 CHECK(content_supplied IN (0,1)),
+    attachments_supplied INTEGER NOT NULL DEFAULT 0 CHECK(attachments_supplied IN (0,1)),
     created_at_ms INTEGER NOT NULL,
     first_observed_at_ms INTEGER NOT NULL,
     last_observed_at_ms INTEGER NOT NULL,
