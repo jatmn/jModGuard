@@ -1598,6 +1598,17 @@ test('View as hands the preview bearer through a URL fragment', async () => {
   assert.equal(h.opened[0][2], 'noopener');
 });
 
+test('only the owner sees the same-origin Administration link without a conductor URL', () => {
+  const h = harness();
+  h.app.state.me.is_bot_owner = false;
+  h.app.bindOwnerTools();
+  assert.equal(findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'Administration'), null);
+  h.app.state.me.is_bot_owner = true;
+  h.app.bindOwnerTools();
+  const link = findNode(h.nodes.get('#owner-tools'), n => n.textContent === 'Administration');
+  assert.equal(link.href, '/administration/index.html');
+});
+
 test('unauthenticated blocked-storage preview never exposes owner login', async () => {
   const blocked = {
     get() { throw new Error('blocked'); },

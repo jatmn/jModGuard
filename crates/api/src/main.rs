@@ -74,10 +74,20 @@ async fn main() -> Result<()> {
                 let web_app = tokio::task::spawn_blocking(move || web::router(router_app))
                     .await
                     .context("router worker stopped before returning")?;
+                jmodguard::mark_child_ready().context("failed to signal API readiness")?;
                 // Runtime work starts only after the serving artifact exists.
                 // Starting the poller before `web::router` succeeded would leave
                 // a background task on a process that then failed to listen.
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
+                let update_app = Arc::clone(&app);
+                tokio::spawn(async move {
+                    let mut interval=tokio::time::interval(Duration::from_secs(3600));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        web::updates::poll_all(&update_app).await;
+                    }
+                });
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

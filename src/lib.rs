@@ -11,6 +11,7 @@ pub mod defaults;
 #[cfg(unix)]
 pub mod evidence_transfer;
 pub use jmodguard_runtime::health;
+pub use jmodguard_runtime::mark_child_ready;
 pub mod ids;
 pub mod image_spam;
 pub mod normalize;

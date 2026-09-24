@@ -43,6 +43,8 @@ mod tenant_lifecycle;
 pub use tenant_lifecycle::*;
 mod settings;
 pub use settings::*;
+mod updates;
+pub use updates::*;
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -59,6 +61,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_guild_moves.sql"),
     include_str!("../migrations/0013_log_filters.sql"),
     include_str!("../migrations/0014_ban_display_identity.sql"),
+    include_str!("../migrations/0015_component_updates.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.

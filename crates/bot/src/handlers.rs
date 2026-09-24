@@ -105,6 +105,11 @@ impl EventHandler for Handler {
             Some(ActivityData::playing(&self.app.cfg.bot.status)),
             serenity::model::user::OnlineStatus::Online,
         );
+        // The launcher must not accept a replacement before Discord has sent
+        // Ready; constructing the client does not make commands available.
+        if let Err(error) = jmodguard::mark_child_ready() {
+            tracing::error!("failed to signal bot readiness: {error}");
+        }
 
         // Per-shard startup: seed + sync each guild once.
         if !self

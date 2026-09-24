@@ -250,7 +250,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch("DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';")?;
+        conn.execute_batch("DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';")?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -2730,7 +2730,13 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
         let mut stats = crate::defaults::default_commands().into_iter().find(|c| c.name == "stats").unwrap();
         stats.aliases.clear();
         for guild in [0, 123, 456] {
-            if guild == 456 { stats.permission = "admin".into(); }
+            if guild == 456 {
+                stats.permission = "everyone".into();
+                stats.description = "Custom stats wording".into();
+            } else {
+                stats.permission = "everyone".into();
+                stats.description = "This server's retained moderation counts (records, warns, bans).".into();
+            }
             conn.execute(
                 "INSERT OR REPLACE INTO commands (guild_id, name, data) VALUES (?1, 'stats', ?2)",
                 params![guild, serde_json::to_string(&stats)?],
@@ -2761,9 +2767,10 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                 }
             }
             if guild == 456 {
-                assert_eq!(parts.commands["stats"].permission, "admin");
+                assert_eq!(parts.commands["stats"].permission, "everyone");
                 assert!(parts.commands["stats"].aliases.is_empty());
             } else {
+                assert_eq!(parts.commands["stats"].permission, "admin");
                 assert!(parts.commands["stats"].matches("status"));
             }
         }
@@ -2831,6 +2838,82 @@ fn attachment_delete_template_upgrade_preserves_customizations() {
         let custom = load_config_parts(&db, 456).await.unwrap();
         assert_eq!(custom.templates["message_delete"], "custom {content}");
     });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
+    let tmp = tmp_db_path("stats_guild_defaults");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        let marker: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='readable_log_defaults_v1'",
+            (),
+            |row| Ok(row.get::<String>(0)?),
+        )?;
+        assert_eq!(marker, "1");
+        let mut stats = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "stats")
+            .unwrap();
+        stats.permission = "everyone".into();
+        stats.description =
+            "This server's retained moderation counts (records, warns, bans).".into();
+        for guild in [123, 124] {
+            if guild == 123 {
+                stats.aliases.clear();
+            } else {
+                stats.aliases = vec!["status".into()];
+            }
+            conn.execute(
+                "INSERT INTO commands(guild_id,name,data) VALUES (?1,'stats',?2)",
+                params![guild, serde_json::to_string(&stats)?],
+            )?;
+        }
+        stats.description = "Operator customized Stats".into();
+        conn.execute(
+            "INSERT INTO commands(guild_id,name,data) VALUES (125,'stats',?1)",
+            params![serde_json::to_string(&stats)?],
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let config_before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash_before = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    for guild in [123, 124] {
+        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
+        assert_eq!(parts.commands["stats"].permission, "admin");
+        assert!(parts.commands["stats"].matches("status"));
+    }
+    let custom = tokio_test_block_on(load_config_parts(&db, 125)).unwrap();
+    assert_eq!(custom.commands["stats"].permission, "everyone");
+    assert_eq!(
+        custom.commands["stats"].description,
+        "Operator customized Stats"
+    );
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        config_before + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1
+    );
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        config_before + 1
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash_before + 1
+    );
     drop(db);
     cleanup_db(&tmp);
 }

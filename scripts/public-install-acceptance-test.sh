@@ -51,12 +51,12 @@ fi
 require_absent docs/DEPLOY-AWS.md 'jmodguard-bot`, `jmodguard-api`, `jmodguard-conductor`'
 
 # test_public_artifact_wording_matches_install
-require_contains docs/INSTALL.md "does not upload a separate frontend"
+require_contains docs/INSTALL.md "Buildkite does not upload"
 require_absent docs/DEPLOY-BUNNY.md "Buildkite frontend artifact"
 require_absent docs/WEBUI.md "matching Buildkite artifact"
 require_contains docs/WEBUI.md "does not upload a separate frontend"
 require_absent docs/OVERHAUL.md "or Buildkite artifacts is the required path"
-require_contains docs/OVERHAUL.md "does not upload a separate frontend"
+require_contains docs/OVERHAUL.md "does not upload it to Bunny Storage"
 require_absent crates/conductor/src/install.rs "Buildkite already publishes public bot/API/conductor/frontend artifacts"
 require_contains crates/conductor/src/install.rs "Nightly/Stable/manual"
 

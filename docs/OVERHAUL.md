@@ -494,12 +494,12 @@ database kinds, and credentials without requiring those local paths. AWS is EC2
 plus the local adapter and SQLite or compatible libSQL; RDS/Postgres URLs are
 refused. The PolyForm Noncommercial license is unchanged.
 
-Bunny Storage publication from public `frontend/` or from `frontend/` paths in
-a Nightly/Stable/manual signed release manifest is the required path (Buildkite
-does not upload a separate frontend bundle on every main SHA). The Guild WebUI
-loads daisyUI and Headless UI from a CDN at runtime; those libraries are not
-extra Storage objects. Owner
-setup, backup-key portability and recover-update are documented in
+Bunny Storage publication from public `frontend/` or from the independently
+published WebUI GHCR package is the required path. Buildkite publishes the
+package on changed main revisions but does not upload it to Bunny Storage.
+The Guild WebUI loads daisyUI and Headless UI from a CDN at runtime; those
+libraries are not extra Storage objects. Owner setup, backup-key portability
+and recover-update are documented in
 [INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
 samples plus current provider list prices ([COST.md](COST.md)).
 

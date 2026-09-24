@@ -140,6 +140,15 @@ steps:
     timeout_in_minutes: 45
     command: bash .buildkite/publish-image.sh api
 
+  - label: "publish WebUI asset package"
+    key: publish-webui
+    depends_on: prepare-images
+    if: *publish_if
+    concurrency: 1
+    concurrency_group: jmodguard/ghcr-webui
+    timeout_in_minutes: 15
+    command: bash .buildkite/publish-image.sh webui
+
   - label: "publish conductor image"
     key: publish-conductor
     depends_on: prepare-images

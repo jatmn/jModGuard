@@ -5,6 +5,7 @@ pub mod cases;
 pub mod oauth;
 pub mod preview;
 pub mod state;
+pub mod updates;
 
 use axum::extract::Query;
 use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
@@ -354,6 +355,9 @@ fn return_to_or_root(cfg: &crate::config::ApiProcessConfig, requested: Option<&s
     if requested.is_empty() {
         return "/".into();
     }
+    if requested == "/administration/index.html" {
+        return requested.into();
+    }
     if cfg
         .web
         .cors_origins
@@ -688,6 +692,22 @@ async fn index() -> impl IntoResponse {
     )
 }
 
+#[cfg(feature = "embed-ui")]
+async fn administration_index() -> impl IntoResponse {
+    static_handler(
+        include_str!("../../../../frontend/administration/index.html"),
+        "text/html; charset=utf-8",
+    )
+}
+
+#[cfg(feature = "embed-ui")]
+async fn administration_js() -> impl IntoResponse {
+    static_handler(
+        include_str!("../../../../frontend/administration.js"),
+        "application/javascript; charset=utf-8",
+    )
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -831,12 +851,21 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
     let sessioned = sessioned
         .route("/", get(index))
         .route("/app.js", get(app_js))
+        .route("/administration/index.html", get(administration_index))
+        .route("/administration.js", get(administration_js))
         .route("/style.css", get(style_css));
     let sessioned = sessioned
         .route("/login", get(login))
         .route("/logout", axum::routing::post(logout))
         .route("/oauth/callback", get(callback))
         .route("/api/me", get_post(api_me))
+        .route("/api/updates", get_post(updates::status))
+        .route("/api/updates/check", axum::routing::post(updates::check))
+        .route(
+            "/api/updates/install",
+            axum::routing::post(updates::install),
+        )
+        .route("/api/updates/policy", axum::routing::post(updates::policy))
         .route(
             "/api/preview",
             axum::routing::post(preview::launch).delete(preview::exit),
@@ -1318,6 +1347,43 @@ mod tests {
         let app = test_app();
         for method in ["GET", "POST"] {
             assert_unauthenticated(app.clone(), method, "/api/me", "").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn update_routes_reject_anonymous_requests_without_disclosing_state() {
+        for (method, path, body) in [
+            ("GET", "/api/updates", ""),
+            ("POST", "/api/updates", "{}"),
+            ("POST", "/api/updates/check", r#"{"component":"api"}"#),
+            (
+                "POST",
+                "/api/updates/install",
+                r#"{"component":"api","digest":"sha256:abc"}"#,
+            ),
+            (
+                "POST",
+                "/api/updates/policy",
+                r#"{"component":"api","channel":"stable","cadence":"daily"}"#,
+            ),
+        ] {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            super::assert_uncacheable_headers(response.headers());
         }
     }
 
@@ -2023,6 +2089,11 @@ mod tests {
             "/"
         );
         assert_eq!(return_to_or_root(&cfg, None), "/");
+        assert_eq!(
+            return_to_or_root(&cfg, Some("/administration/index.html")),
+            "/administration/index.html"
+        );
+        assert_eq!(return_to_or_root(&cfg, Some("//attacker.example.com")), "/");
     }
 
     #[test]

@@ -57,6 +57,107 @@ pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) 
     )
 }
 
+/// Append cached release observations without making a network request from
+/// a Discord command. Unknown includes stale checks and legacy manual images.
+pub fn stats_response_with_updates(
+    uptime_seconds: u64,
+    records: i64,
+    warns: i64,
+    bans: i64,
+    updates: &[crate::db::ComponentUpdate],
+    now: i64,
+) -> String {
+    let mut lines = Vec::new();
+    for component in ["bot", "api", "webui"] {
+        let Some(item) = updates.iter().find(|item| item.component == component) else {
+            lines.push(format!("**{component}:** unknown"));
+            continue;
+        };
+        let fresh = item
+            .observed_at
+            .is_some_and(|at| now.saturating_sub(at) <= 7200)
+            && item.state != "drift";
+        let sha = if fresh {
+            item.observed
+                .as_ref()
+                .map(|v| v.source_sha.as_str())
+                .unwrap_or("unknown")
+        } else {
+            "unknown"
+        };
+        let (time, label) = match (
+            item.installed_at,
+            item.installed.as_ref(),
+            item.observed.as_ref(),
+        ) {
+            (Some(time), Some(installed), Some(observed))
+                if installed.source_sha == observed.source_sha =>
+            {
+                (Some(time), "installed")
+            }
+            _ => (item.observed.as_ref().map(|v| v.started_at), "first seen"),
+        };
+        let age = time
+            .filter(|_| fresh)
+            .map(|time| {
+                format!(
+                    "{} ago",
+                    format_duration(now.saturating_sub(time).max(0) as u64)
+                )
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let availability = if !fresh
+            || item.check_error.is_some()
+            || item
+                .checked_at
+                .is_none_or(|checked| now.saturating_sub(checked) > 7200)
+            || item
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.channel != item.channel)
+        {
+            "unknown"
+        } else if let Some(candidate) = &item.candidate {
+            if item
+                .installed
+                .as_ref()
+                .is_some_and(|installed| installed.digest == candidate.digest)
+                && sha == candidate.source_sha
+            {
+                "up to date"
+            } else if component != "webui"
+                && item.installed.is_none()
+                && item
+                    .observed
+                    .as_ref()
+                    .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
+                && sha == candidate.source_sha
+            {
+                "no source update (image digest unverified)"
+            } else if sha != "unknown" && sha != candidate.source_sha {
+                "update available"
+            } else {
+                "unknown"
+            }
+        } else {
+            "unknown"
+        };
+        lines.push(format!(
+            "**{component}:** `{sha}` · {label} {age} · {availability}"
+        ));
+    }
+    render(
+        "{moderation}\n\n**Release status**\n{releases}",
+        &BTreeMap::from([
+            (
+                "moderation".into(),
+                stats_response(uptime_seconds, records, warns, bans),
+            ),
+            ("releases".into(), lines.join("\n")),
+        ]),
+    )
+}
+
 /// Renders a template, replacing `{variable}` tokens with values from `vars`.
 /// Unknown tokens are left untouched so template mistakes are visible.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
@@ -221,6 +322,79 @@ mod presentation_tests {
             ),
             "**📊 Stats (this server)**\n\n**Uptime:** `22 minutes, 41 seconds`\n**Moderation records:** `0`\n**Warns:** `0`\n**Bans:** `1`"
         );
+    }
+
+    #[test]
+    fn release_stats_hide_stale_observations_and_report_checked_update() {
+        use crate::db::{ComponentObservation, ComponentRelease, ComponentUpdate};
+        let candidate = ComponentRelease {
+            component: "api".into(),
+            channel: "stable".into(),
+            release_id: "v1".into(),
+            source_sha: "b".repeat(40),
+            published_at: "2026-09-23T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-api".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            base_abi: "debian-bookworm-amd64".into(),
+        };
+        let observed = ComponentObservation {
+            source_sha: "a".repeat(40),
+            executable_sha256: "c".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "d".repeat(40),
+            started_at: 900,
+            min_schema: 15,
+            max_schema: 15,
+            api_capability: 1,
+            self_update_enabled: false,
+            base_abi: "debian-bookworm-amd64".into(),
+        };
+        let mut row = ComponentUpdate {
+            component: "api".into(),
+            channel: "stable".into(),
+            cadence: "off".into(),
+            candidate: Some(candidate),
+            checked_at: Some(1000),
+            check_error: None,
+            desired: None,
+            desired_launcher: None,
+            installed: None,
+            installed_launcher: None,
+            launcher_sha256: None,
+            launcher_installed_at: None,
+            previous: None,
+            observed: Some(observed),
+            observed_at: Some(1000),
+            installed_at: None,
+            state: "running".into(),
+            last_error: None,
+        };
+        let fresh = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(fresh.contains(&format!("`{}`", "a".repeat(40))));
+        assert!(fresh.contains("update available"));
+        row.channel = "nightly".into();
+        let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(!wrong_channel.contains("update available"));
+        assert!(wrong_channel.contains("unknown"));
+        row.channel = "stable".into();
+        row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
+        row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
+        let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(baked_current.contains("no source update (image digest unverified)"));
+        row.channel = "nightly".into();
+        let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        assert!(!wrong_channel_current.contains("no source update"));
+        row.channel = "stable".into();
+        row.observed_at = Some(1);
+        let stale = stats_response_with_updates(20, 1, 2, 3, &[row], 9000);
+        assert!(!stale.contains(&"a".repeat(40)));
+        assert!(stale.contains("unknown"));
     }
 
     #[test]

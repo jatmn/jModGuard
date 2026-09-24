@@ -1221,6 +1221,7 @@ function bindOwnerTools() {
     el("option", { value: "member", text: "Member" }),
   );
   const children = [
+    el("a", { class: "btn small", href: "/administration/index.html", text: "Administration" }),
     el("button", { class: "btn small", text: "View as…", onclick: async () => {
       if (!state.guildId) { toast("Select a server first", "error"); return; }
       const launched = await api("/api/preview", "POST", { guild_id: String(state.guildId), profile: profile.value });
@@ -1231,7 +1232,7 @@ function bindOwnerTools() {
     profile,
   ];
   if (state.me.conductor_url) {
-    children.unshift(el("a", { class: "btn small", href: state.me.conductor_url, target: "_blank", rel: "noopener noreferrer", text: "Administration" }));
+    children.push(el("a", { class: "btn small", href: state.me.conductor_url, target: "_blank", rel: "noopener noreferrer", text: "Legacy conductor" }));
   }
   tools.replaceChildren(...children);
 }

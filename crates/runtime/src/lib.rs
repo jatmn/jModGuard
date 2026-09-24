@@ -2,6 +2,16 @@
 
 pub mod health;
 
+/// The launcher uses this separate signal after database/bootstrap work has
+/// completed. `/health` is intentionally live earlier and cannot prove that a
+/// replacement child is ready to take traffic.
+pub fn mark_child_ready() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("JMODGUARD_READY_FILE") {
+        std::fs::write(path, b"ready\n")?;
+    }
+    Ok(())
+}
+
 use std::sync::OnceLock;
 use tokio::sync::watch;
 

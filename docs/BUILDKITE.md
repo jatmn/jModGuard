@@ -8,6 +8,13 @@ dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **U
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
 tests and image jobs. This repository has no GitHub Actions frontend publisher.
 
+The `publish-webui` job creates an independent static WebUI GHCR image from
+`frontend/` on trusted publication builds. Main builds publish each changed
+component under its source SHA and `latest`; the owner Administration update
+page defaults to `latest` and pins its exact digest before installation.
+Stable and Nightly pointers remain optional for future promotion policy.
+See [independent Bunny updates](BUNNY-UPDATES.md).
+
 ## Pipeline and agents
 
 Keep the pipeline's initial step as:
@@ -92,7 +99,7 @@ and tokens in cluster Secrets
 | Value | Where and purpose |
 |---|---|
 | `GHCR_USERNAME` | Non-secret. Set in this repo's `.buildkite/pipeline.yml` `env:` (already `jatmn`). The other official place is **Pipeline settings → Steps** (YAML editor) with a top-level `env:` before `steps`. |
-| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push `jmodguard-bot`, `jmodguard-api` and `jmodguard-conductor`. |
+| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push `jmodguard-bot`, `jmodguard-api`, `jmodguard-webui`, and the legacy `jmodguard-conductor`. |
 | `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker and for Release Please. If absent, `GHCR_TOKEN` is used for Docker and must also read this private repository. Release Please is skipped when no token is available. Do not set this to GitHub Actions' automatic token. |
 | `JMODGUARD_RELEASE_KEY_ID` | Non-secret signing key id for complete Stable/Nightly manifests. |
 | `JMODGUARD_RELEASE_SIGNING_KEY` | 32-byte hex HMAC secret. Store as a Buildkite secret, never in git. |
@@ -146,7 +153,11 @@ in your deployment. Publishing never grants public access or deploys containers.
   This also works for source revisions predating the publishing scripts. Both
   components use the one resolved SHA recorded by the preparation job. Tests
   validate the current pipeline checkout; the image builds compile the selected
-  source. A plain branch name such as `main` is rejected as a publication source.
+  source. For a source before the independent updater, bot/API images keep their
+  original direct-entrypoint layout for dashboard rollback; they are not eligible
+  for owner-managed executable updates. The WebUI job skips sources before the
+  independent WebUI package existed. A plain branch name such as `main` is
+  rejected as a publication source.
   Manual publication by commit SHA publishes container images only; the manifest
   job skips when the source has no installable Stable/Nightly release id.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in
