@@ -436,7 +436,11 @@ mod presentation_tests {
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
         let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
-        assert!(baked_current.contains("⚠️"));
+        let api_line = baked_current
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(api_line.ends_with("⚠️"), "{api_line}");
         assert!(!baked_current.contains("no source update"));
         row.channel = "nightly".into();
         let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
