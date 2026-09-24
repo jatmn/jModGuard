@@ -84,6 +84,11 @@ succeeded.
 
 The helper builds Pullfrog's version-specific structured prompt with
 `JSON.stringify`; owner text cannot inject workflow output keys or event fields.
+Short commands are included once in the prompt. When JSON encoding would exceed
+64 KiB, the prompt instead tells the agent to read the complete `comment.body`
+from GitHub's existing event snapshot file before acting. This keeps large
+commands below the action-input environment limit and preserves the original
+authorized text, including later lines, without refetching an edited comment.
 When updating the action pin, verify its `JsonPayload`, `PayloadEvent`, and
 `reportStatusChecks` contracts, update `PULLFROG_VERSION` in
 `scripts/pullfrog-command-check.mjs`, and run the local checks below.

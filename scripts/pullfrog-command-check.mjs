@@ -6,6 +6,9 @@ const REPOSITORY = 'jatmn/jModGuard';
 // Matches the pinned action in .github/workflows/pullfrog.yml. Pullfrog's
 // structured prompt is version-specific; verify its schema when updating both.
 export const PULLFROG_VERSION = '0.1.82';
+// Action inputs become individual environment strings. Stay comfortably below
+// Linux's per-string exec limit, including JSON escaping and multibyte text.
+const MAX_PAYLOAD_BYTES = 64 * 1024;
 export function isOwnerCommand(eventName, actor, event) {
   if (eventName !== 'issue_comment' || event?.action !== 'created') return false;
   if (actor !== 'jatmn' || event?.sender?.id !== OWNER_ID) return false;
@@ -21,7 +24,7 @@ export function isOwnerCommand(eventName, actor, event) {
   return /^[\p{L}\p{N}]/u.test(instruction);
 }
 
-export function ownerCommandPayload(eventName, actor, event) {
+export function ownerCommandPayload(eventName, actor, event, eventPath) {
   if (!isOwnerCommand(eventName, actor, event)) return undefined;
   const issueNumber = event.issue?.number;
   const commentId = event.comment.id;
@@ -31,7 +34,7 @@ export function ownerCommandPayload(eventName, actor, event) {
   }
   const isPr = Boolean(event.issue.pull_request);
   const url = `https://github.com/${REPOSITORY}/${isPr ? 'pull' : 'issues'}/${issueNumber}#issuecomment-${commentId}`;
-  return {
+  const payload = {
     '~pullfrog': true,
     version: PULLFROG_VERSION,
     triggerer: actor,
@@ -44,14 +47,27 @@ export function ownerCommandPayload(eventName, actor, event) {
       comment_id: commentId,
       issue_number: issueNumber,
       ...(isPr ? { is_pr: true } : {}),
-      body: event.comment.body,
+      // The instruction is already in prompt; Pullfrog allows null here.
+      body: null,
     },
   };
+  if (Buffer.byteLength(JSON.stringify(payload), 'utf8') > MAX_PAYLOAD_BYTES) {
+    if (typeof eventPath !== 'string' || eventPath.length === 0) {
+      throw new Error('Oversized owner command requires its GitHub event snapshot path');
+    }
+    // Use the immutable event file already read by this helper, not a fresh
+    // fetch of a comment that may have been edited since authorization.
+    payload.prompt = `The repository owner issued a command in ${REPOSITORY}. ` +
+      `Before acting, read the full comment.body string from the GitHub event snapshot at ${JSON.stringify(eventPath)}. ` +
+      `That string is the owner's complete instruction; the other JSON fields are event metadata. ` +
+      `Follow that instruction, read the current linked issue or PR, and post your result at ${url}.`;
+  }
+  return payload;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-  const payload = ownerCommandPayload(process.env.GITHUB_EVENT_NAME, process.env.GITHUB_ACTOR, event);
+  const payload = ownerCommandPayload(process.env.GITHUB_EVENT_NAME, process.env.GITHUB_ACTOR, event, process.env.GITHUB_EVENT_PATH);
   if (payload) {
     // JSON.stringify escapes newlines in owner text so it cannot add output keys.
     appendFileSync(process.env.GITHUB_OUTPUT, `payload=${JSON.stringify(payload)}\nauthorized=true\n`);

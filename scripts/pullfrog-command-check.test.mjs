@@ -92,7 +92,8 @@ test('supplies native PR check context and preserves issue-only commands', () =>
   assert.equal(pr.event.is_pr, true);
   assert.equal(pr.event.issue_number, 97);
   assert.match(pr.prompt, /pull\/97#issuecomment-5816388832/);
-  assert.equal(pr.event.body, ownerComment.comment.body);
+  assert.equal(pr.event.body, null);
+  assert.ok(pr.prompt.includes(ownerComment.comment.body));
   assert.equal(pr.checkRun, undefined); // Never impersonate a managed run/check.
 
   const issue = ownerCommandPayload('issue_comment', 'jatmn', {
@@ -133,9 +134,53 @@ test('CLI serializes arbitrary owner text without injecting workflow outputs', (
     assert.equal(lines.length, 2);
     assert.equal(lines[1], 'authorized=true');
     const payload = JSON.parse(lines[0].slice('payload='.length));
-    assert.equal(payload.event.body, body);
+    assert.equal(payload.event.body, null);
     assert.ok(payload.prompt.includes(body));
     assert.equal(payload.event.is_pr, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('large PR and issue commands use the original snapshot and fit action input environments', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pullfrog-large-command-'));
+  try {
+    const eventPath = join(dir, 'event.json');
+    const outputPath = join(dir, 'output');
+    for (const issue of [ownerComment.issue, { number: 98 }]) {
+      for (const suffix of ['x'.repeat(65500), '"\\'.repeat(32700), '界'.repeat(40000)]) {
+        const body = `@pullfrog review this trace\n${suffix}`;
+        const event = { ...ownerComment, issue, comment: { ...ownerComment.comment, body } };
+        writeFileSync(eventPath, JSON.stringify(event));
+        writeFileSync(outputPath, '');
+        const build = spawnSync(process.execPath, [fileURLToPath(new URL('./pullfrog-command-check.mjs', import.meta.url))], {
+          env: { ...process.env, GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath,
+            GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: 'jatmn' },
+          encoding: 'utf8',
+        });
+        assert.equal(build.status, 0, build.stderr);
+        const lines = readFileSync(outputPath, 'utf8').trimEnd().split('\n');
+        assert.equal(lines.length, 2);
+        assert.equal(lines[1], 'authorized=true');
+        const input = lines[0].slice('payload='.length);
+        const payload = JSON.parse(input);
+        assert.ok(Buffer.byteLength(input) <= 64 * 1024);
+        assert.ok(payload.prompt.includes(JSON.stringify(eventPath)));
+        assert.match(payload.prompt, /read the full comment\.body/);
+        assert.equal(payload.event.body, null);
+        assert.equal(payload.event.issue_number, issue.number);
+        assert.equal(payload.event.is_pr, issue.pull_request ? true : undefined);
+        assert.equal(JSON.parse(readFileSync(eventPath, 'utf8')).comment.body, body);
+        // Reproduce the runner's single INPUT_PROMPT environment transport.
+        const launch = spawnSync(process.execPath, ['-e',
+          'const p = JSON.parse(process.env.INPUT_PROMPT); process.stdout.write(String(p.event.issue_number))'], {
+          env: { ...process.env, INPUT_PROMPT: input }, encoding: 'utf8',
+        });
+        assert.equal(launch.status, 0, launch.stderr);
+        assert.equal(launch.stdout, String(issue.number));
+        assert.throws(() => ownerCommandPayload('issue_comment', 'jatmn', event), /snapshot path/);
+      }
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
