@@ -6,6 +6,7 @@ pub mod oauth;
 pub mod preview;
 pub mod state;
 pub mod updates;
+pub mod usage;
 
 use axum::extract::Query;
 use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
@@ -860,6 +861,11 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/oauth/callback", get(callback))
         .route("/api/me", get_post(api_me))
         .route("/api/updates", get_post(updates::status))
+        .route("/api/database-usage", axum::routing::post(usage::overview))
+        .route(
+            "/api/database-usage/{id}",
+            axum::routing::post(usage::detail),
+        )
         .route("/api/updates/check", axum::routing::post(updates::check))
         .route(
             "/api/updates/install",
@@ -1383,6 +1389,24 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
                 "{method} {path}"
             );
+            super::assert_uncacheable_headers(response.headers());
+        }
+    }
+
+    #[tokio::test]
+    async fn database_usage_routes_reject_anonymous_requests_with_private_headers() {
+        for path in ["/api/database-usage", "/api/database-usage/core"] {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
             super::assert_uncacheable_headers(response.headers());
         }
     }

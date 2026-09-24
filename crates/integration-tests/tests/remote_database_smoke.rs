@@ -46,7 +46,10 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     let error = bot
         .with_conn(|conn| -> anyhow::Result<()> {
             let tx = conn.transaction()?;
-            tx.execute_batch("UPDATE meta SET value = '999999999' WHERE key = 'config_version'")?;
+            tx.execute_batch_bounded(
+                "UPDATE meta SET value = '999999999' WHERE key = 'config_version'",
+                64 * 1024 * 1024,
+            )?;
             anyhow::bail!("forced failure after remote transaction write");
         })
         .await
@@ -167,6 +170,120 @@ async fn bot_bootstrap_and_api_share_remote_database() {
         anyhow::ensure!(count == 0, "retired history tables exist");
         Ok(())
     }).await.unwrap();
+
+    exercise_remote_capacity_race(&bot, &api).await;
+}
+
+// This uses two independently opened Db pools and the normal 900 MB application
+// stop. The large allowance is only a reservation; zeroblob builds its pages
+// inside SQLite, so the test does not transmit or allocate anything near 1 GB.
+async fn exercise_remote_capacity_race(bot: &Db, api: &Db) {
+    use jmodguard::capacity::GROWTH_STOP_BYTES;
+    use jmodguard::db::{SqlExecutor, params, usage::measure_database_usage};
+    use std::sync::{Arc, Barrier};
+
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let table = format!("remote_capacity_probe_{suffix}");
+    let index = format!("remote_capacity_index_{suffix}");
+    let schema = format!(
+        "CREATE TABLE {table}(id INTEGER PRIMARY KEY, writer TEXT NOT NULL, payload BLOB NOT NULL); \
+         CREATE INDEX {index} ON {table}(payload)"
+    );
+    bot.with_conn(move |conn| conn.execute_batch_bounded(&schema, 32 * 1024 * 1024))
+        .await
+        .unwrap();
+
+    let initial = measure_database_usage(bot, false, None)
+        .await
+        .unwrap()
+        .allocated_bytes;
+    const MARGIN: u64 = 8 * 1024 * 1024;
+    let allowance = GROWTH_STOP_BYTES
+        .checked_sub(initial)
+        .and_then(|remaining| remaining.checked_sub(MARGIN))
+        .expect("disposable remote database needs room for the capacity probe");
+    assert!(
+        allowance > 16 * 1024 * 1024,
+        "remote capacity probe has insufficient headroom"
+    );
+    // Each remote write reserves 4 MiB for receipt insertion and another 4 MiB
+    // for its commit refresh. The first writer's allowance fits exactly below
+    // 900 MB. Twenty 256 KiB BLOBs are stored in both table and index (>8 MiB
+    // pages), using much smaller individual values than the rejected 5 MiB,
+    // so the second writer cannot fit that same allowance even if rebase refunds
+    // an unused receipt reservation. Both start together; IMMEDIATE serializes
+    // their primary transactions without a provider quota change.
+    let sql = format!(
+        "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<20) \
+         INSERT INTO {table}(writer,payload) SELECT ?1,zeroblob(?2) FROM seq"
+    );
+    let gate = Arc::new(Barrier::new(2));
+    let bot_gate = Arc::clone(&gate);
+    let api_gate = Arc::clone(&gate);
+    let bot_sql = sql.clone();
+    let bot_write = bot.with_conn(move |conn| {
+        bot_gate.wait();
+        conn.execute_bounded(&bot_sql, params!["bot", 256 * 1024_i64], allowance)
+    });
+    let api_write = api.with_conn(move |conn| {
+        api_gate.wait();
+        conn.execute_bounded(&sql, params!["api", 256 * 1024_i64], allowance)
+    });
+    let (bot_result, api_result) = tokio::join!(bot_write, api_write);
+    let outcomes = [bot_result, api_result];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one primary writer must spend the shared growth allowance: {outcomes:?}"
+    );
+    let refused = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .unwrap();
+    assert!(
+        refused
+            .to_string()
+            .contains("application database capacity budget exhausted"),
+        "losing writer was not refused by application capacity admission: {refused:#}"
+    );
+
+    let count_sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = bot
+        .with_conn(move |conn| {
+            let tx = conn.transaction_primary_read()?;
+            let count = tx.query_row(&count_sql, (), |row| Ok(row.get::<i64>(0)?))?;
+            tx.finish_read()?;
+            Ok(count)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 20, "only one complete atomic insert may commit");
+    let final_allocation = measure_database_usage(bot, false, None)
+        .await
+        .unwrap()
+        .allocated_bytes;
+    assert!(
+        final_allocation
+            .checked_sub(initial)
+            .is_some_and(|growth| growth > MARGIN),
+        "probe did not grow table and index beyond the 8 MiB rebase margin"
+    );
+    assert!(
+        final_allocation < GROWTH_STOP_BYTES,
+        "probe unexpectedly approached the application growth stop"
+    );
+
+    let cleanup = format!("DROP TABLE {table}");
+    bot.with_conn(move |conn| conn.execute_batch_bounded(&cleanup, 32 * 1024 * 1024))
+        .await
+        .unwrap();
 }
 
 // Queue storage only: this test never sends a Discord request.
@@ -252,9 +369,10 @@ async fn exercise_membership_storage(bot: &Db, api: &Db) {
     // A rollback can hide executed receipt writes from row-count assertions.
     // Exercise the remote-only receipt path and reject the INSERT itself.
     bot.with_conn(|conn| {
-        conn.execute_batch(
+        conn.execute_batch_bounded(
             "CREATE TRIGGER reject_matching_receipt BEFORE INSERT ON mutation_receipts
              BEGIN SELECT RAISE(ABORT, 'matching observation wrote a receipt'); END",
+            64 * 1024 * 1024,
         )
     })
     .await
@@ -264,9 +382,11 @@ async fn exercise_membership_storage(bot: &Db, api: &Db) {
         Some(first.clone())
     );
     assert!(enroll_guild(bot, 800, 99).await.unwrap().is_none());
-    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_matching_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER reject_matching_receipt", 64 * 1024 * 1024)
+    })
+    .await
+    .unwrap();
     assert!(guild_enrollment(api, 801).await.unwrap().is_none());
     test_drop_next_commit_response();
     retire_guild_enrollment(bot, 800, 100).await.unwrap();
@@ -379,11 +499,16 @@ async fn exercise_nickname_membership(bot: &Db, api: &Db) {
     assert_eq!(resumed.job_id, old.job_id);
     assert!(resumed.generation > old.generation);
     // Healthy repeats preserve the reviewed receipt-free observation behavior.
-    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_nickname_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END")).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_nickname_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     enroll_guild(bot, 600, 100).await.unwrap();
-    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_nickname_noop_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "DROP TRIGGER reject_nickname_noop_receipt",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
     test_drop_next_commit_response();
     retire_guild_enrollment(bot, 600, 100).await.unwrap();
     assert!(
@@ -440,7 +565,7 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
     .await
     .unwrap();
     // Empty patches still verify membership but must not insert recovery receipts.
-    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_config_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END")).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_config_noop_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected noop receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     let settings = patch_enrolled_settings(api, source.clone(), None, None, false)
         .await
         .unwrap();
@@ -450,9 +575,11 @@ async fn exercise_configuration_scopes(bot: &Db, api: &Db) {
         .unwrap();
     assert_eq!(snapshot.settings.settings.prefix, "source");
     assert!(snapshot.version >= api.required_config_version());
-    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_config_noop_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER reject_config_noop_receipt", 64 * 1024 * 1024)
+    })
+    .await
+    .unwrap();
     let write = ConfigurationWriteScope::new(source.clone(), source.clone()).unwrap();
     test_drop_next_commit_response();
     let word = add_enrolled_badword(api, write, "scope-sentinel", None)
@@ -645,7 +772,7 @@ async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
         .await
         .unwrap();
     let version = get_config_version(api).await.unwrap();
-    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_moderation_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_moderation_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     let events = query_enrolled_events(api, scope.clone(), Some("member_ban"), Some(451), 1)
         .await
         .unwrap();
@@ -657,9 +784,14 @@ async fn exercise_moderation_scopes(bot: &Db, api: &Db) {
     let stats = enrolled_guild_stats(api, scope.clone()).await.unwrap();
     assert_eq!((stats.events, stats.bans, stats.warns), (1, 1, 0));
     assert_eq!(get_config_version(api).await.unwrap(), version);
-    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_moderation_read_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "DROP TRIGGER reject_moderation_read_receipt",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
     retire_guild_enrollment(bot, 450, 100).await.unwrap();
     let current = enroll_guild(bot, 450, 101).await.unwrap().unwrap();
     for error in [
@@ -693,7 +825,7 @@ async fn exercise_configuration_reads(bot: &Db, api: &Db) {
             .unwrap();
     }
     let before = get_config_version(api).await.unwrap();
-    bot.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_individual_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    bot.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_individual_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     for captured in [scope.clone(), ConfigurationScope::Global] {
         let pair = get_enrolled_template(api, captured.clone(), "read-scope")
             .await
@@ -727,9 +859,14 @@ async fn exercise_configuration_reads(bot: &Db, api: &Db) {
         list_enrolled_log_channels(api, captured).await.unwrap();
     }
     assert_eq!(get_config_version(api).await.unwrap(), before);
-    bot.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_individual_read_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "DROP TRIGGER reject_individual_read_receipt",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
     retire_guild_enrollment(bot, 460, 100).await.unwrap();
     enroll_guild(bot, 460, 101).await.unwrap();
     for result in [
@@ -784,7 +921,7 @@ async fn exercise_guild_store_catalog(bot: &Db, api: &Db) {
     assign_initial_placement(bot, 480, dedicated.clone())
         .await
         .unwrap();
-    bot.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_store_catalog_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    bot.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_store_catalog_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     register_store(api, shared.clone(), StorePolicy::Shared)
         .await
         .unwrap();
@@ -818,16 +955,23 @@ async fn exercise_guild_store_catalog(bot: &Db, api: &Db) {
     assert!(store_registration(api, &rejected).await.unwrap().is_none());
     assert!(assign_initial_placement(api, 481, shared).await.is_err());
     assert!(guild_placement(api, 481).await.unwrap().is_none());
-    bot.with_conn(|c| c.execute_batch("DROP TRIGGER reject_store_catalog_receipt"))
-        .await
-        .unwrap();
+    bot.with_conn(|c| {
+        c.execute_batch_bounded(
+            "DROP TRIGGER reject_store_catalog_receipt",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
     // Remote stream constraints must reject cross-owner placement without relying on PRAGMAs.
     bot.with_conn(move |c| {
         use jmodguard::db::{params, SqlExecutor};
-        let tx = c.transaction_primary_read()?;
-        assert!(tx.execute("INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(472,?1,'11111111111111111111111111111111')", params![dedicated.as_str()]).is_err());
-        assert!(tx.execute("INSERT OR REPLACE INTO guild_store_catalog(store_id,dedicated_guild_id) VALUES(?1,NULL)", params![dedicated.as_str()]).is_err());
-        tx.finish_read()
+        let tx = c.transaction()?;
+        let placement = tx.execute_bounded("INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(472,?1,'11111111111111111111111111111111')", params![dedicated.as_str()], 64 * 1024 * 1024).unwrap_err();
+        assert!(placement.chain().any(|cause| cause.to_string().contains("invalid guild store placement")), "{placement:#}");
+        let catalog = tx.execute_bounded("INSERT OR REPLACE INTO guild_store_catalog(store_id,dedicated_guild_id) VALUES(?1,NULL)", params![dedicated.as_str()], 64 * 1024 * 1024).unwrap_err();
+        assert!(catalog.chain().any(|cause| cause.to_string().contains("guild store identity is already registered")), "{catalog:#}");
+        tx.commit()
     }).await.unwrap();
     assert!(guild_placement(api, 472).await.unwrap().is_none());
     assert_eq!(get_config_version(api).await.unwrap(), version);

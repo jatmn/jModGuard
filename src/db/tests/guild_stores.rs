@@ -185,7 +185,7 @@ async fn catalog_retries_and_reads_are_receipt_free_and_preserve_versions() {
     let placement = assign_initial_placement(&f.db, 10, id.clone())
         .await
         .unwrap();
-    f.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_catalog_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    f.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_catalog_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     assert_eq!(
         register_store(&f.db, id.clone(), StorePolicy::Shared)
             .await
@@ -212,7 +212,7 @@ async fn catalog_retries_and_reads_are_receipt_free_and_preserve_versions() {
     );
     // Local SQLite needs no remote recovery receipts. Reject actual inserts to
     // exercise rollback; receipt creation failure is covered by remote smoke.
-    f.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_catalog_write BEFORE INSERT ON guild_store_catalog BEGIN SELECT RAISE(ABORT,'rejected write'); END; CREATE TRIGGER reject_placement_write BEFORE INSERT ON guild_store_placements BEGIN SELECT RAISE(ABORT,'rejected write'); END")).await.unwrap();
+    f.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_catalog_write BEFORE INSERT ON guild_store_catalog BEGIN SELECT RAISE(ABORT,'rejected write'); END; CREATE TRIGGER reject_placement_write BEFORE INSERT ON guild_store_placements BEGIN SELECT RAISE(ABORT,'rejected write'); END", 64 * 1024 * 1024)).await.unwrap();
     let rejected = StoreId::new();
     assert!(
         register_store(&f.db, rejected.clone(), StorePolicy::Shared)
@@ -303,8 +303,9 @@ async fn catalog_rejects_invalid_ids_missing_stores_and_broken_references() {
         .unwrap();
     assign_initial_placement(&f.db, 10, id).await.unwrap();
     f.db.with_conn(|c| {
-        c.execute_batch(
+        c.execute_batch_bounded(
             "DROP TRIGGER guild_store_catalog_referenced; DELETE FROM guild_store_catalog",
+            64 * 1024 * 1024,
         )
     })
     .await
@@ -337,7 +338,7 @@ async fn catalog_sql_constraints_do_not_depend_on_foreign_key_pragmas() {
             "INSERT OR REPLACE INTO guild_store_catalog VALUES('11111111111111111111111111111111',NULL)",
             "DELETE FROM guild_store_catalog",
         ] {
-            assert!(c.execute_batch(sql).is_err(), "accepted invalid SQL: {sql}");
+            assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(), "accepted invalid SQL: {sql}");
         }
         Ok(())
     }).await.unwrap();
@@ -357,12 +358,12 @@ async fn catalog_migration_keeps_version_nine_data_and_starts_empty() {
     {
         let c = Connection::open(&path).unwrap();
         for (index, sql) in MIGRATIONS[..9].iter().enumerate() {
-            c.execute_batch(sql).unwrap();
+            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
             c.pragma_update(None, "user_version", (index + 1) as i64)
                 .unwrap();
         }
-        c.execute_batch(
-            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')",
+        c.execute_batch_bounded(
+            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')", 64 * 1024 * 1024,
         )
         .unwrap();
     }
@@ -382,12 +383,12 @@ async fn tenant_runtime_migration_keeps_version_ten_catalog_and_starts_empty() {
     {
         let c = Connection::open(&path).unwrap();
         for (index, sql) in MIGRATIONS[..10].iter().enumerate() {
-            c.execute_batch(sql).unwrap();
+            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
             c.pragma_update(None, "user_version", (index + 1) as i64)
                 .unwrap();
         }
-        c.execute_batch(
-            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')",
+        c.execute_batch_bounded(
+            "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')", 64 * 1024 * 1024,
         )
         .unwrap();
     }
@@ -424,7 +425,7 @@ async fn guild_move_migration_starts_with_empty_fences() {
     {
         let c = Connection::open(&path).unwrap();
         for (index, sql) in MIGRATIONS[..11].iter().enumerate() {
-            c.execute_batch(sql).unwrap();
+            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
             c.pragma_update(None, "user_version", (index + 1) as i64)
                 .unwrap();
         }

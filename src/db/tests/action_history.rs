@@ -31,9 +31,10 @@ impl Fixture {
         let (id, state) = (job.id.clone(), state.to_owned());
         self.db
             .with_conn(move |conn| {
-                conn.execute(
+                conn.execute_bounded(
                     "UPDATE bot_actions SET state=?1,finished_at=?2 WHERE id=?3",
                     params![state, finished, id],
+                    64 * 1024 * 1024,
                 )?;
                 Ok(())
             })
@@ -226,8 +227,8 @@ async fn old_keys_cannot_replay_after_cleanup_restart_or_retention_increase() {
 async fn cleanup_and_its_replay_fence_roll_back_together_and_idle_cleanup_does_not_write() {
     let f = Fixture::new().await;
     f.db.with_conn(|conn| {
-        conn.execute_batch("CREATE TRIGGER reject_floor_update BEFORE UPDATE ON meta
-            WHEN NEW.key='action_request_floor' BEGIN SELECT RAISE(ABORT,'test fence failure'); END")
+        conn.execute_batch_bounded("CREATE TRIGGER reject_floor_update BEFORE UPDATE ON meta
+            WHEN NEW.key='action_request_floor' BEGIN SELECT RAISE(ABORT,'test fence failure'); END", 64 * 1024 * 1024)
     }).await.unwrap();
     assert_eq!(
         prune_bot_action_history(&f.db, 1200, limits())

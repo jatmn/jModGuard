@@ -106,7 +106,7 @@ impl GuildDataStore {
                 return tx.finish_read();
             }
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?1,?2,?3,1,?4)", params![scope.guild_id(), scope.enrollment.id.as_str(), scope.enrollment.joined_at_ns, new_revision()])?;
+            tx.execute_rows("INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?1,?2,?3,1,?4)", params![scope.guild_id(), scope.enrollment.id.as_str(), scope.enrollment.joined_at_ns, new_revision()], 1)?;
             tx.commit()
         }).await
     }
@@ -152,13 +152,14 @@ impl GuildDataStore {
                     return tx.finish_read();
                 }
                 tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.execute_reclaim(
                     "DELETE FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
                 )?;
-                tx.execute(
+                tx.execute_rows(
                     "UPDATE guild_memberships SET active=0 WHERE guild_id=?1",
                     params![scope.guild_id()],
+                    1,
                 )?;
                 tx.commit()
             })
@@ -212,12 +213,12 @@ impl GuildDataStore {
             }
             tx.ensure_mutation_receipt()?;
             if let Some(channel) = channel {
-                tx.execute("INSERT INTO guild_log_channels(guild_id,enrollment_id,event_type,channel_id) VALUES(?1,?2,?3,?4) ON CONFLICT(guild_id,event_type) DO UPDATE SET channel_id=excluded.channel_id", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str(), channel])?;
+                tx.execute_rows("INSERT INTO guild_log_channels(guild_id,enrollment_id,event_type,channel_id) VALUES(?1,?2,?3,?4) ON CONFLICT(guild_id,event_type) DO UPDATE SET channel_id=excluded.channel_id", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str(), channel], 1)?;
             } else {
-                tx.execute("DELETE FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 AND event_type=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str()])?;
+                tx.execute_reclaim("DELETE FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 AND event_type=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str()])?;
             }
             let next = new_revision();
-            tx.execute("UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2", params![next.as_str(), scope.guild_id()])?;
+            tx.execute_rows("UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2", params![next.as_str(), scope.guild_id()], 1)?;
             tx.commit()?;
             Ok(next)
         }).await

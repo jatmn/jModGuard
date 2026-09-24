@@ -31,7 +31,7 @@ pub async fn queue_guild_erasure(
             return Ok(false);
         }
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO guild_erasure_jobs(guild_id,enrollment_id,joined_at_ns,store_id,placement_revision,created_at) VALUES(?1,?2,?3,?4,?5,unixepoch())",
             params![
                 enrollment.guild_id,
@@ -39,7 +39,7 @@ pub async fn queue_guild_erasure(
                 enrollment.joined_at_ns,
                 placement.store_id().as_str(),
                 placement.revision()
-            ],
+            ], 1,
         )?;
         tx.commit()?;
         Ok(true)
@@ -107,7 +107,7 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_reclaim(
             "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
             params![guild],
         )?;
@@ -141,7 +141,7 @@ pub async fn record_backup_cleanup_intent(
         )?;
         if exists { return tx.finish_read(); }
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,case_id,evidence_id,object_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,unixepoch())",
             params![
                 intent,
@@ -151,7 +151,7 @@ pub async fn record_backup_cleanup_intent(
                 case_id,
                 evidence_id,
                 object_key
-            ],
+            ], 1,
         )?;
         tx.commit()
     })
@@ -201,7 +201,7 @@ pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) 
     .into_iter()
     .enumerate()
     {
-        let changed = tx.execute(sql, params![guild])? > 0;
+        let changed = tx.execute_reclaim(sql, params![guild])? > 0;
         config_changed |= index < 7 && changed;
         commands_changed |= index == 1 && changed;
         settings_changed |= index == 6 && changed;
@@ -259,9 +259,10 @@ pub async fn evidence_storage_id(db: &Db, configured: &str) -> Result<String> {
         }
         let id = format!("{:032x}", rand::random::<u128>());
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO meta(key,value) VALUES('evidence_storage_id',?1)",
             params![id.as_str()],
+            1,
         )?;
         tx.commit()?;
         Ok(id)

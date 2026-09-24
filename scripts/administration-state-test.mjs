@@ -15,25 +15,29 @@ class Element {
     this.classList = {
       add(name) { classes.add(name); },
       remove(name) { classes.delete(name); },
+      toggle(name, forced) { if (forced) classes.add(name); else classes.delete(name); },
       contains(name) { return classes.has(name); },
     };
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
+  replaceWith() {}
   addEventListener() {}
   setAttribute() {}
 }
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
-function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test" } = {}) {
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible" } = {}) {
   const elements = new Map();
+  let interval;
   const document = {
+    visibilityState: visibility,
     createElement: (tag) => new Element(tag),
     getElementById(id) {
       if (!elements.has(id)) {
         const element = new Element();
-        if (["sign-in", "updates"].includes(id)) element.classList.add("hidden");
+        if (["sign-in", "updates", "database-usage"].includes(id)) element.classList.add("hidden");
         elements.set(id, element);
       }
       return elements.get(id);
@@ -43,11 +47,11 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     document,
     window: { JMODGUARD_WEBUI_SHA: "a".repeat(40), JMODGUARD_API_BASE: apiBase, location: { origin } },
     fetch: fetchImpl,
-    setInterval() {},
+    setInterval(callback) { interval = callback; },
     Date,
   });
   vm.runInContext(source, context);
-  return { context, elements };
+  return { context, elements, interval };
 }
 
 function find(element, predicate) {
@@ -164,6 +168,36 @@ test("Administration carries the configured API origin through reads, controls, 
   assert.equal(local.elements.get("sign-in-link").href, "/login?return_to=%2Fadministration%2Findex.html");
   assert.match(fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration/index.html"), "utf8"),
     /id="sign-in-link"/);
+});
+
+test("Database Usage shows independent physical databases and unknown allocation honestly", async () => {
+  const calls = [];
+  const view = page(async (url) => {
+    calls.push(url);
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    return { status: 200, ok: true, json: async () => ({ generated_at: Math.floor(Date.now() / 1000), databases: [
+      { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: Math.floor(Date.now() / 1000) },
+        percent_of_limit: 75, headroom_bytes: 250000000, status: "pressure" },
+      { id: "a".repeat(32), kind: "guild", policy: { kind: "shared" }, usage: null,
+        percent_of_limit: null, headroom_bytes: null, status: "unavailable" },
+    ] }) };
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  const text = textOf(view.elements.get("usage-cards"));
+  assert.match(text, /750\.00 MB/);
+  assert.match(text, /75\.00% of 1,000 MB/);
+  assert.match(text, /Shared guild database/);
+  assert.match(text, /Measurement unavailable/);
+  assert.match(text, /Headroom: unavailable/);
+  assert.ok(calls.includes("/api/database-usage"));
+});
+
+test("Administration polling stops while the tab is hidden", async () => {
+  const calls = [];
+  const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });
+  await vm.runInContext('selectView("usage")', view.context);
+  view.interval();
+  assert.deepEqual(calls, []);
 });
 
 test("owner availability distinguishes baked source parity from channel mismatch", () => {

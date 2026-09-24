@@ -10,8 +10,9 @@ use crate::db::guild_stores::{
     register_store, shared_store_registration,
 };
 use crate::db::{
-    self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure_after,
-    queue_guild_erasure, record_backup_cleanup_intent, wipe_departed_directory_guild_data,
+    self, Db, GuildEnrollment, GuildErasureJob, SqlExecutor, finish_guild_erasure,
+    next_guild_erasure_after, queue_guild_erasure, record_backup_cleanup_intent,
+    wipe_departed_directory_guild_data,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
@@ -34,6 +35,12 @@ pub enum TenantError {
 pub struct TenantRuntime {
     core: Db,
     inner: Arc<Inner>,
+}
+
+/// Catalog entry and its locally reachable handle for owner usage inspection.
+pub struct UsageStore {
+    pub registration: StoreRegistration,
+    pub handle: Option<GuildDataStore>,
 }
 
 struct Inner {
@@ -172,6 +179,52 @@ fn block_on<T: Send>(fut: impl std::future::Future<Output = Result<T>> + Send) -
 }
 
 impl TenantRuntime {
+    pub async fn usage_stores(&self) -> Result<Vec<UsageStore>> {
+        let catalog: Vec<StoreRegistration> = self
+            .core
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_read()?;
+                let mut stmt = tx.prepare(
+                    "SELECT store_id,dedicated_guild_id FROM guild_store_catalog ORDER BY store_id",
+                )?;
+                let rows = stmt.query_map((), |row| {
+                    Ok((row.get::<String>(0)?, row.get::<Option<i64>>(1)?))
+                })?;
+                let mut catalog = Vec::new();
+                for row in rows {
+                    let (id, owner) = row?;
+                    let id = StoreId::parse(&id)?;
+                    let policy = match owner {
+                        None => StorePolicy::Shared,
+                        Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
+                        _ => anyhow::bail!("invalid guild store catalog owner"),
+                    };
+                    catalog.push(StoreRegistration::from_parts(id, policy));
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(catalog)
+            })
+            .await?;
+        let mut result = Vec::with_capacity(catalog.len());
+        for registration in catalog {
+            let handle = if self
+                .inner
+                .credentials
+                .iter()
+                .any(|known| known.registration == registration)
+            {
+                self.handle(registration.id()).await.ok()
+            } else {
+                None
+            };
+            result.push(UsageStore {
+                registration,
+                handle,
+            });
+        }
+        Ok(result)
+    }
     pub fn open(
         core: &Db,
         db: &crate::config::DbConfig,

@@ -115,7 +115,7 @@ async fn reservation_ready_read_and_retries_preserve_one_owned_object() {
             .await
             .is_err()
     );
-    store.db.with_conn(|c|{c.execute_batch("CREATE TRIGGER no_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")?;Ok(())}).await.unwrap();
+    store.db.with_conn(|c|{c.execute_batch_bounded("CREATE TRIGGER no_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)?;Ok(())}).await.unwrap();
     assert!(
         !store
             .reserve_case_evidence(a.clone(), case.clone(), id.clone(), req, limits())
@@ -535,8 +535,8 @@ async fn sql_guards_and_failed_cancellation_preserve_parent_and_metadata() {
         .unwrap();
     store.db.with_conn(|c|{
         c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF")?;
-        for sql in ["DELETE FROM guild_case_evidence","INSERT OR REPLACE INTO guild_case_evidence SELECT * FROM guild_case_evidence","UPDATE guild_case_evidence SET reserved_bytes=5","UPDATE guild_case_evidence SET channel_id=99","UPDATE guild_case_evidence SET state=3,cancelled=1,channel_id=NULL,message_id=NULL,attachment_id=NULL","INSERT INTO guild_case_evidence SELECT 20,enrollment_id,case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256 FROM guild_case_evidence"] {assert!(c.execute_batch(sql).is_err(),"accepted {sql}");}
-        c.execute_batch("CREATE TRIGGER refuse_cancel BEFORE UPDATE ON guild_case_evidence BEGIN SELECT RAISE(ABORT,'keep'); END")?;Ok(())
+        for sql in ["DELETE FROM guild_case_evidence","INSERT OR REPLACE INTO guild_case_evidence SELECT * FROM guild_case_evidence","UPDATE guild_case_evidence SET reserved_bytes=5","UPDATE guild_case_evidence SET channel_id=99","UPDATE guild_case_evidence SET state=3,cancelled=1,channel_id=NULL,message_id=NULL,attachment_id=NULL","INSERT INTO guild_case_evidence SELECT 20,enrollment_id,case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256 FROM guild_case_evidence"] {assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),"accepted {sql}");}
+        c.execute_batch_bounded("CREATE TRIGGER refuse_cancel BEFORE UPDATE ON guild_case_evidence BEGIN SELECT RAISE(ABORT,'keep'); END", 64 * 1024 * 1024)?;Ok(())
     }).await.unwrap();
     assert!(store.remove_case(a.clone(), case.clone()).await.is_err());
     assert!(
@@ -556,7 +556,7 @@ async fn sql_guards_and_failed_cancellation_preserve_parent_and_metadata() {
     store
         .db
         .with_conn(|c| {
-            c.execute_batch("DROP TRIGGER refuse_cancel")?;
+            c.execute_batch_bounded("DROP TRIGGER refuse_cancel", 64 * 1024 * 1024)?;
             Ok(())
         })
         .await
@@ -571,7 +571,7 @@ async fn sql_guards_and_failed_cancellation_preserve_parent_and_metadata() {
         .await
         .unwrap();
     store.close_membership(a.clone()).await.unwrap();
-    store.db.with_conn(|c|{c.execute_batch("CREATE TRIGGER refuse_purge BEFORE DELETE ON guild_case_evidence BEGIN SELECT RAISE(ABORT,'keep'); END")?;Ok(())}).await.unwrap();
+    store.db.with_conn(|c|{c.execute_batch_bounded("CREATE TRIGGER refuse_purge BEFORE DELETE ON guild_case_evidence BEGIN SELECT RAISE(ABORT,'keep'); END", 64 * 1024 * 1024)?;Ok(())}).await.unwrap();
     assert!(
         store
             .purge_closed_cases(a.clone(), 1, CaseLimits::default())
@@ -587,7 +587,7 @@ async fn sql_guards_and_failed_cancellation_preserve_parent_and_metadata() {
                 ))?,
                 1
             );
-            c.execute_batch("DROP TRIGGER refuse_purge")?;
+            c.execute_batch_bounded("DROP TRIGGER refuse_purge", 64 * 1024 * 1024)?;
             Ok(())
         })
         .await
@@ -701,20 +701,22 @@ async fn version_five_upgrade_preserves_cases_without_inventing_files() {
             HISTORY_SCHEMA,
             SOURCE_SCHEMA,
         ] {
-            raw.execute_batch(schema).unwrap();
+            raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
         }
-        raw.execute(
+        raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        raw.execute(
+        raw.execute_bounded(
             "INSERT INTO guild_bindings VALUES(10,?1)",
             params![p.revision()],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
-        raw.execute("INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",params![id.as_str(),serde_json::to_string(&data(1)).unwrap()]).unwrap();
+        raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
+        raw.execute_bounded("INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",params![id.as_str(),serde_json::to_string(&data(1)).unwrap()], 64 * 1024 * 1024).unwrap();
         raw.pragma_update(None, "user_version", 5).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());

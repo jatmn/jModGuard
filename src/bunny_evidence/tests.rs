@@ -288,10 +288,11 @@ async fn real_http_capture_hash_cleanup_and_retry_preserve_other_objects() {
         .unwrap(),
         0
     );
-    raw.execute_batch("CREATE TRIGGER fail_ack BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=3 BEGIN SELECT RAISE(ABORT,'ack failed'); END").unwrap();
+    raw.execute_batch_bounded("CREATE TRIGGER fail_ack BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=3 BEGIN SELECT RAISE(ABORT,'ack failed'); END", 64 * 1024 * 1024).unwrap();
     assert!(f.backend.cleanup(f.db.clone(), a.clone()).await.is_err());
     assert_eq!(f.job(&a).await.state, EvidenceState::CleanupPending);
-    raw.execute_batch("DROP TRIGGER fail_ack").unwrap();
+    raw.execute_batch_bounded("DROP TRIGGER fail_ack", 64 * 1024 * 1024)
+        .unwrap();
     assert!(f.backend.cleanup(f.db.clone(), a.clone()).await.unwrap());
     assert!(!f.backend.cleanup(f.db.clone(), a).await.unwrap());
     assert_eq!(f.remote.lock().unwrap().objects.len(), 1);
@@ -340,11 +341,12 @@ async fn accepted_upload_recovers_verification_and_failed_settlement_without_reu
         .is_err()
     );
     let raw = f.raw();
-    raw.execute_batch("CREATE TRIGGER fail_settle BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=1 BEGIN SELECT RAISE(ABORT,'settle failed'); END").unwrap();
+    raw.execute_batch_bounded("CREATE TRIGGER fail_settle BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=1 BEGIN SELECT RAISE(ABORT,'settle failed'); END", 64 * 1024 * 1024).unwrap();
     let mut reopened = f.backend.clone();
     reopened.admission = Arc::new(Semaphore::new(1));
     assert!(reopened.reconcile(f.db.clone(), t.clone()).await.is_err());
-    raw.execute_batch("DROP TRIGGER fail_settle").unwrap();
+    raw.execute_batch_bounded("DROP TRIGGER fail_settle", 64 * 1024 * 1024)
+        .unwrap();
     assert_eq!(
         reopened.reconcile(f.db.clone(), t.clone()).await.unwrap(),
         EvidenceState::Available
@@ -368,7 +370,7 @@ async fn accepted_upload_recovers_verification_and_failed_settlement_without_reu
 async fn lost_acceptance_receipt_never_promotes_matching_remote_bytes() {
     let f = Fixture::new().await;
     let raw = f.raw();
-    raw.execute_batch("CREATE TRIGGER fail_accept BEFORE UPDATE OF accepted ON guild_bunny_evidence BEGIN SELECT RAISE(ABORT,'accept failed'); END").unwrap();
+    raw.execute_batch_bounded("CREATE TRIGGER fail_accept BEFORE UPDATE OF accepted ON guild_bunny_evidence BEGIN SELECT RAISE(ABORT,'accept failed'); END", 64 * 1024 * 1024).unwrap();
     let upload = f.upload();
     let t = upload.target.clone();
     assert!(
@@ -377,7 +379,8 @@ async fn lost_acceptance_receipt_never_promotes_matching_remote_bytes() {
             .await
             .is_err()
     );
-    raw.execute_batch("DROP TRIGGER fail_accept").unwrap();
+    raw.execute_batch_bounded("DROP TRIGGER fail_accept", 64 * 1024 * 1024)
+        .unwrap();
     assert_eq!(f.remote.lock().unwrap().objects.len(), 1);
     assert!(f.backend.reconcile(f.db.clone(), t.clone()).await.is_err());
     f.remove().await;

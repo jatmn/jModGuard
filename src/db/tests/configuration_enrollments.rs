@@ -225,7 +225,10 @@ async fn unavailable_membership_check_returns_a_safe_error_and_no_settings_chang
     let f = Fixture::new();
     let scope = f.scope(10).await;
     f.db.with_conn(|conn| {
-        conn.execute_batch("ALTER TABLE guild_enrollments RENAME TO test_hidden_table")
+        conn.execute_batch_bounded(
+            "ALTER TABLE guild_enrollments RENAME TO test_hidden_table",
+            64 * 1024 * 1024,
+        )
     })
     .await
     .unwrap();
@@ -398,7 +401,7 @@ async fn write_scopes_reject_foreign_targets_and_guard_failures_roll_back() {
     let other = f.scope(20).await;
     assert!(ConfigurationWriteScope::new(request.clone(), other).is_err());
     assert!(ConfigurationWriteScope::new(ConfigurationScope::Global, request.clone()).is_err());
-    f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER refuse_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'fixture'); END")).await.unwrap();
+    f.db.with_conn(|conn|conn.execute_batch_bounded("CREATE TRIGGER refuse_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'fixture'); END", 64 * 1024 * 1024)).await.unwrap();
     let scope = edit_scope(&request, false);
     assert!(
         upsert_enrolled_template(&f.db, scope, "message_edit", "rejected")
@@ -477,7 +480,11 @@ async fn invalid_copy_replacement_rolls_back_settings_nickname_and_versions() {
     .await
     .unwrap();
     f.db.with_conn(|conn| {
-        conn.execute("INSERT INTO badwords(guild_id,pattern) VALUES(10,'[')", ())?;
+        conn.execute_bounded(
+            "INSERT INTO badwords(guild_id,pattern) VALUES(10,'[')",
+            (),
+            64 * 1024 * 1024,
+        )?;
         Ok(())
     })
     .await

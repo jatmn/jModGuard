@@ -99,8 +99,8 @@ async fn observations_preserve_settings_audits_and_unbound_work_without_noop_wri
     );
     assert_eq!(get_settings(&f.db, 10).await.unwrap().prefix, "?");
     assert_eq!(list_warns(&f.db, 10, 99).await.unwrap().len(), 1);
-    f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER block_membership BEFORE UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'unexpected write'); END;
-        CREATE TRIGGER block_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END;")).await.unwrap();
+    f.db.with_conn(|conn|conn.execute_batch_bounded("CREATE TRIGGER block_membership BEFORE UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'unexpected write'); END;
+        CREATE TRIGGER block_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END;", 64 * 1024 * 1024)).await.unwrap();
     assert_eq!(enroll_guild(&f.db, 10, 101).await.unwrap(), identity);
     assert!(enroll_guild(&f.db, 10, 100).await.unwrap().is_none());
 }
@@ -113,7 +113,7 @@ async fn invalid_observations_and_failed_transactions_leave_identity_intact() {
         assert!(retire_guild_enrollment(&f.db, guild, joined).await.is_err());
     }
     let first = enroll_guild(&f.db, 10, 100).await.unwrap();
-    f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_membership AFTER UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'test failure'); END")).await.unwrap();
+    f.db.with_conn(|conn|conn.execute_batch_bounded("CREATE TRIGGER fail_membership AFTER UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'test failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(enroll_guild(&f.db, 10, 101).await.is_err());
     assert!(retire_guild_enrollment(&f.db, 10, 100).await.is_err());
     assert_eq!(guild_enrollment(&f.db, 10).await.unwrap(), first);

@@ -8,20 +8,31 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <a class="skip-link" href="#content">Skip to updates</a>
+  <a class="skip-link" href="#content">Skip to administration</a>
   <main id="content" class="workspace" style="max-width:1000px;margin:auto;padding:32px">
     <header class="workspace-header" style="display:flex;justify-content:space-between;align-items:center;gap:16px">
-      <div><span class="eyebrow">OWNER ADMINISTRATION</span><h1>Updates</h1></div>
+      <div><span class="eyebrow">OWNER ADMINISTRATION</span><h1 id="admin-title">Updates</h1></div>
       <a class="btn btn-sm" href="/">Back to workspace</a>
     </header>
     <p id="update-status" role="status">Checking your access and release state…</p>
     <div id="sign-in" class="hidden"><a id="sign-in-link" class="btn btn-primary" href="/login?return_to=%2Fadministration%2Findex.html">Sign in with Discord</a></div>
+    <nav aria-label="Administration pages" style="display:flex;gap:12px;margin:18px 0">
+      <button id="show-updates" class="btn btn-sm" type="button" aria-current="page">Updates</button>
+      <button id="show-database-usage" class="btn btn-sm" type="button">Database Usage</button>
+    </nav>
     <div id="updates" class="hidden">
       <p>Release checks run hourly. You can check now or install a compatible release when on-demand updates are enabled.</p>
       <p id="automatic-state"></p>
       <p id="browser-version"></p>
       <div id="update-cards" class="grid" style="display:grid;gap:16px"></div>
     </div>
+    <section id="database-usage" class="hidden" aria-labelledby="database-usage-title">
+      <h2 id="database-usage-title">Database Usage</h2>
+      <p>Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable.</p>
+      <p id="usage-status" role="status">Waiting to load usage…</p>
+      <button id="refresh-usage" class="btn btn-sm" type="button">Refresh usage</button>
+      <div id="usage-cards" class="grid" style="display:grid;gap:16px;margin-top:16px"></div>
+    </section>
   </main>
   <script src="/administration.js"></script>
 </body>

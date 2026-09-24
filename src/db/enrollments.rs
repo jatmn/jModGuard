@@ -73,11 +73,11 @@ async fn observe_membership(
                 if dormant {
                     super::guild_stores::refuse_fenced_write(&tx, guild)?;
                     tx.ensure_mutation_receipt()?;
-                    tx.execute(
+                    tx.execute_rows(
                         "UPDATE nickname_reconcile SET generation=generation+1,state='pending',
                          attempt_count=0,next_attempt_at=0,last_error_code=NULL,last_error=NULL,
                          last_error_at=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND state='dormant'",
-                        params![guild, id.as_str()],
+                        params![guild, id.as_str()], 1,
                     )?;
                     tx.commit()?;
                 } else {
@@ -102,33 +102,33 @@ async fn observe_membership(
         // as well. The earlier timestamp guard already rejected stale departures.
         if let Some((id, joined, true)) = &current
         {
-            tx.execute(
+            tx.execute_rows(
                 "INSERT INTO guild_erasure_jobs(guild_id,enrollment_id,joined_at_ns,store_id,placement_revision,created_at)
                  SELECT guild_id,?2,?3,store_id,revision,unixepoch() FROM guild_store_placements
                  WHERE guild_id=?1 AND NOT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
-                params![guild, id.as_str(), *joined],
+                params![guild, id.as_str(), *joined], 1,
             )?;
         }
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bot_actions SET state='cancelled',outcome='enrollment_ended',finished_at=unixepoch()
              WHERE guild_id=?1 AND state IN ('pending','claimed')", params![guild],
         )?;
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bot_actions SET state='uncertain',outcome='enrollment_ended'
              WHERE guild_id=?1 AND state='running'", params![guild],
         )?;
-        tx.execute(
+        tx.execute_rows(
             "UPDATE nickname_reconcile SET generation=generation+1,state='dormant',
              next_attempt_at=0,last_error_code='enrollment_ended',
              last_error='fresh nickname request required',last_error_at=unixepoch()
-             WHERE guild_id=?1 AND state!='dormant'", params![guild],
+             WHERE guild_id=?1 AND state!='dormant'", params![guild], 1,
         )?;
         let id = format!("{:032x}", rand::random::<u128>());
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,?3,?4)
              ON CONFLICT(guild_id) DO UPDATE SET id=excluded.id,
              joined_at_ns=excluded.joined_at_ns,active=excluded.active",
-            params![guild, id.as_str(), joined_at_ns, present],
+            params![guild, id.as_str(), joined_at_ns, present], 1,
         )?;
         if !present {
             let placed: bool = tx.query_row(
@@ -140,10 +140,10 @@ async fn observe_membership(
                 // transaction as retirement, including its backup reminder.
                 super::tenant_lifecycle::wipe_directory_guild_data_conn(&tx, guild)?;
                 if let Some((old, _, true)) = &current {
-                    tx.execute(
+                    tx.execute_rows(
                         "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,created_at)
                          VALUES(?1,'guild',?2,?3,unixepoch())",
-                        params![format!("{:032x}", rand::random::<u128>()), guild, old.as_str()],
+                        params![format!("{:032x}", rand::random::<u128>()), guild, old.as_str()], 1,
                     )?;
                 }
             }

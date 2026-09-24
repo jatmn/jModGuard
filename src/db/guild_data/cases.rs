@@ -255,7 +255,7 @@ impl GuildDataStore {
             drop(stmt);
             if let Some(existing) = existing { tx.finish_read()?; return Ok(existing); }
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()])?;
+            tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()], 1)?;
             tx.commit()?;
             Ok(RecordCase::Created(id))
         }).await
@@ -363,7 +363,7 @@ impl GuildDataStore {
             let present = tx.query_row("SELECT deleted=0 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(r.get::<bool>(0)?)).optional()?.unwrap_or(false);
             if !present { tx.finish_read()?; return Ok(false); }
             tx.ensure_mutation_receipt()?;
-            tx.execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()])?;
+            tx.execute_rows("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], 1)?;
             tx.commit()?;
             Ok(true)
         }).await
@@ -405,7 +405,7 @@ impl GuildDataStore {
             let any: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2)", params![scope.guild_id(),scope.enrollment.id.as_str()], |r| Ok(r.get(0)?))?;
             if !any { tx.finish_read()?; return Ok(0); }
             tx.ensure_mutation_receipt()?;
-            let removed = tx.execute("DELETE FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id IN (SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 ORDER BY case_id LIMIT ?3)", params![scope.guild_id(),scope.enrollment.id.as_str(),count as i64])?;
+            let removed = tx.execute_reclaim("DELETE FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id IN (SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 ORDER BY case_id LIMIT ?3)", params![scope.guild_id(),scope.enrollment.id.as_str(),count as i64])?;
             tx.commit()?;
             Ok(removed)
         }).await

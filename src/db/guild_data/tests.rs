@@ -82,7 +82,7 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         .unwrap();
     store.db.with_conn(|c| {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
-        assert_eq!(count, 11, "store contains identity, bindings, receipts, membership, log routing selected cases and owned history and source associations plus evidence ownership, Bunny attempts and tenant settings");
+        assert_eq!(count, 13, "store contains identity, bindings, receipts, membership, log routing, selected cases and evidence, tenant settings, transient snapshots and health");
         Ok(())
     }).await.unwrap();
     assert!(
@@ -124,8 +124,11 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
     );
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('keep')")
-            .unwrap();
+        raw.execute_batch_bounded(
+            "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('keep')",
+            64 * 1024 * 1024,
+        )
+        .unwrap();
     }
     assert!(GuildDataStore::initialize(f.options(), reg.clone()).is_err());
     {
@@ -139,7 +142,8 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
             .unwrap(),
             "keep"
         );
-        raw.execute_batch("DROP TABLE sentinel").unwrap();
+        raw.execute_batch_bounded("DROP TABLE sentinel", 64 * 1024 * 1024)
+            .unwrap();
     }
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
     for version in [0, VERSION + 1] {
@@ -158,7 +162,9 @@ async fn store_refuses_foreign_core_newer_or_unmarked_schema_without_adoption() 
         .unwrap();
     store
         .db
-        .with_conn(|c| c.execute_batch("DROP TRIGGER guild_binding_owner"))
+        .with_conn(|c| {
+            c.execute_batch_bounded("DROP TRIGGER guild_binding_owner", 64 * 1024 * 1024)
+        })
         .await
         .unwrap();
     assert!(
@@ -184,7 +190,7 @@ async fn expected_identity_and_policy_are_checked_again_after_open() {
     assert!(GuildDataStore::open(f.options(), different_policy).is_err());
     // Simulate a restored different identity, bypassing the immutable trigger explicitly.
     store.db.with_conn(|c| {
-        c.execute_batch("DROP TRIGGER store_identity_no_update; UPDATE store_identity SET store_id='00000000000000000000000000000000'; CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity BEGIN SELECT RAISE(ABORT,'immutable'); END")
+        c.execute_batch_bounded("DROP TRIGGER store_identity_no_update; UPDATE store_identity SET store_id='00000000000000000000000000000000'; CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity BEGIN SELECT RAISE(ABORT,'immutable'); END", 64 * 1024 * 1024)
     }).await.unwrap();
     assert!(matches!(
         store
@@ -247,7 +253,7 @@ async fn matching_bindings_and_initialization_do_not_write() {
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
     let p = f.placement(&reg, 10).await;
     store.bind_initial_placement(p.clone()).await.unwrap();
-    store.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_binding_insert BEFORE INSERT ON guild_bindings BEGIN SELECT RAISE(ABORT,'unexpected binding'); END; CREATE TRIGGER reject_receipt_insert BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_binding_insert BEFORE INSERT ON guild_bindings BEGIN SELECT RAISE(ABORT,'unexpected binding'); END; CREATE TRIGGER reject_receipt_insert BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     store.bind_initial_placement(p.clone()).await.unwrap();
     store.verify_placement(p.clone()).await.unwrap();
     GuildDataStore::initialize(f.options(), reg.clone())
@@ -322,7 +328,7 @@ async fn store_sql_protects_identity_bindings_and_dedicated_ownership_without_fo
             "DELETE FROM guild_bindings",
             "INSERT OR REPLACE INTO guild_bindings VALUES(10,'11111111111111111111111111111111')",
             "INSERT INTO guild_bindings VALUES(20,'11111111111111111111111111111111')",
-        ] { assert!(c.execute_batch(sql).is_err(),"accepted {sql}"); }
+        ] { assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),"accepted {sql}"); }
         Ok(())
     }).await.unwrap();
     store.verify_placement(p).await.unwrap();
@@ -361,19 +367,21 @@ async fn version_seven_upgrade_adds_erasure_and_tenant_settings() {
         EVIDENCE_SCHEMA,
         BUNNY_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        64 * 1024 * 1024,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![p.revision()],
+        64 * 1024 * 1024,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
+    raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
     raw.pragma_update(None, "user_version", 7).unwrap();
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     assert_eq!(
@@ -394,6 +402,7 @@ async fn version_seven_upgrade_adds_erasure_and_tenant_settings() {
     assert!(settings.case_delete_roles.is_empty());
 }
 
+mod snapshots;
 mod tenant_logs;
 
 mod cases;

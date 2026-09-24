@@ -22,9 +22,11 @@ preview) or via `!template`.
 | `{action}` | automod action performed |
 | `{strikes}` | strike count at the time of the action |
 | `{content}` | message content / evidence / plan detail |
-| `{before}` / `{after}` | `before` is not retained; `after` is supplied update text or explicitly unavailable |
+| `{before}` / `{after}` | last retained text before an observed edit, when available; accepted after text or supplied update text if retention fails. Missing and empty are distinct |
 | `{message_id}` / `{message_url}` | single-message ID and Discord reference (edit/delete reports) |
-| `{attachments}` | supplied update attachment count; for a single deletion, bounded URLs from a recent observation, or explicitly unavailable |
+| `{attachments}` | retained attachment metadata when available, or supplied update details / an explicitly unavailable value |
+| `{coverage}` | last-observed continuity or a gap / unavailable reason for edit and single-delete reports |
+| `{retained}` / `{unavailable}` / `{filtered}` / `{details}` | bulk-delete counts, excluded authors and transcript availability |
 | `{count}` | bulk delete count / purge count / warn count |
 | `{duration}` | timeout length / time in server |
 | `{account_created}` | account creation timestamp |
@@ -42,9 +44,9 @@ Unknown variables are left untouched so template mistakes are visible.
 - **member_leave** — left, elapsed time and join date from cached member or recently received message member details; no historical join count
 - **member_ban** / **member_unban** — hammer/unlock with recent matching audit actor + reason (requires View Audit Log); explicit unavailable fallback
 - **member_kick** — boot with actor + reason
-- **message_edit** — one Discord-identified edit (`edited_timestamp`); supplied current text, attachment count and message reference. Not embed/GIF unfurls, chat replies, or the bot's own log posts.
-- **message_delete** — message ID; recent observed author, text and attachment URLs when available
-- **message_bulk_delete** — count in channel
+- **message_edit** — one Discord-identified edit (`edited_timestamp`), last observed before and updated text with coverage label. Embed/GIF unfurls, chat replies and the bot's own log posts do not create edit reports.
+- **message_delete** — message ID and last observed author, text and attachment metadata when available
+- **message_bulk_delete** — count, retained/unavailable counts, and a transient bounded transcript attachment
 - **automod** — shield: rule, action, reason, evidence, channel
 - **mod_action** — judge: action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
@@ -89,6 +91,8 @@ to the previous shipped templates, in both global and guild scopes. Custom wordi
 is preserved. The upgrade is recorded once, so later operator edits are not undone
 on restart. Configuration versioning makes the upgraded values visible to the bot
 and WebUI.
+The retained-message template upgrade likewise replaces only byte-for-byte shipped
+edit/delete/bulk defaults once. Custom wording stays intact.
 
 All 14 built-in log templates use bold headings and labels, inline-code IDs,
 counts/durations/dates, and an absolute event time. Mentions and links remain

@@ -476,10 +476,10 @@ async fn erasure_resumes_after_core_failure_and_reopen() {
             .unwrap();
         db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
         f.tenant.schedule_erasure(e).await.unwrap();
-        f.db.with_conn(move |c| { c.execute_batch(&format!("CREATE TRIGGER review_fail BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'injected core failure'); END"))?; Ok(()) }).await.unwrap();
+        f.db.with_conn(move |c| { c.execute_batch_bounded(&format!("CREATE TRIGGER review_fail BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'injected core failure'); END"), 64 * 1024 * 1024)?; Ok(()) }).await.unwrap();
         let first = f.tenant.drive_erasure().await.unwrap_err();
         f.db.with_conn(|c| {
-            c.execute_batch("DROP TRIGGER review_fail")?;
+            c.execute_batch_bounded("DROP TRIGGER review_fail", 64 * 1024 * 1024)?;
             Ok(())
         })
         .await
@@ -586,7 +586,7 @@ async fn directory_wipe_advances_config_observation() {
 async fn retirement_and_erasure_admission_rollback_together() {
     let f = Fixture::new();
     let enrollment = enroll(&f, 10, 100).await;
-    f.db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fail_queue BEFORE INSERT ON guild_erasure_jobs BEGIN SELECT RAISE(ABORT,'queue unavailable'); END")?; Ok(()) }).await.unwrap();
+    f.db.with_conn(|c| { c.execute_batch_bounded("CREATE TRIGGER fail_queue BEFORE INSERT ON guild_erasure_jobs BEGIN SELECT RAISE(ABORT,'queue unavailable'); END", 64 * 1024 * 1024)?; Ok(()) }).await.unwrap();
     assert!(db::retire_guild_enrollment(&f.db, 10, 100).await.is_err());
     assert_eq!(
         db::guild_enrollment(&f.db, 10).await.unwrap(),
@@ -594,7 +594,7 @@ async fn retirement_and_erasure_admission_rollback_together() {
     );
     assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
     f.db.with_conn(|c| {
-        c.execute_batch("DROP TRIGGER fail_queue")?;
+        c.execute_batch_bounded("DROP TRIGGER fail_queue", 64 * 1024 * 1024)?;
         Ok(())
     })
     .await
@@ -940,14 +940,14 @@ async fn departure_without_placement_settles_directory_in_retirement() {
     db::add_enrolled_warn(&f.db, Some(old.clone()), 99, 42, "private")
         .await
         .unwrap();
-    f.db.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER reject_empty_cleanup BEFORE DELETE ON warns BEGIN SELECT RAISE(ABORT,'fixture'); END;")?; Ok(()) }).await.unwrap();
+    f.db.with_conn(|conn| { conn.execute_batch_bounded("CREATE TRIGGER reject_empty_cleanup BEFORE DELETE ON warns BEGIN SELECT RAISE(ABORT,'fixture'); END;", 64 * 1024 * 1024)?; Ok(()) }).await.unwrap();
     assert!(db::retire_guild_enrollment(&f.db, 10, 100).await.is_err());
     assert_eq!(
         db::guild_enrollment(&f.db, 10).await.unwrap(),
         Some(old.clone())
     );
     f.db.with_conn(|conn| {
-        conn.execute_batch("DROP TRIGGER reject_empty_cleanup;")?;
+        conn.execute_batch_bounded("DROP TRIGGER reject_empty_cleanup;", 64 * 1024 * 1024)?;
         Ok(())
     })
     .await

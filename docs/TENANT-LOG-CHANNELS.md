@@ -61,7 +61,7 @@ trusted SQL access; these checks do not defend against an administrator replacin
 
 ## Schema, verification and remaining integration
 
-`jmodguard-guild-1` uses migrations0001–0006. Version2 added empty membership/mapping
+At the version6 stage documented here, `jmodguard-guild-1` used migrations0001–0006. Version2 added empty membership/mapping
 tables; version3 adds [selected case storage](TENANT-CASES.md). `initialize` verifies the
 expected version1–5 identity before upgrading atomically to6, preserving bindings/settings.
 `open` requires6 and never migrates. Older guild-store binaries reject6; rollback requires

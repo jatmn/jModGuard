@@ -1,9 +1,10 @@
 //! Separate guild-store identity, tenant data and coordinated live erasure.
 use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistration};
+use super::write_budget::BoundedWrites;
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 8;
+const VERSION: i64 = 9;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -13,6 +14,7 @@ const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sourc
 const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evidence.sql");
 const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
 const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.sql");
+const SNAPSHOT_SCHEMA: &str = include_str!("../../migrations/guild/0009_message_snapshots.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -25,6 +27,8 @@ pub use case_history::*;
 mod cases;
 pub use cases::*;
 mod erasure;
+mod snapshots;
+pub use snapshots::*;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
 mod tenant_settings;
@@ -159,6 +163,10 @@ fn verify_identity_version(
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_tenant_settings') OR (type='trigger' AND name IN ('guild_binding_delete','guild_tenant_settings_insert','guild_tenant_settings_no_replace','guild_tenant_settings_update'))", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 5, StoreCheckError::Schema);
     }
+    if wanted >= 9 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_message_snapshots','guild_snapshot_health')) OR (type='index' AND name='guild_snapshot_expiry') OR (type='trigger' AND name IN ('guild_snapshot_insert','guild_snapshot_update','guild_snapshot_account_insert','guild_snapshot_account_update','guild_snapshot_account_delete','guild_membership_delete'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 9, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -188,24 +196,33 @@ fn initialize_store(
         verify_identity_version(&tx, expected, version)?;
         tx.ensure_mutation_receipt()?;
         if version < 2 {
-            tx.execute_batch(TENANT_SCHEMA)?;
+            tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
         }
         if version < 3 {
-            tx.execute_batch(CASE_SCHEMA)?;
+            tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
         }
         if version < 4 {
-            tx.execute_batch(HISTORY_SCHEMA)?;
+            tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
         }
         if version < 5 {
-            tx.execute_batch(SOURCE_SCHEMA)?;
+            // Migration 0005 copies one source row for every existing case and
+            // creates two indexes. The whole source allocation is a conservative
+            // upper bound for those rows; reserve twice that plus B-tree space.
+            let source_bound = crate::capacity::allocated_bytes(&tx)?
+                .saturating_mul(2)
+                .saturating_add(32_000_000);
+            tx.execute_batch_bounded(SOURCE_SCHEMA, source_bound)?;
         }
         if version < 6 {
-            tx.execute_batch(EVIDENCE_SCHEMA)?;
+            tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
         }
         if version < 7 {
-            tx.execute_batch(BUNNY_SCHEMA)?;
+            tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
         }
-        tx.execute_batch(ERASURE_SCHEMA)?;
+        if version < 8 {
+            tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
+        }
+        tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -214,15 +231,17 @@ fn initialize_store(
         tx.finish_read()?;
         return Ok(());
     }
-    tx.execute_batch(SCHEMA)?;
-    tx.execute_batch(TENANT_SCHEMA)?;
-    tx.execute_batch(CASE_SCHEMA)?;
-    tx.execute_batch(HISTORY_SCHEMA)?;
-    tx.execute_batch(SOURCE_SCHEMA)?;
-    tx.execute_batch(EVIDENCE_SCHEMA)?;
-    tx.execute_batch(BUNNY_SCHEMA)?;
-    tx.execute_batch(ERASURE_SCHEMA)?;
-    tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
+    tx.execute_batch_bounded(SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SOURCE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
+    tx.ensure_mutation_receipt()?;
+    tx.execute_rows("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)], 1)?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete
     // identity/schema marker on primary if initialization's COMMIT response is lost.
@@ -239,6 +258,11 @@ fn initialize_store(
 }
 
 impl GuildDataStore {
+    /// Whole-store usage, measured on the store primary with identity verification.
+    pub async fn measure_usage(&self, details: bool) -> Result<crate::db::usage::DatabaseUsage> {
+        crate::db::usage::measure_database_usage(&self.db, details, Some(self.expected.clone()))
+            .await
+    }
     /// Initialize only an empty store, or reopen this exact recognized identity.
     /// Synchronous like Db::open_with; callers must use a startup/blocking worker.
     pub fn initialize(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {
@@ -347,9 +371,10 @@ impl GuildDataStore {
                     return Ok(());
                 }
                 tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.execute_rows(
                     "INSERT INTO guild_bindings(guild_id,revision) VALUES(?1,?2)",
                     params![placement.guild_id(), placement.revision()],
+                    1,
                 )?;
                 tx.commit()
             })

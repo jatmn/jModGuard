@@ -212,9 +212,9 @@ async fn healthy_repair_does_not_write_enrollment_or_nickname_state() {
     let before = db::enroll_guild(&f.db, 10, 100).await.unwrap();
     db::request_nickname_reconcile(&f.db, 10).await.unwrap();
     f.db.with_conn(|conn| {
-        conn.execute("UPDATE nickname_reconcile SET state='terminal' WHERE guild_id=10",())?;
-        conn.execute_batch("CREATE TRIGGER block_enrollment BEFORE UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'unexpected enrollment write'); END;
-            CREATE TRIGGER block_nickname BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'unexpected nickname write'); END")
+        conn.execute_bounded("UPDATE nickname_reconcile SET state='terminal' WHERE guild_id=10",(),65_536)?;
+        conn.execute_batch_bounded("CREATE TRIGGER block_enrollment BEFORE UPDATE ON guild_enrollments BEGIN SELECT RAISE(ABORT,'unexpected enrollment write'); END;
+            CREATE TRIGGER block_nickname BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'unexpected nickname write'); END",65_536)
     }).await.unwrap();
     let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
     assert_eq!(
@@ -257,9 +257,10 @@ async fn timeouts_and_listing_failures_are_bounded_and_non_destructive() {
 async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() {
     let f = Fixture::new();
     f.db.with_conn(|conn| {
-        conn.execute_batch(
+        conn.execute_batch_bounded(
             "CREATE TRIGGER fail_insert BEFORE INSERT ON guild_enrollments
         BEGIN SELECT RAISE(ABORT,'test database failure'); END",
+            65_536,
         )
     })
     .await
@@ -270,7 +271,7 @@ async fn database_failure_preserves_cursor_then_a_later_pass_repairs_the_join() 
     assert_eq!(repair.after, None);
     assert_eq!(source.member_calls.lock().unwrap().as_slice(), &[10]);
     assert!(repair.next > Instant::now() + Duration::from_secs(50));
-    f.db.with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_insert"))
+    f.db.with_conn(|conn| conn.execute_batch_bounded("DROP TRIGGER fail_insert", 65_536))
         .await
         .unwrap();
     repair.next = Instant::now();

@@ -51,6 +51,13 @@ Interrupted running jobs fail closed. Manual retry resumes: if placement already
 points at the destination revision, copy/switch are skipped and source cleanup
 retries. A destination that already has a different binding is refused.
 
+Rolling message snapshots are transient and are not copied to the destination.
+The source retains them until successful cutover and source cleanup; a failed
+copy must not erase them early. Destination capture starts with a history gap.
+Required configuration and moderation rows must fit the application database
+budget before copying begins. An insufficient allowance refuses the move; it
+does not raise any quota. See [database capacity](DATABASE-CAPACITY.md).
+
 Recovery after a failed attempt keeps the original move generation in the
 failed job payload. Use **Retry failed move** in the conductor Moves tab or
 `POST /api/jobs/{id}/retry` on that job record. Starting a new move mints a

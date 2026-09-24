@@ -7,7 +7,7 @@ objects through [tenant runtime](TENANT-RUNTIME.md). The bot captures proving Di
 attachments for selected image-spam enforcement and streams them into this backend
 through that runtime after a ban case is recorded; the API does not perform that Discord
 re-fetch. There is no background capture worker. Core is at migration 0014; the current
-guild schema is 8.
+guild schema is 9.
 
 ## Resource contract
 

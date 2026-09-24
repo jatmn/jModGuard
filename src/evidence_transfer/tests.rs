@@ -219,7 +219,7 @@ async fn completed_file_survives_failed_sql_settlement_and_reopens_without_uploa
     let upload = f.upload(3);
     let t = upload.target.clone();
     let raw = Connection::open(f.base.join("guild.db")).unwrap();
-    raw.execute_batch("CREATE TRIGGER fail_settle BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=1 BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END").unwrap();
+    raw.execute_batch_bounded("CREATE TRIGGER fail_settle BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=1 BEGIN SELECT RAISE(ABORT,'injected settlement failure'); END", 64 * 1024 * 1024).unwrap();
     assert!(
         f.local
             .capture(f.db.clone(), upload, Cursor::new(b"abc".to_vec()))
@@ -227,7 +227,8 @@ async fn completed_file_survives_failed_sql_settlement_and_reopens_without_uploa
             .is_err()
     );
     assert_eq!(f.job(&t).await.state, EvidenceState::Capturing);
-    raw.execute_batch("DROP TRIGGER fail_settle").unwrap();
+    raw.execute_batch_bounded("DROP TRIGGER fail_settle", 64 * 1024 * 1024)
+        .unwrap();
     let reopened =
         LocalEvidenceStore::open(f.local.root.clone(), f.local.storage_id.clone(), 1).unwrap();
     assert_eq!(
@@ -474,11 +475,12 @@ async fn cleanup_failure_keeps_journal_pending_and_preserves_other_objects() {
     assert_eq!(f.job(&a).await.state, EvidenceState::CleanupPending);
     fs::remove_file(hardlink).unwrap();
     let raw = Connection::open(f.base.join("guild.db")).unwrap();
-    raw.execute_batch("CREATE TRIGGER fail_erase BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=3 BEGIN SELECT RAISE(ABORT,'injected deletion acknowledgment failure'); END").unwrap();
+    raw.execute_batch_bounded("CREATE TRIGGER fail_erase BEFORE UPDATE OF state ON guild_case_evidence WHEN NEW.state=3 BEGIN SELECT RAISE(ABORT,'injected deletion acknowledgment failure'); END", 64 * 1024 * 1024).unwrap();
     assert!(f.local.cleanup(f.db.clone(), a.clone()).await.is_err());
     assert!(a_paths.iter().all(|path| !path.exists()));
     assert_eq!(f.job(&a).await.state, EvidenceState::CleanupPending);
-    raw.execute_batch("DROP TRIGGER fail_erase").unwrap();
+    raw.execute_batch_bounded("DROP TRIGGER fail_erase", 64 * 1024 * 1024)
+        .unwrap();
     assert!(f.local.cleanup(f.db.clone(), a).await.unwrap());
     assert_eq!(fs::read(&b_paths[0]).unwrap(), b"xyz");
     assert!(b_paths[1].exists());

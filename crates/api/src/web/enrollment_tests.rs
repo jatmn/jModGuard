@@ -427,7 +427,10 @@ async fn unavailable_membership_database_fails_closed_without_leaking_details() 
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute_batch("ALTER TABLE guild_enrollments RENAME TO private_fixture_table")
+            conn.execute_batch_bounded(
+                "ALTER TABLE guild_enrollments RENAME TO private_fixture_table",
+                64 * 1024 * 1024,
+            )
         })
         .await
         .unwrap();
@@ -443,7 +446,10 @@ async fn unavailable_membership_database_fails_closed_without_leaking_details() 
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute_batch("ALTER TABLE private_fixture_table RENAME TO guild_enrollments")
+            conn.execute_batch_bounded(
+                "ALTER TABLE private_fixture_table RENAME TO guild_enrollments",
+                64 * 1024 * 1024,
+            )
         })
         .await
         .unwrap();
@@ -1734,14 +1740,14 @@ async fn removed_case_retry_recovers_backup_intent() {
     assert_ne!(denied, StatusCode::OK);
     f.discord.guilds.lock().unwrap()[0].owner = true;
     f.app.guild_cache.clear();
-    f.app.db.with_conn(|c|{c.execute_batch("CREATE TRIGGER review_fail BEFORE INSERT ON backup_cleanup_intents BEGIN SELECT RAISE(ABORT,'injected'); END")?;Ok(())}).await.unwrap();
+    f.app.db.with_conn(|c|{c.execute_batch_bounded("CREATE TRIGGER review_fail BEFORE INSERT ON backup_cleanup_intents BEGIN SELECT RAISE(ABORT,'injected'); END", 64 * 1024 * 1024)?;Ok(())}).await.unwrap();
     let (status, first) = f.request("DELETE", &url, "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first["removed"], true);
     f.app
         .db
         .with_conn(|c| {
-            c.execute_batch("DROP TRIGGER review_fail")?;
+            c.execute_batch_bounded("DROP TRIGGER review_fail", 64 * 1024 * 1024)?;
             Ok(())
         })
         .await
@@ -1843,6 +1849,11 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{note}");
     assert_eq!(note["code"], "preview_read_only");
+    for path in ["/api/database-usage", "/api/database-usage/core"] {
+        let (status, denied) = f.request_preview("POST", path, "", token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {denied}");
+        assert_eq!(denied["code"], "preview_read_only");
+    }
     let (status, _global) = f
         .request_preview("PUT", "/api/guilds/0/settings", r#"{"prefix":"!"}"#, token)
         .await;

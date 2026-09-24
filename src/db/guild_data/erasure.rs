@@ -34,7 +34,7 @@ impl GuildDataStore {
                     // Activation may stop after binding, before membership insertion.
                     // Remove only this exact empty placement, under the same snapshot.
                     tx.ensure_mutation_receipt()?;
-                    tx.execute(
+                    tx.execute_reclaim(
                         "DELETE FROM guild_bindings WHERE guild_id=?1",
                         params![scope.guild_id()],
                     )?;
@@ -61,15 +61,19 @@ impl GuildDataStore {
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
                 anyhow::ensure!(!active, CaseError::Active);
                 tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.execute_reclaim(
+                    "DELETE FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                )?;
+                tx.execute_reclaim(
                     "DELETE FROM guild_tenant_settings WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
                 )?;
-                tx.execute(
+                tx.execute_reclaim(
                     "DELETE FROM guild_memberships WHERE guild_id=?1 AND enrollment_id=?2 AND active=0",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
                 )?;
-                tx.execute(
+                tx.execute_reclaim(
                     "DELETE FROM guild_bindings WHERE guild_id=?1",
                     params![scope.guild_id()],
                 )?;

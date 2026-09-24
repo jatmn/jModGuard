@@ -187,6 +187,7 @@ async fn init_guild(
         include_str!("../../../migrations/guild/0006_case_evidence.sql"),
         include_str!("../../../migrations/guild/0007_bunny_evidence.sql"),
         include_str!("../../../migrations/guild/0008_erasure.sql"),
+        include_str!("../../../migrations/guild/0009_message_snapshots.sql"),
     ] {
         conn.execute_batch(sql).await.unwrap();
     }
@@ -196,7 +197,7 @@ async fn init_guild(
     )
     .await
     .unwrap();
-    conn.execute("PRAGMA user_version = 8", ()).await.ok();
+    conn.execute("PRAGMA user_version = 9", ()).await.ok();
     for (guild, enrollment, revision, case_id, source) in guilds {
         conn.execute(
             "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -499,6 +500,14 @@ async fn denied_users_cannot_plan_or_start_moves() {
 #[tokio::test]
 async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     let h = setup().await;
+    let shared = h.root.join("shared.guild.db");
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for (guild, enrollment) in [(10, ENROLL_10), (20, ENROLL_20)] {
+        conn.execute("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes) VALUES(?,?,30,40,'transient',1000,1001,1001,86401000,1,9)", libsql::params![guild,enrollment]).await.unwrap();
+    }
+    drop(conn);
+    drop(db);
     let cookie = login(&h).await;
     let (status, body, _) = call(&h.router, "GET", "/version", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -560,6 +569,30 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     );
     let dedicated = h.root.join("dedicated.guild.db");
     let shared = h.root.join("shared.guild.db");
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=20"
+        )
+        .await,
+        1
+    );
     assert_eq!(
         scalar(
             &dedicated,

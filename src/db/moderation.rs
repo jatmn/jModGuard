@@ -46,7 +46,7 @@ pub async fn insert_event(
     };
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let id = tx.query_row(
+        let id = tx.query_row_write(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              RETURNING id",
@@ -157,7 +157,7 @@ pub async fn add_warn(
     let (now, reason) = (now_str(), reason.to_string());
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let id = tx.query_row(
+        let id = tx.query_row_write(
             "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              RETURNING id",
@@ -197,7 +197,7 @@ pub async fn list_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<Vec<Warn
 
 pub async fn clear_warns(db: &Db, guild_id: i64, user_id: i64) -> Result<usize> {
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_reclaim(
             "DELETE FROM warns WHERE guild_id = ?1 AND user_id = ?2",
             params![guild_id, user_id],
         )
@@ -241,10 +241,11 @@ pub async fn record_ban(
 ) -> Result<()> {
     let (now, reason) = (now_str(), reason.to_string());
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
              VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             params![guild_id, user_id, moderator_id, reason, now],
+            1,
         )?;
         Ok(())
     })
@@ -256,11 +257,12 @@ pub async fn mark_unbanned(db: &Db, guild_id: i64, user_id: i64) -> Result<()> {
     // `remove_ban` should treat errors here as non-fatal (log + continue);
     // `GUILD_BAN_REMOVE` on the bot also calls this to heal drift.
     db.with_conn(move |conn| {
-        conn.execute(
+        let tx = conn.transaction_immediate()?;
+        tx.execute_matching(
             "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1",
             params![guild_id, user_id],
         )?;
-        Ok(())
+        tx.commit()
     })
     .await
 }
@@ -424,7 +426,7 @@ pub async fn insert_enrolled_event(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        let id = tx.query_row(
+        let id = tx.query_row_write(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              RETURNING id",
@@ -452,7 +454,7 @@ pub async fn add_enrolled_warn(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        let id = tx.query_row(
+        let id = tx.query_row_write(
             "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              RETURNING id",
@@ -513,10 +515,10 @@ pub async fn record_enrolled_ban_with_identity(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
-            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name],
+            params![guild_id, user_id, moderator_id, reason, now, user_name, user_display_name, moderator_name], 1,
         )?;
         let row_id = tx.last_insert_rowid();
         tx.commit()?;
@@ -543,7 +545,7 @@ pub async fn attribute_enrolled_ban(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bans SET moderator_id = ?1, moderator_name = ?2, reason = ?3
              WHERE id = ?4 AND guild_id = ?5 AND user_id = ?6 AND moderator_id IS NULL",
             params![
@@ -576,7 +578,7 @@ pub async fn mark_enrolled_unbanned(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bans SET active = 0 WHERE guild_id = ?1 AND user_id = ?2 AND active = 1",
             params![guild_id, user_id],
         )?;
@@ -598,7 +600,7 @@ pub async fn clear_enrolled_warns(
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
         tx.ensure_mutation_receipt()?;
-        let count = tx.execute(
+        let count = tx.execute_reclaim(
             "DELETE FROM warns WHERE guild_id=?1 AND user_id=?2",
             params![enrollment.guild_id, user_id],
         )?;

@@ -1,7 +1,7 @@
 //! Event routing: renders a template for an event type and posts it to the
 //! configured guild-scoped log channel. Routine delivery never archives an event.
 
-use serenity::builder::{CreateAllowedMentions, CreateMessage};
+use serenity::builder::{CreateAllowedMentions, CreateAttachment, CreateMessage};
 use serenity::client::Context;
 use serenity::model::channel::MessageFlags;
 use serenity::model::event::MessageUpdateEvent;
@@ -10,10 +10,11 @@ use serenity::model::id::{ChannelId, GuildId, MessageId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::db::guild_data::MessageSnapshot;
 use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -935,6 +936,9 @@ async fn emit_to_observed_with_audit(
             .map(String::as_str)
             .unwrap_or_else(|| default_template(event));
         templates::format_log_timestamps(&mut vars);
+        if template == default_template(event) {
+            bound_default_message_vars(event, &mut vars);
+        }
         let rendered = templates::render_bounded(template, &vars, 2000);
         sink.send(channel_id, log_message(&rendered)).await?;
         Ok::<_, anyhow::Error>(Delivery::Sent)
@@ -1070,6 +1074,7 @@ fn clip(text: &str, limit: usize) -> String {
     out
 }
 
+#[derive(Clone)]
 pub(crate) struct MessageReport {
     pub guild_id: GuildId,
     pub event: &'static str,
@@ -1090,7 +1095,403 @@ fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<S
         ("user_id".into(), "unavailable".into()),
         ("before".into(), "not retained".into()),
         ("content".into(), "not retained".into()),
+        ("coverage".into(), "retained observation unavailable".into()),
     ])
+}
+
+fn retained_content(row: &MessageSnapshot) -> String {
+    retained_content_with_limit(row, 1000)
+}
+
+fn retained_content_with_limit(row: &MessageSnapshot, limit: usize) -> String {
+    match row.fields.content.as_deref() {
+        Some("") => "empty".into(),
+        Some(text) => {
+            let mut shown = clip(text, limit);
+            if shown != text {
+                shown.push_str(" [display clipped]");
+            }
+            if row.fields.content_truncated {
+                shown.push_str(" [retained text truncated]");
+            }
+            shown
+        }
+        None => "not supplied to capture".into(),
+    }
+}
+
+fn retained_attachments(row: &MessageSnapshot) -> String {
+    retained_attachments_with_limit(row, 1200)
+}
+
+fn retained_attachments_with_limit(row: &MessageSnapshot, limit: usize) -> String {
+    match row.fields.attachments.as_ref() {
+        None => "not supplied to capture".into(),
+        Some(items) if items.is_empty() && !row.fields.attachments_truncated => "none".into(),
+        Some(items) => {
+            let mut shown = String::new();
+            if row.fields.attachments_truncated {
+                let omitted = row.fields.attachments_omitted.unwrap_or(0);
+                if omitted > 0 {
+                    shown.push_str(&format!(
+                        "[attachment capture truncated; {omitted} attachment(s) omitted]\n"
+                    ));
+                } else {
+                    shown.push_str("[attachment metadata truncated during capture]\n");
+                }
+            }
+            for item in items {
+                let next = format!("{} ({})\n", item.filename, item.url);
+                if shown.len() + next.len() > limit {
+                    shown.push_str("[display clipped]");
+                    break;
+                }
+                shown.push_str(&next);
+            }
+            shown
+        }
+    }
+}
+
+fn bound_default_value(vars: &mut BTreeMap<String, String>, name: &str, units: usize) {
+    let Some(value) = vars.get_mut(name) else {
+        return;
+    };
+    if value.encode_utf16().count() <= units {
+        return;
+    }
+    let capture_truncated = value.contains("[retained text truncated]");
+    let marker = if capture_truncated {
+        " [display clipped; retained text truncated]"
+    } else {
+        " [display clipped]"
+    };
+    *value = format!(
+        "{}{}",
+        clip(value, units.saturating_sub(marker.len())),
+        marker
+    );
+}
+
+fn bound_default_message_vars(event: &str, vars: &mut BTreeMap<String, String>) {
+    match event {
+        "message_edit" => {
+            bound_default_value(vars, "before", 600);
+            bound_default_value(vars, "after", 600);
+            bound_default_value(vars, "attachments", 240);
+        }
+        "message_delete" => {
+            bound_default_value(vars, "content", 900);
+            bound_default_value(vars, "attachments", 400);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn apply_retained_edit(
+    report: &mut MessageReport,
+    before: Option<&MessageSnapshot>,
+    after: Option<&MessageSnapshot>,
+) {
+    if let Some(row) = before {
+        report.vars.insert("before".into(), retained_content(row));
+        report.vars.insert(
+            "coverage".into(),
+            if row.continuous {
+                "last observed; Gateway order may be incomplete".into()
+            } else {
+                "last observed; observation gap or restart".into()
+            },
+        );
+    } else {
+        report
+            .vars
+            .insert("before".into(), "unavailable (not captured)".into());
+    }
+    if let Some(row) = after {
+        report.vars.insert("after".into(), retained_content(row));
+        report
+            .vars
+            .insert("attachments".into(), retained_attachments(row));
+    }
+    if let Some(id) = after
+        .and_then(|row| row.fields.author_id)
+        .or_else(|| before.and_then(|row| row.fields.author_id))
+    {
+        report.vars.insert("user_id".into(), id.to_string());
+        report.vars.insert("mention".into(), format!("<@{id}>"));
+    }
+}
+
+pub(crate) fn apply_retained_delete(report: &mut MessageReport, row: Option<&MessageSnapshot>) {
+    if let Some(row) = row {
+        report.vars.insert("content".into(), retained_content(row));
+        report
+            .vars
+            .insert("attachments".into(), retained_attachments(row));
+        report.vars.insert(
+            "coverage".into(),
+            if row.continuous {
+                "last observed; later edits may be missing".into()
+            } else {
+                "last observed; observation gap or restart".into()
+            },
+        );
+        if let Some(id) = row.fields.author_id {
+            report.vars.insert("user_id".into(), id.to_string());
+            report.vars.insert("mention".into(), format!("<@{id}>"));
+        }
+    } else {
+        report
+            .vars
+            .insert("coverage".into(), "retained snapshot unavailable".into());
+    }
+}
+
+pub(crate) struct BulkTranscript {
+    pub total: usize,
+    pub retained: usize,
+    pub unavailable: usize,
+    pub omitted: usize,
+    pub filtered: usize,
+    included_authors: HashSet<i64>,
+    text: String,
+}
+
+impl BulkTranscript {
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            retained: 0,
+            unavailable: 0,
+            omitted: 0,
+            filtered: 0,
+            included_authors: HashSet::new(),
+            text: String::from("jModGuard last-observed deleted messages\n\n"),
+        }
+    }
+
+    pub fn push(&mut self, id: MessageId, row: Option<&MessageSnapshot>) {
+        let line = if let Some(row) = row {
+            self.retained += 1;
+            if let Some(author) = row.fields.author_id {
+                self.included_authors.insert(author);
+            }
+            format!(
+                "Message {} | author {} | {}\nText: {}\nAttachments: {}\n\n",
+                id,
+                row.fields
+                    .author_id
+                    .map_or_else(|| "unavailable".into(), |id| id.to_string()),
+                if row.continuous {
+                    "last observed; later edits may be missing"
+                } else {
+                    "observation gap"
+                },
+                retained_content_with_limit(row, 16_000),
+                retained_attachments_with_limit(row, 4000)
+            )
+        } else {
+            self.unavailable += 1;
+            format!("Message {} | retained content unavailable\n\n", id)
+        };
+        if self
+            .text
+            .len()
+            .saturating_add(line.len())
+            .saturating_add(200)
+            <= 256 * 1024
+        {
+            self.text.push_str(&line);
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    pub fn push_filtered(&mut self) {
+        self.filtered += 1;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.omitted > 0 {
+            self.text.push_str(&format!(
+                "\n{} entries omitted because transcript reached 256 KiB.\n",
+                self.omitted
+            ));
+        }
+        self.text.into_bytes()
+    }
+}
+
+pub(crate) async fn emit_retained_bulk(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    guild: GuildId,
+    channel: ChannelId,
+    transcript: BulkTranscript,
+) {
+    let vars = BTreeMap::from([
+        ("channel".into(), format!("<#{channel}>")),
+        ("channel_id".into(), channel.to_string()),
+        ("count".into(), transcript.total.to_string()),
+        ("retained".into(), transcript.retained.to_string()),
+        ("unavailable".into(), transcript.unavailable.to_string()),
+        ("filtered".into(), transcript.filtered.to_string()),
+        (
+            "details".into(),
+            format!(
+                "transcript attached; {} omitted by 256 KiB limit; {} excluded by user filter",
+                transcript.omitted, transcript.filtered
+            ),
+        ),
+        ("time".into(), chrono::Utc::now().to_rfc3339()),
+    ]);
+    let Ok(_permit) = app.log_delivery_slots.try_acquire() else {
+        record_delivery_failure(app);
+        return;
+    };
+    let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
+    let started = Instant::now();
+    let cfg = match tokio::time::timeout(
+        deadline.saturating_sub(started.elapsed()),
+        app.configs.get(&app.db, guild.get()),
+    )
+    .await
+    {
+        Ok(Ok(cfg)) => cfg,
+        _ => {
+            record_delivery_failure(app);
+            return;
+        }
+    };
+    let Some(destination) = channel_for(&cfg, "message_bulk_delete") else {
+        return;
+    };
+    if cfg
+        .log_filters
+        .get("message_bulk_delete")
+        .is_some_and(|filter| excluded(filter, &vars))
+    {
+        return;
+    }
+    if cfg
+        .log_filters
+        .get("message_bulk_delete")
+        .is_some_and(|filter| {
+            transcript.included_authors.iter().any(|author| {
+                filter
+                    .users
+                    .iter()
+                    .any(|ignored| ignored == &author.to_string())
+            })
+        })
+    {
+        // The filter changed after transcript construction. Suppress all
+        // retained payload rather than expose a newly ignored author's text.
+        let mut display = vars;
+        display.insert(
+            "details".into(),
+            "transcript unavailable after filter change".into(),
+        );
+        templates::format_log_timestamps(&mut display);
+        let template = cfg
+            .templates
+            .get("message_bulk_delete")
+            .map(String::as_str)
+            .unwrap_or_else(|| default_template("message_bulk_delete"));
+        let rendered = templates::render_bounded(template, &display, 2000);
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero()
+            || !matches!(
+                tokio::time::timeout(
+                    left,
+                    destination.send_message(&ctx.http, log_message(&rendered))
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        {
+            record_delivery_failure(app);
+        }
+        return;
+    }
+    let template = cfg
+        .templates
+        .get("message_bulk_delete")
+        .map(String::as_str)
+        .unwrap_or_else(|| default_template("message_bulk_delete"));
+    let mut display = vars;
+    templates::format_log_timestamps(&mut display);
+    let rendered = templates::render_bounded(template, &display, 2000);
+    let body = transcript.finish();
+    let message = log_message(&rendered).add_file(CreateAttachment::bytes(
+        body.clone(),
+        "deleted-messages.txt",
+    ));
+    match tokio::time::timeout(
+        deadline.saturating_sub(started.elapsed()),
+        destination.send_message(&ctx.http, message),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(serenity::Error::Http(error)))
+            if error
+                .status_code()
+                .is_some_and(|status| status.as_u16() == 403) =>
+        {
+            // A definite permission response can mean Attach Files is absent.
+            // A timeout is ambiguous and never enters this fallback.
+            let source = String::from_utf8_lossy(&body);
+            let mut remaining = source.as_ref();
+            for index in 0..3 {
+                if remaining.is_empty() {
+                    break;
+                }
+                let (part, rest) =
+                    take_utf16_prefix(remaining, if index == 0 { 1000 } else { 1700 });
+                remaining = rest;
+                let details = if index == 0 {
+                    format!(
+                        "{}\n\nAttachment unavailable; excerpt capped at 3 chunks, remaining entries omitted ({}/3):\n{}",
+                        clip(&rendered, 650),
+                        index + 1,
+                        part
+                    )
+                } else {
+                    format!("Deleted messages continued ({}/3):\n{}", index + 1, part)
+                };
+                let left = deadline.saturating_sub(started.elapsed());
+                if left.is_zero()
+                    || !matches!(
+                        tokio::time::timeout(
+                            left,
+                            destination.send_message(&ctx.http, log_message(&details))
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    )
+                {
+                    record_delivery_failure(app);
+                    break;
+                }
+            }
+        }
+        _ => record_delivery_failure(app),
+    }
+}
+
+fn take_utf16_prefix(text: &str, max_units: usize) -> (&str, &str) {
+    let mut units = 0;
+    let mut boundary = 0;
+    for (index, ch) in text.char_indices() {
+        if units + ch.len_utf16() > max_units {
+            break;
+        }
+        units += ch.len_utf16();
+        boundary = index + ch.len_utf8();
+    }
+    text.split_at(boundary)
 }
 
 /// Use only fields in the delivered update; cache-filled values are not edit history.

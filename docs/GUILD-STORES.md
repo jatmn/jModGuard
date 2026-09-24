@@ -58,7 +58,7 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0008. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0009. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
@@ -68,13 +68,15 @@ Version5 adds [explicit source associations](CASE-SOURCES.md).
 Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 Version8 allows closed-scope erasure after owned data is gone and stores delegated
-case-removal role IDs. There are no core configuration/default/enrollment tables or general
-event archives. Core bootstrap never applies this schema; the existing core version is 13.
+case-removal role IDs. Version9 adds bounded, latest-observed message snapshots with
+fixed 24-hour expiry and store-level capture health. There are no core
+configuration/default/enrollment tables or general event archives. Core bootstrap
+never applies this schema; the existing core version is 13.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching version1–7 store to version8, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version8 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching version1–8 store to version9, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version9 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

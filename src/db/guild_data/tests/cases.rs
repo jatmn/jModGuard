@@ -180,7 +180,7 @@ async fn concurrent_recording_has_one_row_and_noop_paths_are_write_free() {
         }
         other => panic!("unexpected results {other:?}"),
     };
-    store.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_case_insert BEFORE INSERT ON guild_cases BEGIN SELECT RAISE(ABORT,'unexpected insert'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_case_insert BEFORE INSERT ON guild_cases BEGIN SELECT RAISE(ABORT,'unexpected insert'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     assert_eq!(
         store
             .record_case(a.clone(), id.clone(), data(1), limits)
@@ -345,9 +345,9 @@ async fn sql_guards_prevent_overwrite_replacement_and_live_replay_key_deletion()
     store.db.with_conn(|c| {
         c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF")?;
         for sql in ["INSERT OR REPLACE INTO guild_cases SELECT * FROM guild_cases", "UPDATE guild_cases SET payload='{}'", "DELETE FROM guild_cases", "UPDATE guild_cases SET guild_id=20", "INSERT INTO guild_cases SELECT 20,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases"] {
-            assert!(c.execute_batch(sql).is_err(),"accepted {sql}");
+            assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),"accepted {sql}");
         }
-        c.execute_batch("CREATE TRIGGER reject_removal BEFORE UPDATE ON guild_cases BEGIN SELECT RAISE(ABORT,'test removal failure'); END")?;
+        c.execute_batch_bounded("CREATE TRIGGER reject_removal BEFORE UPDATE ON guild_cases BEGIN SELECT RAISE(ABORT,'test removal failure'); END", 64 * 1024 * 1024)?;
         Ok(())
     }).await.unwrap();
     assert!(store.remove_case(a.clone(), id.clone()).await.is_err());
@@ -357,7 +357,7 @@ async fn sql_guards_prevent_overwrite_replacement_and_live_replay_key_deletion()
     );
     store
         .db
-        .with_conn(|c| c.execute_batch("DROP TRIGGER reject_removal"))
+        .with_conn(|c| c.execute_batch_bounded("DROP TRIGGER reject_removal", 64 * 1024 * 1024))
         .await
         .unwrap();
     store.remove_case(a.clone(), id).await.unwrap();
@@ -365,8 +365,11 @@ async fn sql_guards_prevent_overwrite_replacement_and_live_replay_key_deletion()
         .db
         .with_conn(|c| {
             assert!(
-                c.execute_batch("UPDATE guild_cases SET deleted=0,payload='{}'")
-                    .is_err()
+                c.execute_batch_bounded(
+                    "UPDATE guild_cases SET deleted=0,payload='{}'",
+                    64 * 1024 * 1024
+                )
+                .is_err()
             );
             Ok(())
         })
@@ -410,7 +413,7 @@ async fn wrong_captured_membership_and_changed_identity_deny_empty_case_paths() 
                 .is_err()
         );
     }
-    store.db.with_conn(|c|c.execute_batch("DROP TRIGGER store_identity_no_update; UPDATE store_identity SET store_id='00000000000000000000000000000000'; CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity BEGIN SELECT RAISE(ABORT,'immutable'); END")).await.unwrap();
+    store.db.with_conn(|c|c.execute_batch_bounded("DROP TRIGGER store_identity_no_update; UPDATE store_identity SET store_id='00000000000000000000000000000000'; CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity BEGIN SELECT RAISE(ABORT,'immutable'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(
         store
             .case_ids(a.clone(), None, 1, CaseLimits::default())
@@ -427,19 +430,22 @@ async fn upgrade_from_two_preserves_scoped_settings_without_adopting_cases() {
     let p = f.placement(&reg, 10).await;
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch(SCHEMA).unwrap();
-        raw.execute_batch(TENANT_SCHEMA).unwrap();
-        raw.execute(
+        raw.execute_batch_bounded(SCHEMA, 64 * 1024 * 1024).unwrap();
+        raw.execute_batch_bounded(TENANT_SCHEMA, 64 * 1024 * 1024)
+            .unwrap();
+        raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        raw.execute(
+        raw.execute_bounded(
             "INSERT INTO guild_bindings VALUES(10,?1)",
             params![p.revision()],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'); INSERT INTO guild_log_channels VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','system',12)").unwrap();
+        raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'); INSERT INTO guild_log_channels VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','system',12)", 64 * 1024 * 1024).unwrap();
         raw.pragma_update(None, "user_version", 2).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());

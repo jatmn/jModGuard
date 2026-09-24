@@ -1,13 +1,19 @@
 # Logging and data collection
 
-Routine message text and attachment metadata are no longer archived to SQL. Joining,
-leaving and talking do not maintain a persistent member/user roster or activity counters.
-Basic Discord log delivery is independent of those retired history tables.
+The old general SQL message archive remains retired. A separate, rolling guild-store
+snapshot keeps the latest observed text and attachment metadata for eligible human
+messages in guilds with an edit, delete or bulk-delete log destination. It expires
+at most 24 hours after the original message creation; edits never extend that time.
+Capacity pressure can evict it earlier. It stores no attachment bytes and is omitted
+from application backups. Joining, leaving and talking still do not maintain a
+persistent member/user roster or activity counters.
 
 ## Basic reports
 
-- Updates use only supplied content/attachment fields and guild/channel/message
-  references. A supplied author sets the display name; for ID-only filtering, a
+- Updates use supplied content/attachment fields and the last retained observation,
+  when available. `before` is explicitly the last observed text; Gateway callback
+  scheduling, restart, overload and missing observations can leave a gap before
+  the actual edit. A supplied author sets the display name; for ID-only filtering, a
   recent observation of that exact message can supply its author ID when the edit
   omits the author. An unknown author remains unavailable. An absent field is
   unknown, not empty. Discord sets `edited_timestamp` only for an actual edit;
@@ -16,8 +22,8 @@ Basic Discord log delivery is independent of those retired history tables.
   `message_reference`, or an empty attachment list, are not reports. The bot does
   not report Gateway updates of its own messages, so a log post cannot stack prior
   reports as current text. Each report is one observed edit. Reports say
-  "updated"; they do not claim a verified before/after
-  diff. A bounded 10-second fingerprint merges partial content/attachment updates
+  "updated"; they do not claim a verified complete revision diff. A bounded
+  10-second fingerprint merges partial content/attachment updates
   that share an edit timestamp for the same message in one bot process. A later
   distinct edit timestamp reports again.
 - Each guild can save ignored Discord user IDs (including bot IDs) and source channel
@@ -25,14 +31,17 @@ Basic Discord log delivery is independent of those retired history tables.
   the report. If no user ID is known, only a source channel exclusion can apply.
   The filter applies before Discord delivery and does not alter moderation
   enforcement or retained moderation records.
-- Single deletions report channel/message ID and use a bounded recent observation
-  for author, text and attachment URLs when available. Empty text remains empty;
-  omitted fields remain unavailable. At most 1200 URL bytes are retained per
-  message, in the existing 64-entry-per-guild, ten-minute process-only cache.
-  An actual edit can replace the retained attachment URLs; an untimestamped
-  Gateway refresh does not clear them.
-  Links may expire under Discord's signed CDN URL policy.
-  Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.
+- Single deletions take and remove the retained snapshot, reporting its last
+  observed author, text and attachment metadata when available. Known empty text
+  differs from an unsupplied field. A bounded recent process-only snippet may
+  still supply context when no retained snapshot exists. Attachment links can
+  expire under Discord's signed CDN URL policy.
+  Bulk deletions take a bounded batch of snapshots, report retained and missing
+  counts, omit authors ignored for bulk-delete delivery, and attach a transient
+  UTF-8 transcript capped at 256 KiB. The summary keeps the total and filtered
+  counts without including ignored authors' content. A definite
+  attachment-permission failure uses at most three bounded text chunks; an
+  ambiguous timeout is never resent. The transcript is not archived.
 - Join/leave reports use the delivered user and optional cached member join timestamp.
   Leave reports also use join timestamps already supplied with recent messages when
   the member cache is missing that user. This fallback retains only guild/user IDs
@@ -76,10 +85,16 @@ Basic Discord log delivery is independent of those retired history tables.
   that summary is not a claim that every step succeeded.
 
 Serenity's general message cache remains disabled. The existing detector's independent
-working state implements bounded exact-text and exact-image matching. Optional rich
-delete reports may include a snippet this process recently observed; they do not
-reconstruct history from Discord or SQL. Routine reports are not retained for later
-recovery, and failed delivery is not reconstructed from Discord or SQL.
+working state implements bounded exact-text and exact-image matching. Snapshot capture
+starts automatically only after a captured guild membership, relevant log destination,
+observed content access and storage capacity are available. Set
+`bot.message_capture_enabled = false` (or `JMODGUARD_MESSAGE_CAPTURE_ENABLED=false`)
+to suspend capture. The bot excludes its own messages, other bots and webhooks;
+delivery filters do not narrow capture. Text is capped at 32 KiB UTF-8,
+attachment metadata at 16 KiB, and each encoded snapshot at 64 KiB, with truncation
+marked. Pending observations are capped at 4096 items and 16 MiB; overflow marks a
+coverage gap. Snapshots do not guarantee Discord report replay. Failed delivery is
+not reconstructed from Discord or SQL.
 
 Custom templates in a supported database keep their wording on restart; the readable-log
 upgrade updates exact previous defaults once. See

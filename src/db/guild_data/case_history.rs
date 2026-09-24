@@ -207,7 +207,7 @@ impl GuildDataStore {
             anyhow::ensure!(count>=0 && count<i64::from(limits.max_entries) && bytes>=0 && (bytes as u64).checked_add(payload.len() as u64).is_some_and(|total|total<=limits.max_total_bytes),CaseError::Limit);
             let sequence=last.checked_add(1).filter(|n|*n>0).ok_or(CaseError::Limit)?;
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_case_history(guild_id,enrollment_id,case_id,entry_id,sequence,payload) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),sequence,payload.as_str()])?;
+            tx.execute_rows("INSERT INTO guild_case_history(guild_id,enrollment_id,case_id,entry_id,sequence,payload) VALUES(?1,?2,?3,?4,?5,?6)",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),sequence,payload.as_str()], 1)?;
             tx.commit()?;
             Ok(AppendCaseHistory::Created(CaseHistoryRef{id,sequence}))
         }).await

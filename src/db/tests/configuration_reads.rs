@@ -182,8 +182,9 @@ async fn configuration_layers_preserve_global_guild_order_and_exact_key_semantic
     assert!(missing.guild.is_none() && missing.global.is_none());
     // Detail reads must not load/decode unrelated settings or other configuration rows.
     f.db.with_conn(|conn| {
-        conn.execute_batch(
+        conn.execute_batch_bounded(
             "INSERT INTO rules(guild_id,rule_id,data) VALUES(10,'corrupt','not json')",
+            64 * 1024 * 1024,
         )
     })
     .await
@@ -199,7 +200,7 @@ async fn configuration_reads_preserve_versions_and_refuse_unavailable_membership
     let f = Fixture::new();
     let scope = f.scope().await;
     let before = get_primary_versions(&f.db).await.unwrap();
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_config_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_config_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     for captured in [scope.clone(), ConfigurationScope::Global] {
         for result in reads(&f.db, captured).await {
             result.unwrap();
@@ -216,7 +217,10 @@ async fn configuration_reads_preserve_versions_and_refuse_unavailable_membership
         );
     }
     f.db.with_conn(|conn| {
-        conn.execute_batch("ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments")
+        conn.execute_batch_bounded(
+            "ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments",
+            64 * 1024 * 1024,
+        )
     })
     .await
     .unwrap();
@@ -235,7 +239,7 @@ async fn configuration_read_waiting_for_writer_retains_original_membership() {
     let writer = tokio::spawn(async move {
         writer_db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
-            tx.execute("UPDATE guild_enrollments SET id='replacement',joined_at_ns=101 WHERE guild_id=10", params![])?;
+            tx.execute_bounded("UPDATE guild_enrollments SET id='replacement',joined_at_ns=101 WHERE guild_id=10", params![], 64 * 1024 * 1024)?;
             locked.send(()).unwrap();
             wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             tx.commit()
@@ -266,7 +270,7 @@ async fn configuration_layers_are_coherent_during_concurrent_updates() {
         for n in 1..=40 {
             writer_db.with_conn(move |conn| {
                 let tx = conn.transaction_immediate()?;
-                tx.execute("UPDATE templates SET template=?1 WHERE event_type='paired' AND guild_id IN (0,10)", params![n.to_string()])?;
+                tx.execute_bounded("UPDATE templates SET template=?1 WHERE event_type='paired' AND guild_id IN (0,10)", params![n.to_string()], 64 * 1024 * 1024)?;
                 tx.commit()
             }).await.unwrap();
             tokio::task::yield_now().await;
@@ -289,8 +293,8 @@ async fn web_config_snapshot_matches_layer_helpers_without_receipts() {
     let f = Fixture::new();
     let scope = f.scope().await;
     f.db.with_conn(|conn| {
-        conn.execute_batch(
-            "CREATE TRIGGER reject_config_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END",
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER reject_config_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024,
         )
     })
     .await

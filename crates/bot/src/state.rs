@@ -302,6 +302,7 @@ pub struct BotState {
     pub text_spam: crate::text_spam::Detector,
     pub spam_gate: crate::spam_actions::Gate,
     pub log_snippets: crate::logging::SnippetCache,
+    pub snapshots: crate::snapshot_capture::SnapshotIngress,
     pub edit_reports: crate::logging::EditReportDedup,
     pub member_joins: crate::logging::MemberJoinContext,
     pub member_audits: crate::logging::MemberAuditClaims,
@@ -367,6 +368,7 @@ impl BotState {
             text_spam: crate::text_spam::Detector::default(),
             spam_gate: crate::spam_actions::Gate::default(),
             log_snippets: crate::logging::SnippetCache::default(),
+            snapshots: crate::snapshot_capture::SnapshotIngress::default(),
             edit_reports: crate::logging::EditReportDedup::default(),
             member_joins: crate::logging::MemberJoinContext::default(),
             member_audits: crate::logging::MemberAuditClaims::default(),
@@ -1267,9 +1269,10 @@ mod tests {
         .unwrap();
         tokio_test_block_on(api_db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
-            tx.execute_batch(&format!(
-                "UPDATE meta SET value = '{baseline}' WHERE key = 'config_version'"
-            ))?;
+            tx.execute_batch_bounded(
+                &format!("UPDATE meta SET value = '{baseline}' WHERE key = 'config_version'"),
+                65_536,
+            )?;
             tx.commit()
         }))
         .unwrap();

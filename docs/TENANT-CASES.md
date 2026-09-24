@@ -101,7 +101,7 @@ Guild migration0003 adds only `guild_cases` and its indexes/guards within `jmodg
 it to6, preserving placement, settings and cases. Version4 adds owned history; version5 adds
 source mappings with original-key backfill. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
 applies all six steps.
-`open` requires 8. Old guild-store binaries reject 8; rollback needs matching pre-upgrade
+`open` requires 9. Older guild-store binaries reject 9; rollback needs matching pre-upgrade
 backups and binaries. Core is at migration 0014. Bot and API open these stores through
 [tenant runtime](TENANT-RUNTIME.md).
 

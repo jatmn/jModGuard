@@ -4,6 +4,10 @@ const cards = document.getElementById("update-cards");
 const statusNode = document.getElementById("update-status");
 const updateView = document.getElementById("updates");
 const signIn = document.getElementById("sign-in");
+const usageView = document.getElementById("database-usage");
+const usageCards = document.getElementById("usage-cards");
+const usageStatus = document.getElementById("usage-status");
+let activeView = "updates";
 let snapshot = null;
 
 function apiBase() {
@@ -34,6 +38,7 @@ async function request(path, body) {
       (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
     signIn.classList.remove("hidden");
     updateView.classList.add("hidden");
+    usageView.classList.add("hidden");
     throw new Error("Sign in again to manage updates.");
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
@@ -160,6 +165,7 @@ function render() {
 }
 
 async function refresh() {
+  if (activeView !== "updates" || document.visibilityState === "hidden") return;
   try {
     const me = await request("/api/me", {});
     if (!me.is_bot_owner) {
@@ -168,6 +174,7 @@ async function refresh() {
       return;
     }
     snapshot = await request("/api/updates", {});
+    if (activeView !== "updates") return;
     signIn.classList.add("hidden");
     updateView.classList.remove("hidden");
     statusNode.textContent = "Release state is current as of the last successful check.";
@@ -177,5 +184,118 @@ async function refresh() {
   }
 }
 
+function decimalMB(value) {
+  return value == null ? "unavailable" : `${(value / 1000000).toFixed(2)} MB`;
+}
+
+function physicalPart(value, total) {
+  return value == null || !total ? "unavailable" :
+    `${decimalMB(value)} (${(value * 100 / total).toFixed(2)}% of allocated)`;
+}
+
+function usageState(value) {
+  return ({normal: "Within operating range", pressure: "Pressure: cleanup accelerates at 700 MB",
+    capture_paused: "Capture pause threshold reached at 800 MB", growth_stopped: "Application growth stop threshold reached at 900 MB",
+    stale: "Stale measurement", unavailable: "Measurement unavailable"})[value] || "Unknown";
+}
+
+function renderUsage(database) {
+  const card = node("section", null, "card bg-base-100 shadow-xl");
+  const content = node("div", null, "card-body");
+  const title = database.kind === "core" ? "Core database" :
+    database.policy?.kind === "dedicated" ? `Guild database · ${database.policy.guild_id}` : "Shared guild database";
+  content.append(node("h3", title, "card-title"));
+  line(content, "Database ID", database.id);
+  line(content, "Allocated", decimalMB(database.usage?.allocated_bytes));
+  line(content, "Limit used", database.percent_of_limit == null ? "unavailable" : `${database.percent_of_limit.toFixed(2)}% of 1,000 MB`);
+  line(content, "Headroom", decimalMB(database.headroom_bytes));
+  if (database.kind === "guild") {
+    line(content, "Snapshot budget", decimalMB(database.snapshot_budget_bytes));
+    line(content, "Snapshot footprint estimate", database.snapshot_usage_estimate_bytes == null ? "unavailable" :
+      `${decimalMB(database.snapshot_usage_estimate_bytes)} (${(database.snapshot_usage_estimate_bytes * 100 / database.snapshot_budget_bytes).toFixed(2)}% of 400 MB budget; conservative logical estimate)`);
+  }
+  line(content, "Operating state", usageState(database.status));
+  line(content, "Measured", database.usage?.sampled_at ? age(database.usage.sampled_at) : "unavailable");
+  line(content, "Capture", database.capture_status || "unavailable");
+  line(content, "Cleanup", database.cleanup_status || "unavailable");
+  const usage = database.usage;
+  if (usage?.breakdown_quality === "measured") {
+    line(content, "Category basis", "Measured allocated pages; categories are disjoint");
+    line(content, "Snapshot table", physicalPart(usage.categories.snapshot_data_bytes, usage.allocated_bytes));
+    line(content, "Other tables", physicalPart(usage.categories.other_data_bytes, usage.allocated_bytes));
+    line(content, "Snapshot indexes", physicalPart(usage.categories.snapshot_index_bytes, usage.allocated_bytes));
+    line(content, "Other indexes", physicalPart(usage.categories.other_index_bytes, usage.allocated_bytes));
+    line(content, "Reusable pages", physicalPart(usage.categories.reusable_bytes, usage.allocated_bytes));
+    line(content, "Other allocation", physicalPart(usage.categories.other_allocation_bytes, usage.allocated_bytes));
+  } else if (usage?.breakdown_quality === "estimated") {
+    line(content, "Category basis", "Physical category allocation unavailable; snapshot value is encoded payload estimate");
+    line(content, "Snapshot payload estimate", decimalMB(usage.snapshot_logical_bytes));
+    line(content, "Reusable pages", decimalMB(usage.reusable_bytes));
+    line(content, "Indexes and other allocation", "unavailable");
+  } else if (usage) {
+    line(content, "Category basis", "Physical category allocation unavailable");
+    line(content, "Reusable pages", decimalMB(usage.reusable_bytes));
+  }
+  if (usage?.snapshot_count != null) line(content, "Retained snapshots", usage.snapshot_count);
+  if (!usage || usage.breakdown_quality === "unavailable" && usage.snapshot_count == null) {
+    line(content, "Breakdown", "unavailable");
+  }
+  const details = node("button", "Show current breakdown", "btn btn-sm");
+  details.type = "button";
+  details.addEventListener("click", async () => {
+    details.disabled = true;
+    try {
+      const updated = await request(`/api/database-usage/${database.id}`, {});
+      card.replaceWith(renderUsage(updated));
+    } catch (error) { usageStatus.textContent = error.message; }
+    finally { details.disabled = false; }
+  });
+  content.append(details);
+  card.append(content);
+  return card;
+}
+
+async function refreshUsage() {
+  if (activeView !== "usage" || document.visibilityState === "hidden") return;
+  try {
+    const me = await request("/api/me", {});
+    if (!me.is_bot_owner || me.preview) {
+      usageCards.replaceChildren();
+      usageView.classList.add("hidden");
+      usageStatus.textContent = "Only the configured bot owner can inspect database usage.";
+      return;
+    }
+    const snapshot = await request("/api/database-usage", {});
+    if (activeView !== "usage") return;
+    signIn.classList.add("hidden");
+    usageView.classList.remove("hidden");
+    usageCards.replaceChildren(...snapshot.databases.map(renderUsage));
+    usageStatus.textContent = `Usage sampled ${age(snapshot.generated_at)}. Unknown measurements are not treated as free capacity.`;
+  } catch (error) { usageStatus.textContent = error.message; }
+}
+
+function selectView(view) {
+  activeView = view;
+  if (view === "usage") usageCards.replaceChildren();
+  document.getElementById("admin-title").textContent = view === "usage" ? "Database Usage" : "Updates";
+  document.getElementById("show-updates").setAttribute("aria-current", view === "updates" ? "page" : "false");
+  document.getElementById("show-database-usage").setAttribute("aria-current", view === "usage" ? "page" : "false");
+  updateView.classList.toggle("hidden", view !== "updates");
+  usageView.classList.toggle("hidden", view !== "usage");
+  return view === "usage" ? refreshUsage() : refresh();
+}
+
+document.getElementById("show-updates").addEventListener("click", () => selectView("updates"));
+document.getElementById("show-database-usage").addEventListener("click", () => selectView("usage"));
+document.getElementById("refresh-usage").addEventListener("click", () => refreshUsage());
+document.addEventListener?.("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") {
+    if (activeView === "usage") refreshUsage(); else refresh();
+  }
+});
+
 refresh();
-setInterval(refresh, 30000);
+setInterval(() => {
+  if (document.visibilityState === "hidden") return;
+  if (activeView === "usage") refreshUsage(); else refresh();
+}, 60000);

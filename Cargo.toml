@@ -38,6 +38,8 @@ rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "io-util", "fs"] }
+fallible-iterator = "0.3"
+libsql-sqlite3-parser = "0.13"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "1"
 thiserror = "2"
@@ -48,8 +50,6 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 hyper = { version = "0.14", default-features = false, features = ["server"] }
-fallible-iterator = "0.3"
-libsql-sqlite3-parser = "0.13"
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
 
 [patch.crates-io]
