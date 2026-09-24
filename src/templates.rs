@@ -27,6 +27,39 @@ pub fn format_duration(mut seconds: u64) -> String {
     }
 }
 
+/// Stats-command elapsed time: days, hours, minutes, and seconds.
+/// Leading zero units are omitted. Zeros between the first and last nonzero
+/// unit stay, so one day and 38 seconds is `1d 0h 0m 38s`.
+pub fn format_compact_duration(seconds: u64) -> String {
+    let parts = [
+        (seconds / 86_400, "d"),
+        ((seconds % 86_400) / 3_600, "h"),
+        ((seconds % 3_600) / 60, "m"),
+        (seconds % 60, "s"),
+    ];
+    let Some(start) = parts.iter().position(|(count, _)| *count > 0) else {
+        return "0s".into();
+    };
+    let end = parts
+        .iter()
+        .rposition(|(count, _)| *count > 0)
+        .unwrap_or(start);
+    parts[start..=end]
+        .iter()
+        .map(|(count, unit)| format!("{count}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn release_status_icon(availability: &str) -> &'static str {
+    match availability {
+        "up to date" => "✅",
+        "update available" => "⬆️",
+        "no source update (image digest unverified)" => "⚠️",
+        _ => "❓",
+    }
+}
+
 /// Absolute UTC timestamp for Discord display, without fractional-second noise.
 pub fn format_timestamp(time: chrono::DateTime<chrono::Utc>) -> String {
     time.format("%b %d, %Y • %H:%M:%S UTC").to_string()
@@ -47,9 +80,9 @@ pub fn format_log_timestamps(vars: &mut BTreeMap<String, String>) {
 /// Default stats response, rendered through the same template engine as logs.
 pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) -> String {
     render(
-        "**📊 Stats (this server)**\n\n**Uptime:** `{uptime}`\n**Moderation records:** `{records}`\n**Warns:** `{warns}`\n**Bans:** `{bans}`",
+        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `{uptime}`\n**📋 Moderation records:** `{records}`\n**⚠️ Warns:** `{warns}`\n**🔨 Bans:** `{bans}`",
         &BTreeMap::from([
-            ("uptime".into(), format_duration(uptime_seconds)),
+            ("uptime".into(), format_compact_duration(uptime_seconds)),
             ("records".into(), records.to_string()),
             ("warns".into(), warns.to_string()),
             ("bans".into(), bans.to_string()),
@@ -102,7 +135,7 @@ pub fn stats_response_with_updates(
             .map(|time| {
                 format!(
                     "{} ago",
-                    format_duration(now.saturating_sub(time).max(0) as u64)
+                    format_compact_duration(now.saturating_sub(time).max(0) as u64)
                 )
             })
             .unwrap_or_else(|| "unknown".into());
@@ -142,9 +175,8 @@ pub fn stats_response_with_updates(
         } else {
             "unknown"
         };
-        lines.push(format!(
-            "**{component}:** `{sha}` · {label} {age} · {availability}"
-        ));
+        let icon = release_status_icon(availability);
+        lines.push(format!("**{component}:** `{sha}` · {label} {age} · {icon}"));
     }
     render(
         "{moderation}\n\n**Release status**\n{releases}",
@@ -312,6 +344,22 @@ mod presentation_tests {
     }
 
     #[test]
+    fn compact_stats_duration_keeps_intermediate_zeros() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (1, "1s"),
+            (60, "1m"),
+            (818, "13m 38s"),
+            (3600, "1h"),
+            (86400, "1d"),
+            (86438, "1d 0h 0m 38s"),
+        ] {
+            assert_eq!(format_compact_duration(seconds), expected, "{seconds}");
+        }
+        assert_eq!(format_duration(60), "1 minute");
+    }
+
+    #[test]
     fn screenshot_stats_preview() {
         assert_eq!(
             stats_response(
@@ -320,7 +368,7 @@ mod presentation_tests {
                 0,
                 1
             ),
-            "**📊 Stats (this server)**\n\n**Uptime:** `22 minutes, 41 seconds`\n**Moderation records:** `0`\n**Warns:** `0`\n**Bans:** `1`"
+            "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `22m 41s`\n**📋 Moderation records:** `0`\n**⚠️ Warns:** `0`\n**🔨 Bans:** `1`"
         );
     }
 
@@ -377,16 +425,19 @@ mod presentation_tests {
         };
         let fresh = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
         assert!(fresh.contains(&format!("`{}`", "a".repeat(40))));
-        assert!(fresh.contains("update available"));
+        assert!(fresh.contains("⬆️"));
+        assert!(!fresh.contains("update available"));
         row.channel = "nightly".into();
         let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
         assert!(!wrong_channel.contains("update available"));
+        assert!(wrong_channel.contains("❓"));
         assert!(wrong_channel.contains("unknown"));
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
         let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
-        assert!(baked_current.contains("no source update (image digest unverified)"));
+        assert!(baked_current.contains("⚠️"));
+        assert!(!baked_current.contains("no source update"));
         row.channel = "nightly".into();
         let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
         assert!(!wrong_channel_current.contains("no source update"));
