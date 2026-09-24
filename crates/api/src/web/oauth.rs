@@ -8,8 +8,11 @@ pub struct OAuthClient {
     pub client_secret: String,
     pub redirect_uri: String,
     pub http: reqwest::Client,
-    /// Serializes `/users/@me/guilds` so concurrent callers share one cooldown.
+    /// Token cooldown map. Held only while reading or updating that map.
     pub(crate) guild_list: tokio::sync::Mutex<GuildListGate>,
+    /// One in-flight guild-list fetch per access token. Unrelated tokens do not share it.
+    pub(crate) guild_flights:
+        tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     pub guilds_endpoint: Option<String>,
     #[cfg(test)]
@@ -18,7 +21,15 @@ pub struct OAuthClient {
 
 pub(crate) struct GuildListGate {
     /// Access token → earliest instant another guild-list request may start.
-    cooldowns: HashMap<String, Instant>,
+    cooldowns: HashMap<String, Cooldown>,
+}
+
+/// A cooldown that cannot be added to `Instant` stays until this process exits,
+/// so a later guild-list call cannot start early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cooldown {
+    Until(Instant),
+    RestOfProcess,
 }
 
 impl GuildListGate {
@@ -30,15 +41,28 @@ impl GuildListGate {
 
     fn remaining(&mut self, token: &str) -> Option<Duration> {
         let now = Instant::now();
-        self.cooldowns.retain(|_, until| *until > now);
-        self.cooldowns
-            .get(token)
-            .map(|until| until.saturating_duration_since(now))
+        self.cooldowns.retain(|_, cooldown| match *cooldown {
+            Cooldown::RestOfProcess => true,
+            Cooldown::Until(until) => until > now,
+        });
+        match self.cooldowns.get(token).copied()? {
+            Cooldown::RestOfProcess => Some(Duration::MAX),
+            Cooldown::Until(until) => Some(until.saturating_duration_since(now)),
+        }
     }
 
     fn block_until(&mut self, token: &str, retry_after: Duration) {
-        let until = Instant::now() + retry_after;
-        self.cooldowns.insert(token.to_owned(), until);
+        self.cooldowns.insert(
+            token.to_owned(),
+            cooldown_deadline(Instant::now(), retry_after),
+        );
+    }
+}
+
+pub(crate) fn cooldown_deadline(now: Instant, retry_after: Duration) -> Cooldown {
+    match now.checked_add(retry_after) {
+        Some(until) => Cooldown::Until(until),
+        None => Cooldown::RestOfProcess,
     }
 }
 
@@ -72,9 +96,8 @@ impl std::error::Error for DiscordRateLimit {}
 /// impose a one-second floor so callers do not hammer immediately. The HTTP
 /// handler returns immediately; this number is not a sleep.
 pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
-    let millis = retry_after.as_millis();
-    let seconds = millis.div_ceil(1000) as u64;
-    seconds.max(1)
+    let seconds = retry_after.as_millis().div_ceil(1000);
+    u64::try_from(seconds).unwrap_or(u64::MAX).max(1)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -253,11 +276,14 @@ impl OAuthClient {
         &self,
         access_token: &str,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
-        // One shared gate: a 429 from any page blocks later callers, including
-        // concurrent ones, until Discord's advertised cooldown elapses. The
-        // lock is not held while the caller waits out that cooldown.
-        let mut gate = self.guild_list.lock().await;
-        if let Some(retry_after) = gate.remaining(access_token) {
+        if let Some(retry_after) = self.guild_list.lock().await.remaining(access_token) {
+            return Err(GuildListError::RateLimited { retry_after });
+        }
+        // Same-token callers share one fetch. The cooldown map is not held
+        // across Discord I/O, so another token is not stalled behind this one.
+        let flight = self.guild_flight(access_token).await;
+        let _same_token = flight.lock().await;
+        if let Some(retry_after) = self.guild_list.lock().await.remaining(access_token) {
             return Err(GuildListError::RateLimited { retry_after });
         }
         // Discord paginates at 200 guilds; a single GET silently drops every
@@ -294,7 +320,10 @@ impl OAuthClient {
                     .map(str::to_owned);
                 let bytes = resp.bytes().await.unwrap_or_default();
                 let retry_after = discord_retry_after(header.as_deref(), &bytes);
-                gate.block_until(access_token, retry_after);
+                self.guild_list
+                    .lock()
+                    .await
+                    .block_until(access_token, retry_after);
                 return Err(GuildListError::RateLimited { retry_after });
             }
             if !status.is_success() {
@@ -323,12 +352,21 @@ impl OAuthClient {
         }
         Ok(all)
     }
+
+    async fn guild_flight(&self, access_token: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self.guild_flights.lock().await;
+        flights.retain(|_, flight| std::sync::Arc::strong_count(flight) > 1);
+        flights
+            .entry(access_token.to_owned())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 /// Discord's rate-limit docs: use `Retry-After` or JSON `retry_after` (seconds).
 /// Prefer the longer of the two when both are present. Missing, zero, or
-/// unparseable values still wait one second. Waits above one minute are kept.
-/// Only a value that would overflow the process clock is stored as 24 hours.
+/// unparseable values still wait one second. The parsed wait is kept; only
+/// adding it to the process clock can saturate, and that stays blocked.
 pub(crate) fn discord_retry_after(header: Option<&str>, body: &[u8]) -> Duration {
     let from_header = header.and_then(parse_retry_seconds);
     let from_body = serde_json::from_slice::<serde_json::Value>(body)
@@ -341,8 +379,11 @@ pub(crate) fn discord_retry_after(header: Option<&str>, body: &[u8]) -> Duration
         (None, Some(body)) => body,
         (None, None) => 1.0,
     };
-    let millis = (seconds * 1000.0).ceil().clamp(1000.0, 86_400_000.0) as u64;
-    Duration::from_millis(millis)
+    let millis = (seconds * 1000.0).ceil().max(1000.0);
+    if !millis.is_finite() || millis >= u64::MAX as f64 {
+        return Duration::MAX;
+    }
+    Duration::from_millis(millis as u64)
 }
 
 fn parse_retry_seconds(header: &str) -> Option<f64> {
@@ -410,14 +451,71 @@ mod tests {
         assert_eq!(discord_retry_after(None, b"{}").as_secs(), 1);
         assert_eq!(discord_retry_after(Some("0"), b"{}").as_secs(), 1);
         assert_eq!(discord_retry_after(Some("120"), b"{}").as_secs(), 120);
-        assert_eq!(
-            discord_retry_after(Some("999999"), b"{}").as_secs(),
-            24 * 60 * 60
-        );
+        assert_eq!(discord_retry_after(Some("90000"), b"{}").as_secs(), 90000);
+        assert!(matches!(
+            cooldown_deadline(Instant::now(), Duration::MAX),
+            Cooldown::RestOfProcess
+        ));
+        assert!(matches!(
+            cooldown_deadline(Instant::now(), Duration::from_secs(90_000)),
+            Cooldown::Until(_)
+        ));
         assert_eq!(
             retry_after_header_secs(discord_retry_after(Some("4.2"), b"{}")),
             5
         );
+    }
+
+    #[tokio::test]
+    async fn slow_guild_lookup_does_not_block_another_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_handler = std::sync::Arc::clone(&entered);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/guilds",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    let slow = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.ends_with("slow"));
+                    if slow {
+                        entered_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    axum::Json(serde_json::json!([{
+                        "id": "1",
+                        "name": "n",
+                        "icon": null,
+                        "owner": false,
+                        "permissions": 32
+                    }]))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = std::sync::Arc::new(OAuthClient {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            http: reqwest::Client::new(),
+            guild_list: tokio::sync::Mutex::new(GuildListGate::new()),
+            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guilds_endpoint: Some(format!("http://{address}/guilds")),
+            token_endpoint: None,
+        });
+        let slow_client = std::sync::Arc::clone(&client);
+        let slow = tokio::spawn(async move { slow_client.my_guilds("slow").await });
+        let wait_started = Instant::now();
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(wait_started.elapsed() < Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        client.my_guilds("fast").await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        slow.await.unwrap().unwrap();
     }
 
     #[test]
