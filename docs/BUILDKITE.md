@@ -78,7 +78,7 @@ before fetching `GHCR_TOKEN` or logging in, so missing push credentials cannot
 fail a docs-only main build. Missing image labels, unavailable Git
 history or registry inspection errors cause a rebuild. Bot and API images use
 the shared source trees, so shared Rust/migration changes can build both images.
-Main SHA publication does not publish the conductor image or an installable
+Main and manual commit-SHA publication do not publish the conductor image or an installable
 manifest. Scheduled Nightly and Stable tag/manual builds publish bot, API,
 conductor and a complete signed `JMODGUARD-RELEASE-1` manifest. Nightly tags are
 unique and must not move `latest`. Incomplete publications stay unavailable.
@@ -134,6 +134,22 @@ Existing package visibility is preserved. Ensure the image packages are public
 for unauthenticated Bunny pulls, or configure the private registry credentials
 in your deployment. Publishing never grants public access or deploys containers.
 
+### Connect a newly published package to this repository
+
+The publisher sets `org.opencontainers.image.source=https://github.com/jatmn/jModGuard`
+on its images. Also verify the package's actual GitHub repository association:
+an image source label alone is not confirmation that GitHub displays the link.
+For an existing `jmodguard-webui` package that has no repository connection:
+
+1. Open your GitHub profile, then **Packages**, then **jmodguard-webui**.
+2. Under the package versions, click **Connect repository**.
+3. Select **jModGuard**, then click **Connect repository**.
+4. Return to the package page and confirm it links to `jatmn/jModGuard`.
+
+These are GitHub's documented [package connection steps](https://docs.github.com/en/packages/learn-github-packages/connecting-a-repository-to-a-package).
+Connecting the existing package does not require another build. Package
+visibility is a separate setting; verify it separately for anonymous pulls.
+
 ## Main, tags and manual builds
 
 - Keep branch/PR builds enabled as appropriate for CI. PRs and UI/API builds
@@ -152,7 +168,7 @@ in your deployment. Publishing never grants public access or deploys containers.
 - To publish a release tag or an older SHA manually, choose **New Build**, use
   current `main` for the pipeline code, and set the non-secret environment value
   `JMODGUARD_PUBLISH_SOURCE=refs/tags/v1.2.3` or a full lowercase 40-character SHA.
-  This also works for source revisions predating the publishing scripts. Both
+  This also works for source revisions predating the publishing scripts. All selected
   components use the one resolved SHA recorded by the preparation job. Tests
   validate the current pipeline checkout; the image builds compile the selected
   source. For a source before the independent updater, bot/API images keep their
@@ -160,8 +176,11 @@ in your deployment. Publishing never grants public access or deploys containers.
   for owner-managed executable updates. The WebUI job skips sources before the
   independent WebUI package existed. A plain branch name such as `main` is
   rejected as a publication source.
-  Manual publication by commit SHA publishes container images only; the manifest
-  job skips when the source has no installable Stable/Nightly release id.
+  Manual publication by commit SHA publishes bot/API images and the WebUI asset
+  image when it exists in the selected source. The conductor and manifest jobs
+  skip, including on retries. This manual build republishes all three eligible
+  components; it is not a WebUI-only build. Explicit tag and scheduled release
+  publication retain their existing conductor/manifest paths.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in
   place of the retired Actions `CI failover`. No hosted fallback is automatic.
 

@@ -667,10 +667,14 @@ fn next_steps(root: &Path) -> String {
          4. Record the backup key before the first portable export (docs/BACKUP-RESTORE.md).\n\
          5. Restore only into the absent restore/ directory. After conductor self-replacement,\n\
             run `jmodguard-conductor recover-update` independently of OAuth and private ops.\n\
-         6. A private ops repository is not required. Buildkite publishes bot/API images on\n\
-            every main SHA; conductor images and signed release manifests ship on\n\
-            Nightly/Stable/manual builds only. Admin UI files come from frontend/ in this repo\n\
-            or a release manifest (see docs/INSTALL.md).\n\
+         6. A private ops repository is not required. Buildkite publishes changed bot/API/WebUI\n\
+            images on main. Manual commit-SHA builds skip conductor and signed manifests.\n\
+            They publish eligible bot/API/WebUI images; old sources without WebUI skip it.\n\
+            Conductor images require explicit tag or scheduled Nightly builds, including\n\
+            manual tag builds. Signed manifests require scheduled Nightly or Stable\n\
+            vMAJOR.MINOR.PATCH tag builds, including manual Stable-tag builds. Other tags\n\
+            do not produce a signed manifest. Admin UI files come from frontend/ in this repo,\n\
+            the independent WebUI image or a release manifest (see docs/INSTALL.md).\n\
          7. Live Bunny, Discord, and AWS provider checks remain deferred; see docs/INSTALL.md.\n\
          License: {LICENSE_ID} (LICENSE.md). Do not promise RDS/Postgres.\n",
         root.display()
@@ -904,7 +908,13 @@ mod tests {
         assert!(steps.contains("private ops"));
         assert!(steps.contains("not required"));
         assert!(!steps.contains("GitHub Actions"));
-        assert!(steps.contains("Nightly/Stable/manual"));
+        assert!(steps.contains("Manual commit-SHA builds skip conductor and signed manifests."));
+        assert!(
+            steps.contains("Conductor images require explicit tag or scheduled Nightly builds")
+        );
+        assert!(steps.contains("including manual Stable-tag builds"));
+        assert!(steps.contains("do not produce a signed manifest"));
+        assert!(steps.contains("eligible bot/API/WebUI images"));
         assert!(!steps.contains("bot/API/conductor/frontend artifacts"));
         let env = fs::read_to_string(root.join("conductor.env.example")).unwrap();
         assert!(!env.to_ascii_lowercase().contains("sk-"));

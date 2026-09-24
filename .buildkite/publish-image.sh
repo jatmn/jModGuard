@@ -521,8 +521,11 @@ publish_component() {
   local rest="${selection#*$'\t'}"
   ref="${rest%%$'\t'*}"
   head="${rest#*$'\t'}"
-  if [[ "$component" == "conductor" && "$mode" == "main" ]]; then
-    echo 'conductor: installable control images are published on Stable/Nightly only'
+  # A manual SHA rebuild is the same independent-component publication as
+  # main. Only an explicit tag or scheduled release may publish conductor.
+  if [[ "$component" == "conductor" ]] \
+      && { [[ "$mode" == "main" ]] || [[ "$mode" == "manual" && "$ref" =~ $SHA_RE ]]; }; then
+    echo 'conductor: commit-SHA publication only publishes bot/API/WebUI; skipping'
     return 0
   fi
   IFS=$'\t' read -r sha label <<<"$(read_plan "$mode" "$ref" "$head")"
