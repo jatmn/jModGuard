@@ -1201,6 +1201,7 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "jmodguard",
+ "libsql",
  "parking_lot",
  "rand 0.10.2",
  "regex",

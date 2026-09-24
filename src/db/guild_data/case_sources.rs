@@ -64,6 +64,10 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let anchor = anchor.key()?;
+        let audit_entry_id = match &source {
+            CaseSource::DiscordAudit { entry_id } => Some(*entry_id),
+            _ => None,
+        };
         let key = source.key()?;
         let kind = source.kind();
         let expected = self.expected.clone();
@@ -72,15 +76,30 @@ impl GuildDataStore {
             verify_scope(&tx, &expected, &scope, true)?;
             let parent = source_match(&tx, &scope, &anchor)?.ok_or(CaseError::Conflict)?;
             anyhow::ensure!(parent.id == id, CaseError::Conflict);
+            let staged = if let Some(entry_id) = audit_entry_id {
+                tx.query_row("SELECT user_id,action FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id],|r|Ok((r.get::<i64>(0)?,r.get::<String>(1)?))).optional()?
+            } else {None};
+            if let Some((user_id,action)) = &staged && !parent.removed {
+                let facts:(Option<i64>,Option<String>)=tx.query_row("SELECT CAST(json_extract(payload,'$.subject_id') AS INTEGER),json_extract(payload,'$.action') FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                anyhow::ensure!(facts.0==Some(*user_id) && facts.1.as_deref()==Some(action.as_str()),CaseError::Conflict);
+            }
             if let Some(existing) = source_match(&tx, &scope, &key)? {
                 anyhow::ensure!(existing.id == id, CaseError::Conflict);
-                tx.finish_read()?;
+                if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
+                    tx.ensure_mutation_receipt()?;
+                    tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                    tx.commit()?;
+                } else {tx.finish_read()?;}
                 return Ok(LinkCaseSource::Existing(existing));
             }
             let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_case_sources WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND source_kind=?4)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),kind], |r| Ok(r.get(0)?))?;
             anyhow::ensure!(!occupied, CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
             tx.execute("INSERT INTO guild_case_sources(guild_id,enrollment_id,case_id,source_key,source_kind) VALUES(?1,?2,?3,?4,?5)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),key.as_str(),kind])?;
+            if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
+                let removed=tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                anyhow::ensure!(removed==1,CaseError::Conflict);
+            }
             tx.commit()?;
             Ok(LinkCaseSource::Linked(parent))
         }).await

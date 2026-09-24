@@ -95,8 +95,13 @@ and incomplete coverage are labeled as such. An unlinked Gateway ban/unban
 observation is labeled separately from an audit-ID verified action; a later
 audit record may describe the same Discord change. The directory does not
 merge them by matching user and nearby time or count them as two verified
-actions. Bot-owned actions retain their existing exact operation-to-audit
-source links.
+actions. A confirmed, dated Discord ban or unban audit entry can appear with
+its audit ID, actor, and reason while its association to a local bot case is
+unresolved. It has no case link and may describe a bot action already listed;
+the page does not count it as another canonical case. Once the exact audit
+source links to that case, the unresolved entry is replaced by the linked
+case entry. Bot-owned actions retain their exact operation-to-audit source
+links when that association is known.
 An idempotent bot unban response saying the person was already unbanned remains
 a successful control receipt but is recorded as an attempted case, not proof
 of an earlier ban. Older application unban cases without that response detail
@@ -140,26 +145,28 @@ another database.
 
 ## Storage sizing
 
-The final v11 guild schema was measured in local SQLite with 4 KiB pages and
+The final v12 guild schema was measured in local SQLite with 4 KiB pages and
 `VACUUM`. The measurement includes the nullable stay identity on paced
-target checks; these bulk fixtures have no pending checks. An empty guild store
-measured 258,048 bytes. With one saved stay per
-current member, 11,000 ordinary-name members measured 7,872,512 bytes total
+target checks; these bulk fixtures have no pending checks or unresolved audits.
+An empty guild store measured 274,432 bytes. With one saved stay per
+current member, 11,000 ordinary-name members measured 7,888,896 bytes total
 (7,614,464 bytes above the empty store). A fixture using long Unicode global
-names and nicknames measured 12,173,312 bytes total (11,915,264 bytes above
+names and nicknames measured 12,189,696 bytes total (11,915,264 bytes above
 empty). Adding two extra stays, four case-index identities, and one unknown-time
 state observation for each of 110 retained banned people raised the ordinary
-fixture by 212,992 bytes to 8,085,504 bytes total.
+fixture by 212,992 bytes to 8,101,888 bytes total. A separate hypothetical
+fixture with 110 unresolved own-audit rows added 28,672 bytes to the ordinary
+fixture; this row count is a storage sensitivity, not an assumed ban frequency.
 Canonical case payloads, WAL files, backups, and provider replication are
 outside these directory/index measurements.
 
 At the planning input's net growth of 3,285 current members per year, a
 43,850-member ordinary-name fixture, representing ten years at that rate,
-measured 30,642,176 bytes total (30,384,128 bytes above the empty store).
+measured 30,658,560 bytes total (30,384,128 bytes above the empty store).
 The difference from the same-name 11,000-member fixture is 22,769,664 bytes
 over ten years, or about 2.28 MB (2.17 MiB) per year under the same row mix
 and indexing. Churn and retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
 ordinary and 3.26 MB Unicode figures excluded final stays and indexes; use
-the v11 measured fixtures above for sizing. The earlier candidate
+the v12 measured fixtures above for sizing. The earlier candidate
 measurements used a different row shape and name generator, so their difference
 from these figures is not a pure schema overhead estimate.

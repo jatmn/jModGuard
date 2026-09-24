@@ -523,7 +523,7 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
                     .await?;
             }
         }
-        for table in ["guild_member_feature", "guild_member_seed", "guild_member_sync", "guild_member_directory", "guild_member_pending_bans", "guild_member_stays", "guild_member_state_observations", "guild_member_target_checks", "guild_member_audit_recovery"] {
+        for table in ["guild_member_feature", "guild_member_seed", "guild_member_sync", "guild_member_directory", "guild_member_pending_bans", "guild_member_stays", "guild_member_state_observations", "guild_member_target_checks", "guild_member_audit_recovery", "guild_member_unresolved_audits"] {
             copy_member_table(&src, &dest_conn, table, guild).await?;
         }
         copy_cases(&src, &dest_conn, guild).await?;
@@ -595,6 +595,7 @@ async fn copy_member_table(
             "guild_member_state_observations",
             "guild_member_target_checks",
             "guild_member_audit_recovery",
+            "guild_member_unresolved_audits",
             "guild_member_case_index"
         ]
         .contains(&table),
@@ -848,7 +849,7 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
         }
         conn.execute("DELETE FROM guild_cases WHERE guild_id=?", libsql::params![guild])
             .await?;
-        for table in ["guild_member_case_index","guild_member_state_observations","guild_member_target_checks","guild_member_audit_recovery","guild_member_stays","guild_member_pending_bans","guild_member_directory","guild_member_sync","guild_member_seed","guild_member_feature"] {
+        for table in ["guild_member_case_index","guild_member_state_observations","guild_member_target_checks","guild_member_audit_recovery","guild_member_unresolved_audits","guild_member_stays","guild_member_pending_bans","guild_member_directory","guild_member_sync","guild_member_seed","guild_member_feature"] {
             if table_exists(&conn,table).await? {conn.execute(&format!("DELETE FROM {table} WHERE guild_id=?"),libsql::params![guild]).await?;}
         }
         if table_exists(&conn, "guild_tenant_settings").await? {
@@ -1076,6 +1077,7 @@ async fn tenant_counts(path: &Path, guild: i64) -> Result<Value> {
         "guild_member_state_observations",
         "guild_member_target_checks",
         "guild_member_audit_recovery",
+        "guild_member_unresolved_audits",
     ] {
         member_counts.push(if table_exists(&conn, table).await? {
             scalar(
@@ -1103,6 +1105,7 @@ async fn tenant_counts(path: &Path, guild: i64) -> Result<Value> {
         "member_state_observations":member_counts[7],
         "member_target_checks":member_counts[8],
         "member_audit_recovery":member_counts[9],
+        "member_unresolved_audits":member_counts[10],
     }))
 }
 

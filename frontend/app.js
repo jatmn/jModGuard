@@ -2432,6 +2432,7 @@ function tabMembers() {
       for (const event of page.entries || []) {
         const sourceLabel = ({
           discord_audit: "Discord audit action",
+          discord_audit_unresolved: "Confirmed Discord audit action; local case association unresolved",
           application_audit_linked: "Bot action linked to Discord audit",
           gateway_observation_unlinked: "Gateway observation; action time unconfirmed",
           state_reconciliation: "Verified from current Discord state; transition time unknown",
@@ -2439,7 +2440,9 @@ function tabMembers() {
         })[event.source_kind] || "";
         const eventLabel = event.source_kind === "gateway_observation_unlinked"
           ? `${event.kind || "Ban state"} observation`
-          : event.kind || "Observation";
+          : event.source_kind === "discord_audit_unresolved"
+            ? `${event.kind === "ban" ? "Ban" : event.kind === "unban" ? "Unban" : "Discord"} audit entry`
+            : event.kind || "Observation";
         const visibleLabel = event.kind === "member_state_observation" ? "Membership absence" :
           event.kind === "membership_state_observation" ? "Membership state check" :
           event.kind === "ban_present_state_observation" ? "Ban present (time unknown)" :
@@ -2447,7 +2450,7 @@ function tabMembers() {
         detail.append(el("p", {},
           el("strong", { text: `${visibleLabel} · ${asDate(event.occurred_at_ms)}` }),
           event.case_id ? el("button", { class: "btn small", text: `Case ${event.case_id}`, onclick: () => { pendingCaseId = event.case_id; navigate("cases"); } }) : null,
-          el("span", { class: "muted", text: `${sourceLabel ? ` ${sourceLabel}` : ""}${event.observed_at_ms && event.source_kind === "state_reconciliation" ? ` · Checked ${asDate(event.observed_at_ms)}` : ""}${event.outcome ? ` · ${event.outcome}` : ""}${event.moderator_id ? ` · moderator ${event.moderator_id}` : ""}${event.reason ? ` · ${event.reason}` : ""}` })));
+          el("span", { class: "muted", text: `${sourceLabel ? ` ${sourceLabel}` : ""}${event.source_kind === "discord_audit_unresolved" && event.observation_id ? ` · Audit entry ${event.observation_id}` : ""}${event.observed_at_ms && event.source_kind === "state_reconciliation" ? ` · Checked ${asDate(event.observed_at_ms)}` : ""}${event.outcome ? ` · ${event.outcome}` : ""}${event.moderator_id ? ` · moderator ${event.moderator_id}` : ""}${event.reason ? ` · ${event.reason}` : ""}` })));
       }
       cursor = page.next_cursor || null;
       if (cursor) detail.append(el("button", { class: "btn small", text: "More history", onclick: (event) => { event.currentTarget.remove(); appendPage().catch(reportApiError); } }));

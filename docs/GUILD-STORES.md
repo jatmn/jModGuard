@@ -58,7 +58,7 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0011. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0012. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
@@ -75,6 +75,9 @@ immutable initial-seed completion ([MEMBERS.md](MEMBERS.md)).
 Version10 adds member-state observations, durable targeted checks and bounded audit
 recovery. Version11 adds nullable committed counts by import phase and a measured
 member-page interval; old aggregate counts do not invent historical phase counts.
+Version12 preserves exact, dated bot-executor audit actions while their local case
+source association remains unresolved; a later exact source link consumes the staged
+action without creating a duplicate case.
 
 | Operation | Contract |
 |---|---|

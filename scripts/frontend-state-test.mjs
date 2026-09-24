@@ -289,6 +289,41 @@ test('Members separates current ban reason from an unresolved Gateway action', a
   assert.match(textOf(panel), /Case case-1/);
 });
 
+test('Members renders a dated unresolved Discord audit entry, then its exact case link', async () => {
+  let linked = false;
+  const reason = '<img src=x onerror=alert(1)>';
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
+    if (url.includes('/history')) return response({ entries: [linked
+      ? { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'application_audit_linked', case_id: 'case-linked', observation_id: null, moderator_id: '42', reason, outcome: 'succeeded' }
+      : { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit_unresolved', case_id: null, observation_id: '123456789012345678', moderator_id: '42', reason, outcome: 'succeeded' }], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const historyButton = findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history');
+  historyButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Ban audit entry · /);
+  assert.doesNotMatch(textOf(panel), /Ban audit entry · Unknown/);
+  assert.match(textOf(panel), /Confirmed Discord audit action; local case association unresolved/);
+  assert.match(textOf(panel), /Audit entry 123456789012345678/);
+  assert.match(textOf(panel), /moderator 42/);
+  assert.match(textOf(panel), /<img src=x onerror=alert\(1\)>/);
+  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n).startsWith('Case ')), null);
+  assert.equal(findNode(panel, n => n.tag === 'img'), null, 'audit reason is text, not markup');
+
+  linked = true;
+  historyButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /local case association unresolved/);
+  assert.doesNotMatch(textOf(panel), /Audit entry 123456789012345678/);
+  assert.match(textOf(panel), /Bot action linked to Discord audit/);
+  assert.match(textOf(panel), /Case case-linked/);
+});
+
 test('Members labels verified state changes with unknown event time and separate check time', async () => {
   const h = harness(async (url) => {
     if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000, reconciliation_needed: true, audit_recovery_status: 'waiting', audit_recovery_phase: 'unban', audit_recovery_processed: 3, audit_recovery_reason: 'rate_limited', audit_recovery_next_attempt_at: 1790000000000, audit_recovery_last_progress_at: 1789999990000 });

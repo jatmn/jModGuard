@@ -3,7 +3,7 @@ use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistratio
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 11;
+const VERSION: i64 = include!("../../migrations/guild/current_version.rs");
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -18,6 +18,8 @@ const MEMBER_STATUS_SCHEMA: &str =
     include_str!("../../migrations/guild/0010_member_directory_status.sql");
 const MEMBER_PROGRESS_SCHEMA: &str =
     include_str!("../../migrations/guild/0011_member_sync_progress.sql");
+const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
+    include_str!("../../migrations/guild/0012_member_unresolved_audits.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -170,6 +172,10 @@ fn verify_identity_version(
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('guild_member_feature','guild_member_seed','guild_member_sync','guild_member_directory','guild_member_stays','guild_member_case_index','guild_member_pending_bans','guild_member_state_observations','guild_member_target_checks','guild_member_audit_recovery')", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 10, StoreCheckError::Schema);
     }
+    if wanted >= 12 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_member_unresolved_audits') OR (type='index' AND name='guild_member_unresolved_audits_user') OR (type='trigger' AND name IN ('guild_member_unresolved_audit_insert','guild_member_unresolved_audit_update','guild_member_unresolved_audit_delete'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -228,6 +234,9 @@ fn initialize_store(
         if version < 11 {
             tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
         }
+        if version < 12 {
+            tx.execute_batch(MEMBER_UNRESOLVED_AUDITS_SCHEMA)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -247,6 +256,7 @@ fn initialize_store(
     tx.execute_batch(MEMBER_SCHEMA)?;
     tx.execute_batch(MEMBER_STATUS_SCHEMA)?;
     tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
+    tx.execute_batch(MEMBER_UNRESOLVED_AUDITS_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete

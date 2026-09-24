@@ -972,6 +972,7 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
             "guild_member_state_observations",
             "guild_member_target_checks",
             "guild_member_audit_recovery",
+            "guild_member_unresolved_audits",
             "guild_member_stays",
             "guild_member_pending_bans",
             "guild_member_directory",
@@ -1892,8 +1893,10 @@ mod member_snapshot_tests {
             CREATE TABLE guild_member_state_observations(guild_id INTEGER,enrollment_id TEXT,observation_id TEXT,user_id INTEGER,kind TEXT,observed_at_ms INTEGER);
             INSERT INTO guild_member_state_observations VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc',77,'ban_absent',1500);
             CREATE TABLE guild_member_target_checks(guild_id INTEGER,enrollment_id TEXT,user_id INTEGER,kind TEXT,reason TEXT,row_revision INTEGER,requested_at_ms INTEGER,next_attempt_at_ms INTEGER);
-            INSERT INTO guild_member_target_checks VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',77,'member','gap',1,1600,1700);").await.unwrap();
-        conn.execute("PRAGMA user_version = 10", ()).await.unwrap();
+            INSERT INTO guild_member_target_checks VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',77,'member','gap',1,1600,1700);
+            CREATE TABLE guild_member_unresolved_audits(guild_id INTEGER,enrollment_id TEXT,entry_id INTEGER,user_id INTEGER,action TEXT,occurred_at_ms INTEGER,executor_id INTEGER,reason TEXT);
+            INSERT INTO guild_member_unresolved_audits VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9007199254741993,77,'ban',1550,42,'historical own action');").await.unwrap();
+        conn.execute("PRAGMA user_version = 12", ()).await.unwrap();
         snapshot_sqlite(&source, &snapshot).await.unwrap();
         let db = libsql::Builder::new_local(&snapshot).build().await.unwrap();
         let conn = db.connect().unwrap();
@@ -1941,6 +1944,7 @@ mod member_snapshot_tests {
         for table in [
             "guild_member_state_observations",
             "guild_member_target_checks",
+            "guild_member_unresolved_audits",
         ] {
             let row = conn
                 .query(
@@ -1955,6 +1959,22 @@ mod member_snapshot_tests {
                 .unwrap();
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
         }
+        let unresolved = conn
+            .query(
+                "SELECT entry_id,reason FROM guild_member_unresolved_audits WHERE guild_id=10",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unresolved.get::<i64>(0).unwrap(), 9007199254741993);
+        assert_eq!(
+            unresolved.get::<String>(1).unwrap(),
+            "historical own action"
+        );
         drop(conn);
         drop(db);
         let _ = std::fs::remove_dir_all(root);

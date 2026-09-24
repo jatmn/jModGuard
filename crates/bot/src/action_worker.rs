@@ -329,6 +329,15 @@ async fn execute_inner(
                     )
                     .await
                 {
+                    Ok(status)
+                        if matches!(
+                            operation,
+                            crate::bot_actions::MemberSyncOperation::Resume
+                                | crate::bot_actions::MemberSyncOperation::Retry
+                        ) && status.status == "complete" =>
+                    {
+                        Outcome::succeeded("member_sync_already_completed")
+                    }
                     Ok(_) => Outcome::succeeded("member_sync_updated"),
                     Err(error) => {
                         tracing::warn!(action_id = %job.id, guild_id = job.guild_id, "member sync control failed: {error:#}");

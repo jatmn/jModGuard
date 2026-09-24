@@ -58,6 +58,9 @@ struct Schema {
     guild_version: i64,
 }
 
+/// Guild-store schema version shared with the data crate at build time.
+pub const GUILD_SCHEMA_VERSION: i64 = include!("../../../migrations/guild/current_version.rs");
+
 pub fn discovery_available(cfg: &Config) -> bool {
     cfg.operations_configured() && cfg.release_feed.is_some() && !cfg.release_keys.is_empty()
 }
@@ -69,7 +72,7 @@ pub fn installed(cfg: &Config) -> Value {
         "core_family": "jmodguard-core-1",
         "core_version": 12,
         "guild_family": "jmodguard-guild-1",
-        "guild_version": 10,
+        "guild_version": GUILD_SCHEMA_VERSION,
         "backup_format": "JMODGUARD-BACKUP-1",
         "settings_schema": 1,
     })
@@ -545,7 +548,7 @@ pub fn write_complete_publication(request: CompletePublication) -> Result<PathBu
             "core_family": "jmodguard-core-1",
             "core_version": 12,
             "guild_family": "jmodguard-guild-1",
-            "guild_version": 10,
+            "guild_version": GUILD_SCHEMA_VERSION,
         },
         "settings_schema": 1,
         "source_commit": sha,

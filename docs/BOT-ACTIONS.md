@@ -216,7 +216,8 @@ The Members status card uses `POST .../member-sync/actions` for typed
 `pause`, `resume`, `retry`, and `reconcile` requests with the same stable
 request-key, page-membership, and fresh Manage Guild checks. The bot records a
 receipt after applying a control to scoped guild-store sync state. `retry` on a
-completed initial import does not start another seed; `reconcile` is the
+completed initial import returns an `already_completed` receipt without starting
+another seed; `reconcile` is the
 separate explicit full Discord scan. See [MEMBERS.md](MEMBERS.md).
 
 ## Runtime controls

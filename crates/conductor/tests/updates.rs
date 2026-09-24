@@ -73,7 +73,7 @@ fn unsigned(release_id: &str, bot: char, api: char, conductor: char, frontend: c
             "core_family": "jmodguard-core-1",
             "core_version": 12,
             "guild_family": "jmodguard-guild-1",
-            "guild_version": 10
+            "guild_version": jmodguard_conductor::release::GUILD_SCHEMA_VERSION
         },
         "settings_schema": 1,
         "backup_format": "JMODGUARD-BACKUP-1",
