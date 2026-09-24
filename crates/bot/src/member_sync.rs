@@ -531,6 +531,9 @@ pub async fn run(
         if guilds.is_empty() {
             continue;
         }
+        // A conservative initial scheduling share: every cached guild may
+        // compete for the single paced Discord request stream.
+        let initial_scheduling_share = guilds.len() as u32;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut ready = Vec::new();
         let mut available = Vec::new();
@@ -550,7 +553,39 @@ pub async fn run(
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
                     .await
                 {
-                    Ok(status) => status,
+                    Ok(status) => {
+                        if status.run_kind.as_deref() == Some("initial")
+                            && status.phase.as_deref() == Some("members")
+                            && status.status == "queued"
+                            && status.processed == 0
+                            && status.initial_completed_at.is_none()
+                            && let Some(member_count) = cache
+                                .guild(guild_id)
+                                .map(|guild| guild.member_count as i64)
+                                .filter(|count| *count > 0)
+                            && let Err(error) = store
+                                .set_initial_member_estimate(
+                                    scope.clone(),
+                                    bot_id,
+                                    db::guild_data::MemberInitialEstimate {
+                                        member_count,
+                                        page_size: app.cfg.member_sync.page_size,
+                                        pace_ms: i64::from(
+                                            app.cfg.member_sync.min_request_interval_secs,
+                                        ) * 1000,
+                                        active_guild_count: initial_scheduling_share,
+                                        now_ms,
+                                    },
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "initial member estimate unavailable: {error:#}"
+                            );
+                        }
+                        status
+                    }
                     Err(error) => {
                         initialized.remove(&(gid, enrollment.id));
                         tracing::warn!(
@@ -657,7 +692,7 @@ pub async fn run(
                     next_request = tokio::time::Instant::now() + pace;
                     match fetch_target_check(&app, &http, *guild_id, &check).await {
                         Ok(verification) => {
-                            if let Err(error) = store
+                            match store
                                 .settle_member_target_check(
                                     scope.clone(),
                                     check.clone(),
@@ -666,27 +701,55 @@ pub async fn run(
                                 )
                                 .await
                             {
-                                tracing::warn!(
-                                    guild_id = guild_id.get(),
-                                    "member target check settlement failed: {error:#}"
-                                );
-                                if matches!(
-                                    error.downcast_ref::<db::guild_data::MemberSyncError>(),
-                                    Some(db::guild_data::MemberSyncError::Stale)
-                                ) && let Err(queue_error) = store
-                                    .queue_member_target_check(
-                                        scope.clone(),
-                                        check.user_id,
-                                        check.kind,
-                                        &check.reason,
-                                        chrono::Utc::now().timestamp_millis(),
+                                Ok(Some(departure)) => {
+                                    let profile = match store
+                                        .get_member(scope.clone(), departure.user_id)
+                                        .await
+                                    {
+                                        Ok(profile) => profile,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                guild_id = guild_id.get(),
+                                                user_id = departure.user_id,
+                                                "verified departure profile read failed; logging with user ID: {error:#}"
+                                            );
+                                            None
+                                        }
+                                    };
+                                    crate::logging::emit_verified_member_departure(
+                                        &app,
+                                        &http,
+                                        *guild_id,
+                                        &departure,
+                                        profile.as_ref(),
                                     )
-                                    .await
-                                {
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
                                     tracing::warn!(
                                         guild_id = guild_id.get(),
-                                        "stale target check requeue failed: {queue_error:#}"
+                                        "member target check settlement failed: {error:#}"
                                     );
+                                    if matches!(
+                                        error.downcast_ref::<db::guild_data::MemberSyncError>(),
+                                        Some(db::guild_data::MemberSyncError::Stale)
+                                    ) && check.reason != "ambiguous_departure"
+                                        && let Err(queue_error) = store
+                                            .queue_member_target_check(
+                                                scope.clone(),
+                                                check.user_id,
+                                                check.kind,
+                                                &check.reason,
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            guild_id = guild_id.get(),
+                                            "stale target check requeue failed: {queue_error:#}"
+                                        );
+                                    }
                                 }
                             }
                         }

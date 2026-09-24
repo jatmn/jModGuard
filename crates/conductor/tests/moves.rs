@@ -74,6 +74,10 @@ fn unique_root() -> PathBuf {
 }
 
 async fn setup() -> Harness {
+    setup_with_legacy_cases(false).await
+}
+
+async fn setup_with_legacy_cases(legacy_cases: bool) -> Harness {
     let (discord, task) = discord_stub(42).await;
     let root = unique_root();
     std::fs::create_dir_all(&root).unwrap();
@@ -89,9 +93,10 @@ async fn setup() -> Harness {
             (10, ENROLL_10, REV_10, CASE_10, SRC_10),
             (20, ENROLL_20, REV_20, CASE_20, SRC_20),
         ],
+        legacy_cases,
     )
     .await;
-    init_guild(&dedicated, DEDICATED, Some(10), &[]).await;
+    init_guild(&dedicated, DEDICATED, Some(10), &[], false).await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         log_filter: "warn".into(),
@@ -175,6 +180,7 @@ async fn init_guild(
     store_id: &str,
     dedicated: Option<i64>,
     guilds: &[(i64, &str, &str, &str, &str)],
+    legacy_cases: bool,
 ) {
     let db = libsql::Builder::new_local(path).build().await.unwrap();
     let conn = db.connect().unwrap();
@@ -217,10 +223,34 @@ async fn init_guild(
         .unwrap();
         conn.execute(
             "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?,?,?,?,?,0)",
-            libsql::params![*guild, *enrollment, *case_id, *source, "{\"keep\":true}"],
+            libsql::params![
+                *guild,
+                *enrollment,
+                *case_id,
+                *source,
+                if legacy_cases && *guild == 10 {
+                    r#"{"action":"ban","outcome":"succeeded","subject_id":"9007199254740994","occurred_at_ms":1500}"#
+                } else {
+                    r#"{"keep":true}"#
+                }
+            ],
         )
         .await
         .unwrap();
+        if legacy_cases && *guild == 10 {
+            conn.execute(
+                "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?,?,?,?,?,0)",
+                libsql::params![
+                    *guild,
+                    *enrollment,
+                    "88888888888888888888888888888888",
+                    "app:99999999999999999999999999999999",
+                    r#"{"action":"ban","outcome":"succeeded","subject_id":"9007199254740993","occurred_at_ms":1600}"#
+                ],
+            )
+            .await
+            .unwrap();
+        }
     }
     conn.execute_batch(include_str!(
         "../../../migrations/guild/0009_member_directory.sql"
@@ -499,6 +529,173 @@ async fn denied_users_cannot_plan_or_start_moves() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn move_before_case_backfill_keeps_source_profiles_and_trusted_derived_rows() {
+    let h = setup_with_legacy_cases(true).await;
+    let shared = h.root.join("shared.guild.db");
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms) VALUES(10,?,42,1000,2000)",
+        libsql::params![ENROLL_10],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status) VALUES(10,?,42,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac',1000,'complete')",
+        libsql::params![ENROLL_10],
+    )
+    .await
+    .unwrap();
+    // The cases predate v9, so bounded backfill has not projected either case.
+    // The existing profile must survive the destination trigger unchanged.
+    conn.execute(
+        "INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,username,search_text,joined_at_ms,cleanup_after_ms,observed_at_ms,revision) VALUES(10,?,9007199254740993,'Ada','ada',500,3000,1000,7)",
+        libsql::params![ENROLL_10],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_member_directory WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    let jobs = h.conductor.store().unwrap().list_jobs(8).await.unwrap();
+    let move_job = jobs.iter().find(|job| job.kind == "guild_move").unwrap();
+    assert_eq!(move_job.status, "succeeded", "{:?}", move_job.last_error);
+
+    let dedicated = h.root.join("dedicated.guild.db");
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_directory WHERE guild_id=10"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        text(&dedicated, "SELECT username FROM guild_member_directory WHERE guild_id=10 AND user_id=9007199254740993").await,
+        "Ada"
+    );
+    for (column, expected) in [
+        ("ever_banned", 0),
+        ("cleanup_after_ms", 3000),
+        ("revision", 7),
+        ("joined_at_ms", 500),
+    ] {
+        assert_eq!(
+            scalar(&dedicated, &format!("SELECT {column} FROM guild_member_directory WHERE guild_id=10 AND user_id=9007199254740993")).await,
+            expected,
+            "source {column} changed during case copy"
+        );
+    }
+    assert_eq!(
+        scalar(&dedicated, "SELECT ever_banned FROM guild_member_directory WHERE guild_id=10 AND user_id=9007199254740994").await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT initial_completed_at_ms FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        2000
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT case_backfill_done FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_member_directory WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn move_rejects_an_extra_destination_profile_without_a_trusted_case() {
+    let h = setup().await;
+    let dedicated = h.root.join("dedicated.guild.db");
+    let db = libsql::Builder::new_local(&dedicated)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(10,?,9007199254740995,1,1500)",
+        libsql::params![ENROLL_10],
+    )
+    .await
+    .unwrap();
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    let jobs = h.conductor.store().unwrap().list_jobs(8).await.unwrap();
+    let move_job = jobs.iter().find(|job| job.kind == "guild_move").unwrap();
+    assert_eq!(move_job.status, "failed");
+    assert!(
+        move_job
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("without a trusted copied case"),
+        "{:?}",
+        move_job.last_error
+    );
+    assert_eq!(
+        text(
+            &h.root.join("core.db"),
+            "SELECT store_id FROM guild_store_placements WHERE guild_id=10"
+        )
+        .await,
+        SHARED
+    );
 }
 
 #[tokio::test]

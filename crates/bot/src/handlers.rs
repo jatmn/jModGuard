@@ -294,6 +294,14 @@ impl EventHandler for Handler {
             expected_joined_at_ms,
         )
         .await;
+        if matches!(
+            departed,
+            Some(crate::db::guild_data::MemberDepartureDecision::NeedsVerification)
+        ) {
+            // A paced target check will either discard this stale remove or
+            // emit the leave with the saved duration once absence is proven.
+            return;
+        }
         let joined_at_ms = departure_joined_at_ms(
             departed.as_ref(),
             expected_joined_at_ms,

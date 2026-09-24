@@ -2192,7 +2192,7 @@ function tabMembers() {
   let listRequest = 0, statusRequest = 0, detailRequest = 0;
   let listAbort = null, statusAbort = null, detailAbort = null;
   let timer = null, debounce = null, disposed = false, after = "", nextAfter = null;
-  let latestStatus = null, latestStatusRevision = -1;
+  let latestStatus = null, latestStatusRevision = -1, statusRetryNeeded = false;
   let pendingSyncAction = null, syncActionOutcome = null;
   const aliveHere = () => !disposed && alive();
   const clearTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
@@ -2207,7 +2207,7 @@ function tabMembers() {
   const schedulePoll = () => {
     clearTimer();
     if (!aliveHere() || document.visibilityState !== "visible") return;
-    const active = pendingSyncAction || (latestStatus && (
+    const active = statusRetryNeeded || pendingSyncAction || (latestStatus && (
       ["queued", "running", "waiting"].includes(latestStatus.status) ||
       ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
     if (active) timer = setTimeout(loadStatus, 10000);
@@ -2221,7 +2221,7 @@ function tabMembers() {
     parts.push(el("p", { role: "status", text: `${stage}${sync.status_reason ? ` — ${sync.status_reason}` : ""}` }));
     const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
     const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
-    const percent = sync.percent == null ? null : Math.min(99, Math.max(0, Number(sync.percent)));
+    const percent = sync.status === "complete" ? 100 : sync.percent == null ? null : Math.min(99, Math.max(0, Number(sync.percent)));
     const totalKind = sync.total_is_estimated === false ? "counted" : "estimated";
     const bar = el("progress", { max: "100", value: sync.status === "complete" ? "100" : percent, "aria-label": "Import progress", "aria-valuetext": sync.status === "complete" ? "Complete" : percent === null ? `${processed} records committed; total unknown` : `${Math.round(percent)} percent of ${totalKind} member stage` });
     if (sync.status !== "complete" && percent === null) bar.removeAttribute("value");
@@ -2230,7 +2230,8 @@ function tabMembers() {
     let totalDescription = "current phase total unknown";
     if (total !== null && sync.total_is_estimated === false) totalDescription = `${total.toLocaleString()} members counted`;
     else if (total !== null && memberPhase) totalDescription = `approximately ${total.toLocaleString()} members estimated`;
-    parts.push(el("p", { text: `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${percent === null ? "" : ` · ${Math.round(percent)}% of ${totalKind} member phase`}` }));
+    const progressText = sync.status === "complete" ? " · 100% complete" : percent === null ? "" : ` · ${Math.round(percent)}% of ${totalKind} member phase`;
+    parts.push(el("p", { text: `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}` }));
     const phases = ["members", "bans", "verify", "audit"];
     const currentPhase = phases.indexOf(String(sync.phase || ""));
     parts.push(el("p", { class: "muted", text: phases.map((phase, index) => `${phase === "bans" ? "Current bans" : phase === "audit" ? "Available audit history" : phase === "verify" ? "Candidate checks" : "Members"}: ${sync.status === "complete" || (currentPhase >= 0 && index < currentPhase) ? "done" : index === currentPhase ? sync.status : "pending"}`).join(" · ") }));
@@ -2239,6 +2240,9 @@ function tabMembers() {
     const remaining = workerUnconfirmed ? "Unknown until worker activity is confirmed" : sync.phase_remaining_seconds == null ? (sync.estimate_reason || "Unknown") : `about ${Math.ceil(Number(sync.phase_remaining_seconds) / 60)} minutes for this phase`;
     const finish = workerUnconfirmed ? "Unknown" : asDate(sync.overall_finish_at ?? sync.phase_finish_at ?? sync.expected_finish_at_ms);
     parts.push(el("p", { class: "muted", text: `Elapsed: ${elapsed == null ? "Unknown" : `${Math.round(Number(elapsed) / 60)} minutes`} · Remaining: ${remaining} · Expected finish: ${finish}` }));
+    if (sync.phase === "members" && sync.phase_finish_at != null && sync.estimate_reason?.startsWith("preliminary member-stage estimate")) {
+      parts.push(el("p", { class: "muted", text: "Preliminary member-stage estimate; later stages have unknown totals." }));
+    }
     if (sync.estimate_reason === "worker_unconfirmed") parts.push(el("p", { class: "muted", text: "Worker activity is not recently confirmed. The bot may be between paced pages; timing will resume when activity is confirmed." }));
     if (sync.estimate_reason === "worker_offline") parts.push(el("p", { class: "muted", text: "The bot worker is offline. Timing will resume when it is online." }));
     if (sync.next_attempt_at) parts.push(el("p", { class: "muted", text: `Next attempt: ${asDate(sync.next_attempt_at)}` }));
@@ -2293,7 +2297,11 @@ function tabMembers() {
       const sync = await apiRead(`/api/guilds/${guildId}/member-sync`, statusAbort.signal);
       if (!aliveHere() || request !== statusRequest) return;
       const revision = Number(sync.progress_revision ?? 0);
-      if (latestStatus && revision < latestStatusRevision) { schedulePoll(); return; }
+      if (latestStatus && revision < latestStatusRevision && pendingSyncAction) {
+        syncActionOutcome = "Import status changed after a restore. Check Bot actions before repeating the requested control.";
+        pendingSyncAction = null;
+      }
+      statusRetryNeeded = false;
       if (pendingSyncAction && actionApplied(sync, pendingSyncAction)) pendingSyncAction = null;
       latestStatus = sync;
       latestStatusRevision = revision;
@@ -2320,9 +2328,10 @@ function tabMembers() {
       }
     } catch (error) {
       if (!aliveHere() || request !== statusRequest) return;
+      statusRetryNeeded = true;
       if (latestStatus) renderStatus(latestStatus);
       else syncCard.replaceChildren();
-      syncCard.append(el("p", { class: "err", role: "status", text: "Could not refresh import status. Showing the last saved status; retrying shortly while work is active." }));
+      syncCard.append(el("p", { class: "err", role: "status", text: latestStatus ? "Could not refresh import status. Showing the last saved status; retrying shortly while visible." : "Could not load import status. Retrying shortly while visible." }));
       schedulePoll();
     }
   };

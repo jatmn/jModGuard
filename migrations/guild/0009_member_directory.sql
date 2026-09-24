@@ -115,7 +115,7 @@ CREATE TABLE guild_member_stays (
     joined_at_ms INTEGER,
     departed_at_ms INTEGER,
     ended_unknown INTEGER NOT NULL DEFAULT 0 CHECK(ended_unknown IN (0,1)),
-    provenance TEXT NOT NULL CHECK(provenance IN ('observed','imported','reconciled')),
+    provenance TEXT NOT NULL CHECK(provenance IN ('observed','imported','reconciled','observed_rejoin','imported_rejoin','reconciled_rejoin')),
     PRIMARY KEY(guild_id,enrollment_id,stay_id)
 );
 CREATE INDEX guild_member_stays_user ON guild_member_stays(guild_id,enrollment_id,user_id,joined_at_ms,stay_id);
@@ -142,6 +142,7 @@ CREATE TABLE guild_member_target_checks (
     kind TEXT NOT NULL CHECK(kind IN ('member','ban')),
     reason TEXT NOT NULL,
     row_revision INTEGER,
+    expected_stay_id TEXT,
     requested_at_ms INTEGER NOT NULL,
     next_attempt_at_ms INTEGER NOT NULL,
     PRIMARY KEY(guild_id,enrollment_id,user_id,kind)
@@ -187,8 +188,11 @@ BEGIN
 END;
 CREATE TRIGGER guild_member_case_retain AFTER INSERT ON guild_cases
 WHEN NEW.deleted=0 AND json_valid(NEW.payload)
- AND json_extract(NEW.payload,'$.action') IN ('ban','unban')
  AND json_extract(NEW.payload,'$.outcome')='succeeded'
+ AND (json_extract(NEW.payload,'$.action')='ban'
+      OR (json_extract(NEW.payload,'$.action')='unban'
+          AND (NEW.source_key LIKE 'discord:%'
+               OR json_type(NEW.payload,'$.source.gateway_observation') IS NOT NULL)))
 BEGIN
  INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms)
  VALUES(NEW.guild_id,NEW.enrollment_id,CAST(json_extract(NEW.payload,'$.subject_id') AS INTEGER),1,CAST(json_extract(NEW.payload,'$.occurred_at_ms') AS INTEGER))

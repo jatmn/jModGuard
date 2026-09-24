@@ -152,6 +152,21 @@ fn classify_unban_response(status: u16, code: isize) -> Outcome {
     }
 }
 
+fn unban_case_outcome(outcome: &Outcome) -> crate::db::guild_data::CaseOutcome {
+    use crate::db::guild_data::CaseOutcome;
+    if outcome.code == "already_unbanned" {
+        // Discord confirmed there was no ban to remove. The job succeeded as
+        // an idempotent request, but its case is not evidence of a ban cycle.
+        CaseOutcome::Attempted
+    } else {
+        match outcome.state {
+            "succeeded" => CaseOutcome::Succeeded,
+            "failed" => CaseOutcome::Failed,
+            _ => CaseOutcome::Uncertain,
+        }
+    }
+}
+
 async fn finish_validation_outcome(db: &Db, job: &BotAction, code: &str) -> Result<()> {
     if db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
         db::finish_dispatched_bot_action(db, job, "failed", code).await?;
@@ -381,11 +396,7 @@ async fn execute_inner(
         };
         let operation_id = crate::db::guild_data::CaseId::try_from(job.id.clone()).ok();
         if let (Some(enrollment), Some(operation_id)) = (enrollment, operation_id) {
-            let case_outcome = match outcome.state {
-                "succeeded" => crate::db::guild_data::CaseOutcome::Succeeded,
-                "failed" => crate::db::guild_data::CaseOutcome::Failed,
-                _ => crate::db::guild_data::CaseOutcome::Uncertain,
-            };
+            let case_outcome = unban_case_outcome(&outcome);
             let data = crate::db::guild_data::CaseData {
                 source: crate::db::guild_data::CaseSource::Application { operation_id },
                 action: crate::db::guild_data::CaseAction::Unban,
@@ -397,6 +408,31 @@ async fn execute_inner(
                 evidence: crate::db::guild_data::CaseEvidence::Unavailable,
             };
             let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
+            if outcome.state == "succeeded" && outcome.code != "already_unbanned" {
+                // A successful Discord unban proves the target was banned;
+                // the idempotent 10026 response does not. Persist that state
+                // directly because old application unban cases cannot safely
+                // distinguish these responses during a later backfill.
+                let observed = match tenant.live(enrollment.clone()).await {
+                    Ok((store, scope)) => {
+                        store
+                            .observe_unban(scope, *user_id, data.occurred_at_ms)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = observed {
+                    tracing::warn!(action_id = %job.id, guild_id = job.guild_id, user_id, "confirmed unban state not saved: {error:#}");
+                    if let Some(app) = app {
+                        app.remember_member_gap(
+                            job.guild_id as u64,
+                            Some(enrollment.id.clone()),
+                            Some(*user_id),
+                            "confirmed unban persistence unavailable",
+                        );
+                    }
+                }
+            }
             if let (Some(app), Some(case_id)) = (app, case_id) {
                 let expects_discord_audit =
                     crate::cases::queued_unban_expects_discord_audit(outcome.state, outcome.code);

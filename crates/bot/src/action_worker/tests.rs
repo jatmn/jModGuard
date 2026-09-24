@@ -1519,6 +1519,8 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
     )
     .await
     .unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    assert!(store.get_member(scope, 99).await.unwrap().is_none());
     let real_job = f.enqueue(10, "real", unban(99)).await;
     drain_with_state(
         &app,
@@ -1563,11 +1565,40 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
         .unwrap();
     let audit_case = store
         .case_for_source(
-            scope,
+            scope.clone(),
             crate::db::guild_data::CaseSource::DiscordAudit { entry_id: 555 },
         )
         .await
         .unwrap();
+    let noop_data = store
+        .case(
+            scope.clone(),
+            noop_case.id.clone(),
+            crate::db::guild_data::CaseLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let real_data = store
+        .case(
+            scope.clone(),
+            real_case.id.clone(),
+            crate::db::guild_data::CaseLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        noop_data.outcome,
+        crate::db::guild_data::CaseOutcome::Attempted
+    );
+    assert_eq!(
+        real_data.outcome,
+        crate::db::guild_data::CaseOutcome::Succeeded
+    );
+    let member = store.get_member(scope, 99).await.unwrap().unwrap();
+    assert!(member.ever_banned);
+    assert!(!member.is_banned);
     assert_ne!(noop_case.id, real_case.id);
     assert_eq!(
         audit_case.as_ref().map(|m| m.id.as_str()),

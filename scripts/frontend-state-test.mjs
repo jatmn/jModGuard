@@ -345,7 +345,6 @@ test('Members polls acknowledged Resume until its receipt and newer status agree
   const action = { id: 'sync-action-1', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
   const statuses = [
     { status: 'paused', progress_revision: 5 },
-    { status: 'paused', progress_revision: 4 }, // stale read after acknowledgment
     { status: 'paused', progress_revision: 5 },
     { status: 'queued', progress_revision: 6 },
     { status: 'complete', progress_revision: 7 },
@@ -367,15 +366,12 @@ test('Members polls acknowledged Resume until its receipt and newer status agree
   assert.match(textOf(panel), /Resume requested · bot action pending/);
   assert.equal(statusReads, 2);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
-  await runMemberPoll(h);
-  assert.equal(statusReads, 3);
-  assert.match(textOf(panel), /Resume requested/);
   action.state = 'succeeded';
   await runMemberPoll(h);
-  assert.equal(statusReads, 4);
+  assert.equal(statusReads, 3);
   assert.doesNotMatch(textOf(panel), /Resume requested/);
   await runMemberPoll(h);
-  assert.equal(statusReads, 5);
+  assert.equal(statusReads, 4);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
@@ -419,6 +415,107 @@ test('Members retains an acknowledged control and retries after a status refresh
   assert.match(textOf(panel), /Resume requested · bot action pending/);
   assert.match(textOf(panel), /Could not refresh import status/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+});
+
+test('Members retries its first failed visible status read and renders the recovered status', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads === 1) throw new Error('temporary outage');
+      return response({ status: 'complete', phase: 'complete', run_id: 'restored-run', progress_revision: 2,
+        initial_completed_at: 1790000000000, processed: 12, total_estimate: 12, total_is_estimated: false, percent: 100 });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Could not load import status. Retrying shortly while visible/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 2);
+  assert.match(textOf(panel), /12 records committed in this run/);
+  assert.doesNotMatch(textOf(panel), /Could not load import status/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members accepts a later primary restore status but rejects an older in-flight response', async () => {
+  let statusReads = 0;
+  let resolveOldRequest;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads === 2) return new Promise(resolve => { resolveOldRequest = resolve; });
+      return response(statusReads === 1
+        ? { status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 20, processed: 99 }
+        : { status: 'complete', phase: 'complete', run_id: 'restored-run', progress_revision: 3, processed: 3,
+            initial_completed_at: 1790000000000, reconciliation_needed: true });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  refresh.listeners.click();
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 3);
+  assert.match(textOf(panel), /3 records committed in this run/);
+  assert.match(textOf(panel), /Coverage may be stale after an outage or restore/);
+  resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /3 records committed in this run/);
+  assert.doesNotMatch(textOf(panel), /777 records committed/);
+});
+
+test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
+  const action = { id: 'sync-action-before-restore', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) return response(statusReads++ === 0
+      ? { status: 'paused', phase: 'members', run_id: 'before-restore', progress_revision: 10 }
+      : { status: 'paused', phase: 'members', run_id: 'restored-run', progress_revision: 2, reconciliation_needed: true });
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Import status changed after a restore. Check Bot actions/);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members shows 100 percent on completed status and labels a live member ETA preliminary', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response(statusReads++ === 0
+      ? { status: 'queued', phase: 'members', run_id: 'initial-1', progress_revision: 1, processed: 10,
+          total_estimate: 100, total_is_estimated: true, percent: 10, phase_remaining_seconds: 900,
+          phase_finish_at: 1790000900000, estimate_reason: 'preliminary member-stage estimate; later stages have unknown totals' }
+      : { status: 'complete', phase: 'complete', run_id: 'initial-1', progress_revision: 2, processed: 100,
+          total_estimate: 100, total_is_estimated: false, percent: 100 });
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Preliminary member-stage estimate; later stages have unknown totals/);
+  assert.match(textOf(panel), /10% of estimated member phase/);
+  await runMemberPoll(h);
+  const bar = findNode(panel, n => n.tag === 'progress');
+  assert.equal(bar.attrs.value, '100');
+  assert.equal(bar.attrs['aria-valuetext'], 'Complete');
+  assert.match(textOf(panel), /100% complete/);
+  assert.doesNotMatch(textOf(panel), /99%/);
 });
 
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {

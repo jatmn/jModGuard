@@ -527,6 +527,7 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
             copy_member_table(&src, &dest_conn, table, guild).await?;
         }
         copy_cases(&src, &dest_conn, guild).await?;
+        restore_source_member_rows(&src, &dest_conn, guild).await?;
         copy_member_table(&src, &dest_conn, "guild_member_case_index", guild).await?;
         if table_exists(&dest_conn, "guild_member_sync").await? {
             dest_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
@@ -619,6 +620,42 @@ async fn copy_member_table(
             libsql::params_from_iter(values),
         )
         .await?;
+    }
+    Ok(())
+}
+
+// Case insertion can run the destination's retention trigger before the
+// source's bounded case backfill has projected those cases. Keep existing
+// source profiles unchanged; rows derived only from copied cases remain.
+async fn restore_source_member_rows(
+    src: &libsql::Connection,
+    dest: &libsql::Connection,
+    guild: i64,
+) -> Result<()> {
+    if !table_exists(src, "guild_member_directory").await? {
+        return Ok(());
+    }
+    let mut rows = src
+        .query(
+            "SELECT enrollment_id,user_id,ever_banned,cleanup_after_ms,revision FROM guild_member_directory WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let changed = dest
+            .execute(
+                "UPDATE guild_member_directory SET ever_banned=?,cleanup_after_ms=?,revision=? WHERE guild_id=? AND enrollment_id=? AND user_id=?",
+                libsql::params![
+                    row.get::<i64>(2)?,
+                    row.get::<Option<i64>>(3)?,
+                    row.get::<i64>(4)?,
+                    guild,
+                    row.get::<String>(0)?,
+                    row.get::<i64>(1)?
+                ],
+            )
+            .await?;
+        ensure!(changed == 1, "source member profile was not copied");
     }
     Ok(())
 }
@@ -855,7 +892,6 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
             && expected.get("log_channels") == got.get("log_channels")
             && expected.get("history") == got.get("history")
             && expected.get("member_seed") == got.get("member_seed")
-            && expected.get("member_directory") == got.get("member_directory")
             && expected.get("member_stays") == got.get("member_stays")
             && expected.get("member_feature") == got.get("member_feature")
             && expected.get("member_sync") == got.get("member_sync")
@@ -872,6 +908,122 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
         "destination counts do not match the frozen source"
+    );
+    verify_member_directory(source, dest, guild).await?;
+    Ok(())
+}
+
+async fn member_seed_marker(
+    conn: &libsql::Connection,
+    guild: i64,
+) -> Result<Option<(String, i64, i64, Option<i64>)>> {
+    if !table_exists(conn, "guild_member_seed").await? {
+        return Ok(None);
+    }
+    let mut rows = conn
+        .query(
+            "SELECT enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms FROM guild_member_seed WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        None => None,
+    })
+}
+
+async fn verify_member_directory(source: &Path, dest: &Path, guild: i64) -> Result<()> {
+    let src = open(source).await?;
+    let dest = open(dest).await?;
+    ensure!(
+        member_seed_marker(&src, guild).await? == member_seed_marker(&dest, guild).await?,
+        "destination changed the immutable member seed completion marker"
+    );
+    let source_has_directory = table_exists(&src, "guild_member_directory").await?;
+    if !table_exists(&dest, "guild_member_directory").await? {
+        ensure!(
+            !source_has_directory,
+            "destination has no member directory for source profiles"
+        );
+        return Ok(());
+    }
+    let mut source_rows = if source_has_directory {
+        Some(
+            src.query(
+                "SELECT * FROM guild_member_directory WHERE guild_id=? ORDER BY enrollment_id,user_id",
+                libsql::params![guild],
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let mut source_row = match source_rows.as_mut() {
+        Some(rows) => rows.next().await?,
+        None => None,
+    };
+    let mut destination_rows = dest
+        .query(
+            "SELECT * FROM guild_member_directory WHERE guild_id=? ORDER BY enrollment_id,user_id",
+            libsql::params![guild],
+        )
+        .await?;
+    while let Some(destination_row) = destination_rows.next().await? {
+        let enrollment: String = destination_row.get(1)?;
+        let user: i64 = destination_row.get(2)?;
+        if let Some(ref row) = source_row {
+            let source_key = (row.get::<String>(1)?, row.get::<i64>(2)?);
+            let destination_key = (enrollment.clone(), user);
+            ensure!(
+                source_key >= destination_key,
+                "destination is missing a source member profile"
+            );
+            if source_key == destination_key {
+                ensure!(
+                    row.column_count() == destination_row.column_count(),
+                    "destination member profile width changed"
+                );
+                for column in 0..row.column_count() {
+                    ensure!(
+                        row.get_value(column)? == destination_row.get_value(column)?,
+                        "destination changed source member profile {user}"
+                    );
+                }
+                source_row = source_rows.as_mut().unwrap().next().await?;
+                continue;
+            }
+        }
+        // An extra row can only be the default profile produced by a copied,
+        // trusted case. A count surplus by itself never proves this.
+        ensure!(
+            destination_row.get::<String>(6)?.is_empty()
+                && destination_row.get::<i64>(7)? == 0
+                && destination_row.get::<i64>(8)? == 0
+                && destination_row.get::<i64>(9)? == 1
+                && destination_row.get::<i64>(18)? >= 0,
+            "destination has a non-derived extra member profile {user}"
+        );
+        for column in [3, 4, 5, 10, 11, 12, 13, 14, 15, 17, 19, 20] {
+            ensure!(
+                destination_row.get_value(column)? == libsql::Value::Null,
+                "destination has a non-derived extra member profile {user}"
+            );
+        }
+        let observed_at: i64 = destination_row.get(16)?;
+        let trusted_case = scalar(
+            &src,
+            "SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=? AND enrollment_id=? AND deleted=0 AND json_valid(payload) AND json_extract(payload,'$.outcome')='succeeded' AND (json_extract(payload,'$.action')='ban' OR (json_extract(payload,'$.action')='unban' AND (source_key LIKE 'discord:%' OR json_type(payload,'$.source.gateway_observation') IS NOT NULL))) AND CAST(json_extract(payload,'$.subject_id') AS INTEGER)=? AND CAST(json_extract(payload,'$.occurred_at_ms') AS INTEGER)=?)",
+            libsql::params![guild, enrollment, user, observed_at],
+        )
+        .await?;
+        ensure!(
+            trusted_case == 1,
+            "destination has an extra member profile without a trusted copied case {user}"
+        );
+    }
+    ensure!(
+        source_row.is_none(),
+        "destination is missing a source member profile"
     );
     Ok(())
 }

@@ -20,8 +20,9 @@ current bans, retries, and any available history recovery. The Members status
 card shows committed progress and distinguishes this estimate from known totals.
 While the page is visible, the card keeps following an acknowledged sync
 control and separate audit recovery even if the initial import is complete.
-The member-stage finish time is a preliminary forecast anchored to recent
-committed pages and the shared request pace across active guilds. If progress
+The member-stage finish time is a preliminary forecast from a recent bot
+initialization with a known guild count, then anchored to committed pages and
+the shared request pace across active guilds. If progress
 becomes too old to support that forecast, the remaining time and finish time
 become unknown. An unconfirmed worker is not labeled as crashed. A completed
 member stage uses the actual number traversed rather than retaining the
@@ -66,6 +67,11 @@ audit record may describe the same Discord change. The directory does not
 merge them by matching user and nearby time or count them as two verified
 actions. Bot-owned actions retain their existing exact operation-to-audit
 source links.
+An idempotent bot unban response saying the person was already unbanned remains
+a successful control receipt but is recorded as an attempted case, not proof
+of an earlier ban. Older application unban cases without that response detail
+cannot establish retained ban history by themselves; confirmed ban cases and
+dated audit actions still do.
 
 When an explicit reconciliation confirms that a previously saved member or
 current ban is absent, the history shows a state-reconciliation observation.
@@ -73,6 +79,13 @@ The time of the actual departure or unban remains unknown; the separate check
 time says only when Discord's current state was verified. An ordinary live
 rejoin keeps only its current stay, while a person with confirmed ban history
 keeps earlier known stays.
+When a tokenless remove arrives for a rejoined member, one paced user check
+resolves the membership instance. A confirmed absence closes that saved stay
+at the original remove event time and supplies its saved join date to the
+departure message; a still-present or newer stay is not reported as departed.
+The queued check survives a bot restart. A ban observation alone can establish
+that the person is no longer a current member but cannot invent the departure
+time; a later matching remove may provide it.
 
 The API requires fresh Manage Guild authorization, the WebUI's captured
 `x-jmodguard-enrollment` token, and a live tenant-store scope for reads. Sync
@@ -98,7 +111,9 @@ another database.
 ## Storage sizing
 
 The final v9 guild schema was measured in local SQLite with 4 KiB pages and
-`VACUUM`. An empty guild store measured 258,048 bytes. With one saved stay per
+`VACUUM`. The measurement includes the nullable stay identity on paced
+target checks; these bulk fixtures have no pending checks. An empty guild store
+measured 258,048 bytes. With one saved stay per
 current member, 11,000 ordinary-name members measured 7,872,512 bytes total
 (7,614,464 bytes above the empty store). A fixture using long Unicode global
 names and nicknames measured 12,173,312 bytes total (11,915,264 bytes above
@@ -113,8 +128,7 @@ At the planning input's net growth of 3,285 current members per year, a
 measured 30,642,176 bytes total (30,384,128 bytes above the empty store).
 The difference from the same-name 11,000-member fixture is 22,769,664 bytes
 over ten years, or about 2.28 MB (2.17 MiB) per year under the same row mix
-and indexing. Churn and
-retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
+and indexing. Churn and retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
 ordinary and 3.26 MB Unicode figures excluded final stays and indexes; use
 the repaired-schema measured fixtures above for sizing. The earlier candidate
 measurements used a different row shape and name generator, so their difference
