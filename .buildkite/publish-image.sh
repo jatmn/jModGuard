@@ -215,7 +215,9 @@ build_args() {
     --build-arg "SOURCE_SHA=${sha}"
     --tag "${image}:${sha}"
   )
-  if [[ "$channel" != "nightly" ]]; then
+  # Independent owner controls discover latest. Publish that moving pointer
+  # only after the pulled final image passes verification below.
+  if [[ "$component" == "conductor" && "$channel" != "nightly" ]]; then
     args+=(--tag "${image}:latest")
   fi
   if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
@@ -528,6 +530,11 @@ publish_component() {
   # the new final-image verifier.
   if [[ "$component" != "conductor" ]]; then
     verify_published_image "$component" "${image}:${sha}" "$context"
+  fi
+  if [[ "$component" != "conductor" && "$channel" != "nightly" ]]; then
+    run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
+    IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:latest")"
+    [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'latest pointer differs from verified image digest'
   fi
   if [[ "$channel" == "stable" || "$channel" == "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:${channel}" "${image}@${published_digest}" >/dev/null

@@ -647,12 +647,18 @@ pub async fn request_due_automatic_install(
         let Some(candidate)=state.candidate else { tx.commit()?; return Ok(None); };
         let release:ComponentRelease=serde_json::from_str(&candidate)?;
         let installed=parse_release(state.installed)?;
+        let desired=parse_release(state.desired)?;
+        // A selected service digest remains queued across baked restarts. Only
+        // a settled request may be replaced by a later automatic candidate.
+        if component != "webui" && desired.as_ref().is_some_and(|selected| installed.as_ref().is_none_or(|current| current.digest != selected.digest)) {
+            tx.commit()?; return Ok(None);
+        }
         if release.channel!=state.channel || release.digest!=expected_digest || state.last_digest.as_deref()==Some(release.digest.as_str()) || installed.as_ref().is_some_and(|current| current.digest==release.digest) {
             tx.commit()?; return Ok(None);
         }
         if component=="webui" {
             let reserved:i64=tx.query_row("SELECT EXISTS(SELECT 1 FROM webui_managed_assets WHERE source_sha=?1)",params![release.source_sha.clone()],|row| Ok(row.get(0)?))?;
-            if !webui_source_reusable(&release,&[installed,parse_release(state.previous)?,parse_release(state.desired)?],reserved!=0) {
+            if !webui_source_reusable(&release,&[installed,parse_release(state.previous)?,desired],reserved!=0) {
                 tx.commit()?; return Ok(None);
             }
             tx.execute("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![release.source_sha.clone(),now])?;
@@ -1499,6 +1505,83 @@ mod tests {
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_checks_preserve_pending_service_selection_until_it_runs() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-23T01:00:00Z")
+            .unwrap()
+            .timestamp();
+        for component in ["bot", "api"] {
+            let path = std::env::temp_dir().join(format!(
+                "jmodguard_pending_{component}_{:032x}.db",
+                rand::random::<u128>()
+            ));
+            let db = Db::open(&path, 2).unwrap();
+            let mut selected = candidate('a');
+            selected.component = component.into();
+            selected.channel = "stable".into();
+            selected.image = format!("ghcr.io/jatmn/jmodguard-{component}");
+            let mut newer = candidate('b');
+            newer.component = component.into();
+            newer.channel = "stable".into();
+            newer.image = format!("ghcr.io/jatmn/jmodguard-{component}");
+            let observation = ComponentObservation {
+                source_sha: selected.source_sha.clone(),
+                executable_sha256: "c".repeat(64),
+                admin_sha256: None,
+                base_image_sha: selected.source_sha.clone(),
+                started_at: now,
+                min_schema: 15,
+                max_schema: 15,
+                api_capability: 1,
+                self_update_enabled: true,
+                base_abi: "debian-bookworm-amd64".into(),
+            };
+            set_update_policy(&db, component, "stable", "daily", true)
+                .await
+                .unwrap();
+            record_update_check(&db, component, "stable", Some(selected.clone()), None, now)
+                .await
+                .unwrap();
+            request_component_install(&db, component, &selected.digest, now)
+                .await
+                .unwrap();
+            record_baked_component_running(&db, component, observation.clone(), now + 1)
+                .await
+                .unwrap();
+            record_update_check(&db, component, "stable", Some(newer.clone()), None, now + 2)
+                .await
+                .unwrap();
+
+            assert!(
+                request_due_automatic_install(&db, component, &newer.digest, now + 2, true)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "automatic {component} check displaced an outstanding owner selection"
+            );
+            let state = component_update(&db, component).await.unwrap();
+            assert_eq!(state.desired.unwrap().digest, selected.digest);
+            assert_eq!(state.state, "queued");
+
+            record_component_running(&db, component, Some(selected), observation, now + 3)
+                .await
+                .unwrap();
+            assert_eq!(
+                request_due_automatic_install(&db, component, &newer.digest, now + 3, true)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .digest,
+                newer.digest,
+                "settled {component} selection must not block later automatic releases"
+            );
+            drop(db);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
         }
     }
 

@@ -118,7 +118,7 @@ impl EventHandler for Handler {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             let app = Arc::clone(self.app());
-            tokio::spawn(async move {
+            let startup = async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
                 tracing::info!(
                     "connected as {} — {} guilds; commands are live. If commands do not respond, \
@@ -135,18 +135,20 @@ impl EventHandler for Handler {
                     if !commands::sync_slash_commands(&app, &ctx, gid).await {
                         failed = true;
                     }
-                    let mut vars = BTreeMap::new();
-                    vars.insert(
-                        "content".into(),
+                    logging::emit_system_notice(
+                        &app,
+                        &ctx.http,
+                        gid,
                         format!("Bot started (v{})", env!("CARGO_PKG_VERSION")),
-                    );
-                    logging::emit(&app, &ctx, gid, "system", vars).await;
+                    )
+                    .await;
                 }
                 if failed {
                     app.retry_slash_registry_version();
                 }
                 tracing::info!("startup slash sync complete");
-            });
+            };
+            self.app.spawn_startup_notice_task(startup).await;
         }
     }
 

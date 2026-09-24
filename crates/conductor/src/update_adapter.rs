@@ -14,6 +14,7 @@ pub const RECOVER_FORMAT: &str = "JMODGUARD-UPDATE-RECOVER-1";
 pub const INVENTORY_FORMAT: &str = "JMODGUARD-UPDATE-INVENTORY-1";
 
 const DRAIN_SECS: u64 = 5;
+const BOT_DRAIN_SECS: u64 = 10;
 const READY_SECS: u64 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,7 +187,14 @@ impl Adapter {
             return Ok(());
         };
         signal_pid(pid, true)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(DRAIN_SECS);
+        // The bot spends up to three seconds on shutdown notices before
+        // Serenity closes its shards, which can take five seconds for one shard.
+        let grace = if name == "bot" {
+            BOT_DRAIN_SECS
+        } else {
+            DRAIN_SECS
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(grace);
         while std::time::Instant::now() < deadline {
             reap(pid);
             if !pid_alive(pid) {

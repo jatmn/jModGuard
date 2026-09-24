@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serenity::model::id::ChannelId;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -26,6 +27,12 @@ struct SlashSyncProgress {
     remaining: Option<HashSet<u64>>,
     /// Config cache already invalidated once for this target.
     invalidated: bool,
+}
+
+#[derive(Default)]
+struct StartupNoticeTask {
+    stopping: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -303,6 +310,7 @@ pub struct BotState {
     pub log_delivery_failures: AtomicU64,
     pub start: Instant,
     pub slash_synced: AtomicBool,
+    startup_notice_task: tokio::sync::Mutex<StartupNoticeTask>,
     /// Last observed durable `config_version` from the DB.
     /// Primed at construction from the live DB so the first poll has no
     /// "unobserved" window where a warm cache can miss a cross-process bump.
@@ -367,6 +375,7 @@ impl BotState {
             log_delivery_failures: AtomicU64::new(0),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
+            startup_notice_task: tokio::sync::Mutex::new(StartupNoticeTask::default()),
             last_config_version: AtomicU64::new(primed.config),
             last_config_revision: parking_lot::Mutex::new(primed.config_revision),
             last_slash_registry_version: AtomicU64::new(primed.slash),
@@ -377,6 +386,31 @@ impl BotState {
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
         }))
+    }
+
+    /// Register Ready work only while this process can still send start notices.
+    pub async fn spawn_startup_notice_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut startup = self.startup_notice_task.lock().await;
+        if !startup.stopping {
+            startup.task = Some(tokio::spawn(task));
+        }
+    }
+
+    /// Stop any in-flight Ready work before the same process sends stop notices.
+    pub async fn stop_startup_notice_task(&self) {
+        let task = {
+            let mut startup = self.startup_notice_task.lock().await;
+            startup.stopping = true;
+            startup.task.take()
+        };
+        if let Some(task) = task {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!("startup notice task failed: {error}");
+            }
+        }
     }
 
     pub(crate) fn suppress_next_gateway_case(

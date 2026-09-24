@@ -203,7 +203,7 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:nightly" "${nightly_args[@]}" \
 
 readarray -d '' -t stable_args < <(build_args bot "$HEAD_SHA" v1.2.3 . stable)
 contains_arg "ghcr.io/jatmn/jmodguard-bot:latest" "${stable_args[@]}" \
-  || fail 'stable must move latest'
+  && fail 'stable must not move latest before verification'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
   || fail 'stable must tag the release'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
@@ -253,6 +253,7 @@ REDACTOR_INPUT=""
 BUILD_LINE=""
 GITHUB_TOKEN_SEEN=""
 FAIL_BUILD=0
+FAIL_VERIFY=0
 PUBLISH_SHA="$HEAD_SHA"
 TRACE_FILE=""
 PUBLISH_TEST_TRACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-traces-XXXXXX")"
@@ -267,6 +268,7 @@ mock_publish_helpers() {
 
   verify_published_image() {
     printf 'verify %s %s\n' "$1" "$2" >>"$TRACE_FILE"
+    [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
   }
 
   run_git() {
@@ -277,6 +279,9 @@ mock_publish_helpers() {
       worktree)
         if [[ "$2" == add ]]; then
           mkdir -p "$4"
+          mkdir -p "$4/scripts"
+          cp "$root/scripts/package-webui.mjs" "$4/scripts/"
+          cp -R "$root/frontend" "$4/frontend"
         elif [[ "$2" == remove ]]; then
           rm -rf "$4"
         fi
@@ -335,6 +340,7 @@ load_trace() {
 exercise_publish() {
   local changed="$1"
   FAIL_BUILD="${2:-0}"
+  FAIL_VERIFY="${7:-0}"
   local mode="${3:-main}"
   local source_token="${4:-}"
   local plan="${5:-}"
@@ -376,7 +382,7 @@ exercise_publish() {
     assert_eq "$3" "$HEAD_SHA"
     printf '%s\t\n' "$BASE_SHA"
   }
-  if [[ "$FAIL_BUILD" == 1 ]]; then
+  if [[ "$FAIL_BUILD" == 1 || "$FAIL_VERIFY" == 1 ]]; then
     if ( publish_component "$component" ) >/dev/null 2>&1; then
       fail 'failed build must not succeed'
     fi
@@ -419,7 +425,14 @@ printf '%s\n' "$BUILD_LINE" | grep -q -- '--provenance=false' || fail 'build mus
 printf '%s\n' "$BUILD_LINE" | grep -q -- '--sbom=false' || fail 'build must disable sbom'
 printf '%s\n' "$BUILD_LINE" | grep -q 'linux/amd64' || fail 'build must be linux/amd64'
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" || fail 'build must tag the SHA'
-printf '%s\n' "$BUILD_LINE" | grep -q 'ghcr.io/jatmn/jmodguard-api:latest' || fail 'main build must move latest'
+[[ "$BUILD_LINE" != *'--tag ghcr.io/jatmn/jmodguard-api:latest'* ]] \
+  || fail 'main build must not move latest before verification'
+printf '%s\n' "${CALLS[@]}" | grep -q 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' \
+  || fail 'verified main image must move latest by digest'
+verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify api ' | head -1 | cut -d: -f1)"
+promote_line="$(printf '%s\n' "${CALLS[@]}" | grep -n 'docker buildx imagetools create --prefer-index=false --tag ghcr.io/jatmn/jmodguard-api:latest' | head -1 | cut -d: -f1)"
+[[ -n "$verify_line" && -n "$promote_line" && "$verify_line" -lt "$promote_line" ]] \
+  || fail 'latest must move after effective-image verification'
 [[ "$GITHUB_TOKEN_SEEN" == test-secret ]] || fail "build secret must fall back to GHCR token, got '$GITHUB_TOKEN_SEEN'"
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'publish must remove the worktree'
 printf '%s\n' "${CALLS[@]}" | grep -q 'test-secret' && fail 'secret must not appear on argv'
@@ -432,6 +445,27 @@ JS
 
 exercise_publish 1 1
 printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' || fail 'failed build must still remove the worktree'
+
+for component in bot api webui; do
+  exercise_publish 1 0 main '' '' "$component" 1
+  [[ "$BUILD_LINE" != *"--tag ghcr.io/jatmn/jmodguard-${component}:latest"* ]] \
+    || fail "$component failed verification moved latest during build"
+  printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
+    && fail "$component failed verification promoted latest"
+done
+
+stable_plan="$(plan_json manual refs/tags/v1 "$HEAD_SHA" "$BASE_SHA" v1.2.3)"
+exercise_publish 1 0 manual '' "$stable_plan" bot 1
+printf '%s\n' "${CALLS[@]}" | grep -q -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' \
+  && fail 'failed Stable verification promoted stable'
+printf '%s\n' "${CALLS[@]}" | grep -q -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' \
+  && fail 'failed Stable verification promoted latest'
+exercise_publish 1 0 manual '' "$stable_plan" bot
+verify_line="$(printf '%s\n' "${CALLS[@]}" | grep -n '^verify bot ' | head -1 | cut -d: -f1)"
+latest_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:latest' | head -1 | cut -d: -f1)"
+stable_line="$(printf '%s\n' "${CALLS[@]}" | grep -n -- '--tag ghcr.io/jatmn/jmodguard-bot:stable' | head -1 | cut -d: -f1)"
+[[ -n "$verify_line" && -n "$latest_line" && -n "$stable_line" && "$verify_line" -lt "$latest_line" && "$verify_line" -lt "$stable_line" ]] \
+  || fail 'Stable publication must promote both moving pointers after verification'
 
 reload_publisher
 saved_publish_tmp="${TMPDIR:-/tmp}"
