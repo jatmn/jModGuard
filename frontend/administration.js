@@ -35,8 +35,15 @@ function initTheme() {
   apply();
 }
 
+function applicationPending(record) {
+  // A launcher failure changes the shared state but leaves a service request active.
+  // Failed WebUI publications intentionally retain desired for recovery, not retry.
+  return record.state === "queued" || Boolean(record.component !== "webui" &&
+    record.desired && record.desired.digest !== record.installed?.digest);
+}
+
 function pending(record) {
-  return record.state === "queued" || Boolean(record.desired_launcher &&
+  return applicationPending(record) || Boolean(record.desired_launcher &&
     record.desired_launcher.digest !== record.installed_launcher?.digest);
 }
 
@@ -185,6 +192,10 @@ function render() {
   const browser = document.getElementById("browser-version");
   browser.replaceChildren();
   const browserDetails = node("details");
+  browserDetails.open = expanded.has("browser");
+  browserDetails.addEventListener("toggle", () => {
+    if (browserDetails.open) expanded.add("browser"); else expanded.delete("browser");
+  });
   browserDetails.append(node("summary", "Browser version"));
   line(browserDetails, "Loaded WebUI SHA", loaded);
   line(browserDetails, "Storage-observed SHA", installedWeb);
@@ -260,9 +271,9 @@ function render() {
     row.append(action("Check now", () => request("/api/updates/check", { component: record.component }), false, record));
     const canApply = snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
     if (record.candidate) {
-      const applicationPending = record.state === "queued" && record.desired?.digest === record.candidate.digest;
+      const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate.digest;
       const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate.digest;
-      row.append(action(record.component === "webui" ? "Update WebUI" : "Update application", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest }), !canApply || applicationCurrent || applicationPending, record));
+      row.append(action(record.component === "webui" ? "Update WebUI" : "Update application", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest }), !canApply || applicationCurrent || candidatePending, record));
       if (record.component !== "webui") {
         const launcherPending = record.desired_launcher?.digest === record.candidate.digest;
         const launcherCurrent = record.installed_launcher?.digest === record.candidate.digest;

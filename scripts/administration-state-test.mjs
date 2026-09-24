@@ -402,3 +402,70 @@ test("uptime uses compact day/hour/minute/second units without leading zero unit
   assert.equal(vm.runInContext(`uptime(${now - 94418})`, view.context), "1d 2h 13m 38s");
   assert.equal(vm.runInContext("uptime(null)", view.context), "unknown");
 });
+
+
+test("service application and launcher requests reconcile independently after a sibling failure", async () => {
+  for (const component of ["api", "bot"]) {
+    const item = record(component);
+    item.desired = { ...item.candidate };
+    item.desired_launcher = { ...item.candidate };
+    item.state = "queued";
+    const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
+    item.desired_launcher = null;
+    item.state = "failed";
+    item.last_error = "launcher update: download failed";
+    await vm.runInContext("refresh()", view.context);
+    assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.match(textOf(view.elements.get("update-cards")), /launcher update: download failed/);
+    assert.equal([...view.timers.values()][0].delay, 2000);
+    assert.equal(updateButton(view, component).disabled, true);
+    assert.equal(updateButton(view, component, true).disabled, false);
+    // Owner can supersede a still-active application request with a different digest.
+    item.candidate = { ...item.candidate, digest: "sha256:" + "e".repeat(64) };
+    await vm.runInContext("refresh()", view.context);
+    assert.equal(updateButton(view, component).disabled, false);
+    item.installed = { ...item.desired };
+    item.state = "running";
+    item.last_error = null;
+    await vm.runInContext("refresh()", view.context);
+    assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.equal([...view.timers.values()][0].delay, 30000);
+    // The inverse outcome keeps a launcher pending after application failure.
+    item.desired = null;
+    item.desired_launcher = { ...item.candidate };
+    item.state = "failed";
+    item.last_error = "application download failed";
+    await vm.runInContext("refresh()", view.context);
+    assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.match(textOf(view.elements.get("update-cards")), /application download failed/);
+    assert.equal([...view.timers.values()][0].delay, 2000);
+    item.installed_launcher = { ...item.desired_launcher };
+    await vm.runInContext("refresh()", view.context);
+    assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.equal([...view.timers.values()][0].delay, 30000);
+  }
+});
+
+test("failed WebUI publication remains terminal even with a retained desired digest", async () => {
+  const item = record("webui");
+  item.desired = { ...item.candidate };
+  item.state = "failed";
+  item.last_error = "publication interrupted";
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
+  assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+  assert.equal([...view.timers.values()][0].delay, 30000);
+  assert.equal(updateButton(view, "webui").disabled, false);
+});
+
+test("Browser version remains expanded or collapsed across status refreshes", async () => {
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
+  const details = () => find(view.elements.get("browser-version"), (element) => element.tag === "details");
+  details().open = true;
+  details().listeners.toggle();
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(details().open, true);
+  details().open = false;
+  details().listeners.toggle();
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(details().open, false);
+});
