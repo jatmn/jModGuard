@@ -35,19 +35,19 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     let app = BotState::new(cfg, db)?;
     let before = app.configs.get(&app.db, guild_id).await?;
     std::fs::write(dir.join("bot-ready"), &before.settings.prefix)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let _ = app.poll_config_version().await?;
-        let current = app.configs.get(&app.db, guild_id).await?;
-        if current.settings.prefix == expect {
-            std::fs::write(dir.join("bot-refreshed"), &current.settings.prefix)?;
-            return Ok(());
+        // Accept only a poll-driven invalidation. `configs.get` also reloads
+        // after the 15s cache TTL, which would hide a broken poll.
+        if app.poll_config_version().await? {
+            let current = app.configs.get(&app.db, guild_id).await?;
+            if current.settings.prefix == expect {
+                std::fs::write(dir.join("bot-refreshed"), &current.settings.prefix)?;
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
-            bail!(
-                "bot cache stayed at {:?} waiting for {expect:?}",
-                current.settings.prefix
-            );
+            bail!("bot cache did not refresh to {expect:?} after config poll");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
