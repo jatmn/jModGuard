@@ -69,12 +69,12 @@ impl std::fmt::Display for DiscordRateLimit {
 impl std::error::Error for DiscordRateLimit {}
 
 /// Seconds advertised to the browser. Missing or zero Discord values still
-/// impose a one-second floor so callers do not hammer immediately. Values
-/// above a minute are capped so a bad header cannot stall the dashboard.
+/// impose a one-second floor so callers do not hammer immediately. The HTTP
+/// handler returns immediately; this number is not a sleep.
 pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
     let millis = retry_after.as_millis();
     let seconds = millis.div_ceil(1000) as u64;
-    seconds.clamp(1, 60)
+    seconds.max(1)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -327,7 +327,8 @@ impl OAuthClient {
 
 /// Discord's rate-limit docs: use `Retry-After` or JSON `retry_after` (seconds).
 /// Prefer the longer of the two when both are present. Missing, zero, or
-/// unparseable values still wait one second. The shared gate caps at 60s.
+/// unparseable values still wait one second. Waits above one minute are kept.
+/// Only a value that would overflow the process clock is stored as 24 hours.
 pub(crate) fn discord_retry_after(header: Option<&str>, body: &[u8]) -> Duration {
     let from_header = header.and_then(parse_retry_seconds);
     let from_body = serde_json::from_slice::<serde_json::Value>(body)
@@ -340,7 +341,7 @@ pub(crate) fn discord_retry_after(header: Option<&str>, body: &[u8]) -> Duration
         (None, Some(body)) => body,
         (None, None) => 1.0,
     };
-    let millis = (seconds * 1000.0).ceil().clamp(1000.0, 60_000.0) as u64;
+    let millis = (seconds * 1000.0).ceil().clamp(1000.0, 86_400_000.0) as u64;
     Duration::from_millis(millis)
 }
 
@@ -408,7 +409,11 @@ mod tests {
         );
         assert_eq!(discord_retry_after(None, b"{}").as_secs(), 1);
         assert_eq!(discord_retry_after(Some("0"), b"{}").as_secs(), 1);
-        assert_eq!(discord_retry_after(Some("120"), b"{}").as_secs(), 60);
+        assert_eq!(discord_retry_after(Some("120"), b"{}").as_secs(), 120);
+        assert_eq!(
+            discord_retry_after(Some("999999"), b"{}").as_secs(),
+            24 * 60 * 60
+        );
         assert_eq!(
             retry_after_header_secs(discord_retry_after(Some("4.2"), b"{}")),
             5
