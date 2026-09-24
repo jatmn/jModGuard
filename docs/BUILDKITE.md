@@ -1,8 +1,9 @@
 # Buildkite CI and image publishing
 
 All CI and image publication for this repository run on the self-hosted
-Buildkite `linux` queue. There are no GitHub Actions workflows or GHA runner
-selection/fallback jobs, and this repository has no registered GitHub Actions
+Buildkite `linux` queue. The only GitHub Actions workflow is the owner-command
+Pullfrog agent (`docs/PULLFROG.md`); it is not CI or an image publisher. There
+are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
@@ -45,9 +46,10 @@ advisory-database fetch/load errors) still fail the test job even on the
 fail-open path. The existing clone credential must also fetch tags and full commits from
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
-cache service. Do not add `.github/workflows`; there are no GitHub-hosted CI
-minutes for this repository. Hosted Dependabot Updates are not CI and do not
-consume those minutes. If a Dependabot job stays queued on a `dependabot`
+cache service. Do not add GitHub Actions CI workflows. An owner comment
+containing `@pullfrog` can start the hosted verifier job and use Actions
+minutes even when the agent rejects it as a non-command. Hosted Dependabot
+Updates are not CI and do not consume those minutes. If a Dependabot job stays queued on a `dependabot`
 label, GitHub cancels it after 24 hours.
 
 The remote database job runs `remote_database_smoke` and `guild_store_smoke` from
