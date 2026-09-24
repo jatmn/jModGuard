@@ -282,16 +282,18 @@ impl OAuthClient {
 
     pub async fn my_guilds(
         &self,
+        user_id: u64,
         access_token: &str,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
-        if let Some(retry_after) = self.cooldown_remaining(access_token) {
+        let user_key = user_id.to_string();
+        if let Some(retry_after) = self.cooldown_remaining(&user_key) {
             return Err(GuildListError::RateLimited { retry_after });
         }
-        // Same-token callers share one fetch. The cooldown map is not held
-        // across Discord I/O, so another token is not stalled behind this one.
-        let flight = self.guild_flight(access_token).await;
-        let _same_token = flight.lock().await;
-        if let Some(retry_after) = self.cooldown_remaining(access_token) {
+        // Callers for one Discord user share one fetch. Another user's lookup
+        // does not wait on this one, and a new access token does not bypass it.
+        let flight = self.guild_flight(&user_key).await;
+        let _same_user = flight.lock().await;
+        if let Some(retry_after) = self.cooldown_remaining(&user_key) {
             return Err(GuildListError::RateLimited { retry_after });
         }
         // Discord paginates at 200 guilds; a single GET silently drops every
@@ -327,15 +329,15 @@ impl OAuthClient {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
                 let provisional = discord_retry_after(header.as_deref(), b"{}");
-                self.remember_cooldown(access_token, provisional);
+                self.remember_cooldown(&user_key, provisional);
                 let gate = std::sync::Arc::clone(&self.guild_list);
-                let token = access_token.to_owned();
+                let cooldown_key = user_key.clone();
                 let finish = tokio::spawn(async move {
                     let bytes = resp.bytes().await.unwrap_or_default();
                     let retry_after = discord_retry_after(header.as_deref(), &bytes);
                     gate.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .block_until(&token, retry_after);
+                        .block_until(&cooldown_key, retry_after);
                     retry_after
                 });
                 let retry_after = finish.await.unwrap_or(provisional);
@@ -535,16 +537,59 @@ mod tests {
             token_endpoint: None,
         });
         let slow_client = std::sync::Arc::clone(&client);
-        let slow = tokio::spawn(async move { slow_client.my_guilds("slow").await });
+        let slow = tokio::spawn(async move { slow_client.my_guilds(1, "slow").await });
         let wait_started = Instant::now();
         while !entered.load(std::sync::atomic::Ordering::SeqCst) {
             assert!(wait_started.elapsed() < Duration::from_secs(2));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let started = Instant::now();
-        client.my_guilds("fast").await.unwrap();
+        client.my_guilds(2, "fast").await.unwrap();
         assert!(started.elapsed() < Duration::from_millis(250));
         slow.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshed_token_for_the_same_user_does_not_bypass_cooldown() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/guilds",
+                axum::routing::get(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "30")],
+                            axum::Json(serde_json::json!({"retry_after": 30})),
+                        )
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = OAuthClient {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            http: reqwest::Client::new(),
+            guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
+            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guilds_endpoint: Some(format!("http://{address}/guilds")),
+            token_endpoint: None,
+        };
+        let first = client.my_guilds(7, "old-token").await.unwrap_err();
+        assert!(matches!(first, GuildListError::RateLimited { .. }));
+        let second = client.my_guilds(7, "refreshed-token").await.unwrap_err();
+        assert!(matches!(second, GuildListError::RateLimited { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let other = client.my_guilds(8, "other-user").await.unwrap_err();
+        assert!(matches!(other, GuildListError::RateLimited { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -273,7 +273,7 @@ async fn require_auth_with(
     // Authorization / cold display: always re-fetch guilds from Discord.
     // Fail closed — never authorize from a stale guild snapshot (MustRefresh).
     // User profile may stay cached; `can_manage` only needs guild membership.
-    let (access, guilds) = match app.oauth.my_guilds(&token).await {
+    let (access, guilds) = match app.oauth.my_guilds(user_id, &token).await {
         Ok(g) => (token.clone(), g),
         Err(oauth::GuildListError::Unauthorized) => {
             tracing::warn!(
@@ -290,7 +290,7 @@ async fn require_auth_with(
             if let Some(r) = &tok.refresh_token {
                 let _ = session.insert(SESSION_REFRESH, r).await;
             }
-            match app.oauth.my_guilds(&tok.access_token).await {
+            match app.oauth.my_guilds(user_id, &tok.access_token).await {
                 Ok(g) => (tok.access_token, g),
                 Err(error) => return Err(guild_list_failure(user_id, error)),
             }
