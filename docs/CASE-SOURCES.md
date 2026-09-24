@@ -22,6 +22,10 @@ Discord provenance. Subject/time similarity alone is not a supported correlation
 
 The model permits one ID of each kind per case. This is identity cardinality, not a
 configurable retention or capacity ceiling: multiple Discord actions require separate cases.
+The [member directory](MEMBERS.md) indexes canonical cases by subject for its
+timeline. Bounded audit recovery uses stable Discord audit IDs as replay keys;
+current-ban snapshots alone do not create dated action cases. Neither a subject
+ID nor a nearby timestamp is sufficient to merge distinct ban/unban actions.
 There is no unbounded alias list. An identical association returns `Existing` without writes;
 a new association returns `Linked`. A source already owned by a different case, an occupied
 source kind, a missing/wrong anchor or a conflicting target ID fails. No source is reassigned.

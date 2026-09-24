@@ -212,6 +212,13 @@ work. Both services still require database write access. Public library helpers 
 internal operations, not a security API. Assign the bot token only to the bot and OAuth
 credentials only to the API; ignoring a shared file's fields does not hide its raw contents.
 
+The Members status card uses `POST .../member-sync/actions` for typed
+`pause`, `resume`, `retry`, and `reconcile` requests with the same stable
+request-key, page-membership, and fresh Manage Guild checks. The bot records a
+receipt after applying a control to scoped guild-store sync state. `retry` on a
+completed initial import does not start another seed; `reconcile` is the
+separate explicit full Discord scan. See [MEMBERS.md](MEMBERS.md).
+
 ## Runtime controls
 
 Environment overrides TOML. `[actions]` is shared; configure the same storage policy in

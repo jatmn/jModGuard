@@ -523,7 +523,18 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
                     .await?;
             }
         }
+        for table in ["guild_member_feature", "guild_member_seed", "guild_member_sync", "guild_member_directory", "guild_member_pending_bans", "guild_member_stays", "guild_member_state_observations", "guild_member_target_checks", "guild_member_audit_recovery"] {
+            copy_member_table(&src, &dest_conn, table, guild).await?;
+        }
         copy_cases(&src, &dest_conn, guild).await?;
+        copy_member_table(&src, &dest_conn, "guild_member_case_index", guild).await?;
+        if table_exists(&dest_conn, "guild_member_sync").await? {
+            dest_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
+            dest_conn.execute("UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=unixepoch()*1000 WHERE guild_id=?",libsql::params![guild]).await?;
+            dest_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
+            dest_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE guild_id=? AND status!='complete' AND cursor IS NOT NULL",libsql::params![guild]).await?;
+            dest_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=? AND initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",libsql::params![guild]).await?;
+        }
         copy_history(&src, &dest_conn, guild).await?;
         copy_extra_sources(&src, &dest_conn, guild).await?;
         copy_live_evidence(&src, &dest_conn, guild).await?;
@@ -560,6 +571,52 @@ async fn copy_cases(src: &libsql::Connection, dest: &libsql::Connection, guild: 
                 row.get::<Option<String>>(3)?,
                 row.get::<i64>(4)?
             ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn copy_member_table(
+    src: &libsql::Connection,
+    dest: &libsql::Connection,
+    table: &str,
+    guild: i64,
+) -> Result<()> {
+    ensure!(
+        [
+            "guild_member_feature",
+            "guild_member_seed",
+            "guild_member_sync",
+            "guild_member_directory",
+            "guild_member_pending_bans",
+            "guild_member_stays",
+            "guild_member_state_observations",
+            "guild_member_target_checks",
+            "guild_member_audit_recovery",
+            "guild_member_case_index"
+        ]
+        .contains(&table),
+        "unsupported member table"
+    );
+    if !table_exists(src, table).await? {
+        return Ok(());
+    }
+    let mut rows = src
+        .query(
+            &format!("SELECT * FROM {table} WHERE guild_id=?"),
+            libsql::params![guild],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let width = row.column_count();
+        let placeholders = vec!["?"; width as usize].join(",");
+        let values = (0..width)
+            .map(|i| row.get_value(i))
+            .collect::<libsql::Result<Vec<_>>>()?;
+        dest.execute(
+            &format!("INSERT OR IGNORE INTO {table} VALUES({placeholders})"),
+            libsql::params_from_iter(values),
         )
         .await?;
     }
@@ -754,6 +811,9 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
         }
         conn.execute("DELETE FROM guild_cases WHERE guild_id=?", libsql::params![guild])
             .await?;
+        for table in ["guild_member_case_index","guild_member_state_observations","guild_member_target_checks","guild_member_audit_recovery","guild_member_stays","guild_member_pending_bans","guild_member_directory","guild_member_sync","guild_member_seed","guild_member_feature"] {
+            if table_exists(&conn,table).await? {conn.execute(&format!("DELETE FROM {table} WHERE guild_id=?"),libsql::params![guild]).await?;}
+        }
         if table_exists(&conn, "guild_tenant_settings").await? {
             conn.execute(
                 "DELETE FROM guild_tenant_settings WHERE guild_id=?",
@@ -793,7 +853,24 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
         expected.get("cases") == got.get("cases")
             && expected.get("memberships") == got.get("memberships")
             && expected.get("log_channels") == got.get("log_channels")
-            && expected.get("history") == got.get("history"),
+            && expected.get("history") == got.get("history")
+            && expected.get("member_seed") == got.get("member_seed")
+            && expected.get("member_directory") == got.get("member_directory")
+            && expected.get("member_stays") == got.get("member_stays")
+            && expected.get("member_feature") == got.get("member_feature")
+            && expected.get("member_sync") == got.get("member_sync")
+            && expected.get("member_pending_bans") == got.get("member_pending_bans")
+            && expected.get("member_state_observations") == got.get("member_state_observations")
+            && expected.get("member_target_checks") == got.get("member_target_checks")
+            && expected.get("member_audit_recovery") == got.get("member_audit_recovery")
+            && got
+                .get("member_case_index")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                >= expected
+                    .get("member_case_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
         "destination counts do not match the frozen source"
     );
     Ok(())
@@ -835,11 +912,45 @@ async fn tenant_counts(path: &Path, guild: i64) -> Result<Value> {
     } else {
         0
     };
+    let mut member_counts = Vec::new();
+    for table in [
+        "guild_member_seed",
+        "guild_member_directory",
+        "guild_member_stays",
+        "guild_member_feature",
+        "guild_member_sync",
+        "guild_member_pending_bans",
+        "guild_member_case_index",
+        "guild_member_state_observations",
+        "guild_member_target_checks",
+        "guild_member_audit_recovery",
+    ] {
+        member_counts.push(if table_exists(&conn, table).await? {
+            scalar(
+                &conn,
+                &format!("SELECT COUNT(*) FROM {table} WHERE guild_id=?"),
+                libsql::params![guild],
+            )
+            .await?
+        } else {
+            0
+        });
+    }
     Ok(json!({
         "memberships": memberships,
         "log_channels": logs,
         "cases": cases,
         "history": history,
+        "member_seed":member_counts[0],
+        "member_directory":member_counts[1],
+        "member_stays":member_counts[2],
+        "member_feature":member_counts[3],
+        "member_sync":member_counts[4],
+        "member_pending_bans":member_counts[5],
+        "member_case_index":member_counts[6],
+        "member_state_observations":member_counts[7],
+        "member_target_checks":member_counts[8],
+        "member_audit_recovery":member_counts[9],
     }))
 }
 

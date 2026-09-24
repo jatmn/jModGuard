@@ -493,6 +493,23 @@ pub async fn execute_pending(
             }
         }
         "ban" => {
+            let pending_ban = match crate::member_directory::begin_ban_attempt(
+                app,
+                guild_id.get(),
+                target.id.get(),
+            )
+            .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(
+                        guild_id = guild_id.get(),
+                        user_id = target.id.get(),
+                        "automod ban deferred until retention marker is available: {error:#}"
+                    );
+                    return;
+                }
+            };
             let suppression = app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 guild_id.get(),
@@ -523,7 +540,7 @@ pub async fn execute_pending(
                 app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
-                outcome,
+                outcome.clone(),
                 target.id.get(),
                 None,
                 Some(reason.clone()),
@@ -535,6 +552,7 @@ pub async fn execute_pending(
                 ),
             )
             .await;
+            pending_ban.finish(app, outcome).await;
         }
         other => {
             tracing::warn!("unknown automod action `{other}`");

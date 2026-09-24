@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod cases;
+pub mod members;
 pub mod oauth;
 pub mod preview;
 pub mod state;
@@ -943,6 +944,26 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/api/guilds/{guild_id}/stats", get_post(api::stats))
         .route("/api/guilds/{guild_id}/cases", get_post(cases::list_cases))
         .route(
+            "/api/guilds/{guild_id}/members",
+            get_post(members::list_members),
+        )
+        .route(
+            "/api/guilds/{guild_id}/members/{user_id}",
+            get_post(members::get_member),
+        )
+        .route(
+            "/api/guilds/{guild_id}/members/{user_id}/history",
+            get_post(members::member_history),
+        )
+        .route(
+            "/api/guilds/{guild_id}/member-sync",
+            get_post(members::sync_status),
+        )
+        .route(
+            "/api/guilds/{guild_id}/member-sync/actions",
+            axum::routing::post(members::sync_action),
+        )
+        .route(
             "/api/guilds/{guild_id}/cases/{case_id}",
             get(cases::get_case)
                 .post(cases::get_case)
@@ -1293,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_members_history_endpoint_is_not_served() {
+    async fn member_directory_requires_authorization() {
         let response = test_app()
             .oneshot(
                 Request::builder()
@@ -1303,7 +1324,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

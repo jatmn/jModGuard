@@ -260,6 +260,12 @@ async fn run_step(
         PlanStep::Ban { delete_days } => {
             let target = target.expect("target-required plan steps are validated before execution");
             refuse_fenced_discord_mutation(env).await?;
+            let pending_ban = crate::member_directory::begin_ban_attempt(
+                env.app,
+                env.guild_id.get(),
+                target.get(),
+            )
+            .await?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 env.guild_id.get(),
@@ -284,6 +290,12 @@ async fn run_step(
                 &result,
             )
             .await;
+            pending_ban
+                .finish(
+                    env.app,
+                    crate::cases::classify_discord(result.as_ref().err()),
+                )
+                .await;
             result?;
             db::record_enrolled_ban(
                 &env.app.db,

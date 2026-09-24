@@ -38,6 +38,9 @@ pub enum CaseSource {
     Application {
         operation_id: CaseId,
     },
+    GatewayObservation {
+        observation_id: CaseId,
+    },
     DiscordAudit {
         #[serde(
             serialize_with = "crate::ids::ser_i64_str",
@@ -49,7 +52,7 @@ pub enum CaseSource {
 impl CaseSource {
     pub(super) fn kind(&self) -> i64 {
         match self {
-            Self::Application { .. } => 0,
+            Self::Application { .. } | Self::GatewayObservation { .. } => 0,
             Self::DiscordAudit { .. } => 1,
         }
     }
@@ -57,6 +60,9 @@ impl CaseSource {
     pub(super) fn key(&self) -> Result<String> {
         match self {
             Self::Application { operation_id } => Ok(format!("app:{}", operation_id.as_str())),
+            Self::GatewayObservation { observation_id } => {
+                Ok(format!("app:{}", observation_id.as_str()))
+            }
             Self::DiscordAudit { entry_id } => {
                 anyhow::ensure!(*entry_id > 0, CaseError::Invalid);
                 Ok(format!("discord:{entry_id}"))

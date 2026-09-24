@@ -19,7 +19,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const node = (tag) => {
     const classes = new Set();
     return {
-      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false, value: '',
       classList: {
         toggle(name, force) {
           const enabled = force === undefined ? !classes.has(name) : !!force;
@@ -85,8 +85,12 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
     nodes.get(key).classList.add('hidden');
   }
+  const timers = new Map();
+  let nextTimer = 1;
+  const documentListeners = new Map();
   const context = vm.createContext({
     document: {
+      visibilityState: 'visible', addEventListener(name, fn) { documentListeners.set(name, fn); }, removeEventListener(name, fn) { if (documentListeners.get(name) === fn) documentListeners.delete(name); },
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       getElementById: (id) => nodes.get('#' + id) || null,
@@ -95,13 +99,15 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
+    fetch: fetchImpl, console, AbortController, URLSearchParams,
+    setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); }, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document: context.document, documentListeners };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -116,6 +122,14 @@ function findNode(root, predicate) {
 
 function textOf(root) {
   return (root.textContent || '') + (root.children || []).map(textOf).join('');
+}
+
+async function runMemberPoll(h) {
+  const pending = [...h.timers].find(([, timer]) => timer.delay === 10000);
+  assert(pending, 'expected a visible Members status poll');
+  h.timers.delete(pending[0]);
+  await pending[1].fn();
+  await new Promise(resolve => setImmediate(resolve));
 }
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
@@ -227,13 +241,214 @@ test('blocked browser storage does not block navigation or restoration', () => {
   assert.equal(app.state.guildId, app.state.guilds[0].id);
 });
 
-test('saved Members tab falls back to the dashboard after history removal', () => {
+test('saved Members tab restores for the selected guild', () => {
   const { app, storage } = harness();
   const guildId = app.state.guilds[1].id;
   storage.set(app.workspaceKey(), JSON.stringify({ guildId, tab: 'members' }));
   app.restoreWorkspace();
   assert.equal(app.state.guildId, guildId);
-  assert.equal(app.state.tab, 'dashboard');
+  assert.equal(app.state.tab, 'members');
+});
+
+test('Members uses saved identity, keeps large IDs exact and labels partial import', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.endsWith('/member-sync')) return response({ status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: '🌻 Willow', username: 'willow', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /🌻 Willow/);
+  assert.match(textOf(panel), /1800882749273538599/);
+  assert.match(textOf(panel), /Results are partial/);
+  assert.match(textOf(panel), /Unknown/);
+  assert.equal(calls.length, 2);
+  assert(calls.every(call => call.opts.method === 'POST' && call.opts.headers['x-jmodguard-enrollment'] === 'member-enrollment'));
+});
+
+test('Members separates current ban reason from an unresolved Gateway action', async () => {
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
+    if (url.includes('/history')) return response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'gateway_observation_unlinked', case_id: 'case-1' }], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Current reason: Current rule/);
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Gateway observation; action time unconfirmed/);
+  assert.match(textOf(panel), /Case case-1/);
+});
+
+test('Members labels verified state changes with unknown event time and separate check time', async () => {
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000, reconciliation_needed: true, audit_recovery_status: 'waiting', audit_recovery_phase: 'unban', audit_recovery_processed: 3, audit_recovery_reason: 'rate_limited', audit_recovery_next_attempt_at: 1790000000000, audit_recovery_last_progress_at: 1789999990000 });
+    if (url.includes('/history')) return response({ entries: [
+      { kind: 'member_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'ban_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'membership_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+    ], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Membership absence · Unknown/);
+  assert.match(textOf(panel), /Membership state check · Unknown/);
+  assert.match(textOf(panel), /Ban absence · Unknown/);
+  assert.match(textOf(panel), /Checked /);
+  assert.match(textOf(panel), /Bounded audit recovery: Unban actions · waiting · 3 entries checked · rate_limited/);
+  assert.match(textOf(panel), /Audit recovery next attempt:/);
+  assert.match(textOf(panel), /Audit recovery last progressed:/);
+  assert.doesNotMatch(textOf(panel), /Case /);
+});
+
+test('Members keeps polling audit-only recovery while visible and stops when it completes or hides', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      return response({ status: 'complete', phase: 'complete', progress_revision: 7, initial_completed_at: 1790000000000,
+        audit_recovery_status: statusReads < 3 ? 'waiting' : 'complete', audit_recovery_phase: 'ban' });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 1);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  h.document.visibilityState = 'hidden';
+  h.documentListeners.get('visibilitychange')();
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+  h.document.visibilityState = 'visible';
+  h.documentListeners.get('visibilitychange')();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 2);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 3);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members polls acknowledged Resume until its receipt and newer status agree', async () => {
+  const guildId = '987654321098765432';
+  const action = { id: 'sync-action-1', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  const statuses = [
+    { status: 'paused', progress_revision: 5 },
+    { status: 'paused', progress_revision: 4 }, // stale read after acknowledgment
+    { status: 'paused', progress_revision: 5 },
+    { status: 'queued', progress_revision: 6 },
+    { status: 'complete', progress_revision: 7 },
+  ];
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) return response({ phase: 'members', run_id: 'initial-1', initial_completed_at: null, ...statuses[statusReads++] });
+    if (url.endsWith('/actions')) return response([action]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 1);
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Resume requested · bot action pending/);
+  assert.equal(statusReads, 2);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 3);
+  assert.match(textOf(panel), /Resume requested/);
+  action.state = 'succeeded';
+  await runMemberPoll(h);
+  assert.equal(statusReads, 4);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 5);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members stops pending-control polling when the bot action fails', async () => {
+  const action = { id: 'sync-action-failed', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response({ ...action, state: 'pending' });
+    if (url.endsWith('/member-sync')) return response({ status: 'paused', phase: 'members', run_id: 'initial-1', progress_revision: 5 });
+    if (url.endsWith('/actions')) return response([{ ...action, state: 'failed' }]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /resume action failed. Check Bot actions for details/);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members retains an acknowledged control and retries after a status refresh error', async () => {
+  let statusReads = 0;
+  const action = { id: 'sync-action-delayed', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads > 1) throw new Error('temporary outage');
+      return response({ status: 'paused', phase: 'members', run_id: 'initial-1', progress_revision: 5 });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Resume requested · bot action pending/);
+  assert.match(textOf(panel), /Could not refresh import status/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+});
+
+test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ status: 'queued', phase: 'bans', progress_revision: 9, processed: 80, total_estimate: 80, total_is_estimated: false,
+        estimate_reason: 'worker_unconfirmed', phase_remaining_seconds: null, phase_finish_at: 1790999999999, as_of: 1790000000000 })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const copy = textOf(panel);
+  assert.match(copy, /80 members counted/);
+  assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
+  assert.match(copy, /bot may be between paced pages/);
+  assert.doesNotMatch(copy, /worker is offline/i);
+});
+
+test('Members drops responses from a previous server and page enrollment', async () => {
+  const pending = [];
+  const h = harness((url) => new Promise(resolve => pending.push({ url, resolve })));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'old-enrollment' };
+  const panel = h.app.tabMembers();
+  h.app.state.config = { enrollment_id: 'replacement-enrollment' };
+  pending.find(item => item.url.endsWith('/member-sync')).resolve(response({ status: 'complete', phase: 'complete', progress_revision: 100, processed: 1 }));
+  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong server' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Wrong server/);
+  assert.doesNotMatch(textOf(panel), /Initial member import/);
 });
 
 test('dropdown option arrays become real nodes and boolean false stays false', () => {
@@ -1216,11 +1431,11 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   assert.match(calls[3].url, /\/actions\/log-run$/);
 });
 
-test('moderation reads send the loaded page membership including query-string routes', async () => {
+test('moderation and member reads send the loaded page membership including query-string routes', async () => {
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=willow', 'members/1800882749273538599/history', 'member-sync']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -1229,7 +1444,7 @@ test('moderation reads send the loaded page membership including query-string ro
   h.app.state.config = null;
   await h.app.api(`/api/guilds/${h.app.state.guildId}/stats`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
-  assert.equal(calls.length, 8, 'reads must not silently load a new membership');
+  assert.equal(calls.length, 11, 'reads must not silently load a new membership');
 });
 
 test('individual configuration GETs retain loaded membership without rebinding global or foreign scopes', async () => {

@@ -1118,6 +1118,7 @@ fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action) -> bool {
     match action {
         Action::Unban { .. } => auth.can_ban_members(guild),
         Action::SetLogChannel { .. } => auth.can_manage(guild),
+        Action::MemberSync { .. } => auth.can_manage(guild),
     }
 }
 

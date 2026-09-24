@@ -32,12 +32,15 @@ or the recognized `jmodguard-core-1` family; see `docs/DATABASE-BASELINE.md`. Pr
 family/version checks before bootstrap writes. Never adopt an unmarked old database.
 
 Routine collection of message text/attachments and member/user activity is retired.
+The bounded member directory is a separate current-membership and retained-ban
+feature; see `docs/MEMBERS.md`. It never records general activity.
 See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
 Basic events report to Discord using supplied fields, with bounded delivery and no
 history reconstruction. Message-edit reports require Discord's `edited_timestamp`;
 embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
 report is that one event. Leave logs may use bounded join timestamps already received
-with messages; never fetch a roster. Ban/unban display may use bounded recent audit
+with messages. The separate paced directory importer may list the roster; basic
+report delivery never does. Ban/unban display may use bounded recent audit
 lookup inside report admission; a gateway ban may use the same bounded lookup
 under the report concurrency limit after saving its row. Neither establishes
 durable case-source identity.
@@ -75,7 +78,9 @@ Dashboard cancel may clear unstarted (`pending`/`claimed`) work and stuck log-ch
 The bot records its own membership observations; see `docs/ENROLLMENTS.md`. They now
 bind queue storage, the nickname outbox and API configuration scope.
 Positive repair must stay bounded, use the existing bot HTTP/identity, never fetch a
-member roster or infer removal from omissions/errors. Missing/outage Gateway context
+member roster or infer removal from omissions/errors. The separate Members sync
+worker has an explicit paced roster contract; enrollment repair does not use it.
+Missing/outage Gateway context
 cannot retire an observation. Healthy matching joins write no rows/receipts; resuming a
 dormant request in that exact membership is a mutation with recovery receipts. No
 configuration version changes on observations.
@@ -111,7 +116,7 @@ The guild-store catalog and `TenantRuntime` now route live isolated tenant data 
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Populated shared/dedicated
 moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 8. Identity,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 9. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write. The conductor still has no tenant routing.
 Stable/Nightly publication uses Release Please plus scheduled Buildkite Nightlies; complete
@@ -175,7 +180,7 @@ acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve im
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
 markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core is at migration 0014. Local HTTP/SQL fixtures
+and backup-copy lifecycle remain before activation. Core is at migration 0016. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and

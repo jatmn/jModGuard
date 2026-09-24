@@ -83,6 +83,11 @@ Installation → Validate install plan (`GET /api/install`, `GET /api/install/pl
 7. Practice restore into the absent restore target. After conductor
    self-replacement, run `jmodguard-conductor recover-update` independently of
    OAuth and private ops ([UPDATES.md](UPDATES.md)).
+8. Open **Members** in the guild dashboard to see the automatic initial import
+   and its progress. The bot fetches the roster itself in pages of 100 at least
+   15 seconds apart. About 11,000 members take roughly 28 minutes for the
+   member phase before retries, other guilds and later phases. See
+   [MEMBERS.md](MEMBERS.md) for completion, pause, and explicit reconciliation.
 
 ## Local disposable install and recovery drill
 

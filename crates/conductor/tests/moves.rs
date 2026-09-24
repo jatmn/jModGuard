@@ -196,7 +196,6 @@ async fn init_guild(
     )
     .await
     .unwrap();
-    conn.execute("PRAGMA user_version = 8", ()).await.ok();
     for (guild, enrollment, revision, case_id, source) in guilds {
         conn.execute(
             "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -223,6 +222,12 @@ async fn init_guild(
         .await
         .unwrap();
     }
+    conn.execute_batch(include_str!(
+        "../../../migrations/guild/0009_member_directory.sql"
+    ))
+    .await
+    .unwrap();
+    conn.execute("PRAGMA user_version = 9", ()).await.unwrap();
 }
 
 async fn call(
@@ -499,6 +504,25 @@ async fn denied_users_cannot_plan_or_start_moves() {
 #[tokio::test]
 async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     let h = setup().await;
+    let shared_before = h.root.join("shared.guild.db");
+    let db = libsql::Builder::new_local(&shared_before)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms) VALUES(10,?,42,1000,2000)",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,started_at_ms,completed_at_ms) VALUES(10,?,42,'88888888888888888888888888888888','initial','complete','complete',1000,2000)",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,username,search_text,is_current,joined_at_ms,current_stay_id,observed_at_ms) VALUES(10,?,9007199254740993,'Ada','ada',1,500,'99999999999999999999999999999999',1000)",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_stays(guild_id,enrollment_id,stay_id,user_id,joined_at_ms,provenance) VALUES(10,?,'99999999999999999999999999999999',9007199254740993,500,'imported')",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(10,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab',9007199254740993,'ban_absent',1500)",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_target_checks(guild_id,enrollment_id,user_id,kind,reason,row_revision,requested_at_ms,next_attempt_at_ms) VALUES(10,?,9007199254740993,'member','gap',0,1500,1600)",libsql::params![ENROLL_10]).await.unwrap();
+    conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,processed) VALUES(10,?,42,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac',1000,'complete',2)",libsql::params![ENROLL_10]).await.unwrap();
     let cookie = login(&h).await;
     let (status, body, _) = call(&h.router, "GET", "/version", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -570,6 +594,62 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     );
     assert_eq!(
         scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_directory WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT initial_completed_at_ms FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        2000
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT reconciliation_needed FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT generation FROM guild_member_sync WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_state_observations WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_target_checks WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_audit_recovery WHERE guild_id=10 AND status='queued'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
             &shared,
             "SELECT COUNT(*) FROM guild_cases WHERE guild_id=10"
         )
@@ -625,6 +705,15 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         scalar(
             &shared,
             "SELECT COUNT(*) FROM guild_cases WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(scalar(&shared,"SELECT COUNT(*) FROM guild_member_state_observations WHERE guild_id=10 AND kind='ban_absent'").await,1);
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_member_target_checks WHERE guild_id=10"
         )
         .await,
         1

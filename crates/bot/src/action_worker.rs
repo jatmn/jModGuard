@@ -39,6 +39,9 @@ impl Outcome {
 }
 #[serenity::async_trait]
 pub trait DiscordActions: Send + Sync {
+    fn bot_user_id(&self) -> Option<i64> {
+        None
+    }
     async fn membership_matches(&self, job: &BotAction) -> Result<bool>;
     /// A positive live membership observation used to repair a missed rejoin.
     /// Implementations may return `None` when they cannot expose the identity.
@@ -55,6 +58,9 @@ pub struct LiveDiscord<'a> {
 }
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
+    fn bot_user_id(&self) -> Option<i64> {
+        i64::try_from(self.bot_user_id.get()).ok()
+    }
     async fn membership_matches(&self, job: &BotAction) -> Result<bool> {
         let Some(joined_at_ns) = self.membership_joined_at_ns(job).await? else {
             anyhow::bail!("Discord member has no supported join timestamp");
@@ -119,7 +125,7 @@ fn actor_authorized(
 ) -> bool {
     let needed = match action {
         Action::Unban { .. } => Permissions::BAN_MEMBERS,
-        Action::SetLogChannel { .. } => Permissions::MANAGE_GUILD,
+        Action::SetLogChannel { .. } | Action::MemberSync { .. } => Permissions::MANAGE_GUILD,
     };
     let permissions = guild.member_permissions(member);
     if guild.owner_id == member.user.id || permissions.administrator() {
@@ -265,6 +271,56 @@ async fn execute_inner(
             Err(_) => return Outcome::failed("enrollment_check_unavailable"),
         }
         match &job.action {
+            Action::MemberSync { operation } => {
+                let Some(tenant) = tenant else {
+                    return Outcome::failed("tenant_unavailable");
+                };
+                let enrollment = match (&job.enrollment_id, job.joined_at_ns) {
+                    (Some(id), Some(joined_at_ns)) => db::GuildEnrollment {
+                        guild_id: job.guild_id,
+                        id: id.clone(),
+                        joined_at_ns,
+                    },
+                    _ => return Outcome::failed("enrollment_ended"),
+                };
+                let Ok((store, scope)) = tenant.live(enrollment).await else {
+                    return Outcome::failed("enrollment_ended");
+                };
+                let action = match operation {
+                    crate::bot_actions::MemberSyncOperation::Pause => {
+                        crate::db::guild_data::MemberSyncAction::Pause
+                    }
+                    crate::bot_actions::MemberSyncOperation::Resume => {
+                        crate::db::guild_data::MemberSyncAction::Resume
+                    }
+                    crate::bot_actions::MemberSyncOperation::Retry => {
+                        crate::db::guild_data::MemberSyncAction::Retry
+                    }
+                    crate::bot_actions::MemberSyncOperation::Reconcile => {
+                        crate::db::guild_data::MemberSyncAction::Reconcile
+                    }
+                };
+                mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
+                let Some(bot_id) = discord.bot_user_id() else {
+                    return Outcome::failed("bot_identity_unavailable");
+                };
+                match store
+                    .member_sync_action(
+                        scope,
+                        bot_id,
+                        action,
+                        job.id.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::succeeded("member_sync_updated"),
+                    Err(error) => {
+                        tracing::warn!(action_id = %job.id, guild_id = job.guild_id, "member sync control failed: {error:#}");
+                        Outcome::failed("member_sync_unavailable")
+                    }
+                }
+            }
             Action::Unban { user_id, reason } => {
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");

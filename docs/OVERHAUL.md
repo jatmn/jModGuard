@@ -66,7 +66,8 @@ Routine message/member/user collection, roster backfill, tracking state and peri
 SQL message cleanup are removed. Basic edit/delete/join/leave reports use delivered
 Discord fields, with no reconstructed transcript. Discord delivery is bounded by
 configurable concurrency/deadline, suppresses mentions/previews and has no waiting backlog.
-The Members view/endpoint and retention setting are removed; stats show moderation
+The old general Members archive view/endpoint and retention setting were removed;
+the bounded current-member directory was added later ([MEMBERS.md](MEMBERS.md)). Stats show moderation
 records only. Selected moderation records and moderation-plan summaries remain durable.
 The subsequent fresh baseline removes historical schema/helpers; unsupported existing
 databases are refused without rewriting their application rows.

@@ -82,7 +82,7 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         .unwrap();
     store.db.with_conn(|c| {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
-        assert_eq!(count, 11, "store contains identity, bindings, receipts, membership, log routing selected cases and owned history and source associations plus evidence ownership, Bunny attempts and tenant settings");
+        assert_eq!(count, 21, "store contains prior tenant tables and ten member-directory tables");
         Ok(())
     }).await.unwrap();
     assert!(
@@ -403,6 +403,8 @@ mod case_history;
 mod case_sources;
 
 mod case_evidence;
+
+mod member_directory;
 
 #[cfg(unix)]
 mod bunny_transfer;

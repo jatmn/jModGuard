@@ -55,7 +55,7 @@ fn unsigned(channel: &str, release_id: &str, core_version: i64, missing: &[&str]
             "core_family": "jmodguard-core-1",
             "core_version": core_version,
             "guild_family": "jmodguard-guild-1",
-            "guild_version": 8
+            "guild_version": 9
         },
         "settings_schema": 1,
         "backup_format": "JMODGUARD-BACKUP-1",

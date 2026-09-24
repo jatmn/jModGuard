@@ -1,8 +1,10 @@
 # Logging and data collection
 
-Routine message text and attachment metadata are no longer archived to SQL. Joining,
-leaving and talking do not maintain a persistent member/user roster or activity counters.
-Basic Discord log delivery is independent of those retired history tables.
+Routine message text and attachment metadata are no longer archived to SQL. The
+bounded [member directory](MEMBERS.md) retains current member identity and known
+join dates, plus people with confirmed ban history. It does not maintain message
+activity counters or the retired general user archive. Basic Discord log delivery
+is independent of the retired history tables.
 
 ## Basic reports
 
@@ -33,7 +35,8 @@ Basic Discord log delivery is independent of those retired history tables.
   Gateway refresh does not clear them.
   Links may expire under Discord's signed CDN URL policy.
   Bulk deletions report channel/count without collecting a transcript or per-ID tombstones.
-- Join/leave reports use the delivered user and optional cached member join timestamp.
+- Join/leave reports use the delivered user and saved actual member join timestamp
+  when known; the bounded recent cache remains a fallback.
   Leave reports also use join timestamps already supplied with recent messages when
   the member cache is missing that user. This fallback retains only guild/user IDs
   and join timestamps in memory (at most 4096 entries, usable for one hour after
@@ -120,7 +123,8 @@ ban lookup above can save moderator and reason on a retained ban row, but it doe
 not establish a durable Discord audit source for a selected case. Truthful
 partial-action outcomes and selected evidence capture remain work.
 
-The Members view/endpoint and message-retention UI/API field are removed. Guild stats
+The retired general message-retention UI/API field remains removed. The bounded
+Members view is described in [MEMBERS.md](MEMBERS.md). Guild stats
 report identified moderation counts only. Counts include moderation events and live
 warn/timeout/kick/ban automod records, excluding dry runs. New moderation-plan summaries
 carry a `moderation: true` classification flag, which does not assert step success. Older

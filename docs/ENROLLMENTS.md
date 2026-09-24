@@ -3,7 +3,9 @@
 The bot now records its own observed Discord membership in each guild. Migration 0007
 adds `guild_enrollments` to `jmodguard-core-1`: one row per observed guild containing a
 random identity, the bot's join timestamp in nanoseconds, and active/inactive state.
-No member roster, message history, or per-user activity is collected by this feature.
+Enrollment observations themselves collect no member roster, message history, or
+per-user activity. The separate bounded directory and its one-time import are
+documented in [MEMBERS.md](MEMBERS.md).
 
 Observations bind administrative actions and the nickname outbox.
 API guild access now checks them after fresh Discord user permissions; configuration

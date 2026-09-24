@@ -828,6 +828,27 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
         .context("sqlite snapshot failed")?;
     let snap = libsql::Builder::new_local(dest).build().await?;
     let snap_conn = snap.connect()?;
+    let has_member_seed = {
+        let mut rows = snap_conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='guild_member_seed'",
+                (),
+            )
+            .await?;
+        rows.next().await?.is_some()
+    };
+    if has_member_seed {
+        snap_conn
+            .execute(
+                "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=unixepoch()*1000",
+                (),
+            )
+            .await?;
+        snap_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
+        snap_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
+        snap_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE status!='complete' AND cursor IS NOT NULL",()).await?;
+        snap_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",()).await?;
+    }
     for table in EXCLUDED_TABLES {
         let _ = snap_conn
             .execute(&format!("DROP TABLE IF EXISTS {table}"), ())
@@ -934,6 +955,16 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
         ];
         const ENROLLMENT_TABLES: &[&str] = &[
             "guild_erasure_jobs",
+            "guild_member_case_index",
+            "guild_member_state_observations",
+            "guild_member_target_checks",
+            "guild_member_audit_recovery",
+            "guild_member_stays",
+            "guild_member_pending_bans",
+            "guild_member_directory",
+            "guild_member_sync",
+            "guild_member_seed",
+            "guild_member_feature",
             "backup_cleanup_intents",
             "guild_bunny_evidence",
             "guild_case_evidence",
@@ -1018,6 +1049,7 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
 
         for removed in &request.removed_cases {
             for table in [
+                "guild_member_case_index",
                 "guild_bunny_evidence",
                 "guild_case_evidence",
                 "guild_case_history",
@@ -1033,6 +1065,10 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
                          )"
                     } else {
                         match table {
+                            "guild_member_case_index" => {
+                                "DELETE FROM guild_member_case_index
+                                 WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
+                            }
                             "guild_case_evidence" => {
                                 "DELETE FROM guild_case_evidence
                                  WHERE guild_id = ? AND enrollment_id = ? AND case_id = ?"
@@ -1816,5 +1852,95 @@ mod restore_stage_tests {
         assert!(!recover_restore_stage(&stage, &target).unwrap());
         assert!(!stage.exists());
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod member_snapshot_tests {
+    use super::snapshot_sqlite;
+
+    #[tokio::test]
+    async fn snapshot_keeps_unknown_time_observations_and_queues_audit_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "jmodguard-member-snapshot-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("guild.db");
+        let snapshot = root.join("snapshot.db");
+        let db = libsql::Builder::new_local(&source).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("CREATE TABLE guild_member_seed(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,initial_completed_at_ms INTEGER,reconciliation_needed INTEGER,gap_at_ms INTEGER);
+            INSERT INTO guild_member_seed VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,2000,0,NULL);
+            CREATE TABLE guild_member_sync(guild_id INTEGER PRIMARY KEY,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER,status TEXT,status_reason TEXT);
+            INSERT INTO guild_member_sync VALUES(10,'worker',900000,1,'running',NULL);
+            CREATE TABLE guild_member_audit_recovery(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,run_id TEXT,started_at_ms INTEGER,status TEXT,processed INTEGER,next_attempt_at_ms INTEGER,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER,status_reason TEXT,cursor TEXT,request_after_ms INTEGER,restart_requested_at_ms INTEGER);
+            INSERT INTO guild_member_audit_recovery VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',1000,'complete',2,NULL,NULL,NULL,0,NULL,NULL,NULL,NULL);
+            CREATE TABLE guild_member_state_observations(guild_id INTEGER,enrollment_id TEXT,observation_id TEXT,user_id INTEGER,kind TEXT,observed_at_ms INTEGER);
+            INSERT INTO guild_member_state_observations VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc',77,'ban_absent',1500);
+            CREATE TABLE guild_member_target_checks(guild_id INTEGER,enrollment_id TEXT,user_id INTEGER,kind TEXT,reason TEXT,row_revision INTEGER,requested_at_ms INTEGER,next_attempt_at_ms INTEGER);
+            INSERT INTO guild_member_target_checks VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',77,'member','gap',1,1600,1700);").await.unwrap();
+        snapshot_sqlite(&source, &snapshot).await.unwrap();
+        let db = libsql::Builder::new_local(&snapshot).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let row = conn
+            .query(
+                "SELECT reconciliation_needed,gap_at_ms FROM guild_member_seed WHERE guild_id=10",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert!(row.get::<i64>(1).unwrap() > 0);
+        let row = conn
+            .query(
+                "SELECT status,lease_owner FROM guild_member_sync WHERE guild_id=10",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "waiting");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
+        let row = conn
+            .query(
+                "SELECT status,cursor FROM guild_member_audit_recovery WHERE guild_id=10",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "queued");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
+        for table in [
+            "guild_member_state_observations",
+            "guild_member_target_checks",
+        ] {
+            let row = conn
+                .query(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE guild_id=10"),
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        }
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

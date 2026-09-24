@@ -230,6 +230,29 @@ pub(crate) fn member_join_vars(
         ("time".into(), observed.to_rfc3339()),
     ])
 }
+
+/// A committed stay is preferred to the short-lived member cache for a leave
+/// report. Unknown imported join dates remain visibly unavailable.
+pub(crate) fn member_join_vars_ms(
+    joined_at_ms: Option<i64>,
+    observed: chrono::DateTime<chrono::Utc>,
+) -> BTreeMap<String, String> {
+    let valid = joined_at_ms
+        .filter(|joined| *joined > 0 && *joined <= observed.timestamp_millis())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
+    let (joined, duration) = match valid {
+        Some(joined) => (
+            joined.to_rfc3339(),
+            templates::format_duration((observed - joined).num_seconds().max(0) as u64),
+        ),
+        None => ("Unavailable".into(), "Unavailable".into()),
+    };
+    BTreeMap::from([
+        ("joined".into(), joined),
+        ("duration".into(), duration),
+        ("time".into(), observed.to_rfc3339()),
+    ])
+}
 type EditKey = (u64, u64, u64);
 struct EditObservation {
     edited_at_ms: Option<i64>,

@@ -11,6 +11,7 @@ use jmodguard_bot::{db, init_tracing, shutdown_signal};
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 async fn drain_nickname_reconciles(
@@ -141,7 +142,44 @@ async fn main() -> Result<()> {
     cache_settings.cache_channels = true;
     cache_settings.cache_users = true;
 
-    let mut client = serenity::client::ClientBuilder::new(&cfg.discord.token, intents)
+    // Serenity retries 429s after the provider's Retry-After value. The slow
+    // importer also records that deadline if its own request timeout cancels
+    // the in-progress wait, so a restart or next guild cannot undercut it.
+    let rate_limit_until_ms = Arc::new(AtomicI64::new(0));
+    let sync_bot_id = Arc::new(AtomicI64::new(0));
+    let mut discord_http = serenity::http::Http::new(&cfg.discord.token);
+    if let Some(limiter) = discord_http.ratelimiter.as_mut() {
+        let until = Arc::clone(&rate_limit_until_ms);
+        let bot_id = Arc::clone(&sync_bot_id);
+        let pace_db = app.db.clone();
+        limiter.set_ratelimit_callback(Box::new(move |info| {
+            if info.global
+                || info.path.contains("/members")
+                || info.path.contains("/bans")
+                || info.path.contains("/audit-logs")
+            {
+                let deadline = chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(info.timeout.as_millis().min(i64::MAX as u128) as i64);
+                if deadline > until.fetch_max(deadline, Ordering::Relaxed) {
+                    let bot_id = bot_id.load(Ordering::Relaxed);
+                    if bot_id > 0 {
+                        let db = pace_db.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                db::extend_member_sync_request_after(&db, bot_id, deadline).await
+                            {
+                                tracing::warn!(
+                                    "failed to persist Discord retry deadline: {error:#}"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }));
+    }
+    let mut client = serenity::client::ClientBuilder::new_with_http(discord_http, intents)
         .cache_settings(cache_settings)
         .event_handler(Handler {
             app: Arc::clone(&app),
@@ -151,6 +189,20 @@ async fn main() -> Result<()> {
 
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
+
+    // One process-wide importer shares its Discord request budget across all
+    // enrolled guilds. The job claim/cursor lives in the guild store.
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        let cache = Arc::clone(&cache);
+        let rate_limit_until_ms = Arc::clone(&rate_limit_until_ms);
+        let sync_bot_id = Arc::clone(&sync_bot_id);
+        tokio::spawn(async move {
+            jmodguard_bot::member_sync::run(app, http, cache, rate_limit_until_ms, sync_bot_id)
+                .await
+        });
+    }
 
     if cfg.enrollment.enabled {
         let app = Arc::clone(&app);
