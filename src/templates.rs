@@ -103,7 +103,10 @@ pub fn stats_response_with_updates(
     let mut lines = Vec::new();
     for component in ["bot", "api", "webui"] {
         let Some(item) = updates.iter().find(|item| item.component == component) else {
-            lines.push(format!("**{component}:** unknown"));
+            lines.push(format!(
+                "**{component}:** {}",
+                release_status_icon("unknown")
+            ));
             continue;
         };
         let fresh = item
@@ -430,8 +433,13 @@ mod presentation_tests {
         row.channel = "nightly".into();
         let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
         assert!(!wrong_channel.contains("update available"));
-        assert!(wrong_channel.contains("❓"));
-        assert!(wrong_channel.contains("unknown"));
+        let wrong_api = wrong_channel
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(wrong_api.ends_with("❓"), "{wrong_api}");
+        assert!(wrong_channel.contains("**bot:** ❓"));
+        assert!(wrong_channel.contains("**webui:** ❓"));
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
@@ -449,7 +457,24 @@ mod presentation_tests {
         row.observed_at = Some(1);
         let stale = stats_response_with_updates(20, 1, 2, 3, &[row], 9000);
         assert!(!stale.contains(&"a".repeat(40)));
-        assert!(stale.contains("unknown"));
+        let stale_api = stale
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(stale_api.contains("unknown"), "{stale_api}");
+        assert!(stale_api.ends_with("❓"), "{stale_api}");
+    }
+
+    #[test]
+    fn missing_release_rows_use_the_unknown_icon() {
+        let out = stats_response_with_updates(0, 0, 0, 0, &[], 1_000);
+        for component in ["bot", "api", "webui"] {
+            assert!(
+                out.contains(&format!("**{component}:** ❓")),
+                "{component} missing from {out}"
+            );
+        }
+        assert!(!out.contains("**bot:** unknown"));
     }
 
     #[test]

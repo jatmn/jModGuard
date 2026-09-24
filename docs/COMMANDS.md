@@ -102,7 +102,8 @@ and bans have a leading emote. Uptime and release ages use compact days, hours,
 minutes, and seconds (`13m 38s`; intermediate zeros stay, as in `1d 0h 0m 38s`),
 rounded down to whole seconds; a newly started process shows `0s`. Release
 availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source matches
-but the image digest is unverified, ❓ unknown. Prefix `!status`
+but the image digest is unverified, ❓ unknown. A component with no cached
+release row is `❓` and has no SHA or age. Prefix `!status`
 uses the same stats command, permissions and response; the slash name remains
 `/stats`. On upgrade, untouched saved stats definitions gain the alias once.
 Customized definitions remain unchanged; add `status` in the Commands editor if
