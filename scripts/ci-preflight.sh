@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Single source of truth for the Buildkite `test` job.
 # The remote-database job (libSQL containers) stays separate.
-# GitHub Actions workflows and GitHub-hosted CI runners are forbidden.
+# GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
+# The owner-command Pullfrog workflow is the sole GitHub Actions exception.
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
@@ -39,8 +40,12 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -d "$root/.github/workflows" ]; then
-  echo 'ci-preflight: GitHub Actions workflows are forbidden; CI runs on Buildkite' >&2
-  exit 1
+  while IFS= read -r -d '' workflow; do
+    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
+      echo 'ci-preflight: only the owner-command Pullfrog workflow is allowed; CI runs on Buildkite' >&2
+      exit 1
+    fi
+  done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
 fi
 
 if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.yml"; then
@@ -226,6 +231,9 @@ bash scripts/public-install-acceptance-test.sh
 
 echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
 bash scripts/dependabot-config-test.sh
+
+echo 'ci-preflight: node --test scripts/pullfrog-command-check.test.mjs'
+node --test scripts/pullfrog-command-check.test.mjs
 
 echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
 node --test scripts/frontend-state-test.mjs

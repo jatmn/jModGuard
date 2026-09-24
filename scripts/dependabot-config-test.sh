@@ -48,8 +48,12 @@ done
 require_absent "$yaml" "package-ecosystem: github-actions"
 require_absent "$yaml" "package-ecosystem: docker"
 require_absent "$yaml" '${{'
-if [ -e "$root/.github/workflows" ]; then
-  fail ".github/workflows must not exist"
+if [ -d "$root/.github/workflows" ]; then
+  while IFS= read -r -d '' workflow; do
+    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
+      fail "only the owner-command Pullfrog workflow is allowed under .github/workflows"
+    fi
+  done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
 fi
 
 for needle in \

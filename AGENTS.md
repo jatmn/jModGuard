@@ -203,7 +203,8 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 ## Commands
 
 The Buildkite `test` job and local Linux preflight are the same script. Do not
-add GitHub Actions workflows.
+add GitHub Actions CI workflows. The owner-command Pullfrog workflow is the
+sole exception; see `docs/PULLFROG.md`.
 
 ```bash
 bash scripts/ci-preflight.sh
@@ -250,7 +251,7 @@ cargo run -p jmodguard-api                         # waits ~30s locally / ~6m re
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
   `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
-  Buildkite; see `docs/BUILDKITE.md`. Do not add GitHub Actions workflows.
+  Buildkite; see `docs/BUILDKITE.md`. Do not add GitHub Actions CI workflows.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).

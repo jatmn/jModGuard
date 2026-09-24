@@ -1,0 +1,48 @@
+name: Pullfrog owner command
+
+# Pullfrog is deliberately separate from Buildkite CI. A new comment from the
+# repository owner is the only event that can reach the agent step.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  pullfrog:
+    if: >-
+      github.actor == 'jatmn' &&
+      github.event.comment.user.id == 12479882 &&
+      contains(github.event.comment.body, '@pullfrog')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify owner command
+        id: authorize
+        run: node scripts/pullfrog-command-check.mjs
+
+      - name: Run Pullfrog
+        if: steps.authorize.outputs.authorized == 'true'
+        uses: pullfrog/pullfrog@v0
+        with:
+          prompt: |
+            The repository owner issued this command in ${{ github.repository }}:
+            ${{ github.event.comment.body }}
+
+            Read the linked issue or pull request and current repository state
+            before acting. The command is at ${{ github.event.comment.html_url }}.
+            Post your result in that thread.
+          push: restricted
+          shell: restricted
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}

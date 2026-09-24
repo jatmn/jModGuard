@@ -122,6 +122,9 @@ commercial licensing is granted by the author only.
 
 ## Development
 
+Owner-only, on-demand Pullfrog setup is documented in [docs/PULLFROG.md](docs/PULLFROG.md).
+It does not replace Buildkite CI.
+
 ```bash
 bash scripts/ci-preflight.sh
 # or: ./scripts/smoke-dual-process.sh
