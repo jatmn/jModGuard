@@ -253,14 +253,14 @@ node --test scripts/package-webui-test.mjs
 echo 'ci-preflight: node --test scripts/administration-state-test.mjs'
 node --test scripts/administration-state-test.mjs
 
-echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
-cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture
-
 echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
 cargo build --locked -p jmodguard-bot
 
 echo 'ci-preflight: cargo build --locked -p jmodguard-api'
 cargo build --locked -p jmodguard-api
+
+echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture'
+cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --nocapture
 
 echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
 cargo build --locked -p jmodguard-api --no-default-features

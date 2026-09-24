@@ -131,6 +131,158 @@ async fn smoke_dual_process_config_sync() {
     // Windows cannot unlink an open database file.
     cleanup_db(&tmp);
 }
+
+fn service_bin(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::current_exe().expect("test executable");
+    path.pop();
+    path.pop();
+    path.push(name);
+    path
+}
+
+fn wait_status(
+    path: &std::path::Path,
+    child: &mut std::process::Child,
+    log: &std::path::Path,
+    deadline: std::time::Instant,
+) -> String {
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let logged = std::fs::read_to_string(log).unwrap_or_default();
+            panic!("probe exited {status} before {}:\n{logged}", path.display());
+        }
+        let logged = std::fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}:\n{logged}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[tokio::test]
+async fn smoke_bot_and_api_executables_share_sqlite() {
+    use std::process::{Command, Stdio};
+    let root = tmp_db_path("os-process").with_extension("");
+    std::fs::create_dir(&root).unwrap();
+    let database = root.join("app.db");
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[db]\npath={:?}\npool_size=2\n[bot]\nconfig_poll_secs=1\ndefault_prefix='!'\n[web]\nbind='127.0.0.1:9'\nbase_url='http://127.0.0.1:9'\noauth_client_id='fixture'\noauth_client_secret='fixture'\n[log]\ndirectory=''\n",
+            database.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let bot_bin = service_bin("jmodguard-bot");
+    let api_bin = service_bin("jmodguard-api");
+    assert!(
+        bot_bin.is_file(),
+        "build jmodguard-bot before this test: {}",
+        bot_bin.display()
+    );
+    assert!(
+        api_bin.is_file(),
+        "build jmodguard-api before this test: {}",
+        api_bin.display()
+    );
+    struct Running {
+        child: std::process::Child,
+        root: std::path::PathBuf,
+    }
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    let spawn =
+        |bin: &std::path::Path, probe: &str, log: &std::path::Path, extra: &[(&str, &str)]| {
+            let log_file = std::fs::File::create(log).unwrap();
+            let mut cmd = Command::new(bin);
+            cmd.env_clear()
+                .env("JMODGUARD_CONFIG", &config)
+                .env("JMODGUARD_PROCESS_PROBE", probe)
+                .env("JMODGUARD_PROBE_DIR", &root)
+                .env("JMODGUARD_PROBE_GUILD", "55555")
+                .stdout(Stdio::from(log_file.try_clone().unwrap()))
+                .stderr(Stdio::from(log_file));
+            for (key, value) in extra {
+                cmd.env(key, value);
+            }
+            cmd.spawn().unwrap()
+        };
+    let bot_log = root.join("bot.log");
+    let mut bot = Running {
+        child: spawn(
+            &bot_bin,
+            "bot-cache",
+            &bot_log,
+            &[("JMODGUARD_PROBE_EXPECT", "!from-api")],
+        ),
+        root: root.clone(),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(
+        wait_status(
+            &root.join("bot-migrate"),
+            &mut bot.child,
+            &bot_log,
+            deadline
+        ),
+        "true"
+    );
+    assert_eq!(
+        wait_status(&root.join("bot-ready"), &mut bot.child, &bot_log, deadline),
+        "!"
+    );
+    let api_log = root.join("api.log");
+    let api = spawn(
+        &api_bin,
+        "api-write",
+        &api_log,
+        &[("JMODGUARD_PROBE_PREFIX", "!from-api")],
+    );
+    let mut api = Running { child: api, root };
+    assert_eq!(
+        wait_status(
+            &api.root.join("api-migrate"),
+            &mut api.child,
+            &api_log,
+            deadline
+        ),
+        "false"
+    );
+    assert_eq!(
+        wait_status(
+            &api.root.join("api-wrote"),
+            &mut api.child,
+            &api_log,
+            deadline
+        ),
+        "!from-api"
+    );
+    assert_eq!(
+        wait_status(
+            &api.root.join("bot-refreshed"),
+            &mut bot.child,
+            &bot_log,
+            deadline
+        ),
+        "!from-api"
+    );
+    let bot_status = bot.child.wait().unwrap();
+    let api_status = api.child.wait().unwrap();
+    assert!(bot_status.success(), "bot probe exited {bot_status}");
+    assert!(api_status.success(), "api probe exited {api_status}");
+}
+
 #[tokio::test]
 async fn missing_outage_and_stale_gateway_departures_do_not_invalidate_current_nickname() {
     use jmodguard::db::*;
