@@ -33,15 +33,13 @@ jobs:
 
       - name: Run Pullfrog
         if: steps.authorize.outputs.authorized == 'true'
-        uses: pullfrog/pullfrog@v0
+        # Keep this pin and PULLFROG_VERSION in the command helper in sync.
+        uses: pullfrog/pullfrog@ce127b38d7f0c6c5e2c40ccd290adc4c5652357f # v0.1.82
         with:
-          prompt: |
-            The repository owner issued this command in ${{ github.repository }}:
-            ${{ github.event.comment.body }}
-
-            Read the linked issue or pull request and current repository state
-            before acting. The command is at ${{ github.event.comment.html_url }}.
-            Post your result in that thread.
+          prompt: ${{ steps.authorize.outputs.payload }}
+          # v0.1.82 supports this override for both native PR checks. The
+          # structured event above supplies their PR identity without dispatch.
+          status_checks: enabled
           push: restricted
           shell: restricted
         env:

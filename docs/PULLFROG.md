@@ -11,8 +11,10 @@ starts with `@pullfrog` followed by a visible instruction on the same first
 line. A public contributor's comment, a quoted/passive mention, an edited
 comment, a workflow rerun, and a
 bare `@pullfrog` do not run the agent. The workflow checks out the trusted
-default branch and passes the comment URL to the agent, which must read the
-current issue or PR.
+default branch and passes the comment URL and verified issue/PR event context
+to the agent, which must read the current issue or PR. The structured context
+lets Pullfrog associate its native checks with the PR instead of treating the
+request as an unknown event. Issue commands do not create PR checks.
 
 For example, create a **new top-level comment** on an issue or PR:
 
@@ -59,6 +61,46 @@ repository collaborators to invoke mentions by default. This repository uses
 the documented [standalone action](https://docs.pullfrog.com/headless-action)
 instead so GitHub's signed comment event supplies the requester's identity.
 Pullfrog account settings may change over time; verify the toggles during setup.
+
+## PR checks and run diagnostics
+
+The workflow pins the Pullfrog v0.1.82 action bootstrap and explicitly enables
+its native `pullfrog` run-status and `pullfrog-approval` verdict checks. The
+bootstrap installs the compatible `pullfrog@^0.1.82` CLI from npm, so the runtime
+can receive later 0.1.x updates. The `status_checks` input is
+deprecated upstream but remains supported on v0; it enables
+reporting even if the console's check toggles are off and emits a deprecation
+warning. It does not enable managed
+mentions, automatic reviews, or dispatch. Keep those automations off.
+
+A completed PR command can publish `pullfrog` on the PR head through Pullfrog's
+GitHub App credentials. A clean run that records a review verdict can also
+publish `pullfrog-approval`; that check does not grant a GitHub approving review
+when the console's approval permission is disabled. Read the posted review for
+findings. Early startup failures can occur before Pullfrog initializes its
+check reporter, so inspect the linked **Pullfrog owner command** Actions run
+as well. Successful Actions status alone does not prove every internal API call
+succeeded.
+
+The helper builds Pullfrog's version-specific structured prompt with
+`JSON.stringify`; owner text cannot inject workflow output keys or event fields.
+When updating the action pin, verify its `JsonPayload`, `PayloadEvent`, and
+`reportStatusChecks` contracts, update `PULLFROG_VERSION` in
+`scripts/pullfrog-command-check.mjs`, and run the local checks below.
+
+Existing failed managed-dispatch checks are historical failures. Disabling
+mentions or changing YAML does not rewrite them. After this repair is merged to
+the default branch, a **new** owner PR command can post a new native check on
+the current PR head; verify that check's timestamp and linked Actions run.
+Do not use **Re-run jobs**, which the first-attempt guard intentionally skips.
+
+Pullfrog v0.1.82 can still log
+`patchWorkflowRunFields failed: Error: PATCH workflow-run: 404` when a standalone
+run attempts to save metadata without a server-reserved run record. This is an
+upstream persistence limitation, separate from the review and GitHub check
+publication. This repository does not suppress that warning or fix Pullfrog's
+servers. Adding `workflow_dispatch` would change the owner-only execution policy
+and is not part of this setup.
 
 ## Local checks
 
