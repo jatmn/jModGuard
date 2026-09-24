@@ -342,3 +342,5 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
   .administration-card .card-body { padding: 18px; }
   .administration-tools { width: 100%; }
 }
+
+.administration-info { display: grid; gap: 16px; }

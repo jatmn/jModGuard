@@ -9,9 +9,11 @@ let refreshing = null;
 let busy = false;
 let stale = true;
 let authorized = false;
+let accessDenied = false;
 let refreshTimer;
 let actionMessage = "";
-const expanded = new Set();
+const componentViews = new Map();
+let browserView;
 const refreshButton = document.getElementById("refresh-status");
 
 function initTheme() {
@@ -54,7 +56,7 @@ function notice(message, tone = "neutral") {
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  if (!authorized) return;
+  if (accessDenied) return;
   refreshTimer = setTimeout(() => refresh(), snapshot?.components.some(pending) ? 2000 : 30000);
 }
 
@@ -85,6 +87,7 @@ async function request(path, body) {
   if (response.status === 401 || (path === "/api/me" && response.status === 400) ||
       (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
     authorized = false;
+    accessDenied = true;
     stale = true;
     clearTimeout(refreshTimer);
     signIn.classList.remove("hidden");
@@ -93,6 +96,7 @@ async function request(path, body) {
   }
   if (response.status === 403) {
     authorized = false;
+    accessDenied = true;
     stale = true;
     clearTimeout(refreshTimer);
     updateView.classList.add("hidden");
@@ -128,13 +132,20 @@ function line(parent, label, value) {
   parent.append(item);
 }
 
+function restorePolicySelections() {
+  for (const view of componentViews.values()) {
+    view.channelValue = undefined;
+    view.cadenceValue = undefined;
+  }
+}
+
 async function mutate(record, label, callback) {
   if (busy || stale || !authorized) return;
   busy = true;
   clearTimeout(refreshTimer);
   // Finish any older read before submitting; it must never overwrite the result.
   if (refreshing) await refreshing;
-  if (!authorized || stale) { busy = false; render(); scheduleRefresh(); return; }
+  if (!authorized || stale) { busy = false; restorePolicySelections(); render(); scheduleRefresh(); return; }
   actionMessage = `${record.component.toUpperCase()}: ${label}…`;
   notice(actionMessage);
   render();
@@ -158,17 +169,78 @@ async function mutate(record, label, callback) {
     notice(message, "bad");
   } finally {
     busy = false;
+    restorePolicySelections();
     render();
     scheduleRefresh();
   }
 }
 
-function action(label, callback, disabled, record) {
+function action(label, callback, view) {
   const button = node("button", label, "btn btn-sm");
   button.type = "button";
-  button.disabled = Boolean(disabled || busy || stale);
-  button.addEventListener("click", () => mutate(record, label, callback));
+  button.addEventListener("click", () => {
+    const record = view.record;
+    return mutate(record, label, () => callback(record));
+  });
   return button;
+}
+
+// Keep controls mounted during status reads so native selects and keyboard focus survive.
+function createComponentView(record) {
+  const view = { record };
+  view.card = node("section", null, "card bg-base-100 administration-card");
+  const content = node("div", null, "card-body");
+  view.heading = node("div", null, "administration-card-heading");
+  view.info = node("div", null, "administration-info");
+  const details = node("details", null, "administration-technical");
+  details.append(node("summary", "Version & technical details"));
+  view.technical = node("div");
+  details.append(view.technical);
+  view.help = node("p", null, "muted administration-help");
+  const row = node("div", null, "card-actions administration-actions");
+  view.check = action("Check now", (item) => request("/api/updates/check", { component: item.component }), view);
+  view.install = action(record.component === "webui" ? "Update WebUI" : "Update application",
+    (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }), view);
+  row.append(view.check, view.install);
+  if (record.component !== "webui") {
+    view.launcher = action("Update launcher", (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }), view);
+    row.append(view.launcher);
+  }
+  view.policy = node("fieldset", null, "administration-policy");
+  view.policy.append(node("legend", "Release policy"));
+  view.channel = node("select", null, "select select-bordered select-sm");
+  view.channel.setAttribute("aria-label", `${record.component} release channel`);
+  for (const value of ["latest", "stable", "nightly"]) {
+    const option = node("option", value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases");
+    option.value = value;
+    view.channel.append(option);
+  }
+  view.channel.addEventListener("change", () => {
+    const item = view.record;
+    const value = view.channel.value;
+    return mutate(item, "Save release channel", () => request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence }));
+  });
+  const channelLabel = node("label", "Release channel", "field");
+  channelLabel.append(view.channel);
+  view.cadence = node("select", null, "select select-bordered select-sm");
+  view.cadence.setAttribute("aria-label", `${record.component} automatic installation cadence`);
+  for (const value of ["off", "daily", "weekly", "monthly"]) {
+    const option = node("option", value === "off" ? "Automatic install off" : value);
+    option.value = value;
+    view.cadence.append(option);
+  }
+  view.cadence.addEventListener("change", () => {
+    const item = view.record;
+    const value = view.cadence.value;
+    return mutate(item, "Save automatic installation", () => request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value }));
+  });
+  const cadenceLabel = node("label", "Automatic installation", "field");
+  cadenceLabel.append(view.cadence);
+  view.policy.append(channelLabel, cadenceLabel);
+  content.append(view.heading, view.info, details, view.help, row, view.policy);
+  view.card.append(content);
+  cards.append(view.card);
+  return view;
 }
 
 function badge(text, tone, icon) {
@@ -184,48 +256,50 @@ function releaseText(release) {
 }
 
 function render() {
-  cards.replaceChildren();
-  refreshButton.disabled = busy || Boolean(refreshing);
+  refreshButton.disabled = busy;
   if (!snapshot) return;
   const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
   const installedWeb = snapshot.components.find((item) => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
-  const browser = document.getElementById("browser-version");
-  browser.replaceChildren();
-  const browserDetails = node("details");
-  browserDetails.open = expanded.has("browser");
-  browserDetails.addEventListener("toggle", () => {
-    if (browserDetails.open) expanded.add("browser"); else expanded.delete("browser");
-  });
-  browserDetails.append(node("summary", "Browser version"));
-  line(browserDetails, "Loaded WebUI SHA", loaded);
-  line(browserDetails, "Storage-observed SHA", installedWeb);
-  browser.append(browserDetails);
-  if (/^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb) {
-    browser.append(badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"));
+  if (!browserView) {
+    const browser = document.getElementById("browser-version");
+    const details = node("details");
+    details.append(node("summary", "Browser version"));
+    const technical = node("div");
+    details.append(technical);
+    const warning = badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻");
     const reload = node("button", "Reload page", "btn btn-sm");
     reload.type = "button";
-    reload.disabled = busy;
     reload.addEventListener("click", () => window.location.reload());
-    browser.append(reload);
+    browser.append(details, warning, reload);
+    browserView = { technical, warning, reload };
   }
+  browserView.technical.replaceChildren();
+  line(browserView.technical, "Loaded WebUI SHA", loaded);
+  line(browserView.technical, "Storage-observed SHA", installedWeb);
+  const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;
+  browserView.warning.hidden = !differentWeb;
+  browserView.reload.hidden = !differentWeb;
+  browserView.reload.disabled = busy;
   document.getElementById("automatic-state").textContent = snapshot.unattended_enabled
     ? "Automatic installation policies are available."
     : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work.";
   for (const record of snapshot.components) {
-    const card = node("section", null, "card bg-base-100 administration-card");
-    const content = node("div", null, "card-body");
-    const heading = node("div", null, "administration-card-heading");
+    let view = componentViews.get(record.component);
+    if (!view) {
+      view = createComponentView(record);
+      componentViews.set(record.component, view);
+    }
+    view.record = record;
+    const content = view.info;
+    const details = view.technical;
+    const heading = view.heading;
+    content.replaceChildren();
+    details.replaceChildren();
+    heading.replaceChildren();
     const identity = node("div");
     identity.append(node("h2", record.component.toUpperCase(), "card-title"));
     identity.append(node("p", {api: "Dashboard service", bot: "Discord moderation", webui: "Browser workspace"}[record.component], "muted"));
     heading.append(identity);
-    content.append(heading);
-    const details = node("details", null, "administration-technical");
-    details.open = expanded.has(record.component);
-    details.addEventListener("toggle", () => {
-      if (details.open) expanded.add(record.component); else expanded.delete(record.component);
-    });
-    details.append(node("summary", "Version & technical details"));
     const fresh = record.observed_at && Date.now() / 1000 - record.observed_at < 7200 && record.state !== "drift";
     const observed = fresh ? record.observed : null;
     line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? snapshot.base_image_sha : "unknown"));
@@ -267,79 +341,48 @@ function render() {
     line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
     line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
     line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
-    const row = node("div", null, "card-actions administration-actions");
-    row.append(action("Check now", () => request("/api/updates/check", { component: record.component }), false, record));
     const canApply = snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
-    if (record.candidate) {
-      const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate.digest;
-      const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate.digest;
-      row.append(action(record.component === "webui" ? "Update WebUI" : "Update application", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest }), !canApply || applicationCurrent || candidatePending, record));
-      if (record.component !== "webui") {
-        const launcherPending = record.desired_launcher?.digest === record.candidate.digest;
-        const launcherCurrent = record.installed_launcher?.digest === record.candidate.digest;
-        row.append(action("Update launcher", () => request("/api/updates/install", { component: record.component, digest: record.candidate.digest, launcher: true }), !canApply || launcherCurrent || launcherPending, record));
-      }
+    const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
+    const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
+    view.check.disabled = busy || stale;
+    view.install.hidden = !record.candidate;
+    view.install.disabled = busy || stale || !canApply || applicationCurrent || candidatePending;
+    if (view.launcher) {
+      view.launcher.hidden = !record.candidate;
+      view.launcher.disabled = busy || stale || !canApply || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest;
     }
-    content.append(details);
-    if (!snapshot.apply_enabled) content.append(node("p", "On-demand installation is disabled for this deployment.", "muted administration-help"));
-    else if (record.component === "webui" ? !snapshot.webui_storage_configured : !observed?.self_update_enabled) {
-      content.append(node("p", record.component === "webui" ? "Configure WebUI Storage to enable installation." : "Self-update is not enabled or the running component could not be verified.", "muted administration-help"));
+    view.help.textContent = !snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
+      : record.component === "webui" ? !snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
+      : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";
+    view.help.hidden = !view.help.textContent;
+    view.policy.disabled = busy || stale;
+    // Do not reset an in-progress native selection on an unchanged server value.
+    if (view.channelValue !== record.channel) view.channel.value = record.channel;
+    if (view.cadenceValue !== record.cadence) view.cadence.value = record.cadence;
+    view.channelValue = record.channel;
+    view.cadenceValue = record.cadence;
+    for (const option of view.cadence.children) {
+      option.disabled = option.value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest");
     }
-    content.append(row);
-    const policy = node("fieldset", null, "administration-policy");
-    policy.disabled = busy || stale;
-    policy.append(node("legend", "Release policy"));
-    const channel = node("select", null, "select select-bordered select-sm");
-    channel.setAttribute("aria-label", `${record.component} release channel`);
-    for (const value of ["latest", "stable", "nightly"]) {
-      const option = node("option", value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases");
-      option.value = value;
-      channel.append(option);
-    }
-    channel.value = record.channel;
-    channel.addEventListener("change", () => {
-      const value = channel.value;
-      return mutate(record, "Save release channel", () => request("/api/updates/policy", { component: record.component, channel: value, cadence: value === "latest" ? "off" : record.cadence }));
-    });
-    const channelLabel = node("label", "Release channel", "field");
-    channelLabel.append(channel);
-    policy.append(channelLabel);
-    const cadence = node("select", null, "select select-bordered select-sm");
-    cadence.setAttribute("aria-label", `${record.component} automatic installation cadence`);
-    for (const value of ["off", "daily", "weekly", "monthly"]) {
-      const option = node("option", value === "off" ? "Automatic install off" : value);
-      option.value = value;
-      option.disabled = value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest");
-      cadence.append(option);
-    }
-    cadence.value = record.cadence;
-    cadence.addEventListener("change", () => {
-      const value = cadence.value;
-      return mutate(record, "Save automatic installation", () => request("/api/updates/policy", { component: record.component, channel: record.channel, cadence: value }));
-    });
-    const cadenceLabel = node("label", "Automatic installation", "field");
-    cadenceLabel.append(cadence);
-    policy.append(cadenceLabel);
-    content.append(policy);
-    card.append(content);
-    cards.append(card);
   }
 }
 
 function refresh() {
   if (refreshing) return refreshing;
   clearTimeout(refreshTimer);
-  refreshButton.disabled = true;
+  refreshButton.disabled = busy;
   refreshing = (async () => {
     try {
       if (!authorized) {
         const me = await request("/api/me", {});
         if (!me.is_bot_owner) {
+          accessDenied = true;
           updateView.classList.add("hidden");
           notice("Only the configured bot owner can manage updates.", "bad");
           return;
         }
         authorized = true;
+        accessDenied = false;
       }
       snapshot = await request("/api/updates", {});
       if (!busy) actionMessage = "";

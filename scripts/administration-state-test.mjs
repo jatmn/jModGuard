@@ -461,11 +461,89 @@ test("Browser version remains expanded or collapsed across status refreshes", as
   const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
   const details = () => find(view.elements.get("browser-version"), (element) => element.tag === "details");
   details().open = true;
-  details().listeners.toggle();
   await vm.runInContext("refresh()", view.context);
   assert.equal(details().open, true);
   details().open = false;
-  details().listeners.toggle();
   await vm.runInContext("refresh()", view.context);
   assert.equal(details().open, false);
+});
+
+test("transient initial access checks retry automatically but confirmed denials do not", async () => {
+  for (const failure of ["network", "server"]) {
+    let calls = 0;
+    const view = await ready(async (url) => {
+      if (url === "/api/me" && ++calls === 1) {
+        if (failure === "network") throw new Error("offline");
+        return response({ error: "starting" }, 503);
+      }
+      return response(url === "/api/me" ? { is_bot_owner: true } : state([record()]));
+    });
+    assert.equal([...view.timers.values()][0].delay, 30000);
+    await [...view.timers.values()][0].callback();
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
+    assert.equal(updateButton(view, "api").disabled, false);
+  }
+  for (const denial of [response({}, 401), response({}, 403), response({ is_bot_owner: false })]) {
+    let denied = true;
+    const view = await ready(async (url) => denied ? denial : response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
+    assert.equal(view.timers.size, 0);
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+    denied = false;
+    await view.elements.get("refresh-status").listeners.click();
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
+    assert.equal(view.timers.size, 1);
+  }
+});
+
+test("refresh retains controls and disclosures while actions use the newest component record", async () => {
+  for (const component of ["api", "bot", "webui"]) {
+    let item = record(component);
+    let submitted;
+    const view = await ready(async (url, options) => {
+      if (url === "/api/me") return response({ is_bot_owner: true });
+      if (url === "/api/updates/install") {
+        submitted = JSON.parse(options.body);
+        return response({ queued: true });
+      }
+      return response(state([item]));
+    });
+    const card = view.elements.get("update-cards");
+    const install = updateButton(view, component);
+    const select = find(card, (el) => el.tag === "select");
+    const summary = find(card, (el) => el.tag === "summary");
+    const browserSummary = find(view.elements.get("browser-version"), (el) => el.tag === "summary");
+    item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) }, state: "queued", desired: { ...item.candidate } };
+    await [...view.timers.values()][0].callback();
+    assert.equal(updateButton(view, component), install);
+    assert.equal(find(card, (el) => el.tag === "select"), select);
+    assert.equal(find(card, (el) => el.tag === "summary"), summary);
+    assert.equal(find(view.elements.get("browser-version"), (el) => el.tag === "summary"), browserSummary);
+    assert.match(textOf(card), /Update pending/);
+    await install.listeners.click();
+    assert.equal(submitted.digest, item.candidate.digest);
+    assert.equal(submitted.component, component);
+  }
+});
+
+test("a policy edit abandoned after a failed prior read restores the recorded selection", async () => {
+  let failRead;
+  let block = false;
+  let writes = 0;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") writes++;
+    if (block) { block = false; return new Promise((_, reject) => { failRead = reject; }); }
+    return response(state([record()]));
+  });
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  const select = find(view.elements.get("update-cards"), (el) => el.tag === "select");
+  select.value = "stable";
+  const saving = select.listeners.change();
+  failRead(new Error("offline"));
+  await Promise.all([reading, saving]);
+  assert.equal(writes, 0);
+  assert.equal(select.value, "latest");
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(select.value, "latest");
 });
