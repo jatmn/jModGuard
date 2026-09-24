@@ -2,16 +2,18 @@
 
 Pullfrog is an on-demand agent for this repository. Buildkite remains the only
 CI and image publisher. The sole GitHub Actions workflow,
-`.github/workflows/pullfrog.yml`, listens for newly created issue/PR comments
-and inline PR review comments. It has no push, PR, schedule, or
+`.github/workflows/pullfrog.yml`, listens for newly created issue comments and
+top-level PR comments. It does not listen to inline PR review comments, which
+run GitHub workflows from a PR merge commit. It has no push, PR, schedule, or
 `workflow_dispatch` trigger. The agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
 starts with `@pullfrog` followed by an instruction. A public contributor's
-comment, a quoted/passive mention, an edited comment, and a bare `@pullfrog`
-do not run the agent. The workflow checks out the trusted default branch and
-passes the comment URL to the agent, which must read the current issue or PR.
+comment, a quoted/passive mention, an edited comment, a workflow rerun, and a
+bare `@pullfrog` do not run the agent. The workflow checks out the trusted
+default branch and passes the comment URL to the agent, which must read the
+current issue or PR.
 
-For example, create a **new comment** on an issue or PR:
+For example, create a **new top-level comment** on an issue or PR:
 
 ```text
 @pullfrog review this PR and report actionable defects
@@ -48,7 +50,8 @@ branch and the manual setup below is finished.
 5. After setup, post one new `@pullfrog ...` comment yourself and confirm that
    exactly one `Pullfrog owner command` Actions job runs. Check that a comment
    by another account, or your own comment without an instruction, never
-   reaches the agent step. Do not test with a paid or destructive instruction.
+   reaches the agent step. A workflow rerun is skipped; post a new owner comment
+   if you want another run. Do not test with a paid or destructive instruction.
 
 Pullfrog's standard console workflow uses `workflow_dispatch` and allows all
 repository collaborators to invoke mentions by default. This repository uses

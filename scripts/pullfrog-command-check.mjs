@@ -3,10 +3,8 @@ import { fileURLToPath } from 'node:url';
 
 const OWNER_ID = 12479882;
 const REPOSITORY = 'jatmn/jModGuard';
-const COMMENT_EVENTS = new Set(['issue_comment', 'pull_request_review_comment']);
-
 export function isOwnerCommand(eventName, actor, event) {
-  if (!COMMENT_EVENTS.has(eventName) || event?.action !== 'created') return false;
+  if (eventName !== 'issue_comment' || event?.action !== 'created') return false;
   if (actor !== 'jatmn' || event?.sender?.id !== OWNER_ID) return false;
   if (event?.repository?.full_name !== REPOSITORY) return false;
   if (event?.comment?.user?.id !== OWNER_ID) return false;

@@ -9,9 +9,8 @@ const ownerComment = {
   comment: { user: { id: 12479882 }, body: '@pullfrog review this PR' },
 };
 
-test('accepts an owner instruction on an issue or PR comment', () => {
+test('accepts an owner instruction on an issue or top-level PR comment', () => {
   assert.equal(isOwnerCommand('issue_comment', 'jatmn', ownerComment), true);
-  assert.equal(isOwnerCommand('pull_request_review_comment', 'jatmn', ownerComment), true);
   assert.equal(isOwnerCommand('issue_comment', 'jatmn', {
     ...ownerComment,
     comment: { ...ownerComment.comment, body: '@pullfrog\nPlease review this PR.' },
@@ -56,5 +55,6 @@ test('rejects edits and unrelated events', () => {
     action: 'edited',
   }), false);
   assert.equal(isOwnerCommand('pull_request', 'jatmn', ownerComment), false);
+  assert.equal(isOwnerCommand('pull_request_review_comment', 'jatmn', ownerComment), false);
   assert.equal(isOwnerCommand('workflow_dispatch', 'jatmn', ownerComment), false);
 });
