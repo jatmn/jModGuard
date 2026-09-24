@@ -153,7 +153,11 @@ in your deployment. Publishing never grants public access or deploys containers.
   This also works for source revisions predating the publishing scripts. Both
   components use the one resolved SHA recorded by the preparation job. Tests
   validate the current pipeline checkout; the image builds compile the selected
-  source. A plain branch name such as `main` is rejected as a publication source.
+  source. For a source before the independent updater, bot/API images keep their
+  original direct-entrypoint layout for dashboard rollback; they are not eligible
+  for owner-managed executable updates. The WebUI job skips sources before the
+  independent WebUI package existed. A plain branch name such as `main` is
+  rejected as a publication source.
   Manual publication by commit SHA publishes container images only; the manifest
   job skips when the source has no installable Stable/Nightly release id.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in

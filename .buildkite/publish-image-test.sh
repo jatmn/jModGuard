@@ -255,6 +255,7 @@ GITHUB_TOKEN_SEEN=""
 FAIL_BUILD=0
 FAIL_VERIFY=0
 PUBLISH_SHA="$HEAD_SHA"
+SOURCE_LAYOUT=current
 TRACE_FILE=""
 PUBLISH_TEST_TRACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/publish-traces-XXXXXX")"
 
@@ -267,7 +268,7 @@ mock_publish_helpers() {
   TRACE_FILE="$(mktemp "${PUBLISH_TEST_TRACE_DIR}/publish-trace-XXXXXX")"
 
   verify_published_image() {
-    printf 'verify %s %s\n' "$1" "$2" >>"$TRACE_FILE"
+    printf 'verify %s %s %s\n' "$1" "$2" "${4:-current}" >>"$TRACE_FILE"
     [[ "$FAIL_VERIFY" == 0 ]] || publish_fail 'effective image verification failed'
   }
 
@@ -279,9 +280,19 @@ mock_publish_helpers() {
       worktree)
         if [[ "$2" == add ]]; then
           mkdir -p "$4"
-          mkdir -p "$4/scripts"
-          cp "$root/scripts/package-webui.mjs" "$4/scripts/"
-          cp -R "$root/frontend" "$4/frontend"
+          cp "$root/Dockerfile.bot" "$root/Dockerfile.api" "$4/"
+          if [[ "$SOURCE_LAYOUT" == current ]]; then
+            mkdir -p "$4/scripts" "$4/crates/updater/src"
+            cp "$root/scripts/bootstrap-container.sh" "$root/scripts/package-webui.mjs" "$4/scripts/"
+            cp "$root/crates/updater/src/main.rs" "$4/crates/updater/src/"
+            cp "$root/Dockerfile.webui" "$4/"
+            cp -R "$root/frontend" "$4/frontend"
+          elif [[ "$SOURCE_LAYOUT" == legacy ]]; then
+            printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-bot\n' >"$4/Dockerfile.bot"
+            printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-api\n' >"$4/Dockerfile.api"
+          else
+            fail "unknown source layout: $SOURCE_LAYOUT"
+          fi
         elif [[ "$2" == remove ]]; then
           rm -rf "$4"
         fi
@@ -341,6 +352,7 @@ exercise_publish() {
   local changed="$1"
   FAIL_BUILD="${2:-0}"
   FAIL_VERIFY="${7:-0}"
+  SOURCE_LAYOUT="${8:-current}"
   local mode="${3:-main}"
   local source_token="${4:-}"
   local plan="${5:-}"
@@ -394,6 +406,7 @@ exercise_publish() {
   rm -rf "$scratch"
   TMPDIR="$saved_tmp"
   export TMPDIR
+  SOURCE_LAYOUT=current
 }
 
 reload_publisher
@@ -542,6 +555,51 @@ exercise_publish 0 0 manual
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${BASE_SHA}" \
   || fail 'manual publication must build the planned SHA even when compare would skip'
 
+# A historical manual source predates the WebUI package and service launcher.
+# Its bot/API images remain publishable for dashboard rollback, while their
+# labels cannot claim owner-updater compatibility.
+for component in bot api; do
+  exercise_publish 0 0 manual '' '' "$component" 0 legacy
+  printf '%s\n' "${CALLS[@]}" | grep -q "^verify ${component} .* legacy$" \
+    || fail "historical ${component} must receive the legacy final-image check"
+  [[ "$BUILD_LINE" != *'io.jmodguard.launcher-protocol'* ]] \
+    || fail "historical ${component} must not claim updater compatibility"
+  printf '%s\n' "${CALLS[@]}" | grep -q -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest" \
+    || fail "verified historical ${component} may still move latest for dashboard rollback"
+done
+exercise_publish 0 0 manual '' '' webui 0 legacy
+[[ -z "$BUILD_LINE" ]] || fail 'historical source must skip the nonexistent WebUI package'
+printf '%s\n' "${CALLS[@]}" | grep -q 'git worktree remove' \
+  || fail 'historical WebUI skip must remove the selected source worktree'
+
+reload_publisher
+run_docker() {
+  case "$1" in
+    pull|rm) return 0 ;;
+    create)
+      [[ "$2" == --entrypoint && "$3" == /usr/local/bin/jmodguard-bot ]] \
+        || fail 'historical verifier must inspect the direct-entrypoint image'
+      printf '%s\n' legacy-image
+      ;;
+    cp)
+      [[ "$2" == 'legacy-image:/usr/local/bin/jmodguard-bot' ]] \
+        || fail "historical verifier requested an updater-only file: $2"
+      printf 'historical executable\n' >"$3"
+      ;;
+    *) fail "unexpected historical verifier command: $*" ;;
+  esac
+}
+verify_published_image bot historical-image . legacy
+
+partial_source="$(mktemp -d "${TMPDIR:-/tmp}/partial-source-XXXXXX")"
+mkdir -p "$partial_source/scripts"
+cp "$root/Dockerfile.bot" "$partial_source/Dockerfile.bot"
+cp "$root/scripts/bootstrap-container.sh" "$partial_source/scripts/"
+if ( source_image_layout bot "$partial_source" ) >/dev/null 2>&1; then
+  fail 'partial service layout must not downgrade to legacy verification'
+fi
+rm -rf "$partial_source"
+
 exercise_publish 0 0 manual '' '' conductor
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-conductor:${BASE_SHA}" \
   || fail 'manual conductor publication must still build'
@@ -601,11 +659,13 @@ git -C "$scratch" config user.name Fixture
 git -C "$scratch" config user.email fixture@example.invalid
 mkdir -p "$scratch/src"
 echo old >"$scratch/src/lib.rs"
+printf 'FROM scratch\nCOPY role /usr/local/bin/jmodguard-bot\n' >"$scratch/Dockerfile.bot"
 git -C "$scratch" add .
 git -C "$scratch" commit -m base >/dev/null
 base="$(git -C "$scratch" rev-parse HEAD)"
 git -C "$scratch" tag -a 'release/v1+meta' -m release
 git -C "$scratch" remote add origin "$scratch"
+fixture_git_root="$scratch"
 
 pushd "$scratch" >/dev/null
 reload_publisher
@@ -779,7 +839,9 @@ run_git() {
     rev-parse) printf '%s\n' "$base" ;;
     status) printf '' ;;
     worktree)
-      if [[ "$2" == add ]]; then mkdir -p "$4"
+      if [[ "$2" == add ]]; then
+        mkdir -p "$4"
+        cp "$fixture_git_root/Dockerfile.bot" "$4/Dockerfile.bot"
       elif [[ "$2" == remove ]]; then rm -rf "$4"; fi
       ;;
     *) git "$@" ;;
@@ -854,7 +916,9 @@ run_git() {
     rev-parse) printf '%s\n' "$base" ;;
     status) printf '' ;;
     worktree)
-      if [[ "$2" == add ]]; then mkdir -p "$4"
+      if [[ "$2" == add ]]; then
+        mkdir -p "$4"
+        cp "$fixture_git_root/Dockerfile.bot" "$4/Dockerfile.bot"
       elif [[ "$2" == remove ]]; then rm -rf "$4"; fi
       ;;
     *) git "$@" ;;

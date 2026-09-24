@@ -186,6 +186,7 @@ build_args() {
   local label="$3"
   local context="$4"
   local channel="${5:-}"
+  local layout="${6:-current}"
   local image="ghcr.io/jatmn/jmodguard-${component}"
   local release_channel="${channel:-development}"
   local published_at
@@ -201,20 +202,25 @@ build_args() {
     --label "org.opencontainers.image.source=${REPOSITORY}"
     --label "org.opencontainers.image.revision=${sha}"
     --label "org.opencontainers.image.version=${label:-$sha}"
-    --label "io.jmodguard.component=${component}"
-    --label "io.jmodguard.channel=${release_channel}"
-    --label "io.jmodguard.release-id=${label:-$sha}"
-    --label "io.jmodguard.published-at=${published_at}"
-    --label "io.jmodguard.min-schema=15"
-    --label "io.jmodguard.max-schema=15"
-    --label "io.jmodguard.result-schema=15"
-    --label "io.jmodguard.min-api=1"
-    --label "io.jmodguard.max-api=1"
-    --label "io.jmodguard.launcher-protocol=1"
-    --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
-    --build-arg "SOURCE_SHA=${sha}"
-    --tag "${image}:${sha}"
   )
+  # Old manual-source images can be dashboard rollback images, but they have
+  # no launcher and must not appear compatible with the owner updater.
+  if [[ "$layout" != "legacy" ]]; then
+    args+=(
+      --label "io.jmodguard.component=${component}"
+      --label "io.jmodguard.channel=${release_channel}"
+      --label "io.jmodguard.release-id=${label:-$sha}"
+      --label "io.jmodguard.published-at=${published_at}"
+      --label "io.jmodguard.min-schema=15"
+      --label "io.jmodguard.max-schema=15"
+      --label "io.jmodguard.result-schema=15"
+      --label "io.jmodguard.min-api=1"
+      --label "io.jmodguard.max-api=1"
+      --label "io.jmodguard.launcher-protocol=1"
+      --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
+    )
+  fi
+  args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
   # Independent owner controls discover latest. Publish that moving pointer
   # only after the pulled final image passes verification below.
   if [[ "$component" == "conductor" && "$channel" != "nightly" ]]; then
@@ -331,10 +337,44 @@ process.stdout.write(`${digest}\t${size}\n`);
 JS
 }
 
+source_image_layout() {
+  local component="$1" context="$2" dockerfile="${2}/Dockerfile.${1}"
+  if [[ "$component" == "webui" ]]; then
+    if [[ ! -e "$context/scripts/package-webui.mjs" && ! -e "$dockerfile" ]]; then
+      echo legacy
+    elif [[ -f "$context/scripts/package-webui.mjs" && -f "$dockerfile" ]]; then
+      echo current
+    else
+      publish_fail 'selected source has an incomplete WebUI package'
+    fi
+  elif [[ "$component" == "bot" || "$component" == "api" ]]; then
+    [[ -f "$dockerfile" ]] || publish_fail 'selected source has no service Dockerfile'
+    if [[ ! -e "$context/scripts/bootstrap-container.sh" && ! -e "$context/crates/updater/src/main.rs" ]] \
+        && ! grep -Fq 'jmodguard-launcher' "$dockerfile" \
+        && ! grep -Fq 'files.sha256' "$dockerfile"; then
+      echo legacy
+    elif [[ -f "$context/scripts/bootstrap-container.sh" && -f "$context/crates/updater/src/main.rs" ]] \
+        && grep -Fq 'jmodguard-launcher' "$dockerfile" \
+        && grep -Fq 'files.sha256' "$dockerfile"; then
+      echo current
+    else
+      publish_fail 'selected source has an incomplete service image layout'
+    fi
+  else
+    echo current
+  fi
+}
+
 verify_published_image() {
-  local component="$1" image="$2" context="$3" scratch cid entry
+  local component="$1" image="$2" context="$3" layout="${4:-current}" scratch cid entry
   scratch="$(scratch_dir image-verify)"
-  if [[ "$component" == "webui" ]]; then entry=/webui/index.html; else entry=/usr/local/bin/jmodguard-bootstrap; fi
+  if [[ "$component" == "webui" ]]; then
+    entry=/webui/index.html
+  elif [[ "$layout" == "legacy" ]]; then
+    entry="/usr/local/bin/jmodguard-${component}"
+  else
+    entry=/usr/local/bin/jmodguard-bootstrap
+  fi
   run_docker pull --platform linux/amd64 "$image" >/dev/null
   cid="$(run_docker create --entrypoint "$entry" "$image")"
   if [[ "$component" == "webui" ]]; then
@@ -343,9 +383,12 @@ verify_published_image() {
   else
     mkdir -p "$scratch/bin" "$scratch/share/jmodguard"
     run_docker cp "$cid:/usr/local/bin/jmodguard-${component}" "$scratch/bin/jmodguard-${component}" >/dev/null
-    run_docker cp "$cid:/usr/local/bin/jmodguard-launcher" "$scratch/bin/jmodguard-launcher" >/dev/null
-    run_docker cp "$cid:/usr/local/share/jmodguard/files.sha256" "$scratch/share/jmodguard/files.sha256" >/dev/null
-    (cd "$scratch" && sha256sum -c share/jmodguard/files.sha256 >/dev/null) || publish_fail 'effective service binaries do not match image inventory'
+    [[ -s "$scratch/bin/jmodguard-${component}" ]] || publish_fail 'published service executable is empty'
+    if [[ "$layout" != "legacy" ]]; then
+      run_docker cp "$cid:/usr/local/bin/jmodguard-launcher" "$scratch/bin/jmodguard-launcher" >/dev/null
+      run_docker cp "$cid:/usr/local/share/jmodguard/files.sha256" "$scratch/share/jmodguard/files.sha256" >/dev/null
+      (cd "$scratch" && sha256sum -c share/jmodguard/files.sha256 >/dev/null) || publish_fail 'effective service binaries do not match image inventory'
+    fi
   fi
   run_docker rm "$cid" >/dev/null
   rm -rf "$scratch"
@@ -467,7 +510,7 @@ publish_component() {
     publish_manifest
     return 0
   fi
-  local selection mode ref head sha label image username token source_token scratch context channel published_digest published_size promoted_digest
+  local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest
   local -a build_cmd
   selection="$(checked_request)"
   if [[ "$selection" == "skip" ]]; then
@@ -518,18 +561,25 @@ publish_component() {
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
   run_git worktree add --detach "$context" "$sha" >/dev/null
+  layout="$(source_image_layout "$component" "$context")"
+  if [[ "$component" == "webui" && "$layout" == "legacy" ]]; then
+    echo 'webui: selected source predates the independent WebUI package; no image to publish'
+    trap - EXIT
+    cleanup_publish
+    return 0
+  fi
   channel="$(channel_for "$mode" "$label" || true)"
   if [[ "$component" == "webui" ]]; then
     node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
   fi
-  readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel")
+  readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout")
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
   # The legacy conductor image has no launcher or file inventory. Preserve its
   # existing publication path; only the three independent update packages use
   # the new final-image verifier.
   if [[ "$component" != "conductor" ]]; then
-    verify_published_image "$component" "${image}:${sha}" "$context"
+    verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
   fi
   if [[ "$component" != "conductor" && "$channel" != "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
