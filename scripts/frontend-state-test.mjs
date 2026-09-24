@@ -10,6 +10,8 @@ const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), '
 // production el() sends to the browser, without duplicating its implementation.
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
   const elements = [];
+  let clockOffsetMs = 0;
+  class TestDate extends Date { static now() { return Date.now() + clockOffsetMs; } }
   const location = {
     search: '', pathname: '/', hash: '', replaced: null,
     replace(value) { this.replaced = value; },
@@ -99,7 +101,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    fetch: fetchImpl, console, AbortController, URLSearchParams,
+    fetch: fetchImpl, console, AbortController, URLSearchParams, Date: TestDate,
     setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, delay }); return id; },
     clearTimeout(id) { timers.delete(id); }, confirm, crypto: { randomUUID },
   });
@@ -107,7 +109,8 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document: context.document, documentListeners };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document: context.document, documentListeners,
+    advanceTime(ms) { clockOffsetMs += ms; } };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -532,6 +535,177 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);
+});
+
+test('Members keeps controls unavailable until a real first job exists and after corrupt metadata loss', async () => {
+  const statuses = [
+    { status: 'queued', phase: 'members', run_kind: 'initial', run_id: null, progress_revision: 0,
+      status_reason: 'awaiting first bot initialization' },
+    { status: 'needs_attention', phase: null, run_id: null, progress_revision: 0,
+      status_reason: 'member import metadata is missing' },
+    { status: 'queued', phase: 'members', run_kind: 'initial', run_id: 'real-first-run', progress_revision: 1 },
+  ];
+  let reads = 0, actionPosts = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) { actionPosts++; return response({ id: 'action', state: 'pending' }); }
+    if (url.endsWith('/member-sync')) return response(statuses[reads++]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const controls = () => ['Pause', 'Resume', 'Retry', 'Reconcile from Discord']
+    .map(label => findNode(panel, n => n.tag === 'button' && textOf(n) === label));
+  assert.match(textOf(panel), /bot will create the first import job when it is online/);
+  assert(controls().every(button => button.disabled));
+  await controls()[0].listeners.click();
+  assert.equal(actionPosts, 0, 'even a stale programmatic click cannot submit without a job');
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
+  assert(controls().every(button => button.disabled));
+  await controls()[2].listeners.click();
+  assert.equal(actionPosts, 0);
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(controls()[0].disabled, false, 'Pause becomes available once the first run exists');
+});
+
+test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
+  const asOf = 1790000000000;
+  const statuses = [
+    { status: 'waiting', status_reason: 'rate_limited', estimate_reason: 'rate_limited',
+      next_attempt_at: asOf + 90000, phase_remaining_seconds: 240, phase_finish_at: asOf + 240000,
+      processed: 0, last_progress_at: asOf - 60000, as_of: asOf,
+      last_success_at: asOf - 120000, last_success_processed: 11000, last_success_inserted: 10900,
+      last_success_updated: 50, last_success_unchanged: 50 },
+    { status: 'waiting', status_reason: 'discord_unavailable', estimate_reason: 'discord_unavailable',
+      next_attempt_at: asOf + 90000, phase_remaining_seconds: 240, phase_finish_at: asOf + 240000,
+      last_progress_at: asOf - 60000, as_of: asOf },
+    { status: 'paused', estimate_reason: 'paused', phase_remaining_seconds: 240,
+      phase_finish_at: asOf + 240000, as_of: asOf },
+    { status: 'queued', estimate_reason: 'worker_offline', phase_remaining_seconds: 240,
+      phase_finish_at: asOf + 240000, as_of: asOf },
+  ];
+  let reads = 0;
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ phase: 'members', progress_revision: reads + 1, ...statuses[reads++] })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  let copy = textOf(panel);
+  assert.match(copy, /Rate limit: retry in 1m 30s/);
+  assert.match(copy, /Remaining: about 4 minutes for this phase · Expected finish: (?!Unknown)/);
+  assert.match(copy, /0 records committed in this run/);
+  assert.match(copy, /Last successful run: .*11,000 processed · 10,900 inserted · 50 updated · 50 unchanged/);
+  assert.match(copy, /Last committed progress:/);
+  assert.match(copy, /Status read at/);
+  assert.doesNotMatch(copy, /Status updated/);
+  const countdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(countdown, 'known rate limit schedules a visible countdown');
+  h.advanceTime(1500);
+  h.timers.delete(countdown[0]);
+  countdown[1].fn();
+  assert.match(textOf(panel), /Rate limit: retry in 1m 29s/);
+  h.advanceTime(60000);
+  const laterCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(laterCountdown);
+  h.timers.delete(laterCountdown[0]);
+  laterCountdown[1].fn();
+  assert.match(textOf(panel), /Remaining: about 3 minutes for this phase/);
+  assert.match(textOf(panel), /Rate limit: retry in 0m 29s/);
+  h.advanceTime(190000);
+  const expiredCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(expiredCountdown);
+  h.timers.delete(expiredCountdown[0]);
+  expiredCountdown[1].fn();
+  assert.match(textOf(panel), /Remaining: Unknown · Expected finish: Unknown/);
+  assert.match(textOf(panel), /Rate limit: retry due now/);
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  for (const reason of ['discord_unavailable', 'paused', 'worker_offline']) {
+    refresh.listeners.click();
+    await new Promise(resolve => setImmediate(resolve));
+    copy = textOf(panel);
+    assert.match(copy, /Remaining: Unknown · Expected finish: Unknown|Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
+    assert.doesNotMatch(copy, /Rate limit: retry in/);
+    assert.equal([...h.timers.values()].filter(timer => timer.delay === 1000).length, 0, reason);
+  }
+});
+
+test('Members rejects a pending old search result before the debounce fires', async () => {
+  const pending = [];
+  const h = harness((url, opts) => url.endsWith('/member-sync')
+    ? Promise.resolve(response({ status: 'complete', phase: 'complete' }))
+    : new Promise(resolve => pending.push({ url, opts, resolve })));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  assert.equal(pending.length, 1);
+  const search = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Search members');
+  search.value = 'New Query';
+  search.listeners.input();
+  assert.equal(pending[0].opts.signal.aborted, true);
+  pending[0].resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Old Result' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Old Result/);
+  const debounce = [...h.timers].find(([, timer]) => timer.delay === 300);
+  assert(debounce);
+  h.timers.delete(debounce[0]);
+  debounce[1].fn();
+  assert.equal(pending.length, 2);
+  assert.match(pending[1].url, /q=New\+Query/);
+  pending[1].resolve(response({ members: [{ user_id: '1800882749273538600', display_name: 'New Result' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /New Result/);
+  assert.doesNotMatch(textOf(panel), /Old Result/);
+});
+
+test('Members filter, date, and sort changes discard old history and list responses immediately', async () => {
+  const pending = [];
+  let listReads = 0;
+  const h = harness((url, opts) => {
+    if (url.endsWith('/member-sync')) return Promise.resolve(response({ status: 'complete', phase: 'complete' }));
+    if (url.includes('/history')) return new Promise(resolve => pending.push({ type: 'history', url, opts, resolve }));
+    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow' }] }));
+    return new Promise(resolve => pending.push({ type: 'list', url, opts, resolve }));
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  const history = pending.find(item => item.type === 'history');
+  assert(history);
+  const filter = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Member status');
+  filter.value = 'banned';
+  filter.listeners.change();
+  assert.equal(history.opts.signal.aborted, true);
+  history.resolve(response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Discord audit action/);
+  const oldList = pending.find(item => item.type === 'list');
+  assert.match(oldList.url, /status=banned/);
+  const date = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Joined from date, UTC');
+  date.value = '2026-09-01';
+  date.listeners.input();
+  assert.equal(oldList.opts.signal.aborted, true);
+  oldList.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong Filter' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Wrong Filter/);
+  const sort = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Join date order');
+  sort.value = 'joined_oldest';
+  sort.listeners.change();
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 300).length, 0);
+  const newList = pending.filter(item => item.type === 'list').at(-1);
+  assert.match(newList.url, /joined_from=2026-09-01/);
+  assert.match(newList.url, /sort=joined_oldest/);
+  newList.resolve(response({ members: [{ user_id: '1800882749273538601', display_name: 'Right Filter' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Right Filter/);
 });
 
 test('Members drops responses from a previous server and page enrollment', async () => {

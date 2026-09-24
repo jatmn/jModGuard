@@ -66,7 +66,7 @@ Create a **separate** Bunny Database for the shared guild store. Configure both
 containers with credentials for that same guild database, in addition to the core
 credentials above. Never point the guild store at the core database or the frontend
 Storage Zone. The guild database must be empty on first initialization or already have
-the matching `jmodguard-guild-1` identity; runtime upgrades it to version 9.
+the matching `jmodguard-guild-1` identity; runtime upgrades it to version 10.
 
 ```dotenv
 JMODGUARD_GUILD_STORE_URL=libsql://GUILD_DATABASE_ID.lite.bunnydb.net

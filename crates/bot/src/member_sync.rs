@@ -399,6 +399,27 @@ fn retry_reason(error: &anyhow::Error) -> (&'static str, bool) {
         .unwrap_or(("discord_unavailable", false))
 }
 
+fn retry_reason_with_rate_limit(
+    error: &anyhow::Error,
+    rate_limit_until_ms: &AtomicI64,
+) -> (&'static str, bool) {
+    let result = retry_reason(error);
+    if result.1 || result.0 == "rate_limited" {
+        return result;
+    }
+    // Serenity waits for Retry-After inside the HTTP future. Our shorter
+    // request timeout can cancel that wait, leaving only Elapsed as the error.
+    // The callback has already saved the provider's deadline for pacing.
+    if error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+        && rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis()
+    {
+        return ("rate_limited", false);
+    }
+    result
+}
+
 fn retry_reason_http(error: &serenity::Error) -> (&'static str, bool) {
     if let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = error {
         match response.status_code.as_u16() {
@@ -1026,7 +1047,8 @@ pub async fn run(
                     }
                     Err(error) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
-                        let (reason, denied) = retry_reason(&error);
+                        let (reason, denied) =
+                            retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
                         let delay = if denied {
                             Duration::from_secs(3600)
                         } else {
@@ -1132,7 +1154,8 @@ pub async fn run(
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     tracing::warn!(guild_id = gid, "member sync request failed: {error:#}");
-                    let (reason, denied) = retry_reason(&error);
+                    let (reason, denied) =
+                        retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
                     let delay = if denied {
                         Duration::from_secs(3600)
                     } else {
@@ -1178,6 +1201,24 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timeout_during_known_retry_after_is_reported_as_rate_limited() {
+        let timeout = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let error: anyhow::Error = timeout.into();
+        let deadline = AtomicI64::new(chrono::Utc::now().timestamp_millis() + 60_000);
+        assert_eq!(
+            retry_reason_with_rate_limit(&error, &deadline),
+            ("rate_limited", false)
+        );
+        deadline.store(chrono::Utc::now().timestamp_millis() - 1, Ordering::Relaxed);
+        assert_eq!(
+            retry_reason_with_rate_limit(&error, &deadline),
+            ("discord_unavailable", false)
+        );
+    }
 
     #[test]
     fn filtered_audit_streams_have_independent_durable_positions() {
@@ -1229,6 +1270,10 @@ mod tests {
             overall_finish_at: None,
             estimate_reason: None,
             last_success_at: Some(2),
+            last_success_processed: Some(100),
+            last_success_inserted: Some(100),
+            last_success_updated: Some(0),
+            last_success_unchanged: Some(0),
             unseen_candidate_count: 0,
             audit_recovery_pending: true,
             audit_recovery_status: Some("queued".into()),

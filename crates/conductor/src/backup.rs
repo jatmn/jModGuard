@@ -838,9 +838,22 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
         rows.next().await?.is_some()
     };
     if has_member_seed {
+        let member_version = snap_conn
+            .query("PRAGMA user_version", ())
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("snapshot schema version missing"))?
+            .get::<i64>(0)?;
         snap_conn
             .execute(
-                "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=unixepoch()*1000",
+                if member_version >= 10 {
+                    "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),gap_generation=gap_generation+1,directory_revision=directory_revision+1"
+                } else {
+                    // A v9 snapshot is upgraded later. The v10 migration maps
+                    // its retained gap to generation one and fences old runs.
+                    "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000)"
+                },
                 (),
             )
             .await?;
@@ -1870,8 +1883,8 @@ mod member_snapshot_tests {
         let snapshot = root.join("snapshot.db");
         let db = libsql::Builder::new_local(&source).build().await.unwrap();
         let conn = db.connect().unwrap();
-        conn.execute_batch("CREATE TABLE guild_member_seed(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,initial_completed_at_ms INTEGER,reconciliation_needed INTEGER,gap_at_ms INTEGER);
-            INSERT INTO guild_member_seed VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,2000,0,NULL);
+        conn.execute_batch("CREATE TABLE guild_member_seed(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,initial_completed_at_ms INTEGER,reconciliation_needed INTEGER,gap_at_ms INTEGER,gap_generation INTEGER,directory_revision INTEGER);
+            INSERT INTO guild_member_seed VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,2000,0,NULL,0,7);
             CREATE TABLE guild_member_sync(guild_id INTEGER PRIMARY KEY,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER,status TEXT,status_reason TEXT);
             INSERT INTO guild_member_sync VALUES(10,'worker',900000,1,'running',NULL);
             CREATE TABLE guild_member_audit_recovery(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,run_id TEXT,started_at_ms INTEGER,status TEXT,processed INTEGER,next_attempt_at_ms INTEGER,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER,status_reason TEXT,cursor TEXT,request_after_ms INTEGER,restart_requested_at_ms INTEGER);
@@ -1880,12 +1893,13 @@ mod member_snapshot_tests {
             INSERT INTO guild_member_state_observations VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc',77,'ban_absent',1500);
             CREATE TABLE guild_member_target_checks(guild_id INTEGER,enrollment_id TEXT,user_id INTEGER,kind TEXT,reason TEXT,row_revision INTEGER,requested_at_ms INTEGER,next_attempt_at_ms INTEGER);
             INSERT INTO guild_member_target_checks VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',77,'member','gap',1,1600,1700);").await.unwrap();
+        conn.execute("PRAGMA user_version = 10", ()).await.unwrap();
         snapshot_sqlite(&source, &snapshot).await.unwrap();
         let db = libsql::Builder::new_local(&snapshot).build().await.unwrap();
         let conn = db.connect().unwrap();
         let row = conn
             .query(
-                "SELECT reconciliation_needed,gap_at_ms FROM guild_member_seed WHERE guild_id=10",
+                "SELECT reconciliation_needed,gap_at_ms,gap_generation,directory_revision FROM guild_member_seed WHERE guild_id=10",
                 (),
             )
             .await
@@ -1896,6 +1910,8 @@ mod member_snapshot_tests {
             .unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 1);
         assert!(row.get::<i64>(1).unwrap() > 0);
+        assert_eq!(row.get::<i64>(2).unwrap(), 1);
+        assert_eq!(row.get::<i64>(3).unwrap(), 8);
         let row = conn
             .query(
                 "SELECT status,lease_owner FROM guild_member_sync WHERE guild_id=10",

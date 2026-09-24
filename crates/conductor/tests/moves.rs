@@ -257,7 +257,12 @@ async fn init_guild(
     ))
     .await
     .unwrap();
-    conn.execute("PRAGMA user_version = 9", ()).await.unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/guild/0010_member_directory_status.sql"
+    ))
+    .await
+    .unwrap();
+    conn.execute("PRAGMA user_version = 10", ()).await.unwrap();
 }
 
 async fn call(

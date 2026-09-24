@@ -18,6 +18,10 @@ needs about 110 populated pages plus a terminal request, so the member phase
 takes roughly 28 minutes at the default pace, plus latency, other guilds,
 current bans, retries, and any available history recovery. The Members status
 card shows committed progress and distinguishes this estimate from known totals.
+Before the bot admits a genuinely new enrollment, the card says it is awaiting
+the first bot initialization and disables run controls. Once a saved run exists,
+its controls become available. Missing metadata for an already admitted
+enrollment instead needs attention; it never authorizes a new initial seed.
 While the page is visible, the card keeps following an acknowledged sync
 control and separate audit recovery even if the initial import is complete.
 The member-stage finish time is a preliminary forecast from a recent bot
@@ -27,6 +31,12 @@ becomes too old to support that forecast, the remaining time and finish time
 become unknown. An unconfirmed worker is not labeled as crashed. A completed
 member stage uses the actual number traversed rather than retaining the
 starting guild estimate.
+For a known Discord rate limit, the card counts down to the next attempt and
+uses a recent count and pace anchor to revise the member-stage finish time.
+Paused, offline, stale or unpredictable work has no finish forecast. The card
+shows the last committed progress time separately from the time its status was
+read. A later Reconcile has its own counters; the prior successful run's time
+and final counts remain visible independently.
 
 An unfinished import resumes from its durable cursor after restart. A paused
 import stays paused. Completion is durable for the bot identity and enrollment:
@@ -43,6 +53,9 @@ request budget; this audit-only recovery does not list all members or current
 bans and does not change the original initial-import completion time. The card
 reports its ban/unban stage, checked-entry count, waiting reason, and next
 attempt separately from the completed initial import.
+If another coverage gap is observed while a requested reconciliation is still
+finishing, that older run cannot clear the newer warning. Another explicit
+Reconcile is needed to establish full current-member/current-ban coverage.
 
 The bot uses its existing Discord HTTP client and rate limiter. Current ban-list
 entries establish present ban state, identity, and any supplied current reason,
@@ -51,6 +64,10 @@ roster rows carry the actual join timestamp supplied by Discord. Older events
 unavailable locally or beyond
 Discord's audit retention remain unknown. A snapshot observation never becomes
 a falsely dated ban or join action.
+When a current-ban snapshot is the only evidence of a ban, per-user history
+shows an unknown-event-time state observation rather than inventing a dated
+ban action. A later exact case or audit action remains a separate canonical
+history entry.
 
 ## Search and history
 
@@ -110,7 +127,7 @@ another database.
 
 ## Storage sizing
 
-The final v9 guild schema was measured in local SQLite with 4 KiB pages and
+The final v10 guild schema was measured in local SQLite with 4 KiB pages and
 `VACUUM`. The measurement includes the nullable stay identity on paced
 target checks; these bulk fixtures have no pending checks. An empty guild store
 measured 258,048 bytes. With one saved stay per
@@ -130,6 +147,6 @@ The difference from the same-name 11,000-member fixture is 22,769,664 bytes
 over ten years, or about 2.28 MB (2.17 MiB) per year under the same row mix
 and indexing. Churn and retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
 ordinary and 3.26 MB Unicode figures excluded final stays and indexes; use
-the repaired-schema measured fixtures above for sizing. The earlier candidate
+the v10 measured fixtures above for sizing. The earlier candidate
 measurements used a different row shape and name generator, so their difference
 from these figures is not a pure schema overhead estimate.

@@ -107,8 +107,8 @@ ban rows. Existing rows keep their exact IDs and have no fabricated names.
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version9,
-using `migrations/guild/0001_identity.sql` through `0009_member_directory.sql`. This separate
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version10,
+using `migrations/guild/0001_identity.sql` through `0010_member_directory_status.sql`. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings and the bounded [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
