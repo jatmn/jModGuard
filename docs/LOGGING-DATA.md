@@ -11,8 +11,8 @@ persistent member/user roster or activity counters.
 ## Basic reports
 
 - Updates use supplied content/attachment fields and the last retained observation,
-  when available. `before` is explicitly the last observed text; Gateway callback
-  scheduling, restart, overload and missing observations can leave a gap before
+  when available. `before` is explicitly the last observed text; startup before
+  collector registration, restart, overload and missing observations can leave a gap before
   the actual edit. A supplied author sets the display name; for ID-only filtering, a
   recent observation of that exact message can supply its author ID when the edit
   omits the author. An unknown author remains unavailable. An absent field is
@@ -34,13 +34,16 @@ persistent member/user roster or activity counters.
 - Single deletions take and remove the retained snapshot, reporting its last
   observed author, text and attachment metadata when available. Known empty text
   differs from an unsupplied field. A bounded recent process-only snippet may
-  still supply context when no retained snapshot exists. Attachment links can
+  supply identity for filtering when no retained snapshot exists; its text and
+  attachments never fill a retention miss. Attachment links can
   expire under Discord's signed CDN URL policy.
-  Bulk deletions take a bounded batch of snapshots, report retained and missing
-  counts, omit authors ignored for bulk-delete delivery, and attach a transient
+  Bulk deletions count each distinct message ID once across the entire event,
+  distinguish retained, known missing, storage unknown and filtered entries,
+  and attach a transient
   UTF-8 transcript capped at 256 KiB. The summary keeps the total and filtered
   counts without including ignored authors' content. A definite
-  attachment-permission failure uses at most three bounded text chunks; an
+  attachment-permission failure uses at most three bounded text chunks with the
+  exact number of entries omitted from that fallback; an
   ambiguous timeout is never resent. The transcript is not archived.
 - Join/leave reports use the delivered user and optional cached member join timestamp.
   Leave reports also use join timestamps already supplied with recent messages when
@@ -95,6 +98,14 @@ attachment metadata at 16 KiB, and each encoded snapshot at 64 KiB, with truncat
 marked. Pending observations are capped at 4096 items and 16 MiB; overflow marks a
 coverage gap. Snapshots do not guarantee Discord report replay. Failed delivery is
 not reconstructed from Discord or SQL.
+The shard collector admits observations in Gateway order before Serenity spawns
+ordinary callbacks. It cannot cover events delivered before collector registration;
+those reports state that content is unavailable. A verified cleanup or measurement
+failure pauses growing capture for that physical store while bounded deletion and
+cleanup continue. Capture resumes only after a successful cleanup, fresh measurement
+and normal admission. Turning capture off still consumes confirmed deletions.
+Known losses are counted for the affected physical store; unattributed Gateway or
+catalog gaps advance the coverage epoch without charging an arbitrary store.
 
 Custom templates in a supported database keep their wording on restart; the readable-log
 upgrade updates exact previous defaults once. See

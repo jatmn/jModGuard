@@ -572,8 +572,17 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
         if due == 0 {
             return Ok(0);
         }
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
+        let primary_due: i64 =
+            tx.query_row(&format!("SELECT EXISTS({DUE})"), params![cutoff, 1], |r| {
+                Ok(r.get(0)?)
+            })?;
+        if primary_due == 0 {
+            tx.finish_read()?;
+            return Ok(0);
+        }
         let floor = action_request_floor(&tx)?.max(cutoff);
+        tx.prepare_reclaim()?;
         let deleted = tx.execute_reclaim(
             &format!("DELETE FROM bot_actions WHERE id IN ({DUE})"),
             params![cutoff, limits.cleanup_batch_size],
@@ -582,10 +591,10 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
             tx.finish_read()?;
             return Ok(0);
         }
-        tx.execute_rows(
+        tx.execute_reclaim_metadata_bounded(
             "UPDATE meta SET value=?1 WHERE key='action_request_floor'",
             params![floor.to_string()],
-            1,
+            tx.capacity_page_size()?.saturating_mul(1024),
         )?;
         tx.commit()?;
         Ok(deleted)

@@ -138,7 +138,7 @@ async fn observe_membership(
             if !placed {
                 // No store exists to visit. Settle directory ownership in the same
                 // transaction as retirement, including its backup reminder.
-                super::tenant_lifecycle::wipe_directory_guild_data_conn(&tx, guild)?;
+                super::tenant_lifecycle::wipe_directory_guild_data_conn(&tx, guild, false)?;
                 if let Some((old, _, true)) = &current {
                     tx.execute_rows(
                         "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,created_at)

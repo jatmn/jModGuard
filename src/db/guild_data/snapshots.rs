@@ -338,6 +338,9 @@ impl GuildDataStore {
                         | "scope"
                         | "queue_overflow"
                         | "database"
+                        | "cleanup_failed"
+                        | "measurement_failed"
+                        | "startup_deferred"
                         | "gateway_gap"
                         | "disabled"
                 )
@@ -354,7 +357,7 @@ impl GuildDataStore {
                 return Ok(());
             }
             tx.ensure_mutation_receipt()?;
-            tx.execute_bounded("UPDATE guild_snapshot_health SET epoch=?1,state=?2,reason=?3,last_observed_at_ms=COALESCE(?4,last_observed_at_ms),lost_count=CASE WHEN epoch=?1 THEN lost_count+?5 ELSE ?5 END,updated_at_ms=?6 WHERE singleton=1",params![update.epoch as i64,update.state.as_str(),update.reason,update.observed_at_ms,update.lost_delta.min(i64::MAX as u64) as i64,update.now_ms], growth_reserve(&tx)?)?;
+            tx.execute_bounded("UPDATE guild_snapshot_health SET epoch=?1,state=?2,reason=?3,last_observed_at_ms=COALESCE(?4,last_observed_at_ms),lost_count=CASE WHEN epoch=?1 THEN lost_count+?5 ELSE ?5 END,expired_count=CASE WHEN epoch=?1 THEN expired_count ELSE 0 END,evicted_count=CASE WHEN epoch=?1 THEN evicted_count ELSE 0 END,counters_reset_at_ms=CASE WHEN epoch=?1 THEN counters_reset_at_ms ELSE ?6 END,updated_at_ms=?6 WHERE singleton=1",params![update.epoch as i64,update.state.as_str(),update.reason,update.observed_at_ms,update.lost_delta.min(i64::MAX as u64) as i64,update.now_ms], growth_reserve(&tx)?)?;
             tx.commit()
         }).await
     }
@@ -581,10 +584,17 @@ impl GuildDataStore {
                     row
                 })
             }).collect();
+            let expired_count = found.values().filter(|row| row.expires_at_ms <= effective_now).count();
             if found.is_empty() { tx.finish_read()?; }
             else {
                 tx.prepare_reclaim()?;
                 tx.execute_reclaim(&format!("DELETE FROM guild_message_snapshots WHERE {where_sql}"), params_from_iter(args))?;
+                if expired_count > 0 {
+                    tx.execute_reclaim_metadata_bounded(
+                        "UPDATE guild_snapshot_health SET expired_count=expired_count+?1 WHERE singleton=1",
+                        params![expired_count as i64], growth_reserve(&tx)?,
+                    )?;
+                }
                 tx.commit()?;
             }
             Ok(out)
@@ -625,18 +635,35 @@ impl GuildDataStore {
             };
             let count_sql = format!("SELECT COUNT(*) FROM ({subquery})");
             let count: i64 = tx.query_row(&count_sql, params_from_iter(args.clone()), |r| Ok(r.get(0)?))?;
-            if count == 0 { tx.finish_read()?; return Ok(0); }
+            if count == 0 {
+                let last: Option<i64> = tx.query_row(
+                    "SELECT last_cleanup_at_ms FROM guild_snapshot_health WHERE singleton=1",
+                    (), |r| Ok(r.get(0)?),
+                )?;
+                if last.is_some_and(|at| now_ms.saturating_sub(at) < 30_000) {
+                    tx.finish_read()?;
+                } else {
+                    tx.prepare_reclaim()?;
+                    tx.execute_reclaim_metadata_bounded(
+                        "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1 WHERE singleton=1",
+                        params![now_ms], tx.capacity_page_size()?.saturating_mul(1024),
+                    )?;
+                    tx.commit()?;
+                }
+                return Ok(0);
+            }
             tx.prepare_reclaim()?;
-            let allocated_before = crate::capacity::allocated_bytes(&tx)?;
             let delete_sql = format!("DELETE FROM guild_message_snapshots WHERE (guild_id,enrollment_id,channel_id,message_id) IN ({subquery})");
             let bound = tx.capacity_page_size()?.saturating_mul(1024);
             tx.execute_reclaim_bounded(&delete_sql, params_from_iter(args), bound)?;
-            if allocated_before < crate::capacity::GROWTH_STOP_BYTES {
-                tx.execute_reclaim_metadata_bounded(
-                    "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL WHERE singleton=1",
-                    params![now_ms], growth_reserve(&tx)?,
-                )?;
-            }
+            let metadata_sql = if expired_only {
+                "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,expired_count=expired_count+?2 WHERE singleton=1"
+            } else {
+                "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,evicted_count=evicted_count+?2 WHERE singleton=1"
+            };
+            tx.execute_reclaim_metadata_bounded(
+                metadata_sql, params![now_ms, count], growth_reserve(&tx)?,
+            )?;
             tx.commit()?;
             Ok(count as usize)
         }).await

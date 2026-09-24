@@ -46,7 +46,7 @@ Unknown variables are left untouched so template mistakes are visible.
 - **member_kick** — boot with actor + reason
 - **message_edit** — one Discord-identified edit (`edited_timestamp`), last observed before and updated text with coverage label. Embed/GIF unfurls, chat replies and the bot's own log posts do not create edit reports.
 - **message_delete** — message ID and last observed author, text and attachment metadata when available
-- **message_bulk_delete** — count, retained/unavailable counts, and a transient bounded transcript attachment
+- **message_bulk_delete** — unique count, retained/known-missing/storage-unknown/filtered counts, omitted transcript entries, and a transient bounded transcript attachment; a definite attachment-permission failure uses plain-message chunks with an exact omitted count
 - **automod** — shield: rule, action, reason, evidence, channel
 - **mod_action** — judge: action, user, moderator, reason
 - **timeout_add** / **timeout_remove** — timer events
@@ -93,6 +93,8 @@ on restart. Configuration versioning makes the upgraded values visible to the bo
 and WebUI.
 The retained-message template upgrade likewise replaces only byte-for-byte shipped
 edit/delete/bulk defaults once. Custom wording stays intact.
+The bulk status upgrade updates only the exact earlier retained-bulk default to
+show known missing, storage unknown and omitted entries; custom text stays intact.
 
 All 14 built-in log templates use bold headings and labels, inline-code IDs,
 counts/durations/dates, and an absolute event time. Mentions and links remain

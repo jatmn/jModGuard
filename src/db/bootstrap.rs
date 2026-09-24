@@ -149,6 +149,30 @@ pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
+/// Permit a current, completed installation to start for inspection and
+/// maintenance while ordinary bootstrap writes are over the growth stop.
+/// An incomplete schema or missing persisted defaults still takes the normal
+/// migration path, which must refuse unsafe growth.
+pub(super) fn bootstrap_at_capacity(conn: &Connection) -> Result<bool> {
+    let tx = conn.transaction_primary_read()?;
+    let allocated = crate::capacity::allocated_bytes(&tx)?;
+    if allocated < conn.capacity_growth_limit() {
+        tx.finish_read()?;
+        return Ok(false);
+    }
+    let complete = match ensure_schema_current(&tx).and_then(|_| ensure_bootstrap_complete(&tx)) {
+        Ok(()) => read_terminal_defaults_meta(&tx)?.is_some(),
+        Err(error) if is_schema_not_ready(&error) => false,
+        Err(error) => return Err(error),
+    };
+    if complete {
+        tx.probe_write_permission()
+            .map_err(annotate_readonly_token)?;
+    }
+    tx.finish_read()?;
+    Ok(complete)
+}
+
 pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<GuildSettings> {
     let tx = conn.transaction_primary_read()?;
     ensure_schema_current(&tx)?;
@@ -190,6 +214,46 @@ pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Resul
         "slash_registry_revision",
         &format!("{:032x}", rand::random::<u128>()),
     )
+}
+
+/// Only for verified removal/closure transactions under reclaim admission.
+/// Existing completed schemas have these fixed rows; missing markers refuse
+/// the cleanup rather than silently dropping invalidation floors.
+pub(super) fn bump_config_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
+        "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'",
+        (), reclaim_meta_bound(tx)?,
+    )? == 1, "config_version marker is missing");
+    anyhow::ensure!(
+        tx.execute_reclaim_metadata_bounded(
+            "UPDATE meta SET value=?1 WHERE key='config_revision'",
+            params![format!("{:032x}", rand::random::<u128>())],
+            reclaim_meta_bound(tx)?,
+        )? == 1,
+        "config_revision marker is missing"
+    );
+    tx.record_config_version(get_config_version_conn(tx)?);
+    Ok(())
+}
+
+pub(super) fn bump_slash_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
+        "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='slash_registry_version'",
+        (), reclaim_meta_bound(tx)?,
+    )? == 1, "slash_registry_version marker is missing");
+    anyhow::ensure!(
+        tx.execute_reclaim_metadata_bounded(
+            "UPDATE meta SET value=?1 WHERE key='slash_registry_revision'",
+            params![format!("{:032x}", rand::random::<u128>())],
+            reclaim_meta_bound(tx)?,
+        )? == 1,
+        "slash_registry_revision marker is missing"
+    );
+    Ok(())
+}
+
+pub(super) fn reclaim_meta_bound(tx: &impl SqlExecutor) -> Result<u64> {
+    Ok(tx.capacity_page_size()?.saturating_mul(1024))
 }
 
 pub(super) fn bump_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<()> {
@@ -422,15 +486,11 @@ pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
 /// schema-open and fail on the first WebUI `PUT`.
 pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
     let tx = conn
-        .transaction_immediate()
+        .transaction_primary_read()
         .map_err(annotate_readonly_token)?;
-    tx.execute_rows(
-        "UPDATE meta SET value = value WHERE key = ?1",
-        params![META_BOOTSTRAP_COMPLETE],
-        1,
-    )
-    .map_err(annotate_readonly_token)?;
-    tx.commit().map_err(annotate_readonly_token)?;
+    tx.probe_write_permission()
+        .map_err(annotate_readonly_token)?;
+    tx.finish_read().map_err(annotate_readonly_token)?;
     Ok(())
 }
 
@@ -677,6 +737,18 @@ pub(super) fn seed_globals_conn(
             )?;
         }
         write_meta_string_conn(conn, "retained_message_templates_v1", "1")?;
+    }
+    if meta_string_conn(conn, "retained_bulk_status_template_v1")?.is_none() {
+        let new = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "message_bulk_delete")
+            .expect("shipped bulk delete template")
+            .1;
+        changed += conn.execute_matching(
+            "UPDATE templates SET template=?1 WHERE event_type='message_bulk_delete' AND template=?2",
+            params![new, crate::defaults::PRE_BULK_STATUS_TEMPLATE],
+        )?;
+        write_meta_string_conn(conn, "retained_bulk_status_template_v1", "1")?;
     }
     for mut cmd in crate::defaults::default_commands() {
         if cmd.name == "stats" && status_taken {

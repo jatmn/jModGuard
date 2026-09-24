@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serenity::client::Context;
+use serenity::gateway::CollectorCallback;
 use serenity::model::channel::Message;
-use serenity::model::event::MessageUpdateEvent;
+use serenity::model::event::{Event, MessageUpdateEvent};
 use serenity::model::id::{ChannelId, GuildId, MessageId};
 use tokio::sync::mpsc;
 
@@ -30,6 +31,11 @@ const MAX_KNOWN: usize = 4096;
 const TOMBSTONE_KEEP: Duration = Duration::from_secs(86_400);
 
 type Key = (u64, u64, u64);
+
+pub(crate) fn unique_ids(ids: &[MessageId]) -> Vec<MessageId> {
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+}
 
 /// Fixed-memory reminder of deleted identities after the exact tombstone map
 /// reaches its 4096-entry limit. False positives leave a marked capture gap;
@@ -96,6 +102,22 @@ struct KnownHumans {
     order: VecDeque<(Key, Instant)>,
 }
 
+struct DeletedIdentities {
+    exact: HashMap<Key, Instant>,
+    order: VecDeque<(Key, Instant)>,
+    bloom: DeletionBloom,
+}
+
+impl Default for DeletedIdentities {
+    fn default() -> Self {
+        Self {
+            exact: HashMap::new(),
+            order: VecDeque::new(),
+            bloom: DeletionBloom::new(),
+        }
+    }
+}
+
 struct Work {
     scope: GuildDataScope,
     context: Context,
@@ -143,10 +165,17 @@ pub struct SnapshotIngress {
     bytes: AtomicUsize,
     epoch: AtomicU64,
     started_at_ms: i64,
-    lost_pending: AtomicU64,
+    /// Loss is charged only to the physical store whose scoped work failed.
+    /// Unknown gateway/catalog gaps still advance the observation epoch.
+    lost_pending: Mutex<HashMap<String, u64>>,
     scopes: Mutex<HashMap<u64, GuildDataScope>>,
     known_humans: Mutex<KnownHumans>,
+    deleted: Mutex<DeletedIdentities>,
     content_access: Mutex<HashSet<u64>>,
+    contexts: Mutex<HashMap<u64, (u64, Context)>>,
+    collectors: Mutex<HashMap<u64, u64>>,
+    cleanup_paused: Mutex<HashSet<String>>,
+    health_initialized: Mutex<HashSet<String>>,
     /// Report tasks are bounded separately from snapshot work.
     report_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -160,17 +189,153 @@ impl Default for SnapshotIngress {
             bytes: AtomicUsize::new(0),
             epoch: AtomicU64::new(chrono::Utc::now().timestamp_micros() as u64),
             started_at_ms: chrono::Utc::now().timestamp_millis(),
-            lost_pending: AtomicU64::new(0),
+            lost_pending: Mutex::new(HashMap::new()),
             scopes: Mutex::new(HashMap::new()),
             known_humans: Mutex::new(KnownHumans::default()),
+            deleted: Mutex::new(DeletedIdentities::default()),
             content_access: Mutex::new(HashSet::new()),
+            contexts: Mutex::new(HashMap::new()),
+            collectors: Mutex::new(HashMap::new()),
+            cleanup_paused: Mutex::new(HashSet::new()),
+            health_initialized: Mutex::new(HashSet::new()),
             report_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         }
     }
 }
 
 impl SnapshotIngress {
+    /// Called before the first await in READY/RESUME. Serenity invokes this
+    /// callback on the shard runner before spawning either event handler.
+    pub fn install_collector(&self, app: &Arc<BotState>, context: &Context) {
+        let shard = context.shard_id.get() as u64;
+        let generation = {
+            let mut collectors = self.collectors.lock();
+            let generation = collectors.get(&shard).copied().unwrap_or(0).wrapping_add(1);
+            collectors.insert(shard, generation);
+            generation
+        };
+        self.contexts
+            .lock()
+            .insert(shard, (generation, context.clone()));
+        let weak = Arc::downgrade(app);
+        context
+            .shard
+            .add_collector(CollectorCallback(Box::new(move |event| {
+                let Some(app) = weak.upgrade() else {
+                    return false;
+                };
+                if app.snapshots.collectors.lock().get(&shard).copied() != Some(generation) {
+                    return false;
+                }
+                if !matches!(
+                    event,
+                    Event::MessageCreate(_)
+                        | Event::MessageUpdate(_)
+                        | Event::MessageDelete(_)
+                        | Event::MessageDeleteBulk(_)
+                ) {
+                    return true;
+                }
+                let context = app
+                    .snapshots
+                    .contexts
+                    .lock()
+                    .get(&shard)
+                    .filter(|(current, _)| *current == generation)
+                    .map(|(_, context)| context.clone());
+                if let Some(context) = context {
+                    app.snapshots.on_gateway_event(&app, context, event);
+                } else {
+                    return false;
+                }
+                true
+            })));
+    }
+
+    pub fn collector_active(&self, context: &Context) -> bool {
+        self.collectors
+            .lock()
+            .contains_key(&(context.shard_id.get() as u64))
+    }
+
+    pub fn unhooked_delete(&self, guild: GuildId, channel: ChannelId, ids: &[MessageId]) {
+        self.gap();
+        self.mark_deleted(guild, channel, ids);
+    }
+
+    fn on_gateway_event(&self, app: &Arc<BotState>, context: Context, event: &Event) {
+        match event {
+            Event::MessageCreate(event) => self.create(app, context, &event.message),
+            Event::MessageUpdate(event) => {
+                let known = event.guild_id.and_then(|guild| {
+                    crate::logging::known_message_author(
+                        app,
+                        guild.get(),
+                        event.channel_id.get(),
+                        event.id.get(),
+                    )
+                });
+                let report = crate::logging::message_update_report(
+                    event,
+                    known,
+                    Some(context.cache.current_user().id.get()),
+                )
+                .filter(|_| app.edit_reports.should_report(event));
+                let queued = self.edit(app, context.clone(), event, report.clone());
+                if !queued && let Some(report) = report {
+                    submit_report(app, &context, report);
+                }
+            }
+            Event::MessageDelete(event) => {
+                if let Some(guild) = event.guild_id {
+                    let queued = self.delete(
+                        app,
+                        context.clone(),
+                        guild,
+                        event.channel_id,
+                        vec![event.message_id],
+                        false,
+                    );
+                    if !queued {
+                        let report = logging::message_delete_report(
+                            app,
+                            guild,
+                            event.channel_id,
+                            event.message_id,
+                        );
+                        submit_report(app, &context, report);
+                    }
+                }
+            }
+            Event::MessageDeleteBulk(event) => {
+                if let Some(guild) = event.guild_id {
+                    let ids = unique_ids(&event.ids);
+                    let queued = self.delete(
+                        app,
+                        context.clone(),
+                        guild,
+                        event.channel_id,
+                        ids.clone(),
+                        true,
+                    );
+                    if !queued {
+                        let mut transcript = logging::BulkTranscript::new(ids.len());
+                        for id in ids {
+                            transcript.push_unknown(id);
+                        }
+                        submit_bulk_report(app, &context, guild, event.channel_id, transcript);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub async fn maintain(&self, app: &BotState) {
+        self.maintain_at(app, None).await;
+    }
+
+    async fn maintain_at(&self, app: &BotState, now_override: Option<i64>) {
         let stores = match app.tenant.usage_stores().await {
             Ok(stores) => stores,
             Err(error) => {
@@ -179,73 +344,165 @@ impl SnapshotIngress {
                 return;
             }
         };
-        for entry in stores {
-            let Some(store) = entry.handle else {
-                self.gap();
-                continue;
-            };
-            let store_id = entry.registration.id().as_str();
-            let now = chrono::Utc::now().timestamp_millis();
-            for _ in 0..4 {
-                match store.expire_snapshots(100, now).await {
-                    Ok(100) => tokio::task::yield_now().await,
-                    Ok(_) => break,
-                    Err(error) => {
-                        tracing::warn!("snapshot cleanup unavailable: {error:#}");
-                        self.gap();
-                        break;
+        let mut active = vec![true; stores.len()];
+        // One batch per store per round. A known backlog gets prompt follow-up,
+        // with a scheduler yield so gateway and scope refresh keep running.
+        while active.iter().any(|pending| *pending) {
+            for (index, entry) in stores.iter().enumerate() {
+                if !active[index] {
+                    continue;
+                }
+                let store_id = entry.registration.id().as_str();
+                let Some(store) = entry.handle.as_ref() else {
+                    self.cleanup_paused.lock().insert(store_id.to_owned());
+                    active[index] = false;
+                    self.gap_store(store_id);
+                    continue;
+                };
+                let now = now_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+                if !self.health_initialized.lock().contains(store_id) {
+                    let lost = self.take_loss(store_id);
+                    let initialized = store
+                        .update_snapshot_health(SnapshotHealthUpdate {
+                            epoch: self.epoch.load(Ordering::Acquire),
+                            state: SnapshotHealthState::Paused,
+                            reason: Some("gateway_gap"),
+                            observed_at_ms: None,
+                            lost_delta: lost,
+                            now_ms: now,
+                        })
+                        .await
+                        .is_ok();
+                    if initialized {
+                        let mut seen = self.health_initialized.lock();
+                        if seen.len() < 1024 {
+                            seen.insert(store_id.to_owned());
+                        }
+                    } else {
+                        self.restore_loss(store_id, lost);
+                        self.cleanup_paused.lock().insert(store_id.to_owned());
                     }
                 }
-            }
-            match store.measure_usage(false).await {
-                Ok(usage) if pressure_cleanup_due(usage.allocated_bytes, usage.snapshot_count) => {
-                    // Reusable pages may not lower page_count immediately, but
-                    // retiring oldest transient rows makes room for core writes.
-                    for _ in 0..4 {
-                        match store.evict_snapshots(100, now).await {
-                            Ok(100) => tokio::task::yield_now().await,
-                            Ok(_) => break,
-                            Err(error) => {
-                                tracing::warn!("snapshot pressure cleanup unavailable: {error:#}");
-                                self.gap();
-                                break;
-                            }
+                let expired = match store.expire_snapshots(100, now).await {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::warn!(store_id, "snapshot cleanup unavailable: {error:#}");
+                        self.cleanup_paused.lock().insert(store_id.to_owned());
+                        active[index] = false;
+                        self.gap_store(store_id);
+                        self.write_maintenance_pause(store_id, store, "cleanup_failed", now)
+                            .await;
+                        continue;
+                    }
+                };
+                let usage = match store.measure_usage(false).await {
+                    Ok(usage) => usage,
+                    Err(error) => {
+                        tracing::warn!(
+                            store_id,
+                            "snapshot usage measurement unavailable: {error:#}"
+                        );
+                        self.cleanup_paused.lock().insert(store_id.to_owned());
+                        active[index] = false;
+                        self.gap_store(store_id);
+                        self.write_maintenance_pause(store_id, store, "measurement_failed", now)
+                            .await;
+                        continue;
+                    }
+                };
+                let evicted = if pressure_cleanup_due(usage.allocated_bytes, usage.snapshot_count) {
+                    match store.evict_snapshots(100, now).await {
+                        Ok(count) => count,
+                        Err(error) => {
+                            tracing::warn!(
+                                store_id,
+                                "snapshot pressure cleanup unavailable: {error:#}"
+                            );
+                            self.cleanup_paused.lock().insert(store_id.to_owned());
+                            active[index] = false;
+                            self.gap_store(store_id);
+                            self.write_maintenance_pause(store_id, store, "cleanup_failed", now)
+                                .await;
+                            continue;
                         }
                     }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!("snapshot usage measurement unavailable: {error:#}");
-                    self.gap();
-                }
-            }
-            let verified_content = {
-                let access = self.content_access.lock();
-                self.scopes.lock().iter().any(|(guild, candidate)| {
-                    candidate.placement().store_id().as_str() == store_id && access.contains(guild)
-                })
-            };
-            let idle_state = if !app.cfg.bot.message_capture_enabled {
-                Some((SnapshotHealthState::Disabled, "disabled"))
-            } else if !verified_content {
-                Some((SnapshotHealthState::Unavailable, "content_access"))
-            } else {
-                None
-            };
-            if let Some((state, reason)) = idle_state {
-                let lost = self.lost_pending.swap(0, Ordering::AcqRel);
-                let update = SnapshotHealthUpdate {
-                    epoch: self.epoch.load(Ordering::Acquire),
-                    state,
-                    reason: Some(reason),
-                    observed_at_ms: None,
-                    lost_delta: lost,
-                    now_ms: now,
+                } else {
+                    0
                 };
-                if store.update_snapshot_health(update).await.is_err() {
-                    self.lost_pending.fetch_add(lost, Ordering::AcqRel);
+                if usage.allocated_bytes < jmodguard::capacity::SNAPSHOT_PAUSE_BYTES
+                    && !app.db.capacity_runtime_status().startup_deferred
+                    && self.health_initialized.lock().contains(store_id)
+                {
+                    self.cleanup_paused.lock().remove(store_id);
+                }
+                active[index] = expired == 100 || evicted == 100;
+                let verified_content = {
+                    let access = self.content_access.lock();
+                    self.scopes.lock().iter().any(|(guild, candidate)| {
+                        candidate.placement().store_id().as_str() == store_id
+                            && access.contains(guild)
+                    })
+                };
+                let status = if !app.cfg.bot.message_capture_enabled {
+                    (SnapshotHealthState::Disabled, Some("disabled"))
+                } else if app.db.capacity_runtime_status().startup_deferred {
+                    (SnapshotHealthState::Paused, Some("startup_deferred"))
+                } else if usage.allocated_bytes >= jmodguard::capacity::SNAPSHOT_PAUSE_BYTES
+                    || usage
+                        .snapshot_health
+                        .as_ref()
+                        .is_some_and(|health| health.capacity_paused)
+                {
+                    (SnapshotHealthState::Paused, Some("capacity"))
+                } else if self.cleanup_paused.lock().contains(store_id) {
+                    (SnapshotHealthState::Paused, Some("cleanup_failed"))
+                } else if !verified_content {
+                    (SnapshotHealthState::Unavailable, Some("content_access"))
+                } else {
+                    (SnapshotHealthState::Active, None)
+                };
+                let (state, reason) = status;
+                let lost = self.take_loss(store_id);
+                if store
+                    .update_snapshot_health(SnapshotHealthUpdate {
+                        epoch: self.epoch.load(Ordering::Acquire),
+                        state,
+                        reason,
+                        observed_at_ms: None,
+                        lost_delta: lost,
+                        now_ms: now,
+                    })
+                    .await
+                    .is_err()
+                {
+                    self.restore_loss(store_id, lost);
                 }
             }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn write_maintenance_pause(
+        &self,
+        store_id: &str,
+        store: &GuildDataStore,
+        reason: &'static str,
+        now_ms: i64,
+    ) {
+        let lost = self.take_loss(store_id);
+        if store
+            .update_snapshot_health(SnapshotHealthUpdate {
+                epoch: self.epoch.load(Ordering::Acquire),
+                state: SnapshotHealthState::Paused,
+                reason: Some(reason),
+                observed_at_ms: None,
+                lost_delta: lost,
+                now_ms,
+            })
+            .await
+            .is_err()
+        {
+            self.restore_loss(store_id, lost);
         }
     }
 
@@ -278,7 +535,41 @@ impl SnapshotIngress {
 
     pub fn gap(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
-        self.lost_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn gap_scope(&self, scope: &GuildDataScope) {
+        self.gap_store(scope.placement().store_id().as_str());
+    }
+
+    fn gap_store(&self, store_id: &str) {
+        self.gap();
+        let key = store_id.to_owned();
+        let mut pending = self.lost_pending.lock();
+        if pending.contains_key(&key) || pending.len() < 1024 {
+            let count = pending.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn take_loss(&self, store_id: &str) -> u64 {
+        self.lost_pending.lock().remove(store_id).unwrap_or(0)
+    }
+
+    fn restore_loss(&self, store_id: &str, lost: u64) {
+        if lost == 0 {
+            return;
+        }
+        let mut pending = self.lost_pending.lock();
+        if pending.contains_key(store_id) || pending.len() < 1024 {
+            let count = pending.entry(store_id.to_owned()).or_default();
+            *count = count.saturating_add(lost);
+        }
+    }
+
+    fn capture_paused(&self, scope: &GuildDataScope) -> bool {
+        self.cleanup_paused
+            .lock()
+            .contains(scope.placement().store_id().as_str())
     }
 
     fn scope(&self, guild: u64) -> Option<GuildDataScope> {
@@ -311,6 +602,47 @@ impl SnapshotIngress {
         self.known_humans.lock().entries.contains(&key)
     }
 
+    fn deleted(&self, key: Key) -> bool {
+        let deleted = self.deleted.lock();
+        deleted.exact.contains_key(&key) || deleted.bloom.contains(key)
+    }
+
+    fn mark_deleted(&self, guild: GuildId, channel: ChannelId, ids: &[MessageId]) {
+        let mut deleted = self.deleted.lock();
+        for id in ids {
+            let key = (guild.get(), channel.get(), id.get());
+            deleted.bloom.insert(key);
+            if let std::collections::hash_map::Entry::Vacant(entry) = deleted.exact.entry(key) {
+                let at = Instant::now();
+                entry.insert(at);
+                deleted.order.push_back((key, at));
+            }
+        }
+        while deleted
+            .order
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() >= TOMBSTONE_KEEP)
+            || deleted.order.len() > MAX_KNOWN
+        {
+            let Some((key, at)) = deleted.order.pop_front() else {
+                break;
+            };
+            if deleted
+                .exact
+                .get(&key)
+                .is_some_and(|current| *current == at)
+            {
+                deleted.exact.remove(&key);
+            }
+        }
+        let mut known = self.known_humans.lock();
+        for id in ids {
+            known
+                .entries
+                .remove(&(guild.get(), channel.get(), id.get()));
+        }
+    }
+
     fn enqueue(
         &self,
         app: &Arc<BotState>,
@@ -320,16 +652,16 @@ impl SnapshotIngress {
     ) -> bool {
         let bytes = body.pending_bytes();
         if bytes > MAX_PENDING_BYTES {
-            self.gap();
+            self.gap_scope(&scope);
             return false;
         }
         if !self.reserve_bytes(bytes) {
-            self.gap();
+            self.gap_scope(&scope);
             return false;
         }
         self.start_worker(app);
         let item = Work {
-            scope,
+            scope: scope.clone(),
             context,
             body,
             bytes,
@@ -337,7 +669,7 @@ impl SnapshotIngress {
         };
         if self.sender.try_send(item).is_err() {
             self.bytes.fetch_sub(bytes, Ordering::AcqRel);
-            self.gap();
+            self.gap_scope(&scope);
             return false;
         }
         true
@@ -362,6 +694,7 @@ impl SnapshotIngress {
 
     pub fn create(&self, app: &Arc<BotState>, context: Context, message: &Message) {
         if !app.cfg.bot.message_capture_enabled
+            || app.db.capacity_runtime_status().startup_deferred
             || message.author.bot
             || message.webhook_id.is_some()
         {
@@ -416,6 +749,7 @@ impl SnapshotIngress {
         report: Option<MessageReport>,
     ) -> bool {
         if !app.cfg.bot.message_capture_enabled
+            || app.db.capacity_runtime_status().startup_deferred
             || event.edited_timestamp.is_none()
             || (event.content.is_none() && event.attachments.is_none())
             || event.author.as_ref().is_some_and(|author| author.bot)
@@ -426,13 +760,7 @@ impl SnapshotIngress {
         let Some(guild) = event.guild_id else {
             return false;
         };
-        if !self.content_access.lock().contains(&guild.get())
-            && event.content.as_ref().is_none_or(|text| text.is_empty())
-            && event
-                .attachments
-                .as_ref()
-                .is_none_or(|items| items.is_empty())
-        {
+        if !self.content_access.lock().contains(&guild.get()) {
             self.gap();
             return false;
         }
@@ -479,24 +807,27 @@ impl SnapshotIngress {
         ids: Vec<MessageId>,
         bulk: bool,
     ) -> bool {
-        if !app.cfg.bot.message_capture_enabled {
-            return false;
-        }
+        let ids = unique_ids(&ids);
         let Some(scope) = self.scope(guild.get()) else {
             self.gap();
+            self.mark_deleted(guild, channel, &ids);
             return false;
         };
-        self.enqueue(
+        let queued = self.enqueue(
             app,
             context,
             scope,
             Body::Delete {
                 guild,
                 channel,
-                ids,
+                ids: ids.clone(),
                 bulk,
             },
-        )
+        );
+        if !queued {
+            self.mark_deleted(guild, channel, &ids);
+        }
+        queued
     }
 }
 
@@ -604,30 +935,24 @@ fn estimated_bytes(observation: &SnapshotObservation) -> usize {
 }
 
 async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
-    let mut tombstones: HashMap<Key, Instant> = HashMap::new();
-    let mut tombstone_order: VecDeque<(Key, Instant)> = VecDeque::new();
-    let mut deleted = DeletionBloom::new();
     let mut health: HashMap<String, (Instant, SnapshotHealthState, Option<&'static str>)> =
         HashMap::new();
     while let Some(mut work) = receiver.recv().await {
         app.snapshots.bytes.fetch_sub(work.bytes, Ordering::AcqRel);
-        while let Some((key, at)) = tombstone_order.front().copied() {
-            if at.elapsed() < TOMBSTONE_KEEP && tombstones.len() <= MAX_KNOWN {
-                break;
-            }
-            if tombstones.len() > MAX_KNOWN {
-                app.snapshots.gap();
-            }
-            tombstone_order.pop_front();
-            if tombstones.get(&key).is_some_and(|current| *current == at) {
-                tombstones.remove(&key);
-            }
-        }
         let store = match app.tenant.store(&work.scope).await {
             Ok(store) => store,
             Err(error) => {
                 tracing::warn!("message snapshot store unavailable: {error:#}");
-                app.snapshots.gap();
+                app.snapshots.gap_scope(&work.scope);
+                if let Body::Delete {
+                    guild,
+                    channel,
+                    ref ids,
+                    ..
+                } = work.body
+                {
+                    app.snapshots.mark_deleted(guild, channel, ids);
+                }
                 match work.body {
                     Body::Edit(_, Some(mut report), _) => {
                         report
@@ -658,7 +983,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     } => {
                         let mut transcript = logging::BulkTranscript::new(ids.len());
                         for id in ids {
-                            transcript.push(id, None);
+                            transcript.push_unknown(id);
                         }
                         submit_bulk_report(&app, &work.context, guild, channel, transcript);
                     }
@@ -672,7 +997,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
             Ok(cfg) => Some(cfg),
             Err(error) => {
                 tracing::warn!("message snapshot config unavailable: {error:#}");
-                app.snapshots.gap();
+                app.snapshots.gap_scope(&work.scope);
                 None
             }
         };
@@ -686,16 +1011,17 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if !configured {
                     continue;
                 }
+                if app.snapshots.capture_paused(&work.scope) {
+                    app.snapshots.gap_scope(&work.scope);
+                    continue;
+                }
                 let key = (
                     guild,
                     observation.channel_id as u64,
                     observation.message_id as u64,
                 );
-                if tombstones.contains_key(&key) {
-                    continue;
-                }
-                if deleted.contains(key) {
-                    app.snapshots.gap();
+                if app.snapshots.deleted(key) {
+                    app.snapshots.gap_scope(&work.scope);
                     continue;
                 }
                 observation.coverage_epoch = work.epoch;
@@ -716,7 +1042,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     }
                     Ok(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale) => {}
                     Ok(SnapshotOutcome::CapacityRefused) => {
-                        app.snapshots.gap();
+                        app.snapshots.gap_scope(&work.scope);
                         update_health(
                             &app,
                             &store,
@@ -731,13 +1057,26 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             .await
                         {
                             tracing::warn!("snapshot pressure eviction unavailable: {error:#}");
+                            app.snapshots
+                                .cleanup_paused
+                                .lock()
+                                .insert(work.scope.placement().store_id().as_str().to_owned());
+                            update_health(
+                                &app,
+                                &store,
+                                &work.scope,
+                                &mut health,
+                                SnapshotHealthState::Paused,
+                                Some("cleanup_failed"),
+                            )
+                            .await;
                         }
                         tokio::task::yield_now().await;
                     }
                     Ok(_) => app.snapshots.gap(),
                     Err(error) => {
                         tracing::warn!("message snapshot create unavailable: {error:#}");
-                        app.snapshots.gap();
+                        app.snapshots.gap_scope(&work.scope);
                         update_health(
                             &app,
                             &store,
@@ -751,16 +1090,24 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
             }
             Body::Edit(observation, report, allow_insert) => {
+                if app.snapshots.capture_paused(&work.scope) {
+                    app.snapshots.gap_scope(&work.scope);
+                    if let Some(mut report) = report.take() {
+                        report.vars.insert(
+                            "coverage".into(),
+                            "capture paused after cleanup failure".into(),
+                        );
+                        submit_report(&app, &work.context, report);
+                    }
+                    continue;
+                }
                 let key = (
                     guild,
                     observation.channel_id as u64,
                     observation.message_id as u64,
                 );
-                if tombstones.contains_key(&key) {
-                    continue;
-                }
-                if deleted.contains(key) {
-                    app.snapshots.gap();
+                if app.snapshots.deleted(key) {
+                    app.snapshots.gap_scope(&work.scope);
                     if let Some(mut report) = report.take() {
                         report
                             .vars
@@ -795,7 +1142,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             continue;
                         }
                         if !matches!(transition.outcome, SnapshotOutcome::Stored) {
-                            app.snapshots.gap();
+                            app.snapshots.gap_scope(&work.scope);
                         }
                         match transition.outcome {
                             SnapshotOutcome::Stored => {
@@ -826,6 +1173,18 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                                     tracing::warn!(
                                         "snapshot pressure eviction unavailable: {error:#}"
                                     );
+                                    app.snapshots.cleanup_paused.lock().insert(
+                                        work.scope.placement().store_id().as_str().to_owned(),
+                                    );
+                                    update_health(
+                                        &app,
+                                        &store,
+                                        &work.scope,
+                                        &mut health,
+                                        SnapshotHealthState::Paused,
+                                        Some("cleanup_failed"),
+                                    )
+                                    .await;
                                 }
                                 tokio::task::yield_now().await;
                             }
@@ -838,7 +1197,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     }
                     Err(error) => {
                         tracing::warn!("message snapshot edit unavailable: {error:#}");
-                        app.snapshots.gap();
+                        app.snapshots.gap_scope(&work.scope);
                         update_health(
                             &app,
                             &store,
@@ -863,9 +1222,19 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 ids,
                 bulk,
             } => {
+                if *bulk {
+                    ids.retain(|id| {
+                        !app.snapshots
+                            .deleted((guild.get(), channel.get(), id.get()))
+                    });
+                    if ids.is_empty() {
+                        continue;
+                    }
+                }
                 if !*bulk
                     && ids.first().is_some_and(|id| {
-                        tombstones.contains_key(&(guild.get(), channel.get(), id.get()))
+                        app.snapshots
+                            .deleted((guild.get(), channel.get(), id.get()))
                     })
                 {
                     continue;
@@ -884,6 +1253,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     })
                     .unwrap_or_default();
                 let mut single = None;
+                let mut single_unknown = false;
                 for chunk in ids.chunks(100) {
                     let values = chunk.iter().map(|id| id.get() as i64).collect();
                     match store
@@ -915,31 +1285,28 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         }
                         Err(error) => {
                             tracing::warn!("message snapshot delete unavailable: {error:#}");
-                            app.snapshots.gap();
+                            app.snapshots.gap_scope(&work.scope);
                             if *bulk {
                                 for id in chunk {
-                                    transcript.push(*id, None);
+                                    transcript.push_unknown(*id);
                                 }
+                            } else {
+                                single_unknown = true;
                             }
                         }
                     }
                 }
-                for id in ids.iter() {
-                    let key = (guild.get(), channel.get(), id.get());
-                    deleted.insert(key);
-                    if let std::collections::hash_map::Entry::Vacant(entry) = tombstones.entry(key)
-                    {
-                        let at = Instant::now();
-                        entry.insert(at);
-                        tombstone_order.push_back((key, at));
-                    }
-                    app.snapshots.known_humans.lock().entries.remove(&key);
-                }
+                app.snapshots.mark_deleted(*guild, *channel, ids);
                 if *bulk {
                     submit_bulk_report(&app, &work.context, *guild, *channel, transcript);
                 } else if let Some(id) = ids.first() {
                     let mut report = logging::message_delete_report(&app, *guild, *channel, *id);
                     logging::apply_retained_delete(&mut report, single.as_ref());
+                    if single_unknown {
+                        report
+                            .vars
+                            .insert("coverage".into(), "snapshot storage unavailable".into());
+                    }
                     submit_report(&app, &work.context, report);
                 }
             }
@@ -994,7 +1361,7 @@ async fn update_health(
         return;
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let lost = app.snapshots.lost_pending.swap(0, Ordering::AcqRel);
+    let lost = app.snapshots.take_loss(&key);
     let update = SnapshotHealthUpdate {
         epoch: app.snapshots.epoch.load(Ordering::Acquire),
         state,
@@ -1006,7 +1373,7 @@ async fn update_health(
     if store.update_snapshot_health(update).await.is_ok() {
         recent.insert(key, (Instant::now(), state, reason));
     } else {
-        app.snapshots.lost_pending.fetch_add(lost, Ordering::AcqRel);
+        app.snapshots.restore_loss(&key, lost);
     }
 }
 
@@ -1105,6 +1472,110 @@ mod tests {
         assert!(bloom.contains(first));
         bloom.started = Instant::now() - Duration::from_secs(25 * 3600);
         assert!(!bloom.contains(first));
+    }
+
+    #[test]
+    fn entire_bulk_event_is_deduplicated_before_hundred_id_storage_chunks() {
+        let ids: Vec<_> = (1..=101)
+            .map(MessageId::new)
+            .chain([MessageId::new(1), MessageId::new(101)])
+            .collect();
+        let unique = unique_ids(&ids);
+        assert_eq!(unique.len(), 101);
+        assert_eq!(unique.chunks(100).count(), 2);
+        assert_eq!(unique[0], MessageId::new(1));
+        assert_eq!(unique[100], MessageId::new(101));
+    }
+
+    #[test]
+    fn refused_deletion_identity_blocks_late_create_and_edit() {
+        let ingress = SnapshotIngress::default();
+        let guild = GuildId::new(789);
+        let channel = ChannelId::new(456);
+        let id = MessageId::new(123);
+        assert!(!ingress.deleted((guild.get(), channel.get(), id.get())));
+        ingress.unhooked_delete(guild, channel, &[id]);
+        assert!(ingress.deleted((guild.get(), channel.get(), id.get())));
+    }
+
+    #[test]
+    fn known_store_loss_never_attaches_to_an_unrelated_store() {
+        let ingress = SnapshotIngress::default();
+        ingress.gap_store("store-a");
+        ingress.gap(); // Unattributed Gateway gap.
+        assert_eq!(ingress.take_loss("store-b"), 0);
+        assert_eq!(ingress.take_loss("store-a"), 1);
+        assert_eq!(ingress.take_loss("store-a"), 0);
+    }
+
+    #[test]
+    fn maintenance_drains_more_than_four_expiry_batches_without_waiting_for_another_tick() {
+        let path =
+            std::env::temp_dir().join(format!("snapshot_drain_{:032x}.db", rand::random::<u128>()));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 2;
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+            let store = app.tenant.store(&scope).await.unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            for id in 1..=401 {
+                let outcome = store
+                    .observe_snapshot(
+                        scope.clone(),
+                        SnapshotObservation {
+                            channel_id: 456,
+                            message_id: id,
+                            created_at_ms: now - 23 * 3_600_000,
+                            observed_at_ms: now,
+                            edit_at_ms: None,
+                            coverage_epoch: 1,
+                            fields: SnapshotFields {
+                                content: Some("A".into()),
+                                author_id: Some(42),
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome, SnapshotOutcome::Stored);
+            }
+            app.snapshots.scopes.lock().insert(789, scope.clone());
+            app.snapshots.content_access.lock().insert(789);
+            app.snapshots
+                .maintain_at(&app, Some(now + 2 * 3_600_000))
+                .await;
+            let usage = store.measure_usage(false).await.unwrap();
+            assert_eq!(usage.snapshot_count, Some(0));
+            assert_eq!(usage.snapshot_health.unwrap().expired_count, 401);
+            // A verified cleanup error pauses growing capture for this store;
+            // a later successful check and measurement admit it again.
+            app.snapshots.maintain_at(&app, Some(-1)).await;
+            assert!(app.snapshots.capture_paused(&scope));
+            app.snapshots
+                .maintain_at(&app, Some(now + 2 * 3_600_000 + 1))
+                .await;
+            assert!(!app.snapshots.capture_paused(&scope));
+        });
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

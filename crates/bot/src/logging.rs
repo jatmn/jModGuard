@@ -20,8 +20,6 @@ use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
-const SNIPPET_CHARS: usize = 1000;
-const ATTACHMENT_PREVIEW_BYTES: usize = 1200;
 const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
@@ -431,45 +429,6 @@ struct Snippet {
     guild: u64,
     author: u64,
     webhook: bool,
-    text: Option<String>,
-    attachments: Option<AttachmentPreview>,
-}
-
-struct AttachmentPreview {
-    count: usize,
-    urls: Vec<String>,
-    // None is the create observation; edits use Discord's source timestamp.
-    edited_ms: Option<i64>,
-}
-
-impl AttachmentPreview {
-    fn new(urls: &[String], edited_ms: Option<i64>) -> Self {
-        let mut remaining = ATTACHMENT_PREVIEW_BYTES;
-        let mut retained = Vec::new();
-        for url in urls {
-            if url.len() <= remaining {
-                retained.push(url.clone());
-                remaining -= url.len();
-            }
-        }
-        Self {
-            count: urls.len(),
-            urls: retained,
-            edited_ms,
-        }
-    }
-
-    fn display(&self) -> String {
-        if self.count == 0 {
-            return "none".into();
-        }
-        let mut lines = vec![format!("{} attachment(s)", self.count)];
-        lines.extend(self.urls.iter().cloned());
-        if self.urls.len() < self.count {
-            lines.push(format!("{} URL(s) omitted", self.count - self.urls.len()));
-        }
-        lines.join("\n")
-    }
 }
 
 pub fn remember_message(
@@ -493,74 +452,37 @@ pub fn remember_message(
     );
 }
 
-#[allow(clippy::too_many_arguments)] // Create identity travels with the message observation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn remember_message_create(
     app: &BotState,
     guild: u64,
     channel: u64,
     message: u64,
     author: Option<u64>,
-    text: Option<&str>,
-    attachments: Option<&[String]>,
-    webhook: bool,
-) {
-    remember_message_with_attachment_edit(
-        app,
-        guild,
-        channel,
-        message,
-        author,
-        text,
-        attachments,
-        None,
-        webhook,
-    );
-}
-
-#[allow(clippy::too_many_arguments)] // Keep the source edit identity beside the attachment field.
-fn remember_message_with_attachment_edit(
-    app: &BotState,
-    guild: u64,
-    channel: u64,
-    message: u64,
-    author: Option<u64>,
-    text: Option<&str>,
-    attachments: Option<&[String]>,
-    attachment_edit_ms: Option<i64>,
+    _text: Option<&str>,
+    _attachments: Option<&[String]>,
     webhook: bool,
 ) {
     let mut cache = app.log_snippets.inner.lock();
     cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
     let key = (guild, channel, message);
-    let author = author
+    let Some(author) = author
         .filter(|id| *id != 0)
-        .or_else(|| cache.get(&key).map(|s| s.author).filter(|id| *id != 0));
-    if author.is_none() {
+        .or_else(|| cache.get(&key).map(|s| s.author))
+    else {
         return;
-    }
-    let author = author.unwrap();
+    };
     if cache.values().filter(|s| s.guild == guild).count() >= SNIPPETS_PER_GUILD
         && !cache.contains_key(&key)
         && let Some(oldest) = cache
             .iter()
             .filter(|(_, s)| s.guild == guild)
             .min_by_key(|(_, s)| s.at)
-            .map(|(k, _)| *k)
+            .map(|(key, _)| *key)
     {
         cache.remove(&oldest);
     }
-    let previous = cache.remove(&key);
-    let webhook = webhook || previous.as_ref().is_some_and(|value| value.webhook);
-    let previous_text = previous.as_ref().and_then(|value| value.text.clone());
-    let previous_attachments = previous.and_then(|value| value.attachments);
-    let replace_attachments =
-        previous_attachments
-            .as_ref()
-            .is_none_or(|old| match (old.edited_ms, attachment_edit_ms) {
-                (Some(old), Some(new)) => new >= old,
-                (Some(_), None) => false,
-                (None, _) => true,
-            });
+    let webhook = webhook || cache.get(&key).is_some_and(|old| old.webhook);
     cache.insert(
         key,
         Snippet {
@@ -568,49 +490,30 @@ fn remember_message_with_attachment_edit(
             guild,
             author,
             webhook,
-            text: text
-                .map(|value| value.chars().take(SNIPPET_CHARS).collect())
-                .or(previous_text),
-            attachments: attachments
-                .filter(|_| replace_attachments)
-                .map(|urls| AttachmentPreview::new(urls, attachment_edit_ms))
-                .or(previous_attachments),
         },
     );
 }
 
-/// Refresh the delete preview at Gateway receipt time. Only an actual edit can
-/// replace attachment URLs; an untimestamped Gateway refresh may carry an empty
-/// attachment list even while the original attachments still exist.
+/// Keep only identity for filtering; snapshot storage owns report content.
 pub(crate) fn remember_message_update(
     app: &BotState,
     event: &MessageUpdateEvent,
     author: Option<u64>,
 ) {
-    let Some(guild) = event.guild_id else { return };
-    let attachment_edit_ms = event
-        .edited_timestamp
-        .map(|timestamp| timestamp.timestamp_millis());
-    let attachment_urls = attachment_edit_ms
-        .and(event.attachments.as_ref())
-        .map(|attachments| {
-            attachments
-                .iter()
-                .map(|attachment| attachment.url.clone())
-                .collect::<Vec<_>>()
-        });
-    if event.content.is_none() && attachment_urls.is_none() {
+    let Some(guild) = event.guild_id else {
+        return;
+    };
+    if event.content.is_none() && event.attachments.is_none() {
         return;
     }
-    remember_message_with_attachment_edit(
+    remember_message_create(
         app,
         guild.get(),
         event.channel_id.get(),
         event.id.get(),
         author,
-        event.content.as_deref(),
-        attachment_urls.as_deref(),
-        attachment_edit_ms,
+        None,
+        None,
         matches!(event.webhook_id, Some(Some(_))),
     );
 }
@@ -1093,8 +996,10 @@ fn message_vars(guild: GuildId, channel: ChannelId, id: MessageId) -> BTreeMap<S
         ("mention".into(), "unavailable".into()),
         ("user".into(), "unavailable".into()),
         ("user_id".into(), "unavailable".into()),
-        ("before".into(), "not retained".into()),
-        ("content".into(), "not retained".into()),
+        ("before".into(), "unavailable (not captured)".into()),
+        ("after".into(), "not supplied in this update".into()),
+        ("content".into(), "unavailable (not captured)".into()),
+        ("attachments".into(), "unavailable (not captured)".into()),
         ("coverage".into(), "retained observation unavailable".into()),
     ])
 }
@@ -1244,6 +1149,12 @@ pub(crate) fn apply_retained_delete(report: &mut MessageReport, row: Option<&Mes
     } else {
         report
             .vars
+            .insert("content".into(), "unavailable (not captured)".into());
+        report
+            .vars
+            .insert("attachments".into(), "unavailable (not captured)".into());
+        report
+            .vars
             .insert("coverage".into(), "retained snapshot unavailable".into());
     }
 }
@@ -1252,10 +1163,12 @@ pub(crate) struct BulkTranscript {
     pub total: usize,
     pub retained: usize,
     pub unavailable: usize,
+    pub unknown: usize,
     pub omitted: usize,
     pub filtered: usize,
     included_authors: HashSet<i64>,
-    text: String,
+    bytes: usize,
+    entries: Vec<String>,
 }
 
 impl BulkTranscript {
@@ -1264,10 +1177,12 @@ impl BulkTranscript {
             total,
             retained: 0,
             unavailable: 0,
+            unknown: 0,
             omitted: 0,
             filtered: 0,
             included_authors: HashSet::new(),
-            text: String::from("jModGuard last-observed deleted messages\n\n"),
+            bytes: "jModGuard last-observed deleted messages\n\n".len(),
+            entries: Vec::new(),
         }
     }
 
@@ -1295,14 +1210,18 @@ impl BulkTranscript {
             self.unavailable += 1;
             format!("Message {} | retained content unavailable\n\n", id)
         };
-        if self
-            .text
-            .len()
-            .saturating_add(line.len())
-            .saturating_add(200)
-            <= 256 * 1024
-        {
-            self.text.push_str(&line);
+        self.push_line(line);
+    }
+
+    pub fn push_unknown(&mut self, id: MessageId) {
+        self.unknown += 1;
+        self.push_line(format!("Message {} | snapshot storage unavailable\n\n", id));
+    }
+
+    fn push_line(&mut self, line: String) {
+        if self.bytes.saturating_add(line.len()).saturating_add(200) <= 256 * 1024 {
+            self.bytes += line.len();
+            self.entries.push(line);
         } else {
             self.omitted += 1;
         }
@@ -1312,15 +1231,91 @@ impl BulkTranscript {
         self.filtered += 1;
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(&self) -> Vec<u8> {
+        let mut text = String::with_capacity(self.bytes.saturating_add(200));
+        text.push_str("jModGuard last-observed deleted messages\n\n");
+        for entry in &self.entries {
+            text.push_str(entry);
+        }
         if self.omitted > 0 {
-            self.text.push_str(&format!(
+            text.push_str(&format!(
                 "\n{} entries omitted because transcript reached 256 KiB.\n",
                 self.omitted
             ));
         }
-        self.text.into_bytes()
+        text.into_bytes()
     }
+}
+
+fn fallback_bulk_parts(
+    template: &str,
+    display: &BTreeMap<String, String>,
+    transcript: &BulkTranscript,
+) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut shown = 0usize;
+    let mut clipped = 0usize;
+    for entry in &transcript.entries {
+        let slot = parts.len() - 1;
+        let limit = if slot == 0 { 1100 } else { 1700 };
+        if !parts[slot].is_empty()
+            && parts[slot].encode_utf16().count() + entry.encode_utf16().count() > limit
+        {
+            if parts.len() == 3 {
+                break;
+            }
+            parts.push(String::new());
+        }
+        let slot = parts.len() - 1;
+        let available = (if slot == 0 { 1100usize } else { 1700usize })
+            .saturating_sub(parts[slot].encode_utf16().count());
+        let (prefix, rest) = take_utf16_prefix(
+            entry,
+            if entry.encode_utf16().count() <= available {
+                available
+            } else {
+                available.saturating_sub(24)
+            },
+        );
+        parts[slot].push_str(prefix);
+        if !rest.is_empty() {
+            parts[slot].push_str(" [entry clipped]\n");
+            clipped += 1;
+        }
+        shown += 1;
+    }
+    let omitted = transcript.omitted + transcript.entries.len().saturating_sub(shown);
+    let mut fallback_display = display.clone();
+    fallback_display.insert("omitted".into(), omitted.to_string());
+    fallback_display.insert(
+        "details".into(),
+        format!(
+            "attachment unavailable; {} entries omitted from plain-message fallback",
+            omitted
+        ),
+    );
+    let rendered = templates::render_bounded(template, &fallback_display, 2000);
+    let summary = format!(
+        "Attachment unavailable. Unique deleted: {}; retained: {}; known missing: {}; storage unknown: {}; filtered: {}; entries omitted: {}; entries clipped: {}.\n",
+        transcript.total,
+        transcript.retained,
+        transcript.unavailable,
+        transcript.unknown,
+        transcript.filtered,
+        omitted,
+        clipped
+    );
+    parts[0] = format!("{}\n{}\n{}", clip(&rendered, 450), summary, parts[0]);
+    let part_count = parts.len();
+    for (index, part) in parts.iter_mut().enumerate().skip(1) {
+        *part = format!(
+            "Deleted messages continued ({}/{}):\n{}",
+            index + 1,
+            part_count,
+            part
+        );
+    }
+    parts
 }
 
 pub(crate) async fn emit_retained_bulk(
@@ -1336,7 +1331,9 @@ pub(crate) async fn emit_retained_bulk(
         ("count".into(), transcript.total.to_string()),
         ("retained".into(), transcript.retained.to_string()),
         ("unavailable".into(), transcript.unavailable.to_string()),
+        ("unknown".into(), transcript.unknown.to_string()),
         ("filtered".into(), transcript.filtered.to_string()),
+        ("omitted".into(), transcript.omitted.to_string()),
         (
             "details".into(),
             format!(
@@ -1424,10 +1421,8 @@ pub(crate) async fn emit_retained_bulk(
     templates::format_log_timestamps(&mut display);
     let rendered = templates::render_bounded(template, &display, 2000);
     let body = transcript.finish();
-    let message = log_message(&rendered).add_file(CreateAttachment::bytes(
-        body.clone(),
-        "deleted-messages.txt",
-    ));
+    let message =
+        log_message(&rendered).add_file(CreateAttachment::bytes(body, "deleted-messages.txt"));
     match tokio::time::timeout(
         deadline.saturating_sub(started.elapsed()),
         destination.send_message(&ctx.http, message),
@@ -1442,25 +1437,8 @@ pub(crate) async fn emit_retained_bulk(
         {
             // A definite permission response can mean Attach Files is absent.
             // A timeout is ambiguous and never enters this fallback.
-            let source = String::from_utf8_lossy(&body);
-            let mut remaining = source.as_ref();
-            for index in 0..3 {
-                if remaining.is_empty() {
-                    break;
-                }
-                let (part, rest) =
-                    take_utf16_prefix(remaining, if index == 0 { 1000 } else { 1700 });
-                remaining = rest;
-                let details = if index == 0 {
-                    format!(
-                        "{}\n\nAttachment unavailable; excerpt capped at 3 chunks, remaining entries omitted ({}/3):\n{}",
-                        clip(&rendered, 650),
-                        index + 1,
-                        part
-                    )
-                } else {
-                    format!("Deleted messages continued ({}/3):\n{}", index + 1, part)
-                };
+            let parts = fallback_bulk_parts(template, &display, &transcript);
+            for details in parts {
                 let left = deadline.saturating_sub(started.elapsed());
                 if left.is_zero()
                     || !matches!(
@@ -1570,24 +1548,6 @@ pub(crate) fn message_delete_report(
             &snippet.author.to_string(),
             &snippet.author.to_string(),
         ));
-        vars.insert(
-            "content".into(),
-            match snippet.text.as_deref() {
-                Some("") => "empty".into(),
-                Some(text) => clip(text, 1000),
-                None => "not supplied to this process".into(),
-            },
-        );
-        vars.insert(
-            "attachments".into(),
-            snippet
-                .attachments
-                .map(|preview| preview.display())
-                .unwrap_or_else(|| "not supplied to this process".into()),
-        );
-    } else {
-        vars.insert("content".into(), "not supplied to this process".into());
-        vars.insert("attachments".into(), "not supplied to this process".into());
     }
     MessageReport {
         guild_id,

@@ -140,6 +140,9 @@ pub struct DbRuntime {
 }
 
 impl DbRuntime {
+    pub(crate) fn growth_paused(&self) -> bool {
+        self.growth_paused.load(Ordering::Acquire)
+    }
     pub fn new() -> Result<Self> {
         Self::with_operation_timeout(None)
     }
@@ -249,8 +252,36 @@ struct CapacityLimits {
     reclaim: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_DEFAULT_CAPACITY_LIMITS: std::cell::Cell<Option<CapacityLimits>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_default_capacity_limits<T>(
+    growth: u64,
+    reclaim: u64,
+    f: impl FnOnce() -> T,
+) -> T {
+    assert!(growth > 0 && growth < reclaim);
+    struct Reset(Option<CapacityLimits>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_DEFAULT_CAPACITY_LIMITS.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = TEST_DEFAULT_CAPACITY_LIMITS
+        .with(|slot| slot.replace(Some(CapacityLimits { growth, reclaim })));
+    let _reset = Reset(previous);
+    f()
+}
+
 impl Default for CapacityLimits {
     fn default() -> Self {
+        #[cfg(test)]
+        if let Some(limits) = TEST_DEFAULT_CAPACITY_LIMITS.with(|slot| slot.get()) {
+            return limits;
+        }
         Self {
             growth: crate::capacity::GROWTH_STOP_BYTES,
             reclaim: crate::capacity::RECLAIM_STOP_BYTES,
@@ -518,6 +549,9 @@ fn require_connection_setup_batch(sql: &str) -> Result<()> {
 }
 
 impl Connection {
+    pub(crate) fn capacity_growth_limit(&self) -> u64 {
+        self.capacity_limits.growth
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let runtime = DbRuntime::new()?;
         let path = path.as_ref().to_path_buf();
@@ -839,6 +873,26 @@ struct CapacityReservation {
 }
 
 impl Transaction {
+    /// Startup-only privilege probe. The fixed no-op write is rolled back by
+    /// `finish_read`, so it creates no receipt or capacity reservation.
+    pub(crate) fn probe_write_permission(&self) -> Result<()> {
+        let restore_fence: Option<String> = self
+            .query_row(
+                "SELECT value FROM meta WHERE key='restore_fence'",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            restore_fence.as_deref() != Some("1"),
+            "restore is in progress"
+        );
+        self.execute_unchecked(
+            "UPDATE meta SET value=value WHERE key='bootstrap_complete'",
+            (),
+        )?;
+        Ok(())
+    }
     /// Promote a verified primary snapshot to a maintenance transaction only
     /// after the caller has checked its identity and ownership scope.
     pub(crate) fn prepare_reclaim(&mut self) -> Result<()> {
@@ -1062,8 +1116,20 @@ impl Transaction {
         max_growth_bytes: u64,
     ) -> Result<usize> {
         anyhow::ensure!(
-            sql.trim()
-                == "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL WHERE singleton=1",
+            matches!(
+                sql.trim(),
+                "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,expired_count=expired_count+?2 WHERE singleton=1"
+                    | "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,evicted_count=evicted_count+?2 WHERE singleton=1"
+                    | "UPDATE guild_snapshot_health SET expired_count=expired_count+?1 WHERE singleton=1"
+                    | "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1 WHERE singleton=1"
+                    | "UPDATE meta SET value=?1 WHERE key='action_request_floor'"
+                    | "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'"
+                    | "UPDATE meta SET value=?1 WHERE key='config_revision'"
+                    | "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='slash_registry_version'"
+                    | "UPDATE meta SET value=?1 WHERE key='slash_registry_revision'"
+                    | "UPDATE guild_memberships SET active=0 WHERE guild_id=?1"
+                    | "UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2"
+            ),
             "reclaim metadata mutation refused"
         );
         anyhow::ensure!(

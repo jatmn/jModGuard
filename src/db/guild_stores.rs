@@ -312,7 +312,7 @@ pub async fn clear_erased_placement(
             Some(current)
                 if current.store_id.as_str() == store_id && current.revision == revision =>
             {
-                tx.ensure_mutation_receipt()?;
+                tx.prepare_reclaim()?;
                 tx.execute_reclaim(
                     "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
                     params![guild, store_id.as_str(), revision.as_str()],
@@ -407,7 +407,7 @@ pub async fn clear_guild_write_fence(db: &Db, guild: i64, generation: &str) -> R
             .optional()?;
         match current {
             Some(current) if current == generation => {
-                tx.ensure_mutation_receipt()?;
+                tx.prepare_reclaim()?;
                 tx.execute_reclaim(
                     "DELETE FROM guild_write_fences WHERE guild_id=?1 AND generation=?2",
                     params![guild, generation.as_str()],

@@ -53,6 +53,12 @@ pub struct GuildDataStore {
     core: Option<Db>,
 }
 
+impl GuildDataStore {
+    pub fn capacity_runtime_status(&self) -> crate::db::CapacityRuntimeStatus {
+        self.db.capacity_runtime_status()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreCheckError {
     #[error("unsupported guild-store schema")]

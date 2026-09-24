@@ -271,11 +271,12 @@ pub async fn finish_nickname_reconcile(
 pub async fn acknowledge_nickname_reconcile(db: &Db, job: &NicknameReconcileJob) -> Result<()> {
     let job = job.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         if !nickname_job_matches_conn(&tx, &job)? {
             tx.finish_read()?;
             return Ok(());
         }
+        tx.prepare_reclaim()?;
         tx.execute_reclaim(
             "DELETE FROM nickname_reconcile WHERE guild_id=?1",
             params![job.guild_id],

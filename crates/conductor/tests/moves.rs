@@ -679,3 +679,63 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         0
     );
 }
+
+#[tokio::test]
+async fn move_budget_ignores_source_free_pages_and_unrelated_rows() {
+    let h = setup().await;
+    // These allocations simulate an established shared store and a destination
+    // with limited headroom. They are fixture writes, not application admission.
+    for (name, bytes, free) in [
+        ("shared.guild.db", 300_000_000_i64, true),
+        ("dedicated.guild.db", 880_000_000_i64, false),
+    ] {
+        let db = libsql::Builder::new_local(h.root.join(name))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE fixture_unrelated(guild_id INTEGER, payload BLOB)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fixture_unrelated VALUES(20,zeroblob(?))",
+            libsql::params![bytes],
+        )
+        .await
+        .unwrap();
+        if free {
+            conn.execute("DELETE FROM fixture_unrelated", ())
+                .await
+                .unwrap();
+        }
+    }
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router, "POST", "/api/moves", Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    let jobs = h.conductor.store().unwrap().list_jobs(8).await.unwrap();
+    let job = jobs.iter().find(|job| job.kind == "guild_move").unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.last_error);
+    assert_eq!(
+        scalar(
+            &h.root.join("dedicated.guild.db"),
+            "SELECT COUNT(*) FROM guild_cases WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &h.root.join("shared.guild.db"),
+            "SELECT COUNT(*) FROM guild_cases WHERE guild_id=20"
+        )
+        .await,
+        1
+    );
+}

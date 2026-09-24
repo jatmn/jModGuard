@@ -96,10 +96,12 @@ fn warn_empty_content_once() {
 impl EventHandler for Handler {
     async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
         self.app.snapshots.gap();
+        self.app.snapshots.install_collector(&self.app, &_ctx);
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         self.app.snapshots.gap();
+        self.app.snapshots.install_collector(&self.app, &ctx);
         tracing::info!(
             "logged in as {} ({} guilds, shard {})",
             ready.user.name,
@@ -126,21 +128,25 @@ impl EventHandler for Handler {
             let refresh_app = Arc::clone(&app);
             let refresh_cache = Arc::clone(&ctx.cache);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut ticks = 0u64;
                 loop {
                     interval.tick().await;
-                    if ticks.is_multiple_of(2) {
-                        for guild in refresh_cache.guilds() {
-                            refresh_app
-                                .snapshots
-                                .refresh_scope(&refresh_app, guild.get())
-                                .await;
-                        }
+                    for guild in refresh_cache.guilds() {
+                        refresh_app
+                            .snapshots
+                            .refresh_scope(&refresh_app, guild.get())
+                            .await;
                     }
-                    refresh_app.snapshots.maintain(&refresh_app).await;
-                    ticks = ticks.wrapping_add(1);
+                }
+            });
+            let maintenance_app = Arc::clone(&app);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    maintenance_app.snapshots.maintain(&maintenance_app).await;
                 }
             });
             let startup = async move {
@@ -469,7 +475,9 @@ impl EventHandler for Handler {
         let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
-        app.snapshots.create(&app, ctx.clone(), &msg);
+        if !app.snapshots.collector_active(&ctx) {
+            app.snapshots.gap();
+        }
         app.member_joins.remember(
             guild_id.get(),
             msg.author.id.get(),
@@ -626,13 +634,13 @@ impl EventHandler for Handler {
             .unwrap_or_default();
         logging::remember_message_update(&self.app, &event, known_author_id);
         let bot_user_id = ctx.cache.current_user().id.get();
-        let retained_report =
-            logging::message_update_report(&event, known_author_id, Some(bot_user_id))
-                .filter(|_| self.app.edit_reports.should_report(&event));
-        let queued =
-            self.app
-                .snapshots
-                .edit(&self.app, ctx.clone(), &event, retained_report.clone());
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        let retained_report = (!hooked)
+            .then(|| {
+                logging::message_update_report(&event, known_author_id, Some(bot_user_id))
+                    .filter(|_| self.app.edit_reports.should_report(&event))
+            })
+            .flatten();
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
                 self.app.member_joins.remember(
@@ -680,7 +688,8 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if !queued && let Some(report) = retained_report {
+        if !hooked && let Some(report) = retained_report {
+            self.app.snapshots.gap();
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }
@@ -693,21 +702,19 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
-        let queued = self.app.snapshots.delete(
-            &self.app,
-            ctx.clone(),
-            guild_id,
-            channel_id,
-            vec![deleted_message_id],
-            false,
-        );
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        if !hooked {
+            self.app
+                .snapshots
+                .unhooked_delete(guild_id, channel_id, &[deleted_message_id]);
+        }
         self.app
             .image_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        if !queued {
+        if !hooked {
             let report =
                 logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
             logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
@@ -722,14 +729,14 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
-        let queued = self.app.snapshots.delete(
-            &self.app,
-            ctx.clone(),
-            guild_id,
-            channel_id,
-            multiple_deleted_messages_ids.clone(),
-            true,
-        );
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        if !hooked {
+            self.app.snapshots.unhooked_delete(
+                guild_id,
+                channel_id,
+                &multiple_deleted_messages_ids,
+            );
+        }
         for id in &multiple_deleted_messages_ids {
             self.app
                 .image_spam
@@ -738,14 +745,13 @@ impl EventHandler for Handler {
                 .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
-        let mut vars = BTreeMap::new();
-        vars.insert("channel".into(), format!("<#{}>", channel_id));
-        vars.insert(
-            "count".into(),
-            multiple_deleted_messages_ids.len().to_string(),
-        );
-        if !queued {
-            logging::emit(&self.app, &ctx, guild_id, "message_bulk_delete", vars).await;
+        if !hooked {
+            let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
+            let mut transcript = logging::BulkTranscript::new(ids.len());
+            for id in ids {
+                transcript.push_unknown(id);
+            }
+            logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript).await;
         }
     }
 

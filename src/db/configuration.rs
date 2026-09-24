@@ -205,8 +205,18 @@ async fn delete_row(
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        let exists: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE ({key_cols}) = ({keys}))"),
+            params_from_iter(key_params.clone()),
+            |r| Ok(r.get(0)?),
+        )?;
+        if !exists {
+            tx.finish_read()?;
+            return Ok(());
+        }
+        tx.prepare_reclaim()?;
         let n = tx.execute_reclaim(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
             params_from_iter(key_params),
@@ -214,9 +224,9 @@ async fn delete_row(
         // No-op deletes must not bump versions — that forced cross-process
         // cache invalidation and slash re-sync sweeps for already-gone rows.
         if n > 0 {
-            bump_config_version_conn(&tx)?;
+            bump_config_version_reclaim_conn(&tx)?;
             if bump_slash_registry {
-                bump_slash_registry_version_conn(&tx)?;
+                bump_slash_version_reclaim_conn(&tx)?;
             }
         }
         tx.commit()?;
@@ -625,8 +635,18 @@ async fn delete_badword_inner(
     expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM badwords WHERE id=?1 AND guild_id=?2)",
+            params![id, guild_id],
+            |r| Ok(r.get(0)?),
+        )?;
+        if !exists {
+            tx.finish_read()?;
+            anyhow::bail!("badword not found");
+        }
+        tx.prepare_reclaim()?;
         let n = tx.execute_reclaim(
             "DELETE FROM badwords WHERE id = ?1 AND guild_id = ?2",
             params![id, guild_id],
@@ -635,7 +655,7 @@ async fn delete_badword_inner(
             // Same public wording as API denials — never leak guild/scope detail.
             anyhow::bail!("badword not found");
         }
-        bump_config_version_conn(&tx)?;
+        bump_config_version_reclaim_conn(&tx)?;
         tx.commit()?;
         Ok(())
     })

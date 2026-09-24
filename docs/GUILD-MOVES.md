@@ -22,7 +22,7 @@ hot-reload and automatic shared-service restarts are not claimed.
 
 ## Workflow
 
-`plan → checkpoint → freeze → copy → verify → switch → resume → clean source`
+`plan → checkpoint → freeze → copy → verify → switch → clean source → resume`
 
 1. **Plan** shows source/destination, tenant row counts, neighboring guilds on
    a shared source, and the interruption/restart text.
@@ -42,10 +42,10 @@ hot-reload and automatic shared-service restarts are not claimed.
 6. **Switch** updates `guild_store_placements` in the same core transaction as the
    fence phase change. Stale writers that still hold the old placement fail
    identity/membership checks after source cleanup.
-7. **Resume** deletes the matching fence.
-8. **Clean** removes this guild's rows from the source store only. A leftover
+7. **Clean** removes this guild's rows from the source store only. A leftover
    closed copy is not reused as a reverse-move shortcut; rollback is restore
    from the checkpoint.
+8. **Resume** deletes the matching fence after source cleanup succeeds.
 
 Interrupted running jobs fail closed. Manual retry resumes: if placement already
 points at the destination revision, copy/switch are skipped and source cleanup
@@ -55,7 +55,11 @@ Rolling message snapshots are transient and are not copied to the destination.
 The source retains them until successful cutover and source cleanup; a failed
 copy must not erase them early. Destination capture starts with a history gap.
 Required configuration and moderation rows must fit the application database
-budget before copying begins. An insufficient allowance refuses the move; it
+budget before copying begins. Its conservative copy reserve measures only this
+guild’s durable SQL rows, including their indexes and transaction margin; it
+excludes source free pages, other guilds and rolling snapshots. Source cleanup
+reserves its evidence-state changes separately and must finish without growing
+source allocation. An insufficient allowance refuses the move; it
 does not raise any quota. See [database capacity](DATABASE-CAPACITY.md).
 
 Recovery after a failed attempt keeps the original move generation in the

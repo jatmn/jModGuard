@@ -106,7 +106,7 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
     let guild = job.guild_id;
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
-        tx.ensure_mutation_receipt()?;
+        tx.prepare_reclaim()?;
         tx.execute_reclaim(
             "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
             params![guild],
@@ -171,8 +171,8 @@ pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<b
             tx.finish_read()?;
             return Ok(false);
         }
-        tx.ensure_mutation_receipt()?;
-        wipe_directory_guild_data_conn(&tx, guild)?;
+        tx.prepare_reclaim()?;
+        wipe_directory_guild_data_conn(&tx, guild, true)?;
         tx.commit()?;
         Ok(true)
     })
@@ -180,7 +180,11 @@ pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<b
 }
 
 /// Caller holds the primary write transaction and has proved departure.
-pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) -> Result<()> {
+pub(super) fn wipe_directory_guild_data_conn(
+    tx: &crate::db_compat::Transaction,
+    guild: i64,
+    reclaim: bool,
+) -> Result<()> {
     let mut config_changed = false;
     let mut commands_changed = false;
     let mut settings_changed = false;
@@ -207,10 +211,18 @@ pub(super) fn wipe_directory_guild_data_conn(tx: &impl SqlExecutor, guild: i64) 
         settings_changed |= index == 6 && changed;
     }
     if config_changed {
-        bump_config_version_conn(tx)?;
+        if reclaim {
+            bump_config_version_reclaim_conn(tx)?;
+        } else {
+            bump_config_version_conn(tx)?;
+        }
     }
     if commands_changed {
-        bump_slash_registry_version_conn(tx)?;
+        if reclaim {
+            bump_slash_version_reclaim_conn(tx)?;
+        } else {
+            bump_slash_registry_version_conn(tx)?;
+        }
     }
     if settings_changed {
         invalidate_settings_heal_checksum_conn(tx)?;

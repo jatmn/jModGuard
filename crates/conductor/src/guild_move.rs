@@ -173,7 +173,7 @@ async fn preflight_source_cleanup(cfg: &Config, guild: i64) -> Result<()> {
     let (source_id, _) = placement(&conn, guild)
         .await?
         .context("guild is not placed")?;
-    ensure_source_cleanup_budget(&store_path(cfg, &source_id)?.path).await
+    ensure_source_cleanup_budget(&store_path(cfg, &source_id)?.path, guild).await
 }
 
 async fn resumed_directory(
@@ -458,7 +458,7 @@ async fn copy_and_cutover(
     copy_guild(&source.path, &dest.path, directory).await?;
     *destination_committed = true;
     verify_copy(&source.path, &dest.path, directory.guild).await?;
-    ensure_source_cleanup_budget(&source.path).await?;
+    ensure_source_cleanup_budget(&source.path, directory.guild).await?;
     switch_placement(cfg, directory).await?;
     ensure_guild_schema(
         &source.path,
@@ -629,13 +629,17 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
         );
         return Ok(());
     }
-    dest_conn.execute("BEGIN IMMEDIATE", ()).await?;
+    // Hold the source primary snapshot from measurement through copying.
+    src.execute("BEGIN IMMEDIATE", ()).await?;
+    if let Err(error) = dest_conn.execute("BEGIN IMMEDIATE", ()).await {
+        let _ = src.execute("ROLLBACK", ()).await;
+        return Err(error.into());
+    }
     let copied: Result<()> = async {
-        // Source allocation is an upper bound on the guild's copied payloads;
-        // snapshots are intentionally omitted. The additional reserve covers
-        // destination table/index splits and transaction metadata.
-        let source_bound = allocated_bytes(&src).await?;
-        ensure_app_budget(&dest_conn, source_bound.saturating_mul(2).saturating_add(16_777_216)).await?;
+        // Only selected durable rows enter the destination. Source free pages,
+        // other guilds and transient snapshots consume none of its copy budget.
+        let copy_bound = selected_copy_budget(&src, guild).await?;
+        ensure_app_budget(&dest_conn, copy_bound).await?;
         dest_conn
             .execute(
                 "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -701,6 +705,9 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
         Ok(())
     }
     .await;
+    // Release the read-only source transaction on both success and refusal.
+    let source_released = src.execute("ROLLBACK", ()).await;
+    let copied = copied.and_then(|()| source_released.map(|_| ()).map_err(Into::into));
     match copied {
         Ok(()) => {
             dest_conn.execute("COMMIT", ()).await?;
@@ -896,11 +903,8 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
     let conn = open(path).await?;
     conn.execute("BEGIN IMMEDIATE", ()).await?;
     let cleaned: Result<()> = async {
-        // This phase also rewrites evidence state and removes indexed records.
-        // The entire source allocation bounds the guild's retained records;
-        // reserve a second copy plus B-tree/transaction margin before writing.
-        let source_bound = allocated_bytes(&conn).await?;
-        ensure_app_budget(&conn, source_bound.saturating_mul(2).saturating_add(16_777_216)).await?;
+        let before = allocated_bytes(&conn).await?;
+        ensure_cleanup_budget(&conn, guild).await?;
         if table_exists(&conn, "guild_message_snapshots").await? {
             conn.execute(
                 "DELETE FROM guild_message_snapshots WHERE guild_id=?",
@@ -953,7 +957,10 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
             libsql::params![guild],
         )
         .await?;
-        ensure_app_budget(&conn, 0).await?;
+        ensure!(
+            allocated_bytes(&conn).await? <= before,
+            "source cleanup allocated database pages"
+        );
         Ok(())
     }
     .await;
@@ -1164,14 +1171,125 @@ async fn open(path: &Path) -> Result<libsql::Connection> {
 
 const APP_GROWTH_STOP_BYTES: u64 = 900_000_000;
 
-async fn ensure_source_cleanup_budget(path: &Path) -> Result<()> {
+// The bound covers table/index pages and split slack for the selected rows.
+// It is deliberately conservative; no unselected payload enters the estimate.
+async fn selected_copy_budget(conn: &libsql::Connection, guild: i64) -> Result<u64> {
+    let page_size = scalar(conn, "PRAGMA page_size", ()).await?;
+    ensure!(page_size > 0, "database page size unavailable");
+    let mut bound = (page_size as u64)
+        .checked_mul(1024)
+        .context("copy budget overflow")?;
+    for (table, predicate) in [
+        ("guild_bindings", "guild_id=?"),
+        ("guild_memberships", "guild_id=?"),
+        ("guild_log_channels", "guild_id=?"),
+        ("guild_tenant_settings", "guild_id=?"),
+        ("guild_cases", "guild_id=?"),
+        ("guild_case_history", "guild_id=?"),
+        // Includes original sources created by the case insert trigger.
+        ("guild_case_sources", "guild_id=?"),
+        (
+            "guild_case_evidence",
+            "guild_id=? AND cancelled=0 AND state IN (0,1)",
+        ),
+        (
+            "guild_bunny_evidence",
+            "guild_id=? AND EXISTS(SELECT 1 FROM guild_case_evidence e WHERE e.guild_id=guild_bunny_evidence.guild_id AND e.enrollment_id=guild_bunny_evidence.enrollment_id AND e.evidence_id=guild_bunny_evidence.evidence_id AND e.cancelled=0 AND e.state IN (0,1))",
+        ),
+    ] {
+        if !table_exists(conn, table).await? {
+            continue;
+        }
+        let mut columns = conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await?;
+        let mut lengths = Vec::new();
+        while let Some(column) = columns.next().await? {
+            let name = column.get::<String>(1)?.replace('"', "\"\"");
+            lengths.push(format!("COALESCE(length(CAST(\"{name}\" AS BLOB)),0)+16"));
+        }
+        ensure!(!lengths.is_empty(), "copy table columns unavailable");
+        let payload = scalar(
+            conn,
+            &format!(
+                "SELECT COALESCE(SUM({}),0) FROM {table} WHERE {predicate}",
+                lengths.join("+")
+            ),
+            libsql::params![guild],
+        )
+        .await?;
+        let count = scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+            libsql::params![guild],
+        )
+        .await?;
+        let indexes = scalar(
+            conn,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name=?",
+            libsql::params![table],
+        )
+        .await?;
+        ensure!(
+            payload >= 0 && count >= 0 && indexes >= 0,
+            "copy measurement invalid"
+        );
+        // Every row may need separate table/index pages. Include twice the
+        // payload in each index as an upper bound, even for non-covering indexes.
+        let row_pages = (count as u64)
+            .checked_mul(page_size as u64)
+            .and_then(|n| n.checked_mul(2))
+            .context("copy budget overflow")?;
+        let bytes = (payload as u64)
+            .checked_add(row_pages)
+            .and_then(|n| n.checked_mul(indexes as u64 + 1))
+            .and_then(|n| n.checked_mul(2))
+            .context("copy budget overflow")?;
+        bound = bound.checked_add(bytes).context("copy budget overflow")?;
+    }
+    Ok(bound)
+}
+
+async fn ensure_source_cleanup_budget(path: &Path, guild: i64) -> Result<()> {
     let conn = open(path).await?;
-    let source_bound = allocated_bytes(&conn).await?;
-    ensure_app_budget(
-        &conn,
-        source_bound.saturating_mul(2).saturating_add(16_777_216),
-    )
-    .await
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    let result = ensure_cleanup_budget(&conn, guild).await;
+    let released = conn.execute("ROLLBACK", ()).await;
+    result?;
+    released?;
+    Ok(())
+}
+
+async fn ensure_cleanup_budget(conn: &libsql::Connection, guild: i64) -> Result<()> {
+    let page_size = scalar(conn, "PRAGMA page_size", ()).await?;
+    ensure!(page_size > 0, "database page size unavailable");
+    // Deletions need no payload copy. Evidence transitions can move keys in
+    // their three secondary indexes before deletion; bound those selected rows
+    // separately, plus a fixed margin for membership/snapshot-health metadata.
+    let evidence = if table_exists(conn, "guild_case_evidence").await? {
+        scalar(
+            conn,
+            "SELECT COUNT(*) FROM guild_case_evidence WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?
+    } else {
+        0
+    };
+    ensure!(evidence >= 0, "cleanup measurement invalid");
+    let reserve = (evidence as u64)
+        .checked_mul(24)
+        .and_then(|n| n.checked_add(1024))
+        .and_then(|n| n.checked_mul(page_size as u64))
+        .context("cleanup budget overflow")?;
+    ensure!(
+        allocated_bytes(conn)
+            .await?
+            .checked_add(reserve)
+            .is_some_and(|n| n <= 984_000_000),
+        "source cleanup exceeds recovery ceiling"
+    );
+    Ok(())
 }
 
 async fn allocated_bytes(conn: &libsql::Connection) -> Result<u64> {
@@ -1337,4 +1455,45 @@ async fn copy_simple(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn copy_bound_counts_selected_durable_rows_and_refuses_real_growth() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("CREATE TABLE guild_cases(guild_id INTEGER, payload TEXT); CREATE TABLE guild_message_snapshots(guild_id INTEGER, content TEXT);").await.unwrap();
+        let before_unrelated = selected_copy_budget(&conn, 10).await.unwrap();
+        conn.execute("INSERT INTO guild_cases VALUES(20,zeroblob(100000))", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO guild_message_snapshots VALUES(10,zeroblob(100000))",
+            (),
+        )
+        .await
+        .unwrap();
+        let empty = selected_copy_budget(&conn, 10).await.unwrap();
+        assert_eq!(empty, before_unrelated);
+        conn.execute("INSERT INTO guild_cases VALUES(10,zeroblob(100000))", ())
+            .await
+            .unwrap();
+        let selected = selected_copy_budget(&conn, 10).await.unwrap();
+        assert!(selected > empty + 200_000);
+        // A transaction whose required growth would exceed the ordinary ceiling
+        // remains refused, regardless of how small the source allocation is.
+        let allocated = allocated_bytes(&conn).await.unwrap();
+        assert!(
+            ensure_app_budget(&conn, APP_GROWTH_STOP_BYTES - allocated + 1)
+                .await
+                .is_err()
+        );
+        assert!(ensure_app_budget(&conn, selected).await.is_ok());
+    }
 }

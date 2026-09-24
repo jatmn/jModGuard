@@ -151,16 +151,19 @@ impl GuildDataStore {
                 if !active {
                     return tx.finish_read();
                 }
-                tx.ensure_mutation_receipt()?;
+                tx.prepare_reclaim()?;
                 tx.execute_reclaim(
                     "DELETE FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2",
                     params![scope.guild_id(), scope.enrollment.id.as_str()],
                 )?;
-                tx.execute_rows(
-                    "UPDATE guild_memberships SET active=0 WHERE guild_id=?1",
-                    params![scope.guild_id()],
-                    1,
-                )?;
+                anyhow::ensure!(
+                    tx.execute_reclaim_metadata_bounded(
+                        "UPDATE guild_memberships SET active=0 WHERE guild_id=?1",
+                        params![scope.guild_id()],
+                        tx.capacity_page_size()?.saturating_mul(1024),
+                    )? == 1,
+                    TenantDataError::Membership
+                );
                 tx.commit()
             })
             .await
@@ -211,14 +214,23 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 return Ok(current_revision);
             }
-            tx.ensure_mutation_receipt()?;
             if let Some(channel) = channel {
+                tx.ensure_mutation_receipt()?;
                 tx.execute_rows("INSERT INTO guild_log_channels(guild_id,enrollment_id,event_type,channel_id) VALUES(?1,?2,?3,?4) ON CONFLICT(guild_id,event_type) DO UPDATE SET channel_id=excluded.channel_id", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str(), channel], 1)?;
             } else {
+                tx.prepare_reclaim()?;
                 tx.execute_reclaim("DELETE FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 AND event_type=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), event.as_str()])?;
             }
             let next = new_revision();
-            tx.execute_rows("UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2", params![next.as_str(), scope.guild_id()], 1)?;
+            if channel.is_some() {
+                tx.execute_rows("UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2", params![next.as_str(), scope.guild_id()], 1)?;
+            } else {
+                anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
+                    "UPDATE guild_memberships SET config_revision=?1 WHERE guild_id=?2",
+                    params![next.as_str(), scope.guild_id()],
+                    tx.capacity_page_size()?.saturating_mul(1024),
+                )? == 1, TenantDataError::Membership);
+            }
             tx.commit()?;
             Ok(next)
         }).await

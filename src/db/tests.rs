@@ -1086,6 +1086,73 @@ fn dual_process_local_share_config_version() {
 }
 
 #[test]
+fn completed_core_opens_for_inspection_and_reclaim_above_scaled_growth_stop() {
+    let path = tmp_db_path("pressure_reconnect");
+    let bot_options = DbOpenOptions {
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    };
+    let initialized = Db::open_with(bot_options.clone()).unwrap();
+    initialized.with_conn_sync(|conn| {
+        conn.execute_rows(
+            "INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,9,3,'pressure','2026-01-01')",
+            (), 1,
+        )?;
+        conn.execute_rows("INSERT INTO rules(guild_id,rule_id,data) VALUES(42,'pressure','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO rules(guild_id,rule_id,data) VALUES(42,'pressure-delete','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO commands(guild_id,name,data) VALUES(42,'pressure','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO guild_settings(guild_id,settings) VALUES(42,'{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO badwords(id,guild_id,pattern) VALUES(5,42,'pressure')", (), 1)?;
+        Ok(())
+    }).unwrap();
+    let allocation = initialized
+        .with_conn_sync(|conn| crate::capacity::allocated_bytes(conn))
+        .unwrap();
+    drop(initialized);
+
+    crate::db_compat::with_test_default_capacity_limits(
+        allocation - 4096,
+        allocation + 80 * 1024 * 1024,
+        || {
+            let bot = Db::open_with(bot_options.clone()).expect("completed bot reconnect");
+            assert!(bot.capacity_runtime_status().startup_deferred);
+            let api = Db::open_with(DbOpenOptions {
+                migrate: false,
+                ..bot_options.clone()
+            })
+            .expect("API inspection reconnect");
+            assert!(!api.capacity_runtime_status().startup_deferred);
+            assert_eq!(api.read_terminal_defaults().unwrap().prefix, "!");
+            let ordinary = api.with_conn_sync(|conn| {
+                conn.execute_rows("INSERT INTO warns(guild_id,user_id,moderator_id,created_at) VALUES(42,10,3,'2026-01-01')", (), 1)?;
+                Ok(())
+            });
+            assert!(
+                ordinary
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity budget exhausted")
+            );
+            assert_eq!(tokio_test_block_on(clear_warns(&bot, 42, 9)).unwrap(), 1);
+            assert_eq!(tokio_test_block_on(clear_warns(&bot, 42, 9)).unwrap(), 0);
+            tokio_test_block_on(delete_rule(&bot, 42, "pressure-delete")).unwrap();
+            tokio_test_block_on(delete_badword(&bot, 5, 42)).unwrap();
+            let before = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert!(tokio_test_block_on(wipe_departed_directory_guild_data(&bot, 42)).unwrap());
+            let after = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after.config, before.config + 1);
+            assert_eq!(after.slash, before.slash + 1);
+        },
+    );
+    cleanup_db(&path);
+}
+
+#[test]
 fn config_parts_loads_effective_rules() {
     let tmp = tmp_db_path("config_parts_effective_rules");
     let db = Db::open(&tmp, 2).unwrap();

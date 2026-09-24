@@ -200,6 +200,44 @@ test("Administration polling stops while the tab is hidden", async () => {
   assert.deepEqual(calls, []);
 });
 
+test("Database Usage coalesces overlapping visible refreshes", async () => {
+  const calls = [];
+  let release;
+  const usage = new Promise((resolve) => { release = resolve; });
+  const view = page(async (url) => {
+    calls.push(url);
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    await usage;
+    return { status: 200, ok: true, json: async () => ({ databases: [], generated_at: 1 }) };
+  });
+  const first = vm.runInContext('selectView("usage")', view.context);
+  const second = vm.runInContext('refreshUsage()', view.context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls.filter((url) => url === "/api/database-usage").length, 1);
+  release();
+  await Promise.all([first, second]);
+});
+
+test("Database Usage renders disjoint physical groups and unknown guard status", () => {
+  const view = page();
+  const card = vm.runInContext(`renderUsage(${JSON.stringify({
+    id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
+    policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
+    usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,
+      categories: { snapshot_data_bytes: 1000000, moderation_evidence_data_bytes: 2000000,
+        configuration_data_bytes: 1000000, operational_data_bytes: 2000000,
+        index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } },
+    capture: { status: "unknown", configured_retention_hours: 24 },
+    application_admission: { bot_cross_process_guard: "unknown" },
+  })})`, view.context);
+  const content = textOf(card);
+  for (const label of ["Snapshot table", "Moderation and evidence tables", "Configuration tables",
+    "Operational tables", "Indexes", "Reusable pages", "System / unattributed",
+    "Bot growth guard: unknown", "External evidence file bytes: unavailable"]) {
+    assert.match(content, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
 test("owner availability distinguishes baked source parity from channel mismatch", () => {
   const view = page();
   const api = record();

@@ -57,6 +57,11 @@ CREATE TABLE guild_snapshot_health (
     last_observed_at_ms INTEGER,
     last_cleanup_at_ms INTEGER,
     lost_count INTEGER NOT NULL DEFAULT 0,
+    snapshot_count INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_count >= 0),
+    snapshot_logical_bytes INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_logical_bytes >= 0),
+    expired_count INTEGER NOT NULL DEFAULT 0 CHECK(expired_count >= 0),
+    evicted_count INTEGER NOT NULL DEFAULT 0 CHECK(evicted_count >= 0),
+    counters_reset_at_ms INTEGER,
     estimated_snapshot_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_snapshot_bytes >= 0),
     physical_sample_bytes INTEGER CHECK(physical_sample_bytes IS NULL OR physical_sample_bytes >= 0),
     physical_sample_at_ms INTEGER,
@@ -68,12 +73,15 @@ INSERT INTO guild_snapshot_health(singleton) VALUES(1);
 
 CREATE TRIGGER guild_snapshot_account_insert AFTER INSERT ON guild_message_snapshots
 BEGIN UPDATE guild_snapshot_health SET estimated_snapshot_bytes=estimated_snapshot_bytes+NEW.encoded_bytes+4096,
+    snapshot_count=snapshot_count+1,snapshot_logical_bytes=snapshot_logical_bytes+NEW.encoded_bytes,
     physical_debt_bytes=MIN(4000000000,physical_debt_bytes+NEW.reservation_bytes) WHERE singleton=1; END;
 CREATE TRIGGER guild_snapshot_account_update AFTER UPDATE ON guild_message_snapshots
 BEGIN UPDATE guild_snapshot_health SET estimated_snapshot_bytes=estimated_snapshot_bytes+NEW.encoded_bytes-OLD.encoded_bytes,
+    snapshot_logical_bytes=snapshot_logical_bytes+NEW.encoded_bytes-OLD.encoded_bytes,
     physical_debt_bytes=MIN(4000000000,physical_debt_bytes+NEW.reservation_bytes) WHERE singleton=1; END;
 CREATE TRIGGER guild_snapshot_account_delete AFTER DELETE ON guild_message_snapshots
-BEGIN UPDATE guild_snapshot_health SET estimated_snapshot_bytes=estimated_snapshot_bytes-OLD.encoded_bytes-4096 WHERE singleton=1; END;
+BEGIN UPDATE guild_snapshot_health SET estimated_snapshot_bytes=estimated_snapshot_bytes-OLD.encoded_bytes-4096,
+    snapshot_count=snapshot_count-1,snapshot_logical_bytes=snapshot_logical_bytes-OLD.encoded_bytes WHERE singleton=1; END;
 
 DROP TRIGGER guild_membership_delete;
 CREATE TRIGGER guild_membership_delete BEFORE DELETE ON guild_memberships

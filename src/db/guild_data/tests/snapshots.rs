@@ -34,6 +34,75 @@ async fn ready() -> (Fixture, StoreRegistration, GuildDataStore, GuildDataScope)
     (f, reg, store, scope)
 }
 
+#[tokio::test]
+async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
+    let (_fixture, _registration, store, scope) = ready().await;
+    for id in [101, 102, 103, 104] {
+        assert_eq!(
+            store
+                .observe_snapshot(scope.clone(), observation(id, Some("A"), None, 1))
+                .await
+                .unwrap(),
+            SnapshotOutcome::Stored
+        );
+    }
+    store
+        .apply_snapshot_edit(
+            scope.clone(),
+            observation(101, Some("longer edit"), Some(at(100)), 1),
+        )
+        .await
+        .unwrap();
+    let (count, logical, sum): (i64, i64, i64) = store.db.with_conn_sync(|conn| {
+        let tx = conn.transaction_primary_read()?;
+        let health = tx.query_row("SELECT snapshot_count,snapshot_logical_bytes FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get::<i64>(0)?, r.get::<i64>(1)?)))?;
+        let sum = tx.query_row("SELECT COALESCE(SUM(encoded_bytes),0) FROM guild_message_snapshots", (), |r| Ok(r.get::<i64>(0)?))?;
+        tx.finish_read()?;
+        Ok((health.0, health.1, sum))
+    }).unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(logical, sum);
+    assert!(
+        store
+            .take_snapshot(scope.clone(), 20, 101, at(200))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .take_snapshot(scope.clone(), 20, 104, at(86_400_001))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.evict_snapshots(1, at(300)).await.unwrap(), 1);
+    assert_eq!(
+        store.expire_snapshots(100, at(86_400_001)).await.unwrap(),
+        1
+    );
+    let counters: (i64, i64, i64, i64, i64) = store.db.with_conn_sync(|conn| {
+        let tx = conn.transaction_primary_read()?;
+        let row = tx.query_row("SELECT snapshot_count,snapshot_logical_bytes,estimated_snapshot_bytes,expired_count,evicted_count FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        tx.finish_read()?;
+        Ok(row)
+    }).unwrap();
+    assert_eq!(counters, (0, 0, 0, 2, 1));
+    store
+        .update_snapshot_health(SnapshotHealthUpdate {
+            epoch: 2,
+            state: SnapshotHealthState::Active,
+            reason: None,
+            observed_at_ms: Some(at(500)),
+            lost_delta: 0,
+            now_ms: at(500),
+        })
+        .await
+        .unwrap();
+    let reset: (i64, i64, Option<i64>) = store.db.with_conn_sync(|conn| conn.query_row("SELECT expired_count,evicted_count,counters_reset_at_ms FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))).unwrap();
+    assert_eq!(reset, (0, 0, Some(at(500))));
+}
+
 fn observation(
     message_id: i64,
     text: Option<&str>,
@@ -530,7 +599,7 @@ async fn measure_sustained_snapshot_workload_and_cleanup_reuse() {
                 "page_count": usage.page_count, "page_size": usage.page_size,
                 "freelist_count": usage.freelist_count, "reusable_bytes": usage.reusable_bytes,
                 "snapshot_data_bytes": usage.categories.snapshot_data_bytes,
-                "snapshot_index_bytes": usage.categories.snapshot_index_bytes,
+                "index_bytes": usage.categories.index_bytes,
                 "detail_query_ms": overview_ms,
                 "client_process_rss_kib": rss_kib(), "client_process_rss_start_kib": rss_start,
                 "client_process_cpu_ticks": cpu_ticks(), "client_process_cpu_start_ticks": cpu_start,

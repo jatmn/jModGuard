@@ -437,7 +437,7 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "message_bulk_delete",
-            "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Retained:** `{retained}`\n**Unavailable:** `{unavailable}`\n**Filtered:** `{filtered}`\n**Time:** `{time}`\n**Details:** {details}",
+            "**:wastebasket: Messages deleted in {channel}**\n\n**Unique count:** `{count}`\n**Retained:** `{retained}`\n**Known missing:** `{unavailable}`\n**Storage unknown:** `{unknown}`\n**Filtered:** `{filtered}`\n**Transcript omitted:** `{omitted}`\n**Time:** `{time}`\n**Details:** {details}",
         ),
         (
             "automod",
@@ -484,6 +484,9 @@ pub(crate) const PRE_RETAINED_MESSAGE_TEMPLATES: [(&str, &str); 3] = [
         "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Time:** `{time}`",
     ),
 ];
+
+/// Exact default on the first snapshot branch; custom templates are untouched.
+pub(crate) const PRE_BULK_STATUS_TEMPLATE: &str = "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Retained:** `{retained}`\n**Unavailable:** `{unavailable}`\n**Filtered:** `{filtered}`\n**Time:** `{time}`\n**Details:** {details}";
 
 // Exact defaults from before the readable-log upgrade; used only for one-time migration.
 pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {

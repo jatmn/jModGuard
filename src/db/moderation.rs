@@ -599,7 +599,7 @@ pub async fn clear_enrolled_warns(
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-        tx.ensure_mutation_receipt()?;
+        tx.prepare_reclaim()?;
         let count = tx.execute_reclaim(
             "DELETE FROM warns WHERE guild_id=?1 AND user_id=?2",
             params![enrollment.guild_id, user_id],

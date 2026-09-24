@@ -404,7 +404,7 @@ impl GuildDataStore {
             anyhow::ensure!(!active, CaseError::Active);
             let any: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2)", params![scope.guild_id(),scope.enrollment.id.as_str()], |r| Ok(r.get(0)?))?;
             if !any { tx.finish_read()?; return Ok(0); }
-            tx.ensure_mutation_receipt()?;
+            tx.prepare_reclaim()?;
             let removed = tx.execute_reclaim("DELETE FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id IN (SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 ORDER BY case_id LIMIT ?3)", params![scope.guild_id(),scope.enrollment.id.as_str(),count as i64])?;
             tx.commit()?;
             Ok(removed)

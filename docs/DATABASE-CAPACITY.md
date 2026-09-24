@@ -33,6 +33,15 @@ Cached owner-page measurements cannot authorize a write. Copies measure their
 source within the same write transaction; migrations and conductor moves use
 separate conservative maintenance allowances and can refuse a large operation.
 
+If an already initialized bot database reopens above 900 MB with the current
+schema and persisted terminal defaults intact, startup defers seed/heal and
+exact-default template upgrades. New snapshot capture stays paused while owner
+inspection and verified bounded cleanup remain available. After reclamation
+brings allocation below the growth stop, restart the bot to complete deferred
+bootstrap work before treating capture as ready. Incomplete schemas and missing
+defaults still refuse startup. The API's rolled-back write permission probe
+continues to reject a read-only token without growing the database.
+
 All supported application writes must use the checked paths. Raw administrative
 SQL and unrelated database clients bypass this policy and are outside its
 guarantee. Do not use them to get around a refusal. Do not run an emergency full
@@ -48,19 +57,32 @@ store, including unavailable or unconfigured stores. It does not return database
 URLs, tokens, local paths, message contents or SQL error details.
 
 The overview refreshes no more often than once per minute. Detailed attribution
-is cached for five minutes. Exact category attribution uses `dbstat` when the
-engine supplies it, separating snapshot tables, snapshot indexes, other tables,
-other indexes, reusable pages and remaining allocation. Otherwise the page
-labels the available snapshot payload estimate and unavailable physical
-attribution; estimates are not added to exact totals. Measurements carry their
-sample time. Failed probes preserve a clearly stale prior measurement instead
-of turning unknown space into zero usage.
+is cached for five minutes. The API admits at most two store probes concurrently,
+waits up to eight seconds for each response and limits a fleet refresh to 25
+seconds. A timed-out blocking database call may finish later; it keeps its probe
+slot until completion, so later probes can report unavailable while it drains.
+A detail request opens only the selected cataloged store. Exact category
+attribution uses `dbstat` when the engine supplies it, separating snapshots,
+moderation/evidence metadata, configuration, operational tables, indexes,
+reusable pages and system/unattributed remainder. Categories reconcile to one
+physical allocation sample. If `dbstat` is unavailable, physical categories
+remain unavailable; the encoded snapshot payload estimate is labeled separately.
+Snapshot counts and logical bytes come from bounded singleton accounting, and
+the oldest retained timestamp uses the expiry index. The page does not scan
+message bodies for each refresh. Failed probes preserve a clearly stale prior
+measurement instead of turning unknown space into zero usage.
 
 Capture and cleanup health come from bounded latest-value records written by
-the bot and read by the API. An old heartbeat is stale, not proof that capture
-is healthy. Check these states as well as the size percentage during periodic
-inspection. A provider console's billed storage, replica, backup or journal
-metrics may have a different scope from the engine's allocated main database.
+the bot and read by the API. The page shows the capture reason, per-store loss counter, epoch, heartbeat
+age, 24-hour maximum retention, oldest retained time, cleanup status and counters
+with their reset time. An old or absent heartbeat is unknown, not proof of
+healthy capture. The API process reports its own growth guard and deferred
+startup state; another process's live guard is explicitly unknown. The latest
+primary sample is display evidence, not write-admission authority. Provider
+reported bytes and external Bunny Storage evidence file bytes remain separate
+unavailable fields until a verified measurement source exists. A provider
+console's billed storage, replica, backup or journal metrics may have a
+different scope from the engine's allocated main database.
 
 ## Workload and rollout evidence
 
