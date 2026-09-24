@@ -294,7 +294,8 @@ test('Members labels verified state changes with unknown event time and separate
     if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000, reconciliation_needed: true, audit_recovery_status: 'waiting', audit_recovery_phase: 'unban', audit_recovery_processed: 3, audit_recovery_reason: 'rate_limited', audit_recovery_next_attempt_at: 1790000000000, audit_recovery_last_progress_at: 1789999990000 });
     if (url.includes('/history')) return response({ entries: [
       { kind: 'member_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
-      { kind: 'ban_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'ban_absent_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'ban_present_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
       { kind: 'membership_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
     ], next_cursor: null });
     return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
@@ -307,7 +308,9 @@ test('Members labels verified state changes with unknown event time and separate
   await new Promise(resolve => setImmediate(resolve));
   assert.match(textOf(panel), /Membership absence · Unknown/);
   assert.match(textOf(panel), /Membership state check · Unknown/);
-  assert.match(textOf(panel), /Ban absence · Unknown/);
+  assert.match(textOf(panel), /Ban absent \(time unknown\) · Unknown/);
+  assert.match(textOf(panel), /Ban present \(time unknown\) · Unknown/);
+  assert.doesNotMatch(textOf(panel), /Ban present \(time unknown\) · \d{4}/);
   assert.match(textOf(panel), /Checked /);
   assert.match(textOf(panel), /Bounded audit recovery: Unban actions · waiting · 3 entries checked · rate_limited/);
   assert.match(textOf(panel), /Audit recovery next attempt:/);
@@ -521,6 +524,29 @@ test('Members shows 100 percent on completed status and labels a live member ETA
   assert.doesNotMatch(textOf(panel), /99%/);
 });
 
+test('Members keeps completed phases done while local case history finishes and shows phase counts', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ status: 'waiting', phase: 'complete', run_id: 'initial-1', progress_revision: 12,
+        status_reason: 'finishing local case history', processed: 24, member_processed: 20,
+        ban_processed: 3, verify_processed: 1, audit_processed: 2,
+        local_history_complete: false, total_estimate: 20, total_is_estimated: false,
+        percent: null, as_of: 1790000000000 })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const copy = textOf(panel);
+  assert.match(copy, /Members: done · 20 committed/);
+  assert.match(copy, /Current bans: done · 3 committed/);
+  assert.match(copy, /Candidate checks: done · 1 committed/);
+  assert.match(copy, /Available audit history: done · 2 committed/);
+  assert.match(copy, /Local case history: waiting/);
+  assert.doesNotMatch(copy, /100% complete/);
+  const bar = findNode(panel, n => n.tag === 'progress');
+  assert.equal(bar.attrs.value, undefined);
+});
+
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
   const h = harness(async (url) => url.endsWith('/member-sync')
     ? response({ status: 'queued', phase: 'bans', progress_revision: 9, processed: 80, total_estimate: 80, total_is_estimated: false,
@@ -532,6 +558,7 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   await new Promise(resolve => setImmediate(resolve));
   const copy = textOf(panel);
   assert.match(copy, /80 members counted/);
+  assert.match(copy, /Current bans: queued · committed count unknown/);
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);

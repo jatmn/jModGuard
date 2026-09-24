@@ -3,7 +3,7 @@ use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistratio
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 10;
+const VERSION: i64 = 11;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -16,6 +16,8 @@ const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.s
 const MEMBER_SCHEMA: &str = include_str!("../../migrations/guild/0009_member_directory.sql");
 const MEMBER_STATUS_SCHEMA: &str =
     include_str!("../../migrations/guild/0010_member_directory_status.sql");
+const MEMBER_PROGRESS_SCHEMA: &str =
+    include_str!("../../migrations/guild/0011_member_sync_progress.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -223,6 +225,9 @@ fn initialize_store(
         if version < 10 {
             tx.execute_batch(MEMBER_STATUS_SCHEMA)?;
         }
+        if version < 11 {
+            tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -241,6 +246,7 @@ fn initialize_store(
     tx.execute_batch(ERASURE_SCHEMA)?;
     tx.execute_batch(MEMBER_SCHEMA)?;
     tx.execute_batch(MEMBER_STATUS_SCHEMA)?;
+    tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
     tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete

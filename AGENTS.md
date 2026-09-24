@@ -116,7 +116,7 @@ The guild-store catalog and `TenantRuntime` now route live isolated tenant data 
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Populated shared/dedicated
 moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 10. Identity,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 11. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write. The conductor still has no tenant routing.
 Stable/Nightly publication uses Release Please plus scheduled Buildkite Nightlies; complete

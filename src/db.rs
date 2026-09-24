@@ -354,6 +354,13 @@ impl ConnectionLease {
                 connection
             }
         };
+        if pool.remote {
+            // Successful autocommit reads can leave an Hrana cursor baton on
+            // this connection. Never carry that potentially expired server
+            // stream into a new logical operation. Do not retry the closure:
+            // it may contain writes whose outcome cannot safely be replayed.
+            connection.reset_remote_stream()?;
+        }
         Ok(Self {
             connection: Some(connection),
             pool,

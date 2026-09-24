@@ -2227,11 +2227,13 @@ function tabMembers() {
     } else if (!sync.run_id && sync.status === "needs_attention") {
       parts.push(el("p", { class: "alert alert-warning", text: "Import metadata is unavailable. Controls are disabled until the saved job is restored or repaired." }));
     }
+    const phaseCounts = { members: sync.member_processed, bans: sync.ban_processed, verify: sync.verify_processed, audit: sync.audit_processed };
     const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
+    const phaseProcessed = phaseCounts[sync.phase] == null ? null : Number(phaseCounts[sync.phase]);
     const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
     const percent = sync.status === "complete" ? 100 : sync.percent == null ? null : Math.min(99, Math.max(0, Number(sync.percent)));
     const totalKind = sync.total_is_estimated === false ? "counted" : "estimated";
-    const bar = el("progress", { max: "100", value: sync.status === "complete" ? "100" : percent, "aria-label": "Import progress", "aria-valuetext": sync.status === "complete" ? "Complete" : percent === null ? `${processed} records committed; total unknown` : `${Math.round(percent)} percent of ${totalKind} member stage` });
+    const bar = el("progress", { max: "100", value: sync.status === "complete" ? "100" : percent, "aria-label": "Import progress", "aria-valuetext": sync.status === "complete" ? "Complete" : percent === null ? `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown` : `${Math.round(percent)} percent of ${totalKind} member stage` });
     if (sync.status !== "complete" && percent === null) bar.removeAttribute("value");
     parts.push(bar);
     const memberPhase = sync.phase === "members";
@@ -2240,9 +2242,16 @@ function tabMembers() {
     else if (total !== null && memberPhase) totalDescription = `approximately ${total.toLocaleString()} members estimated`;
     const progressText = sync.status === "complete" ? " · 100% complete" : percent === null ? "" : ` · ${Math.round(percent)}% of ${totalKind} member phase`;
     parts.push(el("p", { text: `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}` }));
-    const phases = ["members", "bans", "verify", "audit"];
-    const currentPhase = phases.indexOf(String(sync.phase || ""));
-    parts.push(el("p", { class: "muted", text: phases.map((phase, index) => `${phase === "bans" ? "Current bans" : phase === "audit" ? "Available audit history" : phase === "verify" ? "Candidate checks" : "Members"}: ${sync.status === "complete" || (currentPhase >= 0 && index < currentPhase) ? "done" : index === currentPhase ? sync.status : "pending"}`).join(" · ") }));
+    const phases = ["members", "bans", "verify", "audit", "local_history"];
+    const phaseLabels = { members: "Members", bans: "Current bans", verify: "Candidate checks", audit: "Available audit history", local_history: "Local case history" };
+    const currentPhase = sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
+      ? phases.indexOf("local_history") : phases.indexOf(String(sync.phase || ""));
+    parts.push(el("p", { class: "muted", text: phases.map((phase, index) => {
+      const state = sync.status === "complete" || (currentPhase >= 0 && index < currentPhase) ? "done" :
+        index === currentPhase ? sync.status : "pending";
+      const count = phaseCounts[phase] == null ? " · committed count unknown" : ` · ${Number(phaseCounts[phase]).toLocaleString()} committed`;
+      return `${phaseLabels[phase]}: ${state}${count}`;
+    }).join(" · ") }));
     const serverReadAt = Number(sync.as_of ?? sync.as_of_ms);
     const statusNow = Number.isFinite(serverReadAt) && serverReadAt > 0
       ? serverReadAt + Math.max(0, Date.now() - latestStatusReceivedAt) : Date.now();
@@ -2433,7 +2442,8 @@ function tabMembers() {
           : event.kind || "Observation";
         const visibleLabel = event.kind === "member_state_observation" ? "Membership absence" :
           event.kind === "membership_state_observation" ? "Membership state check" :
-          event.kind === "ban_state_observation" ? "Ban absence" : eventLabel;
+          event.kind === "ban_present_state_observation" ? "Ban present (time unknown)" :
+          event.kind === "ban_absent_state_observation" || event.kind === "ban_state_observation" ? "Ban absent (time unknown)" : eventLabel;
         detail.append(el("p", {},
           el("strong", { text: `${visibleLabel} · ${asDate(event.occurred_at_ms)}` }),
           event.case_id ? el("button", { class: "btn small", text: `Case ${event.case_id}`, onclick: () => { pendingCaseId = event.case_id; navigate("cases"); } }) : null,

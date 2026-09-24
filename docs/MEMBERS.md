@@ -26,11 +26,18 @@ While the page is visible, the card keeps following an acknowledged sync
 control and separate audit recovery even if the initial import is complete.
 The member-stage finish time is a preliminary forecast from a recent bot
 initialization with a known guild count, then anchored to committed pages and
-the shared request pace across active guilds. If progress
+the shared request pace across active guilds and competing paced checks. Once
+successive pages are committed, it also uses their measured interval. If progress
 becomes too old to support that forecast, the remaining time and finish time
 become unknown. An unconfirmed worker is not labeled as crashed. A completed
 member stage uses the actual number traversed rather than retaining the
 starting guild estimate.
+The card shows committed counts for each phase; current-ban and audit totals
+may be unknown, so those phases use indeterminate progress. Existing version10
+runs keep their old aggregate count and known member total, but cannot
+reconstruct earlier ban, check, or audit counts after migration; the card
+marks those counts unknown. Local case history
+may still be finishing after the Discord phases are done.
 For a known Discord rate limit, the card counts down to the next attempt and
 uses a recent count and pace anchor to revise the member-stage finish time.
 Paused, offline, stale or unpredictable work has no finish forecast. The card
@@ -53,6 +60,11 @@ request budget; this audit-only recovery does not list all members or current
 bans and does not change the original initial-import completion time. The card
 reports its ban/unban stage, checked-entry count, waiting reason, and next
 attempt separately from the completed initial import.
+An ordinary departed person's saved stay waits through a known pending audit
+gap before cleanup; a current-member/current-ban absence check alone cannot
+exclude a ban and later unban during that gap. Once available audit recovery
+settles, a targeted absence check allows safe ordinary cleanup, while a
+recovered ban retains that person's known join context.
 If another coverage gap is observed while a requested reconciliation is still
 finishing, that older run cannot clear the newer warning. Another explicit
 Reconcile is needed to establish full current-member/current-ban coverage.
@@ -65,9 +77,10 @@ unavailable locally or beyond
 Discord's audit retention remain unknown. A snapshot observation never becomes
 a falsely dated ban or join action.
 When a current-ban snapshot is the only evidence of a ban, per-user history
-shows an unknown-event-time state observation rather than inventing a dated
-ban action. A later exact case or audit action remains a separate canonical
-history entry.
+shows a ban-present observation with unknown event time rather than inventing
+a dated ban action. An absence check instead shows a ban-absent observation.
+A failed historic ban attempt does not stand in for a confirmed present state.
+A later exact case or audit action remains a separate canonical history entry.
 
 ## Search and history
 
@@ -127,7 +140,7 @@ another database.
 
 ## Storage sizing
 
-The final v10 guild schema was measured in local SQLite with 4 KiB pages and
+The final v11 guild schema was measured in local SQLite with 4 KiB pages and
 `VACUUM`. The measurement includes the nullable stay identity on paced
 target checks; these bulk fixtures have no pending checks. An empty guild store
 measured 258,048 bytes. With one saved stay per
@@ -147,6 +160,6 @@ The difference from the same-name 11,000-member fixture is 22,769,664 bytes
 over ten years, or about 2.28 MB (2.17 MiB) per year under the same row mix
 and indexing. Churn and retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
 ordinary and 3.26 MB Unicode figures excluded final stays and indexes; use
-the v10 measured fixtures above for sizing. The earlier candidate
+the v11 measured fixtures above for sizing. The earlier candidate
 measurements used a different row shape and name generator, so their difference
 from these figures is not a pure schema overhead estimate.

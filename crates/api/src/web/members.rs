@@ -8,6 +8,7 @@ use crate::db::guild_data::{MemberQuery, MemberSort, MemberStatusFilter};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -185,9 +186,23 @@ pub async fn sync_action(
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
     Json(body): Json<SyncActionBody>,
-) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
-    let (auth, _) = scoped(&app, &session, &headers, guild_id).await?;
-    api::enqueue_action(
+) -> ApiResult<Response> {
+    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (store, scope) = app.tenant.live(enrollment).await?;
+    let status = store
+        .member_sync_status(scope, bot_id(&app)?, Utc::now().timestamp_millis())
+        .await?;
+    if status.run_id.is_none() {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "member import job is unavailable; wait for bot initialization or repair saved metadata",
+                "code": "member_sync_missing_job"
+            })),
+        )
+            .into_response());
+    }
+    Ok(api::enqueue_action(
         &app,
         guild_id,
         &auth,
@@ -196,5 +211,6 @@ pub async fn sync_action(
             operation: body.operation,
         },
     )
-    .await
+    .await?
+    .into_response())
 }

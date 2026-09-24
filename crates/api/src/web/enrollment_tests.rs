@@ -89,6 +89,7 @@ impl Fixture {
         let db = db::Db::open(&path, 2).unwrap();
         let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.bot.owner_id = if operator { 42 } else { 99 };
+        cfg.web.oauth_client_id = "42".into();
         let mut app = ApiState::new(cfg, db).unwrap();
         Arc::get_mut(&mut app).unwrap().oauth.guilds_endpoint =
             Some(format!("http://{address}/guilds"));
@@ -796,6 +797,100 @@ async fn configuration_snapshot_checks_its_captured_membership() {
 
 fn action_key(label: &str) -> String {
     format!("{}_{}", chrono::Utc::now().timestamp(), label)
+}
+
+#[tokio::test]
+async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fails() {
+    use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
+
+    struct Allowed;
+    #[async_trait::async_trait]
+    impl DiscordActions for Allowed {
+        fn bot_user_id(&self) -> Option<i64> {
+            Some(42)
+        }
+        async fn membership_matches(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+    }
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let path = "/api/guilds/10/member-sync/actions";
+    let body =
+        serde_json::json!({"request_id":action_key("unadmitted"),"operation":"pause"}).to_string();
+    let (status, rejected) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_missing_job");
+    let (_, actions) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(actions.as_array().unwrap().len(), 0);
+
+    let seeded = store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert!(seeded.run_id.is_some());
+    let body =
+        serde_json::json!({"request_id":action_key("queued"),"operation":"pause"}).to_string();
+    let (status, queued) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    jmodguard_bot::action_worker::drain_with_tenant(
+        &f.app.db,
+        &f.app.tenant,
+        &Allowed,
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    let (_, actions) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(actions[0]["id"], queued["id"]);
+    assert_eq!(actions[0]["state"], "failed");
+    assert_eq!(actions[0]["outcome"], "member_sync_missing_job");
+
+    let body =
+        serde_json::json!({"request_id":action_key("missing"),"operation":"retry"}).to_string();
+    let (status, rejected) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_missing_job");
+    let still_missing = store
+        .initialize_member_directory(scope, 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert!(still_missing.run_id.is_none());
+    assert_eq!(still_missing.status, "needs_attention");
 }
 
 #[tokio::test]

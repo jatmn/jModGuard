@@ -332,7 +332,14 @@ async fn execute_inner(
                     Ok(_) => Outcome::succeeded("member_sync_updated"),
                     Err(error) => {
                         tracing::warn!(action_id = %job.id, guild_id = job.guild_id, "member sync control failed: {error:#}");
-                        Outcome::failed("member_sync_unavailable")
+                        if matches!(
+                            error.downcast_ref::<crate::db::guild_data::MemberSyncError>(),
+                            Some(crate::db::guild_data::MemberSyncError::MissingJob)
+                        ) {
+                            Outcome::failed("member_sync_missing_job")
+                        } else {
+                            Outcome::failed("member_sync_unavailable")
+                        }
                     }
                 }
             }
