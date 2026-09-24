@@ -2611,6 +2611,7 @@ mod schema;
 
 mod action_history;
 mod action_queue;
+mod remote_stream;
 
 mod enrollments;
 
