@@ -30,6 +30,8 @@ pub(crate) struct GuildListGate {
 pub(crate) enum Cooldown {
     Until(Instant),
     RestOfProcess,
+    /// Discord already returned 429. Stay blocked until its body is applied.
+    AwaitingBody,
 }
 
 impl GuildListGate {
@@ -42,11 +44,11 @@ impl GuildListGate {
     fn remaining(&mut self, token: &str) -> Option<Duration> {
         let now = Instant::now();
         self.cooldowns.retain(|_, cooldown| match *cooldown {
-            Cooldown::RestOfProcess => true,
+            Cooldown::RestOfProcess | Cooldown::AwaitingBody => true,
             Cooldown::Until(until) => until > now,
         });
         match self.cooldowns.get(token).copied()? {
-            Cooldown::RestOfProcess => Some(Duration::MAX),
+            Cooldown::RestOfProcess | Cooldown::AwaitingBody => Some(Duration::MAX),
             Cooldown::Until(until) => Some(until.saturating_duration_since(now)),
         }
     }
@@ -55,9 +57,11 @@ impl GuildListGate {
         let next = cooldown_deadline(Instant::now(), retry_after);
         let replace = match self.cooldowns.get(token).copied() {
             Some(Cooldown::RestOfProcess) => false,
+            Some(Cooldown::AwaitingBody) => true,
             Some(Cooldown::Until(existing)) => match next {
                 Cooldown::RestOfProcess => true,
                 Cooldown::Until(until) => until > existing,
+                Cooldown::AwaitingBody => true,
             },
             None => true,
         };
@@ -328,19 +332,30 @@ impl OAuthClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
-                let provisional = discord_retry_after(header.as_deref(), b"{}");
-                self.remember_cooldown(&user_key, provisional);
                 let gate = std::sync::Arc::clone(&self.guild_list);
                 let cooldown_key = user_key.clone();
+                self.hold_for_body(&user_key);
+                let header_for_response = header.clone();
                 let finish = tokio::spawn(async move {
-                    let bytes = resp.bytes().await.unwrap_or_default();
-                    let retry_after = discord_retry_after(header.as_deref(), &bytes);
+                    let retry_after = match resp.bytes().await {
+                        Ok(bytes) => discord_retry_after(header.as_deref(), &bytes),
+                        Err(_) if header.is_some() => discord_retry_after(header.as_deref(), b"{}"),
+                        Err(_) => {
+                            gate.lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .cooldowns
+                                .insert(cooldown_key, Cooldown::RestOfProcess);
+                            return Duration::MAX;
+                        }
+                    };
                     gate.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .block_until(&cooldown_key, retry_after);
                     retry_after
                 });
-                let retry_after = finish.await.unwrap_or(provisional);
+                let retry_after = finish
+                    .await
+                    .unwrap_or_else(|_| discord_retry_after(header_for_response.as_deref(), b"{}"));
                 return Err(GuildListError::RateLimited { retry_after });
             }
             if !status.is_success() {
@@ -377,11 +392,18 @@ impl OAuthClient {
             .remaining(access_token)
     }
 
-    fn remember_cooldown(&self, access_token: &str, retry_after: Duration) {
-        self.guild_list
+    fn hold_for_body(&self, user_key: &str) {
+        let mut gate = self
+            .guild_list
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .block_until(access_token, retry_after);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(
+            gate.cooldowns.get(user_key),
+            Some(Cooldown::RestOfProcess | Cooldown::Until(_))
+        ) {
+            gate.cooldowns
+                .insert(user_key.to_owned(), Cooldown::AwaitingBody);
+        }
     }
 
     async fn guild_flight(&self, access_token: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -590,6 +612,62 @@ mod tests {
         let other = client.my_guilds(8, "other-user").await.unwrap_err();
         assert!(matches!(other, GuildListError::RateLimited { .. }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn delayed_rate_limit_body_blocks_the_user_until_it_arrives() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = std::sync::Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 20\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let _ = socket.write_all(br#"{"retry_after":30}"#).await;
+                });
+            }
+        });
+        let client = std::sync::Arc::new(OAuthClient {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
+            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guilds_endpoint: Some(format!("http://{address}/guilds")),
+            token_endpoint: None,
+        });
+        let first_client = std::sync::Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.my_guilds(9, "first").await });
+        let wait_started = Instant::now();
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(wait_started.elapsed() < Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let second = client.my_guilds(9, "second").await.unwrap_err();
+        assert!(matches!(second, GuildListError::RateLimited { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = first.await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
