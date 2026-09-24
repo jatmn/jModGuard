@@ -225,6 +225,18 @@ with_main
 publish_component conductor
 publish_component manifest
 
+# UI and API commit-SHA rebuilds must not bootstrap the unused conductor
+# package, read publication credentials, or reach Docker (including retries).
+for build_source in ui api; do
+  for retry in 0 1; do
+    with_main
+    BUILDKITE_SOURCE="$build_source"
+    BUILDKITE_RETRY_COUNT="$retry"
+    JMODGUARD_PUBLISH_SOURCE="$BASE_SHA"
+    publish_component conductor
+  done
+done
+
 reload_publisher() {
   # shellcheck disable=SC1091
   JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
@@ -364,7 +376,7 @@ exercise_publish() {
   GITHUB_TOKEN="$source_token"
   export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN
   if [[ "$mode" == manual ]]; then
-    ref='refs/tags/v1'
+    ref="${9:-refs/tags/v1}"
     sha="$BASE_SHA"
     BUILDKITE_SOURCE=ui
     JMODGUARD_PUBLISH_SOURCE="$ref"
@@ -555,6 +567,14 @@ exercise_publish 0 0 manual
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-api:${BASE_SHA}" \
   || fail 'manual publication must build the planned SHA even when compare would skip'
 
+for component in bot api webui; do
+  exercise_publish 0 0 manual '' '' "$component" 0 current "$BASE_SHA"
+  printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-${component}:${BASE_SHA}" \
+    || fail "manual SHA publication must still build ${component}"
+  printf '%s\n' "${CALLS[@]}" | grep -q "^verify ${component} " \
+    || fail "manual SHA publication must verify ${component} before promotion"
+done
+
 # A historical manual source predates the WebUI package and service launcher.
 # Its bot/API images remain publishable for dashboard rollback, while their
 # labels cannot claim owner-updater compatibility.
@@ -602,7 +622,7 @@ rm -rf "$partial_source"
 
 exercise_publish 0 0 manual '' '' conductor
 printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-conductor:${BASE_SHA}" \
-  || fail 'manual conductor publication must still build'
+  || fail 'explicit manual-tag conductor publication must still build'
 printf '%s\n' "${CALLS[@]}" | grep -q '^verify ' \
   && fail 'legacy conductor must not enter bot/API/WebUI image verification'
 
