@@ -7,8 +7,9 @@ top-level PR comments. It does not listen to inline PR review comments, which
 run GitHub workflows from a PR merge commit. It has no push, PR, schedule, or
 `workflow_dispatch` trigger. The agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
-starts with `@pullfrog` followed by an instruction. A public contributor's
-comment, a quoted/passive mention, an edited comment, a workflow rerun, and a
+starts with `@pullfrog` followed by a visible instruction on the same first
+line. A public contributor's comment, a quoted/passive mention, an edited
+comment, a workflow rerun, and a
 bare `@pullfrog` do not run the agent. The workflow checks out the trusted
 default branch and passes the comment URL to the agent, which must read the
 current issue or PR.

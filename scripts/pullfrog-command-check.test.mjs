@@ -13,7 +13,7 @@ test('accepts an owner instruction on an issue or top-level PR comment', () => {
   assert.equal(isOwnerCommand('issue_comment', 'jatmn', ownerComment), true);
   assert.equal(isOwnerCommand('issue_comment', 'jatmn', {
     ...ownerComment,
-    comment: { ...ownerComment.comment, body: '@pullfrog\nPlease review this PR.' },
+    comment: { ...ownerComment.comment, body: '@pullfrog Please review this PR.\nFocus on security.' },
   }), true);
   assert.equal(isOwnerCommand('issue_comment', 'jatmn', {
     ...ownerComment,
@@ -46,6 +46,13 @@ test('rejects passive mentions and empty commands', () => {
     '\t@pullfrog review this',
     '\n@pullfrog review this',
     '\n    @pullfrog review this',
+    '@pullfrog\nPlease review this',
+    '@pullfrog\n> Please review this',
+    '@pullfrog\n<!-- Please review this -->',
+    '@pullfrog > Please review this',
+    '@pullfrog <!-- Please review this -->',
+    '@pullfrog `Please review this`',
+    '@pullfrog \u200B',
     '@pullfrog',
     '@pullfrog   ',
     '@pullfrogger review this',

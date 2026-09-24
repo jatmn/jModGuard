@@ -11,8 +11,11 @@ export function isOwnerCommand(eventName, actor, event) {
 
   const body = event.comment.body;
   if (typeof body !== 'string') return false;
-  const command = /^ {0,3}@pullfrog(?=\s|$)([\s\S]*)$/i.exec(body);
-  return command !== null && command[1].trim().length > 0;
+  const firstLine = body.split(/\r?\n/, 1)[0];
+  const command = /^ {0,3}@pullfrog[ \t]+([^\r\n]+)$/i.exec(firstLine);
+  if (command === null) return false;
+  const instruction = command[1].replace(/\p{Default_Ignorable_Code_Point}/gu, '').trimStart();
+  return /^[\p{L}\p{N}]/u.test(instruction);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
