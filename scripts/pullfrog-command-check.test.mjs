@@ -15,6 +15,10 @@ test('accepts an owner instruction on an issue or top-level PR comment', () => {
     ...ownerComment,
     comment: { ...ownerComment.comment, body: '@pullfrog\nPlease review this PR.' },
   }), true);
+  assert.equal(isOwnerCommand('issue_comment', 'jatmn', {
+    ...ownerComment,
+    comment: { ...ownerComment.comment, body: '   @pullfrog review this PR' },
+  }), true);
 });
 
 test('rejects all other actors and mismatched identities', () => {
@@ -38,6 +42,10 @@ test('rejects passive mentions and empty commands', () => {
     'Can someone ask @pullfrog?',
     '> @pullfrog review this',
     '`@pullfrog review this`',
+    '    @pullfrog review this',
+    '\t@pullfrog review this',
+    '\n@pullfrog review this',
+    '\n    @pullfrog review this',
     '@pullfrog',
     '@pullfrog   ',
     '@pullfrogger review this',

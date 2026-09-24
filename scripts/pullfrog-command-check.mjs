@@ -11,7 +11,7 @@ export function isOwnerCommand(eventName, actor, event) {
 
   const body = event.comment.body;
   if (typeof body !== 'string') return false;
-  const command = /^\s*@pullfrog(?=\s|$)([\s\S]*)$/i.exec(body);
+  const command = /^ {0,3}@pullfrog(?=\s|$)([\s\S]*)$/i.exec(body);
   return command !== null && command[1].trim().length > 0;
 }
 
