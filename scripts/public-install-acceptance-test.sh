@@ -58,7 +58,11 @@ require_contains docs/WEBUI.md "does not upload a separate frontend"
 require_absent docs/OVERHAUL.md "or Buildkite artifacts is the required path"
 require_contains docs/OVERHAUL.md "does not upload it to Bunny Storage"
 require_absent crates/conductor/src/install.rs "Buildkite already publishes public bot/API/conductor/frontend artifacts"
-require_contains crates/conductor/src/install.rs "Nightly/Stable/manual"
+for relative in docs/INSTALL.md crates/conductor/src/install.rs; do
+  require_contains "$relative" "Manual commit-SHA builds skip conductor and signed manifests."
+  require_contains "$relative" "manual Stable-tag builds"
+  require_contains "$relative" "do not produce a signed manifest"
+done
 
 # test_bunny_and_webui_do_not_require_private_ops
 require_absent docs/DEPLOY-BUNNY.md "The UI files are published by **GitHub Actions in your private ops repo**."

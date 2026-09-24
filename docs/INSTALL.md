@@ -20,8 +20,12 @@ AWS proof. Eight merged overhaul PRs do not prove production cutover.
 | Cost | [COST.md](COST.md) | Formulas from local measurements plus current provider list prices |
 
 Buildkite publishes changed bot, API, and WebUI images from this repository on main SHAs.
-Conductor images and a complete signed `JMODGUARD-RELEASE-1` manifest ship only on
-scheduled Nightly, Stable tag, and manual builds ([BUILDKITE.md](BUILDKITE.md)).
+Manual commit-SHA builds skip conductor and signed manifests. They publish the
+eligible bot/API/WebUI images, with WebUI skipped for sources predating that package.
+Conductor images require explicit tag builds (including manual `refs/tags/...`
+sources) or scheduled Nightly builds. Complete signed `JMODGUARD-RELEASE-1`
+manifests require scheduled Nightly or Stable `vMAJOR.MINOR.PATCH` tag builds,
+including manual Stable-tag builds ([BUILDKITE.md](BUILDKITE.md)).
 
 ## Public artifacts
 
@@ -29,9 +33,13 @@ Use a source commit SHA or the matching Buildkite image digests:
 
 - source: `https://github.com/jatmn/jModGuard`
 - independently published images on main: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui` (source SHA and `latest` tags for each changed component)
-- conductor image and installable release manifest: Nightly / Stable tag / manual
-  Buildkite builds only (`ghcr.io/jatmn/jmodguard-conductor`); on main SHA build
-  from source (`cargo build --locked -p jmodguard-conductor`) or pin a tagged release
+- conductor image: explicit tag or scheduled Nightly builds
+  (`ghcr.io/jatmn/jmodguard-conductor`), including manual tag builds; for a main
+  or manual commit SHA, build from source (`cargo build --locked -p jmodguard-conductor`)
+  or pin a tagged release
+- installable signed release manifest: scheduled Nightly or Stable tag builds,
+  including manual Stable-tag builds; other tags and manual commit SHAs
+  do not produce a signed manifest
 - admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`, `frontend/administration/index.html`, `frontend/administration.js`
   (the browser also fetches daisyUI CSS and Headless UI from a CDN at runtime;
   those libraries are not extra files in this repository)
