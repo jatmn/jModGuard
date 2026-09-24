@@ -1,13 +1,80 @@
 //! Discord OAuth client and dashboard identity models.
 use anyhow::{Context as _, Result};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 pub struct OAuthClient {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
     pub http: reqwest::Client,
+    /// Serializes `/users/@me/guilds` so concurrent callers share one cooldown.
+    pub(crate) guild_list: tokio::sync::Mutex<GuildListGate>,
     #[cfg(test)]
     pub guilds_endpoint: Option<String>,
+    #[cfg(test)]
+    pub token_endpoint: Option<String>,
+}
+
+pub(crate) struct GuildListGate {
+    /// Access token → earliest instant another guild-list request may start.
+    cooldowns: HashMap<String, Instant>,
+}
+
+impl GuildListGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            cooldowns: HashMap::new(),
+        }
+    }
+
+    fn remaining(&mut self, token: &str) -> Option<Duration> {
+        let now = Instant::now();
+        self.cooldowns.retain(|_, until| *until > now);
+        self.cooldowns
+            .get(token)
+            .map(|until| until.saturating_duration_since(now))
+    }
+
+    fn block_until(&mut self, token: &str, retry_after: Duration) {
+        let until = Instant::now() + retry_after;
+        self.cooldowns.insert(token.to_owned(), until);
+    }
+}
+
+/// Upstream guild-list failure. Only `Unauthorized` justifies an OAuth refresh.
+#[derive(Debug)]
+pub enum GuildListError {
+    RateLimited { retry_after: Duration },
+    Unauthorized,
+    Failed(anyhow::Error),
+}
+
+/// Browser-facing temporary failure. Not an authentication or client error.
+#[derive(Debug)]
+pub struct DiscordRateLimit {
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for DiscordRateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = retry_after_header_secs(self.retry_after);
+        write!(
+            f,
+            "Discord is temporarily rate limiting guild checks. Try again in about {seconds}s."
+        )
+    }
+}
+
+impl std::error::Error for DiscordRateLimit {}
+
+/// Seconds advertised to the browser. Missing or zero Discord values still
+/// impose a one-second floor so callers do not hammer immediately. Values
+/// above a minute are capped so a bad header cannot stall the dashboard.
+pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
+    let millis = retry_after.as_millis();
+    let seconds = millis.div_ceil(1000) as u64;
+    seconds.clamp(1, 60)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,9 +201,12 @@ impl OAuthClient {
         value: &str,
         _code_verifier: Option<&str>,
     ) -> Result<TokenResponse> {
+        let url = "https://discord.com/api/oauth2/token";
+        #[cfg(test)]
+        let url = self.token_endpoint.as_deref().unwrap_or(url);
         let resp = self
             .http
-            .post("https://discord.com/api/oauth2/token")
+            .post(url)
             .form(&[
                 ("client_id", self.client_id.as_str()),
                 ("client_secret", self.client_secret.as_str()),
@@ -179,7 +249,17 @@ impl OAuthClient {
         resp.json().await.context("invalid discord user response")
     }
 
-    pub async fn my_guilds(&self, access_token: &str) -> Result<Vec<DiscordGuild>> {
+    pub async fn my_guilds(
+        &self,
+        access_token: &str,
+    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+        // One shared gate: a 429 from any page blocks later callers, including
+        // concurrent ones, until Discord's advertised cooldown elapses. The
+        // lock is not held while the caller waits out that cooldown.
+        let mut gate = self.guild_list.lock().await;
+        if let Some(retry_after) = gate.remaining(access_token) {
+            return Err(GuildListError::RateLimited { retry_after });
+        }
         // Discord paginates at 200 guilds; a single GET silently drops every
         // server past the first page and deny WebUI manage access for them.
         const PAGE_LIMIT: usize = 200;
@@ -194,20 +274,42 @@ impl OAuthClient {
                 url.push_str("&after=");
                 url.push_str(cursor);
             }
-            let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(access_token)
-                .send()
-                .await
-                .context("discord guilds request failed")?;
-            if !resp.status().is_success() {
-                anyhow::bail!("discord guilds request failed with {}", resp.status());
+            let resp = match self.http.get(&url).bearer_auth(access_token).send().await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    return Err(GuildListError::Failed(anyhow::anyhow!(
+                        "discord guilds request failed: {error}"
+                    )));
+                }
+            };
+            let status = resp.status();
+            if status.as_u16() == 401 {
+                return Err(GuildListError::Unauthorized);
             }
-            let page: Vec<DiscordGuild> = resp
-                .json()
-                .await
-                .context("invalid discord guilds response")?;
+            if status.as_u16() == 429 {
+                let header = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let bytes = resp.bytes().await.unwrap_or_default();
+                let retry_after = discord_retry_after(header.as_deref(), &bytes);
+                gate.block_until(access_token, retry_after);
+                return Err(GuildListError::RateLimited { retry_after });
+            }
+            if !status.is_success() {
+                return Err(GuildListError::Failed(anyhow::anyhow!(
+                    "discord guilds request failed with {status}"
+                )));
+            }
+            let page: Vec<DiscordGuild> = match resp.json().await {
+                Ok(page) => page,
+                Err(error) => {
+                    return Err(GuildListError::Failed(anyhow::anyhow!(
+                        "invalid discord guilds response: {error}"
+                    )));
+                }
+            };
             match next_guilds_after_cursor(&page, PAGE_LIMIT) {
                 Some(next) => {
                     all.extend(page);
@@ -220,6 +322,34 @@ impl OAuthClient {
             }
         }
         Ok(all)
+    }
+}
+
+/// Discord's rate-limit docs: use `Retry-After` or JSON `retry_after` (seconds).
+/// Prefer the longer of the two when both are present. Missing, zero, or
+/// unparseable values still wait one second. The shared gate caps at 60s.
+pub(crate) fn discord_retry_after(header: Option<&str>, body: &[u8]) -> Duration {
+    let from_header = header.and_then(parse_retry_seconds);
+    let from_body = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("retry_after").and_then(|v| v.as_f64()))
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+    let seconds = match (from_header, from_body) {
+        (Some(header), Some(body)) => header.max(body),
+        (Some(header), None) => header,
+        (None, Some(body)) => body,
+        (None, None) => 1.0,
+    };
+    let millis = (seconds * 1000.0).ceil().clamp(1000.0, 60_000.0) as u64;
+    Duration::from_millis(millis)
+}
+
+fn parse_retry_seconds(header: &str) -> Option<f64> {
+    let seconds: f64 = header.trim().parse().ok()?;
+    if seconds.is_finite() && seconds >= 0.0 {
+        Some(seconds)
+    } else {
+        None
     }
 }
 
@@ -267,6 +397,22 @@ mod tests {
         assert!(after.is_none());
         assert_eq!(all.len(), 201);
         assert_eq!(all.last().unwrap().id, "200");
+    }
+
+    #[test]
+    fn discord_retry_after_honors_header_and_json_seconds() {
+        assert_eq!(discord_retry_after(Some("2"), b"{}").as_secs(), 2);
+        assert_eq!(
+            discord_retry_after(Some("2"), br#"{"retry_after":4.5}"#).as_millis(),
+            4500
+        );
+        assert_eq!(discord_retry_after(None, b"{}").as_secs(), 1);
+        assert_eq!(discord_retry_after(Some("0"), b"{}").as_secs(), 1);
+        assert_eq!(discord_retry_after(Some("120"), b"{}").as_secs(), 60);
+        assert_eq!(
+            retry_after_header_secs(discord_retry_after(Some("4.2"), b"{}")),
+            5
+        );
     }
 
     #[test]

@@ -38,8 +38,11 @@ impl ApiState {
             client_secret: cfg.web.oauth_client_secret.clone(),
             redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
             http,
+            guild_list: tokio::sync::Mutex::new(super::oauth::GuildListGate::new()),
             #[cfg(test)]
             guilds_endpoint: None,
+            #[cfg(test)]
+            token_endpoint: None,
         };
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;

@@ -43,7 +43,7 @@ function loadFrontend(fetchImpl, clock, timers) {
     console,
   });
   return vm.runInContext(
-    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, parseRetryAfterMs, waitForApiMe, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage })`,
+    `${src}\n({ isApiWarmup, isOriginStarting, isUnauthenticated, isDiscordRateLimited, parseRetryAfterMs, waitForApiMe, api, apiError, API_WARMUP_BUDGET_MS, ORIGIN_REACHABILITY_BUDGET_MS, originGaveUpMessage })`,
     context,
   );
 }
@@ -347,4 +347,36 @@ test("waitForApiMe aborts a fetch that never settles after the reachability budg
     assert.equal(err.message, originGaveUpMessage(apiError("Failed to fetch")));
     return true;
   });
+});
+
+test("discord guild rate limit is shown once and does not log out or replay", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 429,
+      headers: { get: (name) => (String(name).toLowerCase() === "retry-after" ? "5" : null) },
+      text: async () => JSON.stringify({
+        error: "Discord is temporarily rate limiting guild checks. Try again in about 5s.",
+        code: "discord_rate_limited",
+        retry_after: 5,
+      }),
+    };
+  };
+  const { api, isDiscordRateLimited, isUnauthenticated, isOriginStarting } = loadFrontend(fetchImpl);
+  await assert.rejects(
+    api("/api/guilds/10/cases/case-1", "POST", { note: "do not replay" }),
+    (err) => {
+      assert.equal(isDiscordRateLimited(err), true);
+      assert.equal(isUnauthenticated(err), false);
+      assert.equal(isOriginStarting(err), false);
+      assert.equal(err.status, 429);
+      assert.equal(err.code, "discord_rate_limited");
+      assert.equal(err.retryAfterMs, 5000);
+      assert.match(err.message, /rate limiting/);
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
 });
