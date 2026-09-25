@@ -8,7 +8,6 @@ import vm from "node:vm";
 class Element {
   constructor(tag = "div") {
     this.tag = tag;
-    this.children = [];
     this.textContent = "";
     this.disabled = false;
     this.listeners = {};
@@ -23,9 +22,28 @@ class Element {
         return forced;
       },
     };
+    const childNodes = [];
+    this.children = new Proxy(childNodes, {
+      get(target, prop) {
+        if (prop === "unshift") return undefined;
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    this._childNodes = childNodes;
+    const dataset = {};
+    Object.defineProperty(this, "dataset", {
+      get: () => dataset,
+      set() {
+        throw new TypeError("Cannot set property dataset which has only a getter");
+      },
+      enumerable: true,
+      configurable: true,
+    });
   }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  append(...children) { this._childNodes.push(...children); }
+  prepend(...children) { this._childNodes.unshift(...children); }
+  replaceChildren(...children) { this._childNodes.length = 0; this._childNodes.push(...children); }
   replaceWith(next) { this.replacedWith = next; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   setAttribute(name, value) { this.attributes = { ...(this.attributes || {}), [name]: value }; }

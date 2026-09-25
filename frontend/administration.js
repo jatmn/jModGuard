@@ -558,11 +558,10 @@ async function doRefreshUsage() {
   } catch (error) {
     usageStatus.textContent = error.message;
     for (const card of usageCards.children) {
-      card.dataset = card.dataset || {};
-      if (card.dataset.usageStale) continue;
+      if (card.dataset.usageStale === "1") continue;
       card.dataset.usageStale = "1";
       const note = node("p", "Stale: the latest usage refresh failed. These figures are not a current capacity sample.", "text-warning");
-      card.children.unshift(note);
+      card.prepend(note);
     }
   }
   finally { scheduleRefresh(); }

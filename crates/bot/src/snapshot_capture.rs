@@ -209,14 +209,9 @@ impl SnapshotIngress {
     pub fn install_collector(&self, app: &Arc<BotState>, context: &Context) {
         let shard = context.shard_id.get() as u64;
         let generation = {
-            let mut collectors = self.collectors.lock();
-            let generation = collectors.get(&shard).copied().unwrap_or(0).wrapping_add(1);
-            collectors.insert(shard, generation);
-            generation
+            let collectors = self.collectors.lock();
+            collectors.get(&shard).copied().unwrap_or(0).wrapping_add(1)
         };
-        self.contexts
-            .lock()
-            .insert(shard, (generation, context.clone()));
         let weak = Arc::downgrade(app);
         context
             .shard
@@ -250,12 +245,21 @@ impl SnapshotIngress {
                 }
                 true
             })));
+        let mut collectors = self.collectors.lock();
+        collectors.insert(shard, generation);
+        self.contexts
+            .lock()
+            .insert(shard, (generation, context.clone()));
     }
 
     pub fn collector_active(&self, context: &Context) -> bool {
-        self.collectors
-            .lock()
-            .contains_key(&(context.shard_id.get() as u64))
+        let shard = context.shard_id.get() as u64;
+        let collectors = self.collectors.lock();
+        let contexts = self.contexts.lock();
+        matches!(
+            (collectors.get(&shard), contexts.get(&shard)),
+            (Some(generation), Some((current, _))) if generation == current
+        )
     }
 
     pub fn unhooked_delete(&self, guild: GuildId, channel: ChannelId, ids: &[MessageId]) {

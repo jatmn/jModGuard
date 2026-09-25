@@ -95,13 +95,13 @@ fn warn_empty_content_once() {
 #[async_trait]
 impl EventHandler for Handler {
     async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
-        self.app.snapshots.gap();
         self.app.snapshots.install_collector(&self.app, &_ctx);
+        self.app.snapshots.gap();
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        self.app.snapshots.gap();
         self.app.snapshots.install_collector(&self.app, &ctx);
+        self.app.snapshots.gap();
         tracing::info!(
             "logged in as {} ({} guilds, shard {})",
             ready.user.name,
