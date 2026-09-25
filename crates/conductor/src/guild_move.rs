@@ -931,11 +931,7 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
     }
 }
 
-async fn member_feature_counts_match(
-    source: &Path,
-    expected: i64,
-    got: i64,
-) -> Result<()> {
+async fn member_feature_counts_match(source: &Path, expected: i64, got: i64) -> Result<()> {
     if expected == got {
         return Ok(());
     }
