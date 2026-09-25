@@ -1,6 +1,6 @@
 #!/bin/sh
 # Prove host ESLint accepts the existing browser scripts and rejects an
-# undefined name. Install first:
+# undefined name with the no-undef rule. Install first:
 #   npm ci --ignore-scripts --prefix tools/eslint
 
 set -eu
@@ -27,10 +27,14 @@ cd "$REPO_ROOT"
 "$ESLINT" -c "$CONFIG" frontend crates/conductor/frontend
 echo "PASS: browser JavaScript matches the ESLint rules"
 
-if printf '%s\n' 'const broken = notDeclared;' \
-    | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename frontend/eslint-selftest-probe.js
-then
-    echo "FAIL: ESLint accepted an undefined name" >&2
+# Exit 1 is a reported rule error. Exit 0 means the name was allowed.
+# Any other status is an ESLint failure, not proof that the rule ran.
+probe_status=0
+probe_out="$(printf '%s\n' 'void notDeclared;' \
+    | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename frontend/eslint-selftest-probe.js 2>&1)" || probe_status=$?
+if [ "$probe_status" -ne 1 ] || ! printf '%s\n' "$probe_out" | grep -q 'no-undef'; then
+    echo "FAIL: ESLint did not reject an undefined name (exit ${probe_status})" >&2
+    printf '%s\n' "$probe_out" >&2
     exit 1
 fi
 echo "PASS: ESLint rejects an undefined name"
