@@ -208,8 +208,9 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands
 
-The Buildkite `test` job and local Linux preflight are the same script. Do not
-add GitHub Actions CI workflows. The owner-command Pullfrog workflow is the
+Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
+Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
+Do not add GitHub Actions CI workflows. The owner-command Pullfrog workflow is the
 sole exception; see `docs/PULLFROG.md`.
 
 ```bash

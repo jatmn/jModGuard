@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single source of truth for the Buildkite `test` job.
+# Single source of truth for Buildkite check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
 # GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
 # The owner-command Pullfrog workflow is the sole GitHub Actions exception.
@@ -11,9 +11,13 @@ cd "$root"
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/ci-preflight.sh [--base <git-revision>]
+Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
 
-Run the Buildkite `test` job gates locally or on a Buildkite linux agent.
+Run the Buildkite test gates locally or on a Buildkite linux agent.
+With no --only, run the full suite (local hooks and a complete check).
+Buildkite uploads one step per selected group. Known groups: contracts,
+frontend, fmt, api, bot, conductor, runtime, updater, core, integration,
+boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
 By default the whitespace diff base is origin/main. Pass --base origin/<branch>
 for a PR whose base is not main. Scheduled Buildkite builds set
 JMODGUARD_AUDIT_FAIL_CLOSED=1 so cargo-audit fails the job.
@@ -21,11 +25,22 @@ EOF
 }
 
 base_ref="${JMODGUARD_PREFLIGHT_BASE:-origin/main}"
+only_names=""
+known_only="contracts frontend fmt api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       base_ref="$2"
+      shift 2
+      ;;
+    --only)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      case " ${known_only} " in
+        *" $2 "*) ;;
+        *) echo "ci-preflight: unknown --only group: $2" >&2; exit 2 ;;
+      esac
+      only_names="${only_names} $2"
       shift 2
       ;;
     -h|--help)
@@ -39,7 +54,17 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -d "$root/.github/workflows" ]; then
+should_run() {
+  if [ -z "${only_names}" ]; then
+    return 0
+  fi
+  case " ${only_names} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if should_run contracts && [ -d "$root/.github/workflows" ]; then
   while IFS= read -r -d '' workflow; do
     if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
       echo 'ci-preflight: only the owner-command Pullfrog workflow is allowed; CI runs on Buildkite' >&2
@@ -48,11 +73,18 @@ if [ -d "$root/.github/workflows" ]; then
   done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
 fi
 
-if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.yml"; then
-  echo 'ci-preflight: .buildkite/pipeline.yml must invoke bash scripts/ci-preflight.sh' >&2
-  exit 1
+if should_run contracts; then
+  if ! grep -Fq 'bash .buildkite/select-checks.sh upload' "$root/.buildkite/pipeline.yml"; then
+    echo 'ci-preflight: .buildkite/pipeline.yml must invoke bash .buildkite/select-checks.sh upload' >&2
+    exit 1
+  fi
+  if ! grep -Fq 'bash scripts/ci-preflight.sh' "$root/.buildkite/pipeline.steps.yml"; then
+    echo 'ci-preflight: .buildkite/pipeline.steps.yml must invoke bash scripts/ci-preflight.sh' >&2
+    exit 1
+  fi
 fi
 
+if should_run contracts; then
 for hook in pre-commit pre-push; do
   hook_path="$root/.githooks/$hook"
   if [ ! -f "$hook_path" ]; then
@@ -67,6 +99,7 @@ for hook in pre-commit pre-push; do
     exit 1
   fi
 done
+fi
 
 require_command() {
   local command="$1"
@@ -88,9 +121,13 @@ ensure_cargo_tool() {
   cargo install "$crate" --locked --version "$version"
 }
 
-require_command rustfmt 'rustup component add rustfmt'
-ensure_cargo_tool cargo-deny cargo-deny 0.20.2
-ensure_cargo_tool cargo-audit cargo-audit 0.22.2
+if should_run fmt; then
+  require_command rustfmt 'rustup component add rustfmt'
+fi
+if should_run supply-chain; then
+  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
+  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
+fi
 
 # cargo-audit 0.22.2 uses exit 1 for both advisory reports and some operational
 # failures (for example advisory DB fetch/load). Classify from JSON stdout and
@@ -159,7 +196,7 @@ JS
     return 1
   fi
 
-  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the test job" >&2
+  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the supply-chain check" >&2
   rm -f "$audit_out" "$audit_err"
   return 0
 }
@@ -194,81 +231,175 @@ whitespace_check() {
   git diff --check
 }
 
-echo 'ci-preflight: cargo update --workspace --locked'
-cargo update --workspace --locked
+run_cargo() {
+  if should_run fmt || should_run api || should_run bot || should_run conductor || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
+    return 0
+  fi
+  return 1
+}
 
-echo 'ci-preflight: cargo fmt --check'
-cargo fmt --check
+if run_cargo; then
+  echo 'ci-preflight: cargo update --workspace --locked'
+  cargo update --workspace --locked
+fi
 
-whitespace_check
+if should_run fmt; then
+  echo 'ci-preflight: cargo fmt --check'
+  cargo fmt --check
+fi
 
-echo 'ci-preflight: bash .buildkite/publish-image-test.sh'
-bash .buildkite/publish-image-test.sh
+if should_run contracts; then
+  whitespace_check
+  echo 'ci-preflight: bash .buildkite/select-checks-test.sh'
+  bash .buildkite/select-checks-test.sh
+fi
 
-echo 'ci-preflight: bash scripts/bootstrap-container-test.sh'
-bash scripts/bootstrap-container-test.sh
+if should_run publish-tests; then
+  echo 'ci-preflight: bash .buildkite/publish-image-test.sh'
+  bash .buildkite/publish-image-test.sh
+fi
 
-echo 'ci-preflight: cargo test --locked --workspace'
-cargo test --locked --workspace
+if should_run bootstrap; then
+  echo 'ci-preflight: bash scripts/bootstrap-container-test.sh'
+  bash scripts/bootstrap-container-test.sh
+fi
 
-echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-cargo test --locked -p jmodguard-api --no-default-features --lib
+if [ -z "${only_names}" ]; then
+  echo 'ci-preflight: cargo test --locked --workspace'
+  cargo test --locked --workspace
 
-echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
-cargo clippy --locked --workspace --all-targets -- -D warnings
+  echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+  cargo test --locked -p jmodguard-api --no-default-features --lib
 
-echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
-cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+  echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
+  cargo clippy --locked --workspace --all-targets -- -D warnings
 
-echo 'ci-preflight: cargo build --locked -p jmodguard-conductor'
-cargo build --locked -p jmodguard-conductor
+  echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
+  cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
 
-echo 'ci-preflight: bash scripts/check-service-boundaries.sh'
-bash scripts/check-service-boundaries.sh
+  echo 'ci-preflight: cargo build --locked -p jmodguard-conductor'
+  cargo build --locked -p jmodguard-conductor
+else
+  if should_run api; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api'
+    cargo test --locked -p jmodguard-api
+    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+    cargo test --locked -p jmodguard-api --no-default-features --lib
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+    echo 'ci-preflight: cargo build --locked -p jmodguard-api'
+    cargo build --locked -p jmodguard-api
+    echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
+    cargo build --locked -p jmodguard-api --no-default-features
+  fi
+  if should_run bot; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-bot'
+    cargo test --locked -p jmodguard-bot
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings
+    echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
+    cargo build --locked -p jmodguard-bot
+  fi
+  if should_run conductor; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-conductor'
+    cargo test --locked -p jmodguard-conductor
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-conductor --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-conductor --all-targets -- -D warnings
+    echo 'ci-preflight: cargo build --locked -p jmodguard-conductor'
+    cargo build --locked -p jmodguard-conductor
+  fi
+  if should_run runtime; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-runtime'
+    cargo test --locked -p jmodguard-runtime
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-runtime --all-targets -- -D warnings
+  fi
+  if should_run updater; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-updater'
+    cargo test --locked -p jmodguard-updater
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-updater --all-targets -- -D warnings
+  fi
+  if should_run core; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard'
+    cargo test --locked -p jmodguard
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard --all-targets -- -D warnings
+  fi
+  if should_run integration; then
+    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
+    cargo test --locked -p jmodguard-integration-tests
+    echo 'ci-preflight: cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings'
+    cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings
+    echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
+    cargo build --locked -p jmodguard-bot
+    echo 'ci-preflight: cargo build --locked -p jmodguard-api'
+    cargo build --locked -p jmodguard-api
+    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
+    cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+  fi
+fi
 
-echo 'ci-preflight: bash scripts/public-install-acceptance-test.sh'
-bash scripts/public-install-acceptance-test.sh
+if should_run boundaries; then
+  echo 'ci-preflight: bash scripts/check-service-boundaries.sh'
+  bash scripts/check-service-boundaries.sh
+fi
 
-echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
-bash scripts/dependabot-config-test.sh
+if should_run contracts; then
+  echo 'ci-preflight: bash scripts/public-install-acceptance-test.sh'
+  bash scripts/public-install-acceptance-test.sh
 
-echo 'ci-preflight: node --test scripts/pullfrog-command-check.test.mjs'
-node --test scripts/pullfrog-command-check.test.mjs
+  echo 'ci-preflight: bash scripts/dependabot-config-test.sh'
+  bash scripts/dependabot-config-test.sh
+fi
 
-echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
-node --test scripts/frontend-state-test.mjs
+if should_run pullfrog; then
+  echo 'ci-preflight: node --test scripts/pullfrog-command-check.test.mjs'
+  node --test scripts/pullfrog-command-check.test.mjs
+fi
 
-echo 'ci-preflight: node --test scripts/frontend-contrast-test.mjs'
-node --test scripts/frontend-contrast-test.mjs
+if should_run frontend; then
+  echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
+  node --test scripts/frontend-state-test.mjs
 
-echo 'ci-preflight: node --test scripts/frontend-warmup-test.mjs'
-node --test scripts/frontend-warmup-test.mjs
+  echo 'ci-preflight: node --test scripts/frontend-contrast-test.mjs'
+  node --test scripts/frontend-contrast-test.mjs
 
-echo 'ci-preflight: node --test scripts/publish-frontend-test.mjs'
-node --test scripts/publish-frontend-test.mjs
+  echo 'ci-preflight: node --test scripts/frontend-warmup-test.mjs'
+  node --test scripts/frontend-warmup-test.mjs
 
-echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
-node --test scripts/package-webui-test.mjs
+  echo 'ci-preflight: node --test scripts/publish-frontend-test.mjs'
+  node --test scripts/publish-frontend-test.mjs
 
-echo 'ci-preflight: node --test scripts/administration-state-test.mjs'
-node --test scripts/administration-state-test.mjs
+  echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
+  node --test scripts/package-webui-test.mjs
 
-echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
-cargo build --locked -p jmodguard-bot
+  echo 'ci-preflight: node --test scripts/administration-state-test.mjs'
+  node --test scripts/administration-state-test.mjs
+fi
 
-echo 'ci-preflight: cargo build --locked -p jmodguard-api'
-cargo build --locked -p jmodguard-api
+if [ -z "${only_names}" ]; then
+  echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
+  cargo build --locked -p jmodguard-bot
 
-echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
-cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
+  echo 'ci-preflight: cargo build --locked -p jmodguard-api'
+  cargo build --locked -p jmodguard-api
 
-echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
-cargo build --locked -p jmodguard-api --no-default-features
+  echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture'
+  cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --include-ignored --nocapture
 
-echo 'ci-preflight: cargo deny check bans licenses sources'
-cargo deny check bans licenses sources
+  echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
+  cargo build --locked -p jmodguard-api --no-default-features
+fi
 
-echo 'ci-preflight: cargo audit'
-run_cargo_audit_gate
+if should_run supply-chain; then
+  echo 'ci-preflight: cargo deny check bans licenses sources'
+  cargo deny check bans licenses sources
+
+  echo 'ci-preflight: cargo audit'
+  run_cargo_audit_gate
+fi
 
 echo 'ci-preflight: Buildkite test gates passed'
