@@ -361,6 +361,9 @@ if should_run pullfrog; then
 fi
 
 if should_run frontend; then
+  echo 'ci-preflight: bash scripts/require-host-eslint-node.sh'
+  bash scripts/require-host-eslint-node.sh
+
   echo 'ci-preflight: npm ci --ignore-scripts --prefix tools/eslint'
   npm ci --ignore-scripts --prefix tools/eslint
 

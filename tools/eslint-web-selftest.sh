@@ -10,8 +10,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ESLINT="$REPO_ROOT/tools/eslint/node_modules/.bin/eslint"
 CONFIG="$REPO_ROOT/tools/eslint/eslint.config.js"
 
-if ! command -v node >/dev/null 2>&1; then
-    echo "FAIL: node is required for the ESLint web self-test" >&2
+if ! bash "$REPO_ROOT/scripts/require-host-eslint-node.sh"; then
+    echo "FAIL: host ESLint requires a supported Node.js and npm (see require-host-eslint-node.sh)" >&2
     exit 1
 fi
 if [ ! -x "$ESLINT" ]; then

@@ -228,7 +228,9 @@ API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
 service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
 (`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
-(`bash tools/eslint-web-selftest.sh` after `npm ci --ignore-scripts --prefix tools/eslint`),
+(`bash scripts/require-host-eslint-node.sh`, then `npm ci --ignore-scripts --prefix tools/eslint`,
+then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=24` per
+`tools/eslint/package.json` `engines`),
 frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
