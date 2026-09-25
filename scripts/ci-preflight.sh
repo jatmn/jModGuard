@@ -88,7 +88,11 @@ if should_run contracts && [ -d "$root/.github/workflows" ]; then
     'socketsecurity==2.10.2' \
     'socketcli' \
     '--scm github' \
-    'actions/checkout@v6'
+    'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
+    '--exit-code-on-api-error 0' \
+    'persist-credentials: false' \
+    'fetch-depth: 0' \
+    'EVENT_ACTION:'
   do
     if ! grep -Fq -- "$needle" "$socket_workflow"; then
       echo "ci-preflight: socket workflow missing: $needle" >&2

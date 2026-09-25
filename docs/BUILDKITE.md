@@ -5,7 +5,9 @@ Buildkite `linux` queue. GitHub Actions workflow files are the owner-command
 Pullfrog agent (`docs/PULLFROG.md`) and the Socket Security manifest scan
 (`.github/workflows/socket.yml`). Neither is CI or an image publisher. Set the
 repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
-relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git. There
+relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
+A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate. There
 are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the

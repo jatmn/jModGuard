@@ -76,22 +76,30 @@ for needle in \
   "socketsecurity==2.10.2" \
   "socketcli" \
   "--scm github" \
-  "actions/checkout@v6"
+  "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803" \
+  "--exit-code-on-api-error 0" \
+  "persist-credentials: false" \
+  "fetch-depth: 0" \
+  "EVENT_ACTION:"
 do
   require_contains "$socket_workflow" "$needle"
 done
 require_absent "$socket_workflow" "issue_comment:"
 require_absent "$socket_workflow" "repo-is-public"
-require_absent "$socket_workflow" "persist-credentials:"
 require_contains "$socket_workflow" "head.repo.full_name == github.repository"
 require_contains "$socket_workflow" "skipping the Socket scan"
 require_absent "$socket_workflow" "exit 1"
 require_contains "$socket_workflow" 'group: socket-scan-${{ github.ref }}'
 require_contains "$socket_workflow" "cancel-in-progress: true"
+# The group is the branch or pull-request ref. Including github.sha gives every
+# commit its own group, so cancel-in-progress cannot stop the scan it replaces.
 require_absent "$socket_workflow" "github.sha"
 for doc in AGENTS.md development.md docs/BUILDKITE.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
   require_contains "$doc" "SOCKET_SECURITY_API_KEY"
   require_contains "$doc" "not stored in git."
+  require_contains "$doc" "uploads Cargo.toml and Cargo.lock to Socket"
+  require_contains "$doc" "A new blocking alert fails this check."
+  require_contains "$doc" "An API or infrastructure error does not fail this check."
 done
 
 for needle in \

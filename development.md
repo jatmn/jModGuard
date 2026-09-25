@@ -74,6 +74,8 @@ The Socket Security manifest scan is `.github/workflows/socket.yml` on GitHub
 Actions. It is not CI. Set the repository Actions secret
 `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on the scan.
 A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
+A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
 Do not register leftover Proxmox GHA runners or label any runner
 `dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
 and the operator-copy contract.

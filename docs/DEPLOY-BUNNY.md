@@ -173,6 +173,8 @@ and manual publication builds still run every check. This repository has no GitH
 image jobs or runner fallback. The Socket Security manifest scan is not a CI or image job. Set the repository
 Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on
 the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
+A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
 Dependabot version updates use GitHub-hosted
 dynamic workflows only while **Dependabot on self-hosted runners** stays
 disabled; they are not image publication. GitHub still displays the Buildkite status and a link to

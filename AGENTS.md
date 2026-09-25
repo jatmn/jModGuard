@@ -213,6 +213,8 @@ manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
 Actions; it is not CI, image publication, or a Buildkite job. Set the
 repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
 relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
+A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
 
 ```bash
 bash scripts/ci-preflight.sh
