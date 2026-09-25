@@ -136,19 +136,22 @@ fn service_bin(name: &str) -> std::path::PathBuf {
     let mut path = std::env::current_exe().expect("test executable");
     path.pop();
     path.pop();
-    path.push(name);
+    path.push(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
     path
 }
 
 fn wait_status(
     path: &std::path::Path,
+    expected: &str,
     child: &mut std::process::Child,
     log: &std::path::Path,
     deadline: std::time::Instant,
 ) -> String {
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
-            return text;
+            if text == expected {
+                return text;
+            }
         }
         if let Some(status) = child.try_wait().unwrap() {
             let logged = std::fs::read_to_string(log).unwrap_or_default();
@@ -233,18 +236,19 @@ async fn smoke_bot_and_api_executables_share_sqlite() {
         root: root.clone(),
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    assert_eq!(
-        wait_status(
-            &root.join("bot-migrate"),
-            &mut bot.child,
-            &bot_log,
-            deadline
-        ),
-        "true"
+    wait_status(
+        &root.join("bot-migrate"),
+        "true",
+        &mut bot.child,
+        &bot_log,
+        deadline,
     );
-    assert_eq!(
-        wait_status(&root.join("bot-ready"), &mut bot.child, &bot_log, deadline),
-        "!"
+    wait_status(
+        &root.join("bot-ready"),
+        "!",
+        &mut bot.child,
+        &bot_log,
+        deadline,
     );
     let api_log = root.join("api.log");
     let api = spawn(
@@ -254,32 +258,26 @@ async fn smoke_bot_and_api_executables_share_sqlite() {
         &[("JMODGUARD_PROBE_PREFIX", "!from-api")],
     );
     let mut api = Running { child: api, root };
-    assert_eq!(
-        wait_status(
-            &api.root.join("api-migrate"),
-            &mut api.child,
-            &api_log,
-            deadline
-        ),
-        "false"
+    wait_status(
+        &api.root.join("api-migrate"),
+        "false",
+        &mut api.child,
+        &api_log,
+        deadline,
     );
-    assert_eq!(
-        wait_status(
-            &api.root.join("api-wrote"),
-            &mut api.child,
-            &api_log,
-            deadline
-        ),
-        "!from-api"
+    wait_status(
+        &api.root.join("api-wrote"),
+        "!from-api",
+        &mut api.child,
+        &api_log,
+        deadline,
     );
-    assert_eq!(
-        wait_status(
-            &api.root.join("bot-refreshed"),
-            &mut bot.child,
-            &bot_log,
-            deadline
-        ),
-        "!from-api"
+    wait_status(
+        &api.root.join("bot-refreshed"),
+        "!from-api",
+        &mut bot.child,
+        &bot_log,
+        deadline,
     );
     let bot_status = bot.child.wait().unwrap();
     let api_status = api.child.wait().unwrap();

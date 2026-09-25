@@ -8,8 +8,16 @@ use crate::config::BotProcessConfig;
 use crate::db::{self, Db};
 use crate::state::BotState;
 use anyhow::{Context as _, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+fn write_probe_marker(dir: &Path, name: &str, contents: &str) -> Result<()> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.part"));
+    std::fs::write(&tmp, contents).with_context(|| format!("write probe marker {name}"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("publish probe marker {name}"))?;
+    Ok(())
+}
 
 pub async fn open_database(cfg: &BotProcessConfig) -> Result<Db> {
     let opts = cfg.db_open_options();
@@ -27,14 +35,11 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     let expect = std::env::var("JMODGUARD_PROBE_EXPECT").context("JMODGUARD_PROBE_EXPECT")?;
     let dir = PathBuf::from(std::env::var("JMODGUARD_PROBE_DIR").context("JMODGUARD_PROBE_DIR")?);
     let migrate = cfg.db_open_options().migrate;
-    std::fs::write(
-        dir.join("bot-migrate"),
-        if migrate { "true" } else { "false" },
-    )?;
+    write_probe_marker(&dir, "bot-migrate", if migrate { "true" } else { "false" })?;
     let db = open_database(&cfg).await?;
     let app = BotState::new(cfg, db)?;
     let before = app.configs.get(&app.db, guild_id).await?;
-    std::fs::write(dir.join("bot-ready"), &before.settings.prefix)?;
+    write_probe_marker(&dir, "bot-ready", &before.settings.prefix)?;
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         // Accept only a poll-driven invalidation. `configs.get` also reloads
@@ -42,7 +47,7 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
         if app.poll_config_version().await? {
             let current = app.configs.get(&app.db, guild_id).await?;
             if current.settings.prefix == expect {
-                std::fs::write(dir.join("bot-refreshed"), &current.settings.prefix)?;
+                write_probe_marker(&dir, "bot-refreshed", &current.settings.prefix)?;
                 return Ok(());
             }
         }
