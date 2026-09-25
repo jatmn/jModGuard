@@ -43,6 +43,8 @@ expect "contracts fmt bot boundaries integration" crates/bot/src/main.rs
 expect "contracts fmt conductor boundaries" crates/conductor/src/install.rs
 expect "contracts fmt conductor boundaries frontend" crates/conductor/frontend/app.js
 expect "contracts fmt bot bootstrap publish-tests" Dockerfile.bot
+expect "contracts fmt runtime boundaries core conductor integration" crates/runtime/src/lib.rs
+expect "contracts fmt updater api boundaries" crates/updater/src/lib.rs
 expect "$rust" src/db/mod.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml

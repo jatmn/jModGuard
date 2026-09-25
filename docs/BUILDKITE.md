@@ -66,7 +66,10 @@ diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
 bootstrap, or remote-database jobs. A `frontend/` or `crates/conductor/frontend/` WebUI diff runs the frontend Node checks. `Dockerfile.webui`
 also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
-build, service-boundary, and dual-process checks. Shared `src/` and migrations run the Rust packages and the remote-database job.
+build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
+conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
+are compiled and tested. A `crates/updater` diff also runs the API and boundary groups
+because the API is the sole consumer of `jmodguard-updater`. Shared `src/` and migrations run the Rust packages and the remote-database job.
 The root lockfile and toolchain do too, and they also run the publisher and
 bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and

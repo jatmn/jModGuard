@@ -67,6 +67,20 @@ all_rust() {
   done
 }
 
+# jmodguard-runtime is a direct dependency of jmodguard (core) and jmodguard-conductor;
+# bot/API consume it through the root crate. Exercise those groups on runtime edits.
+runtime_consumers() {
+  add core
+  add conductor
+  add integration
+}
+
+# jmodguard-updater is a direct dependency of jmodguard-api only.
+updater_consumers() {
+  add api
+  add boundaries
+}
+
 classify() {
   local path="$1"
   local top="${path%%/*}"
@@ -101,10 +115,12 @@ classify() {
       ;;
     crates/runtime/Cargo.toml)
       add fmt; add runtime; add boundaries; add supply-chain
+      runtime_consumers
       return
       ;;
     crates/updater/Cargo.toml)
       add fmt; add updater; add supply-chain
+      updater_consumers
       return
       ;;
     crates/integration-tests/Cargo.toml)
@@ -179,8 +195,8 @@ classify() {
         api) add fmt; add api; add boundaries; add integration ;;
         bot) add fmt; add bot; add boundaries; add integration ;;
         conductor) add fmt; add conductor; add boundaries ;;
-        runtime) add fmt; add runtime; add boundaries ;;
-        updater) add fmt; add updater ;;
+        runtime) add fmt; add runtime; add boundaries; runtime_consumers ;;
+        updater) add fmt; add updater; updater_consumers ;;
         integration-tests) add fmt; add integration ;;
         *) all_groups ;;
       esac
