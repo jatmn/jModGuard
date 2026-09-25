@@ -886,6 +886,41 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Gateway bot user id already persisted for this enrollment's directory work.
+    pub async fn persisted_member_sync_bot_id(
+        &self,
+        scope: GuildDataScope,
+    ) -> Result<Option<i64>> {
+        checked_scope(self, &scope)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let from_seed: Option<i64> = tx
+                    .query_row(
+                        "SELECT bot_id FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?;
+                if from_seed.is_some() {
+                    tx.finish_read()?;
+                    return Ok(from_seed);
+                }
+                let from_sync: Option<i64> = tx
+                    .query_row(
+                        "SELECT bot_id FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(from_sync)
+            })
+            .await
+    }
+
     pub async fn member_sync_status(
         &self,
         scope: GuildDataScope,

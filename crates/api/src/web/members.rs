@@ -4,7 +4,7 @@ use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
-use crate::db::guild_data::{MemberQuery, MemberSort, MemberStatusFilter};
+use crate::db::guild_data::{GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -50,13 +50,16 @@ async fn scoped(
     Ok((auth, enrollment))
 }
 
-fn bot_id(app: &ApiState) -> ApiResult<i64> {
-    app.oauth
-        .client_id
-        .parse::<i64>()
-        .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| ApiError(anyhow::anyhow!("configured bot identity is unavailable")))
+async fn member_sync_bot_id(
+    store: &db::guild_data::GuildDataStore,
+    scope: GuildDataScope,
+) -> ApiResult<i64> {
+    if let Some(bot_id) = store.persisted_member_sync_bot_id(scope).await? {
+        return Ok(bot_id);
+    }
+    // Pre-seed status does not compare against OAuth client id; any positive id is ignored until
+    // the bot writes guild_member_seed.
+    Ok(1)
 }
 
 fn parse_user_id(raw: &str) -> ApiResult<i64> {
@@ -174,8 +177,9 @@ pub async fn sync_status(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
+    let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store
-        .member_sync_status(scope, bot_id(&app)?, Utc::now().timestamp_millis())
+        .member_sync_status(scope, bot_id, Utc::now().timestamp_millis())
         .await?;
     Ok(Json(serde_json::to_value(status)?))
 }
@@ -189,8 +193,9 @@ pub async fn sync_action(
 ) -> ApiResult<Response> {
     let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
+    let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store
-        .member_sync_status(scope, bot_id(&app)?, Utc::now().timestamp_millis())
+        .member_sync_status(scope, bot_id, Utc::now().timestamp_millis())
         .await?;
     if status.run_id.is_none() {
         return Ok((

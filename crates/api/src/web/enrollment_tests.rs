@@ -40,6 +40,9 @@ fn managed_guild(id: u64) -> oauth::DiscordGuild {
 }
 impl Fixture {
     async fn new(operator: bool) -> Self {
+        Self::with_oauth_client_id(operator, "42").await
+    }
+    async fn with_oauth_client_id(operator: bool, oauth_client_id: &str) -> Self {
         let discord = Arc::new(DiscordStub {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
             failed: AtomicBool::new(false),
@@ -160,7 +163,7 @@ impl Fixture {
         let db = db::Db::open(&path, 2).unwrap();
         let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.bot.owner_id = if operator { 42 } else { 99 };
-        cfg.web.oauth_client_id = "42".into();
+        cfg.web.oauth_client_id = oauth_client_id.into();
         let mut app = ApiState::new(cfg, db).unwrap();
         Arc::get_mut(&mut app).unwrap().oauth.guilds_endpoint =
             Some(format!("http://{address}/guilds"));
@@ -1097,6 +1100,29 @@ async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fa
         .unwrap();
     assert!(still_missing.run_id.is_none());
     assert_eq!(still_missing.status, "needs_attention");
+}
+
+#[tokio::test]
+async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
+    let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let (status, body) = f
+        .request("GET", "/api/guilds/10/member-sync", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["run_id"].as_str().is_some(), "{body}");
 }
 
 #[tokio::test]

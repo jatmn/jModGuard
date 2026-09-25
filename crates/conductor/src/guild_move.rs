@@ -482,12 +482,13 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
             .await?;
         let row = membership.next().await?.context("source has no membership")?;
         ensure!(row.get::<i64>(2)? == 1, "source membership is not active");
+        let enrollment_id: String = row.get(0)?;
         dest_conn
             .execute(
                 "INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?,?,?,1,?)",
                 libsql::params![
                     guild,
-                    row.get::<String>(0)?,
+                    enrollment_id.as_str(),
                     row.get::<i64>(1)?,
                     row.get::<String>(3)?
                 ],
@@ -526,6 +527,7 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
         for table in ["guild_member_feature", "guild_member_seed", "guild_member_sync", "guild_member_directory", "guild_member_pending_bans", "guild_member_stays", "guild_member_state_observations", "guild_member_target_checks", "guild_member_audit_recovery", "guild_member_unresolved_audits"] {
             copy_member_table(&src, &dest_conn, table, guild).await?;
         }
+        ensure_member_feature_admission(&dest_conn, guild, &enrollment_id).await?;
         copy_cases(&src, &dest_conn, guild).await?;
         restore_source_member_rows(&src, &dest_conn, guild).await?;
         copy_member_table(&src, &dest_conn, "guild_member_case_index", guild).await?;
@@ -622,6 +624,22 @@ async fn copy_member_table(
         )
         .await?;
     }
+    Ok(())
+}
+
+async fn ensure_member_feature_admission(
+    dest: &libsql::Connection,
+    guild: i64,
+    enrollment_id: &str,
+) -> Result<()> {
+    if !table_exists(dest, "guild_member_feature").await? {
+        return Ok(());
+    }
+    dest.execute(
+        "INSERT OR IGNORE INTO guild_member_feature(guild_id,enrollment_id,seed_admitted) VALUES(?,?,0)",
+        libsql::params![guild, enrollment_id],
+    )
+    .await?;
     Ok(())
 }
 

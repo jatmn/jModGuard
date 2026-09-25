@@ -2125,6 +2125,10 @@ async fn eligible_first_status_is_queued_but_admitted_missing_metadata_fails_clo
         .unwrap();
     assert_eq!(admitted.status, "queued");
     assert!(admitted.run_id.is_some());
+    assert_eq!(
+        store.persisted_member_sync_bot_id(scope.clone()).await.unwrap(),
+        Some(42)
+    );
     store
         .db
         .with_conn(|conn| {

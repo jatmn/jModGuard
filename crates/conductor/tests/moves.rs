@@ -275,6 +275,61 @@ async fn init_guild(
     conn.execute("PRAGMA user_version = 12", ()).await.unwrap();
 }
 
+async fn init_guild_v8_only(
+    path: &Path,
+    store_id: &str,
+    dedicated: Option<i64>,
+    guilds: &[(i64, &str, &str, &str, &str)],
+) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        include_str!("../../../migrations/guild/0001_identity.sql"),
+        include_str!("../../../migrations/guild/0002_tenant_log_channels.sql"),
+        include_str!("../../../migrations/guild/0003_cases.sql"),
+        include_str!("../../../migrations/guild/0004_case_history.sql"),
+        include_str!("../../../migrations/guild/0005_case_sources.sql"),
+        include_str!("../../../migrations/guild/0006_case_evidence.sql"),
+        include_str!("../../../migrations/guild/0007_bunny_evidence.sql"),
+        include_str!("../../../migrations/guild/0008_erasure.sql"),
+    ] {
+        conn.execute_batch(sql).await.unwrap();
+    }
+    conn.execute(
+        "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,'jmodguard-guild-1',?,?)",
+        libsql::params![store_id, dedicated],
+    )
+    .await
+    .unwrap();
+    for (guild, enrollment, revision, case_id, source) in guilds {
+        conn.execute(
+            "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
+            libsql::params![*guild, *revision],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?,?,1,1,?)",
+            libsql::params![*guild, *enrollment, CFG_REV],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO guild_log_channels(guild_id,enrollment_id,event_type,channel_id) VALUES(?,?,'automod',99)",
+            libsql::params![*guild, *enrollment],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?,?,?,?,?,0)",
+            libsql::params![*guild, *enrollment, *case_id, *source, r#"{"keep":true}"#],
+        )
+        .await
+        .unwrap();
+    }
+    conn.execute("PRAGMA user_version = 8", ()).await.unwrap();
+}
+
 async fn call(
     router: &axum::Router,
     method: &str,
@@ -952,6 +1007,100 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         scalar(
             &dedicated,
             "SELECT COUNT(*) FROM guild_cases WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn move_from_pre_member_source_creates_destination_admission() {
+    let (discord, task) = discord_stub(42).await;
+    let root = unique_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let core = root.join("core.db");
+    let shared = root.join("shared.guild.db");
+    let dedicated = root.join("dedicated.guild.db");
+    write_core(&core).await;
+    init_guild_v8_only(
+        &shared,
+        SHARED,
+        None,
+        &[(10, ENROLL_10, REV_10, CASE_10, SRC_10)],
+    )
+    .await;
+    init_guild(&dedicated, DEDICATED, Some(10), &[], false).await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: Some(root.join("control.db")),
+        public_url: "http://127.0.0.1:8081".into(),
+        owner_id: 42,
+        oauth_client_id: "cid".into(),
+        oauth_client_secret: "csecret".into(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: format!("{discord}/token"),
+        oauth_me_url: format!("{discord}/me"),
+        backup_root: None,
+        backup_key: None,
+        capture_stores: vec![CaptureStore {
+            role: "core".into(),
+            path: core,
+        }],
+        evidence_root: None,
+        restore_target: None,
+        guild_stores: vec![
+            GuildStorePath {
+                id: SHARED.into(),
+                role: "shared".into(),
+                path: shared,
+            },
+            GuildStorePath {
+                id: DEDICATED.into(),
+                role: "dedicated".into(),
+                path: dedicated.clone(),
+            },
+        ],
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
+    };
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let h = Harness {
+        conductor,
+        router,
+        root,
+        _discord: task,
+    };
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_feature WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT seed_admitted FROM guild_member_feature WHERE guild_id=10"
         )
         .await,
         0
