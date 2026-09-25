@@ -46,7 +46,7 @@ builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
 npm updates for the host-only ESLint pin under `tools/eslint` after they are
 merged to `main`. Cargo and npm minor and patch version updates are grouped;
 major updates remain separate. Dependabot permits up to
-five open version-update PRs. Review and run the Buildkite checks before
+five open version-update PRs per ecosystem (Cargo and npm each). Review and run the Buildkite checks before
 merging dependency updates.
 
 The `libsql-sqlite3-parser` Git patch is excluded from automatic updates:
