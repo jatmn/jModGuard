@@ -1065,7 +1065,7 @@ mod tests {
                 "core_family": "jmodguard-core-1",
                 "core_version": 12,
                 "guild_family": "jmodguard-guild-1",
-                "guild_version": 8
+                "guild_version": 9
             },
             "settings_schema": 1,
             "backup_format": "JMODGUARD-BACKUP-1",
@@ -1144,7 +1144,7 @@ mod tests {
                 "core_family": "jmodguard-core-1",
                 "core_version": 12,
                 "guild_family": "jmodguard-guild-1",
-                "guild_version": 8
+                "guild_version": 9
             },
             "settings_schema": 1,
             "backup_format": "JMODGUARD-BACKUP-1",

@@ -347,7 +347,10 @@ fn guild_and_settings_schema_compatibility() {
         update_provider: None,
     };
     let mut body = unsigned("stable", "v0.2.0", 12, &[]);
-    assert_eq!(release::installed(&cfg)["guild_version"], json!(12));
+    assert_eq!(
+        release::installed(&cfg)["guild_version"],
+        json!(release::GUILD_SCHEMA_VERSION)
+    );
     body["schema"]["guild_version"] = json!(10);
     let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
     assert!(!ok);
@@ -361,6 +364,11 @@ fn guild_and_settings_schema_compatibility() {
     assert!(ok);
     assert!(reason.is_none());
     body["schema"]["guild_version"] = json!(1);
+    let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
+    assert!(!ok);
+    assert!(reason.unwrap().contains("guild schema"));
+    body = unsigned("stable", "v0.2.0", 12, &[]);
+    body["schema"]["guild_version"] = json!(8);
     let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
     assert!(!ok);
     assert!(reason.unwrap().contains("guild schema"));

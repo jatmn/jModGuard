@@ -1,6 +1,7 @@
 //! One durable request slot shared by the member importer across guild stores.
 
 use super::*;
+use crate::db::write_budget::BoundedWrites;
 
 #[derive(Debug, Clone)]
 pub struct MemberSyncRequestClaim {
@@ -43,13 +44,14 @@ pub async fn claim_member_sync_request(
         }
         tx.ensure_mutation_receipt()?;
         let next_generation = generation.checked_add(1).context("member sync pacing generation exhausted")?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO member_sync_pacing(bot_id,request_after_ms,lease_owner,lease_until_ms,generation)
              VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(bot_id) DO UPDATE SET
                request_after_ms=MAX(member_sync_pacing.request_after_ms,excluded.request_after_ms),
                lease_owner=excluded.lease_owner,lease_until_ms=excluded.lease_until_ms,generation=excluded.generation",
             params![bot_id, now_ms.saturating_add(min_interval_ms), worker_id.as_str(), now_ms.saturating_add(lease_ms), next_generation],
+            1,
         )?;
         tx.commit()?;
         Ok(Some(MemberSyncRequestClaim { bot_id, worker_id, generation: next_generation }))
@@ -71,10 +73,11 @@ pub async fn extend_member_sync_request_after(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO member_sync_pacing(bot_id,request_after_ms) VALUES(?1,?2)
              ON CONFLICT(bot_id) DO UPDATE SET request_after_ms=MAX(member_sync_pacing.request_after_ms,excluded.request_after_ms)",
             params![bot_id, deadline_ms],
+            1,
         )?;
         tx.commit()
     }).await
@@ -89,7 +92,7 @@ pub async fn finish_member_sync_request(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_read()?;
         tx.ensure_mutation_receipt()?;
-        let changed = tx.execute(
+        let changed = tx.execute_matching(
             "UPDATE member_sync_pacing SET request_after_ms=MAX(request_after_ms,?4),lease_owner=NULL,lease_until_ms=NULL
              WHERE bot_id=?1 AND lease_owner=?2 AND generation=?3",
             params![claim.bot_id, claim.worker_id, claim.generation, request_after_ms],

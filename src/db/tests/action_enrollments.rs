@@ -205,9 +205,10 @@ async fn enrollment_transition_and_queue_cancellation_roll_back_together() {
     let first = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let job = f.enqueue("rollback", unban()).await;
     f.db.with_conn(|conn| {
-        conn.execute_batch(
+        conn.execute_batch_bounded(
             "CREATE TRIGGER reject_enrollment BEFORE UPDATE ON guild_enrollments
         BEGIN SELECT RAISE(ABORT,'test failure'); END",
+            64 * 1024 * 1024,
         )
     })
     .await
@@ -226,9 +227,10 @@ async fn unbound_earlier_queue_rows_are_never_dispatched_or_adopted() {
     enroll_guild(&f.db, 10, 100).await.unwrap();
     let old = f.enqueue("unbound", unban()).await;
     f.db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "UPDATE bot_actions SET enrollment_id=NULL,joined_at_ns=NULL",
             (),
+            64 * 1024 * 1024,
         )?;
         Ok(())
     })
@@ -435,7 +437,10 @@ async fn altered_admission_identity_and_membership_read_errors_leave_no_work() {
         );
     }
     f.db.with_conn(|conn| {
-        conn.execute_batch("ALTER TABLE guild_enrollments RENAME TO fixture_unavailable")
+        conn.execute_batch_bounded(
+            "ALTER TABLE guild_enrollments RENAME TO fixture_unavailable",
+            64 * 1024 * 1024,
+        )
     })
     .await
     .unwrap();
@@ -505,7 +510,7 @@ async fn captured_admission_preserves_deduplication_and_transaction_rollback() {
     .await
     .unwrap();
     assert_eq!(first.id, repeated.id);
-    f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER reject_action AFTER INSERT ON bot_actions BEGIN SELECT RAISE(ABORT,'fixture failure'); END")).await.unwrap();
+    f.db.with_conn(|conn|conn.execute_batch_bounded("CREATE TRIGGER reject_action AFTER INSERT ON bot_actions BEGIN SELECT RAISE(ABORT,'fixture failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(
         enqueue_enrolled_bot_action(
             &f.db,
@@ -580,13 +585,16 @@ fn version_seven_actions_are_not_adopted_by_an_existing_membership() {
     let conn = Connection::open(&path).unwrap();
     for (index, sql) in MIGRATIONS[..7].iter().enumerate() {
         let tx = conn.transaction_primary_read().unwrap();
-        tx.execute_batch(sql).unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
         tx.commit().unwrap();
     }
-    conn.execute_batch("INSERT INTO guild_enrollments VALUES(10,'existing-membership',100,1)")
-        .unwrap();
+    conn.execute_batch_bounded(
+        "INSERT INTO guild_enrollments VALUES(10,'existing-membership',100,1)",
+        64 * 1024 * 1024,
+    )
+    .unwrap();
     for (i, state) in ["pending", "claimed", "running", "uncertain", "succeeded"]
         .into_iter()
         .enumerate()
@@ -595,8 +603,8 @@ fn version_seven_actions_are_not_adopted_by_an_existing_membership() {
             user_id: 100 + i as i64,
             reason: "before upgrade".into(),
         };
-        conn.execute("INSERT INTO bot_actions(id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at,claim,finished_at)
-            VALUES(?1,10,42,?2,?3,?4,?5,1000,1300,1000,'old-claim',1000)",params![state,format!("1000_{state}"),action.resource(),serde_json::to_string(&action).unwrap(),state]).unwrap();
+        conn.execute_bounded("INSERT INTO bot_actions(id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at,claim,finished_at)
+            VALUES(?1,10,42,?2,?3,?4,?5,1000,1300,1000,'old-claim',1000)",params![state,format!("1000_{state}"),action.resource(),serde_json::to_string(&action).unwrap(),state], 64 * 1024 * 1024).unwrap();
     }
     drop(conn);
     let db = Db::open(&path, 2).unwrap();

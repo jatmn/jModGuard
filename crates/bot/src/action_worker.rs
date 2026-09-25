@@ -330,10 +330,8 @@ async fn execute_inner(
                     .await
                 {
                     Ok(status)
-                        if matches!(
-                            operation,
-                            crate::bot_actions::MemberSyncOperation::Retry
-                        ) && status.status == "complete" =>
+                        if matches!(operation, crate::bot_actions::MemberSyncOperation::Retry)
+                            && status.status == "complete" =>
                     {
                         if status.member_sync_retry_requeued_audit() {
                             Outcome::succeeded("member_sync_updated")
@@ -342,10 +340,8 @@ async fn execute_inner(
                         }
                     }
                     Ok(status)
-                        if matches!(
-                            operation,
-                            crate::bot_actions::MemberSyncOperation::Resume
-                        ) && status.status == "complete" =>
+                        if matches!(operation, crate::bot_actions::MemberSyncOperation::Resume)
+                            && status.status == "complete" =>
                     {
                         Outcome::succeeded("member_sync_already_completed")
                     }

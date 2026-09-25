@@ -1,4 +1,7 @@
 use super::*;
+use crate::db::write_budget::MemberSqlWrites;
+
+const SCHEMA_BATCH_LIMIT: u64 = 64 * 1024 * 1024;
 
 async fn ready() -> (Fixture, GuildDataStore, GuildDataScope) {
     let f = Fixture::new();
@@ -39,23 +42,30 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
         BUNNY_SCHEMA,
         ERASURE_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
     let legacy_payload = r#"{"source":{"discord_audit":{"entry_id":"99"}},"action":"ban","outcome":"succeeded","subject_id":"77","actor_id":null,"occurred_at_ms":900,"reason":"legacy","evidence":"unavailable"}"#;
-    raw.execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc','discord:99',?1,0)",params![legacy_payload]).unwrap();
+    raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc','discord:99',?1,0)",params![legacy_payload], SCHEMA_BATCH_LIMIT).unwrap();
     let old_app_unban = r#"{"source":{"application":{"operation_id":"dddddddddddddddddddddddddddddddd"}},"action":"unban","outcome":"succeeded","subject_id":"78","actor_id":null,"occurred_at_ms":901,"reason":null,"evidence":"unavailable"}"#;
-    raw.execute("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd','app:dddddddddddddddddddddddddddddddd',?1,0)",params![old_app_unban]).unwrap();
+    raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd','app:dddddddddddddddddddddddddddddddd',?1,0)",params![old_app_unban], SCHEMA_BATCH_LIMIT).unwrap();
     raw.pragma_update(None, "user_version", 8).unwrap();
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -112,7 +122,7 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
             .len(),
         1
     );
-    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=10 AND case_id='cccccccccccccccccccccccccccccccc'",())?;tx.commit()}).await.unwrap();
+    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_cases SET deleted=1,payload=NULL WHERE guild_id=10 AND case_id='cccccccccccccccccccccccccccccccc'",())?;tx.commit()}).await.unwrap();
     assert!(
         store
             .member_history(scope.clone(), 77, None, 50)
@@ -126,8 +136,8 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
-            tx.execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
             tx.commit()
         })
         .await
@@ -366,8 +376,8 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
-            tx.execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_seed WHERE guild_id=10", ())?;
             tx.commit()
         })
         .await
@@ -465,11 +475,11 @@ async fn pending_ban_fences_cleanup_until_verified_or_failed() {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute(
+            tx.member_execute(
                 "UPDATE guild_member_seed SET initial_completed_at_ms=2000,case_backfill_done=1 WHERE guild_id=10",
                 (),
             )?;
-            tx.execute(
+            tx.member_execute(
                 "UPDATE guild_member_sync SET phase='complete',status='complete' WHERE guild_id=10",
                 (),
             )?;
@@ -598,11 +608,11 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute(
+            tx.member_execute(
                 "UPDATE guild_member_seed SET initial_completed_at_ms=2000 WHERE guild_id=10",
                 (),
             )?;
-            tx.execute(
+            tx.member_execute(
                 "UPDATE guild_member_sync SET phase='complete',status='complete' WHERE guild_id=10",
                 (),
             )?;
@@ -1418,15 +1428,15 @@ async fn retry_requeues_audit_pagination_stall_after_initial_complete() {
     store.db.with_conn(|conn| {
         let mut tx = conn.transaction_primary_read()?;
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.member_execute(
             "UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",
             (),
         )?;
-        tx.execute(
+        tx.member_execute(
             "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=5000,last_success_at_ms=5000 WHERE guild_id=10",
             (),
         )?;
-        tx.execute(
+        tx.member_execute(
             "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
              VALUES(10,(SELECT enrollment_id FROM guild_member_seed WHERE guild_id=10 LIMIT 1),42,'audit-run',5000,'needs_attention','pagination_stalled',0,0)
              ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
@@ -1493,7 +1503,7 @@ async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion()
             .unwrap()
             .is_some()
     );
-    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",())?;tx.execute("UPDATE guild_member_sync SET phase='complete',status='complete',lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=10",())?;tx.commit()}).await.unwrap();
+    store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_read()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",())?;tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=10",())?;tx.commit()}).await.unwrap();
     store
         .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 6_000)
         .await
@@ -2292,7 +2302,7 @@ async fn eligible_first_status_is_queued_but_admitted_missing_metadata_fails_clo
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.commit()
         })
         .await
@@ -3080,26 +3090,34 @@ async fn version_nine_upgrade_preserves_completion_and_unknown_time_history() {
         EVIDENCE_SCHEMA,
         BUNNY_SCHEMA,
         ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
         MEMBER_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
         UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
         INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,reconciliation_needed,gap_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1,2100);
         INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,inserted,updated,unchanged,started_at_ms,last_success_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1,1,1,1000,2000);
-        INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd',87,'ban_absent',1500);").unwrap();
-    raw.pragma_update(None, "user_version", 9).unwrap();
+        INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd',87,'ban_absent',1500);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -3137,7 +3155,7 @@ async fn version_nine_upgrade_preserves_completion_and_unknown_time_history() {
         .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, VERSION);
 }
 
 #[tokio::test]
@@ -3156,26 +3174,34 @@ async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_u
         EVIDENCE_SCHEMA,
         BUNNY_SCHEMA,
         ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
         MEMBER_SCHEMA,
         MEMBER_STATUS_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
         UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
         INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,case_backfill_done) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1);
-        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,inserted,updated,unchanged,started_at_ms,last_success_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1,1,1,1000,2000);").unwrap();
-    raw.pragma_update(None, "user_version", 10).unwrap();
+        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,inserted,updated,unchanged,started_at_ms,last_success_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1,1,1,1000,2000);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 11).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -3202,7 +3228,7 @@ async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_u
         .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, VERSION);
 }
 
 #[tokio::test]
@@ -3303,7 +3329,7 @@ async fn admitted_missing_sync_job_rejects_controls_without_reseeding() {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
+            tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
             tx.commit()
         })
         .await
@@ -3957,7 +3983,10 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
     reopened
         .db
         .with_conn(|conn| {
-            conn.execute_batch("CREATE TRIGGER refuse_unresolved_delete BEFORE DELETE ON guild_member_unresolved_audits BEGIN SELECT RAISE(ABORT,'test rollback'); END")?;
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER refuse_unresolved_delete BEFORE DELETE ON guild_member_unresolved_audits BEGIN SELECT RAISE(ABORT,'test rollback'); END",
+                SCHEMA_BATCH_LIMIT,
+            )?;
             Ok(())
         })
         .await
@@ -3984,7 +4013,10 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
     reopened
         .db
         .with_conn(|conn| {
-            conn.execute_batch("DROP TRIGGER refuse_unresolved_delete")?;
+            conn.execute_batch_bounded(
+                "DROP TRIGGER refuse_unresolved_delete",
+                SCHEMA_BATCH_LIMIT,
+            )?;
             Ok(())
         })
         .await
@@ -4237,27 +4269,35 @@ async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
         EVIDENCE_SCHEMA,
         BUNNY_SCHEMA,
         ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
         MEMBER_SCHEMA,
         MEMBER_STATUS_SCHEMA,
         MEMBER_PROGRESS_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
         UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
         INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,case_backfill_done) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1);
-        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,cursor,started_at_ms,member_processed,ban_processed,verify_processed,audit_processed) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','reconcile','members','queued','123',2100,7,2,1,3);").unwrap();
-    raw.pragma_update(None, "user_version", 11).unwrap();
+        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,cursor,started_at_ms,member_processed,ban_processed,verify_processed,audit_processed) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','reconcile','members','queued','123',2100,7,2,1,3);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 12).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -4290,7 +4330,7 @@ async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
         .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, VERSION);
     let unresolved_table: i64 = store
         .db
         .with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_member_unresolved_audits'", (), |r| Ok(r.get(0)?)))
@@ -4763,7 +4803,7 @@ async fn linking_an_audit_that_is_already_attached_still_retains_the_unban() {
         .with_conn(|conn| {
             let mut tx = conn.transaction_primary_read()?;
             tx.ensure_mutation_receipt()?;
-            tx.execute(
+            tx.member_execute(
                 "UPDATE guild_member_directory SET ever_banned=0 WHERE guild_id=10 AND user_id=71",
                 (),
             )?;

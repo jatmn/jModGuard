@@ -27,7 +27,7 @@ impl GuildDataStore {
             let job = record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job;
             anyhow::ensure!(job.case_id == case && job.state == EvidenceState::Capturing && !job.cancelled, CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_bunny_evidence(guild_id,enrollment_id,evidence_id,storage_id,binding,sha256,accepted) VALUES(?1,?2,?3,?4,?5,?6,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),job.storage_id.as_str(),binding,sha256])?;
+            tx.execute_rows("INSERT INTO guild_bunny_evidence(guild_id,enrollment_id,evidence_id,storage_id,binding,sha256,accepted) VALUES(?1,?2,?3,?4,?5,?6,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),job.storage_id.as_str(),binding,sha256], 1)?;
             tx.commit()
         }).await
     }
@@ -64,7 +64,7 @@ impl GuildDataStore {
             let accepted:bool=tx.query_row("SELECT accepted FROM guild_bunny_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r|Ok(r.get(0)?))?;
             if accepted {tx.finish_read()?;return Ok(());}
             tx.ensure_mutation_receipt()?;
-            tx.execute("UPDATE guild_bunny_evidence SET accepted=1 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()])?;
+            tx.execute_rows("UPDATE guild_bunny_evidence SET accepted=1 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], 1)?;
             tx.commit()
         }).await
     }

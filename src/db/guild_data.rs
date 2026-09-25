@@ -1,5 +1,6 @@
 //! Separate guild-store identity, tenant data and coordinated live erasure.
 use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistration};
+use super::write_budget::BoundedWrites;
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
@@ -13,13 +14,14 @@ const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sourc
 const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evidence.sql");
 const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
 const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.sql");
-const MEMBER_SCHEMA: &str = include_str!("../../migrations/guild/0009_member_directory.sql");
+const SNAPSHOT_SCHEMA: &str = include_str!("../../migrations/guild/0009_message_snapshots.sql");
+const MEMBER_SCHEMA: &str = include_str!("../../migrations/guild/0010_member_directory.sql");
 const MEMBER_STATUS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0010_member_directory_status.sql");
+    include_str!("../../migrations/guild/0011_member_directory_status.sql");
 const MEMBER_PROGRESS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0011_member_sync_progress.sql");
+    include_str!("../../migrations/guild/0012_member_sync_progress.sql");
 const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0012_member_unresolved_audits.sql");
+    include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -32,6 +34,8 @@ pub use case_history::*;
 mod cases;
 pub use cases::*;
 mod erasure;
+mod snapshots;
+pub use snapshots::*;
 mod member_directory;
 pub use member_directory::*;
 mod tenant_logs;
@@ -169,10 +173,14 @@ fn verify_identity_version(
         anyhow::ensure!(objects == 5, StoreCheckError::Schema);
     }
     if wanted >= 9 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_message_snapshots','guild_snapshot_health')) OR (type='index' AND name='guild_snapshot_expiry') OR (type='trigger' AND name IN ('guild_snapshot_insert','guild_snapshot_update','guild_snapshot_account_insert','guild_snapshot_account_update','guild_snapshot_account_delete','guild_membership_delete'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 9, StoreCheckError::Schema);
+    }
+    if wanted >= 10 {
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('guild_member_feature','guild_member_seed','guild_member_sync','guild_member_directory','guild_member_stays','guild_member_case_index','guild_member_pending_bans','guild_member_state_observations','guild_member_target_checks','guild_member_audit_recovery')", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 10, StoreCheckError::Schema);
     }
-    if wanted >= 12 {
+    if wanted >= 13 {
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_member_unresolved_audits') OR (type='index' AND name='guild_member_unresolved_audits_user') OR (type='trigger' AND name IN ('guild_member_unresolved_audit_insert','guild_member_unresolved_audit_update','guild_member_unresolved_audit_delete'))", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 5, StoreCheckError::Schema);
     }
@@ -205,37 +213,43 @@ fn initialize_store(
         verify_identity_version(&tx, expected, version)?;
         tx.ensure_mutation_receipt()?;
         if version < 2 {
-            tx.execute_batch(TENANT_SCHEMA)?;
+            tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
         }
         if version < 3 {
-            tx.execute_batch(CASE_SCHEMA)?;
+            tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
         }
         if version < 4 {
-            tx.execute_batch(HISTORY_SCHEMA)?;
+            tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
         }
         if version < 5 {
-            tx.execute_batch(SOURCE_SCHEMA)?;
+            let source_bound = crate::capacity::allocated_bytes(&tx)?
+                .saturating_mul(2)
+                .saturating_add(32_000_000);
+            tx.execute_batch_bounded(SOURCE_SCHEMA, source_bound)?;
         }
         if version < 6 {
-            tx.execute_batch(EVIDENCE_SCHEMA)?;
+            tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
         }
         if version < 7 {
-            tx.execute_batch(BUNNY_SCHEMA)?;
+            tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
         }
         if version < 8 {
-            tx.execute_batch(ERASURE_SCHEMA)?;
+            tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
         }
         if version < 9 {
-            tx.execute_batch(MEMBER_SCHEMA)?;
+            tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
         }
         if version < 10 {
-            tx.execute_batch(MEMBER_STATUS_SCHEMA)?;
+            tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
         }
         if version < 11 {
-            tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
+            tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
         }
         if version < 12 {
-            tx.execute_batch(MEMBER_UNRESOLVED_AUDITS_SCHEMA)?;
+            tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
+        }
+        if version < 13 {
+            tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
         }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
@@ -245,19 +259,25 @@ fn initialize_store(
         tx.finish_read()?;
         return Ok(());
     }
-    tx.execute_batch(SCHEMA)?;
-    tx.execute_batch(TENANT_SCHEMA)?;
-    tx.execute_batch(CASE_SCHEMA)?;
-    tx.execute_batch(HISTORY_SCHEMA)?;
-    tx.execute_batch(SOURCE_SCHEMA)?;
-    tx.execute_batch(EVIDENCE_SCHEMA)?;
-    tx.execute_batch(BUNNY_SCHEMA)?;
-    tx.execute_batch(ERASURE_SCHEMA)?;
-    tx.execute_batch(MEMBER_SCHEMA)?;
-    tx.execute_batch(MEMBER_STATUS_SCHEMA)?;
-    tx.execute_batch(MEMBER_PROGRESS_SCHEMA)?;
-    tx.execute_batch(MEMBER_UNRESOLVED_AUDITS_SCHEMA)?;
-    tx.execute("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)])?;
+    tx.execute_batch_bounded(SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SOURCE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
+    tx.ensure_mutation_receipt()?;
+    tx.execute_rows(
+        "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
+        params![FAMILY, expected.id().as_str(), owner(expected)],
+        1,
+    )?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete
     // identity/schema marker on primary if initialization's COMMIT response is lost.
@@ -274,6 +294,16 @@ fn initialize_store(
 }
 
 impl GuildDataStore {
+    pub fn capacity_runtime_status(&self) -> crate::db::CapacityRuntimeStatus {
+        self.db.capacity_runtime_status()
+    }
+
+    /// Whole-store usage, measured on the store primary with identity verification.
+    pub async fn measure_usage(&self, details: bool) -> Result<crate::db::usage::DatabaseUsage> {
+        crate::db::usage::measure_database_usage(&self.db, details, Some(self.expected.clone()))
+            .await
+    }
+
     /// Initialize only an empty store, or reopen this exact recognized identity.
     /// Synchronous like Db::open_with; callers must use a startup/blocking worker.
     pub fn initialize(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {
@@ -382,9 +412,10 @@ impl GuildDataStore {
                     return Ok(());
                 }
                 tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.execute_rows(
                     "INSERT INTO guild_bindings(guild_id,revision) VALUES(?1,?2)",
                     params![placement.guild_id(), placement.revision()],
+                    1,
                 )?;
                 tx.commit()
             })

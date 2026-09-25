@@ -206,9 +206,10 @@ pub async fn register_store(
             return Ok(existing);
         }
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO guild_store_catalog(store_id,dedicated_guild_id) VALUES(?1,?2)",
             params![id.as_str(), policy.owner()],
+            1,
         )?;
         tx.commit()?;
         Ok(StoreRegistration { id, policy })
@@ -280,9 +281,10 @@ fn assign_initial_placement_transaction(
     }
     let revision = format!("{:032x}", rand::random::<u128>());
     tx.ensure_mutation_receipt()?;
-    tx.execute(
+    tx.execute_rows(
         "INSERT INTO guild_store_placements(guild_id,store_id,revision) VALUES(?1,?2,?3)",
         params![guild, store_id.as_str(), revision.as_str()],
+        1,
     )?;
     tx.commit()?;
     Ok(GuildPlacement {
@@ -310,8 +312,8 @@ pub async fn clear_erased_placement(
             Some(current)
                 if current.store_id.as_str() == store_id && current.revision == revision =>
             {
-                tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.prepare_reclaim()?;
+                tx.execute_reclaim(
                     "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
                     params![guild, store_id.as_str(), revision.as_str()],
                 )?;
@@ -362,9 +364,9 @@ pub async fn set_guild_write_fence(
             );
             if phase != "freeze" {
                 tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.execute_rows(
                     "UPDATE guild_write_fences SET phase=?1 WHERE guild_id=?2",
-                    params![phase.as_str(), guild],
+                    params![phase.as_str(), guild], 1,
                 )?;
                 tx.commit()?;
             } else {
@@ -374,7 +376,7 @@ pub async fn set_guild_write_fence(
         }
         let generation = format!("{:032x}", rand::random::<u128>());
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at) VALUES(?1,?2,?3,?4,?5,unixepoch())",
             params![
                 guild,
@@ -382,7 +384,7 @@ pub async fn set_guild_write_fence(
                 phase.as_str(),
                 destination.as_str(),
                 destination_revision.as_str()
-            ],
+            ], 1,
         )?;
         tx.commit()?;
         Ok(generation)
@@ -405,8 +407,8 @@ pub async fn clear_guild_write_fence(db: &Db, guild: i64, generation: &str) -> R
             .optional()?;
         match current {
             Some(current) if current == generation => {
-                tx.ensure_mutation_receipt()?;
-                tx.execute(
+                tx.prepare_reclaim()?;
+                tx.execute_reclaim(
                     "DELETE FROM guild_write_fences WHERE guild_id=?1 AND generation=?2",
                     params![guild, generation.as_str()],
                 )?;
@@ -463,7 +465,7 @@ pub async fn rebind_placement(
             CatalogConflict::Placement
         );
         tx.ensure_mutation_receipt()?;
-        tx.execute(
+        tx.execute_rows(
             "UPDATE guild_store_placements SET store_id=?1, revision=?2 WHERE guild_id=?3 AND store_id=?4 AND revision=?5",
             params![
                 destination.as_str(),
@@ -471,11 +473,11 @@ pub async fn rebind_placement(
                 expected.guild_id(),
                 expected.store_id.as_str(),
                 expected.revision.as_str()
-            ],
+            ], 1,
         )?;
-        tx.execute(
+        tx.execute_rows(
             "UPDATE guild_write_fences SET phase='switch' WHERE guild_id=?1",
-            params![expected.guild_id()],
+            params![expected.guild_id()], 1,
         )?;
         tx.commit()?;
         Ok(GuildPlacement {

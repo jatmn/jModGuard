@@ -58,7 +58,7 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0012. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0013. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
@@ -68,21 +68,24 @@ Version5 adds [explicit source associations](CASE-SOURCES.md).
 Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md).
 Version7 adds durable [Bunny transfer attempts](BUNNY-EVIDENCE.md) for the opt-in HTTP adapter.
 Version8 allows closed-scope erasure after owned data is gone and stores delegated
-case-removal role IDs. There are no core configuration/default/enrollment tables or general
-event archives. Core bootstrap never applies this schema; the existing core version is 16.
-Version9 adds the bounded member directory, stays, case projection, sync state and
-immutable initial-seed completion ([MEMBERS.md](MEMBERS.md)).
-Version10 adds member-state observations, durable targeted checks and bounded audit
-recovery. Version11 adds nullable committed counts by import phase and a measured
+case-removal role IDs. Version9 adds bounded, latest-observed message snapshots with
+fixed 24-hour expiry and store-level capture health. Departure erasure deletes
+those rows in transactions of at most 100 and removes membership only after
+they are gone. Version10 adds the bounded member directory, stays, case projection,
+sync state and immutable initial-seed completion ([MEMBERS.md](MEMBERS.md)).
+Version11 adds member-state observations, durable targeted checks and bounded audit
+recovery. Version12 adds nullable committed counts by import phase and a measured
 member-page interval; old aggregate counts do not invent historical phase counts.
-Version12 preserves exact, dated bot-executor audit actions while their local case
+Version13 preserves exact, dated bot-executor audit actions while their local case
 source association remains unresolved; a later exact source link consumes the staged
-action without creating a duplicate case.
+action without creating a duplicate case. There are no core
+configuration/default/enrollment tables or general event archives. Core bootstrap
+never applies this schema; the existing core version is 16.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version12, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version12 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version13, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version13 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

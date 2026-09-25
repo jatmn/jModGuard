@@ -153,7 +153,7 @@ async fn scoped_data_rechecks_store_and_placement_inside_transaction() {
         .revision()
         .to_owned();
     // Change an on-disk placement after capture/open, bypassing its guard as a restore fixture.
-    store.db.with_conn(|c| c.execute_batch("DROP TRIGGER guild_binding_no_update; UPDATE guild_bindings SET revision='11111111111111111111111111111111'; CREATE TRIGGER guild_binding_no_update BEFORE UPDATE ON guild_bindings BEGIN SELECT RAISE(ABORT,'immutable'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("DROP TRIGGER guild_binding_no_update; UPDATE guild_bindings SET revision='11111111111111111111111111111111'; CREATE TRIGGER guild_binding_no_update BEFORE UPDATE ON guild_bindings BEGIN SELECT RAISE(ABORT,'immutable'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(store.log_channels(a.clone()).await.is_err());
     assert!(
         store
@@ -202,7 +202,7 @@ async fn concurrent_edits_use_revision_cas_and_noop_edits_write_nothing() {
             .await
             .is_err()
     );
-    store.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_membership_write BEFORE UPDATE ON guild_memberships BEGIN SELECT RAISE(ABORT,'unexpected revision write'); END; CREATE TRIGGER reject_log_write BEFORE INSERT ON guild_log_channels BEGIN SELECT RAISE(ABORT,'unexpected log write'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_membership_write BEFORE UPDATE ON guild_memberships BEGIN SELECT RAISE(ABORT,'unexpected revision write'); END; CREATE TRIGGER reject_log_write BEFORE INSERT ON guild_log_channels BEGIN SELECT RAISE(ABORT,'unexpected log write'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     store.bind_initial_membership(a.clone()).await.unwrap();
     assert_eq!(
         store
@@ -324,13 +324,13 @@ async fn sql_scope_guards_work_without_foreign_keys_and_events_match_shared_type
             "UPDATE guild_log_channels SET guild_id=20",
             "UPDATE guild_log_channels SET event_type='unknown'",
             "UPDATE guild_log_channels SET channel_id=1.5",
-        ] { assert!(c.execute_batch(sql).is_err(), "accepted {sql}"); }
+        ] { assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(), "accepted {sql}"); }
         Ok(())
     }).await.unwrap();
     store.close_membership(a).await.unwrap();
     store.db.with_conn(|c| {
-        assert!(c.execute_batch("UPDATE guild_memberships SET active=1").is_err());
-        assert!(c.execute_batch("INSERT INTO guild_log_channels SELECT guild_id,enrollment_id,'system',12 FROM guild_memberships").is_err());
+        assert!(c.execute_batch_bounded("UPDATE guild_memberships SET active=1", 64 * 1024 * 1024).is_err());
+        assert!(c.execute_batch_bounded("INSERT INTO guild_log_channels SELECT guild_id,enrollment_id,'system',12 FROM guild_memberships", 64 * 1024 * 1024).is_err());
         Ok(())
     }).await.unwrap();
 }
@@ -342,15 +342,17 @@ async fn version_one_upgrade_preserves_identity_bindings_and_refuses_wrong_ident
     let p = f.placement(&reg, 10).await;
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch(SCHEMA).unwrap();
-        raw.execute(
+        raw.execute_batch_bounded(SCHEMA, 64 * 1024 * 1024).unwrap();
+        raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        raw.execute(
+        raw.execute_bounded(
             "INSERT INTO guild_bindings VALUES(?1,?2)",
             params![p.guild_id(), p.revision()],
+            64 * 1024 * 1024,
         )
         .unwrap();
         raw.pragma_update(None, "user_version", 1).unwrap();
@@ -401,17 +403,17 @@ async fn failed_close_rolls_back_mapping_removal_and_repeated_close_is_write_fre
         .set_log_channel(a.clone(), &revision, "system", Some(12))
         .await
         .unwrap();
-    store.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_close BEFORE UPDATE ON guild_memberships WHEN NEW.active=0 BEGIN SELECT RAISE(ABORT,'test close failure'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_close BEFORE UPDATE ON guild_memberships WHEN NEW.active=0 BEGIN SELECT RAISE(ABORT,'test close failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(store.close_membership(a.clone()).await.is_err());
     let after = store.log_channels(a.clone()).await.unwrap();
     assert_eq!(after.revision(), revision);
     assert_eq!(after.channels(), &[("system".to_owned(), 12)]);
     store
         .db
-        .with_conn(|c| c.execute_batch("DROP TRIGGER reject_close"))
+        .with_conn(|c| c.execute_batch_bounded("DROP TRIGGER reject_close", 64 * 1024 * 1024))
         .await
         .unwrap();
     store.close_membership(a.clone()).await.unwrap();
-    store.db.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_close BEFORE UPDATE ON guild_memberships BEGIN SELECT RAISE(ABORT,'test duplicate close'); END; CREATE TRIGGER reject_delete BEFORE DELETE ON guild_log_channels BEGIN SELECT RAISE(ABORT,'test duplicate delete'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'test duplicate receipt'); END")).await.unwrap();
+    store.db.with_conn(|c| c.execute_batch_bounded("CREATE TRIGGER reject_close BEFORE UPDATE ON guild_memberships BEGIN SELECT RAISE(ABORT,'test duplicate close'); END; CREATE TRIGGER reject_delete BEFORE DELETE ON guild_log_channels BEGIN SELECT RAISE(ABORT,'test duplicate delete'); END; CREATE TRIGGER reject_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'test duplicate receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     store.close_membership(a).await.unwrap();
 }

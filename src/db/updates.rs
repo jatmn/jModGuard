@@ -201,9 +201,9 @@ pub async fn record_update_check(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         let changed = if let Some(error) = error {
-            tx.execute("UPDATE component_updates SET checked_at=?2,check_error=?3 WHERE component=?1 AND channel=?4", params![component,now,error,channel])?
+            tx.execute_rows("UPDATE component_updates SET checked_at=?2,check_error=?3 WHERE component=?1 AND channel=?4", params![component,now,error,channel], 1)?
         } else {
-            tx.execute("UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1 AND channel=?4", params![component,candidate,now,channel])?
+            tx.execute_rows("UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1 AND channel=?4", params![component,candidate,now,channel], 1)?
         };
         anyhow::ensure!(changed == 1, "release channel changed during check; check again");
         tx.commit()?;
@@ -281,9 +281,9 @@ pub async fn request_component_install(
         if component == "webui" {
             let reserved: i64 = tx.query_row("SELECT EXISTS(SELECT 1 FROM webui_managed_assets WHERE source_sha=?1)", params![candidate.source_sha.clone()], |row| Ok(row.get(0)?))?;
             anyhow::ensure!(webui_source_reusable(&candidate, &[installed.clone(),parse_release(state.previous)?,parse_release(state.desired)?],reserved != 0), "WebUI source SHA already has a different or unknown image digest; use a new source commit");
-            tx.execute("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![candidate.source_sha.clone(),now])?;
+            tx.execute_rows("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![candidate.source_sha.clone(),now], 1)?;
         }
-        tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?])?;
+        tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL WHERE component=?1", params![component,serde_json::to_string(&candidate)?], 1)?;
         tx.commit()?;
         Ok(candidate)
     }).await
@@ -316,9 +316,9 @@ pub async fn request_launcher_install(
                 .is_none_or(|release| release.digest != digest),
             "launcher release is already installed"
         );
-        tx.execute(
+        tx.execute_rows(
             "UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
-            params![component, serde_json::to_string(&candidate)?],
+            params![component, serde_json::to_string(&candidate)?], 1,
         )?;
         tx.commit()?;
         Ok(candidate)
@@ -344,7 +344,7 @@ pub async fn record_launcher_running(
     );
     db.with_conn(move |conn| {
         let tx=conn.transaction_immediate()?;
-        let changed=tx.execute("UPDATE component_updates SET installed_launcher=?2,launcher_sha256=?3,launcher_installed_at=?4 WHERE component=?1 AND desired_launcher=?2",params![component,release,hash,now])?;
+        let changed=tx.execute_rows("UPDATE component_updates SET installed_launcher=?2,launcher_sha256=?3,launcher_installed_at=?4 WHERE component=?1 AND desired_launcher=?2",params![component,release,hash,now], 1)?;
         anyhow::ensure!(changed==1,"desired launcher changed before activation");
         tx.commit()?;
         Ok(())
@@ -362,7 +362,7 @@ pub async fn record_baked_launcher(db: &Db, component: &str, hash: &str, now: i6
     );
     let (component, hash) = (component.to_owned(), hash.to_owned());
     db.with_conn(move |conn| {
-        conn.execute("UPDATE component_updates SET installed_launcher=NULL,launcher_sha256=?2,launcher_installed_at=?3 WHERE component=?1",params![component,hash,now])?;
+        conn.execute_rows("UPDATE component_updates SET installed_launcher=NULL,launcher_sha256=?2,launcher_installed_at=?3 WHERE component=?1",params![component,hash,now], 1)?;
         Ok(())
     }).await
 }
@@ -386,7 +386,7 @@ pub async fn record_launcher_failure(
         let tx=conn.transaction_immediate()?;
         let desired:Option<String>=tx.query_row("SELECT desired_launcher FROM component_updates WHERE component=?1",params![component.clone()],|row| Ok(row.get(0)?))?;
         if desired.as_deref().is_some_and(|raw| serde_json::from_str::<ComponentRelease>(raw).is_ok_and(|release| release.digest==digest)) {
-            tx.execute("UPDATE component_updates SET desired_launcher=NULL,state='failed',last_error=?2 WHERE component=?1",params![component,error])?;
+            tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL,state='failed',last_error=?2 WHERE component=?1",params![component,error], 1)?;
         }
         tx.commit()?;
         Ok(())
@@ -417,10 +417,10 @@ pub async fn record_component_running(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if let Some(release) = release {
-            let changed = tx.execute("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND desired=?2", params![component,release,now,observation])?;
+            let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND desired=?2", params![component,release,now,observation], 1)?;
             anyhow::ensure!(changed == 1, "desired release changed before activation");
         } else {
-            tx.execute("UPDATE component_updates SET observed=?2,observed_at=?3 WHERE component=?1", params![component,observation,now])?;
+            tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3 WHERE component=?1", params![component,observation,now], 1)?;
         }
         tx.commit()?;
         Ok(())
@@ -442,9 +442,9 @@ pub async fn record_baked_component_running(
     );
     let (component, observation) = (component.to_owned(), serde_json::to_string(&observation)?);
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "UPDATE component_updates SET installed=NULL,installed_at=NULL,previous=NULL,observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE 'queued' END,last_error=NULL WHERE component=?1",
-            params![component,observation,now],
+            params![component,observation,now], 1,
         )?;
         Ok(())
     }).await
@@ -462,9 +462,9 @@ pub async fn record_component_failure(
     let failed = serde_json::to_string(failed)?;
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "UPDATE component_updates SET desired=CASE WHEN component='webui' THEN desired ELSE NULL END,state='failed',last_error=?3 WHERE component=?1 AND desired=?2",
-            params![component, failed, error],
+            params![component, failed, error], 1,
         )?;
         Ok(())
     })
@@ -493,7 +493,7 @@ pub async fn record_component_rollback(
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        tx.execute("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed])?;
+        tx.execute_rows("UPDATE component_updates SET installed=?2,installed_at=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,desired=CASE WHEN desired=?6 THEN NULL ELSE desired END,observed=?4,observed_at=?3,state=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN 'queued' ELSE 'failed' END,last_error=CASE WHEN desired IS NOT NULL AND desired<>?6 THEN last_error ELSE ?5 END WHERE component=?1",params![component,previous,now,observation,error,failed], 1)?;
         tx.commit()?;
         Ok(())
     }).await
@@ -502,7 +502,7 @@ pub async fn record_component_rollback(
 pub async fn record_webui_drift(db: &Db, error: &str) -> Result<()> {
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state='failed' THEN last_error ELSE ?1 END WHERE component='webui'", params![error])?;
+        conn.execute_rows("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state='failed' THEN last_error ELSE ?1 END WHERE component='webui'", params![error], 1)?;
         Ok(())
     }).await
 }
@@ -519,7 +519,7 @@ pub async fn record_webui_installed_verified(
     let observation = serde_json::to_string(&observation)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let changed = tx.execute("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now])?;
+        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
         anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
         tx.commit()?;
         Ok(())
@@ -533,9 +533,9 @@ pub async fn track_webui_assets(db: &Db, sha: &str, now: i64) -> Result<()> {
     );
     let sha = sha.to_owned();
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "INSERT INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2) ON CONFLICT(source_sha) DO UPDATE SET created_at=excluded.created_at WHERE webui_managed_assets.created_at<0",
-            params![sha, now],
+            params![sha, now], 1,
         )?;
         Ok(())
     })
@@ -565,9 +565,10 @@ pub async fn untrack_webui_assets(db: &Db, sha: &str) -> Result<()> {
     );
     let sha = sha.to_owned();
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "UPDATE webui_managed_assets SET created_at=-1 WHERE source_sha=?1",
             params![sha],
+            1,
         )?;
         Ok(())
     })
@@ -603,9 +604,9 @@ pub async fn set_update_policy(
     let (component, channel, cadence) =
         (component.to_owned(), channel.to_owned(), cadence.to_owned());
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "UPDATE component_updates SET channel=?2,cadence=?3,candidate=CASE WHEN channel=?2 THEN candidate ELSE NULL END,checked_at=CASE WHEN channel=?2 THEN checked_at ELSE NULL END,check_error=CASE WHEN channel=?2 THEN check_error ELSE NULL END WHERE component=?1",
-            params![component, channel, cadence],
+            params![component, channel, cadence], 1,
         )?;
         Ok(())
     })
@@ -661,9 +662,9 @@ pub async fn request_due_automatic_install(
             if !webui_source_reusable(&release,&[installed,parse_release(state.previous)?,desired],reserved!=0) {
                 tx.commit()?; return Ok(None);
             }
-            tx.execute("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![release.source_sha.clone(),now])?;
+            tx.execute_rows("INSERT OR IGNORE INTO webui_managed_assets(source_sha,created_at) VALUES (?1,?2)",params![release.source_sha.clone(),now], 1)?;
         }
-        tx.execute("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL,auto_last_digest=?3,auto_last_window=?4 WHERE component=?1",params![component,candidate,release.digest.clone(),window])?;
+        tx.execute_rows("UPDATE component_updates SET desired=?2,state='queued',last_error=NULL,auto_last_digest=?3,auto_last_window=?4 WHERE component=?1",params![component,candidate,release.digest.clone(),window], 1)?;
         tx.commit()?;
         Ok(Some(release))
     }).await
@@ -704,7 +705,7 @@ pub async fn claim_update_lease(
     let (component, owner) = (component.to_owned(), owner.to_owned());
     db.with_conn(move |conn| {
         let tx=conn.transaction_immediate()?;
-        let changed=tx.execute("UPDATE component_updates SET lease_owner=?2,lease_until=?3 WHERE component=?1 AND lease_until<=?4",params![component,owner,now+ttl,now])?;
+        let changed=tx.execute_rows("UPDATE component_updates SET lease_owner=?2,lease_until=?3 WHERE component=?1 AND lease_until<=?4",params![component,owner,now+ttl,now], 1)?;
         tx.commit()?;
         Ok(changed==1)
     }).await
@@ -714,7 +715,7 @@ pub async fn release_update_lease(db: &Db, component: &str, owner: &str) -> Resu
     validate_component(component)?;
     let (component, owner) = (component.to_owned(), owner.to_owned());
     db.with_conn(move |conn| {
-        conn.execute("UPDATE component_updates SET lease_owner=NULL,lease_until=0 WHERE component=?1 AND lease_owner=?2",params![component,owner])?;
+        conn.execute_rows("UPDATE component_updates SET lease_owner=NULL,lease_until=0 WHERE component=?1 AND lease_owner=?2",params![component,owner], 1)?;
         Ok(())
     }).await
 }
@@ -732,9 +733,9 @@ pub async fn renew_update_lease(
     anyhow::ensure!((1..=3600).contains(&ttl), "invalid update lease");
     let (component, owner) = (component.to_owned(), owner.to_owned());
     db.with_conn(move |conn| {
-        Ok(conn.execute(
+        Ok(conn.execute_rows(
             "UPDATE component_updates SET lease_until=?3 WHERE component=?1 AND lease_owner=?2 AND lease_until>?4",
-            params![component,owner,now+ttl,now],
+            params![component,owner,now+ttl,now], 1,
         )? == 1)
     }).await
 }
@@ -745,9 +746,9 @@ pub async fn renew_update_lease(
 pub async fn settle_interrupted_webui(db: &Db, release: &ComponentRelease) -> Result<()> {
     let desired = serde_json::to_string(release)?;
     db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_rows(
             "UPDATE component_updates SET state='failed',last_error='WebUI installation was interrupted; Storage may be partially switched. Check Storage and retry' WHERE component='webui' AND desired=?1 AND state='queued'",
-            params![desired],
+            params![desired], 1,
         )?;
         Ok(())
     }).await
@@ -852,9 +853,10 @@ mod tests {
             .unwrap();
         let installed = serde_json::to_string(&nightly).unwrap();
         db.with_conn(move |conn| {
-            conn.execute(
+            conn.execute_rows(
                 "UPDATE component_updates SET installed=?1 WHERE component='api'",
                 params![installed],
+                1,
             )?;
             Ok(())
         })
@@ -886,9 +888,10 @@ mod tests {
             .unwrap();
         let installed = serde_json::to_string(&webui).unwrap();
         db.with_conn(move |conn| {
-            conn.execute(
+            conn.execute_rows(
                 "UPDATE component_updates SET installed=?1 WHERE component='webui'",
                 params![installed],
+                1,
             )?;
             Ok(())
         })
@@ -916,9 +919,10 @@ mod tests {
         let old = serde_json::to_string(&webui).unwrap();
         let current = serde_json::to_string(&replacement).unwrap();
         db.with_conn(move |conn| {
-            conn.execute(
+            conn.execute_rows(
                 "UPDATE component_updates SET installed=?1,previous=?2 WHERE component='webui'",
                 params![current, old],
+                1,
             )?;
             Ok(())
         })

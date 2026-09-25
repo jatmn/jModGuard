@@ -23,6 +23,7 @@ pub struct ApiState {
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
+    pub usage_cache: crate::web::usage::UsageCache,
     config_observation: tokio::sync::Mutex<(u64, String)>,
 }
 
@@ -60,6 +61,7 @@ impl ApiState {
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
+            usage_cache: crate::web::usage::UsageCache::default(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
         }))
     }
@@ -162,9 +164,10 @@ mod tests {
         f.writer
             .with_conn(move |conn| {
                 let tx = conn.transaction_immediate()?;
-                tx.execute_batch(&format!(
-                    "UPDATE meta SET value='{baseline}' WHERE key='config_version'"
-                ))?;
+                tx.execute_batch_bounded(
+                    &format!("UPDATE meta SET value='{baseline}' WHERE key='config_version'"),
+                    64 * 1024 * 1024,
+                )?;
                 tx.commit()
             })
             .await
@@ -179,7 +182,7 @@ mod tests {
         assert!(f.api.db.required_config_version() > baseline);
         f.writer.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
-            tx.execute_batch(&format!("UPDATE meta SET value='{baseline}' WHERE key='config_version'; UPDATE meta SET value='restored-revision' WHERE key='config_revision'"))?;
+            tx.execute_batch_bounded(&format!("UPDATE meta SET value='{baseline}' WHERE key='config_version'; UPDATE meta SET value='restored-revision' WHERE key='config_revision'"), 64 * 1024 * 1024)?;
             tx.commit()
         }).await.unwrap();
         assert!(f.api.poll_config_version().await.unwrap());

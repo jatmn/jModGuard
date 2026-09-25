@@ -25,7 +25,7 @@ core. Before rollout, configure both services with the shared-store URL/token pa
 and an explicit evidence backend from [the Bunny runbook](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).
 Local installs use `{core-path}.guild.db` and, on Unix, `{core-path}.evidence` by default.
 Keep these stores and evidence resources with their core catalog during recovery;
-a missing owned guild database fails closed. Guild schema version 12 requires matching
+a missing owned guild database fails closed. Guild schema version 13 requires matching
 binaries; rollback needs the corresponding pre-upgrade stores, not just the core file.
 The completed initial member import marker is preserved by compatible upgrades;
 upgrading does not trigger another full roster or current-ban scan. See [MEMBERS.md](MEMBERS.md).

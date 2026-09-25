@@ -84,7 +84,9 @@ physical absence. Restore the owning backend and retry; do not change resource i
 Guild Delete with usable membership context retires the core observation and admits its
 `guild_erasure_jobs` row in the same core transaction when a placement exists. A failed
 queue write leaves retirement uncommitted so the confirmed departure can be retried. A bounded bot worker closes store membership, cancels in-flight
-evidence, removes owned objects, purges cases, deletes remaining store identity,
+evidence, removes owned objects, purges cases, deletes owned message snapshots
+in transactions of at most 100 rows, and deletes remaining store identity only
+after those snapshots are gone,
 records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
 join cannot be resurrected. There is no permanent departed-guild ledger. The conductor

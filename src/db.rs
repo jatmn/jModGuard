@@ -47,6 +47,9 @@ mod settings;
 pub use settings::*;
 mod updates;
 pub use updates::*;
+pub mod usage;
+mod write_budget;
+use write_budget::BoundedWrites;
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -304,6 +307,7 @@ pub struct Db {
     remote: bool,
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
+    startup_deferred: bool,
     connections: Arc<ConnectionPool>,
     permits: Arc<tokio::sync::Semaphore>,
     permit_timeout: Option<Duration>,
@@ -316,12 +320,34 @@ pub struct Db {
 }
 
 impl Db {
+    /// This pool's known capacity state. Cross-process admission remains unknown.
+    pub fn capacity_runtime_status(&self) -> CapacityRuntimeStatus {
+        let growth_paused = self.runtime.growth_paused();
+        CapacityRuntimeStatus {
+            growth_paused,
+            startup_deferred: self.startup_deferred,
+            reason: if growth_paused {
+                Some("write_bound_exceeded")
+            } else if self.startup_deferred {
+                Some("startup_deferred")
+            } else {
+                None
+            },
+        }
+    }
     pub fn sqlite_path(&self) -> Option<&Path> {
         (!self.remote).then_some(self.path.as_path())
     }
     pub fn is_remote(&self) -> bool {
         self.remote
     }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CapacityRuntimeStatus {
+    pub growth_paused: bool,
+    pub startup_deferred: bool,
+    pub reason: Option<&'static str>,
 }
 
 struct ConnectionPool {
@@ -442,15 +468,24 @@ impl Db {
     }
 
     pub fn open_with(opts: DbOpenOptions) -> Result<Self> {
+        let startup_deferred = std::cell::Cell::new(false);
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
             bot_name: GuildSettings::default().bot_name,
             retention_days: opts.retention_days,
         };
-        Self::open_with_bootstrap(
+        let mut db = Self::open_with_bootstrap(
             &opts,
             |bootstrap| {
                 if opts.migrate {
+                    // A completed, current core can reconnect for inspection and
+                    // bounded cleanup above the ordinary growth stop. Its existing
+                    // terminal defaults remain authoritative until a later restart
+                    // can safely finish ordinary seed/heal work.
+                    if bootstrap_at_capacity(bootstrap)? {
+                        startup_deferred.set(true);
+                        return Ok(());
+                    }
                     // Hide readiness only when this open will actually rebuild
                     // schema/defaults. Clearing on every reconnect made a
                     // retryable pool failure look like an incomplete first boot
@@ -484,7 +519,7 @@ impl Db {
                 Ok(())
             },
             |bootstrap| {
-                if opts.migrate {
+                if opts.migrate && !startup_deferred.get() {
                     write_meta_string_conn(
                         bootstrap,
                         META_BOOTSTRAP_COMPLETE,
@@ -493,7 +528,9 @@ impl Db {
                 }
                 Ok(())
             },
-        )
+        )?;
+        db.startup_deferred = startup_deferred.get();
+        Ok(db)
     }
 
     // Share transport/pool creation while keeping core and guild-store schemas separate.
@@ -562,6 +599,7 @@ impl Db {
                 remote,
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
+                startup_deferred: false,
                 connections: Arc::new(ConnectionPool {
                     idle: Mutex::new(connections),
                     database,

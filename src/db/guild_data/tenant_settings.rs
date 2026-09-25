@@ -86,19 +86,19 @@ impl GuildDataStore {
                 tx.ensure_mutation_receipt()?;
                 let next = format!("{:032x}", rand::random::<u128>());
                 if existing.is_some() {
-                    tx.execute(
+                    tx.execute_rows(
                         "UPDATE guild_tenant_settings SET case_delete_roles=?3,revision=?4 WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str(), encoded, next.as_str()],
+                        params![scope.guild_id(), scope.enrollment.id.as_str(), encoded, next.as_str()], 1,
                     )?;
                 } else {
-                    tx.execute(
+                    tx.execute_rows(
                         "INSERT INTO guild_tenant_settings(guild_id,enrollment_id,case_delete_roles,revision) VALUES(?1,?2,?3,?4)",
-                        params![scope.guild_id(), scope.enrollment.id.as_str(), encoded, next.as_str()],
+                        params![scope.guild_id(), scope.enrollment.id.as_str(), encoded, next.as_str()], 1,
                     )?;
                 }
-                tx.execute(
+                tx.execute_rows(
                     "UPDATE guild_memberships SET config_revision=?2 WHERE guild_id=?1",
-                    params![scope.guild_id(), next.as_str()],
+                    params![scope.guild_id(), next.as_str()], 1,
                 )?;
                 tx.commit()?;
                 Ok(next)

@@ -151,13 +151,83 @@ pub async fn run(conductor: &Conductor, payload_json: &str) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("fresh");
     checkpoint(conductor, preop).await?;
-    let directory = freeze(conductor, guild, &dest_id, &dest_revision).await?;
-    let mut destination_committed = false;
+    let resumed =
+        resumed_directory(&conductor.cfg, &payload, guild, &dest_id, &dest_revision).await?;
+    let mut destination_committed = resumed.is_some();
+    let directory = match resumed {
+        Some(directory) => directory,
+        None => {
+            preflight_source_cleanup(&conductor.cfg, guild).await?;
+            freeze(conductor, guild, &dest_id, &dest_revision).await?
+        }
+    };
     let result = copy_and_cutover(conductor, &directory, &mut destination_committed).await;
     if result.is_err() && !destination_committed {
         let _ = clear_fence(&conductor.cfg, guild, &directory.dest_revision).await;
     }
     result
+}
+
+async fn preflight_source_cleanup(cfg: &Config, guild: i64) -> Result<()> {
+    let conn = open(core_path(cfg)?).await?;
+    let (source_id, _) = placement(&conn, guild)
+        .await?
+        .context("guild is not placed")?;
+    ensure_source_cleanup_budget(&store_path(cfg, &source_id)?.path, guild).await
+}
+
+async fn resumed_directory(
+    cfg: &Config,
+    payload: &Value,
+    guild: i64,
+    dest_id: &str,
+    dest_revision: &str,
+) -> Result<Option<Directory>> {
+    let conn = open(core_path(cfg)?).await?;
+    let Some((placed_id, placed_revision)) = placement(&conn, guild).await? else {
+        return Ok(None);
+    };
+    if placed_id != dest_id || placed_revision != dest_revision {
+        return Ok(None);
+    }
+    if let Some((fenced_id, fenced_revision)) = active_move_fence(cfg, guild).await? {
+        ensure!(
+            fenced_id == dest_id && fenced_revision == dest_revision,
+            "retry fence does not match destination"
+        );
+    }
+    let plan = payload
+        .get("plan")
+        .context("move retry lacks original plan")?;
+    let source_id = plan
+        .get("source_store_id")
+        .and_then(Value::as_str)
+        .context("move retry lacks source store")?
+        .to_owned();
+    let source_revision = plan
+        .get("source_revision")
+        .and_then(Value::as_str)
+        .context("move retry lacks source revision")?
+        .to_owned();
+    ensure!(
+        source_id != dest_id,
+        "move retry source matches destination"
+    );
+    let source_role = catalog(&conn, &source_id)
+        .await?
+        .context("move retry source catalog missing")?;
+    let dest_role = catalog(&conn, dest_id)
+        .await?
+        .context("move retry destination catalog missing")?;
+    Ok(Some(Directory {
+        guild,
+        source_id,
+        source_revision,
+        source_role,
+        dest_id: dest_id.to_owned(),
+        dest_revision: dest_revision.to_owned(),
+        dest_role,
+    }))
 }
 
 async fn checkpoint(conductor: &Conductor, preop: &str) -> Result<()> {
@@ -249,6 +319,8 @@ async fn freeze(
 ) -> Result<Directory> {
     let core = core_path(&conductor.cfg)?;
     let conn = open(core).await?;
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    ensure_app_budget(&conn, 1_048_576).await?;
     let (source_id, source_revision) = placement(&conn, guild)
         .await?
         .context("guild is not placed")?;
@@ -292,6 +364,8 @@ async fn freeze(
         .await
         .context("failed to freeze guild writes")?;
     }
+    ensure_app_budget(&conn, 0).await?;
+    conn.execute("COMMIT", ()).await?;
     Ok(Directory {
         guild,
         source_id,
@@ -316,7 +390,6 @@ async fn copy_and_cutover(
         && store_id == directory.dest_id
         && revision == directory.dest_revision
     {
-        resume(cfg, directory).await?;
         ensure_guild_schema(
             &source.path,
             &directory.source_id,
@@ -324,7 +397,48 @@ async fn copy_and_cutover(
             directory.guild,
         )
         .await?;
+        ensure_guild_schema(
+            &dest.path,
+            &directory.dest_id,
+            &directory.dest_role,
+            directory.guild,
+        )
+        .await?;
+        let source_conn = open(&source.path).await?;
+        let source_bound: i64 = scalar(
+            &source_conn,
+            "SELECT COUNT(*) FROM guild_bindings WHERE guild_id=?",
+            libsql::params![directory.guild],
+        )
+        .await?;
+        if source_bound == 0 {
+            let dest_conn = open(&dest.path).await?;
+            let revision = query_string(
+                &dest_conn,
+                "SELECT revision FROM guild_bindings WHERE guild_id=?",
+                libsql::params![directory.guild],
+            )
+            .await?;
+            ensure!(
+                revision.as_deref() == Some(directory.dest_revision.as_str()),
+                "destination binding changed after source cleanup"
+            );
+            let snapshots: i64 = scalar(
+                &dest_conn,
+                "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?",
+                libsql::params![directory.guild],
+            )
+            .await?;
+            ensure!(
+                snapshots == 0,
+                "destination retains transient message snapshots"
+            );
+            resume(cfg, directory).await?;
+            return Ok(());
+        }
+        verify_copy(&source.path, &dest.path, directory.guild).await?;
         cleanup_source(&source.path, directory.guild).await?;
+        resume(cfg, directory).await?;
         return Ok(());
     }
     ensure_guild_schema(
@@ -344,8 +458,8 @@ async fn copy_and_cutover(
     copy_guild(&source.path, &dest.path, directory).await?;
     *destination_committed = true;
     verify_copy(&source.path, &dest.path, directory.guild).await?;
+    ensure_source_cleanup_budget(&source.path, directory.guild).await?;
     switch_placement(cfg, directory).await?;
-    resume(cfg, directory).await?;
     ensure_guild_schema(
         &source.path,
         &directory.source_id,
@@ -354,6 +468,7 @@ async fn copy_and_cutover(
     )
     .await?;
     cleanup_source(&source.path, directory.guild).await?;
+    resume(cfg, directory).await?;
     Ok(())
 }
 
@@ -361,6 +476,7 @@ async fn switch_placement(cfg: &Config, directory: &Directory) -> Result<()> {
     let conn = open(core_path(cfg)?).await?;
     conn.execute("BEGIN IMMEDIATE", ()).await?;
     let switched: Result<()> = async {
+        ensure_app_budget(&conn, 1_048_576).await?;
         let queued: i64 = scalar(
             &conn,
             "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?)",
@@ -386,6 +502,7 @@ async fn switch_placement(cfg: &Config, directory: &Directory) -> Result<()> {
             )
             .await?;
         ensure!(changed == 1, "placement changed during the move");
+        ensure_app_budget(&conn, 0).await?;
         Ok(())
     }
     .await;
@@ -419,27 +536,73 @@ pub async fn clear_stale_fences(cfg: &Config, store: &ControlStore) -> Result<()
     // Only drop fences left after a completed cutover (placement matches destination).
     // Failed moves that copied to the destination while placement still points at the
     // source must keep the fence until retry or restore.
-    conn.execute(
-        "DELETE FROM guild_write_fences WHERE EXISTS (
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    let cleared: Result<()> = async {
+        let before = allocated_bytes(&conn).await?;
+        ensure!(
+            before <= 984_000_000,
+            "fence cleanup exceeds recovery ceiling"
+        );
+        conn.execute(
+            "DELETE FROM guild_write_fences WHERE EXISTS (
             SELECT 1 FROM guild_store_placements p
             WHERE p.guild_id = guild_write_fences.guild_id
               AND p.store_id = guild_write_fences.destination_store_id
               AND p.revision = guild_write_fences.destination_revision
         )",
-        (),
-    )
-    .await?;
-    Ok(())
+            (),
+        )
+        .await?;
+        ensure!(
+            allocated_bytes(&conn).await? <= before,
+            "fence cleanup allocated database pages"
+        );
+        Ok(())
+    }
+    .await;
+    match cleared {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(error)
+        }
+    }
 }
 
 async fn clear_fence(cfg: &Config, guild: i64, generation: &str) -> Result<()> {
     let conn = open(core_path(cfg)?).await?;
-    conn.execute(
-        "DELETE FROM guild_write_fences WHERE guild_id=? AND generation=?",
-        libsql::params![guild, generation],
-    )
-    .await?;
-    Ok(())
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    let cleared: Result<()> = async {
+        let before = allocated_bytes(&conn).await?;
+        ensure!(
+            before <= 984_000_000,
+            "fence cleanup exceeds recovery ceiling"
+        );
+        conn.execute(
+            "DELETE FROM guild_write_fences WHERE guild_id=? AND generation=?",
+            libsql::params![guild, generation],
+        )
+        .await?;
+        ensure!(
+            allocated_bytes(&conn).await? <= before,
+            "fence cleanup allocated database pages"
+        );
+        Ok(())
+    }
+    .await;
+    match cleared {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(error)
+        }
+    }
 }
 
 async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result<()> {
@@ -466,8 +629,17 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
         );
         return Ok(());
     }
-    dest_conn.execute("BEGIN IMMEDIATE", ()).await?;
+    // Hold the source primary snapshot from measurement through copying.
+    src.execute("BEGIN IMMEDIATE", ()).await?;
+    if let Err(error) = dest_conn.execute("BEGIN IMMEDIATE", ()).await {
+        let _ = src.execute("ROLLBACK", ()).await;
+        return Err(error.into());
+    }
     let copied: Result<()> = async {
+        // Only selected durable rows enter the destination. Source free pages,
+        // other guilds and transient snapshots consume none of its copy budget.
+        let copy_bound = selected_copy_budget(&src, guild).await?;
+        ensure_app_budget(&dest_conn, copy_bound).await?;
         dest_conn
             .execute(
                 "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -494,6 +666,8 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
                 ],
             )
             .await?;
+        // Message snapshots are transient: a move begins new observation coverage.
+        // Never copy them into the destination, including on a resumed copy.
         copy_simple(
             &src,
             &dest_conn,
@@ -541,9 +715,13 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
         copy_history(&src, &dest_conn, guild).await?;
         copy_extra_sources(&src, &dest_conn, guild).await?;
         copy_live_evidence(&src, &dest_conn, guild).await?;
+        ensure_app_budget(&dest_conn, 0).await?;
         Ok(())
     }
     .await;
+    // Release the read-only source transaction on both success and refusal.
+    let source_released = src.execute("ROLLBACK", ()).await;
+    let copied = copied.and_then(|()| source_released.map(|_| ()).map_err(Into::into));
     match copied {
         Ok(()) => {
             dest_conn.execute("COMMIT", ()).await?;
@@ -864,10 +1042,35 @@ async fn bunny_binding(
 }
 
 async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
-    let conn = open(path).await?;
-    conn.execute("BEGIN IMMEDIATE", ()).await?;
-    let cleaned: Result<()> = async {
-        conn.execute(
+    loop {
+        let conn = open(path).await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let cleaned: Result<bool> = async {
+            let before = allocated_bytes(&conn).await?;
+            ensure_cleanup_budget(&conn, guild).await?;
+            if table_exists(&conn, "guild_message_snapshots").await? {
+                let left = scalar(
+                    &conn,
+                    "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?",
+                    libsql::params![guild],
+                )
+                .await?;
+                if left > 0 {
+                    let removed = conn
+                        .execute(
+                            "DELETE FROM guild_message_snapshots WHERE (guild_id,enrollment_id,channel_id,message_id) IN (SELECT guild_id,enrollment_id,channel_id,message_id FROM guild_message_snapshots WHERE guild_id=?1 LIMIT 100)",
+                            libsql::params![guild],
+                        )
+                        .await?;
+                    ensure!(removed > 0, "snapshot cleanup made no progress");
+                    ensure!(
+                        allocated_bytes(&conn).await? <= before,
+                        "source cleanup allocated database pages"
+                    );
+                    return Ok(false);
+                }
+            }
+            conn.execute(
             "DELETE FROM guild_log_channels WHERE guild_id=?",
             libsql::params![guild],
         )
@@ -916,17 +1119,24 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
             libsql::params![guild],
         )
         .await?;
-        Ok(())
+        ensure!(
+            allocated_bytes(&conn).await? <= before,
+            "source cleanup allocated database pages"
+        );
+        Ok(true)
     }
     .await;
-    match cleaned {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(error)
+        match cleaned {
+            Ok(finished) => {
+                conn.execute("COMMIT", ()).await?;
+                if finished {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
         }
     }
 }
@@ -942,6 +1152,36 @@ async fn member_feature_counts_match(source: &Path, expected: i64, got: i64) -> 
     anyhow::bail!("destination member_feature count does not match the frozen source");
 }
 
+async fn member_audit_recovery_counts_match(
+    source: &Path,
+    guild: i64,
+    expected: i64,
+    got: i64,
+) -> Result<()> {
+    if expected == got {
+        return Ok(());
+    }
+    if expected == 0 && got == 1 {
+        let src = open(source).await?;
+        if table_exists(&src, "guild_member_seed").await? {
+            let mut rows = src
+                .query(
+                    "SELECT initial_completed_at_ms FROM guild_member_seed WHERE guild_id=?",
+                    libsql::params![guild],
+                )
+                .await?;
+            let completed = rows
+                .next()
+                .await?
+                .and_then(|row| row.get::<Option<i64>>(0).ok().flatten());
+            if completed.is_some_and(|v| v > 0) {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("destination member_audit_recovery count does not match the frozen source");
+}
+
 async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
     let expected = tenant_counts(source, guild).await?;
     let got = tenant_counts(dest, guild).await?;
@@ -954,6 +1194,28 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     member_feature_counts_match(source, expected_feature, got_feature).await?;
+    let expected_audit = expected
+        .get("member_audit_recovery")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let got_audit = got
+        .get("member_audit_recovery")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    member_audit_recovery_counts_match(source, guild, expected_audit, got_audit).await?;
+    let dest_conn = open(dest).await?;
+    if table_exists(&dest_conn, "guild_message_snapshots").await? {
+        let snapshots = scalar(
+            &dest_conn,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?;
+        ensure!(
+            snapshots == 0,
+            "destination retains transient message snapshots"
+        );
+    }
     ensure!(
         expected.get("cases") == got.get("cases")
             && expected.get("memberships") == got.get("memberships")
@@ -965,7 +1227,6 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
             && expected.get("member_pending_bans") == got.get("member_pending_bans")
             && expected.get("member_state_observations") == got.get("member_state_observations")
             && expected.get("member_target_checks") == got.get("member_target_checks")
-            && expected.get("member_audit_recovery") == got.get("member_audit_recovery")
             && got
                 .get("member_case_index")
                 .and_then(Value::as_i64)
@@ -1177,6 +1438,18 @@ async fn tenant_counts(path: &Path, guild: i64) -> Result<Value> {
 
 async fn ensure_guild_schema(path: &Path, store_id: &str, role: &str, guild: i64) -> Result<()> {
     let conn = open(path).await?;
+    let version = scalar(&conn, "PRAGMA user_version", ()).await?;
+    ensure!(
+        (8..=crate::release::GUILD_SCHEMA_VERSION).contains(&version),
+        "guild move requires guild schema 8..={}",
+        crate::release::GUILD_SCHEMA_VERSION
+    );
+    if version >= 9 {
+        ensure!(
+            table_exists(&conn, "guild_message_snapshots").await?,
+            "guild move requires snapshot-aware guild schema when version >= 9"
+        );
+    }
     let family = query_string(
         &conn,
         "SELECT schema_family FROM store_identity WHERE singleton=1",
@@ -1292,6 +1565,152 @@ async fn open(path: &Path) -> Result<libsql::Connection> {
         .await
         .with_context(|| format!("failed to open {}", path.display()))?;
     db.connect().context("failed to connect")
+}
+
+const APP_GROWTH_STOP_BYTES: u64 = 900_000_000;
+
+// The bound covers table/index pages and split slack for the selected rows.
+// It is deliberately conservative; no unselected payload enters the estimate.
+async fn selected_copy_budget(conn: &libsql::Connection, guild: i64) -> Result<u64> {
+    let page_size = scalar(conn, "PRAGMA page_size", ()).await?;
+    ensure!(page_size > 0, "database page size unavailable");
+    let mut bound = (page_size as u64)
+        .checked_mul(1024)
+        .context("copy budget overflow")?;
+    for (table, predicate) in [
+        ("guild_bindings", "guild_id=?"),
+        ("guild_memberships", "guild_id=?"),
+        ("guild_log_channels", "guild_id=?"),
+        ("guild_tenant_settings", "guild_id=?"),
+        ("guild_cases", "guild_id=?"),
+        ("guild_case_history", "guild_id=?"),
+        // Includes original sources created by the case insert trigger.
+        ("guild_case_sources", "guild_id=?"),
+        (
+            "guild_case_evidence",
+            "guild_id=? AND cancelled=0 AND state IN (0,1)",
+        ),
+        (
+            "guild_bunny_evidence",
+            "guild_id=? AND EXISTS(SELECT 1 FROM guild_case_evidence e WHERE e.guild_id=guild_bunny_evidence.guild_id AND e.enrollment_id=guild_bunny_evidence.enrollment_id AND e.evidence_id=guild_bunny_evidence.evidence_id AND e.cancelled=0 AND e.state IN (0,1))",
+        ),
+    ] {
+        if !table_exists(conn, table).await? {
+            continue;
+        }
+        let mut columns = conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await?;
+        let mut lengths = Vec::new();
+        while let Some(column) = columns.next().await? {
+            let name = column.get::<String>(1)?.replace('"', "\"\"");
+            lengths.push(format!("COALESCE(length(CAST(\"{name}\" AS BLOB)),0)+16"));
+        }
+        ensure!(!lengths.is_empty(), "copy table columns unavailable");
+        let payload = scalar(
+            conn,
+            &format!(
+                "SELECT COALESCE(SUM({}),0) FROM {table} WHERE {predicate}",
+                lengths.join("+")
+            ),
+            libsql::params![guild],
+        )
+        .await?;
+        let count = scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+            libsql::params![guild],
+        )
+        .await?;
+        let indexes = scalar(
+            conn,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name=?",
+            libsql::params![table],
+        )
+        .await?;
+        ensure!(
+            payload >= 0 && count >= 0 && indexes >= 0,
+            "copy measurement invalid"
+        );
+        // Every row may need separate table/index pages. Include twice the
+        // payload in each index as an upper bound, even for non-covering indexes.
+        let row_pages = (count as u64)
+            .checked_mul(page_size as u64)
+            .and_then(|n| n.checked_mul(2))
+            .context("copy budget overflow")?;
+        let bytes = (payload as u64)
+            .checked_add(row_pages)
+            .and_then(|n| n.checked_mul(indexes as u64 + 1))
+            .and_then(|n| n.checked_mul(2))
+            .context("copy budget overflow")?;
+        bound = bound.checked_add(bytes).context("copy budget overflow")?;
+    }
+    Ok(bound)
+}
+
+async fn ensure_source_cleanup_budget(path: &Path, guild: i64) -> Result<()> {
+    let conn = open(path).await?;
+    conn.execute("BEGIN IMMEDIATE", ()).await?;
+    let result = ensure_cleanup_budget(&conn, guild).await;
+    let released = conn.execute("ROLLBACK", ()).await;
+    result?;
+    released?;
+    Ok(())
+}
+
+async fn ensure_cleanup_budget(conn: &libsql::Connection, guild: i64) -> Result<()> {
+    let page_size = scalar(conn, "PRAGMA page_size", ()).await?;
+    ensure!(page_size > 0, "database page size unavailable");
+    // Deletions need no payload copy. Evidence transitions can move keys in
+    // their three secondary indexes before deletion; bound those selected rows
+    // separately, plus a fixed margin for membership/snapshot-health metadata.
+    let evidence = if table_exists(conn, "guild_case_evidence").await? {
+        scalar(
+            conn,
+            "SELECT COUNT(*) FROM guild_case_evidence WHERE guild_id=?",
+            libsql::params![guild],
+        )
+        .await?
+    } else {
+        0
+    };
+    ensure!(evidence >= 0, "cleanup measurement invalid");
+    let reserve = (evidence as u64)
+        .checked_mul(24)
+        .and_then(|n| n.checked_add(1024))
+        .and_then(|n| n.checked_mul(page_size as u64))
+        .context("cleanup budget overflow")?;
+    ensure!(
+        allocated_bytes(conn)
+            .await?
+            .checked_add(reserve)
+            .is_some_and(|n| n <= 984_000_000),
+        "source cleanup exceeds recovery ceiling"
+    );
+    Ok(())
+}
+
+async fn allocated_bytes(conn: &libsql::Connection) -> Result<u64> {
+    let pages = scalar(conn, "PRAGMA page_count", ()).await?;
+    let page_size = scalar(conn, "PRAGMA page_size", ()).await?;
+    ensure!(
+        pages >= 0 && page_size > 0,
+        "database capacity measurement unavailable"
+    );
+    (pages as u64)
+        .checked_mul(page_size as u64)
+        .context("database allocation overflow")
+}
+
+async fn ensure_app_budget(conn: &libsql::Connection, reserved_growth: u64) -> Result<()> {
+    let allocated = allocated_bytes(conn).await?;
+    ensure!(
+        allocated
+            .checked_add(reserved_growth)
+            .is_some_and(|total| total <= APP_GROWTH_STOP_BYTES),
+        "application database capacity budget exhausted"
+    );
+    Ok(())
 }
 
 async fn placement(conn: &libsql::Connection, guild: i64) -> Result<Option<(String, String)>> {
@@ -1434,4 +1853,45 @@ async fn copy_simple(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn copy_bound_counts_selected_durable_rows_and_refuses_real_growth() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("CREATE TABLE guild_cases(guild_id INTEGER, payload TEXT); CREATE TABLE guild_message_snapshots(guild_id INTEGER, content TEXT);").await.unwrap();
+        let before_unrelated = selected_copy_budget(&conn, 10).await.unwrap();
+        conn.execute("INSERT INTO guild_cases VALUES(20,zeroblob(100000))", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO guild_message_snapshots VALUES(10,zeroblob(100000))",
+            (),
+        )
+        .await
+        .unwrap();
+        let empty = selected_copy_budget(&conn, 10).await.unwrap();
+        assert_eq!(empty, before_unrelated);
+        conn.execute("INSERT INTO guild_cases VALUES(10,zeroblob(100000))", ())
+            .await
+            .unwrap();
+        let selected = selected_copy_budget(&conn, 10).await.unwrap();
+        assert!(selected > empty + 200_000);
+        // A transaction whose required growth would exceed the ordinary ceiling
+        // remains refused, regardless of how small the source allocation is.
+        let allocated = allocated_bytes(&conn).await.unwrap();
+        assert!(
+            ensure_app_budget(&conn, APP_GROWTH_STOP_BYTES - allocated + 1)
+                .await
+                .is_err()
+        );
+        assert!(ensure_app_budget(&conn, selected).await.is_ok());
+    }
 }

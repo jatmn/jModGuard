@@ -5,6 +5,387 @@ use crate::db::SqlExecutor;
 use crate::state::BotState;
 use std::sync::Mutex;
 
+#[test]
+fn bulk_transcript_reports_omissions_within_attachment_limit() {
+    let row = MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some("message text ".repeat(300)),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_001,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
+    };
+    let mut transcript = BulkTranscript::new(1000);
+    for id in 1..=1000 {
+        transcript.push(MessageId::new(id), Some(&row));
+    }
+    assert_eq!(transcript.retained, 1000);
+    assert!(transcript.omitted > 0);
+    let bytes = transcript.finish();
+    assert!(bytes.len() <= 256 * 1024);
+    assert!(
+        String::from_utf8(bytes)
+            .unwrap()
+            .contains("entries omitted")
+    );
+}
+
+#[test]
+fn bulk_transcript_counts_unique_missing_unknown_and_filtered_entries() {
+    let ids = crate::snapshot_capture::unique_ids(&[
+        MessageId::new(123),
+        MessageId::new(123),
+        MessageId::new(456),
+        MessageId::new(789),
+    ]);
+    let mut transcript = BulkTranscript::new(ids.len());
+    transcript.push(ids[0], None);
+    transcript.push_filtered();
+    transcript.push_unknown(ids[2]);
+    assert_eq!(transcript.total, 3);
+    assert_eq!(transcript.unavailable, 1);
+    assert_eq!(transcript.unknown, 1);
+    assert_eq!(transcript.filtered, 1);
+    assert_eq!(transcript.retained, 0);
+    let output = String::from_utf8(transcript.finish()).unwrap();
+    assert_eq!(
+        output
+            .matches("Message 123 | retained content unavailable")
+            .count(),
+        1
+    );
+    assert!(output.contains("Message 789 | snapshot storage unavailable"));
+}
+
+#[test]
+fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachment() {
+    let mut transcript = BulkTranscript::new(9);
+    for id in 1..=9 {
+        transcript.push(MessageId::new(id), None);
+    }
+    let display = BTreeMap::from([("details".into(), "transcript attached".into())]);
+    let parts = fallback_bulk_parts("{details}", &display, &transcript);
+    assert!(parts.len() <= 3);
+    assert!(parts.iter().all(|part| part.encode_utf16().count() <= 2000));
+    assert!(parts[0].contains("Attachment unavailable"));
+    assert!(!parts[0].contains("transcript attached"));
+    let shown: usize = parts
+        .iter()
+        .map(|part| part.matches(" | retained content unavailable").count())
+        .sum();
+    assert_eq!(shown, 9);
+    assert!(parts[0].contains("entries omitted: 0"));
+
+    let mut long = BulkTranscript::new(200);
+    for id in 1..=200 {
+        long.push(MessageId::new(id), None);
+    }
+    let bounded = fallback_bulk_parts("{details}", &display, &long);
+    let shown: usize = bounded
+        .iter()
+        .map(|part| part.matches(" | retained content unavailable").count())
+        .sum();
+    assert!(shown < 200);
+    assert!(bounded[0].contains(&format!("entries omitted: {}", 200 - shown)));
+    assert!(
+        bounded
+            .iter()
+            .all(|part| part.encode_utf16().count() <= 2000)
+    );
+}
+
+#[test]
+fn retained_edit_and_delete_reports_distinguish_empty_missing_and_gap() {
+    let mut before = MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some("A".into()),
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_001,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
+    };
+    let mut after = before.clone();
+    after.fields.content = Some("B".into());
+    let mut edit = edit_report(&edited(serde_json::json!({"content":"B"})), Some(42)).unwrap();
+    apply_retained_edit(&mut edit, Some(&before), Some(&after));
+    assert_eq!(edit.vars["before"], "A");
+    assert_eq!(edit.vars["after"], "B");
+    assert!(edit.vars["coverage"].contains("gap"));
+
+    after.fields.content = Some(String::new());
+    let mut deletion = MessageReport {
+        guild_id: GuildId::new(789),
+        event: "message_delete",
+        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
+    };
+    apply_retained_delete(&mut deletion, Some(&after));
+    assert_eq!(deletion.vars["content"], "empty");
+    before.fields.content = None;
+    apply_retained_delete(&mut deletion, Some(&before));
+    assert_eq!(deletion.vars["content"], "not supplied to capture");
+}
+
+#[test]
+fn refused_edit_uses_retained_author_for_existing_user_filter() {
+    let prior = MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some("A".into()),
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_001,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
+    };
+    let mut report = MessageReport {
+        guild_id: GuildId::new(789),
+        event: "message_edit",
+        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
+    };
+    report.vars.insert("after".into(), "B".into());
+    apply_retained_edit(&mut report, Some(&prior), None);
+    assert_eq!(report.vars["after"], "B");
+    assert_eq!(report.vars["user_id"], "42");
+    assert_eq!(report.vars["mention"], "<@42>");
+    let filter = db::LogFilter {
+        users: vec!["42".into()],
+        channels: Vec::new(),
+    };
+    assert!(excluded(&filter, &report.vars));
+}
+
+#[test]
+fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
+    let before = MessageSnapshot {
+        guild_id: 789,
+        channel_id: 456,
+        message_id: 123,
+        fields: crate::db::guild_data::SnapshotFields {
+            content: Some("🦀".repeat(700)),
+            content_truncated: true,
+            author_id: Some(42),
+            ..Default::default()
+        },
+        created_at_ms: 1,
+        first_observed_at_ms: 1,
+        last_observed_at_ms: 2,
+        edit_at_ms: None,
+        expires_at_ms: 86_400_001,
+        generation: 1,
+        coverage_epoch: 1,
+        continuous: false,
+        content_supplied: false,
+        attachments_supplied: false,
+    };
+    let mut after = before.clone();
+    after.fields.content = Some("🌕".repeat(700));
+    after.fields.attachments = Some(vec![crate::db::guild_data::SnapshotAttachment {
+        id: 1,
+        filename: "f".repeat(256),
+        size: 5,
+        content_type: Some("image/jpeg".into()),
+        url: "https://cdn.discordapp.com/attachments/".to_string() + &"x".repeat(1000),
+    }]);
+    after.fields.attachments_truncated = true;
+    after.fields.attachments_omitted = Some(0);
+    let mut report = edit_report(&edited(serde_json::json!({"content":"new"})), Some(42)).unwrap();
+    apply_retained_edit(&mut report, Some(&before), Some(&after));
+    let template = default_template("message_edit");
+    bound_default_message_vars("message_edit", &mut report.vars);
+    let rendered = templates::render_bounded(template, &report.vars, 2000);
+    assert!(rendered.contains("**Before (last observed):**"));
+    assert!(rendered.contains("**After:**"));
+    assert!(rendered.contains("**Coverage:** last observed; observation gap"));
+    assert!(rendered.contains("display clipped; retained text truncated"));
+    assert!(rendered.contains("**Attachments:**"));
+    assert!(rendered.contains("attachment metadata truncated during capture"));
+    assert!(!rendered.contains("0 attachment(s) omitted"));
+    assert!(rendered.encode_utf16().count() <= 2000);
+}
+
+#[tokio::test]
+async fn committed_snapshot_transition_reaches_edit_and_delete_delivery() {
+    use crate::db::guild_data::{SnapshotFields, SnapshotObservation, SnapshotOutcome};
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.app.db, 789, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 456)
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let observation = SnapshotObservation {
+        channel_id: 456,
+        message_id: 123,
+        created_at_ms: now - 1000,
+        observed_at_ms: now,
+        edit_at_ms: None,
+        coverage_epoch: 7,
+        fields: SnapshotFields {
+            content: Some("before text".into()),
+            attachments: Some(Vec::new()),
+            author_id: Some(42),
+            author_name: Some("human".into()),
+            ..Default::default()
+        },
+    };
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), observation.clone())
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    let mut edit_observation = observation;
+    edit_observation.observed_at_ms = now + 1;
+    edit_observation.edit_at_ms = Some(now + 1);
+    edit_observation.fields.content = Some("after text".into());
+    edit_observation.fields.author_id = None;
+    edit_observation.fields.author_name = None;
+    let transition = store
+        .apply_snapshot_edit_existing(scope.clone(), edit_observation.clone())
+        .await
+        .unwrap();
+    assert_eq!(transition.outcome, SnapshotOutcome::Stored);
+    let mut edit = edit_report(
+        &edited(serde_json::json!({"content":"after text"})),
+        Some(42),
+    )
+    .unwrap();
+    apply_retained_edit(
+        &mut edit,
+        transition.before.as_ref(),
+        transition.after.as_ref(),
+    );
+    let sink = Sink::default();
+    assert_eq!(
+        emit_to(&f.app, &sink, edit.guild_id, edit.event, edit.vars).await,
+        Delivery::Sent
+    );
+    edit_observation.observed_at_ms = now + 2;
+    edit_observation.edit_at_ms = Some(now + 2);
+    edit_observation.fields.content = Some("final text".into());
+    let next = store
+        .apply_snapshot_edit_existing(scope.clone(), edit_observation)
+        .await
+        .unwrap();
+    assert_eq!(next.outcome, SnapshotOutcome::Stored);
+    assert_eq!(
+        next.before.as_ref().unwrap().fields.content.as_deref(),
+        Some("after text")
+    );
+    assert_eq!(
+        next.after.as_ref().unwrap().fields.content.as_deref(),
+        Some("final text")
+    );
+    let mut second_edit = edit_report(
+        &edited_at(
+            serde_json::json!({"content":"final text"}),
+            "2026-09-21T00:00:02.000Z",
+        ),
+        Some(42),
+    )
+    .unwrap();
+    apply_retained_edit(&mut second_edit, next.before.as_ref(), next.after.as_ref());
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            second_edit.guild_id,
+            second_edit.event,
+            second_edit.vars
+        )
+        .await,
+        Delivery::Sent
+    );
+    // Ordinary handler callbacks may finish in reverse order. They update only
+    // bounded identity hints; the retained transition has already committed.
+    remember_message_update(
+        &f.app,
+        &edited_at(
+            serde_json::json!({"content":"final text"}),
+            "2026-09-21T00:00:02.000Z",
+        ),
+        Some(42),
+    );
+    remember_message_update(
+        &f.app,
+        &edited_at(
+            serde_json::json!({"content":"after text"}),
+            "2026-09-21T00:00:01.000Z",
+        ),
+        Some(42),
+    );
+    let deleted = store
+        .take_snapshot_at_epoch(scope, 456, 123, now + 3, 7)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut deletion = MessageReport {
+        guild_id: GuildId::new(789),
+        event: "message_delete",
+        vars: message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123)),
+    };
+    apply_retained_delete(&mut deletion, Some(&deleted));
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            deletion.guild_id,
+            deletion.event,
+            deletion.vars
+        )
+        .await,
+        Delivery::Sent
+    );
+    let messages = sink.messages.lock().unwrap();
+    let edit_text = messages[0].1["content"].as_str().unwrap();
+    assert!(edit_text.contains("before text") && edit_text.contains("after text"));
+    let second_text = messages[1].1["content"].as_str().unwrap();
+    assert!(second_text.contains("after text") && second_text.contains("final text"));
+    let delete_text = messages[2].1["content"].as_str().unwrap();
+    assert!(delete_text.contains("final text") && delete_text.contains("<@42>"));
+}
+
 const EDITED: &str = "2026-09-21T00:00:01.000Z";
 
 fn update(fields: serde_json::Value) -> MessageUpdateEvent {
@@ -36,7 +417,7 @@ fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Opti
 fn basic_updates_use_only_supplied_fields_and_never_invent_history() {
     let report = edit_report(&edited(serde_json::json!({"content":"new text"})), None).unwrap();
     assert_eq!(report.vars["after"], "new text");
-    assert_eq!(report.vars["before"], "not retained");
+    assert_eq!(report.vars["before"], "unavailable (not captured)");
     assert_eq!(report.vars["mention"], "unavailable");
     assert_eq!(
         report.vars["message_url"],
@@ -391,16 +772,16 @@ fn basic_delete_reports_ids_and_unavailable_content() {
     );
     assert_eq!(report.vars["message_id"], "123");
     assert_eq!(report.vars["mention"], "unavailable");
-    assert_eq!(report.vars["content"], "not supplied to this process");
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
     let rendered = templates::render(default_template(report.event), &report.vars);
     assert!(rendered.contains("123"));
-    assert!(rendered.contains("not supplied to this process"));
+    assert!(rendered.contains("unavailable (not captured)"));
     assert!(!rendered.contains("{mention}"));
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
-fn observed_delete_reports_can_include_a_recent_snippet() {
+fn observed_delete_reports_keep_only_recent_snippet_identity() {
     let path = std::env::temp_dir().join(format!("log_snip_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
     remember_message(&app, 789, 456, 123, Some(1), Some("hello there"), None);
@@ -410,269 +791,53 @@ fn observed_delete_reports_can_include_a_recent_snippet() {
         ChannelId::new(456),
         MessageId::new(123),
     );
-    assert_eq!(report.vars["content"], "hello there");
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
+    assert_eq!(report.vars["user_id"], "1");
     let missing = message_delete_report(
         &app,
         GuildId::new(789),
         ChannelId::new(456),
         MessageId::new(123),
     );
-    assert_eq!(missing.vars["content"], "not supplied to this process");
+    assert_eq!(missing.vars["content"], "unavailable (not captured)");
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
-fn attachment_only_delete_reports_observed_urls_and_empty_text() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
+fn snippet_preserves_author_for_filtering_without_exposing_unretained_payload() {
+    let path =
+        std::env::temp_dir().join(format!("log_identity_{:032x}.db", rand::random::<u128>()));
     let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let urls = vec![
-        "https://cdn.discordapp.com/attachments/456/1/image.jpg?ex=one".into(),
-        "https://cdn.discordapp.com/attachments/456/2/image.jpg?ex=two".into(),
-    ];
-    remember_message(&app, 789, 456, 123, Some(42), Some(""), Some(&urls));
-    // A content-only update must not erase the attachment observation.
-    remember_message(&app, 789, 456, 123, None, Some(""), None);
+    let urls = vec!["https://cdn.discordapp.com/attachments/456/1/secret.jpg".into()];
+    remember_message(
+        &app,
+        789,
+        456,
+        123,
+        Some(42),
+        Some("not retained"),
+        Some(&urls),
+    );
+    remember_message_update(
+        &app,
+        &edited(serde_json::json!({"content":"also not retained"})),
+        Some(42),
+    );
     let report = message_delete_report(
         &app,
         GuildId::new(789),
         ChannelId::new(456),
         MessageId::new(123),
     );
-    assert_eq!(report.vars["content"], "empty");
     assert_eq!(report.vars["user_id"], "42");
-    assert!(report.vars["attachments"].contains(&urls[0]));
-    assert!(report.vars["attachments"].contains(&urls[1]));
-    let rendered = templates::render(default_template(report.event), &report.vars);
-    assert!(rendered.contains("**Text:** empty"));
-    assert!(rendered.contains("**Attachments:** 2 attachment(s)"));
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn attachment_update_replaces_urls_without_inventing_text() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
-    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let first = vec!["https://cdn.discordapp.com/attachments/456/1/old.jpg".into()];
-    let replacement = vec!["https://cdn.discordapp.com/attachments/456/2/new.jpg".into()];
-    remember_message(&app, 789, 456, 123, Some(42), None, Some(&first));
-    remember_message(&app, 789, 456, 123, None, None, Some(&replacement));
-    let report = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
+    assert_eq!(report.vars["attachments"], "unavailable (not captured)");
+    assert!(
+        !report
+            .vars
+            .values()
+            .any(|value| value.contains("secret.jpg"))
     );
-    assert_eq!(report.vars["content"], "not supplied to this process");
-    assert!(report.vars["attachments"].contains(&replacement[0]));
-    assert!(!report.vars["attachments"].contains(&first[0]));
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn gateway_refresh_keeps_attachment_preview_but_real_edits_replace_or_remove_it() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
-    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let original = "https://cdn.discordapp.com/attachments/456/1/original.jpg";
-    let replacement = "https://cdn.discordapp.com/attachments/456/2/replacement.jpg";
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-
-    // A refresh can contain an empty attachment list without being an edit.
-    remember_message_update(
-        &app,
-        &update(serde_json::json!({"content":"", "attachments":[]})),
-        Some(42),
-    );
-    remember_message_update(
-        &app,
-        &edited(serde_json::json!({"attachments":[{
-            "id":"555", "filename":"replacement.jpg",
-            "proxy_url":replacement, "url":replacement, "size":100
-        }]})),
-        Some(42),
-    );
-    let replaced = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert_eq!(replaced.vars["content"], "empty");
-    assert!(replaced.vars["attachments"].contains(replacement));
-    assert!(!replaced.vars["attachments"].contains(original));
-
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-    remember_message_update(
-        &app,
-        &update(serde_json::json!({"attachments":[]})),
-        Some(42),
-    );
-    let refreshed = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert!(refreshed.vars["attachments"].contains(original));
-
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-    remember_message_update(
-        &app,
-        &edited(serde_json::json!({"attachments":[]})),
-        Some(42),
-    );
-    let removed = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert_eq!(removed.vars["attachments"], "none");
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn older_attachment_edits_cannot_roll_back_delete_preview() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
-    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let original = "https://cdn.discordapp.com/attachments/456/1/original.jpg";
-    let first_edit = "https://cdn.discordapp.com/attachments/456/2/first.jpg";
-    let latest_edit = "https://cdn.discordapp.com/attachments/456/3/latest.jpg";
-    let attachment = |id: &str, filename: &str, url: &str| {
-        serde_json::json!({
-            "id": id, "filename": filename, "proxy_url": url, "url": url, "size": 100
-        })
-    };
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-    let first = edited_at(
-        serde_json::json!({"attachments":[attachment("2", "first.jpg", first_edit)]}),
-        "2026-09-21T00:00:01.000Z",
-    );
-    let latest = edited_at(
-        serde_json::json!({"attachments":[attachment("3", "latest.jpg", latest_edit)]}),
-        "2026-09-21T00:00:02.000Z",
-    );
-    remember_message_update(&app, &first, Some(42));
-    remember_message_update(&app, &latest, Some(42));
-    remember_message_update(&app, &first, Some(42));
-    let report = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert!(report.vars["attachments"].contains(latest_edit));
-    assert!(!report.vars["attachments"].contains(first_edit));
-    assert!(!report.vars["attachments"].contains(original));
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn delayed_create_cannot_roll_back_a_real_attachment_edit() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
-    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let original = "https://cdn.discordapp.com/attachments/456/1/original.jpg";
-    let edited_url = "https://cdn.discordapp.com/attachments/456/2/edited.jpg";
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-    remember_message_update(
-        &app,
-        &edited(serde_json::json!({"attachments":[{
-            "id":"2", "filename":"edited.jpg", "proxy_url":edited_url,
-            "url":edited_url, "size":100
-        }]})),
-        Some(42),
-    );
-    // Partial current-edit data must retain the attachment observation.
-    remember_message_update(
-        &app,
-        &edited(serde_json::json!({"content":"latest text"})),
-        Some(42),
-    );
-    remember_message(
-        &app,
-        789,
-        456,
-        123,
-        Some(42),
-        Some(""),
-        Some(&[original.into()]),
-    );
-    let report = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert!(report.vars["attachments"].contains(edited_url));
-    assert!(!report.vars["attachments"].contains(original));
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn stale_edit_cannot_resurrect_removed_attachment_urls() {
-    let path = std::env::temp_dir().join(format!("log_attach_{:032x}.db", rand::random::<u128>()));
-    let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-    let url = "https://cdn.discordapp.com/attachments/456/1/removed.jpg";
-    let first = edited_at(
-        serde_json::json!({"attachments":[{
-            "id":"1", "filename":"removed.jpg", "proxy_url":url,
-            "url":url, "size":100
-        }]}),
-        "2026-09-21T00:00:01.000Z",
-    );
-    let removed = edited_at(
-        serde_json::json!({"attachments":[]}),
-        "2026-09-21T00:00:02.000Z",
-    );
-    remember_message_update(&app, &first, Some(42));
-    remember_message_update(&app, &removed, Some(42));
-    remember_message_update(&app, &first, Some(42));
-    let report = message_delete_report(
-        &app,
-        GuildId::new(789),
-        ChannelId::new(456),
-        MessageId::new(123),
-    );
-    assert_eq!(report.vars["attachments"], "none");
     let _ = std::fs::remove_file(path);
 }
 
@@ -688,7 +853,7 @@ fn partial_update_without_author_preserves_create_snippet_author() {
         ChannelId::new(456),
         MessageId::new(123),
     );
-    assert_eq!(report.vars["content"], "edited text");
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
     assert_eq!(report.vars["user_id"], "42");
     let _ = std::fs::remove_file(path);
 }
@@ -704,7 +869,7 @@ fn unattributed_update_does_not_create_a_snippet() {
         ChannelId::new(456),
         MessageId::new(123),
     );
-    assert_eq!(report.vars["content"], "not supplied to this process");
+    assert_eq!(report.vars["content"], "unavailable (not captured)");
     let _ = std::fs::remove_file(path);
 }
 
@@ -772,9 +937,10 @@ async fn persisted_event_filter_blocks_matching_reports_only() {
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'message_edit',?1)",
                 db::params![r#"{"users":["123"],"channels":["999"]}"#],
+                65_536,
             )?;
             Ok(())
         })
@@ -1033,8 +1199,9 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute_batch(
+            conn.execute_batch_bounded(
                 "DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS members; DROP TABLE IF EXISTS users; DROP TABLE events;",
+                65_536,
             )?;
             Ok(())
         })
@@ -1054,7 +1221,7 @@ async fn configured_routine_delivery_needs_no_history_tables_and_keeps_guild_rou
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute_batch("DROP TABLE meta;")?;
+            conn.execute_batch_bounded("DROP TABLE meta;", 65_536)?;
             Ok(())
         })
         .await
@@ -1278,9 +1445,10 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
     f.app
         .db
         .with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,'member_ban',?1)",
                 db::params![r#"{"users":["777"],"channels":[]}"#],
+                65_536,
             )?;
             Ok(())
         })
@@ -1602,9 +1770,10 @@ async fn repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report
                 f.app
                     .db
                     .with_conn(move |conn| {
-                        conn.execute(
+                        conn.execute_bounded(
                             "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,?1,?2)",
                             db::params![event, r#"{"users":["777"],"channels":[]}"#],
+                            65_536,
                         )?;
                         Ok(())
                     })
@@ -1719,9 +1888,10 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
                 f.app
                     .db
                     .with_conn(move |conn| {
-                        conn.execute(
+                        conn.execute_bounded(
                             "INSERT INTO log_filters(guild_id,event_type,data) VALUES(789,?1,?2)",
                             db::params![event, r#"{"users":["123"],"channels":[]}"#],
+                            65_536,
                         )?;
                         Ok(())
                     })
@@ -1764,7 +1934,7 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             f.app
                 .db
                 .with_conn(|conn| {
-                    conn.execute("DELETE FROM log_filters", db::params![])?;
+                    conn.execute_bounded("DELETE FROM log_filters", db::params![], 65_536)?;
                     Ok(())
                 })
                 .await

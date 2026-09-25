@@ -1,5 +1,12 @@
 # Backup and restore
 
+Rolling message snapshots are omitted from controlled backup copies. The copy
+is sanitized without editing the live source. Restore also removes transient
+snapshots from staged databases, including older archives, and resets capture
+health before publishing the restored stores. New capture starts without
+pre-restore history. Restored databases must fit the application size budget;
+restoring cannot bypass [capacity admission](DATABASE-CAPACITY.md).
+
 **Database compatibility:** this release requires a fresh database or the recognized
 `jmodguard-core-1` family. Earlier databases/backups require their matching old release;
 they cannot be adopted by this baseline. See [database setup and recovery](DATABASE-BASELINE.md).

@@ -4,6 +4,7 @@
 pub mod bot_actions;
 #[cfg(unix)]
 pub mod bunny_evidence;
+pub mod capacity;
 pub mod config;
 pub mod db;
 mod db_compat;

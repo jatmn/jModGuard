@@ -501,6 +501,11 @@ async fn restore_files(
             let dest = target.join(format!("{role}.sqlite"));
             fs::copy(&path, &dest)?;
             apply_removals(&dest, request).await?;
+            scrub_transient_snapshots(&dest).await?;
+            ensure!(
+                sqlite_logical_bytes(&dest).await? <= 900_000_000,
+                "restored database exceeds application capacity budget"
+            );
         } else if let Some(relative) = evidence_relative_name(&name)? {
             if evidence_is_removed(
                 &relative,
@@ -553,6 +558,7 @@ pub async fn sanitize_complete_archives(
         for (name, path) in files {
             if name.starts_with("store-") {
                 apply_removals(&path, request).await?;
+                scrub_transient_snapshots(&path).await?;
                 append_file(&mut writer, &name, &path)?;
             } else if let Some(relative) = evidence_relative_name(&name)? {
                 if evidence_is_removed(
@@ -717,14 +723,58 @@ pub async fn clear_cleanup_intents(cfg: &Config, ids: &[String]) -> Result<()> {
     };
     let db = libsql::Builder::new_local(&core.path).build().await?;
     let conn = db.connect()?;
-    for id in ids {
-        conn.execute(
-            "DELETE FROM backup_cleanup_intents WHERE intent_id = ?",
-            libsql::params![id.clone()],
-        )
-        .await?;
+    for chunk in ids.chunks(100) {
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let cleared: Result<()> = async {
+            let before = cleanup_allocated_bytes(&conn).await?;
+            // This indexed table has no delete triggers. Cleanup claims no
+            // growth, and the primary transaction rolls back if pages grow.
+            ensure!(
+                before <= 984_000_000,
+                "cleanup database exceeds recovery ceiling"
+            );
+            for id in chunk {
+                conn.execute(
+                    "DELETE FROM backup_cleanup_intents WHERE intent_id = ?",
+                    libsql::params![id.clone()],
+                )
+                .await?;
+            }
+            ensure!(
+                cleanup_allocated_bytes(&conn).await? <= before,
+                "cleanup database allocation grew during reclamation"
+            );
+            Ok(())
+        }
+        .await;
+        match cleared {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
     }
     Ok(())
+}
+
+async fn cleanup_allocated_bytes(conn: &libsql::Connection) -> Result<u64> {
+    async fn pragma(conn: &libsql::Connection, name: &str) -> Result<u64> {
+        let mut rows = conn.query(&format!("PRAGMA {name}"), ()).await?;
+        let value: i64 = rows
+            .next()
+            .await?
+            .context("database capacity measurement unavailable")?
+            .get(0)?;
+        ensure!(value > 0, "database capacity measurement unavailable");
+        Ok(value as u64)
+    }
+    pragma(conn, "page_count")
+        .await?
+        .checked_mul(pragma(conn, "page_size").await?)
+        .context("database allocation overflow")
 }
 
 pub fn promote_staging_archive(zone: &BackupZone, id: &str) -> Result<()> {
@@ -867,6 +917,49 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
             .execute(&format!("DROP TABLE IF EXISTS {table}"), ())
             .await;
     }
+    drop(snap_conn);
+    scrub_transient_snapshots(dest).await?;
+    Ok(())
+}
+
+/// Sanitizes a copied database only. Restore calls this before publishing its
+/// staging directory, including for an older full archive.
+async fn scrub_transient_snapshots(path: &Path) -> Result<()> {
+    let db = libsql::Builder::new_local(path).build().await?;
+    let conn = db.connect()?;
+    let mut rows = conn.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('guild_message_snapshots','guild_snapshot_health')", ()).await?;
+    let mut tables = BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        tables.insert(row.get::<String>(0)?);
+    }
+    drop(rows);
+    if tables.contains("guild_message_snapshots") {
+        let mut updated = conn.query("PRAGMA secure_delete=ON", ()).await?;
+        let _ = updated.next().await?;
+        drop(updated);
+        let mut setting = conn.query("PRAGMA secure_delete", ()).await?;
+        ensure!(
+            setting
+                .next()
+                .await?
+                .context("secure delete unavailable")?
+                .get::<i64>(0)?
+                == 1,
+            "secure delete unavailable for snapshot sanitation"
+        );
+        drop(setting);
+        conn.execute("DELETE FROM guild_message_snapshots", ())
+            .await?;
+    }
+    if tables.contains("guild_snapshot_health") {
+        conn.execute("DELETE FROM guild_snapshot_health", ())
+            .await?;
+        conn.execute("INSERT INTO guild_snapshot_health(singleton) VALUES(1)", ())
+            .await?;
+    }
+    if tables.contains("guild_message_snapshots") {
+        conn.execute("VACUUM", ()).await?;
+    }
     Ok(())
 }
 
@@ -987,6 +1080,7 @@ async fn apply_removals(path: &Path, request: &RestoreRequest) -> Result<()> {
             "guild_cases",
             "guild_log_channels",
             "guild_tenant_settings",
+            "guild_message_snapshots",
             "guild_memberships",
         ];
         for removed in &request.removed_guilds {
@@ -1896,7 +1990,7 @@ mod member_snapshot_tests {
             INSERT INTO guild_member_target_checks VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',77,'member','gap',1,1600,1700);
             CREATE TABLE guild_member_unresolved_audits(guild_id INTEGER,enrollment_id TEXT,entry_id INTEGER,user_id INTEGER,action TEXT,occurred_at_ms INTEGER,executor_id INTEGER,reason TEXT);
             INSERT INTO guild_member_unresolved_audits VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9007199254741993,77,'ban',1550,42,'historical own action');").await.unwrap();
-        conn.execute("PRAGMA user_version = 12", ()).await.unwrap();
+        conn.execute("PRAGMA user_version = 13", ()).await.unwrap();
         snapshot_sqlite(&source, &snapshot).await.unwrap();
         let db = libsql::Builder::new_local(&snapshot).build().await.unwrap();
         let conn = db.connect().unwrap();
@@ -1978,5 +2072,90 @@ mod member_snapshot_tests {
         drop(conn);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod transient_snapshot_tests {
+    use super::{scrub_transient_snapshots, snapshot_sqlite};
+
+    #[tokio::test]
+    async fn backup_copy_and_older_restore_copy_omit_transient_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "jmodguard-snapshot-backup-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let live = root.join("live.sqlite");
+        let copy = root.join("copy.sqlite");
+        let older = root.join("older.sqlite");
+        let db = libsql::Builder::new_local(&live).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("CREATE TABLE guild_message_snapshots(id INTEGER PRIMARY KEY, content TEXT); INSERT INTO guild_message_snapshots VALUES(1,'private'); CREATE TABLE guild_snapshot_health(singleton INTEGER PRIMARY KEY, state TEXT NOT NULL DEFAULT 'unknown'); INSERT INTO guild_snapshot_health VALUES(1,'active');").await.unwrap();
+        drop(conn);
+        drop(db);
+        snapshot_sqlite(&live, &copy).await.unwrap();
+        let db = libsql::Builder::new_local(&live).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            &format!("VACUUM INTO '{}'", super::sql_literal_path(&older).unwrap()),
+            (),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        drop(db);
+        scrub_transient_snapshots(&older).await.unwrap();
+        for path in [&copy, &older] {
+            let db = libsql::Builder::new_local(path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query("SELECT COUNT(*) FROM guild_message_snapshots", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                0
+            );
+            let mut rows = conn
+                .query(
+                    "SELECT state FROM guild_snapshot_health WHERE singleton=1",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
+                "unknown"
+            );
+        }
+        for path in [&copy, &older] {
+            assert!(
+                !std::fs::read(path)
+                    .unwrap()
+                    .windows(b"private".len())
+                    .any(|window| window == b"private"),
+                "archive copy still contains transient payload bytes"
+            );
+        }
+        let db = libsql::Builder::new_local(&live).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM guild_message_snapshots", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1
+        );
+        drop(rows);
+        drop(conn);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

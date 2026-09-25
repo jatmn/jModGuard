@@ -86,8 +86,8 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
     f.db.with_conn(|conn| {
         let tx = conn.transaction_immediate()?;
         for i in 0..205i64 {
-            tx.execute("INSERT INTO events(guild_id,event_type,user_id,data,created_at) VALUES(10,'member_ban',?1,'{\"snowflake\":1329331947876479006}','now')", params![i])?;
-            tx.execute("INSERT INTO bans(guild_id,user_id,reason,created_at,active) VALUES(10,?1,'fixture','now',?2)", params![i, i % 2])?;
+            tx.execute_bounded("INSERT INTO events(guild_id,event_type,user_id,data,created_at) VALUES(10,'member_ban',?1,'{\"snowflake\":1329331947876479006}','now')", params![i], 64 * 1024 * 1024)?;
+            tx.execute_bounded("INSERT INTO bans(guild_id,user_id,reason,created_at,active) VALUES(10,?1,'fixture','now',?2)", params![i, i % 2], 64 * 1024 * 1024)?;
         }
         tx.commit()
     }).await.unwrap();
@@ -260,7 +260,7 @@ async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed(
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let version = get_config_version(&f.db).await.unwrap();
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
     query_enrolled_events(&f.db, scope.clone(), None, None, 50)
         .await
         .unwrap();
@@ -268,7 +268,10 @@ async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed(
     enrolled_guild_stats(&f.db, scope.clone()).await.unwrap();
     assert_eq!(get_config_version(&f.db).await.unwrap(), version);
     f.db.with_conn(|conn| {
-        conn.execute_batch("ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments")
+        conn.execute_batch_bounded(
+            "ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments",
+            64 * 1024 * 1024,
+        )
     })
     .await
     .unwrap();
@@ -295,7 +298,7 @@ async fn moderation_read_rechecks_membership_after_waiting_for_primary_writer() 
     let writer = tokio::spawn(async move {
         writer_db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
-            tx.execute("UPDATE guild_enrollments SET id='replacement',joined_at_ns=101 WHERE guild_id=10", params![])?;
+            tx.execute_bounded("UPDATE guild_enrollments SET id='replacement',joined_at_ns=101 WHERE guild_id=10", params![], 64 * 1024 * 1024)?;
             locked.send(()).unwrap();
             wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             tx.commit()

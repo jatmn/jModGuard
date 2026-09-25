@@ -9,7 +9,7 @@ pub(super) fn enqueue_nickname_reconcile_conn(
     let defaults = terminal_defaults_conn(conn)?;
     let nickname = effective_settings_conn(conn, guild_id, &defaults)?.bot_name;
     let job_id = format!("{:032x}", rand::random::<u128>());
-    conn.execute(
+    conn.execute_rows(
         "INSERT INTO nickname_reconcile
              (guild_id, generation, state, attempt_count, next_attempt_at,
               last_error_code, last_error, last_error_at, job_id, enrollment_id, nickname)
@@ -36,6 +36,7 @@ pub(super) fn enqueue_nickname_reconcile_conn(
             enrollment.map(|e| e.id),
             nickname
         ],
+        1,
     )?;
     Ok(())
 }
@@ -212,7 +213,7 @@ pub async fn schedule_nickname_reconcile_retry(
             tx.finish_read()?;
             return Ok(false);
         }
-        tx.execute(
+        tx.execute_rows(
             "UPDATE nickname_reconcile SET
                  state = ?1, attempt_count = ?2, next_attempt_at = ?3,
                  last_error_code = ?4, last_error = ?5, last_error_at = ?6
@@ -227,6 +228,7 @@ pub async fn schedule_nickname_reconcile_retry(
                 guild_id,
                 generation
             ],
+            1,
         )?;
         tx.commit()?;
         Ok(exhausted)
@@ -252,12 +254,13 @@ pub async fn finish_nickname_reconcile(
             tx.finish_read()?;
             return Ok(());
         }
-        tx.execute(
+        tx.execute_rows(
             "UPDATE nickname_reconcile SET state = ?1, attempt_count = attempt_count + 1,
                  next_attempt_at = 0, last_error_code = ?2,
                  last_error = ?3, last_error_at = ?4
              WHERE guild_id = ?5 AND generation = ?6 AND state = 'pending'",
             params![state, code, error, now, guild_id, generation],
+            1,
         )?;
         tx.commit()?;
         Ok(())
@@ -268,12 +271,13 @@ pub async fn finish_nickname_reconcile(
 pub async fn acknowledge_nickname_reconcile(db: &Db, job: &NicknameReconcileJob) -> Result<()> {
     let job = job.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         if !nickname_job_matches_conn(&tx, &job)? {
             tx.finish_read()?;
             return Ok(());
         }
-        tx.execute(
+        tx.prepare_reclaim()?;
+        tx.execute_reclaim(
             "DELETE FROM nickname_reconcile WHERE guild_id=?1",
             params![job.guild_id],
         )?;

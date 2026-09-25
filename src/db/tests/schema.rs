@@ -65,7 +65,7 @@ fn old_or_foreign_databases_are_rejected_without_changing_their_rows() {
     ] {
         let path = tmp_db_path(label);
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(sql).unwrap();
+        conn.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         let before: String = conn
             .query_row(
                 "SELECT group_concat(sql, ';') FROM sqlite_master",
@@ -149,7 +149,8 @@ fn first_schema_and_family_marker_rollback_together() {
     let conn = Connection::open(&path).unwrap();
     {
         let tx = conn.transaction_primary_read().unwrap();
-        tx.execute_batch(MIGRATIONS[0]).unwrap();
+        tx.execute_batch_bounded(MIGRATIONS[0], 64 * 1024 * 1024)
+            .unwrap();
         tx.pragma_update(None, "user_version", 1).unwrap();
         // Interrupted initializer before commit: dropping rolls back both.
     }
@@ -180,7 +181,7 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
         let conn = Connection::open(&path).unwrap();
         for (index, sql) in MIGRATIONS[..completed].iter().enumerate() {
             let tx = conn.transaction_primary_read().unwrap();
-            tx.execute_batch(sql).unwrap();
+            tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
             tx.pragma_update(None, "user_version", (index + 1) as i64)
                 .unwrap();
             tx.commit().unwrap();
@@ -206,13 +207,13 @@ fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     let conn = Connection::open(&path).unwrap();
     for (index, sql) in MIGRATIONS[..5].iter().enumerate() {
         let tx = conn.transaction_primary_read().unwrap();
-        tx.execute_batch(sql).unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         tx.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
         tx.commit().unwrap();
     }
-    conn.execute_batch("INSERT INTO log_channels(guild_id,event_type,channel_id) VALUES(42,'member_join',123);
-        INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,100,200,'keep audit','2026-09-07');").unwrap();
+    conn.execute_batch_bounded("INSERT INTO log_channels(guild_id,event_type,channel_id) VALUES(42,'member_join',123);
+        INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,100,200,'keep audit','2026-09-07');", 64 * 1024 * 1024).unwrap();
     drop(conn);
     assert!(is_schema_not_ready(
         &Db::open_with(options(&path, false)).err().unwrap()

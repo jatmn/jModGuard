@@ -39,7 +39,7 @@ path.
   entire configuration from one server to another.
 - **Logging**: every event type (joins, leaves, bans, edits, deletes, automod
   hits, mod actions) routes to its own channel with editable templates.
-- **Minimal routine storage**: basic Discord-channel reports without SQL message/member
+- **Bounded routine storage**: Discord-channel reports with rolling latest-message snapshots and no persistent member
   history. Selected moderation records remain durable; see [logging/data](docs/LOGGING-DATA.md).
 - **Prefix + slash commands**, multi-server, Linux binary (SQLite and
   TLS are bundled — zero system dependencies).

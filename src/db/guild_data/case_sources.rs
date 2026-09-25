@@ -89,12 +89,12 @@ impl GuildDataStore {
                     tx.ensure_mutation_receipt()?;
                     super::member_directory::retain_confirmed_ban_history(&tx, &scope, &key)?;
                     if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
-                        tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                        tx.execute_rows("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id], 1)?;
                     }
                     tx.commit()?;
                 } else if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
                     tx.ensure_mutation_receipt()?;
-                    tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                    tx.execute_rows("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id], 1)?;
                     tx.commit()?;
                 } else {tx.finish_read()?;}
                 return Ok(LinkCaseSource::Existing(existing));
@@ -102,12 +102,12 @@ impl GuildDataStore {
             let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_case_sources WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND source_kind=?4)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),kind], |r| Ok(r.get(0)?))?;
             anyhow::ensure!(!occupied, CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_case_sources(guild_id,enrollment_id,case_id,source_key,source_kind) VALUES(?1,?2,?3,?4,?5)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),key.as_str(),kind])?;
+            tx.execute_rows("INSERT INTO guild_case_sources(guild_id,enrollment_id,case_id,source_key,source_kind) VALUES(?1,?2,?3,?4,?5)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),key.as_str(),kind], 1)?;
             if audit_entry_id.is_some() && !parent.removed {
                 super::member_directory::retain_confirmed_ban_history(&tx, &scope, &key)?;
             }
             if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
-                let removed=tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                let removed=tx.execute_rows("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id], 1)?;
                 anyhow::ensure!(removed==1,CaseError::Conflict);
             }
             tx.commit()?;
