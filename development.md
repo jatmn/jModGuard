@@ -17,8 +17,10 @@ bash scripts/ci-preflight.sh
 # or: ./scripts/smoke-dual-process.sh
 ```
 
-The Buildkite `test` job is that script. Remote libSQL containers stay in the
-separate `remote-database` job. Optional local hooks:
+Local hooks run that full script. Buildkite selects groups from the diff
+(`bash .buildkite/select-checks.sh`) and runs `ci-preflight.sh --only <group>`.
+Remote libSQL containers stay in the `remote-database` group, which is
+skipped for docs-only, WebUI-only, and API-only diffs. Optional local hooks:
 
 ```bash
 bash scripts/install-git-hooks.sh
