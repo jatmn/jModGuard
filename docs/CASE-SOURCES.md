@@ -89,7 +89,7 @@ Guild migration0005 adds the source table and ownership triggers, backfilling or
 keys for existing live, removed and closed cases. It does not guess counterpart IDs or alter
 case payload/history. `initialize` verifies versions1–5 and expected identity before upgrading
 atomically to6. Version6 adds an [evidence ownership journal](CASE-EVIDENCE.md). Fresh initialization
-applies 1–8; `open` requires 8. See [tenant runtime](TENANT-RUNTIME.md).
+applies 1–9; `open` requires 9. See [tenant runtime](TENANT-RUNTIME.md).
 
 Local tests cover both association orders, immutable facts, concurrent retries and conflicting
 records, write-free no-ops, late/deletion-racing associations, source replay and cleanup

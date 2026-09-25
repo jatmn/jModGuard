@@ -168,12 +168,13 @@ async fn upsert_row<T: Serialize + Send + 'static>(
         let n = key_params.len() + 1;
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        tx.execute(
+        tx.execute_rows(
             &format!(
                 "INSERT INTO {table} ({key_cols}, data) VALUES ({keys}, ?{n})
                  ON CONFLICT({key_cols}) DO UPDATE SET data = excluded.data"
             ),
             params_from_iter(key_params.into_iter().chain(std::iter::once(json.into()))),
+            1,
         )?;
         bump_config_version_conn(&tx)?;
         if bump_slash_registry {
@@ -204,18 +205,28 @@ async fn delete_row(
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        let n = tx.execute(
+        let exists: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE ({key_cols}) = ({keys}))"),
+            params_from_iter(key_params.clone()),
+            |r| Ok(r.get(0)?),
+        )?;
+        if !exists {
+            tx.finish_read()?;
+            return Ok(());
+        }
+        tx.prepare_reclaim()?;
+        let n = tx.execute_reclaim(
             &format!("DELETE FROM {table} WHERE ({key_cols}) = ({keys})"),
             params_from_iter(key_params),
         )?;
         // No-op deletes must not bump versions — that forced cross-process
         // cache invalidation and slash re-sync sweeps for already-gone rows.
         if n > 0 {
-            bump_config_version_conn(&tx)?;
+            bump_config_version_reclaim_conn(&tx)?;
             if bump_slash_registry {
-                bump_slash_registry_version_conn(&tx)?;
+                bump_slash_version_reclaim_conn(&tx)?;
             }
         }
         tx.commit()?;
@@ -352,10 +363,11 @@ async fn upsert_template_inner(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET template = excluded.template",
             params![guild_id, event, template],
+            1,
         )?;
         bump_config_version_conn(&tx)?;
         tx.commit()?;
@@ -426,13 +438,14 @@ pub(super) fn write_log_channel_conn(
     channel_id: Option<i64>,
 ) -> Result<()> {
     let changed = if let Some(channel_id) = channel_id {
-        conn.execute(
+        conn.execute_rows(
             "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (?1, ?2, ?3)
              ON CONFLICT(guild_id, event_type) DO UPDATE SET channel_id = excluded.channel_id",
             params![guild_id, event, channel_id],
+            1,
         )?
     } else {
-        conn.execute(
+        conn.execute_reclaim(
             "DELETE FROM log_channels WHERE guild_id=?1 AND event_type=?2",
             params![guild_id, event],
         )?
@@ -570,9 +583,10 @@ async fn add_badword_inner(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (?1, ?2, ?3)",
             params![guild_id, pattern, note],
+            1,
         )?;
         let id = tx.last_insert_rowid();
         bump_config_version_conn(&tx)?;
@@ -621,9 +635,19 @@ async fn delete_badword_inner(
     expected: Option<ConfigurationWriteScope>,
 ) -> Result<()> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        let n = tx.execute(
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM badwords WHERE id=?1 AND guild_id=?2)",
+            params![id, guild_id],
+            |r| Ok(r.get(0)?),
+        )?;
+        if !exists {
+            tx.finish_read()?;
+            anyhow::bail!("badword not found");
+        }
+        tx.prepare_reclaim()?;
+        let n = tx.execute_reclaim(
             "DELETE FROM badwords WHERE id = ?1 AND guild_id = ?2",
             params![id, guild_id],
         )?;
@@ -631,7 +655,7 @@ async fn delete_badword_inner(
             // Same public wording as API denials — never leak guild/scope detail.
             anyhow::bail!("badword not found");
         }
-        bump_config_version_conn(&tx)?;
+        bump_config_version_reclaim_conn(&tx)?;
         tx.commit()?;
         Ok(())
     })
@@ -792,11 +816,15 @@ async fn copy_guild_config_inner(
                 crate::image_spam::validate_rule(&id, &rule)?;
             }
             if src != dst {
-                tx.execute("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
-                tx.execute(
+                tx.execute_reclaim("DELETE FROM rules WHERE guild_id = ?1", params![dst])?;
+                tx.execute_copy(
                     "INSERT INTO rules (guild_id, rule_id, data)
                      SELECT ?1, rule_id, data FROM rules WHERE guild_id = ?2",
-                    params![dst, src],
+                    dst,
+                    src,
+                    "rules",
+                    "rule_id",
+                    "data",
                 )?;
             }
             result.copied.push("rules");
@@ -820,7 +848,7 @@ async fn copy_guild_config_inner(
             result.skipped_badwords = skipped;
 
             if src != dst {
-                tx.execute("DELETE FROM badwords WHERE guild_id = ?1", params![dst])?;
+                tx.execute_reclaim("DELETE FROM badwords WHERE guild_id = ?1", params![dst])?;
                 // Keep remote round trips bounded: validated rows are inserted
                 // in parameterized batches rather than one request per row.
                 for chunk in replacement.chunks(100) {
@@ -837,9 +865,10 @@ async fn copy_guild_config_inner(
                         args.push(Value::Text(pattern.clone()));
                         args.push(note.clone().map(Value::Text).unwrap_or(Value::Null));
                     }
-                    tx.execute(
+                    tx.execute_rows(
                         &format!("INSERT INTO badwords (guild_id, pattern, note) VALUES {values}"),
                         params_from_iter(args),
+                        chunk.len() as u64,
                     )?;
                 }
             }
@@ -852,11 +881,15 @@ async fn copy_guild_config_inner(
 
         if wants("commands") {
             if src != dst {
-                tx.execute("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
-                tx.execute(
+                tx.execute_reclaim("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
+                tx.execute_copy(
                     "INSERT INTO commands (guild_id, name, data)
                      SELECT ?1, name, data FROM commands WHERE guild_id = ?2",
-                    params![dst, src],
+                    dst,
+                    src,
+                    "commands",
+                    "name",
+                    "data",
                 )?;
             }
             result.copied.push("commands");
@@ -864,11 +897,15 @@ async fn copy_guild_config_inner(
 
         if wants("templates") {
             if src != dst {
-                tx.execute("DELETE FROM templates WHERE guild_id = ?1", params![dst])?;
-                tx.execute(
+                tx.execute_reclaim("DELETE FROM templates WHERE guild_id = ?1", params![dst])?;
+                tx.execute_copy(
                     "INSERT INTO templates (guild_id, event_type, template)
                      SELECT ?1, event_type, template FROM templates WHERE guild_id = ?2",
-                    params![dst, src],
+                    dst,
+                    src,
+                    "templates",
+                    "event_type",
+                    "template",
                 )?;
             }
             result.copied.push("templates");

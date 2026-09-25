@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod image_spam;
 pub mod logging;
 pub mod nickname_worker;
+pub mod snapshot_capture;
 pub mod spam_actions;
 pub mod startup;
 pub mod state;

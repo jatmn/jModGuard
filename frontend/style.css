@@ -310,7 +310,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .administration-header h1 { font-size: 30px; margin: 6px 0 0; }
 .administration-overview h2 { margin: 0 0 6px; font-size: 20px; }
 .administration-overview p, .administration-card-heading p { margin: 0; }
-.administration-page #update-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(350px, 100%), 1fr)); gap: 20px; align-items: start; }
+.administration-nav { display: flex; gap: 12px; flex-wrap: wrap; }
+.administration-page #update-cards, .administration-page #usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(350px, 100%), 1fr)); gap: 20px; align-items: start; }
 .administration-card, .administration-card .card-body { min-width: 0; }
 .administration-card .card-body { padding: 24px; gap: 16px; }
 .administration-card-heading { align-items: flex-start; }

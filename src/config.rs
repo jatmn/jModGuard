@@ -66,6 +66,8 @@ pub struct BotConfig {
     pub status: String,
     /// How often the bot polls durable `config_version` for cross-process cache invalidation.
     pub config_poll_secs: u64,
+    /// Automatically retain eligible guild messages unless explicitly disabled.
+    pub message_capture_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +279,7 @@ impl Default for BotConfig {
             retention_days: 7,
             status: "moderating".into(),
             config_poll_secs: 5,
+            message_capture_enabled: true,
         }
     }
 }
@@ -815,6 +818,12 @@ impl Config {
                     format!("JMODGUARD_CONFIG_POLL_SECS must be a positive integer, got `{v}`")
                 })?;
             }
+        }
+        if let Ok(v) = env::var("JMODGUARD_MESSAGE_CAPTURE_ENABLED") {
+            self.bot.message_capture_enabled = v
+                .trim()
+                .parse()
+                .context("JMODGUARD_MESSAGE_CAPTURE_ENABLED must be true or false")?;
         }
         if let Ok(v) = env::var("JMODGUARD_LOG_DISCORD_CONCURRENCY") {
             self.log.discord_concurrency = v
@@ -1503,6 +1512,20 @@ mod tests {
             err.to_string().contains("bot.retention_days"),
             "unexpected: {err:#}"
         );
+    }
+
+    #[test]
+    fn message_capture_defaults_on_and_has_explicit_disable() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_MESSAGE_CAPTURE_ENABLED"]);
+        unsafe { std::env::remove_var("JMODGUARD_MESSAGE_CAPTURE_ENABLED") };
+        assert!(Config::default().bot.message_capture_enabled);
+        unsafe { std::env::set_var("JMODGUARD_MESSAGE_CAPTURE_ENABLED", "false") };
+        let mut cfg = Config::default();
+        cfg.apply_env_for(false).unwrap();
+        assert!(!cfg.bot.message_capture_enabled);
+        unsafe { std::env::set_var("JMODGUARD_MESSAGE_CAPTURE_ENABLED", "maybe") };
+        assert!(Config::default().apply_env_for(false).is_err());
     }
 }
 

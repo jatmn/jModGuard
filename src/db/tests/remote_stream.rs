@@ -73,6 +73,7 @@ impl HranaFixture {
             remote: true,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
+            startup_deferred: false,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
                 database,

@@ -429,15 +429,15 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "message_edit",
-            "**:pencil2: Message updated in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Attachments:** `{attachments}`\n**Current text:** {after}",
+            "**:pencil2: Message updated in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Before (last observed):** {before}\n**After:** {after}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
         ),
         (
             "message_delete",
-            "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}\n**Attachments:** {attachments}",
+            "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Last observed text:** {content}\n**Attachments:** {attachments}\n**Coverage:** {coverage}",
         ),
         (
             "message_bulk_delete",
-            "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Time:** `{time}`",
+            "**:wastebasket: Messages deleted in {channel}**\n\n**Unique count:** `{count}`\n**Retained:** `{retained}`\n**Known missing:** `{unavailable}`\n**Storage unknown:** `{unknown}`\n**Filtered:** `{filtered}`\n**Transcript omitted:** `{omitted}`\n**Time:** `{time}`\n**Details:** {details}",
         ),
         (
             "automod",
@@ -468,6 +468,25 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
 
 /// Exact shipped delete template before attachment details were added.
 pub(crate) const PRE_ATTACHMENT_DELETE_TEMPLATE: &str = "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}";
+
+/// Byte-for-byte defaults shipped before routine retained snapshots.
+pub(crate) const PRE_RETAINED_MESSAGE_TEMPLATES: [(&str, &str); 3] = [
+    (
+        "message_edit",
+        "**:pencil2: Message updated in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Attachments:** `{attachments}`\n**Current text:** {after}",
+    ),
+    (
+        "message_delete",
+        "**:wastebasket: Message deleted in {channel}**\n\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`\n**Text:** {content}\n**Attachments:** {attachments}",
+    ),
+    (
+        "message_bulk_delete",
+        "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Time:** `{time}`",
+    ),
+];
+
+/// Exact default on the first snapshot branch; custom templates are untouched.
+pub(crate) const PRE_BULK_STATUS_TEMPLATE: &str = "**:wastebasket: Messages deleted in {channel}**\n\n**Count:** `{count}`\n**Retained:** `{retained}`\n**Unavailable:** `{unavailable}`\n**Filtered:** `{filtered}`\n**Time:** `{time}`\n**Details:** {details}";
 
 // Exact defaults from before the readable-log upgrade; used only for one-time migration.
 pub(crate) fn legacy_log_templates() -> Vec<(&'static str, &'static str)> {

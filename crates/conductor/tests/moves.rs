@@ -187,6 +187,7 @@ async fn init_guild(
         include_str!("../../../migrations/guild/0006_case_evidence.sql"),
         include_str!("../../../migrations/guild/0007_bunny_evidence.sql"),
         include_str!("../../../migrations/guild/0008_erasure.sql"),
+        include_str!("../../../migrations/guild/0009_message_snapshots.sql"),
     ] {
         conn.execute_batch(sql).await.unwrap();
     }
@@ -196,7 +197,7 @@ async fn init_guild(
     )
     .await
     .unwrap();
-    conn.execute("PRAGMA user_version = 8", ()).await.ok();
+    conn.execute("PRAGMA user_version = 9", ()).await.ok();
     for (guild, enrollment, revision, case_id, source) in guilds {
         conn.execute(
             "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -499,6 +500,17 @@ async fn denied_users_cannot_plan_or_start_moves() {
 #[tokio::test]
 async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     let h = setup().await;
+    let shared = h.root.join("shared.guild.db");
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for (guild, enrollment) in [(10, ENROLL_10), (20, ENROLL_20)] {
+        conn.execute("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes) VALUES(?,?,30,40,'transient',1000,1001,1001,86401000,1,9)", libsql::params![guild,enrollment]).await.unwrap();
+    }
+    for message_id in 41..141 {
+        conn.execute("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,content,created_at_ms,first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes) VALUES(?,?,30,?,'transient',1000,1001,1001,86401000,1,9)", libsql::params![10_i64, ENROLL_10, message_id]).await.unwrap();
+    }
+    drop(conn);
+    drop(db);
     let cookie = login(&h).await;
     let (status, body, _) = call(&h.router, "GET", "/version", Some(&cookie), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -514,6 +526,14 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("confirm"), "{body}");
+    assert_eq!(
+        scalar(
+            &h.root.join("shared.guild.db"),
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        101
+    );
 
     let (status, plan, _) = call(
         &h.router,
@@ -560,6 +580,30 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
     );
     let dedicated = h.root.join("dedicated.guild.db");
     let shared = h.root.join("shared.guild.db");
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &shared,
+            "SELECT COUNT(*) FROM guild_message_snapshots WHERE guild_id=20"
+        )
+        .await,
+        1
+    );
     assert_eq!(
         scalar(
             &dedicated,
@@ -644,5 +688,65 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         )
         .await,
         0
+    );
+}
+
+#[tokio::test]
+async fn move_budget_ignores_source_free_pages_and_unrelated_rows() {
+    let h = setup().await;
+    // These allocations simulate an established shared store and a destination
+    // with limited headroom. They are fixture writes, not application admission.
+    for (name, bytes, free) in [
+        ("shared.guild.db", 300_000_000_i64, true),
+        ("dedicated.guild.db", 880_000_000_i64, false),
+    ] {
+        let db = libsql::Builder::new_local(h.root.join(name))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE fixture_unrelated(guild_id INTEGER, payload BLOB)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fixture_unrelated VALUES(20,zeroblob(?))",
+            libsql::params![bytes],
+        )
+        .await
+        .unwrap();
+        if free {
+            conn.execute("DELETE FROM fixture_unrelated", ())
+                .await
+                .unwrap();
+        }
+    }
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router, "POST", "/api/moves", Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    let jobs = h.conductor.store().unwrap().list_jobs(8).await.unwrap();
+    let job = jobs.iter().find(|job| job.kind == "guild_move").unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.last_error);
+    assert_eq!(
+        scalar(
+            &h.root.join("dedicated.guild.db"),
+            "SELECT COUNT(*) FROM guild_cases WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &h.root.join("shared.guild.db"),
+            "SELECT COUNT(*) FROM guild_cases WHERE guild_id=20"
+        )
+        .await,
+        1
     );
 }

@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0014. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0015. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -107,14 +107,19 @@ ban rows. Existing rows keep their exact IDs and have no fabricated names.
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version8,
-using `migrations/guild/0001_identity.sql` through `0008_erasure.sql`. This separate
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version9,
+using `migrations/guild/0001_identity.sql` through `0009_message_snapshots.sql`. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
-progress and tenant settings. Initialize verifies and upgrades a matching version1–7
-store atomically; open requires 8. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0014. Each opener refuses the other family. No records are moved by startup.
+progress, tenant settings and bounded latest-message snapshots. Initialize verifies and upgrades a matching version1–8
+store atomically; open requires 9. See [tenant runtime](TENANT-RUNTIME.md). Core is at
+migration 0015. Each opener refuses the other family. No records are moved by startup.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
 Selected case payload removal, replay-key cleanup and live guild erasure are described in
 [tenant case storage](TENANT-CASES.md) and [tenant runtime](TENANT-RUNTIME.md).
+
+Guild migration 0009 starts with no retained message payloads. It adds snapshot
+expiry/identity constraints and bounded store-health metadata. Deploy matching
+bot/API builds; old guild-store binaries reject version9. Rollback requires a
+matching pre-upgrade backup and binaries. See [application database budgets](DATABASE-CAPACITY.md).

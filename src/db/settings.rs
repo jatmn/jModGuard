@@ -61,25 +61,27 @@ pub(super) fn write_settings_override_conn(
     let override_ = normalize_settings_override_for_scope(guild_id, override_.clone());
     if override_.is_empty() {
         if guild_id != GLOBAL_SCOPE {
-            conn.execute(
+            conn.execute_reclaim(
                 "DELETE FROM guild_settings WHERE guild_id = ?1",
                 params![guild_id],
             )?;
         } else {
             // Global row should exist as an explicit layer; store `{}` rather than delete.
-            conn.execute(
+            conn.execute_rows(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)
                  ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
                 params![guild_id, "{}"],
+                1,
             )?;
         }
         return Ok(());
     }
     let json = serde_json::to_string(&override_)?;
-    conn.execute(
+    conn.execute_rows(
         "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)
          ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
         params![guild_id, json],
+        1,
     )?;
     Ok(())
 }

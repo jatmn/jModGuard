@@ -5,7 +5,7 @@ use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::gateway::ActivityData;
 use serenity::model::channel::Message;
-use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent};
+use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent, ResumedEvent};
 use serenity::model::gateway::Ready;
 use serenity::model::guild::{Guild, Member, UnavailableGuild};
 use serenity::model::id::{GuildId, MessageId};
@@ -94,7 +94,14 @@ fn warn_empty_content_once() {
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
+        self.app.snapshots.install_collector(&self.app, &_ctx);
+        self.app.snapshots.gap();
+    }
+
     async fn ready(&self, ctx: Context, ready: Ready) {
+        self.app.snapshots.install_collector(&self.app, &ctx);
+        self.app.snapshots.gap();
         tracing::info!(
             "logged in as {} ({} guilds, shard {})",
             ready.user.name,
@@ -118,6 +125,30 @@ impl EventHandler for Handler {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             let app = Arc::clone(self.app());
+            let refresh_app = Arc::clone(&app);
+            let refresh_cache = Arc::clone(&ctx.cache);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    for guild in refresh_cache.guilds() {
+                        refresh_app
+                            .snapshots
+                            .refresh_scope(&refresh_app, guild.get())
+                            .await;
+                    }
+                }
+            });
+            let maintenance_app = Arc::clone(&app);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    maintenance_app.snapshots.maintain(&maintenance_app).await;
+                }
+            });
             let startup = async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
                 tracing::info!(
@@ -129,6 +160,7 @@ impl EventHandler for Handler {
                 );
                 let mut failed = false;
                 for gid in guild_ids {
+                    app.snapshots.refresh_scope(&app, gid.get()).await;
                     // Joining/ready does not insert guild_settings — inheritance
                     // from global must remain unblocked until an operator sets
                     // an intentional override.
@@ -167,6 +199,7 @@ impl EventHandler for Handler {
         .await
         {
             Ok(()) => {
+                app.snapshots.refresh_scope(&app, gid.get()).await;
                 crate::cases::retry_deferred_discord_audit_links(&app, Some(gid.get())).await;
             }
             Err(error) => {
@@ -187,6 +220,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());
         self.app.text_spam.invalidate_guild(incomplete.id.get());
@@ -441,6 +475,9 @@ impl EventHandler for Handler {
         let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
+        if !app.snapshots.collector_active(&ctx) {
+            app.snapshots.gap();
+        }
         app.member_joins.remember(
             guild_id.get(),
             msg.author.id.get(),
@@ -596,6 +633,14 @@ impl EventHandler for Handler {
             })
             .unwrap_or_default();
         logging::remember_message_update(&self.app, &event, known_author_id);
+        let bot_user_id = ctx.cache.current_user().id.get();
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        let retained_report = (!hooked)
+            .then(|| {
+                logging::message_update_report(&event, known_author_id, Some(bot_user_id))
+                    .filter(|_| self.app.edit_reports.should_report(&event))
+            })
+            .flatten();
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
                 self.app.member_joins.remember(
@@ -643,11 +688,8 @@ impl EventHandler for Handler {
                 }
             }
         }
-        let bot_user_id = ctx.cache.current_user().id.get();
-        if let Some(report) =
-            logging::message_update_report(&event, known_author_id, Some(bot_user_id))
-            && self.app.edit_reports.should_report(&event)
-        {
+        if !hooked && let Some(report) = retained_report {
+            self.app.snapshots.gap();
             logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }
@@ -660,15 +702,23 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        if !hooked {
+            self.app
+                .snapshots
+                .unhooked_delete(guild_id, channel_id, &[deleted_message_id]);
+        }
         self.app
             .image_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        let report =
-            logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
-        logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
+        if !hooked {
+            let report =
+                logging::message_delete_report(&self.app, guild_id, channel_id, deleted_message_id);
+            logging::emit(&self.app, &ctx, guild_id, report.event, report.vars).await;
+        }
     }
 
     async fn message_delete_bulk(
@@ -679,6 +729,14 @@ impl EventHandler for Handler {
         guild_id: Option<GuildId>,
     ) {
         let Some(guild_id) = guild_id else { return };
+        let hooked = self.app.snapshots.collector_active(&ctx);
+        if !hooked {
+            self.app.snapshots.unhooked_delete(
+                guild_id,
+                channel_id,
+                &multiple_deleted_messages_ids,
+            );
+        }
         for id in &multiple_deleted_messages_ids {
             self.app
                 .image_spam
@@ -687,13 +745,14 @@ impl EventHandler for Handler {
                 .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
-        let mut vars = BTreeMap::new();
-        vars.insert("channel".into(), format!("<#{}>", channel_id));
-        vars.insert(
-            "count".into(),
-            multiple_deleted_messages_ids.len().to_string(),
-        );
-        logging::emit(&self.app, &ctx, guild_id, "message_bulk_delete", vars).await;
+        if !hooked {
+            let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
+            let mut transcript = logging::BulkTranscript::new(ids.len());
+            for id in ids {
+                transcript.push_unknown(id);
+            }
+            logging::emit_retained_bulk(&self.app, &ctx, guild_id, channel_id, transcript).await;
+        }
     }
 
     async fn guild_member_update(

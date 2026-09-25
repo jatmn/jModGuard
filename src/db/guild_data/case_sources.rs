@@ -80,7 +80,7 @@ impl GuildDataStore {
             let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_case_sources WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND source_kind=?4)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),kind], |r| Ok(r.get(0)?))?;
             anyhow::ensure!(!occupied, CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_case_sources(guild_id,enrollment_id,case_id,source_key,source_kind) VALUES(?1,?2,?3,?4,?5)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),key.as_str(),kind])?;
+            tx.execute_rows("INSERT INTO guild_case_sources(guild_id,enrollment_id,case_id,source_key,source_kind) VALUES(?1,?2,?3,?4,?5)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),key.as_str(),kind], 1)?;
             tx.commit()?;
             Ok(LinkCaseSource::Linked(parent))
         }).await

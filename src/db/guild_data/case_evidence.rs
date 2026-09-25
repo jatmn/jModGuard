@@ -203,7 +203,7 @@ impl GuildDataStore {
             let (count,bytes)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(reserved_bytes),0) FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<i64>(1)?)))?;
             anyhow::ensure!(count<i64::from(limits.max_items_per_case) && bytes>=0 && (bytes as u64).checked_add(request.bytes).is_some_and(|sum|sum<=limits.max_case_bytes),CaseError::Limit);
             tx.ensure_mutation_receipt()?;
-            tx.execute("INSERT INTO guild_case_evidence(guild_id,enrollment_id,case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id) VALUES(?1,?2,?3,?4,?5,?6,0,0,?7,?8,?9)",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),request.storage_id.as_str(),request.bytes as i64,request.origin.channel_id,request.origin.message_id,request.origin.attachment_id])?;
+            tx.execute_rows("INSERT INTO guild_case_evidence(guild_id,enrollment_id,case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id) VALUES(?1,?2,?3,?4,?5,?6,0,0,?7,?8,?9)",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),request.storage_id.as_str(),request.bytes as i64,request.origin.channel_id,request.origin.message_id,request.origin.attachment_id], 1)?;
             let result=record(&tx,&scope,&id)?.ok_or(CaseError::Conflict)?.job;
             tx.commit()?;Ok(ReserveEvidence{created:true,job:result})
         }).await
@@ -246,10 +246,10 @@ impl GuildDataStore {
             let digest=match result {EvidenceCapture::Stored{sha256,..} if active && !old.job.cancelled && live(&tx,&scope,&case)?=>Some(sha256),_=>None};
             tx.ensure_mutation_receipt()?;
             if let Some(digest)=digest {
-                tx.execute("UPDATE guild_case_evidence SET state=1,sha256=?4 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),digest.as_str()])?;
+                tx.execute_rows("UPDATE guild_case_evidence SET state=1,sha256=?4 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),digest.as_str()], 1)?;
                 tx.commit()?;Ok(EvidenceState::Available)
             } else {
-                tx.execute("UPDATE guild_case_evidence SET state=2,cancelled=1,channel_id=NULL,message_id=NULL,attachment_id=NULL,sha256=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()])?;
+                tx.execute_rows("UPDATE guild_case_evidence SET state=2,cancelled=1,channel_id=NULL,message_id=NULL,attachment_id=NULL,sha256=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], 1)?;
                 tx.commit()?;Ok(EvidenceState::CleanupPending)
             }
         }).await
@@ -273,7 +273,7 @@ impl GuildDataStore {
             if old.job.state==EvidenceState::Erased {tx.finish_read()?;return Ok(false);}
             anyhow::ensure!(old.job.state==EvidenceState::CleanupPending,CaseError::Conflict);
             tx.ensure_mutation_receipt()?;
-            tx.execute("UPDATE guild_case_evidence SET state=3 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()])?;
+            tx.execute_rows("UPDATE guild_case_evidence SET state=3 WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], 1)?;
             tx.commit()?;Ok(true)
         }).await
     }
@@ -380,7 +380,7 @@ impl GuildDataStore {
             let any:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND cancelled=0)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
             if !any {tx.finish_read()?;return Ok(0);}
             tx.ensure_mutation_receipt()?;
-            let count=tx.execute("UPDATE guild_case_evidence SET cancelled=1,state=CASE state WHEN 0 THEN 0 ELSE 2 END,channel_id=NULL,message_id=NULL,attachment_id=NULL,sha256=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id IN (SELECT evidence_id FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND cancelled=0 ORDER BY evidence_id LIMIT ?3)",params![scope.guild_id(),scope.enrollment.id.as_str(),i64::from(count)])?;
+            let count=tx.execute_rows("UPDATE guild_case_evidence SET cancelled=1,state=CASE state WHEN 0 THEN 0 ELSE 2 END,channel_id=NULL,message_id=NULL,attachment_id=NULL,sha256=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id IN (SELECT evidence_id FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND cancelled=0 ORDER BY evidence_id LIMIT ?3)",params![scope.guild_id(),scope.enrollment.id.as_str(),i64::from(count)], u64::from(count))?;
             tx.commit()?;Ok(count)
         }).await
     }

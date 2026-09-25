@@ -204,7 +204,7 @@ async fn enqueue_bot_action_inner(
         let expires = now
             .checked_add(i64::from(limits.max_age_secs))
             .context("action expiry overflow")?;
-        tx.execute(
+        tx.execute_rows(
             "INSERT INTO bot_actions
              (id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at,enrollment_id,joined_at_ns)
              VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?11)",
@@ -220,7 +220,7 @@ async fn enqueue_bot_action_inner(
                 request_time,
                 enrollment.id,
                 enrollment.joined_at_ns
-            ],
+            ], 1,
         )?;
         let result = tx.query_row(
             &format!("SELECT {COLS} FROM bot_actions WHERE id=?1"),
@@ -317,13 +317,13 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
             return Ok(None);
         }
         let tx = conn.transaction_immediate()?;
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bot_actions SET state='expired',outcome='expired_before_execution',finished_at=?1
              WHERE id IN (SELECT id FROM bot_actions
              WHERE state IN ('pending','claimed') AND expires_at<=?1 LIMIT 64)",
             params![now],
         )?;
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown'
              WHERE id IN (SELECT id FROM bot_actions
              WHERE state='running' AND expires_at<=?1 LIMIT 64)",
@@ -343,7 +343,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         };
         job.action.validate()?;
         let claim = key();
-        tx.execute(
+        tx.execute_matching(
             "UPDATE bot_actions SET state='claimed',claim=?1,claimed_at=?2
              WHERE id=?3 AND state='pending'",
             params![claim.as_str(), now, job.id.as_str()],
@@ -365,7 +365,7 @@ pub async fn begin_bot_action(db: &Db, job: &BotAction, now: i64) -> Result<bool
             tx.finish_read()?;
             return Ok(false);
         }
-        let n = tx.execute(
+        let n = tx.execute_matching(
             &format!(
                 "UPDATE bot_actions SET state='running'
              WHERE id=?1 AND claim=?2 AND state='claimed' AND expires_at>?3 AND {ACTIVE}"
@@ -436,7 +436,7 @@ async fn finish_bot_action_inner(
         } else {
             (state, outcome)
         };
-        let changed = tx.execute(
+        let changed = tx.execute_matching(
             &format!(
                 "UPDATE bot_actions SET state=?1,outcome=?2,finished_at=unixepoch()
              WHERE id=?3 AND claim=?4 AND state IN ('running','uncertain') AND {ACTIVE}"
@@ -455,7 +455,7 @@ async fn finish_bot_action_inner(
         if state == "succeeded" {
             match &job.action {
                 Action::Unban { user_id, reason } if !write_fenced => {
-                    tx.execute(
+                    tx.execute_matching(
                         "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2",
                         params![job.guild_id, user_id],
                     )?;
@@ -463,10 +463,11 @@ async fn finish_bot_action_inner(
                         "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
                     })
                     .to_string();
-                    tx.execute(
+                    tx.execute_rows(
                         "INSERT INTO events(guild_id,event_type,user_id,actor_id,data,created_at)
                          VALUES(?1,'member_unban',?2,?3,?4,?5)",
                         params![job.guild_id, user_id, job.actor_id, data, now_str()],
+                        1,
                     )?;
                 }
                 Action::Unban { .. } => {}
@@ -499,7 +500,7 @@ async fn cancel_bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Resul
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         scope.verify_conn(&tx)?;
-        let n = tx.execute(
+        let n = tx.execute_matching(
             &format!(
                 "UPDATE bot_actions SET state='cancelled',outcome='cancelled_before_execution',
              finished_at=unixepoch() WHERE guild_id=?1 AND id=?2 AND {ACTIVE} AND (
@@ -526,7 +527,7 @@ fn supersede_log_action_with(
     event: &str,
     outcome: &str,
 ) -> Result<()> {
-    conn.execute(
+    conn.execute_matching(
         &format!(
             "UPDATE bot_actions SET state='cancelled',outcome=?3,
          finished_at=unixepoch() WHERE guild_id=?1 AND resource=?2
@@ -571,9 +572,18 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
         if due == 0 {
             return Ok(0);
         }
-        let tx = conn.transaction_immediate()?;
+        let mut tx = conn.transaction_primary_read()?;
+        let primary_due: i64 =
+            tx.query_row(&format!("SELECT EXISTS({DUE})"), params![cutoff, 1], |r| {
+                Ok(r.get(0)?)
+            })?;
+        if primary_due == 0 {
+            tx.finish_read()?;
+            return Ok(0);
+        }
         let floor = action_request_floor(&tx)?.max(cutoff);
-        let deleted = tx.execute(
+        tx.prepare_reclaim()?;
+        let deleted = tx.execute_reclaim(
             &format!("DELETE FROM bot_actions WHERE id IN ({DUE})"),
             params![cutoff, limits.cleanup_batch_size],
         )?;
@@ -581,9 +591,10 @@ pub async fn prune_bot_action_history(db: &Db, now: i64, limits: Limits) -> Resu
             tx.finish_read()?;
             return Ok(0);
         }
-        tx.execute(
+        tx.execute_reclaim_metadata_bounded(
             "UPDATE meta SET value=?1 WHERE key='action_request_floor'",
             params![floor.to_string()],
+            tx.capacity_page_size()?.saturating_mul(1024),
         )?;
         tx.commit()?;
         Ok(deleted)

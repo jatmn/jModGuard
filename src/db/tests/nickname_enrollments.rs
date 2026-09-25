@@ -202,7 +202,7 @@ async fn nickname_and_enrollment_invalidation_rollback_together() {
     let f = Fixture::new();
     let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap();
     let job = f.request(10, "name").await;
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_nickname BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected failure'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER fail_nickname BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(retire_guild_enrollment(&f.db, 10, 100).await.is_err());
     assert!(enroll_guild(&f.db, 10, 101).await.is_err());
     assert_eq!(guild_enrollment(&f.db, 10).await.unwrap(), enrollment);
@@ -220,15 +220,17 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
     let f = Fixture::new();
     let identity = enroll_guild(&f.db, 10, 100).await.unwrap();
     let job = f.request(10, "name").await;
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_nickname_write BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected write failure'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_nickname_write BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected write failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert_eq!(enroll_guild(&f.db, 10, 100).await.unwrap(), identity);
-    f.db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_nickname_write"))
-        .await
-        .unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER reject_nickname_write", 64 * 1024 * 1024)
+    })
+    .await
+    .unwrap();
     finish_nickname_reconcile(&f.db, &job, "dormant", "unknown_guild", "unknown", 1)
         .await
         .unwrap();
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_nickname_write BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected write failure'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_nickname_write BEFORE UPDATE ON nickname_reconcile BEGIN SELECT RAISE(ABORT,'injected write failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(enroll_guild(&f.db, 10, 100).await.is_err());
     assert_eq!(guild_enrollment(&f.db, 10).await.unwrap(), identity);
     assert_eq!(
@@ -239,9 +241,11 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
             .state,
         "dormant"
     );
-    f.db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_nickname_write"))
-        .await
-        .unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER reject_nickname_write", 64 * 1024 * 1024)
+    })
+    .await
+    .unwrap();
     assert_eq!(enroll_guild(&f.db, 10, 100).await.unwrap(), identity);
     let resumed = pending_nickname_reconciles(&f.db, 0, 1)
         .await
@@ -257,17 +261,18 @@ async fn version_eight_upgrade_does_not_bind_existing_nickname_to_active_members
     let path = tmp_db_path("nickname_version_eight");
     let conn = Connection::open(&path).unwrap();
     for (index, sql) in MIGRATIONS[..8].iter().enumerate() {
-        conn.execute_batch(sql).unwrap();
+        conn.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         conn.pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
     }
     for (guild, state) in [(10, "pending"), (20, "terminal"), (30, "dormant")] {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,100,1)",
             params![guild, format!("membership-{guild}")],
+            64 * 1024 * 1024,
         )
         .unwrap();
-        conn.execute("INSERT INTO nickname_reconcile(guild_id,generation,state,attempt_count,next_attempt_at) VALUES(?1,3,?2,2,99)", params![guild, state]).unwrap();
+        conn.execute_bounded("INSERT INTO nickname_reconcile(guild_id,generation,state,attempt_count,next_attempt_at) VALUES(?1,3,?2,2,99)", params![guild, state], 64 * 1024 * 1024).unwrap();
     }
     drop(conn);
     let db = Db::open(&path, 2).unwrap();

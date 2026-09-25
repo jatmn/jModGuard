@@ -72,7 +72,14 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         // migration from the same stale pre-lock user_version.
         let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
         if version < target {
-            tx.execute_batch(sql)
+            // Historical migrations can copy existing rows and build indexes.
+            // Reserve their complete conservative rebuild allowance under the
+            // same primary lock; a large upgrade must fail before mutation.
+            let growth = crate::capacity::allocated_bytes(&tx)?
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(16 * 1024 * 1024))
+                .ok_or_else(|| anyhow::anyhow!("migration capacity bound overflow"))?;
+            tx.execute_batch_bounded(sql, growth)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;
             // Migrations predate `mutation_receipts`, so their primary-routed
@@ -142,6 +149,30 @@ pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
+/// Permit a current, completed installation to start for inspection and
+/// maintenance while ordinary bootstrap writes are over the growth stop.
+/// An incomplete schema or missing persisted defaults still takes the normal
+/// migration path, which must refuse unsafe growth.
+pub(super) fn bootstrap_at_capacity(conn: &Connection) -> Result<bool> {
+    let tx = conn.transaction_primary_read()?;
+    let allocated = crate::capacity::allocated_bytes(&tx)?;
+    if allocated < conn.capacity_growth_limit() {
+        tx.finish_read()?;
+        return Ok(false);
+    }
+    let complete = match ensure_schema_current(&tx).and_then(|_| ensure_bootstrap_complete(&tx)) {
+        Ok(()) => read_terminal_defaults_meta(&tx)?.is_some(),
+        Err(error) if is_schema_not_ready(&error) => false,
+        Err(error) => return Err(error),
+    };
+    if complete {
+        tx.probe_write_permission()
+            .map_err(annotate_readonly_token)?;
+    }
+    tx.finish_read()?;
+    Ok(complete)
+}
+
 pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<GuildSettings> {
     let tx = conn.transaction_primary_read()?;
     ensure_schema_current(&tx)?;
@@ -158,7 +189,7 @@ pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<Guild
 
 /// Bumps durable `config_version` on an open connection (config writers only).
 pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
-    let version: u64 = conn.query_row(
+    let version: u64 = conn.query_row_write(
         "INSERT INTO meta (key, value) VALUES ('config_version', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
          RETURNING CAST(value AS INTEGER)",
@@ -185,11 +216,52 @@ pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Resul
     )
 }
 
+/// Only for verified removal/closure transactions under reclaim admission.
+/// Existing completed schemas have these fixed rows; missing markers refuse
+/// the cleanup rather than silently dropping invalidation floors.
+pub(super) fn bump_config_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
+        "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'",
+        (), reclaim_meta_bound(tx)?,
+    )? == 1, "config_version marker is missing");
+    anyhow::ensure!(
+        tx.execute_reclaim_metadata_bounded(
+            "UPDATE meta SET value=?1 WHERE key='config_revision'",
+            params![format!("{:032x}", rand::random::<u128>())],
+            reclaim_meta_bound(tx)?,
+        )? == 1,
+        "config_revision marker is missing"
+    );
+    tx.record_config_version(get_config_version_conn(tx)?);
+    Ok(())
+}
+
+pub(super) fn bump_slash_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
+        "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='slash_registry_version'",
+        (), reclaim_meta_bound(tx)?,
+    )? == 1, "slash_registry_version marker is missing");
+    anyhow::ensure!(
+        tx.execute_reclaim_metadata_bounded(
+            "UPDATE meta SET value=?1 WHERE key='slash_registry_revision'",
+            params![format!("{:032x}", rand::random::<u128>())],
+            reclaim_meta_bound(tx)?,
+        )? == 1,
+        "slash_registry_revision marker is missing"
+    );
+    Ok(())
+}
+
+pub(super) fn reclaim_meta_bound(tx: &impl SqlExecutor) -> Result<u64> {
+    Ok(tx.capacity_page_size()?.saturating_mul(1024))
+}
+
 pub(super) fn bump_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Result<()> {
-    conn.execute(
+    conn.execute_rows(
         "INSERT INTO meta (key, value) VALUES (?1, '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
         params![key],
+        1,
     )?;
     Ok(())
 }
@@ -323,10 +395,11 @@ pub(super) fn write_meta_string_conn(
     key: &str,
     value: &str,
 ) -> Result<()> {
-    conn.execute(
+    conn.execute_rows(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
+        1,
     )?;
     Ok(())
 }
@@ -413,14 +486,11 @@ pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
 /// schema-open and fail on the first WebUI `PUT`.
 pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
     let tx = conn
-        .transaction_immediate()
+        .transaction_primary_read()
         .map_err(annotate_readonly_token)?;
-    tx.execute(
-        "UPDATE meta SET value = value WHERE key = ?1",
-        params![META_BOOTSTRAP_COMPLETE],
-    )
-    .map_err(annotate_readonly_token)?;
-    tx.commit().map_err(annotate_readonly_token)?;
+    tx.probe_write_permission()
+        .map_err(annotate_readonly_token)?;
+    tx.finish_read().map_err(annotate_readonly_token)?;
     Ok(())
 }
 
@@ -451,9 +521,13 @@ pub(super) fn clear_bootstrap_complete(conn: &Connection) -> Result<()> {
         |r| Ok(r.get(0)?),
     )?;
     if has_meta != 0 {
-        tx.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![META_BOOTSTRAP_COMPLETE],
+        // This runs before the receipt schema is available on old databases.
+        // Use the same bounded, independently reconciled maintenance path as
+        // migrations; ordinary reclaim requires a prepared receipt/fence.
+        debug_assert_eq!(META_BOOTSTRAP_COMPLETE, "bootstrap_complete");
+        tx.execute_batch_bounded(
+            "DELETE FROM meta WHERE key = 'bootstrap_complete'",
+            tx.capacity_page_size()?.saturating_mul(1024),
         )?;
     }
     match tx.commit() {
@@ -543,7 +617,7 @@ pub(super) fn refresh_settings_heal_checksum_conn(conn: &impl SqlExecutor) -> Re
 /// while holding the primary writer transaction; the next bot bootstrap will
 /// verify/heal once and publish a fresh checksum.
 pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) -> Result<()> {
-    conn.execute(
+    conn.execute_reclaim(
         "DELETE FROM meta WHERE key IN (?1, ?2)",
         params![META_SETTINGS_HEAL_GENERATION, META_SETTINGS_HEAL_CHECKSUM],
     )?;
@@ -572,19 +646,21 @@ pub(super) fn seed_globals_conn(
     } else {
         serde_json::to_string(&global_settings)?
     };
-    let mut changed = conn.execute(
+    let mut changed = conn.execute_rows(
         "INSERT OR IGNORE INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
         params![GLOBAL_SCOPE, json],
+        1,
     )?;
     let rules = crate::defaults::default_rules();
     for (i, rule) in rules.iter().enumerate() {
-        changed += conn.execute(
+        changed += conn.execute_rows(
             "INSERT OR IGNORE INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
             params![
                 GLOBAL_SCOPE,
                 crate::types::RULE_IDS[i],
                 serde_json::to_string(rule)?
             ],
+            1,
         )?;
     }
     // One-time presentation upgrade: only byte-for-byte shipped defaults.
@@ -611,7 +687,7 @@ pub(super) fn seed_globals_conn(
                 .find(|(name, _)| *name == event)
                 .unwrap()
                 .1;
-            changed += conn.execute(
+            changed += conn.execute_matching(
                 "UPDATE templates SET template = ?1 WHERE event_type = ?2 AND template = ?3",
                 params![new, event, old],
             )?;
@@ -626,7 +702,7 @@ pub(super) fn seed_globals_conn(
         legacy.description =
             "This server's retained moderation counts (records, warns, bans).".into();
         if !status_taken {
-            commands_changed += conn.execute(
+            commands_changed += conn.execute_matching(
                 "UPDATE commands SET data = ?1 WHERE name = 'stats' AND data = ?2",
                 params![
                     serde_json::to_string(&stats)?,
@@ -642,11 +718,37 @@ pub(super) fn seed_globals_conn(
             .find(|(event, _)| *event == "message_delete")
             .unwrap()
             .1;
-        changed += conn.execute(
+        changed += conn.execute_matching(
             "UPDATE templates SET template = ?1 WHERE event_type = 'message_delete' AND template = ?2",
             params![new, crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
         )?;
         write_meta_string_conn(conn, "attachment_delete_template_v1", "1")?;
+    }
+    if meta_string_conn(conn, "retained_message_templates_v1")?.is_none() {
+        for (event, old) in crate::defaults::PRE_RETAINED_MESSAGE_TEMPLATES {
+            let new = crate::defaults::default_templates()
+                .into_iter()
+                .find(|(name, _)| *name == event)
+                .expect("shipped message template")
+                .1;
+            changed += conn.execute_matching(
+                "UPDATE templates SET template = ?1 WHERE event_type = ?2 AND template = ?3",
+                params![new, event, old],
+            )?;
+        }
+        write_meta_string_conn(conn, "retained_message_templates_v1", "1")?;
+    }
+    if meta_string_conn(conn, "retained_bulk_status_template_v1")?.is_none() {
+        let new = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "message_bulk_delete")
+            .expect("shipped bulk delete template")
+            .1;
+        changed += conn.execute_matching(
+            "UPDATE templates SET template=?1 WHERE event_type='message_bulk_delete' AND template=?2",
+            params![new, crate::defaults::PRE_BULK_STATUS_TEMPLATE],
+        )?;
+        write_meta_string_conn(conn, "retained_bulk_status_template_v1", "1")?;
     }
     for mut cmd in crate::defaults::default_commands() {
         if cmd.name == "stats" && status_taken {
@@ -677,7 +779,7 @@ pub(super) fn seed_globals_conn(
                 } else {
                     cmd.aliases.clone()
                 };
-                commands_changed += conn.execute(
+                commands_changed += conn.execute_matching(
                     "UPDATE commands SET data=?1 WHERE name='stats' AND data=?2",
                     params![
                         serde_json::to_string(&upgraded)?,
@@ -691,7 +793,7 @@ pub(super) fn seed_globals_conn(
             legacy.description =
                 "Set the bot's nickname in this server (omit / clear / - to reset).".into();
             legacy.response = "Bot nickname set to {name}".into();
-            commands_changed += conn.execute(
+            commands_changed += conn.execute_matching(
                 "UPDATE commands SET data = ?1
                  WHERE guild_id = ?2 AND name = 'setname' AND data = ?3",
                 params![
@@ -701,19 +803,21 @@ pub(super) fn seed_globals_conn(
                 ],
             )?;
         }
-        commands_changed += conn.execute(
+        commands_changed += conn.execute_rows(
             "INSERT OR IGNORE INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
             params![
                 GLOBAL_SCOPE,
                 cmd.name.to_lowercase(),
                 serde_json::to_string(&cmd)?
             ],
+            1,
         )?;
     }
     for (event, template) in crate::defaults::default_templates() {
-        changed += conn.execute(
+        changed += conn.execute_rows(
             "INSERT OR IGNORE INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)",
             params![GLOBAL_SCOPE, event, template],
+            1,
         )?;
     }
     changed += commands_changed;

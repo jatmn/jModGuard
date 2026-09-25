@@ -55,7 +55,7 @@ fn unsigned(channel: &str, release_id: &str, core_version: i64, missing: &[&str]
             "core_family": "jmodguard-core-1",
             "core_version": core_version,
             "guild_family": "jmodguard-guild-1",
-            "guild_version": 8
+            "guild_version": 9
         },
         "settings_schema": 1,
         "backup_format": "JMODGUARD-BACKUP-1",
@@ -348,6 +348,11 @@ fn guild_and_settings_schema_compatibility() {
     };
     let mut body = unsigned("stable", "v0.2.0", 12, &[]);
     body["schema"]["guild_version"] = json!(1);
+    let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
+    assert!(!ok);
+    assert!(reason.unwrap().contains("guild schema"));
+    body = unsigned("stable", "v0.2.0", 12, &[]);
+    body["schema"]["guild_version"] = json!(8);
     let (ok, reason) = release::compatibility(&body, &cfg).unwrap();
     assert!(!ok);
     assert!(reason.unwrap().contains("guild schema"));

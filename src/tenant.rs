@@ -10,9 +10,11 @@ use crate::db::guild_stores::{
     register_store, shared_store_registration,
 };
 use crate::db::{
-    self, Db, GuildEnrollment, GuildErasureJob, finish_guild_erasure, next_guild_erasure_after,
-    queue_guild_erasure, record_backup_cleanup_intent, wipe_departed_directory_guild_data,
+    self, Db, GuildEnrollment, GuildErasureJob, SqlExecutor, finish_guild_erasure,
+    next_guild_erasure_after, queue_guild_erasure, record_backup_cleanup_intent,
+    wipe_departed_directory_guild_data,
 };
+use crate::db_compat::OptionalExtension;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -36,11 +38,18 @@ pub struct TenantRuntime {
     inner: Arc<Inner>,
 }
 
+/// Catalog entry and its locally reachable handle for owner usage inspection.
+pub struct UsageStore {
+    pub registration: StoreRegistration,
+    pub handle: Option<GuildDataStore>,
+}
+
 struct Inner {
     credentials: Vec<ResolvedStore>,
     default_shared: StoreId,
     max_handles: usize,
     handles: Mutex<HandleCache>,
+    handle_open_locks: parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     evidence: EvidenceBackend,
     erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
@@ -172,6 +181,101 @@ fn block_on<T: Send>(fut: impl std::future::Future<Output = Result<T>> + Send) -
 }
 
 impl TenantRuntime {
+    /// Resolve one catalog ID without opening or enumerating unrelated stores.
+    pub async fn usage_store(&self, id: &str) -> Result<Option<UsageStore>> {
+        let id = StoreId::parse(id)?;
+        let lookup = id.as_str().to_owned();
+        let registration = self
+            .core
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                let row = tx
+                    .query_row(
+                        "SELECT dedicated_guild_id FROM guild_store_catalog WHERE store_id=?1",
+                        crate::db::params![lookup],
+                        |row| Ok(row.get::<Option<i64>>(0)?),
+                    )
+                    .optional()?;
+                tx.finish_read()?;
+                Ok(row)
+            })
+            .await?;
+        let Some(owner) = registration else {
+            return Ok(None);
+        };
+        let policy = match owner {
+            None => StorePolicy::Shared,
+            Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
+            _ => bail!("invalid guild store catalog owner"),
+        };
+        let registration = StoreRegistration::from_parts(id, policy);
+        let handle = if self
+            .inner
+            .credentials
+            .iter()
+            .any(|known| known.registration == registration)
+        {
+            self.handle(registration.id()).await.ok()
+        } else {
+            None
+        };
+        Ok(Some(UsageStore {
+            registration,
+            handle,
+        }))
+    }
+
+    pub async fn usage_catalog(&self) -> Result<Vec<StoreRegistration>> {
+        let catalog: Vec<StoreRegistration> = self
+            .core
+            .with_conn(|conn| {
+                let tx = conn.transaction_primary_read()?;
+                let mut stmt = tx.prepare(
+                    "SELECT store_id,dedicated_guild_id FROM guild_store_catalog ORDER BY store_id",
+                )?;
+                let rows = stmt.query_map((), |row| {
+                    Ok((row.get::<String>(0)?, row.get::<Option<i64>>(1)?))
+                })?;
+                let mut catalog = Vec::new();
+                for row in rows {
+                    let (id, owner) = row?;
+                    let id = StoreId::parse(&id)?;
+                    let policy = match owner {
+                        None => StorePolicy::Shared,
+                        Some(guild_id) if guild_id > 0 => StorePolicy::Dedicated { guild_id },
+                        _ => anyhow::bail!("invalid guild store catalog owner"),
+                    };
+                    catalog.push(StoreRegistration::from_parts(id, policy));
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(catalog)
+            })
+            .await?;
+        Ok(catalog)
+    }
+
+    pub async fn usage_stores(&self) -> Result<Vec<UsageStore>> {
+        let catalog = self.usage_catalog().await?;
+        let mut result = Vec::with_capacity(catalog.len());
+        for registration in catalog {
+            let handle = if self
+                .inner
+                .credentials
+                .iter()
+                .any(|known| known.registration == registration)
+            {
+                self.handle(registration.id()).await.ok()
+            } else {
+                None
+            };
+            result.push(UsageStore {
+                registration,
+                handle,
+            });
+        }
+        Ok(result)
+    }
     pub fn open(
         core: &Db,
         db: &crate::config::DbConfig,
@@ -229,6 +333,7 @@ impl TenantRuntime {
                     order: VecDeque::new(),
                     map: HashMap::new(),
                 }),
+                handle_open_locks: parking_lot::Mutex::new(HashMap::new()),
                 evidence: open_evidence(core, evidence).await?,
                 erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
@@ -590,7 +695,7 @@ impl TenantRuntime {
                 .await?
                 > 0
             {}
-            handle.erase_closed_scope(scope.clone()).await?;
+            while !handle.erase_closed_scope(scope.clone()).await? {}
         }
         record_backup_cleanup_intent(
             &self.core,
@@ -718,6 +823,20 @@ impl TenantRuntime {
             cache.order.push_back(id.as_str().to_owned());
             return Ok(handle);
         }
+        drop(cache);
+        let open_lock = self
+            .inner
+            .handle_open_locks
+            .lock()
+            .entry(id.as_str().to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _opening = open_lock.lock().await;
+        let cache = self.inner.handles.lock().await;
+        if let Some(handle) = cache.map.get(id.as_str()).cloned() {
+            return Ok(handle);
+        }
+        drop(cache);
         let resolved = self
             .inner
             .credentials
@@ -725,6 +844,10 @@ impl TenantRuntime {
             .find(|store| store.registration.id() == id)
             .ok_or(TenantError::Offline)?;
         let handle = open_runtime_store(&self.core, resolved).await?;
+        let mut cache = self.inner.handles.lock().await;
+        if let Some(existing) = cache.map.get(id.as_str()).cloned() {
+            return Ok(existing);
+        }
         cache.order.retain(|stored| stored != id.as_str());
         cache.order.push_back(id.as_str().to_owned());
         cache.map.insert(id.as_str().to_owned(), handle.clone());

@@ -8,7 +8,6 @@ import vm from "node:vm";
 class Element {
   constructor(tag = "div") {
     this.tag = tag;
-    this.children = [];
     this.textContent = "";
     this.disabled = false;
     this.listeners = {};
@@ -17,26 +16,53 @@ class Element {
       add(name) { classes.add(name); },
       remove(name) { classes.delete(name); },
       contains(name) { return classes.has(name); },
+      toggle(name, forced) {
+        if (forced === undefined) forced = !classes.has(name);
+        if (forced) classes.add(name); else classes.delete(name);
+        return forced;
+      },
     };
+    const childNodes = [];
+    this.children = new Proxy(childNodes, {
+      get(target, prop) {
+        if (prop === "unshift") return undefined;
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    this._childNodes = childNodes;
+    const dataset = {};
+    Object.defineProperty(this, "dataset", {
+      get: () => dataset,
+      set() {
+        throw new TypeError("Cannot set property dataset which has only a getter");
+      },
+      enumerable: true,
+      configurable: true,
+    });
   }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  append(...children) { this._childNodes.push(...children); }
+  prepend(...children) { this._childNodes.unshift(...children); }
+  replaceChildren(...children) { this._childNodes.length = 0; this._childNodes.push(...children); }
+  replaceWith(next) { this.replacedWith = next; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes = { ...(this.attributes || {}), [name]: value }; }
 }
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
-function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test" } = {}) {
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible" } = {}) {
   const elements = new Map();
   const document = {
+    visibilityState: visibility,
     documentElement: { dataset: {} },
     querySelector: () => ({}),
+    addEventListener() {},
     createElement: (tag) => new Element(tag),
     getElementById(id) {
       if (!elements.has(id)) {
         const element = new Element();
-        if (["sign-in", "updates"].includes(id)) element.classList.add("hidden");
+        if (["sign-in", "updates", "database-usage"].includes(id)) element.classList.add("hidden");
         elements.set(id, element);
       }
       return elements.get(id);
@@ -670,4 +696,102 @@ test("a policy edit abandoned after a failed prior read restores the recorded se
   assert.equal(select.value, "latest");
   await vm.runInContext("refresh()", view.context);
   assert.equal(select.value, "latest");
+});
+
+test("Database Usage shows independent physical databases and unknown allocation honestly", async () => {
+  const calls = [];
+  const view = page(async (url) => {
+    calls.push(url);
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    return { status: 200, ok: true, json: async () => ({ generated_at: Math.floor(Date.now() / 1000), databases: [
+      { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: Math.floor(Date.now() / 1000) },
+        percent_of_limit: 75, headroom_bytes: 250000000, status: "pressure" },
+      { id: "a".repeat(32), kind: "guild", policy: { kind: "shared" }, usage: null,
+        percent_of_limit: null, headroom_bytes: null, status: "unavailable" },
+    ] }) };
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  const text = textOf(view.elements.get("usage-cards"));
+  assert.match(text, /750\.00 MB/);
+  assert.match(text, /75\.00% of 1,000 MB/);
+  assert.match(text, /Shared guild database/);
+  assert.match(text, /Measurement unavailable/);
+  assert.match(text, /Headroom: unavailable/);
+  assert.ok(calls.includes("/api/database-usage"));
+});
+
+test("Database Usage does not paint cards if the tab hides during the fetch", async () => {
+  let release;
+  const usage = new Promise((resolve) => { release = resolve; });
+  const view = page(async (url) => {
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    await usage;
+    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1 }, percent_of_limit: 0, status: "normal" }], generated_at: 1 }) };
+  });
+  const pending = vm.runInContext('selectView("usage")', view.context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  view.context.document.visibilityState = "hidden";
+  release();
+  await pending;
+  assert.equal(textOf(view.elements.get("usage-cards")), "");
+});
+
+test("Database Usage marks retained cards stale when refresh fails", async () => {
+  let fail = false;
+  const view = page(async (url) => {
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    if (fail) throw new Error("usage unavailable");
+    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 }, percent_of_limit: 0.1, status: "normal" }], generated_at: 1 }) };
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  fail = true;
+  await vm.runInContext('refreshUsage()', view.context);
+  const text = textOf(view.elements.get("usage-cards"));
+  assert.match(text, /Stale: the latest usage refresh failed/);
+  assert.match(view.elements.get("usage-status").textContent, /usage unavailable/);
+});
+
+test("Administration usage polling does not fetch while the tab is hidden", async () => {
+  const calls = [];
+  const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });
+  await vm.runInContext('selectView("usage")', view.context);
+  assert.deepEqual(calls, []);
+});
+
+test("Database Usage coalesces overlapping visible refreshes", async () => {
+  const calls = [];
+  let release;
+  const usage = new Promise((resolve) => { release = resolve; });
+  const view = page(async (url) => {
+    calls.push(url);
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    await usage;
+    return { status: 200, ok: true, json: async () => ({ databases: [], generated_at: 1 }) };
+  });
+  const first = vm.runInContext('selectView("usage")', view.context);
+  const second = vm.runInContext('refreshUsage()', view.context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls.filter((url) => url === "/api/database-usage").length, 1);
+  release();
+  await Promise.all([first, second]);
+});
+
+test("Database Usage renders disjoint physical groups and unknown guard status", () => {
+  const view = page();
+  const card = vm.runInContext(`renderUsage(${JSON.stringify({
+    id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
+    policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
+    usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,
+      categories: { snapshot_data_bytes: 1000000, moderation_evidence_data_bytes: 2000000,
+        configuration_data_bytes: 1000000, operational_data_bytes: 2000000,
+        index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } },
+    capture: { status: "unknown", configured_retention_hours: 24 },
+    application_admission: { bot_cross_process_guard: "unknown" },
+  })})`, view.context);
+  const content = textOf(card);
+  for (const label of ["Snapshot table", "Moderation and evidence tables", "Configuration tables",
+    "Operational tables", "Indexes", "Reusable pages", "System / unattributed",
+    "Bot growth guard: unknown", "External evidence file bytes: unavailable"]) {
+    assert.match(content, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
 });

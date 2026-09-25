@@ -30,9 +30,9 @@ fn restore_fence_blocks_primary_writes() {
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
         db.with_conn(|c| {
-            c.execute(
+            c.execute_bounded(
                 "INSERT INTO meta(key, value) VALUES ('restore_fence', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (),
+                (), 64 * 1024 * 1024,
             )?;
             Ok(())
         })
@@ -51,9 +51,10 @@ fn restore_fence_blocks_primary_writes() {
         );
         let error = db
             .with_conn(|c| {
-                c.execute(
+                c.execute_bounded(
                     "UPDATE meta SET value = 'blocked' WHERE key = 'schema_family'",
                     (),
+                    64 * 1024 * 1024,
                 )?;
                 Ok(())
             })
@@ -244,13 +245,13 @@ fn migration_archives_legacy_global_log_channels() {
     let tmp = tmp_db_path("archive_global_logchannels");
     let db = Db::open(&tmp, 2).unwrap();
     db.with_conn_sync(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (0, 'automod', 12345)",
-            (),
+            (), 64 * 1024 * 1024,
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch("DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';")?;
+        conn.execute_batch_bounded("DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -800,9 +801,10 @@ fn copy_guild_config_skips_invalid_badwords() {
     tokio_test_block_on(crate::db::add_badword(&db, 11, "scam", None)).unwrap();
     // Legacy row inserted past the gate (raw SQL) — copy must not propagate it.
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (11, ?1, NULL)",
             params![r"\w{100000}"],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -835,13 +837,15 @@ fn copy_badwords_refuses_all_invalid_and_preserves_destination() {
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(crate::db::add_badword(&db, 22, "keep-me", None)).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (11, ?1, NULL)",
             params![r"\w{100000}"],
+            64 * 1024 * 1024,
         )?;
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (11, ?1, NULL)",
             params!["a".repeat(crate::normalize::USER_REGEX_MAX_PATTERN_BYTES + 1)],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -898,9 +902,10 @@ fn copy_all_rolls_back_when_badwords_refuse() {
     tokio_test_block_on(crate::db::upsert_settings(&db, 11, &settings)).unwrap();
     tokio_test_block_on(crate::db::add_badword(&db, 22, "keep", None)).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (11, ?1, NULL)",
             params![r"\w{100000}"],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -937,7 +942,10 @@ fn guild_stats_are_scoped_not_global() {
     tokio_test_block_on(crate::db::record_ban(&db, g2, 4, Some(9), "spam")).unwrap();
     // No historical member/message tables are needed for guild stats.
     db.with_conn_sync(|conn| {
-        conn.execute_batch("DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS members;")?;
+        conn.execute_batch_bounded(
+            "DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS members;",
+            64 * 1024 * 1024,
+        )?;
         Ok(())
     })
     .unwrap();
@@ -980,9 +988,10 @@ fn moderation_stats_exclude_routine_and_unclassified_history() {
     }
     // Transitional rows can contain malformed JSON; they must not break stats.
     db.with_conn_sync(|conn| {
-        conn.execute_batch(
+        conn.execute_batch_bounded(
             "INSERT INTO events (guild_id,event_type,data,created_at)
              VALUES (11,'automod','invalid',''), (11,'plan_executed',NULL,'');",
+            64 * 1024 * 1024,
         )?;
         Ok(())
     })
@@ -1074,6 +1083,73 @@ fn dual_process_local_share_config_version() {
         baseline + 1
     );
     cleanup_db(&tmp);
+}
+
+#[test]
+fn completed_core_opens_for_inspection_and_reclaim_above_scaled_growth_stop() {
+    let path = tmp_db_path("pressure_reconnect");
+    let bot_options = DbOpenOptions {
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    };
+    let initialized = Db::open_with(bot_options.clone()).unwrap();
+    initialized.with_conn_sync(|conn| {
+        conn.execute_rows(
+            "INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,9,3,'pressure','2026-01-01')",
+            (), 1,
+        )?;
+        conn.execute_rows("INSERT INTO rules(guild_id,rule_id,data) VALUES(42,'pressure','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO rules(guild_id,rule_id,data) VALUES(42,'pressure-delete','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO commands(guild_id,name,data) VALUES(42,'pressure','{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO guild_settings(guild_id,settings) VALUES(42,'{}')", (), 1)?;
+        conn.execute_rows("INSERT INTO badwords(id,guild_id,pattern) VALUES(5,42,'pressure')", (), 1)?;
+        Ok(())
+    }).unwrap();
+    let allocation = initialized
+        .with_conn_sync(|conn| crate::capacity::allocated_bytes(conn))
+        .unwrap();
+    drop(initialized);
+
+    crate::db_compat::with_test_default_capacity_limits(
+        allocation - 4096,
+        allocation + 80 * 1024 * 1024,
+        || {
+            let bot = Db::open_with(bot_options.clone()).expect("completed bot reconnect");
+            assert!(bot.capacity_runtime_status().startup_deferred);
+            let api = Db::open_with(DbOpenOptions {
+                migrate: false,
+                ..bot_options.clone()
+            })
+            .expect("API inspection reconnect");
+            assert!(!api.capacity_runtime_status().startup_deferred);
+            assert_eq!(api.read_terminal_defaults().unwrap().prefix, "!");
+            let ordinary = api.with_conn_sync(|conn| {
+                conn.execute_rows("INSERT INTO warns(guild_id,user_id,moderator_id,created_at) VALUES(42,10,3,'2026-01-01')", (), 1)?;
+                Ok(())
+            });
+            assert!(
+                ordinary
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capacity budget exhausted")
+            );
+            assert_eq!(tokio_test_block_on(clear_warns(&bot, 42, 9)).unwrap(), 1);
+            assert_eq!(tokio_test_block_on(clear_warns(&bot, 42, 9)).unwrap(), 0);
+            tokio_test_block_on(delete_rule(&bot, 42, "pressure-delete")).unwrap();
+            tokio_test_block_on(delete_badword(&bot, 5, 42)).unwrap();
+            let before = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert!(tokio_test_block_on(wipe_departed_directory_guild_data(&bot, 42)).unwrap());
+            let after = tokio_test_block_on(get_primary_versions(&bot)).unwrap();
+            assert_eq!(after.config, before.config + 1);
+            assert_eq!(after.slash, before.slash + 1);
+        },
+    );
+    cleanup_db(&path);
 }
 
 #[test]
@@ -1213,10 +1289,11 @@ fn query_events_heals_legacy_numeric_data_blobs() {
     let snow = 1329331947876479006i64;
     // Simulate a pre-fix row that stored snowflakes as JSON numbers.
     tokio_test_block_on(db.with_conn(move |conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
              VALUES (1, 'message_edit', NULL, NULL, ?1, 't')",
             params![format!(r#"{{"channel_id":{snow},"message_id":1}}"#)],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -1375,26 +1452,29 @@ fn heal_normalizes_legacy_blobs_and_preserves_intentional_overrides() {
         ))
         .unwrap();
         tokio_test_block_on(db.with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (99, ?1)",
                 params![serde_json::to_string(&GuildSettings::default())?],
+                64 * 1024 * 1024,
             )?;
             // Partial override — the durable intentional shape.
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (88, ?1)",
                 params![serde_json::to_string(&GuildSettingsOverride {
                     prefix: Some("!".into()),
                     bot_name: None,
                     retention_days: None,
                 })?],
+                64 * 1024 * 1024,
             )?;
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (77, ?1)",
                 params![serde_json::to_string(&GuildSettingsOverride {
                     prefix: Some("?".into()),
                     bot_name: Some(String::new()),
                     retention_days: Some(30),
                 })?],
+                64 * 1024 * 1024,
             )?;
             Ok(())
         }))
@@ -1448,9 +1528,10 @@ fn heal_normalizes_legacy_blobs_and_preserves_intentional_overrides() {
     ))
     .unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (66, ?1)",
             params![serde_json::to_string(&GuildSettings::default())?],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -1474,13 +1555,15 @@ fn heal_normalizes_global_and_clears_corrupt_rows() {
         // Replace seed with a legacy full hardcoded-default global blob
         // (old writers pinned every field).
         tokio_test_block_on(db.with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "UPDATE guild_settings SET settings = ?1 WHERE guild_id = 0",
                 params![serde_json::to_string(&GuildSettings::default())?],
+                64 * 1024 * 1024,
             )?;
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (55, ?1)",
                 params!["{not-json"],
+                64 * 1024 * 1024,
             )?;
             Ok(())
         }))
@@ -1554,9 +1637,10 @@ fn copy_refuses_all_invalid_badwords_before_writes() {
     let db = Db::open(&tmp, 2).unwrap();
     // Legacy row past the add gate — same shape that refuses a live copy.
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO badwords (guild_id, pattern, note) VALUES (11, ?1, NULL)",
             params![r"("],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -1586,13 +1670,14 @@ fn patch_settings_strips_legacy_materialized_fields() {
     .unwrap();
     // Simulate old writer: full effective blob stored as guild row.
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (77, ?1)",
             params![serde_json::to_string(&GuildSettingsOverride {
                 prefix: Some("g".into()),
                 bot_name: None,
                 retention_days: Some(14),
             })?],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -1882,9 +1967,10 @@ fn api_open_leaves_healing_to_bot_authority() {
     {
         let db = Db::open(&tmp, 2).unwrap();
         tokio_test_block_on(db.with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO guild_settings (guild_id, settings) VALUES (55, ?1)",
                 params!["{not-json"],
+                64 * 1024 * 1024,
             )?;
             Ok(())
         }))
@@ -1999,9 +2085,10 @@ fn terminal_defaults_come_from_durable_meta_not_process_config() {
         .unwrap();
         tokio_test_block_on(db.with_conn(|conn| {
             // Empty global override → effective falls through to terminal defaults.
-            conn.execute(
+            conn.execute_bounded(
                 "UPDATE guild_settings SET settings = '{}' WHERE guild_id = 0",
                 (),
+                64 * 1024 * 1024,
             )?;
             Ok(())
         }))
@@ -2040,9 +2127,10 @@ fn runtime_read_ignores_corrupt_settings_and_bot_heals_atomically() {
     let tmp = tmp_db_path("runtime_corrupt_clear");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (44, ?1)",
             params!["{not-json"],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -2094,9 +2182,10 @@ fn api_open_refuses_missing_terminal_defaults_meta() {
     let tmp = tmp_db_path("api_no_terminal_meta");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "DELETE FROM meta WHERE key = 'settings_terminal_defaults'",
             (),
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -2260,27 +2349,30 @@ fn nickname_outbox_migration_does_not_adopt_unbound_guild_nicknames() {
     let tmp = tmp_db_path("nickname_outbox_migration");
     let legacy = Connection::open(&tmp).unwrap();
     for (index, sql) in MIGRATIONS[..4].iter().enumerate() {
-        legacy.execute_batch(sql).unwrap();
+        legacy.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
         legacy
             .pragma_update(None, "user_version", (index + 1) as i64)
             .unwrap();
     }
     legacy
-        .execute(
+        .execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
             params![42i64, r#"{"bot_name":"Legacy nickname"}"#],
+            64 * 1024 * 1024,
         )
         .unwrap();
     legacy
-        .execute(
+        .execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
             params![43i64, r#"{"bot_name":""}"#],
+            64 * 1024 * 1024,
         )
         .unwrap();
     legacy
-        .execute(
+        .execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
             params![0i64, r#"{"bot_name":"Global nickname"}"#],
+            64 * 1024 * 1024,
         )
         .unwrap();
     drop(legacy);
@@ -2532,9 +2624,10 @@ fn bot_terminal_defaults_update_visible_without_api_restart() {
     })
     .unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "UPDATE guild_settings SET settings = '{}' WHERE guild_id = 0",
             (),
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -2715,17 +2808,17 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
     let tmp = tmp_db_path("readable_defaults");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute("DELETE FROM meta WHERE key = 'readable_log_defaults_v1'", ())?;
+        conn.execute_bounded("DELETE FROM meta WHERE key = 'readable_log_defaults_v1'", (), 64 * 1024 * 1024)?;
         for (event, old) in crate::defaults::legacy_log_templates() {
             for guild in [0, 123] {
-                conn.execute(
+                conn.execute_bounded(
                     "INSERT OR REPLACE INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)",
-                    params![guild, event, old],
+                    params![guild, event, old], 64 * 1024 * 1024,
                 )?;
             }
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO templates (guild_id, event_type, template) VALUES (456, ?1, ?2)",
-                params![event, format!("custom {old}")],
+                params![event, format!("custom {old}")], 64 * 1024 * 1024,
             )?;
         }
         let mut stats = crate::defaults::default_commands().into_iter().find(|c| c.name == "stats").unwrap();
@@ -2738,9 +2831,9 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
                 stats.permission = "everyone".into();
                 stats.description = "This server's retained moderation counts (records, warns, bans).".into();
             }
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT OR REPLACE INTO commands (guild_id, name, data) VALUES (?1, 'stats', ?2)",
-                params![guild, serde_json::to_string(&stats)?],
+                params![guild, serde_json::to_string(&stats)?], 64 * 1024 * 1024,
             )?;
         }
         Ok(())
@@ -2778,9 +2871,10 @@ fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
         // Even a deliberate reversion to old wording is retained after the one-time upgrade.
         db.with_conn(|conn| {
             let (event, old) = crate::defaults::legacy_log_templates()[0];
-            conn.execute(
+            conn.execute_bounded(
                 "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type=?2",
                 params![old, event],
+                64 * 1024 * 1024,
             )?;
             Ok(())
         })
@@ -2809,18 +2903,18 @@ fn attachment_delete_template_upgrade_preserves_customizations() {
     let tmp = tmp_db_path("attachment_delete_template");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute("DELETE FROM meta WHERE key = 'attachment_delete_template_v1'", ())?;
-        conn.execute(
+        conn.execute_bounded("DELETE FROM meta WHERE key = 'attachment_delete_template_v1'", (), 64 * 1024 * 1024)?;
+        conn.execute_bounded(
             "UPDATE templates SET template=?1 WHERE guild_id=0 AND event_type='message_delete'",
-            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
+            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE], 64 * 1024 * 1024,
         )?;
-        conn.execute(
+        conn.execute_bounded(
             "INSERT OR REPLACE INTO templates (guild_id,event_type,template) VALUES (123,'message_delete',?1)",
-            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
+            params![crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE], 64 * 1024 * 1024,
         )?;
-        conn.execute(
+        conn.execute_bounded(
             "INSERT OR REPLACE INTO templates (guild_id,event_type,template) VALUES (456,'message_delete','custom {content}')",
-            (),
+            (), 64 * 1024 * 1024,
         )?;
         Ok(())
     })).unwrap();
@@ -2867,15 +2961,17 @@ fn stats_default_upgrade_reaches_saved_guilds_after_presentation_marker() {
             } else {
                 stats.aliases = vec!["status".into()];
             }
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO commands(guild_id,name,data) VALUES (?1,'stats',?2)",
                 params![guild, serde_json::to_string(&stats)?],
+                64 * 1024 * 1024,
             )?;
         }
         stats.description = "Operator customized Stats".into();
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO commands(guild_id,name,data) VALUES (125,'stats',?1)",
             params![serde_json::to_string(&stats)?],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -2924,24 +3020,27 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     let tmp = tmp_db_path("readable_status_collision");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "DELETE FROM meta WHERE key = 'readable_log_defaults_v1'",
             (),
+            64 * 1024 * 1024,
         )?;
         let mut stats = crate::defaults::default_commands()
             .into_iter()
             .find(|c| c.name == "stats")
             .unwrap();
         stats.aliases.clear();
-        conn.execute(
+        conn.execute_bounded(
             "UPDATE commands SET data=?1 WHERE name='stats'",
             params![serde_json::to_string(&stats)?],
+            64 * 1024 * 1024,
         )?;
         stats.name = "custom".into();
         stats.aliases = vec!["STATUS".into()];
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO commands(guild_id,name,data) VALUES (123,'custom',?1)",
             params![serde_json::to_string(&stats)?],
+            64 * 1024 * 1024,
         )?;
         Ok(())
     }))
@@ -2953,7 +3052,11 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     assert!(parts.commands["custom"].matches("status"));
     // Restoring a deleted default on a later boot must not steal the alias either.
     tokio_test_block_on(db.with_conn(|conn| {
-        conn.execute("DELETE FROM commands WHERE name='stats'", ())?;
+        conn.execute_bounded(
+            "DELETE FROM commands WHERE name='stats'",
+            (),
+            64 * 1024 * 1024,
+        )?;
         Ok(())
     }))
     .unwrap();

@@ -12,6 +12,113 @@ fn remote_options() -> GuildStoreOptions {
     }
 }
 
+async fn retained_messages_survive_remote_reopen(
+    store: &GuildDataStore,
+    reopened: &GuildDataStore,
+    scope: &GuildDataScope,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let observation = |id, content: String| SnapshotObservation {
+        channel_id: 99,
+        message_id: id,
+        created_at_ms: now - 1_000,
+        observed_at_ms: now,
+        edit_at_ms: None,
+        coverage_epoch: 1,
+        fields: SnapshotFields {
+            content: Some(content),
+            author_id: Some(123),
+            attachments: Some(vec![]),
+            ..Default::default()
+        },
+    };
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), observation(1000, "before".into()))
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    let mut edit = observation(1000, "after".into());
+    edit.edit_at_ms = Some(now + 1);
+    edit.observed_at_ms = now + 1;
+    edit.coverage_epoch = 2;
+    edit.fields.author_id = None;
+    edit.fields.attachments = None;
+    let transition = reopened
+        .apply_snapshot_edit_existing(scope.clone(), edit)
+        .await
+        .unwrap();
+    assert_eq!(transition.outcome, SnapshotOutcome::Stored);
+    assert_eq!(
+        transition.before.unwrap().fields.content.as_deref(),
+        Some("before")
+    );
+    let after = transition.after.unwrap();
+    assert_eq!(after.fields.content.as_deref(), Some("after"));
+    assert_eq!(after.fields.attachments, Some(vec![]));
+    assert!(!after.continuous);
+    assert_eq!(
+        reopened
+            .take_snapshot(scope.clone(), 99, 1000, now + 2)
+            .await
+            .unwrap()
+            .unwrap()
+            .fields
+            .content
+            .as_deref(),
+        Some("after")
+    );
+    assert!(
+        store
+            .take_snapshot(scope.clone(), 99, 1000, now + 3)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Exercise a full Discord bulk-delete batch over real Hrana transport.
+    // This deliberately has no timing assertion: local-container latency is
+    // not evidence about the production Bunny endpoint.
+    let started = std::time::Instant::now();
+    let before = store.measure_usage(false).await.unwrap().allocated_bytes;
+    for id in 2000..2100 {
+        assert_eq!(
+            store
+                .observe_snapshot(scope.clone(), observation(id, "x".repeat(4096)))
+                .await
+                .unwrap(),
+            SnapshotOutcome::Stored
+        );
+    }
+    let allocated = store.measure_usage(false).await.unwrap().allocated_bytes;
+    let taken = reopened
+        .take_snapshots(scope.clone(), 99, (2000..2100).collect(), now + 4)
+        .await
+        .unwrap();
+    assert_eq!(taken.len(), 100);
+    for (offset, snapshot) in taken.into_iter().enumerate() {
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.message_id, 2000 + offset as i64);
+        assert_eq!(snapshot.fields.content.unwrap().len(), 4096);
+    }
+    assert!(
+        store
+            .take_snapshots(scope.clone(), 99, (2000..2100).collect(), now + 5)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    eprintln!(
+        "remote retained-message sample: 100 x 4KiB, allocation {before} -> {allocated} bytes, elapsed {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires its own empty disposable libSQL server"]
 async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
@@ -112,6 +219,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
+    retained_messages_survive_remote_reopen(&store, &reopened, &scoped).await;
     let case_id = CaseId::new();
     let limits = CaseLimits::default();
     let facts = CaseData {

@@ -355,7 +355,7 @@ async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
     f.enqueue(10, "atomic", unban(99)).await;
     let job = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
     assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
-    f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'test audit failure'); END")).await.unwrap();
+    f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER fail_audit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'test audit failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(
         finish_bot_action(&f.db, &job, "succeeded", "unbanned")
             .await
@@ -367,7 +367,7 @@ async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
             Ok(r.get(0)?)
         })?;
         assert_eq!(active, 2);
-        conn.execute_batch("DROP TRIGGER fail_audit")
+        conn.execute_batch_bounded("DROP TRIGGER fail_audit", 64 * 1024 * 1024)
     })
     .await
     .unwrap();
@@ -516,7 +516,7 @@ async fn failed_direct_config_write_does_not_supersede_pending_work() {
         .await
         .unwrap();
     let pending = f.enqueue(10, "rollback", channel(Some(100))).await;
-    f.db.with_conn(|conn|conn.execute_batch("CREATE TRIGGER fail_config_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'test failure'); END")).await.unwrap();
+    f.db.with_conn(|conn|conn.execute_batch_bounded("CREATE TRIGGER fail_config_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'test failure'); END", 64 * 1024 * 1024)).await.unwrap();
     assert!(
         upsert_log_channel(&f.db, 10, "member_join", 200)
             .await
@@ -571,7 +571,7 @@ async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomicall
         assert!(begin_bot_action(&f.db, &job, 1001).await.unwrap());
         let before = get_version_state(&f.db).await.unwrap();
         let generation = f.db.config_write_generation();
-        f.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER reject_clear_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'version write rejected'); END")).await.unwrap();
+        f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_clear_version BEFORE UPDATE ON meta WHEN NEW.key='config_version' BEGIN SELECT RAISE(ABORT,'version write rejected'); END", 64 * 1024 * 1024)).await.unwrap();
         if present {
             assert!(
                 finish_bot_action(&f.db, &job, "succeeded", "cleared")
@@ -582,9 +582,11 @@ async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomicall
             assert_eq!(list_log_channels(&f.db, 10).await.unwrap()[0].1, 100);
             assert_eq!(get_version_state(&f.db).await.unwrap(), before);
             assert_eq!(f.db.config_write_generation(), generation);
-            f.db.with_conn(|conn| conn.execute_batch("DROP TRIGGER reject_clear_version"))
-                .await
-                .unwrap();
+            f.db.with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_clear_version", 64 * 1024 * 1024)
+            })
+            .await
+            .unwrap();
         }
         // An absent mapping completes even when any version write would fail.
         assert!(

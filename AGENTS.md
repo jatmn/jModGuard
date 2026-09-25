@@ -31,17 +31,20 @@ Bot/API configuration remains available. The current baseline requires a fresh d
 or the recognized `jmodguard-core-1` family; see `docs/DATABASE-BASELINE.md`. Preserve
 family/version checks before bootstrap writes. Never adopt an unmarked old database.
 
-Routine collection of message text/attachments and member/user activity is retired.
-See `docs/LOGGING-DATA.md`. Historical archive tables and helpers are removed.
-Basic events report to Discord using supplied fields, with bounded delivery and no
-history reconstruction. Message-edit reports require Discord's `edited_timestamp`;
+The old general message archive and member/user activity collection are retired.
+The separate rolling guild-store snapshot records only eligible human messages for
+configured edit/delete logs, expires at most 24 hours after original creation, and
+is omitted from application backups. See `docs/LOGGING-DATA.md`. Historical archive
+tables and helpers remain removed. Basic reports use the last retained observation,
+with explicit gaps and bounded delivery; they never reconstruct Discord history.
+Message-edit reports require Discord's `edited_timestamp`;
 embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
 report is that one event. Leave logs may use bounded join timestamps already received
 with messages; never fetch a roster. Ban/unban display may use bounded recent audit
 lookup inside report admission; a gateway ban may use the same bounded lookup
 under the report concurrency limit after saving its row. Neither establishes
 durable case-source identity.
-General message caching stays disabled. Keep selected moderation
+General Serenity message caching stays disabled. Keep selected moderation
 records and moderation-plan summaries; routine plan/dry-run/log/delete observations do
 not create durable audit rows. Internal retention fields remain transitional with no
 collection effect. Unsupported databases are refused without changing application rows.
@@ -111,7 +114,7 @@ The guild-store catalog and `TenantRuntime` now route live isolated tenant data 
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Populated shared/dedicated
 moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 8. Identity,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 9. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write. The conductor still has no tenant routing.
 Stable/Nightly publication uses Release Please plus scheduled Buildkite Nightlies; complete

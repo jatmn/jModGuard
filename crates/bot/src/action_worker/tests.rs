@@ -263,9 +263,10 @@ async fn move_fence_racing_local_completion_blocks_the_write_transaction() {
 async fn move_fence_racing_unban_completion_blocks_local_mirror_writes() {
     let f = Fixture::new();
     f.db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now')",
             (),
+            65_536,
         )?;
         Ok(())
     })
@@ -318,9 +319,10 @@ async fn move_fence_racing_unban_completion_blocks_local_mirror_writes() {
 async fn copied_claim_can_dispatch_only_once_and_audit_is_atomic() {
     let f = Fixture::new();
     f.db.with_conn(|conn| {
-        conn.execute(
+        conn.execute_bounded(
             "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now'),(20,99,'now')",
             params![],
+            65_536,
         )?;
         Ok(())
     })
@@ -518,9 +520,10 @@ async fn uncertain_and_failed_discord_results_do_not_change_ban_mirror() {
     ] {
         let f = Fixture::new();
         f.db.with_conn(|conn| {
-            conn.execute(
+            conn.execute_bounded(
                 "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now')",
                 params![],
+                65_536,
             )?;
             Ok(())
         })
@@ -558,8 +561,8 @@ async fn uncertain_and_failed_discord_results_do_not_change_ban_mirror() {
 async fn failed_receipt_rolls_back_local_effects_without_resending_discord() {
     let f = Fixture::new();
     f.db.with_conn(|conn| {
-        conn.execute("INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now')", params![])?;
-        conn.execute("CREATE TRIGGER reject_action_audit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END", params![])?;
+        conn.execute_bounded("INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,99,'now')", params![], 65_536)?;
+        conn.execute_batch_bounded("CREATE TRIGGER reject_action_audit BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END", 65_536)?;
         Ok(())
     }).await.unwrap();
     let job = f.enqueue(10, "unban", unban(99)).await;

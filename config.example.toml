@@ -110,6 +110,11 @@ status = "moderating"
 # How often each process polls durable config_version (cross-process cache invalidation).
 # Env: JMODGUARD_CONFIG_POLL_SECS.
 config_poll_secs = 5
+# Capture starts automatically when a guild has message log destinations and
+# the schema, membership, content, and database capacity checks pass.
+# Set false to suspend routine message snapshots. Read at bot startup; restart to apply.
+# Env: JMODGUARD_MESSAGE_CAPTURE_ENABLED.
+message_capture_enabled = true
 
 [log]
 # tracing level: trace | debug | info | warn | error

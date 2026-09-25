@@ -90,7 +90,10 @@ async fn bunny_attempts_are_single_use_scoped_and_guard_generic_settlement() {
                 "UPDATE guild_bunny_evidence SET sha256=NULL",
                 "UPDATE guild_bunny_evidence SET sha256=printf('%064d',0)",
             ] {
-                assert!(c.execute_batch(sql).is_err(), "accepted {sql}");
+                assert!(
+                    c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),
+                    "accepted {sql}"
+                );
             }
             Ok(())
         })
@@ -178,28 +181,34 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
         SOURCE_SCHEMA,
         EVIDENCE_SCHEMA,
     ] {
-        raw.execute_batch(schema).unwrap();
+        raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
     }
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
+        64 * 1024 * 1024,
     )
     .unwrap();
-    raw.execute(
+    raw.execute_bounded(
         "INSERT INTO guild_bindings VALUES(10,?1)",
         params![p.revision()],
+        64 * 1024 * 1024,
     )
     .unwrap();
-    raw.execute_batch("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
-    raw.execute(
+    raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
+    raw.execute_bounded(
         "INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",
         params![case.as_str(), serde_json::to_string(&data(1)).unwrap()],
+        64 * 1024 * 1024,
     )
     .unwrap();
-    raw.execute("INSERT INTO guild_case_evidence VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,?2,?3,3,0,0,1,2,3,NULL)",params![case.as_str(),evidence.as_str(),storage.as_str()]).unwrap();
+    raw.execute_bounded("INSERT INTO guild_case_evidence VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,?2,?3,3,0,0,1,2,3,NULL)",params![case.as_str(),evidence.as_str(),storage.as_str()], 64 * 1024 * 1024).unwrap();
     raw.pragma_update(None, "user_version", 6).unwrap();
-    raw.execute_batch("CREATE INDEX guild_bunny_resource ON guild_case_evidence(storage_id)")
-        .unwrap();
+    raw.execute_batch_bounded(
+        "CREATE INDEX guild_bunny_resource ON guild_case_evidence(storage_id)",
+        64 * 1024 * 1024,
+    )
+    .unwrap();
     assert!(GuildDataStore::initialize(f.options(), reg.clone()).is_err());
     assert_eq!(
         raw.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
@@ -212,7 +221,7 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
         ))
         .is_err()
     );
-    raw.execute_batch("DROP INDEX guild_bunny_resource")
+    raw.execute_batch_bounded("DROP INDEX guild_bunny_resource", 64 * 1024 * 1024)
         .unwrap();
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
