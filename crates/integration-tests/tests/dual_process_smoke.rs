@@ -148,10 +148,10 @@ fn wait_status(
     deadline: std::time::Instant,
 ) -> String {
     loop {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if text == expected {
-                return text;
-            }
+        if let Ok(text) = std::fs::read_to_string(path)
+            && text == expected
+        {
+            return text;
         }
         if let Some(status) = child.try_wait().unwrap() {
             let logged = std::fs::read_to_string(log).unwrap_or_default();
