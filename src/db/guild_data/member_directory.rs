@@ -1177,6 +1177,10 @@ impl GuildDataStore {
                     tx.execute("UPDATE guild_member_directory SET ban_observed_at_ms=?4,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
                     if let Some((username,global_name))=&identity { update_ban_identity(&tx,&scope,user_id,username,global_name)?; }
                     if banned { close_current_for_ban(&tx,&scope,user_id,observed_at_ms)?; }
+                    if order_uncertain {
+                        let revision: i64 = tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), user_id], |r| Ok(r.get(0)?))?;
+                        queue_target_check_tx(&tx, &scope, user_id, MemberVerifyKind::Ban, "ban_order_uncertain", revision, observed_at_ms)?;
+                    }
                     bump_revision(&tx,&scope)?;tx.commit()?;return Ok(true)
                 }
             }

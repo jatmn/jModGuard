@@ -402,6 +402,8 @@ pub struct BotState {
     /// Increments on each Gateway READY. Resume does not change it.
     pub(crate) gateway_ready_generation: AtomicU64,
     ban_observations: Mutex<HashSet<(u64, u64)>>,
+    /// Shards that have already delivered READY in this process.
+    ready_shards: Mutex<HashSet<u32>>,
 }
 
 impl BotState {
@@ -460,6 +462,7 @@ impl BotState {
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
             ban_observations: Mutex::new(HashSet::new()),
+            ready_shards: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -542,6 +545,15 @@ impl BotState {
 
     pub(crate) fn end_ban_observation(&self, guild_id: u64, user_id: u64) {
         self.ban_observations.lock().remove(&(guild_id, user_id));
+    }
+
+    /// A shard's first READY is startup. A later READY from that same shard is
+    /// a replaced session and advances the coverage-gap generation.
+    pub(crate) fn note_shard_ready(&self, shard_id: u32) {
+        if !self.ready_shards.lock().insert(shard_id) {
+            self.gateway_ready_generation
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn remember_application_audit(

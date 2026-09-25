@@ -4533,3 +4533,97 @@ async fn newer_local_ban_after_unban_still_requests_a_polarity_check() {
     assert_eq!(check.user_id, 65);
     assert_eq!(check.reason, "ban_order_uncertain");
 }
+
+#[tokio::test]
+async fn contested_repeat_of_the_current_polarity_still_requests_a_check() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store.observe_unban(scope.clone(), 70, 4_000).await.unwrap();
+    store
+        .observe_unban_contested(scope.clone(), 70, 5_000, "User".into(), None)
+        .await
+        .unwrap();
+    let member = store.get_member(scope.clone(), 70).await.unwrap().unwrap();
+    assert!(!member.is_banned);
+    let check = store
+        .next_member_target_check(scope.clone(), 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.user_id, 70);
+    assert_eq!(check.reason, "ban_order_uncertain");
+}
+
+#[tokio::test]
+async fn linking_an_audit_that_is_already_attached_still_retains_the_unban() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    departed_member(&store, &scope, 71).await;
+    let app_source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    let case_id = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case_id.clone(),
+            CaseData {
+                source: app_source.clone(),
+                action: CaseAction::Unban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 71,
+                actor_id: Some(42),
+                occurred_at_ms: 2_500,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .link_case_source(
+            scope.clone(),
+            case_id.clone(),
+            app_source.clone(),
+            CaseSource::DiscordAudit { entry_id: 9004 },
+        )
+        .await
+        .unwrap();
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute(
+                "UPDATE guild_member_directory SET ever_banned=0 WHERE guild_id=10 AND user_id=71",
+                (),
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    store
+        .link_case_source(
+            scope.clone(),
+            case_id,
+            app_source,
+            CaseSource::DiscordAudit { entry_id: 9004 },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_member(scope, 71)
+            .await
+            .unwrap()
+            .unwrap()
+            .ever_banned
+    );
+}

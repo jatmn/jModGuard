@@ -85,7 +85,14 @@ impl GuildDataStore {
             }
             if let Some(existing) = source_match(&tx, &scope, &key)? {
                 anyhow::ensure!(existing.id == id, CaseError::Conflict);
-                if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
+                if audit_entry_id.is_some() && !parent.removed {
+                    tx.ensure_mutation_receipt()?;
+                    super::member_directory::retain_confirmed_ban_history(&tx, &scope, &key)?;
+                    if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
+                        tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
+                    }
+                    tx.commit()?;
+                } else if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
                     tx.ensure_mutation_receipt()?;
                     tx.execute("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id])?;
                     tx.commit()?;
