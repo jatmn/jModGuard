@@ -4270,3 +4270,266 @@ async fn gateway_ban_identity_updates_saved_names_without_losing_nickname_or_ord
     assert_eq!(refreshed.global_name, None);
     assert_eq!(refreshed.nickname.as_deref(), Some("Favorite Nick"));
 }
+
+async fn departed_member(store: &GuildDataStore, scope: &GuildDataScope, user_id: i64) {
+    complete_for_checks(store, scope).await;
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id,
+                username: Some(Some("Leaver".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(1_500),
+                observed_at_ms: 2_000,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .depart_member(scope.clone(), user_id, 2_500)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn audit_alias_before_recovery_retains_a_confirmed_unban() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 61).await;
+    let app_source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    let case_id = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case_id.clone(),
+            CaseData {
+                source: app_source.clone(),
+                action: CaseAction::Unban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 61,
+                actor_id: Some(42),
+                occurred_at_ms: 2_600,
+                reason: Some("command unban".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .get_member(scope.clone(), 61)
+            .await
+            .unwrap()
+            .unwrap()
+            .ever_banned
+    );
+    store
+        .link_case_source(
+            scope.clone(),
+            case_id,
+            app_source,
+            CaseSource::DiscordAudit { entry_id: 9001 },
+        )
+        .await
+        .unwrap();
+    let retained = store.get_member(scope.clone(), 61).await.unwrap().unwrap();
+    assert!(retained.ever_banned);
+    assert!(!retained.is_banned);
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 400_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn recovery_before_alias_and_attempted_unban_keep_retention_rules() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 62).await;
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), 3_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_audit_recovery_page(
+            scope.clone(),
+            claim,
+            vec![MemberAuditSnapshot {
+                entry_id: 9002,
+                user_id: 62,
+                executor_id: Some(42),
+                action: MemberAuditAction::Unban,
+                occurred_at_ms: 2_700,
+                reason: None,
+            }],
+            (None, true),
+            3_001,
+            15_000,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_member(scope.clone(), 62)
+            .await
+            .unwrap()
+            .unwrap()
+            .ever_banned
+    );
+    let app_source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    let case_id = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case_id.clone(),
+            CaseData {
+                source: app_source.clone(),
+                action: CaseAction::Unban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 62,
+                actor_id: Some(42),
+                occurred_at_ms: 2_700,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .link_case_source(
+            scope.clone(),
+            case_id,
+            app_source,
+            CaseSource::DiscordAudit { entry_id: 9002 },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_member(scope.clone(), 62)
+            .await
+            .unwrap()
+            .unwrap()
+            .ever_banned
+    );
+
+    departed_member(&store, &scope, 63).await;
+    let noop_source = CaseSource::Application {
+        operation_id: CaseId::new(),
+    };
+    let noop_case = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            noop_case.clone(),
+            CaseData {
+                source: noop_source.clone(),
+                action: CaseAction::Unban,
+                outcome: CaseOutcome::Attempted,
+                subject_id: 63,
+                actor_id: Some(42),
+                occurred_at_ms: 2_800,
+                reason: Some("already unbanned".into()),
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .link_case_source(
+            scope.clone(),
+            noop_case,
+            noop_source,
+            CaseSource::DiscordAudit { entry_id: 9003 },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .get_member(scope.clone(), 63)
+            .await
+            .unwrap()
+            .unwrap()
+            .ever_banned
+    );
+}
+
+#[tokio::test]
+async fn newer_local_ban_after_unban_still_requests_a_polarity_check() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store.observe_unban(scope.clone(), 64, 4_000).await.unwrap();
+    store
+        .observe_ban_contested(scope.clone(), 64, 5_000, "User".into(), None)
+        .await
+        .unwrap();
+    let member = store.get_member(scope.clone(), 64).await.unwrap().unwrap();
+    assert!(member.is_banned);
+    let check = store
+        .next_member_target_check(scope.clone(), 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.reason, "ban_order_uncertain");
+    assert_eq!(check.kind, MemberVerifyKind::Ban);
+    store
+        .settle_member_target_check(
+            scope.clone(),
+            check.clone(),
+            MemberVerification {
+                user_id: 64,
+                revision: check.revision,
+                kind: MemberVerifyKind::Ban,
+                present: true,
+                member: None,
+                ban: Some(MemberBanSnapshot {
+                    user_id: 64,
+                    username: None,
+                    global_name: None,
+                    reason: None,
+                }),
+            },
+            5_100,
+        )
+        .await
+        .unwrap();
+    store.observe_ban(scope.clone(), 65, 6_000).await.unwrap();
+    store
+        .observe_unban_contested(scope.clone(), 65, 7_000, "User".into(), None)
+        .await
+        .unwrap();
+    let member = store.get_member(scope.clone(), 65).await.unwrap().unwrap();
+    assert!(!member.is_banned);
+    let check = store
+        .next_member_target_check(scope.clone(), 7_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.user_id, 65);
+    assert_eq!(check.reason, "ban_order_uncertain");
+}

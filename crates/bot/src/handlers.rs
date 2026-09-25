@@ -119,6 +119,9 @@ fn warn_empty_content_once() {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
+        self.app
+            .gateway_ready_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             "logged in as {} ({} guilds, shard {})",
             ready.user.name,

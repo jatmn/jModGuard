@@ -27,6 +27,14 @@ enum ReadyWork {
     AuditRecovery,
 }
 
+fn coverage_gap_for_session(
+    newly_initialized: bool,
+    session_replaced: bool,
+    had_progress: bool,
+) -> bool {
+    had_progress && (newly_initialized || session_replaced)
+}
+
 fn due_work(
     status: &db::guild_data::MemberSyncStatus,
     now_ms: i64,
@@ -525,6 +533,7 @@ pub async fn run(
     sync_bot_id: Arc<AtomicI64>,
 ) {
     let mut initialized = HashSet::<(i64, String)>::new();
+    let mut seen_ready = app.gateway_ready_generation.load(Ordering::Relaxed);
     let mut backfilled = HashSet::<(i64, String)>::new();
     let mut offset = 0usize;
     let mut cleanup_offset = 0usize;
@@ -555,6 +564,9 @@ pub async fn run(
         // A conservative initial scheduling share: every cached guild may
         // compete for the single paced Discord request stream.
         let initial_scheduling_share = guilds.len() as u32;
+        let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
+        let session_replaced = ready_generation != seen_ready;
+        seen_ready = ready_generation;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut ready = Vec::new();
         let mut available = Vec::new();
@@ -631,15 +643,17 @@ pub async fn run(
                     }
                 }
             };
-            if newly_initialized
-                && (status.initial_completed_at.is_some() || status.last_progress_at.is_some())
-                && let Err(error) = store
-                    .mark_member_reconciliation_needed(
-                        scope.clone(),
-                        "gateway continuity interrupted",
-                        now_ms,
-                    )
-                    .await
+            if coverage_gap_for_session(
+                newly_initialized,
+                session_replaced,
+                status.initial_completed_at.is_some() || status.last_progress_at.is_some(),
+            ) && let Err(error) = store
+                .mark_member_reconciliation_needed(
+                    scope.clone(),
+                    "gateway continuity interrupted",
+                    now_ms,
+                )
+                .await
             {
                 initialized.remove(&(gid, enrollment.id.clone()));
                 tracing::warn!(
@@ -1218,6 +1232,15 @@ mod tests {
             retry_reason_with_rate_limit(&error, &deadline),
             ("discord_unavailable", false)
         );
+    }
+
+    #[test]
+    fn replaced_ready_marks_a_gap_without_treating_resume_as_a_new_session() {
+        assert!(!coverage_gap_for_session(false, false, true));
+        assert!(coverage_gap_for_session(true, false, true));
+        assert!(coverage_gap_for_session(false, true, true));
+        assert!(!coverage_gap_for_session(false, true, false));
+        assert!(!coverage_gap_for_session(true, true, false));
     }
 
     #[test]

@@ -399,6 +399,9 @@ pub struct BotState {
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pending_audit_links: Mutex<PendingAuditLinks>,
     pending_member_gaps: Mutex<PendingMemberGaps>,
+    /// Increments on each Gateway READY. Resume does not change it.
+    pub(crate) gateway_ready_generation: AtomicU64,
+    ban_observations: Mutex<HashSet<(u64, u64)>>,
 }
 
 impl BotState {
@@ -455,6 +458,8 @@ impl BotState {
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
+            gateway_ready_generation: AtomicU64::new(0),
+            ban_observations: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -527,6 +532,16 @@ impl BotState {
 
     pub(crate) fn acknowledge_member_gap(&self, gap: &PendingMemberGap) {
         self.pending_member_gaps.lock().acknowledge(gap);
+    }
+
+    /// Returns whether another ban or unban callback for this user is already
+    /// inside its handler. Local start time is not Gateway order.
+    pub(crate) fn begin_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
+        !self.ban_observations.lock().insert((guild_id, user_id))
+    }
+
+    pub(crate) fn end_ban_observation(&self, guild_id: u64, user_id: u64) {
+        self.ban_observations.lock().remove(&(guild_id, user_id));
     }
 
     pub(crate) fn remember_application_audit(

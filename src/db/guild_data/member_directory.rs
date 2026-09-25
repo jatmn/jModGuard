@@ -818,7 +818,7 @@ impl GuildDataStore {
             tx.ensure_mutation_receipt()?;
             if let Some(last)=&last {
                 tx.execute("INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT guild_id,enrollment_id,CAST(json_extract(payload,'$.subject_id') AS INTEGER),case_id,json_extract(payload,'$.action'),CAST(json_extract(payload,'$.occurred_at_ms') AS INTEGER) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id>?3 AND case_id<=?4 AND deleted=0 AND json_valid(payload)",params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_deref().unwrap_or(""),last.as_str()])?;
-                tx.execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) SELECT ?1,?2,CAST(json_extract(payload,'$.subject_id') AS INTEGER),1,MIN(CAST(json_extract(payload,'$.occurred_at_ms') AS INTEGER)) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id>?3 AND case_id<=?4 AND deleted=0 AND json_valid(payload) AND json_extract(payload,'$.outcome')='succeeded' AND (json_extract(payload,'$.action')='ban' OR (json_extract(payload,'$.action')='unban' AND (source_key LIKE 'discord:%' OR json_type(payload,'$.source.gateway_observation') IS NOT NULL))) GROUP BY CAST(json_extract(payload,'$.subject_id') AS INTEGER) HAVING true ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1",params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_deref().unwrap_or(""),last.as_str()])?;
+                tx.execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) SELECT ?1,?2,CAST(json_extract(payload,'$.subject_id') AS INTEGER),1,MIN(CAST(json_extract(payload,'$.occurred_at_ms') AS INTEGER)) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id>?3 AND case_id<=?4 AND deleted=0 AND json_valid(payload) AND json_extract(payload,'$.outcome')='succeeded' AND (json_extract(payload,'$.action')='ban' OR (json_extract(payload,'$.action')='unban' AND (source_key LIKE 'discord:%' OR json_type(payload,'$.source.gateway_observation') IS NOT NULL OR EXISTS(SELECT 1 FROM guild_case_sources s WHERE s.guild_id=guild_cases.guild_id AND s.enrollment_id=guild_cases.enrollment_id AND s.case_id=guild_cases.case_id AND s.source_kind=1)))) GROUP BY CAST(json_extract(payload,'$.subject_id') AS INTEGER) HAVING true ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1",params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_deref().unwrap_or(""),last.as_str()])?;
                 bump_revision(&tx,&scope)?;
             }
             let finished=count<limit;
@@ -1057,7 +1057,7 @@ impl GuildDataStore {
         user_id: i64,
         observed_at_ms: i64,
     ) -> Result<bool> {
-        self.set_ban(scope, user_id, observed_at_ms, true, None)
+        self.set_ban(scope, user_id, observed_at_ms, true, None, false)
             .await
     }
     pub async fn observe_unban(
@@ -1066,8 +1066,44 @@ impl GuildDataStore {
         user_id: i64,
         observed_at_ms: i64,
     ) -> Result<bool> {
-        self.set_ban(scope, user_id, observed_at_ms, false, None)
+        self.set_ban(scope, user_id, observed_at_ms, false, None, false)
             .await
+    }
+    pub async fn observe_ban_contested(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+        observed_at_ms: i64,
+        username: String,
+        global_name: Option<String>,
+    ) -> Result<bool> {
+        self.set_ban(
+            scope,
+            user_id,
+            observed_at_ms,
+            true,
+            Some((username, global_name)),
+            true,
+        )
+        .await
+    }
+    pub async fn observe_unban_contested(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+        observed_at_ms: i64,
+        username: String,
+        global_name: Option<String>,
+    ) -> Result<bool> {
+        self.set_ban(
+            scope,
+            user_id,
+            observed_at_ms,
+            false,
+            Some((username, global_name)),
+            true,
+        )
+        .await
     }
     pub async fn observe_ban_with_identity(
         &self,
@@ -1083,6 +1119,7 @@ impl GuildDataStore {
             observed_at_ms,
             true,
             Some((username, global_name)),
+            false,
         )
         .await
     }
@@ -1100,6 +1137,7 @@ impl GuildDataStore {
             observed_at_ms,
             false,
             Some((username, global_name)),
+            false,
         )
         .await
     }
@@ -1110,6 +1148,7 @@ impl GuildDataStore {
         observed_at_ms: i64,
         banned: bool,
         identity: Option<(String, Option<String>)>,
+        order_uncertain: bool,
     ) -> Result<bool> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(user_id > 0 && observed_at_ms > 0, MemberSyncError::Invalid);
@@ -1144,6 +1183,10 @@ impl GuildDataStore {
             tx.ensure_mutation_receipt()?;
             tx.execute("INSERT OR IGNORE INTO guild_member_directory(guild_id,enrollment_id,user_id,observed_at_ms,ever_banned) VALUES(?1,?2,?3,?4,1)",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
             tx.execute("UPDATE guild_member_directory SET is_banned=?4,ever_banned=1,current_ban_reason=CASE WHEN ?4 THEN current_ban_reason ELSE NULL END,cleanup_after_ms=NULL,observed_at_ms=MAX(observed_at_ms,?5),ban_observed_at_ms=?5,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,banned,observed_at_ms])?;
+            if order_uncertain {
+                let revision: i64 = tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3", params![scope.guild_id(), scope.enrollment.id.as_str(), user_id], |r| Ok(r.get(0)?))?;
+                queue_target_check_tx(&tx, &scope, user_id, MemberVerifyKind::Ban, "ban_order_uncertain", revision, observed_at_ms)?;
+            }
             if let Some((username,global_name))=&identity { update_ban_identity(&tx,&scope,user_id,username,global_name)?; }
             if banned { close_current_for_ban(&tx,&scope,user_id,observed_at_ms)?; }
             if banned {tx.execute("DELETE FROM guild_member_pending_bans WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id])?;}
@@ -1248,6 +1291,27 @@ fn settle_verified_state(
     Ok(())
 }
 
+pub(super) fn retain_confirmed_ban_history(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    source_key: &str,
+) -> Result<()> {
+    let row: Option<(i64, i64)> = conn.query_row(
+        "SELECT CAST(json_extract(c.payload,'$.subject_id') AS INTEGER), CAST(json_extract(c.payload,'$.occurred_at_ms') AS INTEGER) FROM guild_case_sources s JOIN guild_cases c USING(guild_id,enrollment_id,case_id) WHERE s.guild_id=?1 AND s.enrollment_id=?2 AND s.source_key=?3 AND c.deleted=0 AND json_valid(c.payload) AND json_extract(c.payload,'$.outcome')='succeeded' AND json_extract(c.payload,'$.action') IN ('ban','unban')",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), source_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((user_id, occurred_at_ms)) = row else {
+        return Ok(());
+    };
+    if user_id <= 0 || occurred_at_ms <= 0 {
+        return Ok(());
+    }
+    conn.execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1", params![scope.guild_id(), scope.enrollment.id.as_str(), user_id, occurred_at_ms])?;
+    bump_revision(conn, scope)?;
+    Ok(())
+}
+
 fn ingest_member_audits(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
@@ -1271,6 +1335,7 @@ fn ingest_member_audits(
         };
         let key = source.key()?;
         if super::case_sources::source_match(conn, scope, &key)?.is_some() {
+            retain_confirmed_ban_history(conn, scope, &key)?;
             unchanged += 1;
             continue;
         }

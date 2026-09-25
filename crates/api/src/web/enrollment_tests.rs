@@ -10,6 +10,14 @@ struct DiscordStub {
     guilds: std::sync::Mutex<Vec<oauth::DiscordGuild>>,
     failed: AtomicBool,
     calls: AtomicUsize,
+    token_calls: AtomicUsize,
+    rate_limited: AtomicBool,
+    retry_after: std::sync::Mutex<String>,
+    body_retry_after: std::sync::Mutex<Option<f64>>,
+    /// First page is a full 200-guild page; the following page is HTTP 429.
+    limit_on_next_page: AtomicBool,
+    /// `fixture-token` is rejected until `/token` issues `refreshed-token`.
+    unauthorized_until_refresh: AtomicBool,
     retire_during_lookup: std::sync::Mutex<Option<db::Db>>,
     retire_destination_on_second_lookup: std::sync::Mutex<Option<db::Db>>,
 }
@@ -36,20 +44,57 @@ impl Fixture {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
             failed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            token_calls: AtomicUsize::new(0),
+            rate_limited: AtomicBool::new(false),
+            retry_after: std::sync::Mutex::new("2".into()),
+            body_retry_after: std::sync::Mutex::new(None),
+            limit_on_next_page: AtomicBool::new(false),
+            unauthorized_until_refresh: AtomicBool::new(false),
             retire_during_lookup: std::sync::Mutex::new(None),
             retire_destination_on_second_lookup: std::sync::Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handler = Arc::clone(&discord);
-        let routes = Router::new().route(
+        let token_handler = Arc::clone(&discord);
+        let routes = Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let handler = Arc::clone(&token_handler);
+                    async move {
+                        handler.token_calls.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "access_token": "refreshed-token",
+                            "refresh_token": "refreshed-refresh",
+                            "expires_in": 3600,
+                        }))
+                    }
+                }),
+            )
+            .route(
             "/guilds",
-            get(move |headers: HeaderMap| {
+            get(move |headers: HeaderMap, Query(query): Query<std::collections::HashMap<String, String>>| {
                 let handler = Arc::clone(&handler);
                 async move {
-                    assert_eq!(
-                        headers.get("authorization").unwrap(),
-                        "Bearer fixture-token"
+                    let bearer = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    if handler.unauthorized_until_refresh.load(Ordering::SeqCst)
+                        && bearer != "Bearer refreshed-token"
+                    {
+                        handler.calls.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            axum::http::HeaderMap::new(),
+                            Json(serde_json::json!({"error": "invalid token"})),
+                        )
+                            .into_response();
+                    }
+                    assert!(
+                        bearer == "Bearer fixture-token" || bearer == "Bearer refreshed-token",
+                        "{bearer}"
                     );
                     let call = handler.calls.fetch_add(1, Ordering::SeqCst);
                     if call == 1 {
@@ -69,13 +114,39 @@ impl Fixture {
                     if handler.failed.load(Ordering::SeqCst) {
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
+                            axum::http::HeaderMap::new(),
                             Json(serde_json::json!({"error":"offline"})),
-                        );
+                        )
+                            .into_response();
                     }
+                    if handler.limit_on_next_page.load(Ordering::SeqCst) && query.contains_key("after")
+                        || handler.rate_limited.load(Ordering::SeqCst)
+                    {
+                        let mut headers = axum::http::HeaderMap::new();
+                        let retry_after = handler.retry_after.lock().unwrap().clone();
+                        if !retry_after.is_empty() {
+                            headers.insert(
+                                axum::http::header::RETRY_AFTER,
+                                retry_after.parse().unwrap(),
+                            );
+                        }
+                        let mut body = serde_json::json!({"message": "You are being rate limited."});
+                        if let Some(seconds) = *handler.body_retry_after.lock().unwrap() {
+                            body["retry_after"] = serde_json::json!(seconds);
+                        }
+                        return (StatusCode::TOO_MANY_REQUESTS, headers, Json(body)).into_response();
+                    }
+                    let guilds = if handler.limit_on_next_page.load(Ordering::SeqCst) {
+                        (0..200).map(managed_guild).collect::<Vec<_>>()
+                    } else {
+                        handler.guilds.lock().unwrap().clone()
+                    };
                     (
                         StatusCode::OK,
-                        Json(serde_json::json!(*handler.guilds.lock().unwrap())),
+                        axum::http::HeaderMap::new(),
+                        Json(serde_json::json!(guilds)),
                     )
+                        .into_response()
                 }
             }),
         );
@@ -93,12 +164,18 @@ impl Fixture {
         let mut app = ApiState::new(cfg, db).unwrap();
         Arc::get_mut(&mut app).unwrap().oauth.guilds_endpoint =
             Some(format!("http://{address}/guilds"));
+        Arc::get_mut(&mut app).unwrap().oauth.token_endpoint =
+            Some(format!("http://{address}/token"));
         tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
         let store = MemoryStore::default();
         let session = Session::new(None, Arc::new(store.clone()), None);
         session.insert(SESSION_USER, 42u64).await.unwrap();
         session
             .insert(SESSION_TOKEN, "fixture-token")
+            .await
+            .unwrap();
+        session
+            .insert(SESSION_REFRESH, "fixture-refresh")
             .await
             .unwrap();
         session.save().await.unwrap();
@@ -461,7 +538,136 @@ async fn discord_failure_never_uses_cached_authority_or_retires_membership() {
     f.discord.failed.store(true, Ordering::SeqCst);
     let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
     assert!(!status.is_success());
+    assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert!(db::guild_enrollment(&f.app.db, 10).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn guild_list_rate_limit_is_temporary_and_does_not_refresh() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    *f.discord.body_retry_after.lock().unwrap() = Some(4.5);
+    let response = f
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/guilds/10/cases/case-1")
+                .header("cookie", &f.cookie)
+                .header("content-type", "application/json")
+                .header(
+                    "x-jmodguard-enrollment",
+                    db::guild_enrollment(&f.app.db, 10)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                )
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .unwrap(),
+        "5"
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(body["retry_after"], 5);
+    assert!(!body["error"].as_str().unwrap().contains("400"));
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    let (status, _) = f.request("POST", "/api/guilds/10/cases/case-1", "{}").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        1,
+        "cooldown must not send another guild-list request"
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    assert!(db::guild_enrollment(&f.app.db, 10).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn guild_list_rate_limit_on_later_page_does_not_authorize() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord.limit_on_next_page.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/guilds/10/cases/case-1", "{}").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    let (again, _) = f.request("POST", "/api/guilds/10/cases/case-1", "{}").await;
+    assert_eq!(again, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn concurrent_guild_checks_share_one_rate_limit() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let first = f.request("POST", "/api/guilds/10/cases/case-1", "{}");
+    let second = f.request("GET", "/api/guilds/10/config", "");
+    let ((left, _), (right, _)) = tokio::join!(first, second);
+    assert_eq!(left, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(right, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_guild_token_refreshes_once_and_server_errors_do_not() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+
+    f.discord.failed.store(true, Ordering::SeqCst);
+    f.discord
+        .unauthorized_until_refresh
+        .store(false, Ordering::SeqCst);
+    let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert!(!status.is_success());
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn revoked_permission_stays_denied_after_token_refresh() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord
+        .unauthorized_until_refresh
+        .store(true, Ordering::SeqCst);
+    f.discord.guilds.lock().unwrap().clear();
+    let (status, _) = f
+        .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"nope"}"#)
+        .await;
+    assert!(!status.is_success());
+    assert_ne!(
+        db::get_settings(&f.app.db, 10).await.unwrap().prefix,
+        "nope"
+    );
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

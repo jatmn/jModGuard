@@ -100,6 +100,24 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        if let Some(limit) = self.0.downcast_ref::<oauth::DiscordRateLimit>() {
+            let seconds = oauth::retry_after_header_secs(limit.retry_after);
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": limit.to_string(),
+                    "code": "discord_rate_limited",
+                    "retry_after": seconds,
+                })),
+            )
+                .into_response();
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+            return response;
+        }
         if let Some(key_error) = self.0.downcast_ref::<crate::bot_actions::RequestKeyError>() {
             let (status, code) = match key_error {
                 crate::bot_actions::RequestKeyError::EnrollmentChanged => {
@@ -256,11 +274,11 @@ async fn require_auth_with(
     // Authorization / cold display: always re-fetch guilds from Discord.
     // Fail closed — never authorize from a stale guild snapshot (MustRefresh).
     // User profile may stay cached; `can_manage` only needs guild membership.
-    let (access, guilds) = match app.oauth.my_guilds(&token).await {
+    let (access, guilds) = match app.oauth.my_guilds(user_id, &token).await {
         Ok(g) => (token.clone(), g),
-        Err(e) => {
+        Err(oauth::GuildListError::Unauthorized) => {
             tracing::warn!(
-                "webui auth: guilds fetch failed for user {user_id}: {e:#}; trying refresh"
+                "webui auth: guilds fetch unauthorized for user {user_id}; trying refresh"
             );
             let refresh = session
                 .get::<String>(SESSION_REFRESH)
@@ -273,16 +291,12 @@ async fn require_auth_with(
             if let Some(r) = &tok.refresh_token {
                 let _ = session.insert(SESSION_REFRESH, r).await;
             }
-            match app.oauth.my_guilds(&tok.access_token).await {
+            match app.oauth.my_guilds(user_id, &tok.access_token).await {
                 Ok(g) => (tok.access_token, g),
-                Err(e2) => {
-                    tracing::warn!(
-                        "webui auth: refresh guilds fetch failed for user {user_id}: {e2:#}"
-                    );
-                    return Err(ApiError(e2));
-                }
+                Err(error) => return Err(guild_list_failure(user_id, error)),
             }
         }
+        Err(error) => return Err(guild_list_failure(user_id, error)),
     };
 
     let user = match cached_user {
@@ -299,6 +313,23 @@ async fn require_auth_with(
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
+}
+
+fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
+    match error {
+        oauth::GuildListError::RateLimited { retry_after } => {
+            tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
+            ApiError(oauth::DiscordRateLimit { retry_after }.into())
+        }
+        oauth::GuildListError::Unauthorized => {
+            tracing::warn!("webui auth: guilds fetch still unauthorized for user {user_id}");
+            ApiError(anyhow::anyhow!("discord authorization failed"))
+        }
+        oauth::GuildListError::Failed(error) => {
+            tracing::warn!("webui auth: guilds fetch failed for user {user_id}: {error:#}");
+            ApiError(error)
+        }
+    }
 }
 
 fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {

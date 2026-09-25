@@ -371,40 +371,77 @@ pub async fn observe_ban(
     user: &User,
     observed_at_ms: i64,
 ) -> Option<bool> {
+    let user_id = user.id.get();
+    let contested = app.begin_ban_observation(guild_id, user_id);
+    let _end = BanObservation::new(app, guild_id, user_id);
     let (store, scope) = live_observation(
         app,
         guild_id,
-        Some(user.id.get() as i64),
+        Some(user_id as i64),
         "ban observation persistence unavailable",
     )
     .await?;
-    match store
-        .observe_ban_with_identity(
-            scope.clone(),
-            user.id.get() as i64,
-            observed_at_ms,
-            user.name.clone(),
-            user.global_name.clone(),
-        )
-        .await
-    {
+    let saved = if contested {
+        store
+            .observe_ban_contested(
+                scope.clone(),
+                user_id as i64,
+                observed_at_ms,
+                user.name.clone(),
+                user.global_name.clone(),
+            )
+            .await
+    } else {
+        store
+            .observe_ban_with_identity(
+                scope.clone(),
+                user_id as i64,
+                observed_at_ms,
+                user.name.clone(),
+                user.global_name.clone(),
+            )
+            .await
+    };
+    match saved {
         Ok(changed) => Some(changed),
         Err(error) => {
             tracing::warn!(
                 guild_id,
-                user_id = user.id.get(),
+                user_id,
                 "member ban observation failed: {error:#}"
             );
             mark_gap(
                 app,
                 &store,
                 scope,
-                Some(user.id.get() as i64),
+                Some(user_id as i64),
                 "ban observation persistence unavailable",
             )
             .await;
             None
         }
+    }
+}
+
+struct BanObservation<'a> {
+    app: &'a BotState,
+    guild_id: u64,
+    user_id: u64,
+}
+
+impl<'a> BanObservation<'a> {
+    fn new(app: &'a BotState, guild_id: u64, user_id: u64) -> Self {
+        Self {
+            app,
+            guild_id,
+            user_id,
+        }
+    }
+}
+
+impl Drop for BanObservation<'_> {
+    fn drop(&mut self) {
+        self.app.end_ban_observation(self.guild_id, self.user_id);
     }
 }
 
@@ -414,23 +451,38 @@ pub async fn observe_unban(
     user: &User,
     observed_at_ms: i64,
 ) -> Option<bool> {
+    let user_id = user.id.get();
+    let contested = app.begin_ban_observation(guild_id, user_id);
+    let _end = BanObservation::new(app, guild_id, user_id);
     let (store, scope) = live_observation(
         app,
         guild_id,
-        Some(user.id.get() as i64),
+        Some(user_id as i64),
         "unban observation persistence unavailable",
     )
     .await?;
-    match store
-        .observe_unban_with_identity(
-            scope.clone(),
-            user.id.get() as i64,
-            observed_at_ms,
-            user.name.clone(),
-            user.global_name.clone(),
-        )
-        .await
-    {
+    let saved = if contested {
+        store
+            .observe_unban_contested(
+                scope.clone(),
+                user_id as i64,
+                observed_at_ms,
+                user.name.clone(),
+                user.global_name.clone(),
+            )
+            .await
+    } else {
+        store
+            .observe_unban_with_identity(
+                scope.clone(),
+                user_id as i64,
+                observed_at_ms,
+                user.name.clone(),
+                user.global_name.clone(),
+            )
+            .await
+    };
+    match saved {
         Ok(changed) => Some(changed),
         Err(error) => {
             tracing::warn!(
