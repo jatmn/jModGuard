@@ -45,11 +45,21 @@ branch and the manual setup below is finished.
    a switch for Pullfrog's built-in mention dispatcher, turn it off too. The
    workflow's owner check is the final execution guard, including against
    mentions by other collaborators.
-4. Under account **Billing → Model usage**, choose **BYOK**. Add your OpenCode
-   Go key as the repository's GitHub Actions secret named `OPENCODE_API_KEY`;
-   the workflow already maps that secret only to the Pullfrog step. Choose an
-   **OpenCode Go** model in the repo's Agent settings. The key and model
-   configuration are account details and are not stored in this repository.
+4. Under account **Billing → Model usage**, choose **BYOK**. Add two
+   repository GitHub Actions secrets. The workflow maps both only onto the
+   Pullfrog step:
+   - `OPENCODE_API_KEY`: the OpenCode Go key.
+   - `PULLFROG_MODEL`: the full model id OpenCode Go serves, `opencode-go/<id>`.
+     The live catalog is [OpenCode Go models](https://opencode.ai/zen/go/v1/models).
+     Pullfrog's Agent picker is a shorter menu
+     ([Models](https://docs.pullfrog.com/models)). Put the id in this secret,
+     including a model that picker does not list. The pinned action reads
+     `PULLFROG_MODEL` before the console model and passes a non-curated
+     `provider/model` id through. Do not choose the model in Agent settings.
+     A `@pullfrog --model=...` comment does not select it either; this
+     standalone action does not resolve prompt flags. If `PULLFROG_MODEL` is
+     empty, the run falls back to the console model. Neither secret value is
+     stored in this repository.
 5. After setup, post one new `@pullfrog ...` comment yourself and confirm that
    exactly one `Pullfrog owner command` Actions job runs. Check that a comment
    by another account, or your own comment without an instruction, never
