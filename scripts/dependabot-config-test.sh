@@ -45,6 +45,14 @@ do
   require_contains "$yaml" "$needle"
 done
 
+for needle in \
+  "package-ecosystem: npm" \
+  'directory: "/tools/eslint"' \
+  "npm-minor-and-patch"
+do
+  require_contains "$yaml" "$needle"
+done
+
 require_absent "$yaml" "package-ecosystem: github-actions"
 require_absent "$yaml" "package-ecosystem: docker"
 require_absent "$yaml" '${{'
@@ -91,5 +99,9 @@ require_contains "$agents" "no GitHub Actions self-hosted"
 require_contains "$preflight" "bash scripts/dependabot-config-test.sh"
 require_contains "$preflight" "GitHub Actions workflows and GitHub-hosted CI runners are forbidden"
 require_contains "$preflight" "Dependabot Updates dynamic workflows are not CI"
+require_contains "$preflight" "npm audit --prefix tools/eslint --audit-level=high"
+require_contains "$agents" "npm audit --prefix tools/eslint --audit-level=high"
+require_contains "$buildkite" "npm audit --prefix tools/eslint --audit-level=high"
+require_contains "$development" "five open version-update PRs per ecosystem"
 
 echo 'dependabot-config-test: ok'

@@ -227,14 +227,22 @@ no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
 service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
-(`bash scripts/dependabot-config-test.sh`), frontend Node tests,
+(`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
+(`bash scripts/require-host-eslint-node.sh`, then `npm ci --ignore-scripts --prefix tools/eslint`,
+then `npm audit --prefix tools/eslint --audit-level=high`,
+then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=24` per
+`tools/eslint/package.json` `engines`),
+frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
 workspace test runs only the in-process smoke), the API build without default features,
 `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
-`cargo audit` cannot run). GitHub-hosted Dependabot Updates dynamic workflows
+`cargo audit` cannot run). `npm audit --prefix tools/eslint --audit-level=high`
+always fails the `frontend` group on a high or critical advisory and on an
+advisory-endpoint failure. There is no fail-open switch and no ignore list;
+an unfixable transitive advisory is handled by pinning or dropping that package. GitHub-hosted Dependabot Updates dynamic workflows
 are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled. This repository has no GitHub Actions self-hosted
 runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
 them after 24 hours. Do not register leftover Proxmox GHA runners or label

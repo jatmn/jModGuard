@@ -35,6 +35,8 @@ all="contracts frontend fmt api bot conductor runtime updater core integration b
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
 expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
+expect "contracts frontend" tools/eslint/package.json
+expect "contracts frontend" tools/eslint-web-selftest.sh
 expect "contracts fmt api boundaries integration supply-chain" crates/api/src/lib.rs
 expect "contracts fmt integration supply-chain" crates/integration-tests/tests/dual_process_smoke.rs
 expect "contracts fmt remote-database supply-chain" crates/integration-tests/tests/remote_database_smoke.rs

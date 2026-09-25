@@ -170,7 +170,7 @@ classify() {
       add contracts
       return
       ;;
-    scripts/frontend-state-test.mjs|scripts/frontend-contrast-test.mjs|scripts/frontend-warmup-test.mjs|scripts/publish-frontend-test.mjs|scripts/publish-frontend-bunny.sh|scripts/frontend_publication.sh|scripts/package-webui.mjs|scripts/package-webui-test.mjs|scripts/administration-state-test.mjs)
+    scripts/frontend-state-test.mjs|scripts/frontend-contrast-test.mjs|scripts/frontend-warmup-test.mjs|scripts/publish-frontend-test.mjs|scripts/publish-frontend-bunny.sh|scripts/frontend_publication.sh|scripts/package-webui.mjs|scripts/package-webui-test.mjs|scripts/administration-state-test.mjs|scripts/require-host-eslint-node.sh|tools/eslint/*|tools/eslint-web-selftest.sh)
       add frontend
       return
       ;;

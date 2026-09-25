@@ -1,0 +1,14 @@
+{
+  "name": "jmodguard-eslint-host",
+  "private": true,
+  "type": "module",
+  "description": "Host-only ESLint pin for jModGuard browser JavaScript. Not packaged into the WebUI.",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.11.0",
+    "globals": "17.12.0"
+  }
+}
