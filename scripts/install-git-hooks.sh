@@ -46,5 +46,5 @@ git -C "$root" config --worktree core.hooksPath .githooks
 git -C "$root" config --worktree jmodguard.preflight-base "$base_ref"
 echo "Installed .githooks for this worktree (core.hooksPath) with preflight base $base_ref."
 echo "Git will use only .githooks here (previous hook directories are not chained)."
-echo "Each hook runs the full bash scripts/ci-preflight.sh Buildkite test job."
+echo "Each hook runs the full bash scripts/ci-preflight.sh suite."
 echo "This does not add GitHub Actions."

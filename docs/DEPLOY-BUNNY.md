@@ -166,8 +166,10 @@ these files.
 
 ## 3. Build and publish both images
 
-Buildkite's self-hosted `linux` queue runs tests and publishes the bot/API
-images after both test jobs pass. This repository has no GitHub Actions CI or
+Buildkite's self-hosted `linux` queue runs the checks selected for that
+diff and publishes the bot/API images after those checks pass. Docs-only
+and other non-image diffs do not run the full Rust suite. Scheduled, tag,
+and manual publication builds still run every check. This repository has no GitHub Actions CI or
 image jobs or runner fallback. Dependabot version updates use GitHub-hosted
 dynamic workflows only while **Dependabot on self-hosted runners** stays
 disabled; they are not image publication. GitHub still displays the Buildkite status and a link to

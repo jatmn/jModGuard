@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local pre-commit: same gates as the Buildkite `test` job.
+# Local pre-commit: full bash scripts/ci-preflight.sh, not the path-selected CI groups.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 base_ref="$(git -C "$root" config --get jmodguard.preflight-base 2>/dev/null || true)"
