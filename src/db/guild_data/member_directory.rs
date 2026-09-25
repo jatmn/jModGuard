@@ -272,6 +272,23 @@ pub struct MemberSyncStatus {
     pub unseen_candidate_count: i64,
 }
 
+impl MemberSyncStatus {
+    pub fn audit_pagination_stalled(&self) -> bool {
+        self.audit_recovery_status.as_deref() == Some("needs_attention")
+            && self.audit_recovery_reason.as_deref() == Some("pagination_stalled")
+    }
+
+    pub fn allows_member_sync_retry(&self) -> bool {
+        self.audit_pagination_stalled()
+            || matches!(self.status.as_str(), "needs_attention" | "waiting")
+    }
+
+    /// True when a Retry on a completed import re-queued stalled audit recovery.
+    pub fn member_sync_retry_requeued_audit(&self) -> bool {
+        self.status == "complete" && self.audit_recovery_status.as_deref() == Some("queued")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MemberInitialEstimate {
     pub member_count: i64,
@@ -2367,7 +2384,7 @@ impl GuildDataStore {
             match action {
                 MemberSyncAction::Pause=>{tx.execute("UPDATE guild_member_sync SET status='paused',status_reason='paused by administrator',lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?2 WHERE guild_id=?1",params![scope.guild_id(),operation_key])?;}
                 MemberSyncAction::Resume|MemberSyncAction::Retry=>{
-                    if action==MemberSyncAction::Retry {tx.execute("UPDATE guild_member_audit_recovery SET status='queued',status_reason=NULL,next_attempt_at_ms=?2,request_after_ms=NULL,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled'",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,now_ms])?;}
+                    if action==MemberSyncAction::Retry {tx.execute("UPDATE guild_member_audit_recovery SET status='queued',status_reason=NULL,next_attempt_at_ms=?4,request_after_ms=NULL,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled'",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,now_ms])?;}
                     if state!="complete" {tx.execute("UPDATE guild_member_sync SET request_after_ms=CASE WHEN ?4=1 AND status_reason='permission_denied' THEN ?2 ELSE request_after_ms END,status='queued',status_reason=NULL,next_attempt_at_ms=?2,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?3 WHERE guild_id=?1",params![scope.guild_id(),now_ms,operation_key,action==MemberSyncAction::Retry])?;}
                     else {tx.execute("UPDATE guild_member_sync SET last_operation_key=?2,progress_revision=progress_revision+1 WHERE guild_id=?1",params![scope.guild_id(),operation_key])?;}
                 }

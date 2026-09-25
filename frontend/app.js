@@ -2203,6 +2203,12 @@ function tabMembers() {
   const aliveHere = () => !disposed && alive();
   const clearTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
   const clearCountdown = () => { if (countdownTimer !== null) clearTimeout(countdownTimer); countdownTimer = null; };
+  const auditPaginationStalled = (sync) =>
+    sync?.audit_recovery_status === "needs_attention" &&
+    sync?.audit_recovery_reason === "pagination_stalled";
+  const memberSyncRetryEnabled = (sync) =>
+    ["needs_attention", "waiting"].includes(sync?.status) ||
+    (sync?.status === "complete" && auditPaginationStalled(sync));
   const actionApplied = (sync, pending) => {
     if (!sync) return false;
     if (pending.state !== "succeeded") return false;
@@ -2318,7 +2324,7 @@ function tabMembers() {
       for (const [operation, label] of [["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry"], ["reconcile", "Reconcile from Discord"]]) {
         const disabled = !sync.run_id || !!pendingSyncAction || (operation === "pause" && !["queued", "running", "waiting"].includes(sync.status)) ||
           (operation === "resume" && sync.status !== "paused") ||
-          (operation === "retry" && !["needs_attention", "waiting"].includes(sync.status)) ||
+          (operation === "retry" && !memberSyncRetryEnabled(sync)) ||
           (operation === "reconcile" && (sync.status !== "complete" || !sync.initial_completed_at));
         controls.append(el("button", { class: "btn small", text: label, disabled, onclick: async () => {
           if (!latestStatus?.run_id) return;

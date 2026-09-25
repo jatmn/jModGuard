@@ -1376,6 +1376,52 @@ async fn stalled_pagination_needs_attention_and_stale_controls_do_not_overwrite_
 }
 
 #[tokio::test]
+async fn retry_requeues_audit_pagination_stall_after_initial_complete() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 5_000)
+        .await
+        .unwrap();
+    store.db.with_conn(|conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        tx.ensure_mutation_receipt()?;
+        tx.execute(
+            "UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",
+            (),
+        )?;
+        tx.execute(
+            "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=5000,last_success_at_ms=5000 WHERE guild_id=10",
+            (),
+        )?;
+        tx.execute(
+            "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
+             VALUES(10,(SELECT enrollment_id FROM guild_member_seed WHERE guild_id=10 LIMIT 1),42,'audit-run',5000,'needs_attention','pagination_stalled',0,0)
+             ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
+            (),
+        )?;
+        tx.commit()
+    }).await.unwrap();
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Retry,
+            "retry-audit-stall".into(),
+            6_000,
+        )
+        .await
+        .unwrap();
+    let status = store
+        .member_sync_status(scope.clone(), 42, 6_000)
+        .await
+        .unwrap();
+    assert_eq!(status.status, "complete");
+    assert_eq!(status.audit_recovery_status.as_deref(), Some("queued"));
+    assert_eq!(status.audit_recovery_reason, None);
+    assert!(status.audit_recovery_next_attempt_at.unwrap_or(0) >= 6_000);
+}
+
+#[tokio::test]
 async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion() {
     let (_f, store, scope) = ready().await;
     store

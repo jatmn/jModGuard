@@ -332,8 +332,19 @@ async fn execute_inner(
                     Ok(status)
                         if matches!(
                             operation,
+                            crate::bot_actions::MemberSyncOperation::Retry
+                        ) && status.status == "complete" =>
+                    {
+                        if status.member_sync_retry_requeued_audit() {
+                            Outcome::succeeded("member_sync_updated")
+                        } else {
+                            Outcome::succeeded("member_sync_already_completed")
+                        }
+                    }
+                    Ok(status)
+                        if matches!(
+                            operation,
                             crate::bot_actions::MemberSyncOperation::Resume
-                                | crate::bot_actions::MemberSyncOperation::Retry
                         ) && status.status == "complete" =>
                     {
                         Outcome::succeeded("member_sync_already_completed")

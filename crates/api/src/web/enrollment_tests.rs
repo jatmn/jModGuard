@@ -1165,6 +1165,90 @@ async fn member_sync_controls_reject_invalid_operations_before_queueing() {
 }
 
 #[tokio::test]
+async fn member_sync_retry_admits_audit_pagination_stall_after_initial_complete() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let enrollment_id = enrollment.id.clone();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let completed_at = chrono::Utc::now().timestamp_millis();
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db_path = std::path::PathBuf::from(guild_path.clone());
+    let guild_db = libsql::Builder::new_local(guild_db_path)
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=?1,last_success_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
+         VALUES(10,?1,42,'audit-run',?2,'needs_attention','pagination_stalled',0,0)
+         ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
+        libsql::params![enrollment_id.as_str(), completed_at],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(guild_db);
+
+    let path = "/api/guilds/10/member-sync/actions";
+    let retry = serde_json::json!({
+        "request_id": action_key("retry-audit-stall"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, queued) = f.request("POST", path, &retry).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE guild_member_audit_recovery SET status='complete',status_reason=NULL WHERE guild_id=10",
+            (),
+        )
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    let noop = serde_json::json!({
+        "request_id": action_key("retry-complete-no-stall"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &noop).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+}
+
+#[tokio::test]
 async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
     let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
     f.enroll(10).await;

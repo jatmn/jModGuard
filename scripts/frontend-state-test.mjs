@@ -635,6 +635,47 @@ test('Members keeps controls unavailable until a real first job exists and after
   assert.equal(controls()[0].disabled, false, 'Pause becomes available once the first run exists');
 });
 
+test('Members enables Retry when audit recovery pagination stalls after initial complete', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({
+      status: 'complete',
+      phase: 'complete',
+      run_id: 'initial-done',
+      progress_revision: 7,
+      initial_completed_at: 1790000000000,
+      audit_recovery_status: 'needs_attention',
+      audit_recovery_reason: 'pagination_stalled',
+    })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert.equal(retry.disabled, false);
+  const reconcile = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Reconcile from Discord');
+  assert.equal(reconcile.disabled, false);
+});
+
+test('Members keeps Retry disabled after initial complete when audit recovery is healthy', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({
+      status: 'complete',
+      phase: 'complete',
+      run_id: 'initial-done',
+      progress_revision: 7,
+      initial_completed_at: 1790000000000,
+      audit_recovery_status: 'complete',
+    })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert.equal(retry.disabled, true);
+});
+
 test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
   const asOf = 1790000000000;
   const statuses = [

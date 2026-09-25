@@ -560,6 +560,81 @@ async fn queued_retry_and_resume_after_initial_completion_keep_the_seed_checkpoi
 }
 
 #[tokio::test]
+async fn completed_retry_requeues_stalled_audit_recovery() {
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let enrollment_id = enrollment.id.clone();
+    let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+    let completed_at = chrono::Utc::now().timestamp_millis() - 1_000;
+    store
+        .initialize_member_directory(scope.clone(), 42, completed_at - 1_000)
+        .await
+        .unwrap();
+    let guild_path = std::path::PathBuf::from(format!("{}.guild.db", f.path.display()));
+    let guild_db = libsql::Builder::new_local(&guild_path)
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1,case_backfill_done=1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=?1,last_success_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
+         VALUES(10,?1,42,'audit-run',?2,'needs_attention','pagination_stalled',0,0)
+         ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
+        libsql::params![enrollment_id.as_str(), completed_at],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(guild_db);
+    let job = f
+        .enqueue(
+            10,
+            "retry-audit-stall",
+            Action::MemberSync {
+                operation: crate::bot_actions::MemberSyncOperation::Retry,
+            },
+        )
+        .await;
+    drain_with_state(
+        &app,
+        &MockDiscord {
+            bot_id: Some(42),
+            ..Default::default()
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("succeeded".into(), Some("member_sync_updated".into()))
+    );
+    let status = store
+        .member_sync_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert_eq!(status.audit_recovery_status.as_deref(), Some("queued"));
+}
+
+#[tokio::test]
 async fn revoked_permissions_never_dispatch() {
     let f = Fixture::new();
     let job = f.enqueue(10, "unban", unban(99)).await;

@@ -73,9 +73,7 @@ fn validate_member_sync_operation(
             matches!(status.status.as_str(), "queued" | "running" | "waiting")
         }
         MemberSyncOperation::Resume => status.status == "paused",
-        MemberSyncOperation::Retry => {
-            matches!(status.status.as_str(), "needs_attention" | "waiting")
-        }
+        MemberSyncOperation::Retry => status.allows_member_sync_retry(),
         MemberSyncOperation::Reconcile => {
             status.initial_completed_at.is_some() && status.status == "complete"
         }
