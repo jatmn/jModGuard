@@ -243,7 +243,8 @@ frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
 workspace test runs only the in-process smoke), the API build without default features,
-`cargo deny check bans licenses sources`, and
+`cargo deny check bans licenses sources`,
+`bash scripts/dylint.sh` (the Trail of Bits general lints pinned in `dylint.toml`), and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
 `cargo audit` cannot run). `npm audit --prefix tools/eslint --audit-level=high`
@@ -291,6 +292,7 @@ authorize live provider calls or require a Codex skill to contribute.
 
 ## Version pins (verified)
 
+- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source. The lint compiler is that library's nightly, not the 1.96.0 project pin.
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
   `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use

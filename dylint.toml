@@ -1,0 +1,31 @@
+# cargo-dylint reads [workspace.metadata.dylint] from this file.
+# Keeping the pin here leaves Cargo.toml cargo-native and makes the
+# lint-library cache key a hash of this file.
+#
+# cargo-dylint and dylint-link must match this tag. A library built by a
+# different dylint_linting version is refused.
+#
+# These are individual Trail of Bits general lints. Each one typechecks
+# with the toolchain in examples/general/rust-toolchain.toml
+# (nightly-2026-08-20 at v6.1.0). Project builds stay on rust-toolchain.toml.
+# scripts/dylint.sh denies warnings and allows `deprecated`, because that
+# nightly can rename an API the pinned project compiler still accepts.
+#
+# Not loaded:
+# - examples/general/non_thread_safe_call_in_test flags std::fs calls in
+#   tests that use a private temporary directory.
+# - examples/general/non_local_effect_before_unhandled_error flags
+#   intentional trim-then-reject helpers.
+#
+# Run: bash scripts/dylint.sh
+[[workspace.metadata.dylint.libraries]]
+git = "https://github.com/trailofbits/dylint"
+tag = "v6.1.0"
+pattern = [
+    "examples/general/abs_home_path",
+    "examples/general/await_holding_span_guard",
+    "examples/general/basic_dead_store",
+    "examples/general/crate_wide_allow",
+    "examples/general/incorrect_matches_operation",
+    "examples/general/wrong_serialize_struct_arg",
+]

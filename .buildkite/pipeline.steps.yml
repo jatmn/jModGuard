@@ -33,6 +33,13 @@ steps:
     timeout_in_minutes: 15
     command: bash .buildkite/with-cargo-auth.sh bash scripts/ci-preflight.sh --only fmt
 
+  # group: dylint
+  - label: "dylint"
+    key: dylint
+    if: __SELECTED__
+    timeout_in_minutes: 90
+    command: bash .buildkite/with-cargo-auth.sh bash scripts/ci-preflight.sh --only dylint
+
   # group: api
   - label: "api"
     key: api
@@ -179,6 +186,7 @@ steps:
       - boundaries
       - frontend
       - fmt
+      - dylint
       - publish-tests
       - bootstrap
       - pullfrog
@@ -259,6 +267,7 @@ steps:
       - boundaries
       - frontend
       - fmt
+      - dylint
       - publish-tests
       - bootstrap
       - pullfrog
