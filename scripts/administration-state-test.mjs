@@ -11,28 +11,35 @@ class Element {
     this.children = [];
     this.textContent = "";
     this.disabled = false;
+    this.listeners = {};
     const classes = new Set();
     this.classList = {
       add(name) { classes.add(name); },
       remove(name) { classes.delete(name); },
-      toggle(name, forced) { if (forced) classes.add(name); else classes.delete(name); },
       contains(name) { return classes.has(name); },
+      toggle(name, forced) {
+        if (forced === undefined) forced = !classes.has(name);
+        if (forced) classes.add(name); else classes.delete(name);
+        return forced;
+      },
     };
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
-  replaceWith() {}
-  addEventListener() {}
-  setAttribute() {}
+  replaceWith(next) { this.replacedWith = next; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes = { ...(this.attributes || {}), [name]: value }; }
 }
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
 function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible" } = {}) {
   const elements = new Map();
-  let interval;
   const document = {
     visibilityState: visibility,
+    documentElement: { dataset: {} },
+    querySelector: () => ({}),
+    addEventListener() {},
     createElement: (tag) => new Element(tag),
     getElementById(id) {
       if (!elements.has(id)) {
@@ -43,15 +50,18 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
       return elements.get(id);
     },
   };
+  const timers = new Map();
+  let nextTimer = 0;
   const context = vm.createContext({
     document,
-    window: { JMODGUARD_WEBUI_SHA: "a".repeat(40), JMODGUARD_API_BASE: apiBase, location: { origin } },
+    window: { JMODGUARD_WEBUI_SHA: "a".repeat(40), JMODGUARD_API_BASE: apiBase, location: { origin }, matchMedia: () => ({ matches: false, addEventListener() {} }) },
     fetch: fetchImpl,
-    setInterval(callback) { interval = callback; },
+    setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+    clearTimeout(id) { timers.delete(id); },
     Date,
   });
   vm.runInContext(source, context);
-  return { context, elements, interval };
+  return { context, elements, timers };
 }
 
 function find(element, predicate) {
@@ -93,7 +103,7 @@ function render(pageState, item) {
     components: [item], compatibility: { [item.component]: { installable: true } },
     apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
   };
-  vm.runInContext("snapshot = " + JSON.stringify(snapshot) + "; render();", pageState.context);
+  vm.runInContext("snapshot = " + JSON.stringify(snapshot) + "; stale = false; authorized = true; render();", pageState.context);
 }
 
 test("owner update controls require a current installable candidate", () => {
@@ -170,6 +180,506 @@ test("Administration carries the configured API origin through reads, controls, 
     /id="sign-in-link"/);
 });
 
+test("owner availability distinguishes baked source parity from channel mismatch", () => {
+  const view = page();
+  const api = record();
+  api.candidate.source_sha = api.observed.source_sha;
+  render(view, api);
+  const availability = () => {
+    const card = view.elements.get("update-cards").children[0];
+    return textOf(find(card, (element) => element.tag === "p" && textOf(element).startsWith("Availability:")));
+  };
+  assert.match(availability(), /no source update \(image digest unverified\)/);
+  api.channel = "nightly";
+  render(view, api);
+  assert.match(availability(), /unknown/);
+});
+
+test("owner cannot queue an already installed service release", () => {
+  const view = page();
+  const api = record();
+  api.installed = { ...api.candidate };
+  api.installed_launcher = { ...api.candidate };
+  render(view, api);
+  assert.equal(updateButton(view, "api").disabled, true);
+  assert.equal(updateButton(view, "api", true).disabled, true);
+
+  // A baked process with the same source SHA has no verified install digest.
+  api.installed = null;
+  api.installed_launcher = null;
+  api.candidate.source_sha = api.observed.source_sha;
+  render(view, api);
+  assert.equal(updateButton(view, "api").disabled, false);
+  assert.equal(updateButton(view, "api", true).disabled, false);
+
+  // A WebUI owner can retry a same-digest publication to repair Storage.
+  const webui = record("webui");
+  webui.installed = { ...webui.candidate };
+  render(view, webui);
+  assert.equal(updateButton(view, "webui").disabled, false);
+});
+
+function response(value, status = 200) {
+  return { status, ok: status === 200, json: async () => value };
+}
+function state(items) {
+  return { components: items, compatibility: Object.fromEntries(items.map((item) => [item.component, { installable: true }])),
+    apply_enabled: true, unattended_enabled: true, webui_storage_configured: true };
+}
+
+async function ready(fetchImpl) {
+  const view = page(fetchImpl);
+  await vm.runInContext("refresh()", view.context);
+  return view;
+}
+
+test("check applies its returned snapshot and reports failures without leaving enabled stale controls", async () => {
+  const api = record();
+  let unavailable = false;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/check") {
+      api.candidate.source_sha = api.observed.source_sha;
+      return response(state([api]));
+    }
+    if (unavailable) throw new Error("offline");
+    return response(state([api]));
+  });
+  const check = find(view.elements.get("update-cards"), (item) => item.tag === "button" && item.textContent === "Check now");
+  await check.listeners.click();
+  assert.match(textOf(view.elements.get("update-cards")), /no source update/);
+  unavailable = true;
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(updateButton(view, "api").disabled, true);
+  assert.match(view.elements.get("update-status").textContent, /offline/);
+  unavailable = false;
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(updateButton(view, "api").disabled, false);
+});
+
+test("application, launcher and WebUI installs show pending and automatically reconcile completion", async () => {
+  for (const [component, launcher] of [["api", false], ["bot", true], ["webui", false]]) {
+    const item = record(component);
+    const calls = [];
+    const view = await ready(async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      if (url === "/api/me") return response({ is_bot_owner: true });
+      if (url === "/api/updates/install") {
+        if (launcher) item.desired_launcher = item.candidate;
+        else { item.state = "queued"; item.desired = item.candidate; }
+        return response({ queued: true });
+      }
+      return response(state([item]));
+    });
+    await updateButton(view, component, launcher).listeners.click();
+    assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.equal(updateButton(view, component, launcher).disabled, true);
+    assert.equal([...view.timers.values()][0].delay, 2000);
+    if (launcher) item.installed_launcher = item.candidate;
+    else { item.state = "running"; item.installed = item.candidate; item.observed.source_sha = item.candidate.source_sha; }
+    await [...view.timers.values()][0].callback();
+    assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.doesNotMatch(view.elements.get("update-status").textContent, /Waiting for the component/);
+    assert.equal([...view.timers.values()][0].delay, 30000);
+    assert.equal(calls.filter((call) => call.url === "/api/me").length, 1);
+    assert.equal(calls.find((call) => call.url === "/api/updates/install").body.launcher, launcher || undefined);
+  }
+});
+
+test("queued acknowledgement uses the immediate status snapshot for api, bot, WebUI, and launcher", async () => {
+  const targets = [["api", false], ["bot", false], ["bot", true], ["webui", false]];
+  for (const outcome of ["pending", "success", "failed"]) {
+    for (const [component, launcher] of targets) {
+      const item = record(component);
+      let acknowledged = false;
+      const view = await ready(async (url) => {
+        if (url === "/api/me") return response({ is_bot_owner: true });
+        if (url === "/api/updates/install") { acknowledged = true; return response({ queued: true }); }
+        if (!acknowledged) return response(state([item]));
+        if (outcome === "pending") {
+          if (launcher) item.desired_launcher = item.candidate;
+          else { item.state = "queued"; item.desired = item.candidate; }
+        } else if (outcome === "success") {
+          if (launcher) item.installed_launcher = item.candidate;
+          else {
+            item.state = "running";
+            item.installed = item.candidate;
+            item.observed.source_sha = item.candidate.source_sha;
+          }
+        } else {
+          item.state = "failed";
+          item.last_error = "Storage authentication failed";
+        }
+        return response(state([item]));
+      });
+      await updateButton(view, component, launcher).listeners.click();
+      const banner = view.elements.get("update-status").textContent;
+      const card = textOf(view.elements.get("update-cards"));
+      assert.match(banner, /update request accepted/);
+      if (outcome === "pending") {
+        assert.match(banner, /Waiting for the component/);
+        assert.match(card, /Update pending/);
+      } else {
+        assert.doesNotMatch(banner, /Waiting for the component/);
+        if (outcome === "failed") assert.match(card, /Install failed: Storage authentication failed/);
+        else assert.doesNotMatch(card, /Update pending/);
+      }
+    }
+  }
+});
+
+test("a failed status read after a queued acknowledgement keeps the status error", async () => {
+  const item = record("webui");
+  let installed = false;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/install") { installed = true; return response({ queued: true }); }
+    if (installed) throw new Error("status offline");
+    return response(state([item]));
+  });
+  await updateButton(view, "webui").listeners.click();
+  const banner = view.elements.get("update-status").textContent;
+  assert.match(banner, /status offline/);
+  assert.doesNotMatch(banner, /Waiting for the component/);
+  assert.doesNotMatch(banner, /update request accepted/);
+});
+
+test("overlapping refreshes share one read and mutations wait for that read", async () => {
+  const item = record();
+  let releaseRead;
+  let block = false;
+  let installs = 0;
+  let reads = 0;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/install") { installs++; return response({ queued: true }); }
+    reads++;
+    if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
+    return response(state([item]));
+  });
+  block = true;
+  const first = vm.runInContext("refresh()", view.context);
+  const second = vm.runInContext("refresh()", view.context);
+  assert.equal(first, second);
+  const action = updateButton(view, "api").listeners.click();
+  assert.equal(installs, 0);
+  releaseRead(response(state([item])));
+  await action;
+  assert.equal(installs, 1);
+  assert.equal(reads, 3);
+});
+
+test("authorization loss hides the controls and stops automatic polling", async () => {
+  let lost = false;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    return lost ? response({ error: "bot owner required" }, 403) : response(state([record()]));
+  });
+  lost = true;
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+  assert.equal(view.timers.size, 0);
+});
+
+function findAll(element, predicate, found = []) {
+  if (predicate(element)) found.push(element);
+  for (const child of element.children || []) findAll(child, predicate, found);
+  return found;
+}
+
+test("a policy save keeps the sibling field from the refresh it waits for", async () => {
+  const item = record("bot");
+  item.channel = "stable";
+  item.cadence = "daily";
+  let releaseRead;
+  let block = false;
+  let saved;
+  const view = await ready(async (url, options) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") {
+      saved = JSON.parse(options.body);
+      Object.assign(item, saved);
+      return response(state([item]));
+    }
+    if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
+    return response(state([item]));
+  });
+  const [channel, cadence] = findAll(view.elements.get("update-cards"), (element) => element.tag === "select");
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  channel.value = "nightly";
+  const savingChannel = channel.listeners.change();
+  item.cadence = "weekly";
+  releaseRead(response(state([item])));
+  await Promise.all([reading, savingChannel]);
+  assert.deepEqual(saved, { component: "bot", channel: "nightly", cadence: "weekly" });
+
+  block = true;
+  const readingAgain = vm.runInContext("refresh()", view.context);
+  cadence.value = "monthly";
+  const savingCadence = cadence.listeners.change();
+  item.channel = "stable";
+  releaseRead(response(state([item])));
+  await Promise.all([readingAgain, savingCadence]);
+  assert.deepEqual(saved, { component: "bot", channel: "stable", cadence: "monthly" });
+});
+
+test("an install uses the candidate from the refresh it waits for", async () => {
+  let item = record("api");
+  let releaseRead;
+  let block = false;
+  let submitted;
+  const view = await ready(async (url, options) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/install") {
+      submitted = JSON.parse(options.body);
+      return response({ queued: true });
+    }
+    if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
+    return response(state([item]));
+  });
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  const saving = updateButton(view, "api").listeners.click();
+  item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) } };
+  releaseRead(response(state([item])));
+  await Promise.all([reading, saving]);
+  assert.equal(submitted.digest, item.candidate.digest);
+});
+
+test("policy changes use authoritative responses and latest switches automatic installation off", async () => {
+  const item = record("bot");
+  item.channel = "stable";
+  item.cadence = "daily";
+  let saved;
+  const view = await ready(async (url, options) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") {
+      saved = JSON.parse(options.body);
+      Object.assign(item, saved);
+    }
+    return response(state([item]));
+  });
+  const channel = find(view.elements.get("update-cards"), (element) => element.tag === "select");
+  channel.value = "latest";
+  await channel.listeners.change();
+  assert.deepEqual(saved, { component: "bot", channel: "latest", cadence: "off" });
+});
+
+test("pending installs surface terminal failures and leave Check now available for recovery", async () => {
+  const item = record("webui");
+  item.state = "queued";
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
+  const check = find(view.elements.get("update-cards"), (element) => element.tag === "button" && element.textContent === "Check now");
+  assert.equal(check.disabled, false);
+  item.state = "failed";
+  item.last_error = "Storage installation interrupted";
+  await [...view.timers.values()][0].callback();
+  assert.match(textOf(view.elements.get("update-cards")), /Needs attention/);
+  assert.match(textOf(view.elements.get("update-cards")), /Install failed: Storage installation interrupted/);
+  assert.equal(updateButton(view, "webui").disabled, false);
+});
+
+test("a failed policy save restores the server's channel and displays the error", async () => {
+  const item = record("api");
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") return response({ error: "policy rejected" }, 400);
+    return response(state([item]));
+  });
+  const select = find(view.elements.get("update-cards"), (element) => element.tag === "select");
+  select.value = "nightly";
+  await select.listeners.change();
+  assert.equal(find(view.elements.get("update-cards"), (element) => element.tag === "select").value, "latest");
+  assert.match(view.elements.get("update-status").textContent, /policy rejected/);
+});
+
+test("appearance changes even when browser storage is unavailable", () => {
+  const view = page();
+  const select = view.elements.get("appearance");
+  select.value = "dark";
+  select.listeners.change();
+  assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "dark");
+  select.value = "light";
+  select.listeners.change();
+  assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "light");
+});
+
+
+test("a queued older digest can still be superseded by the owner", () => {
+  const view = page();
+  const item = record("bot");
+  item.state = "queued";
+  item.desired = { ...item.candidate, digest: "sha256:" + "e".repeat(64) };
+  item.desired_launcher = { ...item.desired };
+  render(view, item);
+  assert.equal(updateButton(view, "bot").disabled, false);
+  assert.equal(updateButton(view, "bot", true).disabled, false);
+  item.desired = { ...item.candidate };
+  item.desired_launcher = { ...item.candidate };
+  render(view, item);
+  assert.equal(updateButton(view, "bot").disabled, true);
+  assert.equal(updateButton(view, "bot", true).disabled, true);
+});
+
+
+test("uptime uses compact day/hour/minute/second units without leading zero units", () => {
+  const view = page();
+  const now = 1800000000;
+  vm.runInContext(`Date = { now: () => ${now} * 1000 };`, view.context);
+  for (const [seconds, expected] of [[0, "0s"], [38, "38s"], [818, "13m 38s"],
+    [3608, "1h 0m 8s"]]) {
+    assert.equal(vm.runInContext(`uptime(${now - seconds})`, view.context), expected);
+  }
+  assert.equal(vm.runInContext(`uptime(${now - 94418})`, view.context), "1d 2h 13m 38s");
+  assert.equal(vm.runInContext("uptime(null)", view.context), "unknown");
+});
+
+
+test("service application and launcher requests reconcile independently after a sibling failure", async () => {
+  for (const component of ["api", "bot"]) {
+    const item = record(component);
+    item.desired = { ...item.candidate };
+    item.desired_launcher = { ...item.candidate };
+    item.state = "queued";
+    const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
+    item.desired_launcher = null;
+    item.state = "failed";
+    item.last_error = "launcher update: download failed";
+    await vm.runInContext("refresh()", view.context);
+    assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.match(textOf(view.elements.get("update-cards")), /launcher update: download failed/);
+    assert.equal([...view.timers.values()][0].delay, 2000);
+    assert.equal(updateButton(view, component).disabled, true);
+    assert.equal(updateButton(view, component, true).disabled, false);
+    // Owner can supersede a still-active application request with a different digest.
+    item.candidate = { ...item.candidate, digest: "sha256:" + "e".repeat(64) };
+    await vm.runInContext("refresh()", view.context);
+    assert.equal(updateButton(view, component).disabled, false);
+    item.installed = { ...item.desired };
+    item.state = "running";
+    item.last_error = null;
+    await vm.runInContext("refresh()", view.context);
+    assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.equal([...view.timers.values()][0].delay, 30000);
+    // The inverse outcome keeps a launcher pending after application failure.
+    item.desired = null;
+    item.desired_launcher = { ...item.candidate };
+    item.state = "failed";
+    item.last_error = "application download failed";
+    await vm.runInContext("refresh()", view.context);
+    assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.match(textOf(view.elements.get("update-cards")), /application download failed/);
+    assert.equal([...view.timers.values()][0].delay, 2000);
+    item.installed_launcher = { ...item.desired_launcher };
+    await vm.runInContext("refresh()", view.context);
+    assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+    assert.equal([...view.timers.values()][0].delay, 30000);
+  }
+});
+
+test("failed WebUI publication remains terminal even with a retained desired digest", async () => {
+  const item = record("webui");
+  item.desired = { ...item.candidate };
+  item.state = "failed";
+  item.last_error = "publication interrupted";
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
+  assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
+  assert.equal([...view.timers.values()][0].delay, 30000);
+  assert.equal(updateButton(view, "webui").disabled, false);
+});
+
+test("Browser version remains expanded or collapsed across status refreshes", async () => {
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
+  const details = () => find(view.elements.get("browser-version"), (element) => element.tag === "details");
+  details().open = true;
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(details().open, true);
+  details().open = false;
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(details().open, false);
+});
+
+test("transient initial access checks retry automatically but confirmed denials do not", async () => {
+  for (const failure of ["network", "server"]) {
+    let calls = 0;
+    const view = await ready(async (url) => {
+      if (url === "/api/me" && ++calls === 1) {
+        if (failure === "network") throw new Error("offline");
+        return response({ error: "starting" }, 503);
+      }
+      return response(url === "/api/me" ? { is_bot_owner: true } : state([record()]));
+    });
+    assert.equal([...view.timers.values()][0].delay, 30000);
+    await [...view.timers.values()][0].callback();
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
+    assert.equal(updateButton(view, "api").disabled, false);
+  }
+  for (const denial of [response({}, 401), response({}, 403), response({ is_bot_owner: false })]) {
+    let denied = true;
+    const view = await ready(async (url) => denied ? denial : response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
+    assert.equal(view.timers.size, 0);
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+    denied = false;
+    await view.elements.get("refresh-status").listeners.click();
+    assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
+    assert.equal(view.timers.size, 1);
+  }
+});
+
+test("refresh retains controls and disclosures while actions use the newest component record", async () => {
+  for (const component of ["api", "bot", "webui"]) {
+    let item = record(component);
+    let submitted;
+    const view = await ready(async (url, options) => {
+      if (url === "/api/me") return response({ is_bot_owner: true });
+      if (url === "/api/updates/install") {
+        submitted = JSON.parse(options.body);
+        return response({ queued: true });
+      }
+      return response(state([item]));
+    });
+    const card = view.elements.get("update-cards");
+    const install = updateButton(view, component);
+    const select = find(card, (el) => el.tag === "select");
+    const summary = find(card, (el) => el.tag === "summary");
+    const browserSummary = find(view.elements.get("browser-version"), (el) => el.tag === "summary");
+    item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) }, state: "queued", desired: { ...item.candidate } };
+    await [...view.timers.values()][0].callback();
+    assert.equal(updateButton(view, component), install);
+    assert.equal(find(card, (el) => el.tag === "select"), select);
+    assert.equal(find(card, (el) => el.tag === "summary"), summary);
+    assert.equal(find(view.elements.get("browser-version"), (el) => el.tag === "summary"), browserSummary);
+    assert.match(textOf(card), /Update pending/);
+    await install.listeners.click();
+    assert.equal(submitted.digest, item.candidate.digest);
+    assert.equal(submitted.component, component);
+  }
+});
+
+test("a policy edit abandoned after a failed prior read restores the recorded selection", async () => {
+  let failRead;
+  let block = false;
+  let writes = 0;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") writes++;
+    if (block) { block = false; return new Promise((_, reject) => { failRead = reject; }); }
+    return response(state([record()]));
+  });
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  const select = find(view.elements.get("update-cards"), (el) => el.tag === "select");
+  select.value = "stable";
+  const saving = select.listeners.change();
+  failRead(new Error("offline"));
+  await Promise.all([reading, saving]);
+  assert.equal(writes, 0);
+  assert.equal(select.value, "latest");
+  await vm.runInContext("refresh()", view.context);
+  assert.equal(select.value, "latest");
+});
+
 test("Database Usage shows independent physical databases and unknown allocation honestly", async () => {
   const calls = [];
   const view = page(async (url) => {
@@ -192,11 +702,10 @@ test("Database Usage shows independent physical databases and unknown allocation
   assert.ok(calls.includes("/api/database-usage"));
 });
 
-test("Administration polling stops while the tab is hidden", async () => {
+test("Administration usage polling does not fetch while the tab is hidden", async () => {
   const calls = [];
   const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });
   await vm.runInContext('selectView("usage")', view.context);
-  view.interval();
   assert.deepEqual(calls, []);
 });
 
@@ -236,43 +745,4 @@ test("Database Usage renders disjoint physical groups and unknown guard status",
     "Bot growth guard: unknown", "External evidence file bytes: unavailable"]) {
     assert.match(content, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
-});
-
-test("owner availability distinguishes baked source parity from channel mismatch", () => {
-  const view = page();
-  const api = record();
-  api.candidate.source_sha = api.observed.source_sha;
-  render(view, api);
-  const availability = () => {
-    const card = view.elements.get("update-cards").children[0];
-    return textOf(find(card, (element) => element.tag === "p" && textOf(element).startsWith("Availability:")));
-  };
-  assert.match(availability(), /no source update \(image digest unverified\)/);
-  api.channel = "nightly";
-  render(view, api);
-  assert.match(availability(), /unknown/);
-});
-
-test("owner cannot queue an already installed service release", () => {
-  const view = page();
-  const api = record();
-  api.installed = { ...api.candidate };
-  api.installed_launcher = { ...api.candidate };
-  render(view, api);
-  assert.equal(updateButton(view, "api").disabled, true);
-  assert.equal(updateButton(view, "api", true).disabled, true);
-
-  // A baked process with the same source SHA has no verified install digest.
-  api.installed = null;
-  api.installed_launcher = null;
-  api.candidate.source_sha = api.observed.source_sha;
-  render(view, api);
-  assert.equal(updateButton(view, "api").disabled, false);
-  assert.equal(updateButton(view, "api", true).disabled, false);
-
-  // A WebUI owner can retry a same-digest publication to repair Storage.
-  const webui = record("webui");
-  webui.installed = { ...webui.candidate };
-  render(view, webui);
-  assert.equal(updateButton(view, "webui").disabled, false);
 });

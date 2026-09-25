@@ -302,3 +302,46 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
   .editor-footer { align-items: stretch; }
   .editor-footer .row { flex-wrap: wrap; }
 }
+
+/* Owner Updates shares the workspace palette and daisyUI components. */
+.administration-page #content { max-width: 1440px; margin-inline: auto; padding: 32px; gap: 24px; }
+.administration-header, .administration-tools, .administration-overview, .administration-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.administration-header { padding-bottom: 24px; border-bottom: 1px solid var(--shell-border); }
+.administration-header h1 { font-size: 30px; margin: 6px 0 0; }
+.administration-overview h2 { margin: 0 0 6px; font-size: 20px; }
+.administration-overview p, .administration-card-heading p { margin: 0; }
+.administration-nav { display: flex; gap: 12px; flex-wrap: wrap; }
+.administration-page #update-cards, .administration-page #usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(350px, 100%), 1fr)); gap: 20px; align-items: start; }
+.administration-card, .administration-card .card-body { min-width: 0; }
+.administration-card .card-body { padding: 24px; gap: 16px; }
+.administration-card-heading { align-items: flex-start; }
+.administration-card-heading h2 { font-size: 20px; margin: 0 0 4px; }
+.administration-card-heading p, .administration-help { font-size: 12px; }
+.administration-badge { height: auto; min-height: 28px; padding: 5px 9px; white-space: normal; text-align: start; gap: 6px; font-size: 12px; }
+.administration-good { color: var(--good); background: var(--good-bg); border-color: var(--good-border); }
+.administration-warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-border); }
+.administration-bad { color: var(--bad); background: var(--bad-bg); border-color: var(--bad-border); }
+.administration-neutral { color: var(--muted); background: var(--panel2); border-color: var(--shell-border); }
+.administration-notice { padding: 14px 18px; border: 1px solid var(--shell-border); border-radius: 10px; margin: 0; overflow-wrap: anywhere; }
+.administration-detail { display: flex; flex-direction: column; gap: 4px; margin: 0; min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.administration-detail strong { color: var(--muted); font-size: 11px; font-weight: 650; }
+.administration-technical { border-block: 1px solid var(--shell-border); padding-block: 12px; }
+.administration-technical summary, .administration-browser summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 650; }
+.administration-technical .administration-detail, .administration-browser .administration-detail { margin-top: 12px; }
+.administration-technical .administration-detail span, .administration-browser .administration-detail span { font-family: ui-monospace, monospace; font-size: 12px; }
+.administration-actions { justify-content: flex-start; gap: 8px; flex-wrap: wrap; }
+.administration-actions .btn { height: auto; min-height: 34px; white-space: normal; }
+.administration-policy { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 0; padding: 16px 0 0; border: 0; border-top: 1px solid var(--shell-border); min-width: 0; }
+.administration-policy legend { padding-right: 8px; font-size: 12px; color: var(--muted); }
+.administration-policy .field { margin: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.administration-policy .select { max-width: 100%; }
+.administration-browser { display: flex; align-items: start; flex-wrap: wrap; gap: 12px; min-width: 0; overflow-wrap: anywhere; }
+.administration-browser details { flex: 1 1 300px; min-width: 0; }
+.administration-page #automatic-state { margin: 0; font-size: 13px; }
+@media (max-width: 600px) {
+  .administration-page #content { padding: 20px 16px; }
+  .administration-card .card-body { padding: 18px; }
+  .administration-tools { width: 100%; }
+}
+
+.administration-info { display: grid; gap: 16px; }
