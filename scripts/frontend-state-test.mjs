@@ -506,7 +506,7 @@ test('Members accepts a later primary restore status but rejects an older in-fli
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(statusReads, 3);
   assert.match(textOf(panel), /3 records committed in this run/);
-  assert.match(textOf(panel), /Coverage may be stale after an outage or restore/);
+  assert.match(textOf(panel), /Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement/);
   resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.match(textOf(panel), /3 records committed in this run/);
