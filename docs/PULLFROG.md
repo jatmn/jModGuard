@@ -7,6 +7,9 @@ top-level PR comments. It does not listen to inline PR review comments, which
 run GitHub workflows from a PR merge commit. It has no push, PR, schedule, or
 `workflow_dispatch` trigger. The Socket Security manifest scan is the separate
 workflow `.github/workflows/socket.yml`, and it does not listen for comments.
+Set the repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key
+before relying on the scan. The workflow fails until that secret exists, and
+the key is not stored in git.
 The agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
 starts with `@pullfrog` followed by a visible instruction on the same first

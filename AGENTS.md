@@ -210,7 +210,10 @@ Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
 Do not add GitHub Actions CI workflows. Allowed workflow files are the
 owner-command Pullfrog workflow (`docs/PULLFROG.md`) and the Socket Security
 manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
-Actions; it is not CI, image publication, or a Buildkite job.
+Actions; it is not CI, image publication, or a Buildkite job. Set the
+repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
+relying on the scan. The workflow fails until that secret exists, and the key
+is not stored in git.
 
 ```bash
 bash scripts/ci-preflight.sh

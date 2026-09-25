@@ -71,7 +71,9 @@ Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
 **disabled** so GitHub-hosted standard runners can execute the job. This
 repository has no GitHub Actions self-hosted runners; CI is Buildkite.
 The Socket Security manifest scan is `.github/workflows/socket.yml` on GitHub
-Actions. It is not CI.
+Actions. It is not CI. Set the repository Actions secret
+`SOCKET_SECURITY_API_KEY` to a Socket API key before relying on the scan. The
+workflow fails until that secret exists, and the key is not stored in git.
 Do not register leftover Proxmox GHA runners or label any runner
 `dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
 and the operator-copy contract.

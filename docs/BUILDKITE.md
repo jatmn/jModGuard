@@ -3,7 +3,10 @@
 All CI and image publication for this repository run on the self-hosted
 Buildkite `linux` queue. GitHub Actions workflow files are the owner-command
 Pullfrog agent (`docs/PULLFROG.md`) and the Socket Security manifest scan
-(`.github/workflows/socket.yml`). Neither is CI or an image publisher. There
+(`.github/workflows/socket.yml`). Neither is CI or an image publisher. Set the
+repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
+relying on the scan. The workflow fails until that secret exists, and the key
+is not stored in git. There
 are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the
@@ -54,7 +57,8 @@ advisory-database fetch/load errors) still fail the supply-chain check even on t
 fail-open path. The existing clone credential must also fetch tags and full commits from
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
-cache service. Do not add GitHub Actions CI workflows. An owner comment
+cache service. Do not add GitHub Actions CI workflows. The Socket Security
+manifest scan is not a CI workflow. An owner comment
 containing `@pullfrog` can start the hosted verifier job and use Actions
 minutes even when the agent rejects it as a non-command. Hosted Dependabot
 Updates are not CI and do not consume those minutes. If a Dependabot job stays queued on a `dependabot`

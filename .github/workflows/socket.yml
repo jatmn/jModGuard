@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   socket-security:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       issues: write
@@ -25,7 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          persist-credentials: false
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - uses: actions/setup-python@v5
