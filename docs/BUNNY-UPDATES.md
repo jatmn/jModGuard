@@ -2,6 +2,18 @@
 
 The owner opens **Administration → Updates** at `/administration/index.html` on the existing WebUI host. The page uses the existing Discord login and the API's owner check. It is not a separate conductor site or another container. The page shows the observed bot, API, and WebUI source SHAs, release publication times, install ages, failures, and available candidates. `Check now` refreshes one component; the API also checks all three every hour without an open browser. Discord `!stats`, `!status`, and `/stats` use cached observations and ship with Admin permission by default.
 
+The page shares the workspace's Light, Dark, and System appearance preference. Each
+component has a status badge, release controls, and expandable **Version & technical
+details** with full hashes. **Uptime** uses compact durations such as `13m 38s` or
+`1d 2h 13m 38s`. **Refresh status** reads the current recorded state;
+**Check now** performs release discovery. Status refreshes every 30 seconds when idle
+and every two seconds while a component or launcher update is pending. Controls stay
+disabled during an action or after a failed status refresh until a fresh read succeeds.
+An accepted update request is shown as pending, not as a completed installation.
+If the status read that follows the acknowledgement already shows success or failure,
+the page confirms only that the request was accepted and leaves that result on the card.
+When the installed WebUI differs from this tab, **Reload page** loads the new UI.
+
 ## Release and runtime model
 
 Buildkite publishes each component to its own GHCR package: `jmodguard-bot`, `jmodguard-api`, and `jmodguard-webui`. The owner controls default to the `latest` image published by trusted Buildkite builds; an ordinary `main` publication is sufficient, with no Stable or Nightly release build needed for on-demand checking and installation. The updater resolves that moving tag to an exact OCI digest before downloading. Stable and Nightly registry tags remain optional future discovery pointers. The WebUI image contains five static files under `webui/`. Bot/API images contain their baked application, a launcher, and `files.sha256` in the final COPY layer. The launcher downloads only the selected role binary from a verified image digest and checks it against that inventory. There is no second compiled bot/API release package, GitHub-to-Bunny push, or Bunny account API key.
@@ -10,7 +22,7 @@ The Bunny dashboard still selects the base bot/API images. Runtime updates chang
 
 On restart, the baked child's successful readiness clears any managed application digest and install time from the prior process. A pending selected release remains queued for reinstallation. The owner controls reject an application or launcher release that is already installed; a baked application with the same source SHA can still be switched on demand because its image digest has not been verified.
 
-For a dashboard-selected bot/API image, the running source SHA can match the checked release without a managed-install digest. Administration reports **no source update (image digest unverified)** in that case. Discord Stats shows ⚠️ for the same state. `first seen`/`Running since` describe the observed process age; a managed release install time remains unknown until this updater installs one. The status does not claim byte or OCI digest equality for a manually selected image.
+For a dashboard-selected bot/API image, the running source SHA can match the checked release without a managed-install digest. Administration reports **no source update (image digest unverified)** in that case. Discord Stats shows ⚠️ for the same state. `first seen`/`Uptime` describe the observed process age; a managed release install time remains unknown until this updater installs one. The status does not claim byte or OCI digest equality for a manually selected image.
 
 The update policy supports Off, Daily, Weekly, and Monthly UTC windows for promoted channels. `latest` allows owner-requested installs only; it cannot be assigned an automatic cadence. A missed hourly poll may run once in its current window. The same failed digest is never retried unattended; the owner can request it again. **Automatic installation is disabled by default** (`JMODGUARD_UNATTENDED_UPDATES` unset or `0`) and remains off while this repository is private. The separate `JMODGUARD_UPDATE_APPLY_ENABLED` and per-container `JMODGUARD_SELF_UPDATE` gates also default off. Do not enable them until the controlled Bunny rollout has passed. Stable/Nightly Git branches and their promotion policy are future work.
 
