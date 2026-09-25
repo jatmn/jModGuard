@@ -603,7 +603,7 @@ async fn copy_member_table(
         .contains(&table),
         "unsupported member table"
     );
-    if !table_exists(src, table).await? || !table_exists(dest, table).await? {
+    if !table_exists(src, table).await? {
         return Ok(());
     }
     // Later guild migrations add columns. Copy the names both schemas share so
