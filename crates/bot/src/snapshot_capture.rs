@@ -1397,6 +1397,16 @@ async fn update_health(
     }
 }
 
+fn acquire_report_slot(app: &BotState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match Arc::clone(&app.snapshots.report_slots).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            logging::record_delivery_failure(app);
+            None
+        }
+    }
+}
+
 fn submit_bulk_report(
     app: &Arc<BotState>,
     context: &Context,
@@ -1404,7 +1414,7 @@ fn submit_bulk_report(
     channel: ChannelId,
     transcript: logging::BulkTranscript,
 ) {
-    let Ok(permit) = Arc::clone(&app.snapshots.report_slots).try_acquire_owned() else {
+    let Some(permit) = acquire_report_slot(app) else {
         return;
     };
     let app = Arc::clone(app);
@@ -1416,7 +1426,7 @@ fn submit_bulk_report(
 }
 
 fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) {
-    let Ok(permit) = Arc::clone(&app.snapshots.report_slots).try_acquire_owned() else {
+    let Some(permit) = acquire_report_slot(app) else {
         return;
     };
     let app = Arc::clone(app);
@@ -1445,6 +1455,37 @@ mod tests {
         assert!(retained.content_truncated);
         assert_eq!(retained.content_original_bytes, Some(long.len() as i64));
         assert_eq!(retained.content.as_deref().unwrap().len(), MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn saturated_report_slots_increment_delivery_failures() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_report_slots_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let held: Vec<_> = (0..32)
+            .map(|_| {
+                app.snapshots
+                    .report_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        assert!(acquire_report_slot(&app).is_none());
+        assert_eq!(
+            app.log_delivery_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(held);
+        assert!(acquire_report_slot(&app).is_some());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

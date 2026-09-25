@@ -96,7 +96,8 @@ working state implements bounded exact-text and exact-image matching. Snapshot c
 starts automatically only after a captured guild membership, relevant log destination,
 observed content access and storage capacity are available. Set
 `bot.message_capture_enabled = false` (or `JMODGUARD_MESSAGE_CAPTURE_ENABLED=false`)
-to suspend capture. The bot excludes its own messages, other bots and webhooks;
+to suspend capture. The bot reads this process setting at startup; change it and
+restart the bot before capture stops. The bot excludes its own messages, other bots and webhooks;
 delivery filters do not narrow capture. Text is capped at 32 KiB UTF-8,
 attachment metadata at 16 KiB, and each encoded snapshot at 64 KiB, with truncation
 marked. Pending observations are capped at 4096 items and 16 MiB; overflow marks a

@@ -935,7 +935,7 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
             .is_some_and(|source| filter.channels.iter().any(|id| id == &source.to_string()))
 }
 
-fn record_delivery_failure(app: &BotState) {
+pub(crate) fn record_delivery_failure(app: &BotState) {
     let count = app
         .log_delivery_failures
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
