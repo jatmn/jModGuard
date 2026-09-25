@@ -248,6 +248,28 @@ cargo run -p jmodguard-bot   # migrates DB; Discord gateway
 cargo run -p jmodguard-api                         # waits ~30s locally / ~6m remote for bot migrate, then serves HTTP
 ```
 
+## Test quality and regression evidence
+
+Before implementing a fix, identify the accepted behavior, a credible failure,
+and an independent expected result. Extend existing cases where useful. For
+regressions, demonstrate failure before the fix and success afterward when feasible;
+confirm the failure reaches the intended assertion rather than unrelated setup.
+
+Use the smallest reliable test boundary for that failure, adding broader evidence
+when the risk crosses components. State which dependencies and processes are real:
+two service states in one process do not prove executable startup; a Node VM with a
+simulated DOM does not prove browser behavior; local SQLite or HTTP fixtures do not
+prove remote libSQL, Discord, or Bunny acceptance. Exercise the actual production
+owner rather than having a mock supply the effect the test claims to verify.
+
+Preserve useful unit, integration, static-boundary, and smoke tests. Before removing
+or consolidating coverage, identify the exact remaining cases, assertions, and CI
+routes, or explain which requirement is obsolete. Shared or parameterized cases can
+protect several entry points; neither test counts nor an E2E-only policy is the goal.
+Follow the existing preflight and relevant separate remote-database gates above;
+report unrun checks and simulated boundaries explicitly. These principles do not
+authorize live provider calls or require a Codex skill to contribute.
+
 ## Version pins (verified)
 
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
