@@ -64,7 +64,7 @@ these ignored tests at an existing installation or share one database between th
 Selected checks must pass before preparation and publication. A docs-only
 diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
-bootstrap, or remote-database jobs. A `frontend/` WebUI diff runs the frontend Node checks. `Dockerfile.webui`
+bootstrap, or remote-database jobs. A `frontend/` or `crates/conductor/frontend/` WebUI diff runs the frontend Node checks. `Dockerfile.webui`
 also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
 build, service-boundary, and dual-process checks. Shared `src/` and migrations run the Rust packages and the remote-database job.
 The root lockfile and toolchain do too, and they also run the publisher and
@@ -72,9 +72,13 @@ bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and
 manual `JMODGUARD_PUBLISH_SOURCE` builds run every check. A diff that
 cannot be computed also runs every check. Pull requests use the
-three-dot diff against the base branch. Other builds use the first-parent
-diff of `HEAD`, which is the whole pull request for a merge or squash and
-only the tip commit for a fast-forward of several commits. Skipped checks
+three-dot diff against the base branch. Other builds union every path
+changed between the previous `origin/<branch>` tip recorded before fetch and
+`BUILDKITE_COMMIT`. When that push range cannot be established on a `main`
+webhook build, every check group runs instead of classifying only the tip
+commit. Cargo-wrapped Buildkite steps each use an isolated
+`target-<step-key>` directory via `bash .buildkite/with-cargo-auth.sh`.
+Skipped checks
 are uploaded with `if: "false"` so publication still runs; the publisher
 then skips unchanged images. Local git hooks still run the full
 `bash scripts/ci-preflight.sh` without `--only`. Prepare and publish

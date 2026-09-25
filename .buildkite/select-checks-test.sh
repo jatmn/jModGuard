@@ -41,6 +41,8 @@ expect "contracts fmt remote-database" crates/integration-tests/tests/remote_dat
 expect "contracts frontend publish-tests" Dockerfile.webui
 expect "contracts fmt bot boundaries integration" crates/bot/src/main.rs
 expect "contracts fmt conductor boundaries" crates/conductor/src/install.rs
+expect "contracts fmt conductor boundaries frontend" crates/conductor/frontend/app.js
+expect "contracts fmt bot bootstrap publish-tests" Dockerfile.bot
 expect "$rust" src/db/mod.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
@@ -68,6 +70,15 @@ fi
 
 if ! grep -Fq 'bash .buildkite/select-checks-test.sh' "$root/scripts/ci-preflight.sh"; then
   fail "ci-preflight does not run select-checks-test.sh"
+fi
+
+if ! grep -Fq 'BUILDKITE_STEP_KEY' "$root/.buildkite/with-cargo-auth.sh"; then
+  fail "with-cargo-auth must isolate CARGO_TARGET_DIR per Buildkite step"
+fi
+
+fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan | wc -l)"
+if [ "$fetch_fail_count" -ne 16 ]; then
+  fail "fetch failure did not select every group (got ${fetch_fail_count})"
 fi
 
 echo 'select-checks-test: ok'

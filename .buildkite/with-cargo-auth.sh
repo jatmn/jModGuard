@@ -3,8 +3,9 @@
 # Local ci-preflight runs do not use this wrapper.
 set -euo pipefail
 
-mkdir -p .tmp
-export TMPDIR="${PWD}/.tmp" CARGO_TARGET_DIR="${PWD}/target"
+step_key="${BUILDKITE_STEP_KEY:-local}"
+mkdir -p ".tmp/${step_key}"
+export TMPDIR="${PWD}/.tmp/${step_key}" CARGO_TARGET_DIR="${PWD}/target-${step_key}"
 
 case "${GITHUB_TOKEN:-}" in
   ''|'$$GITHUB_TOKEN')

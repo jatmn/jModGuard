@@ -117,7 +117,14 @@ classify() {
       return
       ;;
     Dockerfile.bot)
-      add bot; add bootstrap; add publish-tests
+      add fmt; add bot; add bootstrap; add publish-tests
+      return
+      ;;
+    crates/conductor/frontend/*)
+      add frontend
+      add fmt
+      add conductor
+      add boundaries
       return
       ;;
     Dockerfile.api)
@@ -201,10 +208,30 @@ prove_diff() {
     git diff --name-only "origin/${base}...HEAD" || return 1
     return 0
   fi
-  if ! git rev-parse --verify --quiet 'HEAD^1' >/dev/null; then
+  local branch="${BUILDKITE_BRANCH:-main}"
+  local remote="origin/${branch}"
+  local before="" after
+  after="$(git rev-parse "${BUILDKITE_COMMIT:-HEAD}")"
+  if git rev-parse --verify --quiet "$remote" >/dev/null; then
+    before="$(git rev-parse "$remote")"
+  fi
+  git fetch --no-tags origin "$branch" || return 1
+  if [ -n "$before" ] && [ "$before" != "$after" ]; then
+    case "$before" in
+      0000000000000000000000000000000000000000) return 1 ;;
+    esac
+    git diff --name-only "$before" "$after" || return 1
+    return 0
+  fi
+  if [ "${BUILDKITE_SOURCE:-}" = "webhook" ] \
+      && [ "$branch" = "main" ] \
+      && [ -z "${BUILDKITE_TAG:-}" ]; then
     return 1
   fi
-  git diff --name-only 'HEAD^1' HEAD
+  if ! git rev-parse --verify --quiet "${after}^1" >/dev/null; then
+    return 1
+  fi
+  git diff --name-only "${after}^1" "$after"
 }
 
 add contracts
