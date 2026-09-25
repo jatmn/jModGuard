@@ -1789,6 +1789,24 @@ mod tests {
     }
 
     #[test]
+    fn connection_execute_batch_allows_transaction_control_only() {
+        let path = std::env::temp_dir().join(format!(
+            "db_compat_tx_batch_{:032x}",
+            rand::random::<u128>()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        connection.execute_batch("COMMIT").unwrap();
+        assert!(connection
+            .execute_batch("CREATE TABLE refused(a INTEGER)")
+            .is_err());
+        drop(connection);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
     fn remote_database_call_has_a_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

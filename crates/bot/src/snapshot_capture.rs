@@ -511,16 +511,33 @@ impl SnapshotIngress {
             self.gap();
             return;
         };
-        let scope = match crate::db::guild_enrollment(&app.db, guild_id).await {
-            Ok(Some(enrollment)) => app.tenant.scope(enrollment).await.ok(),
-            _ => None,
+        let enrollment = match crate::db::guild_enrollment(&app.db, guild_id).await {
+            Ok(Some(enrollment)) => enrollment,
+            Ok(None) => {
+                let had_scope = self.scopes.lock().remove(&guild).is_some();
+                if had_scope {
+                    self.gap();
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id,
+                    "snapshot scope refresh enrollment unavailable: {error:#}"
+                );
+                return;
+            }
         };
-        let mut scopes = self.scopes.lock();
-        if let Some(scope) = scope {
-            scopes.insert(guild, scope);
-        } else {
-            scopes.remove(&guild);
-            self.gap();
+        match app.tenant.scope(enrollment).await {
+            Ok(scope) => {
+                self.scopes.lock().insert(guild, scope);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    guild_id,
+                    "snapshot scope refresh tenant scope unavailable: {error:#}"
+                );
+            }
         }
     }
 
@@ -993,12 +1010,12 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
             }
         };
         let guild = work.scope.guild_id() as u64;
-        let config = match app.configs.get(&app.db, guild).await {
-            Ok(cfg) => Some(cfg),
+        let (config, config_load_failed) = match app.configs.get(&app.db, guild).await {
+            Ok(cfg) => (Some(cfg), false),
             Err(error) => {
                 tracing::warn!("message snapshot config unavailable: {error:#}");
                 app.snapshots.gap_scope(&work.scope);
-                None
+                (None, true)
             }
         };
         let configured = config.as_ref().is_some_and(|cfg| {
@@ -1121,6 +1138,15 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     continue;
                 }
                 if !configured {
+                    if config_load_failed {
+                        if let Some(mut report) = report.take() {
+                            report.vars.insert(
+                                "coverage".into(),
+                                "configuration unavailable".into(),
+                            );
+                            submit_report(&app, &work.context, report);
+                        }
+                    }
                     continue;
                 }
                 observation.coverage_epoch = work.epoch;
@@ -1574,6 +1600,64 @@ mod tests {
             ".guild.db-wal",
             ".guild.db-shm",
         ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_scope_preserves_cached_scope_when_tenant_lookup_fails() {
+        let path =
+            std::env::temp_dir().join(format!("scope_refresh_{:032x}", rand::random::<u128>()));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 2;
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        app.snapshots.scopes.lock().insert(789, scope);
+        app.snapshots.content_access.lock().insert(789);
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "DELETE FROM guild_store_placements WHERE guild_id=789",
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        app.snapshots.refresh_scope(&app, 789).await;
+        assert!(app.snapshots.scopes.lock().contains_key(&789));
+        drop(app);
+        for suffix in ["", "-wal", "-shm", ".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_scope_clears_scope_when_enrollment_is_absent() {
+        let path =
+            std::env::temp_dir().join(format!("scope_clear_{:032x}", rand::random::<u128>()));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 2;
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        app.snapshots.scopes.lock().insert(789, scope);
+        crate::db::retire_guild_enrollment(&app.db, 789, 100).await.unwrap();
+        app.snapshots.refresh_scope(&app, 789).await;
+        assert!(!app.snapshots.scopes.lock().contains_key(&789));
+        drop(app);
+        for suffix in ["", "-wal", "-shm", ".guild.db", ".guild.db-wal", ".guild.db-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
