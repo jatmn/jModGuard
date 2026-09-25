@@ -70,8 +70,21 @@ fn next_ban_cursor(bans: &[serenity::model::guild::Ban]) -> Option<String> {
     bans.last().map(|b| b.user.id.get().to_string())
 }
 
-/// A full Discord page must advance the stored cursor. Repeating the same boundary
-/// would otherwise commit identical state and request the same page forever.
+/// A full Discord page did not make directional cursor progress.
+#[derive(Debug)]
+struct PaginationStalled;
+
+impl std::fmt::Display for PaginationStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("discord pagination cursor did not advance")
+    }
+}
+
+impl std::error::Error for PaginationStalled {}
+
+/// Member and ban lists page with `after` (the next id must be greater).
+/// Audit logs page with `before` (the next id must be smaller).
+/// A full page that repeats or moves the wrong way must not be committed.
 fn ensure_discord_cursor_advanced(
     claim_cursor: &Option<String>,
     next_cursor: &Option<String>,
@@ -80,10 +93,38 @@ fn ensure_discord_cursor_advanced(
     if !full_page {
         return Ok(());
     }
-    if next_cursor.as_ref() == claim_cursor.as_ref() {
-        anyhow::bail!("discord pagination cursor did not advance");
+    if discord_cursor_progressed(claim_cursor.as_deref(), next_cursor.as_deref()) {
+        Ok(())
+    } else {
+        Err(PaginationStalled.into())
     }
-    Ok(())
+}
+
+fn discord_cursor_progressed(previous: Option<&str>, next: Option<&str>) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    let Some(previous) = previous else {
+        return true;
+    };
+    if let (Some((prev_phase, prev_id)), Some((next_phase, next_id))) =
+        (audit_cursor_boundary(previous), audit_cursor_boundary(next))
+    {
+        return prev_phase == next_phase && next_id < prev_id;
+    }
+    match (previous.parse::<u64>(), next.parse::<u64>()) {
+        (Ok(prev_id), Ok(next_id)) => next_id > prev_id,
+        _ => false,
+    }
+}
+
+fn audit_cursor_boundary(cursor: &str) -> Option<(&str, u64)> {
+    let (phase, raw) = cursor.split_once(':')?;
+    if phase != "ban" && phase != "unban" {
+        return None;
+    }
+    let id = raw.parse().ok()?;
+    Some((phase, id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +467,9 @@ fn retry_delay(app: &BotState, failed: u32) -> Duration {
 }
 
 fn retry_reason(error: &anyhow::Error) -> (&'static str, bool) {
+    if error.downcast_ref::<PaginationStalled>().is_some() {
+        return ("pagination_stalled", false);
+    }
     error
         .downcast_ref::<serenity::Error>()
         .map(retry_reason_http)
@@ -1265,7 +1309,18 @@ mod tests {
         let next = Some("42".to_string());
         assert!(ensure_discord_cursor_advanced(&cursor, &next, true).is_err());
         assert!(ensure_discord_cursor_advanced(&cursor, &Some("43".to_string()), true).is_ok());
+        assert!(ensure_discord_cursor_advanced(&cursor, &Some("41".to_string()), true).is_err());
         assert!(ensure_discord_cursor_advanced(&cursor, &next, false).is_ok());
+        let audit = Some("ban:100".to_string());
+        assert!(ensure_discord_cursor_advanced(&audit, &Some("ban:99".to_string()), true).is_ok());
+        assert!(
+            ensure_discord_cursor_advanced(&audit, &Some("ban:100".to_string()), true).is_err()
+        );
+        assert!(
+            ensure_discord_cursor_advanced(&audit, &Some("ban:101".to_string()), true).is_err()
+        );
+        let stalled: anyhow::Error = PaginationStalled.into();
+        assert_eq!(retry_reason(&stalled), ("pagination_stalled", false));
     }
 
     #[test]

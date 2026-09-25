@@ -1847,8 +1847,9 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
             let completed=ensure_seed_bot(&tx,&scope,bot_id)?.flatten();
             if completed.is_none(){tx.finish_read()?;return Ok(None)}
-            let row=tx.query_row("SELECT run_id,cursor,generation,lease_owner,lease_until_ms,next_attempt_at_ms,request_after_ms,status,started_at_ms FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<Option<String>>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?,r.get::<Option<i64>>(4)?,r.get::<Option<i64>>(5)?,r.get::<Option<i64>>(6)?,r.get::<String>(7)?,r.get::<i64>(8)?))).optional()?;
-            let Some((run_id,cursor,generation,owner,until,next,request_after,state,started_at))=row else {tx.finish_read()?;return Ok(None)};
+            let row=tx.query_row("SELECT run_id,cursor,generation,lease_owner,lease_until_ms,next_attempt_at_ms,request_after_ms,status,started_at_ms,status_reason FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<Option<String>>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?,r.get::<Option<i64>>(4)?,r.get::<Option<i64>>(5)?,r.get::<Option<i64>>(6)?,r.get::<String>(7)?,r.get::<i64>(8)?,r.get::<Option<String>>(9)?))).optional()?;
+            let Some((run_id,cursor,generation,owner,until,next,request_after,state,started_at,status_reason))=row else {tx.finish_read()?;return Ok(None)};
+            if state=="needs_attention" && status_reason.as_deref()==Some("pagination_stalled") {tx.finish_read()?;return Ok(None)}
             if !matches!(state.as_str(),"queued"|"running"|"waiting"|"needs_attention") || next.is_some_and(|v|v>now_ms) || request_after.is_some_and(|v|v>now_ms) || owner.is_some()&&until.is_some_and(|v|v>now_ms) {tx.finish_read()?;return Ok(None)}
             tx.ensure_mutation_receipt()?;let generation=generation+1;
             tx.execute("UPDATE guild_member_audit_recovery SET status='running',lease_owner=?4,lease_until_ms=?5,generation=?6 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,worker_id.as_str(),now_ms.saturating_add(lease_ms),generation])?;
@@ -1906,7 +1907,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
-            let state=if reason=="permission_denied"{"needs_attention"}else{"waiting"};
+            let state=if reason=="permission_denied"||reason=="pagination_stalled"{"needs_attention"}else{"waiting"};
             let changed=tx.execute("UPDATE guild_member_audit_recovery SET status=?9,status_reason=?4,next_attempt_at_ms=?5,request_after_ms=MAX(coalesce(request_after_ms,0),?5),lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND run_id=?6 AND generation=?7 AND lease_owner=?8",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id,reason,next_attempt_at_ms,claim.run_id,claim.generation,claim.worker_id,state])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
         }).await
@@ -2334,7 +2335,7 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;tx.ensure_mutation_receipt()?;
-            let state=if reason=="permission_denied"{"needs_attention"}else{"waiting"};
+            let state=if reason=="permission_denied"||reason=="pagination_stalled"{"needs_attention"}else{"waiting"};
             let changed=tx.execute("UPDATE guild_member_sync SET status=?11,status_reason=?4,next_attempt_at_ms=?5,request_after_ms=MAX(coalesce(request_after_ms,0),?5),lease_owner=NULL,lease_until_ms=NULL,progress_revision=progress_revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND run_id=?6 AND generation=?7 AND lease_owner=?8 AND phase=?9 AND cursor IS ?10",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id,reason,next_attempt_at_ms,claim.run_id,claim.generation,claim.worker_id,claim.phase.as_str(),claim.cursor,state])?;
             anyhow::ensure!(changed==1,MemberSyncError::Stale);tx.commit()
         }).await
@@ -2358,12 +2359,18 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;let completed=ensure_seed_bot(&tx,&scope,bot_id)?.ok_or(MemberSyncError::Stale)?;
             let current=tx.query_row("SELECT run_kind,status,last_operation_key FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?))).optional()?;
             let Some((kind,state,last_key))=current else {return Err(MemberSyncError::MissingJob.into())};
-            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && state=="complete") {tx.finish_read()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;return Ok(out)}
-            if action==MemberSyncAction::Reconcile {anyhow::ensure!(completed.is_some() && state=="complete",MemberSyncError::Invalid)}
+            let audit_stalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled')",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok(r.get(0)?))?;
+            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state=="complete") || (action==MemberSyncAction::Retry && state=="complete" && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;return Ok(out)}
+            let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>audit_stalled||matches!(state.as_str(),"needs_attention"|"waiting"),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
+            anyhow::ensure!(allowed,MemberSyncError::Invalid);
             tx.ensure_mutation_receipt()?;
             match action {
                 MemberSyncAction::Pause=>{tx.execute("UPDATE guild_member_sync SET status='paused',status_reason='paused by administrator',lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?2 WHERE guild_id=?1",params![scope.guild_id(),operation_key])?;}
-                MemberSyncAction::Resume|MemberSyncAction::Retry=>{tx.execute("UPDATE guild_member_sync SET request_after_ms=CASE WHEN ?4=1 AND status_reason='permission_denied' THEN ?2 ELSE request_after_ms END,status='queued',status_reason=NULL,next_attempt_at_ms=?2,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?3 WHERE guild_id=?1",params![scope.guild_id(),now_ms,operation_key,action==MemberSyncAction::Retry])?;}
+                MemberSyncAction::Resume|MemberSyncAction::Retry=>{
+                    if action==MemberSyncAction::Retry {tx.execute("UPDATE guild_member_audit_recovery SET status='queued',status_reason=NULL,next_attempt_at_ms=?2,request_after_ms=NULL,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1 WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled'",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id,now_ms])?;}
+                    if state!="complete" {tx.execute("UPDATE guild_member_sync SET request_after_ms=CASE WHEN ?4=1 AND status_reason='permission_denied' THEN ?2 ELSE request_after_ms END,status='queued',status_reason=NULL,next_attempt_at_ms=?2,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?3 WHERE guild_id=?1",params![scope.guild_id(),now_ms,operation_key,action==MemberSyncAction::Retry])?;}
+                    else {tx.execute("UPDATE guild_member_sync SET last_operation_key=?2,progress_revision=progress_revision+1 WHERE guild_id=?1",params![scope.guild_id(),operation_key])?;}
+                }
                 MemberSyncAction::Reconcile=>{tx.execute("UPDATE guild_member_sync SET run_id=?2,run_kind='reconcile',phase='members',status='queued',status_reason=NULL,cursor=NULL,processed=0,member_processed=0,ban_processed=0,verify_processed=0,audit_processed=0,member_page_interval_ms=NULL,inserted=0,updated=0,unchanged=0,total_estimate=NULL,started_at_ms=?3,last_progress_at_ms=NULL,completed_at_ms=NULL,next_attempt_at_ms=?3,reconcile_gap_generation=(SELECT gap_generation FROM guild_member_seed WHERE guild_id=?1),lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?4 WHERE guild_id=?1",params![scope.guild_id(),random_id(),now_ms,operation_key])?;}
             }
             let _=kind;tx.commit()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;Ok(out)

@@ -45,11 +45,19 @@ shows the last committed progress time separately from the time its status was
 read. A later Reconcile has its own counters; the prior successful run's time
 and final counts remain visible independently.
 
-An unfinished import resumes from its durable cursor after restart. A paused
+An unfinished import resumes from its durable cursor after restart. A full
+Discord members, bans, or audit page whose cursor repeats or moves the wrong
+way is not committed. That import or audit recovery stops in needs attention
+until an administrator selects Retry; it does not request the same page forever.
+A paused
 import stays paused. Completion is durable for the bot identity and enrollment:
 source commits, image releases, schema upgrades, restarts, and redeployments do
 not start another initial import. An empty directory or missing job metadata is
-not permission to reseed. Retry on a completed initial import is a no-op. After
+not permission to reseed. Retry on a completed initial import is a no-op,
+except it resumes audit recovery that stopped because a Discord page did not
+advance. Pause, resume, and retry apply only while the saved import state still
+allows that control; a queued control that arrives after the state has changed
+does not overwrite needs attention or a pause. After
 completion, a full current-member and current-ban scan runs only when a guild
 administrator explicitly selects **Reconcile from Discord**. An outage,
 restore, bot restart or redeploy, or a replaced Gateway session on an already

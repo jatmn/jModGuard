@@ -1300,6 +1300,82 @@ async fn verified_absence_has_unknown_event_time_and_gap_cleanup_is_targeted() {
 }
 
 #[tokio::test]
+async fn stalled_pagination_needs_attention_and_stale_controls_do_not_overwrite_it() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 1_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .defer_member_sync(
+            scope.clone(),
+            claim,
+            "pagination_stalled".into(),
+            2_000,
+            1_001,
+        )
+        .await
+        .unwrap();
+    let stalled = store
+        .member_sync_status(scope.clone(), 42, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(stalled.status, "needs_attention");
+    assert_eq!(stalled.status_reason.as_deref(), Some("pagination_stalled"));
+    assert!(
+        store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), 3_000, 90_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Pause,
+            "stale-pause".into(),
+            3_100,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::Invalid)
+    ));
+    assert_eq!(
+        store
+            .member_sync_status(scope.clone(), 42, 3_100)
+            .await
+            .unwrap()
+            .status,
+        "needs_attention"
+    );
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Retry,
+            "retry-stall".into(),
+            3_200,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), 3_200, 90_000)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion() {
     let (_f, store, scope) = ready().await;
     store

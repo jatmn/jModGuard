@@ -346,6 +346,11 @@ async fn execute_inner(
                             Some(crate::db::guild_data::MemberSyncError::MissingJob)
                         ) {
                             Outcome::failed("member_sync_missing_job")
+                        } else if matches!(
+                            error.downcast_ref::<crate::db::guild_data::MemberSyncError>(),
+                            Some(crate::db::guild_data::MemberSyncError::Invalid)
+                        ) {
+                            Outcome::failed("member_sync_invalid_operation")
                         } else {
                             Outcome::failed("member_sync_unavailable")
                         }
