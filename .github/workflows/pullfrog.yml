@@ -44,3 +44,7 @@ jobs:
           shell: restricted
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          # Pinned v0.1.82 resolveModel reads this before the console model.
+          # A non-curated opencode-go/<id> passes through; the dashboard picker
+          # does not. See docs/PULLFROG.md.
+          PULLFROG_MODEL: ${{ secrets.PULLFROG_MODEL }}
