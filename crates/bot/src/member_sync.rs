@@ -110,7 +110,10 @@ fn discord_cursor_progressed(previous: Option<&str>, next: Option<&str>) -> bool
     if let (Some((prev_phase, prev_id)), Some((next_phase, next_id))) =
         (audit_cursor_boundary(previous), audit_cursor_boundary(next))
     {
-        return prev_phase == next_phase && next_id < prev_id;
+        if prev_phase != next_phase {
+            return true;
+        }
+        return next_id < prev_id;
     }
     match (previous.parse::<u64>(), next.parse::<u64>()) {
         (Ok(prev_id), Ok(next_id)) => next_id > prev_id,
@@ -123,7 +126,11 @@ fn audit_cursor_boundary(cursor: &str) -> Option<(&str, u64)> {
     if phase != "ban" && phase != "unban" {
         return None;
     }
-    let id = raw.parse().ok()?;
+    let id = if raw.is_empty() {
+        u64::MAX
+    } else {
+        raw.parse().ok()?
+    };
     Some((phase, id))
 }
 
@@ -1318,6 +1325,22 @@ mod tests {
         );
         assert!(
             ensure_discord_cursor_advanced(&audit, &Some("ban:101".to_string()), true).is_err()
+        );
+        assert!(
+            ensure_discord_cursor_advanced(
+                &Some("ban:100".to_string()),
+                &Some("unban:".to_string()),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_discord_cursor_advanced(
+                &Some("unban:".to_string()),
+                &Some("unban:99".to_string()),
+                true,
+            )
+            .is_ok()
         );
         let stalled: anyhow::Error = PaginationStalled.into();
         assert_eq!(retry_reason(&stalled), ("pagination_stalled", false));

@@ -216,6 +216,39 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
         .unwrap();
     assert_eq!(members.members.len(), 1);
     assert_eq!(members.members[0].user_id, "9007199254740993");
+    let by_id = store
+        .list_members(
+            scope.clone(),
+            MemberQuery {
+                q: Some("9007199254740993".into()),
+                status: MemberStatusFilter::Current,
+                joined_from_ms: None,
+                joined_to_ms: None,
+                sort: MemberSort::JoinedNewest,
+                after: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_id.members.len(), 1);
+    assert_eq!(by_id.members[0].user_id, "9007199254740993");
+    let by_mention = store
+        .list_members(
+            scope.clone(),
+            MemberQuery {
+                q: Some("<@!9007199254740993>".into()),
+                status: MemberStatusFilter::Current,
+                joined_from_ms: None,
+                joined_to_ms: None,
+                sort: MemberSort::JoinedNewest,
+                after: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_mention.members.len(), 1);
     let complete_members = store
         .claim_member_sync(scope.clone(), 42, "worker".into(), 16_001, 90_000)
         .await

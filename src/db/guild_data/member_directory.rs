@@ -397,6 +397,22 @@ fn normalized_name(
     .to_lowercase()
 }
 
+fn member_search_user_id(raw: &str) -> Option<i64> {
+    let token = raw
+        .strip_prefix("<@")
+        .and_then(|v| v.strip_suffix('>'))
+        .map(|v| v.trim_start_matches('!'))
+        .unwrap_or(raw)
+        .trim();
+    if token.is_empty() {
+        return None;
+    }
+    if token.chars().all(|c| c.is_ascii_digit()) {
+        return token.parse::<i64>().ok().filter(|id| *id > 0);
+    }
+    None
+}
+
 fn bounded_name(name: Option<String>) -> Result<Option<String>> {
     if let Some(value) = &name {
         anyhow::ensure!(value.len() <= 256, MemberSyncError::Invalid);
@@ -2113,15 +2129,9 @@ impl GuildDataStore {
                 && query.after.as_ref().is_none_or(|v| v.len() <= 64),
             MemberSyncError::Invalid
         );
-        let search = query.q.as_deref().unwrap_or("").trim().to_lowercase();
-        let mention_id = search
-            .strip_prefix("<@")
-            .and_then(|v| v.strip_suffix('>'))
-            .map(|v| v.trim_start_matches('!'))
-            .unwrap_or(search.as_str())
-            .parse::<i64>()
-            .ok()
-            .filter(|v| *v > 0);
+        let raw_q = query.q.as_deref().unwrap_or("").trim();
+        let search = raw_q.to_lowercase();
+        let mention_id = member_search_user_id(raw_q);
         let (after_join, after_id) = if let Some(cursor) = &query.after {
             let (j, id) = cursor.split_once(':').ok_or(MemberSyncError::Invalid)?;
             (j.parse::<i64>()?, id.parse::<i64>()?)
