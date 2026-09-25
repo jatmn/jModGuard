@@ -4,7 +4,9 @@ use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
-use crate::db::guild_data::{GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter};
+use crate::db::guild_data::{
+    GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -48,6 +50,41 @@ async fn scoped(
     super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     Ok((auth, enrollment))
+}
+
+fn member_sync_invalid_operation() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "this member import control is not available in the current import state",
+            "code": "member_sync_invalid_operation"
+        })),
+    )
+        .into_response()
+}
+
+/// Match WebUI enablement and `member_sync_action` store guards before queueing work.
+fn validate_member_sync_operation(
+    status: &MemberSyncStatus,
+    operation: MemberSyncOperation,
+) -> Option<Response> {
+    let allowed = match operation {
+        MemberSyncOperation::Pause => {
+            matches!(status.status.as_str(), "queued" | "running" | "waiting")
+        }
+        MemberSyncOperation::Resume => status.status == "paused",
+        MemberSyncOperation::Retry => {
+            matches!(status.status.as_str(), "needs_attention" | "waiting")
+        }
+        MemberSyncOperation::Reconcile => {
+            status.initial_completed_at.is_some() && status.status == "complete"
+        }
+    };
+    if allowed {
+        None
+    } else {
+        Some(member_sync_invalid_operation())
+    }
 }
 
 async fn member_sync_bot_id(
@@ -206,6 +243,9 @@ pub async fn sync_action(
             })),
         )
             .into_response());
+    }
+    if let Some(response) = validate_member_sync_operation(&status, body.operation) {
+        return Ok(response);
     }
     Ok(api::enqueue_action(
         &app,

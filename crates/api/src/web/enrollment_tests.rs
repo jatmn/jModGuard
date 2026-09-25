@@ -1103,6 +1103,68 @@ async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fa
 }
 
 #[tokio::test]
+async fn member_sync_controls_reject_invalid_operations_before_queueing() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let path = "/api/guilds/10/member-sync/actions";
+    let reconcile = serde_json::json!({
+        "request_id": action_key("reconcile-early"),
+        "operation": "reconcile"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &reconcile).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE guild_member_sync SET status='needs_attention',status_reason='permission_denied',request_after_ms=? WHERE guild_id=10",
+            libsql::params![chrono::Utc::now().timestamp_millis() + 60_000],
+        )
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    let resume = serde_json::json!({
+        "request_id": action_key("resume-needs-attention"),
+        "operation": "resume"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &resume).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+
+    let retry = serde_json::json!({
+        "request_id": action_key("retry-needs-attention"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, queued) = f.request("POST", path, &retry).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+}
+
+#[tokio::test]
 async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
     let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
     f.enroll(10).await;

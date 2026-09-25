@@ -51,9 +51,10 @@ source commits, image releases, schema upgrades, restarts, and redeployments do
 not start another initial import. An empty directory or missing job metadata is
 not permission to reseed. Retry on a completed initial import is a no-op. After
 completion, a full current-member and current-ban scan runs only when a guild
-administrator explicitly selects **Reconcile from Discord**. An outage or
-restore can leave coverage uncertain; the card reports that gap until a
-requested reconciliation finishes. Live events and bounded checks for affected
+administrator explicitly selects **Reconcile from Discord**. An outage,
+restore, bot restart or redeploy, or a replaced Gateway session on an already
+progressed import can leave coverage uncertain; the card reports that gap until
+a requested reconciliation finishes. Live events and bounded checks for affected
 users continue while coverage is uncertain. The bot separately catches up
 available ban and unban audit actions after a Gateway gap using the same paced
 request budget; this audit-only recovery does not list all members or current

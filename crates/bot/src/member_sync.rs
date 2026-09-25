@@ -70,6 +70,22 @@ fn next_ban_cursor(bans: &[serenity::model::guild::Ban]) -> Option<String> {
     bans.last().map(|b| b.user.id.get().to_string())
 }
 
+/// A full Discord page must advance the stored cursor. Repeating the same boundary
+/// would otherwise commit identical state and request the same page forever.
+fn ensure_discord_cursor_advanced(
+    claim_cursor: &Option<String>,
+    next_cursor: &Option<String>,
+    full_page: bool,
+) -> anyhow::Result<()> {
+    if !full_page {
+        return Ok(());
+    }
+    if next_cursor.as_ref() == claim_cursor.as_ref() {
+        anyhow::bail!("discord pagination cursor did not advance");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuditStream {
     Ban,
@@ -149,6 +165,11 @@ async fn fetch_audit_page(
         .last()
         .map(|entry| format!("{}:{}", stream.prefix(), entry.id.get()))
         .or_else(|| cursor.map(str::to_owned));
+    ensure_discord_cursor_advanced(
+        &cursor.map(str::to_owned),
+        &next_cursor,
+        logs.entries.len() >= usize::from(limit),
+    )?;
     let audits = logs
         .entries
         .into_iter()
@@ -213,8 +234,10 @@ async fn fetch_page(
                 http.get_guild_members(guild_id, Some(limit), after),
             )
             .await??;
+            let full_page = members.len() >= limit as usize;
             let next_cursor = next_member_cursor(&members).or_else(|| claim.cursor.clone());
-            let terminal = members.len() < limit as usize;
+            ensure_discord_cursor_advanced(&claim.cursor, &next_cursor, full_page)?;
+            let terminal = !full_page;
             Ok(MemberSyncPage {
                 phase: MemberSyncPhase::Members,
                 expected_cursor: claim.cursor.clone(),
@@ -249,8 +272,10 @@ async fn fetch_page(
                 ),
             )
             .await??;
+            let full_page = bans.len() >= usize::from(limit);
             let next_cursor = next_ban_cursor(&bans).or_else(|| claim.cursor.clone());
-            let terminal = bans.len() < usize::from(limit);
+            ensure_discord_cursor_advanced(&claim.cursor, &next_cursor, full_page)?;
+            let terminal = !full_page;
             Ok(MemberSyncPage {
                 phase: MemberSyncPhase::Bans,
                 expected_cursor: claim.cursor.clone(),
@@ -1232,6 +1257,15 @@ mod tests {
             retry_reason_with_rate_limit(&error, &deadline),
             ("discord_unavailable", false)
         );
+    }
+
+    #[test]
+    fn discord_pagination_rejects_a_repeated_full_page_cursor() {
+        let cursor = Some("42".to_string());
+        let next = Some("42".to_string());
+        assert!(ensure_discord_cursor_advanced(&cursor, &next, true).is_err());
+        assert!(ensure_discord_cursor_advanced(&cursor, &Some("43".to_string()), true).is_ok());
+        assert!(ensure_discord_cursor_advanced(&cursor, &next, false).is_ok());
     }
 
     #[test]

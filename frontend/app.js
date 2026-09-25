@@ -2300,7 +2300,7 @@ function tabMembers() {
         .map(([field, label]) => `${Number(sync[`last_success_${field}`]).toLocaleString()} ${label}`);
       parts.push(el("p", { class: "muted", text: `Last successful run: ${asDate(sync.last_success_at)}${counts.length ? ` · ${counts.join(" · ")}` : ""}` }));
     }
-    if (sync.reconciliation_needed) parts.push(el("p", { class: "alert alert-warning", text: "Coverage may be stale after an outage or restore. A full current-member and current-ban check needs an administrator to select Reconcile from Discord." }));
+    if (sync.reconciliation_needed) parts.push(el("p", { class: "alert alert-warning", text: "Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement. A full current-member and current-ban check needs an administrator to select Reconcile from Discord." }));
     if (sync.audit_recovery_status && sync.audit_recovery_status !== "complete") {
       const phase = sync.audit_recovery_phase === "ban" ? "Ban actions" : sync.audit_recovery_phase === "unban" ? "Unban actions" : "Ban and unban actions";
       parts.push(el("p", { class: "muted", text: `Bounded audit recovery: ${phase} · ${sync.audit_recovery_status} · ${Number(sync.audit_recovery_processed || 0).toLocaleString()} entries checked${sync.audit_recovery_reason ? ` · ${sync.audit_recovery_reason}` : ""}` }));

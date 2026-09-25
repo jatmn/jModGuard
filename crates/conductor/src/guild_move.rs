@@ -931,9 +931,33 @@ async fn cleanup_source(path: &Path, guild: i64) -> Result<()> {
     }
 }
 
+async fn member_feature_counts_match(
+    source: &Path,
+    expected: i64,
+    got: i64,
+) -> Result<()> {
+    if expected == got {
+        return Ok(());
+    }
+    let src = open(source).await?;
+    if !table_exists(&src, "guild_member_feature").await? && expected == 0 && got == 1 {
+        return Ok(());
+    }
+    anyhow::bail!("destination member_feature count does not match the frozen source");
+}
+
 async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
     let expected = tenant_counts(source, guild).await?;
     let got = tenant_counts(dest, guild).await?;
+    let expected_feature = expected
+        .get("member_feature")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let got_feature = got
+        .get("member_feature")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    member_feature_counts_match(source, expected_feature, got_feature).await?;
     ensure!(
         expected.get("cases") == got.get("cases")
             && expected.get("memberships") == got.get("memberships")
@@ -941,7 +965,6 @@ async fn verify_copy(source: &Path, dest: &Path, guild: i64) -> Result<()> {
             && expected.get("history") == got.get("history")
             && expected.get("member_seed") == got.get("member_seed")
             && expected.get("member_stays") == got.get("member_stays")
-            && expected.get("member_feature") == got.get("member_feature")
             && expected.get("member_sync") == got.get("member_sync")
             && expected.get("member_pending_bans") == got.get("member_pending_bans")
             && expected.get("member_state_observations") == got.get("member_state_observations")
