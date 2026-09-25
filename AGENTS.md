@@ -227,7 +227,9 @@ no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
 service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
-(`bash scripts/dependabot-config-test.sh`), frontend Node tests,
+(`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
+(`bash tools/eslint-web-selftest.sh` after `npm ci --ignore-scripts --prefix tools/eslint`),
+frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
 workspace test runs only the in-process smoke), the API build without default features,

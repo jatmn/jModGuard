@@ -1,0 +1,45 @@
+#!/bin/sh
+# Prove host ESLint accepts the existing browser scripts and rejects an
+# undefined name. Install first:
+#   npm ci --ignore-scripts --prefix tools/eslint
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ESLINT="$REPO_ROOT/tools/eslint/node_modules/.bin/eslint"
+CONFIG="$REPO_ROOT/tools/eslint/eslint.config.js"
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "FAIL: node is required for the ESLint web self-test" >&2
+    exit 1
+fi
+if [ ! -x "$ESLINT" ]; then
+    echo "FAIL: ESLint is not installed. Run: npm ci --ignore-scripts --prefix tools/eslint" >&2
+    exit 1
+fi
+if [ -e "$REPO_ROOT/frontend/package.json" ] || [ -d "$REPO_ROOT/frontend/node_modules" ]; then
+    echo "FAIL: host npm files must not live in frontend/ (that tree is packaged and embedded)" >&2
+    exit 1
+fi
+
+cd "$REPO_ROOT"
+"$ESLINT" -c "$CONFIG" frontend crates/conductor/frontend
+echo "PASS: browser JavaScript matches the ESLint rules"
+
+if printf '%s\n' 'const broken = notDeclared;' \
+    | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename frontend/eslint-selftest-probe.js
+then
+    echo "FAIL: ESLint accepted an undefined name" >&2
+    exit 1
+fi
+echo "PASS: ESLint rejects an undefined name"
+
+if ! printf '%s\n' 'const ready = true;' 'void ready;' \
+    | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename frontend/eslint-selftest-ok.js
+then
+    echo "FAIL: ESLint rejected an ordinary browser script" >&2
+    exit 1
+fi
+echo "PASS: ESLint accepts an ordinary browser script"
+echo "ESLint web self-test: PASS"

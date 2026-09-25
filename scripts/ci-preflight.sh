@@ -361,6 +361,12 @@ if should_run pullfrog; then
 fi
 
 if should_run frontend; then
+  echo 'ci-preflight: npm ci --ignore-scripts --prefix tools/eslint'
+  npm ci --ignore-scripts --prefix tools/eslint
+
+  echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
+  bash tools/eslint-web-selftest.sh
+
   echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
   node --test scripts/frontend-state-test.mjs
 
