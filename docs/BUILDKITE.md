@@ -64,11 +64,12 @@ these ignored tests at an existing installation or share one database between th
 Selected checks must pass before preparation and publication. A docs-only
 diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
-bootstrap, or remote-database jobs. A `frontend/` WebUI diff runs the
-frontend Node checks. An `crates/api` diff runs the API test, Clippy,
-build, service-boundary, and dual-process checks. Shared `src/`,
-migrations, the root lockfile, toolchain, or an unclassified path runs
-the Rust and remote-database checks. Scheduled builds, tag builds, and
+bootstrap, or remote-database jobs. A `frontend/` WebUI diff runs the frontend Node checks. `Dockerfile.webui`
+also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
+build, service-boundary, and dual-process checks. Shared `src/` and migrations run the Rust packages and the remote-database job.
+The root lockfile and toolchain do too, and they also run the publisher and
+bootstrap contract tests, because those files are image inputs. An
+unclassified path runs every check. Scheduled builds, tag builds, and
 manual `JMODGUARD_PUBLISH_SOURCE` builds run every check. A diff that
 cannot be computed also runs every check. Pull requests use the
 three-dot diff against the base branch. Other builds use the first-parent

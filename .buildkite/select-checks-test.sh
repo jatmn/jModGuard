@@ -29,13 +29,16 @@ expect() {
   fi
 }
 
-rust="contracts fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database"
+rust="contracts fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
 all="contracts frontend fmt api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
 expect "contracts frontend" frontend/app.js frontend/administration/index.html
 expect "contracts fmt api boundaries integration" crates/api/src/lib.rs
+expect "contracts fmt integration" crates/integration-tests/tests/dual_process_smoke.rs
+expect "contracts fmt remote-database" crates/integration-tests/tests/remote_database_smoke.rs
+expect "contracts frontend publish-tests" Dockerfile.webui
 expect "contracts fmt bot boundaries integration" crates/bot/src/main.rs
 expect "contracts fmt conductor boundaries" crates/conductor/src/install.rs
 expect "$rust" src/db/mod.rs
@@ -43,7 +46,7 @@ expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
 expect "$all" mystery.bin
 expect "contracts publish-tests" .buildkite/publish-image.sh
-expect "contracts frontend" Dockerfile.webui
+expect "contracts frontend publish-tests" Dockerfile.webui
 
 schedule="$(BUILDKITE_SOURCE=schedule bash "$selector" plan)"
 if [ "$(printf '%s\n' "$schedule" | sort)" != "$(printf '%s\n' $all | sort)" ]; then

@@ -29,7 +29,7 @@ bash scripts/install-git-hooks.sh
 ```
 
 That sets worktree-local `core.hooksPath` to `.githooks` so `pre-commit` and
-`pre-push` run the same full preflight as the Buildkite `test` job (commit then
+`pre-push` run the full `bash scripts/ci-preflight.sh` suite (commit then
 push runs it twice). Git then uses only `.githooks` in this worktree; previous
 hook directories are not chained. Linked worktrees are unaffected unless you run
 install there too. It does not add GitHub Actions.

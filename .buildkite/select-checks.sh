@@ -62,7 +62,7 @@ all_groups() {
 
 all_rust() {
   local group
-  for group in fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database; do
+  for group in fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
     add "$group"
   done
 }
@@ -113,6 +113,7 @@ classify() {
       ;;
     Dockerfile.webui)
       add frontend
+      add publish-tests
       return
       ;;
     Dockerfile.bot)
@@ -149,6 +150,7 @@ classify() {
       return
       ;;
     crates/integration-tests/tests/remote_database_smoke.rs|crates/integration-tests/tests/guild_store_smoke.rs)
+      add fmt
       add remote-database
       return
       ;;
@@ -172,7 +174,7 @@ classify() {
         conductor) add fmt; add conductor; add boundaries ;;
         runtime) add fmt; add runtime; add boundaries ;;
         updater) add fmt; add updater ;;
-        integration-tests) add integration ;;
+        integration-tests) add fmt; add integration ;;
         *) all_groups ;;
       esac
       ;;
@@ -195,8 +197,8 @@ prove_diff() {
   fi
   if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
     local base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
-    git fetch --no-tags origin "$base"
-    git diff --name-only "origin/${base}...HEAD"
+    git fetch --no-tags origin "$base" || return 1
+    git diff --name-only "origin/${base}...HEAD" || return 1
     return 0
   fi
   if ! git rev-parse --verify --quiet 'HEAD^1' >/dev/null; then
