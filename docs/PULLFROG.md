@@ -53,13 +53,16 @@ branch and the manual setup below is finished.
      The live catalog is [OpenCode Go models](https://opencode.ai/zen/go/v1/models).
      Pullfrog's Agent picker is a shorter menu
      ([Models](https://docs.pullfrog.com/models)). Put the id in this secret,
-     including a model that picker does not list. The pinned action reads
-     `PULLFROG_MODEL` before the console model and passes a non-curated
-     `provider/model` id through. Do not choose the model in Agent settings.
-     A `@pullfrog --model=...` comment does not select it either; this
-     standalone action does not resolve prompt flags. If `PULLFROG_MODEL` is
-     empty, the run falls back to the console model. Neither secret value is
-     stored in this repository.
+     including a model that picker does not list. The pinned action uses a
+     non-empty `PULLFROG_MODEL`, after trimming whitespace, before any console
+     model, and it passes a non-curated `provider/model` id through. Do not
+     select the model in Agent settings; a console pick does not replace this
+     secret. A `@pullfrog --model=...` comment does not select it either; this
+     standalone action does not resolve prompt flags. If the secret is missing
+     or only whitespace, the action ignores it: a console model that is still
+     set is used, and if none is set Pullfrog auto-selects. Set the secret
+     before you rely on a specific model. Neither secret value is stored in
+     this repository.
 5. After setup, post one new `@pullfrog ...` comment yourself and confirm that
    exactly one `Pullfrog owner command` Actions job runs. Check that a comment
    by another account, or your own comment without an instruction, never
