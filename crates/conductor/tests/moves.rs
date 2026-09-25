@@ -330,6 +330,35 @@ async fn init_guild_v8_only(
     conn.execute("PRAGMA user_version = 8", ()).await.unwrap();
 }
 
+async fn init_guild_v9_members(
+    path: &Path,
+    store_id: &str,
+    dedicated: Option<i64>,
+    guilds: &[(i64, &str, &str, &str, &str)],
+) {
+    init_guild_v8_only(path, store_id, dedicated, guilds).await;
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/guild/0009_member_directory.sql"
+    ))
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,started_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1000)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("PRAGMA user_version = 9", ()).await.unwrap();
+}
+
 async fn call(
     router: &axum::Router,
     method: &str,
@@ -1104,5 +1133,107 @@ async fn move_from_pre_member_source_creates_destination_admission() {
         )
         .await,
         0
+    );
+}
+
+#[tokio::test]
+async fn move_from_v9_member_rows_fills_later_destination_columns() {
+    let (discord, task) = discord_stub(42).await;
+    let root = unique_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let core = root.join("core.db");
+    let shared = root.join("shared.guild.db");
+    let dedicated = root.join("dedicated.guild.db");
+    write_core(&core).await;
+    init_guild_v9_members(
+        &shared,
+        SHARED,
+        None,
+        &[(10, ENROLL_10, REV_10, CASE_10, SRC_10)],
+    )
+    .await;
+    init_guild(&dedicated, DEDICATED, Some(10), &[], false).await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        log_filter: "warn".into(),
+        shutdown_grace: Duration::from_secs(1),
+        db_path: Some(root.join("control.db")),
+        public_url: "http://127.0.0.1:8081".into(),
+        owner_id: 42,
+        oauth_client_id: "cid".into(),
+        oauth_client_secret: "csecret".into(),
+        bot_health_url: String::new(),
+        api_health_url: String::new(),
+        oauth_token_url: format!("{discord}/token"),
+        oauth_me_url: format!("{discord}/me"),
+        backup_root: None,
+        backup_key: None,
+        capture_stores: vec![CaptureStore {
+            role: "core".into(),
+            path: core,
+        }],
+        evidence_root: None,
+        restore_target: None,
+        guild_stores: vec![
+            GuildStorePath {
+                id: SHARED.into(),
+                role: "shared".into(),
+                path: shared,
+            },
+            GuildStorePath {
+                id: DEDICATED.into(),
+                role: "dedicated".into(),
+                path: dedicated.clone(),
+            },
+        ],
+        release_feed: None,
+        release_keys: Default::default(),
+        installed_release: None,
+        update_root: None,
+        artifact_root: None,
+        update_provider: None,
+    };
+    let conductor = Conductor::start(cfg, false).await.unwrap();
+    let router = router_for(Arc::clone(&conductor));
+    let h = Harness {
+        conductor,
+        router,
+        root,
+        _discord: task,
+    };
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT gap_generation FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT initial_completed_at_ms FROM guild_member_seed WHERE guild_id=10"
+        )
+        .await,
+        2000
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT member_processed IS NULL FROM guild_member_sync WHERE guild_id=10"
+        )
+        .await,
+        1
     );
 }

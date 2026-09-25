@@ -1346,16 +1346,20 @@ mod tests {
 
     #[tokio::test]
     async fn member_directory_requires_authorization() {
-        let response = test_app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/guilds/123/members")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(response.status(), StatusCode::OK);
+        let app = test_app();
+        for (method, uri, body) in [
+            ("GET", "/api/guilds/123/members", ""),
+            ("GET", "/api/guilds/123/members/1", ""),
+            ("GET", "/api/guilds/123/members/1/history", ""),
+            ("GET", "/api/guilds/123/member-sync", ""),
+            (
+                "POST",
+                "/api/guilds/123/member-sync/actions",
+                r#"{"request_id":"1758140000_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"pause"}"#,
+            ),
+        ] {
+            assert_unauthenticated(app.clone(), method, uri, body).await;
+        }
     }
 
     #[tokio::test]

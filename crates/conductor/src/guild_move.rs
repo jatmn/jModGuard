@@ -603,12 +603,22 @@ async fn copy_member_table(
         .contains(&table),
         "unsupported member table"
     );
-    if !table_exists(src, table).await? {
+    if !table_exists(src, table).await? || !table_exists(dest, table).await? {
         return Ok(());
     }
+    // Later guild migrations add columns. Copy the names both schemas share so
+    // a v9 row can land in a v12 table and new columns keep their defaults.
+    let source_columns = table_columns(src, table).await?;
+    let shared: Vec<String> = table_columns(dest, table)
+        .await?
+        .into_iter()
+        .filter(|column| source_columns.iter().any(|source| source == column))
+        .collect();
+    ensure!(!shared.is_empty(), "member table has no shared columns");
+    let column_list = shared.join(",");
     let mut rows = src
         .query(
-            &format!("SELECT * FROM {table} WHERE guild_id=?"),
+            &format!("SELECT {column_list} FROM {table} WHERE guild_id=?"),
             libsql::params![guild],
         )
         .await?;
@@ -619,12 +629,31 @@ async fn copy_member_table(
             .map(|i| row.get_value(i))
             .collect::<libsql::Result<Vec<_>>>()?;
         dest.execute(
-            &format!("INSERT OR IGNORE INTO {table} VALUES({placeholders})"),
+            &format!("INSERT OR IGNORE INTO {table}({column_list}) VALUES({placeholders})"),
             libsql::params_from_iter(values),
         )
         .await?;
     }
     Ok(())
+}
+
+async fn table_columns(conn: &libsql::Connection, table: &str) -> Result<Vec<String>> {
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let name: String = row.get(1)?;
+        ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "unexpected member column name"
+        );
+        names.push(name);
+    }
+    Ok(names)
 }
 
 async fn ensure_member_feature_admission(

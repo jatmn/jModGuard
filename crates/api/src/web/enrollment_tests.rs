@@ -1118,9 +1118,7 @@ async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
         .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
         .await
         .unwrap();
-    let (status, body) = f
-        .request("GET", "/api/guilds/10/member-sync", "")
-        .await;
+    let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["run_id"].as_str().is_some(), "{body}");
 }

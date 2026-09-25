@@ -887,10 +887,7 @@ impl GuildDataStore {
     }
 
     /// Gateway bot user id already persisted for this enrollment's directory work.
-    pub async fn persisted_member_sync_bot_id(
-        &self,
-        scope: GuildDataScope,
-    ) -> Result<Option<i64>> {
+    pub async fn persisted_member_sync_bot_id(&self, scope: GuildDataScope) -> Result<Option<i64>> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
         self.db
