@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single source of truth for the Buildkite `test` job.
+# Single source of truth for Buildkite check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
 # GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
 # The owner-command Pullfrog workflow is the sole GitHub Actions exception.
@@ -196,7 +196,7 @@ JS
     return 1
   fi
 
-  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the test job" >&2
+  echo "ci-preflight: cargo audit reported ${advisory_count} advisories; pull requests and ordinary main pushes do not fail the supply-chain check" >&2
   rm -f "$audit_out" "$audit_err"
   return 0
 }
