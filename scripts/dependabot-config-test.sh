@@ -84,6 +84,8 @@ require_absent "$socket_workflow" "issue_comment:"
 require_absent "$socket_workflow" "repo-is-public"
 require_absent "$socket_workflow" "persist-credentials:"
 require_contains "$socket_workflow" "head.repo.full_name == github.repository"
+require_contains "$socket_workflow" "skipping the Socket scan"
+require_absent "$socket_workflow" "exit 1"
 for doc in AGENTS.md development.md docs/BUILDKITE.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
   require_contains "$doc" "SOCKET_SECURITY_API_KEY"
   require_contains "$doc" "not stored in git."

@@ -41,8 +41,8 @@ jobs:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "$SOCKET_SECURITY_API_KEY" ]; then
-            echo 'SOCKET_SECURITY_API_KEY repository secret is required' >&2
-            exit 1
+            echo 'SOCKET_SECURITY_API_KEY is not set; skipping the Socket scan'
+            exit 0
           fi
           PR_NUMBER=0
           if [ "${{ github.event_name }}" = "pull_request" ]; then

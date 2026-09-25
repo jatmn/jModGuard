@@ -172,7 +172,7 @@ and other non-image diffs do not run the full Rust suite. Scheduled, tag,
 and manual publication builds still run every check. This repository has no GitHub Actions CI or
 image jobs or runner fallback. The Socket Security manifest scan is not a CI or image job. Set the repository
 Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on
-the scan. The workflow fails until that secret exists, and the key is not stored in git.
+the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 Dependabot version updates use GitHub-hosted
 dynamic workflows only while **Dependabot on self-hosted runners** stays
 disabled; they are not image publication. GitHub still displays the Buildkite status and a link to
