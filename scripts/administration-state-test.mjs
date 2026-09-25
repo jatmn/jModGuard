@@ -373,6 +373,72 @@ test("authorization loss hides the controls and stops automatic polling", async 
   assert.equal(view.timers.size, 0);
 });
 
+function findAll(element, predicate, found = []) {
+  if (predicate(element)) found.push(element);
+  for (const child of element.children || []) findAll(child, predicate, found);
+  return found;
+}
+
+test("a policy save keeps the sibling field from the refresh it waits for", async () => {
+  const item = record("bot");
+  item.channel = "stable";
+  item.cadence = "daily";
+  let releaseRead;
+  let block = false;
+  let saved;
+  const view = await ready(async (url, options) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/policy") {
+      saved = JSON.parse(options.body);
+      Object.assign(item, saved);
+      return response(state([item]));
+    }
+    if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
+    return response(state([item]));
+  });
+  const [channel, cadence] = findAll(view.elements.get("update-cards"), (element) => element.tag === "select");
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  channel.value = "nightly";
+  const savingChannel = channel.listeners.change();
+  item.cadence = "weekly";
+  releaseRead(response(state([item])));
+  await Promise.all([reading, savingChannel]);
+  assert.deepEqual(saved, { component: "bot", channel: "nightly", cadence: "weekly" });
+
+  block = true;
+  const readingAgain = vm.runInContext("refresh()", view.context);
+  cadence.value = "monthly";
+  const savingCadence = cadence.listeners.change();
+  item.channel = "stable";
+  releaseRead(response(state([item])));
+  await Promise.all([readingAgain, savingCadence]);
+  assert.deepEqual(saved, { component: "bot", channel: "stable", cadence: "monthly" });
+});
+
+test("an install uses the candidate from the refresh it waits for", async () => {
+  let item = record("api");
+  let releaseRead;
+  let block = false;
+  let submitted;
+  const view = await ready(async (url, options) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/install") {
+      submitted = JSON.parse(options.body);
+      return response({ queued: true });
+    }
+    if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
+    return response(state([item]));
+  });
+  block = true;
+  const reading = vm.runInContext("refresh()", view.context);
+  const saving = updateButton(view, "api").listeners.click();
+  item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) } };
+  releaseRead(response(state([item])));
+  await Promise.all([reading, saving]);
+  assert.equal(submitted.digest, item.candidate.digest);
+});
+
 test("policy changes use authoritative responses and latest switches automatic installation off", async () => {
   const item = record("bot");
   item.channel = "stable";

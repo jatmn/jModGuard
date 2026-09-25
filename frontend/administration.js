@@ -185,8 +185,8 @@ function action(label, callback, view) {
   const button = node("button", label, "btn btn-sm");
   button.type = "button";
   button.addEventListener("click", () => {
-    const record = view.record;
-    return mutate(record, label, () => callback(record));
+    // Read the record when the request is built, after mutate finishes any in-flight refresh.
+    return mutate(view.record, label, () => callback(view.record));
   });
   return button;
 }
@@ -222,9 +222,11 @@ function createComponentView(record) {
     view.channel.append(option);
   }
   view.channel.addEventListener("change", () => {
-    const item = view.record;
     const value = view.channel.value;
-    return mutate(item, "Save release channel", () => request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence }));
+    return mutate(view.record, "Save release channel", () => {
+      const item = view.record;
+      return request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence });
+    });
   });
   const channelLabel = node("label", "Release channel", "field");
   channelLabel.append(view.channel);
@@ -236,9 +238,11 @@ function createComponentView(record) {
     view.cadence.append(option);
   }
   view.cadence.addEventListener("change", () => {
-    const item = view.record;
     const value = view.cadence.value;
-    return mutate(item, "Save automatic installation", () => request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value }));
+    return mutate(view.record, "Save automatic installation", () => {
+      const item = view.record;
+      return request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value });
+    });
   });
   const cadenceLabel = node("label", "Automatic installation", "field");
   cadenceLabel.append(view.cadence);
