@@ -227,8 +227,9 @@ bash scripts/ci-preflight.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That script runs lockfile verification, `cargo fmt --check`, whitespace
-`git diff --check`, the publisher/release contract tests
+That script runs lockfile verification, `cargo fmt --check`,
+`bash scripts/dylint.sh` (the Trail of Bits general lints pinned in `dylint.toml`),
+whitespace `git diff --check`, the publisher/release contract tests
 (`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
@@ -243,8 +244,7 @@ frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
 workspace test runs only the in-process smoke), the API build without default features,
-`cargo deny check bans licenses sources`,
-`bash scripts/dylint.sh` (the Trail of Bits general lints pinned in `dylint.toml`), and
+`cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
 `cargo audit` cannot run). `npm audit --prefix tools/eslint --audit-level=high`

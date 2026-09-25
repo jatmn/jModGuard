@@ -11,7 +11,19 @@ if [ -z "$root" ]; then
 fi
 cd "$root"
 
-version="6.1.0"
+version="$(sed -n 's/^tag = "v\(.*\)".*/\1/p' dylint.toml | head -1)"
+if [ -z "$version" ]; then
+  echo "dylint: could not read library tag from dylint.toml" >&2
+  exit 1
+fi
+
+# Buildkite runs many cargo steps in parallel on one agent. Give dylint its own
+# CARGO_HOME so `cargo fetch` for Trail of Bits lint libraries does not race
+# shared git checkouts under the agent default home.
+scratch="${TMPDIR:-$root/.tmp/dylint}"
+mkdir -p "$scratch"
+export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"
+mkdir -p "$CARGO_HOME"
 
 # `cargo-dylint -V` is not a version flag: Cargo only prints it for
 # `cargo dylint -V`. `dylint-link` is a linker wrapper and has no version
@@ -47,9 +59,15 @@ fi
 # The lint libraries typecheck with their own nightly, which is newer than
 # this repo's pinned toolchain, so allow `deprecated`: a rename that exists
 # only on that nightly is not a failure of the project compiler.
-if [ -z "${RUSTFLAGS:-}" ]; then
-  export RUSTFLAGS='-D warnings -A deprecated'
-fi
+dylint_rustflags="${RUSTFLAGS:-}"
+case " ${dylint_rustflags} " in
+  *" -D warnings "*) ;;
+  *) dylint_rustflags="${dylint_rustflags:+$dylint_rustflags }-D warnings" ;;
+esac
+case " ${dylint_rustflags} " in
+  *" -A deprecated "*) ;;
+  *) dylint_rustflags="${dylint_rustflags:+$dylint_rustflags }-A deprecated" ;;
+esac
 
 echo "dylint: cargo dylint --all -- --locked --all-targets --workspace"
-cargo dylint --all -- --locked --all-targets --workspace
+RUSTFLAGS="$dylint_rustflags" cargo dylint --all -- --locked --all-targets --workspace

@@ -40,6 +40,7 @@ expect "contracts frontend" tools/eslint-web-selftest.sh
 expect "contracts fmt dylint api boundaries integration supply-chain" crates/api/src/lib.rs
 expect "contracts fmt dylint integration supply-chain" crates/integration-tests/tests/dual_process_smoke.rs
 expect "contracts fmt dylint remote-database supply-chain" crates/integration-tests/tests/remote_database_smoke.rs
+expect "contracts fmt dylint remote-database supply-chain" crates/integration-tests/tests/guild_store_smoke.rs
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 expect "contracts fmt dylint bot boundaries integration supply-chain" crates/bot/src/main.rs
 expect "contracts fmt dylint conductor boundaries supply-chain" crates/conductor/src/install.rs
