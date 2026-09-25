@@ -151,15 +151,21 @@ async function mutate(record, label, callback) {
   render();
   try {
     const result = await callback();
-    actionMessage = result.queued
-      ? `${record.component.toUpperCase()}: update request accepted. Waiting for the component to report its result.`
-      : `${record.component.toUpperCase()}: ${label} completed.`;
     if (result.components) {
       snapshot = result;
       stale = false;
     } else {
       await refresh();
     }
+    // The queued acknowledgement is not progress. Say we are waiting only when
+    // the snapshot just read still has that component's work pending.
+    const current = snapshot?.components?.find((item) => item.component === record.component);
+    const name = record.component.toUpperCase();
+    actionMessage = result.queued
+      ? current && pending(current)
+        ? `${name}: update request accepted. Waiting for the component to report its result.`
+        : `${name}: update request accepted.`
+      : `${name}: ${label} completed.`;
     if (!stale) notice(actionMessage, "good");
   } catch (error) {
     const message = `${record.component.toUpperCase()}: ${error.message}`;

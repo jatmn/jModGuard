@@ -278,6 +278,64 @@ test("application, launcher and WebUI installs show pending and automatically re
   }
 });
 
+test("queued acknowledgement uses the immediate status snapshot for api, bot, WebUI, and launcher", async () => {
+  const targets = [["api", false], ["bot", false], ["bot", true], ["webui", false]];
+  for (const outcome of ["pending", "success", "failed"]) {
+    for (const [component, launcher] of targets) {
+      const item = record(component);
+      let acknowledged = false;
+      const view = await ready(async (url) => {
+        if (url === "/api/me") return response({ is_bot_owner: true });
+        if (url === "/api/updates/install") { acknowledged = true; return response({ queued: true }); }
+        if (!acknowledged) return response(state([item]));
+        if (outcome === "pending") {
+          if (launcher) item.desired_launcher = item.candidate;
+          else { item.state = "queued"; item.desired = item.candidate; }
+        } else if (outcome === "success") {
+          if (launcher) item.installed_launcher = item.candidate;
+          else {
+            item.state = "running";
+            item.installed = item.candidate;
+            item.observed.source_sha = item.candidate.source_sha;
+          }
+        } else {
+          item.state = "failed";
+          item.last_error = "Storage authentication failed";
+        }
+        return response(state([item]));
+      });
+      await updateButton(view, component, launcher).listeners.click();
+      const banner = view.elements.get("update-status").textContent;
+      const card = textOf(view.elements.get("update-cards"));
+      assert.match(banner, /update request accepted/);
+      if (outcome === "pending") {
+        assert.match(banner, /Waiting for the component/);
+        assert.match(card, /Update pending/);
+      } else {
+        assert.doesNotMatch(banner, /Waiting for the component/);
+        if (outcome === "failed") assert.match(card, /Install failed: Storage authentication failed/);
+        else assert.doesNotMatch(card, /Update pending/);
+      }
+    }
+  }
+});
+
+test("a failed status read after a queued acknowledgement keeps the status error", async () => {
+  const item = record("webui");
+  let installed = false;
+  const view = await ready(async (url) => {
+    if (url === "/api/me") return response({ is_bot_owner: true });
+    if (url === "/api/updates/install") { installed = true; return response({ queued: true }); }
+    if (installed) throw new Error("status offline");
+    return response(state([item]));
+  });
+  await updateButton(view, "webui").listeners.click();
+  const banner = view.elements.get("update-status").textContent;
+  assert.match(banner, /status offline/);
+  assert.doesNotMatch(banner, /Waiting for the component/);
+  assert.doesNotMatch(banner, /update request accepted/);
+});
+
 test("overlapping refreshes share one read and mutations wait for that read", async () => {
   const item = record();
   let releaseRead;

@@ -10,6 +10,8 @@ details** with full hashes. **Uptime** uses compact durations such as `13m 38s` 
 and every two seconds while a component or launcher update is pending. Controls stay
 disabled during an action or after a failed status refresh until a fresh read succeeds.
 An accepted update request is shown as pending, not as a completed installation.
+If the status read that follows the acknowledgement already shows success or failure,
+the page confirms only that the request was accepted and leaves that result on the card.
 When the installed WebUI differs from this tab, **Reload page** loads the new UI.
 
 ## Release and runtime model
