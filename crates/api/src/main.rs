@@ -2,7 +2,6 @@
 
 use anyhow::{Context as _, Result};
 use jmodguard_api::config::ApiProcessConfig;
-use jmodguard_api::db::Db;
 use jmodguard_api::web::state::ApiState;
 use jmodguard_api::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
@@ -11,8 +10,12 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = ApiProcessConfig::load()?;
+    let offline_write =
+        std::env::var("JMODGUARD_PROCESS_PROBE").ok().as_deref() == Some("api-write");
 
-    if cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty() {
+    if !offline_write
+        && (cfg.web.oauth_client_id.is_empty() || cfg.web.oauth_client_secret.is_empty())
+    {
         anyhow::bail!(
             "Discord OAuth credentials required for jmodguard-api. Set \
              `oauth_client_id` / `oauth_client_secret` in config.toml \
@@ -22,6 +25,12 @@ async fn main() -> Result<()> {
     }
 
     init_tracing(&cfg.log, "api");
+
+    if offline_write {
+        jmodguard_api::startup::write_shared_config(cfg).await?;
+        tracing::info!("API process stopped");
+        return Ok(());
+    }
 
     if cfg.bot.owner_id == 0 {
         tracing::warn!(
@@ -44,9 +53,8 @@ async fn main() -> Result<()> {
 
     // API expects the bot (or a one-shot migrate) to have applied schema already.
     // Wait briefly so systemd/container start order can race the bot's first migrate.
-    let opts = cfg.db_open_options();
-    let (attempts, delay) = jmodguard_api::db::startup_open_retry(&opts);
     let cfg_for_state = cfg.clone();
+    let open_cfg = cfg.clone();
     let db_label = if cfg.db.url.is_empty() {
         cfg.db.path.display().to_string()
     } else {
@@ -55,7 +63,7 @@ async fn main() -> Result<()> {
     let web_app = health::serve_while(&listener, async {
         tokio::select! {
             result = async {
-                let db = Db::open_with_until_ready(opts, attempts, delay)
+                let db = jmodguard_api::startup::open_database(&open_cfg)
                     .await
                     .with_context(|| {
                         format!(

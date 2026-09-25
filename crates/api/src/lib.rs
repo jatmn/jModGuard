@@ -3,4 +3,5 @@ pub use jmodguard::{
     bot_actions, config, db, defaults, health, ids, init_tracing, normalize, shutdown_signal,
     templates, tenant, types,
 };
+pub mod startup;
 pub mod web;

@@ -16,5 +16,6 @@ pub mod member_directory;
 pub mod member_sync;
 pub mod nickname_worker;
 pub mod spam_actions;
+pub mod startup;
 pub mod state;
 pub mod text_spam;

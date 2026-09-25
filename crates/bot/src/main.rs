@@ -2,7 +2,6 @@
 
 use anyhow::{Context as _, Result};
 use jmodguard_bot::config::BotProcessConfig;
-use jmodguard_bot::db::Db;
 use jmodguard_bot::handlers::Handler;
 use jmodguard_bot::logging;
 use jmodguard_bot::nickname_worker::reconcile_nickname_job;
@@ -77,8 +76,10 @@ async fn drain_nickname_reconciles(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = BotProcessConfig::load()?;
+    let offline_cache =
+        std::env::var("JMODGUARD_PROCESS_PROBE").ok().as_deref() == Some("bot-cache");
 
-    if cfg.discord.token.is_empty() {
+    if !offline_cache && cfg.discord.token.is_empty() {
         anyhow::bail!(
             "no Discord token configured. Set `token` in config.toml \
              (see config.example.toml) or JMODGUARD_DISCORD_TOKEN."
@@ -90,7 +91,7 @@ async fn main() -> Result<()> {
     // Liveness must accept before database retry. Platform probes hit this
     // port while `open_with_until_ready` waits on a waking database or a
     // local SQLite lock.
-    if let Some(bind) = cfg.health_bind() {
+    if !offline_cache && let Some(bind) = cfg.health_bind() {
         let listener = jmodguard_bot::health::bind(&bind).await?;
         tokio::spawn(async move {
             if let Err(error) = jmodguard_bot::health::serve_listener(listener).await {
@@ -99,10 +100,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    let opts = cfg.db_open_options();
-    let (attempts, delay) = db::startup_open_retry(&opts);
+    if offline_cache {
+        jmodguard_bot::startup::observe_shared_config(cfg).await?;
+        tracing::info!("bot process stopped");
+        return Ok(());
+    }
+
     let db = tokio::select! {
-        db = Db::open_with_until_ready(opts, attempts, delay) => db.with_context(|| {
+        db = jmodguard_bot::startup::open_database(&cfg) => db.with_context(|| {
             if cfg.is_remote_db() {
                 format!(
                     "failed to open remote database {} after waiting for a transient connect/bootstrap",
