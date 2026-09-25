@@ -64,12 +64,12 @@ these ignored tests at an existing installation or share one database between th
 Selected checks must pass before preparation and publication. A docs-only
 diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
-bootstrap, or remote-database jobs. A `frontend/` or `crates/conductor/frontend/` WebUI diff runs the frontend Node checks. `Dockerfile.webui`
+bootstrap, or remote-database jobs. A `frontend/` diff runs the frontend Node checks and the API group, because the default API `embed-ui` build embeds those files. A `crates/conductor/frontend/` diff runs the frontend Node checks plus conductor and boundary checks. `Dockerfile.webui`
 also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
 conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
-are compiled and tested. A `crates/updater` diff also runs the API and boundary groups
-because the API is the sole consumer of `jmodguard-updater`. Shared `src/` and migrations run the Rust packages and the remote-database job.
+are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Shared `src/` and migrations run the Rust packages and the remote-database job.
 The root lockfile and toolchain do too, and they also run the publisher and
 bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and

@@ -75,9 +75,11 @@ runtime_consumers() {
   add integration
 }
 
-# jmodguard-updater is a direct dependency of jmodguard-api only.
+# jmodguard-updater is a library dependency of jmodguard-api and a release
+# binary in both the bot and API images (jmodguard-launcher).
 updater_consumers() {
   add api
+  add bot
   add boundaries
 }
 
@@ -133,7 +135,7 @@ classify() {
       return
       ;;
     Dockerfile.bot)
-      add fmt; add bot; add bootstrap; add publish-tests
+      add fmt; add bot; add updater; add bootstrap; add publish-tests
       return
       ;;
     crates/conductor/frontend/*)
@@ -144,7 +146,7 @@ classify() {
       return
       ;;
     Dockerfile.api)
-      add api; add fmt; add boundaries; add integration; add bootstrap; add publish-tests
+      add api; add fmt; add updater; add boundaries; add integration; add bootstrap; add publish-tests
       return
       ;;
     Dockerfile.conductor)
@@ -183,7 +185,9 @@ classify() {
       all_rust
       ;;
     frontend)
+      # Default API embed-ui compiles these files with include_str!.
       add frontend
+      add api
       ;;
     docs)
       add contracts
@@ -262,6 +266,17 @@ else
     [ "$full" -eq 1 ] && break
   done <<<"$names"
 fi
+
+# cargo deny / cargo audit stay on every plan that compiles or publishes Rust.
+ensure_supply_chain() {
+  local group
+  for group in fmt api bot conductor runtime updater core integration boundaries remote-database publish-tests bootstrap; do
+    case " ${selected} " in
+      *" ${group} "*) add supply-chain; return ;;
+    esac
+  done
+}
+ensure_supply_chain
 
 if [ "$mode" = "plan" ]; then
   for group in "${groups[@]}"; do
