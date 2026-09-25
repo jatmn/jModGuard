@@ -367,6 +367,9 @@ if should_run frontend; then
   echo 'ci-preflight: npm ci --ignore-scripts --prefix tools/eslint'
   npm ci --ignore-scripts --prefix tools/eslint
 
+  echo 'ci-preflight: npm audit --prefix tools/eslint --audit-level=high'
+  npm audit --prefix tools/eslint --audit-level=high
+
   echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
   bash tools/eslint-web-selftest.sh
 

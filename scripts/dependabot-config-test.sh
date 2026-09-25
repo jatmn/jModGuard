@@ -45,6 +45,14 @@ do
   require_contains "$yaml" "$needle"
 done
 
+for needle in \
+  "package-ecosystem: npm" \
+  'directory: "/tools/eslint"' \
+  "npm-minor-and-patch"
+do
+  require_contains "$yaml" "$needle"
+done
+
 require_absent "$yaml" "package-ecosystem: github-actions"
 require_absent "$yaml" "package-ecosystem: docker"
 require_absent "$yaml" '${{'

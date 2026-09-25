@@ -30,7 +30,7 @@ steps:
 
 The agents need Linux x86-64, Git, Node.js `^20.19.0`, `^22.13.0`, or `>=24`
 (host ESLint 10 and the frontend checks; `bash scripts/require-host-eslint-node.sh`
-enforces this before `npm ci --prefix tools/eslint`), Rust 1.96.0 with Clippy and
+enforces this before `npm ci --ignore-scripts --prefix tools/eslint`), Rust 1.96.0 with Clippy and
 rustfmt, `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`

@@ -37,7 +37,17 @@ if [ "$probe_status" -ne 1 ] || ! printf '%s\n' "$probe_out" | grep -q 'no-undef
     printf '%s\n' "$probe_out" >&2
     exit 1
 fi
-echo "PASS: ESLint rejects an undefined name"
+echo "PASS: ESLint rejects an undefined name (frontend pattern)"
+
+probe_status=0
+probe_out="$(printf '%s\n' 'void notDeclared;' \
+    | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename crates/conductor/frontend/eslint-selftest-probe.js 2>&1)" || probe_status=$?
+if [ "$probe_status" -ne 1 ] || ! printf '%s\n' "$probe_out" | grep -q 'no-undef'; then
+    echo "FAIL: ESLint did not reject an undefined name for conductor (exit ${probe_status})" >&2
+    printf '%s\n' "$probe_out" >&2
+    exit 1
+fi
+echo "PASS: ESLint rejects an undefined name (conductor pattern)"
 
 if ! printf '%s\n' 'const ready = true;' 'void ready;' \
     | "$ESLINT" -c "$CONFIG" --stdin --stdin-filename frontend/eslint-selftest-ok.js

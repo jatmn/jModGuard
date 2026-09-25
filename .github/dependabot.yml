@@ -30,3 +30,16 @@ updates:
     # of this repository. Replacing it requires manual regression testing.
     ignore:
       - dependency-name: libsql-sqlite3-parser
+  # Host-only ESLint pin (tools/eslint); not packaged into the WebUI.
+  - package-ecosystem: npm
+    directory: "/tools/eslint"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

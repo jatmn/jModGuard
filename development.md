@@ -42,9 +42,10 @@ builds: **[docs/BUILDKITE.md](docs/BUILDKITE.md)**.
 
 ## Dependency updates
 
-`.github/dependabot.yml` schedules weekly Cargo workspace
-checks after it is merged to `main`. Cargo minor and patch version updates
-are grouped; major updates remain separate. Dependabot permits up to
+`.github/dependabot.yml` schedules weekly Cargo workspace checks and weekly
+npm updates for the host-only ESLint pin under `tools/eslint` after they are
+merged to `main`. Cargo and npm minor and patch version updates are grouped;
+major updates remain separate. Dependabot permits up to
 five open version-update PRs. Review and run the Buildkite checks before
 merging dependency updates.
 
