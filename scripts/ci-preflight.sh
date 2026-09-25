@@ -2,7 +2,8 @@
 # Single source of truth for Buildkite check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
 # GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
-# The owner-command Pullfrog workflow is the sole GitHub Actions exception.
+# Allowed workflow files are the owner-command Pullfrog workflow and the
+# Socket Security manifest scan. CI runs on Buildkite.
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
@@ -65,12 +66,43 @@ should_run() {
 }
 
 if should_run contracts && [ -d "$root/.github/workflows" ]; then
-  while IFS= read -r -d '' workflow; do
-    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
-      echo 'ci-preflight: only the owner-command Pullfrog workflow is allowed; CI runs on Buildkite' >&2
+  for required in pullfrog.yml socket.yml; do
+    if [ ! -f "$root/.github/workflows/$required" ]; then
+      echo "ci-preflight: missing .github/workflows/$required; CI runs on Buildkite" >&2
       exit 1
     fi
+  done
+  while IFS= read -r -d '' workflow; do
+    case "$workflow" in
+      "$root/.github/workflows/pullfrog.yml"|"$root/.github/workflows/socket.yml") ;;
+      *)
+        echo 'ci-preflight: only the Pullfrog and Socket Security workflows are allowed; CI runs on Buildkite' >&2
+        exit 1
+        ;;
+    esac
   done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
+  socket_workflow="$root/.github/workflows/socket.yml"
+  for needle in \
+    'name: socket-security-workflow' \
+    'SOCKET_SECURITY_API_KEY' \
+    'socketsecurity==2.10.2' \
+    'socketcli' \
+    '--scm github' \
+    'actions/checkout@v6'
+  do
+    if ! grep -Fq -- "$needle" "$socket_workflow"; then
+      echo "ci-preflight: socket workflow missing: $needle" >&2
+      exit 1
+    fi
+  done
+  if grep -Fq 'issue_comment:' "$socket_workflow"; then
+    echo 'ci-preflight: Socket Security must not run from comments' >&2
+    exit 1
+  fi
+  if grep -Fq 'repo-is-public' "$socket_workflow"; then
+    echo 'ci-preflight: Socket Security must not mark this private repository public' >&2
+    exit 1
+  fi
 fi
 
 if should_run contracts; then

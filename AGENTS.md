@@ -207,8 +207,10 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 
 Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
 Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
-Do not add GitHub Actions CI workflows. The owner-command Pullfrog workflow is the
-sole exception; see `docs/PULLFROG.md`.
+Do not add GitHub Actions CI workflows. Allowed workflow files are the
+owner-command Pullfrog workflow (`docs/PULLFROG.md`) and the Socket Security
+manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
+Actions; it is not CI, image publication, or a Buildkite job.
 
 ```bash
 bash scripts/ci-preflight.sh

@@ -1,8 +1,9 @@
 # Buildkite CI and image publishing
 
 All CI and image publication for this repository run on the self-hosted
-Buildkite `linux` queue. The only GitHub Actions workflow is the owner-command
-Pullfrog agent (`docs/PULLFROG.md`); it is not CI or an image publisher. There
+Buildkite `linux` queue. GitHub Actions workflow files are the owner-command
+Pullfrog agent (`docs/PULLFROG.md`) and the Socket Security manifest scan
+(`.github/workflows/socket.yml`). Neither is CI or an image publisher. There
 are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the

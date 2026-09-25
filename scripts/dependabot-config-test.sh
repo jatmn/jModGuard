@@ -57,12 +57,31 @@ require_absent "$yaml" "package-ecosystem: github-actions"
 require_absent "$yaml" "package-ecosystem: docker"
 require_absent "$yaml" '${{'
 if [ -d "$root/.github/workflows" ]; then
-  while IFS= read -r -d '' workflow; do
-    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
-      fail "only the owner-command Pullfrog workflow is allowed under .github/workflows"
+  for required in pullfrog.yml socket.yml; do
+    if [ ! -f "$root/.github/workflows/$required" ]; then
+      fail "missing .github/workflows/$required"
     fi
+  done
+  while IFS= read -r -d '' workflow; do
+    case "$workflow" in
+      "$root/.github/workflows/pullfrog.yml"|"$root/.github/workflows/socket.yml") ;;
+      *) fail "only the Pullfrog and Socket Security workflows are allowed under .github/workflows" ;;
+    esac
   done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
 fi
+socket_workflow=".github/workflows/socket.yml"
+for needle in \
+  "name: socket-security-workflow" \
+  "SOCKET_SECURITY_API_KEY" \
+  "socketsecurity==2.10.2" \
+  "socketcli" \
+  "--scm github" \
+  "actions/checkout@v6"
+do
+  require_contains "$socket_workflow" "$needle"
+done
+require_absent "$socket_workflow" "issue_comment:"
+require_absent "$socket_workflow" "repo-is-public"
 
 for needle in \
   "Dependabot on self-hosted runners" \

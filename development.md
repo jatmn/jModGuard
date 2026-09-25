@@ -70,6 +70,8 @@ the job stays **queued** on a `dependabot` label and then **cancelled** at
 Keep **Settings → Advanced Security → Dependabot on self-hosted runners**
 **disabled** so GitHub-hosted standard runners can execute the job. This
 repository has no GitHub Actions self-hosted runners; CI is Buildkite.
+The Socket Security manifest scan is `.github/workflows/socket.yml` on GitHub
+Actions. It is not CI.
 Do not register leftover Proxmox GHA runners or label any runner
 `dependabot`. `bash scripts/dependabot-config-test.sh` guards this YAML
 and the operator-copy contract.
