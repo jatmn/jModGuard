@@ -5,11 +5,13 @@
 # cargo-dylint and dylint-link must match this tag. A library built by a
 # different dylint_linting version is refused.
 #
-# These are individual Trail of Bits general lints. Each one typechecks
-# with the toolchain in examples/general/rust-toolchain.toml
-# (nightly-2026-08-20 at v6.1.0). Project builds stay on rust-toolchain.toml.
-# scripts/dylint.sh denies warnings and allows `deprecated`, because that
-# nightly can rename an API the pinned project compiler still accepts.
+# These are individual Trail of Bits general lints. They share the toolchain
+# in examples/general/rust-toolchain.toml (nightly-2026-08-20 at v6.1.0).
+# `cargo dylint` runs one workspace `cargo check --all-targets` under that
+# nightly (into the step's `target-dylint` tree). Clippy, tests, and images
+# stay on rust-toolchain.toml (1.96.0). scripts/dylint.sh passes
+# `-D warnings -A deprecated` through RUSTFLAGS to that workspace check,
+# not to the lint-library builds (those clear RUSTFLAGS).
 #
 # Not loaded:
 # - examples/general/non_thread_safe_call_in_test flags std::fs calls in

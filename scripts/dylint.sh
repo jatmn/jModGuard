@@ -56,9 +56,10 @@ fi
 
 # `-D warnings` must arrive through RUSTFLAGS. Arguments after `--` are
 # forwarded to `cargo check`, which rejects `-D warnings` as a cargo flag.
-# The lint libraries typecheck with their own nightly, which is newer than
-# this repo's pinned toolchain, so allow `deprecated`: a rename that exists
-# only on that nightly is not a failure of the project compiler.
+# `cargo dylint` checks the workspace with the lint libraries' nightly
+# (nightly-2026-08-20 at the pinned tag). Allow `deprecated` on that check
+# so a nightly-only rename does not fail a tree that still builds on 1.96.0
+# under Clippy and release builds.
 dylint_rustflags="${RUSTFLAGS:-}"
 case " ${dylint_rustflags} " in
   *" -D warnings "*) ;;
