@@ -9,7 +9,7 @@ on:
     types: [opened, synchronize, reopened]
 
 concurrency:
-  group: socket-scan-${{ github.ref }}-${{ github.sha }}
+  group: socket-scan-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
