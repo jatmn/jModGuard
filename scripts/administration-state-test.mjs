@@ -702,6 +702,37 @@ test("Database Usage shows independent physical databases and unknown allocation
   assert.ok(calls.includes("/api/database-usage"));
 });
 
+test("Database Usage does not paint cards if the tab hides during the fetch", async () => {
+  let release;
+  const usage = new Promise((resolve) => { release = resolve; });
+  const view = page(async (url) => {
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    await usage;
+    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1 }, percent_of_limit: 0, status: "normal" }], generated_at: 1 }) };
+  });
+  const pending = vm.runInContext('selectView("usage")', view.context);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  view.context.document.visibilityState = "hidden";
+  release();
+  await pending;
+  assert.equal(textOf(view.elements.get("usage-cards")), "");
+});
+
+test("Database Usage marks retained cards stale when refresh fails", async () => {
+  let fail = false;
+  const view = page(async (url) => {
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    if (fail) throw new Error("usage unavailable");
+    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 }, percent_of_limit: 0.1, status: "normal" }], generated_at: 1 }) };
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  fail = true;
+  await vm.runInContext('refreshUsage()', view.context);
+  const text = textOf(view.elements.get("usage-cards"));
+  assert.match(text, /Stale: the latest usage refresh failed/);
+  assert.match(view.elements.get("usage-status").textContent, /usage unavailable/);
+});
+
 test("Administration usage polling does not fetch while the tab is hidden", async () => {
   const calls = [];
   const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });

@@ -72,6 +72,11 @@ impl GuildDataStore {
                         params![scope.guild_id(), scope.enrollment.id.as_str()],
                     )?;
                     anyhow::ensure!(removed > 0, SnapshotError::Invalid);
+                    tx.execute_reclaim_metadata_bounded(
+                        "UPDATE guild_snapshot_health SET physical_sample_at_ms=NULL WHERE singleton=1",
+                        (),
+                        super::snapshots::growth_reserve(&tx)?,
+                    )?;
                     tx.commit()?;
                     return Ok(false);
                 }

@@ -550,12 +550,21 @@ async function doRefreshUsage() {
       return;
     }
     const snapshot = await request("/api/database-usage", {});
-    if (activeView !== "usage") return;
+    if (activeView !== "usage" || document.visibilityState === "hidden") return;
     signIn.classList.add("hidden");
     usageView.classList.remove("hidden");
     usageCards.replaceChildren(...snapshot.databases.map(renderUsage));
     usageStatus.textContent = `Usage response ${age(snapshot.generated_at)}. Catalog ${snapshot.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.`;
-  } catch (error) { usageStatus.textContent = error.message; }
+  } catch (error) {
+    usageStatus.textContent = error.message;
+    for (const card of usageCards.children) {
+      card.dataset = card.dataset || {};
+      if (card.dataset.usageStale) continue;
+      card.dataset.usageStale = "1";
+      const note = node("p", "Stale: the latest usage refresh failed. These figures are not a current capacity sample.", "text-warning");
+      card.children.unshift(note);
+    }
+  }
   finally { scheduleRefresh(); }
 }
 

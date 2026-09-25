@@ -409,6 +409,86 @@ async fn bulk_delete_repeated_id_returns_one_before_state() {
 }
 
 #[tokio::test]
+async fn same_size_edit_near_budget_does_not_recharge_row_reserve() {
+    let (_fixture, _registration, store, scope) = ready().await;
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), observation(120, Some("same"), None, 1))
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "UPDATE guild_snapshot_health SET estimated_snapshot_bytes=?1 WHERE singleton=1",
+                params![crate::capacity::SNAPSHOT_BUDGET_BYTES as i64],
+                1_000_000,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    let edit = observation(120, Some("same"), Some(at(2)), 2);
+    assert_eq!(
+        store
+            .apply_snapshot_edit(scope, edit)
+            .await
+            .unwrap()
+            .outcome,
+        SnapshotOutcome::Stored
+    );
+}
+
+#[tokio::test]
+async fn consumed_snapshot_invalidates_physical_sample() {
+    let (_fixture, _registration, store, scope) = ready().await;
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), observation(121, Some("gone"), None, 1))
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "UPDATE guild_snapshot_health SET physical_sample_at_ms=?1,physical_sample_bytes=?2 WHERE singleton=1",
+                params![at(1), 1_i64],
+                1_000_000,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .take_snapshot(scope, 20, 121, at(3))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let sampled_at: Option<i64> = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT physical_sample_at_ms FROM guild_snapshot_health WHERE singleton=1",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(sampled_at, None);
+}
+
+#[tokio::test]
 async fn conservative_debt_cannot_exceed_fresh_whole_file_bound() {
     let (_fixture, _registration, store, scope) = ready().await;
     assert_eq!(

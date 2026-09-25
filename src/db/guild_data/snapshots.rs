@@ -17,7 +17,7 @@ const ROW_RESERVE: u64 = 4096;
 /// indexes (primary-key autoindex and expiry), and mutation receipts. Reserve
 /// 64 pages per tree using the actual page size. This is intentionally larger
 /// than ordinary writes; commit admission remains the final allocated-byte check.
-fn growth_reserve(tx: &impl SqlExecutor) -> Result<u64> {
+pub(super) fn growth_reserve(tx: &impl SqlExecutor) -> Result<u64> {
     let page_size = tx.capacity_page_size()?;
     (page_size)
         .checked_mul(64 * 4)
@@ -617,6 +617,11 @@ impl GuildDataStore {
                         params![expired_count as i64], growth_reserve(&tx)?,
                     )?;
                 }
+                tx.execute_reclaim_metadata_bounded(
+                    "UPDATE guild_snapshot_health SET physical_sample_at_ms=NULL WHERE singleton=1",
+                    (),
+                    growth_reserve(&tx)?,
+                )?;
                 tx.commit()?;
             }
             Ok(out)
@@ -742,9 +747,12 @@ fn admit_snapshot(
         )?;
         wrote_health = true;
     }
+    // Insert accounting adds the one-time row reserve. An update already
+    // carries that reserve and only changes encoded bytes.
+    let row_reserve = if old_bytes == 0 { ROW_RESERVE } else { 0 };
     let estimated = (logical.max(0) as u64)
         .saturating_add(incoming_bytes.saturating_sub(old_bytes))
-        .saturating_add(ROW_RESERVE);
+        .saturating_add(row_reserve);
     if estimated > crate::capacity::SNAPSHOT_BUDGET_BYTES {
         return Ok(SnapshotAdmission {
             allowed: false,

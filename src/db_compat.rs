@@ -1121,6 +1121,7 @@ impl Transaction {
                 "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,expired_count=expired_count+?2 WHERE singleton=1"
                     | "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1,physical_sample_at_ms=NULL,evicted_count=evicted_count+?2 WHERE singleton=1"
                     | "UPDATE guild_snapshot_health SET expired_count=expired_count+?1 WHERE singleton=1"
+                    | "UPDATE guild_snapshot_health SET physical_sample_at_ms=NULL WHERE singleton=1"
                     | "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1 WHERE singleton=1"
                     | "UPDATE meta SET value=?1 WHERE key='action_request_floor'"
                     | "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'"
@@ -1797,9 +1798,11 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
         connection.execute_batch("COMMIT").unwrap();
-        assert!(connection
-            .execute_batch("CREATE TABLE refused(a INTEGER)")
-            .is_err());
+        assert!(
+            connection
+                .execute_batch("CREATE TABLE refused(a INTEGER)")
+                .is_err()
+        );
         drop(connection);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

@@ -374,10 +374,7 @@ impl SnapshotIngress {
                         .await
                         .is_ok();
                     if initialized {
-                        let mut seen = self.health_initialized.lock();
-                        if seen.len() < 1024 {
-                            seen.insert(store_id.to_owned());
-                        }
+                        self.health_initialized.lock().insert(store_id.to_owned());
                     } else {
                         self.restore_loss(store_id, lost);
                         self.cleanup_paused.lock().insert(store_id.to_owned());
@@ -562,10 +559,8 @@ impl SnapshotIngress {
         self.gap();
         let key = store_id.to_owned();
         let mut pending = self.lost_pending.lock();
-        if pending.contains_key(&key) || pending.len() < 1024 {
-            let count = pending.entry(key).or_default();
-            *count = count.saturating_add(1);
-        }
+        let count = pending.entry(key).or_default();
+        *count = count.saturating_add(1);
     }
 
     fn take_loss(&self, store_id: &str) -> u64 {
@@ -577,10 +572,8 @@ impl SnapshotIngress {
             return;
         }
         let mut pending = self.lost_pending.lock();
-        if pending.contains_key(store_id) || pending.len() < 1024 {
-            let count = pending.entry(store_id.to_owned()).or_default();
-            *count = count.saturating_add(lost);
-        }
+        let count = pending.entry(store_id.to_owned()).or_default();
+        *count = count.saturating_add(lost);
     }
 
     fn capture_paused(&self, scope: &GuildDataScope) -> bool {
@@ -1138,14 +1131,11 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     continue;
                 }
                 if !configured {
-                    if config_load_failed {
-                        if let Some(mut report) = report.take() {
-                            report.vars.insert(
-                                "coverage".into(),
-                                "configuration unavailable".into(),
-                            );
-                            submit_report(&app, &work.context, report);
-                        }
+                    if config_load_failed && let Some(mut report) = report.take() {
+                        report
+                            .vars
+                            .insert("coverage".into(), "configuration unavailable".into());
+                        submit_report(&app, &work.context, report);
                     }
                     continue;
                 }
@@ -1633,7 +1623,14 @@ mod tests {
         app.snapshots.refresh_scope(&app, 789).await;
         assert!(app.snapshots.scopes.lock().contains_key(&789));
         drop(app);
-        for suffix in ["", "-wal", "-shm", ".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
@@ -1653,13 +1650,39 @@ mod tests {
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
         app.snapshots.scopes.lock().insert(789, scope);
-        crate::db::retire_guild_enrollment(&app.db, 789, 100).await.unwrap();
+        crate::db::retire_guild_enrollment(&app.db, 789, 100)
+            .await
+            .unwrap();
         app.snapshots.refresh_scope(&app, 789).await;
         assert!(!app.snapshots.scopes.lock().contains_key(&789));
         drop(app);
-        for suffix in ["", "-wal", "-shm", ".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn known_losses_are_counted_for_every_physical_store() {
+        let ingress = SnapshotIngress::default();
+        for index in 0..1025 {
+            ingress.gap_store(&format!("store-{index}"));
+        }
+        assert_eq!(ingress.lost_pending.lock().len(), 1025);
+        assert_eq!(ingress.take_loss("store-1024"), 1);
+        for index in 0..1025 {
+            ingress
+                .health_initialized
+                .lock()
+                .insert(format!("store-{index}"));
+        }
+        assert!(ingress.health_initialized.lock().contains("store-1024"));
     }
 
     #[test]
