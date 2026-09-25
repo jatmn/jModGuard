@@ -507,6 +507,10 @@ function parseRetryAfterMs(header) {
   return Math.min(seconds, 30) * 1000;
 }
 
+function isDiscordRateLimited(err) {
+  return !!err && (err.status === 429 || err.code === "discord_rate_limited");
+}
+
 function isUnauthenticated(err) {
   const msg = String(err && err.message);
   return err.status === 401 || msg.includes("not authenticated") || msg === "session expired" || msg.includes("401");
@@ -537,6 +541,7 @@ function isApiWarmup(err) {
  *  (`api()` reports those as "HTTP 503"). A JSON 503 with a different
  *  `error` field is an application response and must not spin. */
 function isOriginStarting(err) {
+  if (isDiscordRateLimited(err)) return false;
   if (isApiWarmup(err)) return true;
   if (!err || !err.status) return true;
   if (err.status === 502 || err.status === 504) return true;
