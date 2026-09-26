@@ -170,7 +170,13 @@ Buildkite's self-hosted `linux` queue runs the checks selected for that
 diff and publishes the bot/API images after those checks pass. Docs-only
 and other non-image diffs do not run the full Rust suite. Scheduled, tag,
 and manual publication builds still run every check. This repository has no GitHub Actions CI or
-image jobs or runner fallback. Dependabot version updates use GitHub-hosted
+image jobs or runner fallback. The Socket Security manifest scan is not a CI or image job. Set the repository
+Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on
+the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
+Dependabot version updates use GitHub-hosted
 dynamic workflows only while **Dependabot on self-hosted runners** stays
 disabled; they are not image publication. GitHub still displays the Buildkite status and a link to
 its build logs. See [Buildkite setup](BUILDKITE.md) for GHCR credentials,

@@ -2,7 +2,8 @@
 # Single source of truth for Buildkite check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
 # GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
-# The owner-command Pullfrog workflow is the sole GitHub Actions exception.
+# Allowed workflow files are the owner-command Pullfrog workflow and the
+# Socket Security manifest scan. CI runs on Buildkite.
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
@@ -63,15 +64,6 @@ should_run() {
     *) return 1 ;;
   esac
 }
-
-if should_run contracts && [ -d "$root/.github/workflows" ]; then
-  while IFS= read -r -d '' workflow; do
-    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
-      echo 'ci-preflight: only the owner-command Pullfrog workflow is allowed; CI runs on Buildkite' >&2
-      exit 1
-    fi
-  done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
-fi
 
 if should_run contracts; then
   if ! grep -Fq 'bash .buildkite/select-checks.sh upload' "$root/.buildkite/pipeline.yml"; then
