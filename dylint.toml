@@ -10,8 +10,10 @@
 # `cargo dylint` runs one workspace `cargo check --all-targets` under that
 # nightly (into the step's `target-dylint` tree). Clippy, tests, and images
 # stay on rust-toolchain.toml (1.96.0). scripts/dylint.sh passes
-# `-D warnings -A deprecated` through RUSTFLAGS to that workspace check,
-# not to the lint-library builds (those clear RUSTFLAGS).
+# `-D warnings -A deprecated` through DYLINT_RUSTFLAGS, which the driver
+# applies only while it is RUSTC_WORKSPACE_WRAPPER. The script unsets
+# RUSTFLAGS for that run so the flag cannot reach the driver build or
+# dependency crates. Lint-library builds also clear RUSTFLAGS.
 #
 # Not loaded:
 # - examples/general/non_thread_safe_call_in_test flags std::fs calls in

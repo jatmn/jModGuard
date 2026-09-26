@@ -25,9 +25,13 @@ mkdir -p "$scratch"
 export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"
 mkdir -p "$CARGO_HOME"
 
-# Dylint uses `cargo init` for a temporary dependency. Inside this workspace,
-# Cargo writes `edition.workspace = true`; Dylint then isolates the package
-# with `[workspace]`, leaving that edition without a definition.
+# `cargo dylint --all` builds two temporary projects under TMPDIR.
+# Resolving the git library runs `cargo init`, then appends `[workspace]`.
+# Inside this repository, `cargo init` writes `edition.workspace = true`,
+# which has no edition once that package is its own workspace.
+# The rustc driver package is written by hand (`edition = "2018"`, no
+# `[workspace]`). Cargo still walks up to this repository's `[workspace]`
+# and rejects the unlisted package. Keep both projects outside the workspace.
 dylint_tmpdir="$(cd -P "$scratch" && pwd)"
 root="$(cd -P "$root" && pwd)"
 case "$dylint_tmpdir/" in
@@ -60,13 +64,19 @@ done
 
 if [ "$need_install" -eq 1 ]; then
   echo "dylint: installing cargo-dylint and dylint-link ${version} from source"
-  # Caller RUSTFLAGS are for the workspace lint check below. An inherited
-  # toolchain flag must not fail this install before Dylint runs.
-  env -u RUSTFLAGS cargo install cargo-dylint dylint-link --locked --version "$version" --force
+  # Cargo-wide rustc flags are not for this tool build. The workspace
+  # check below uses DYLINT_RUSTFLAGS.
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    cargo install cargo-dylint dylint-link --locked --version "$version" --force
 fi
 
-# `-D warnings` must arrive through RUSTFLAGS. Arguments after `--` are
-# forwarded to `cargo check`, which rejects `-D warnings` as a cargo flag.
+# `-D warnings` is a rustc flag. Arguments after `--` are forwarded to
+# `cargo check`, which rejects it. `RUSTFLAGS` is the wrong channel:
+# cargo-dylint 6.1.0 prepends it onto the temporary driver build, and the
+# workspace `cargo check` applies it to every crate. Lint-library builds
+# clear it, so they are not the leak. `DYLINT_RUSTFLAGS` reaches rustc only
+# for workspace packages, because `cargo dylint` sets
+# `RUSTC_WORKSPACE_WRAPPER`.
 # `cargo dylint` checks the workspace with the lint libraries' nightly
 # (nightly-2026-08-20 at the pinned tag). Allow `deprecated` on that check
 # so a nightly-only rename does not fail a tree that still builds on 1.96.0
@@ -76,4 +86,6 @@ fi
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
 echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace"
-TMPDIR="$dylint_tmpdir" RUSTFLAGS="$dylint_rustflags" cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
+  cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace
