@@ -46,4 +46,35 @@ caller_flags='-D warnings -A warnings -A deprecated -D deprecated'
   bash scripts/dylint.sh)
 [ "$(sed -n '2p' "$capture")" = "$caller_flags -D warnings -A deprecated" ]
 [ "$(sed -n '3p' "$capture")" = 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace' ]
+
+# A mismatched installed version must run `cargo install` without the caller's
+# RUSTFLAGS. Those flags are only for the workspace lint check.
+install_capture="$fixture/install-capture"
+cat > "$fixture/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1 $2" = 'install --list' ]; then
+  ver="${DYLINT_TEST_LISTED_VERSION:-6.1.0}"
+  printf 'cargo-dylint v%s:\n    cargo-dylint\n\ndylint-link v%s:\n    dylint-link\n' "$ver" "$ver"
+elif [ "$1" = install ]; then
+  if [ -n "${RUSTFLAGS+x}" ]; then
+    printf 'set\n%s\n' "$RUSTFLAGS" > "$DYLINT_TEST_INSTALL_CAPTURE"
+  else
+    printf 'unset\n' > "$DYLINT_TEST_INSTALL_CAPTURE"
+  fi
+  printf '%s\n' "$*" >> "$DYLINT_TEST_INSTALL_CAPTURE"
+elif [ "$1" = dylint ]; then
+  printf '%s\n%s\n%s\n' "$TMPDIR" "$RUSTFLAGS" "$*" > "$DYLINT_TEST_CAPTURE"
+else
+  exit 1
+fi
+SH
+chmod +x "$fixture/bin/cargo"
+(cd "$fixture/project" && PATH="$fixture/bin:$PATH" DYLINT_TEST_CAPTURE="$capture" \
+  DYLINT_TEST_INSTALL_CAPTURE="$install_capture" DYLINT_TEST_LISTED_VERSION='0.0.0' \
+  TMPDIR="$fixture/external" RUSTFLAGS='-Z unstable-options' \
+  bash scripts/dylint.sh)
+[ "$(sed -n '1p' "$install_capture")" = 'unset' ]
+[ "$(sed -n '2p' "$install_capture")" = 'install cargo-dylint dylint-link --locked --version 6.1.0 --force' ]
+[ "$(sed -n '2p' "$capture")" = '-Z unstable-options -D warnings -A deprecated' ]
 echo 'dylint test: isolated temporary directory and caller flags verified'

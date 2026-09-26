@@ -60,7 +60,9 @@ done
 
 if [ "$need_install" -eq 1 ]; then
   echo "dylint: installing cargo-dylint and dylint-link ${version} from source"
-  cargo install cargo-dylint dylint-link --locked --version "$version" --force
+  # Caller RUSTFLAGS are for the workspace lint check below. An inherited
+  # toolchain flag must not fail this install before Dylint runs.
+  env -u RUSTFLAGS cargo install cargo-dylint dylint-link --locked --version "$version" --force
 fi
 
 # `-D warnings` must arrive through RUSTFLAGS. Arguments after `--` are
