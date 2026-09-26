@@ -241,6 +241,8 @@ if should_run fmt; then
 fi
 
 if should_run dylint; then
+  echo 'ci-preflight: bash scripts/dylint-test.sh'
+  bash scripts/dylint-test.sh
   echo 'ci-preflight: bash scripts/dylint.sh'
   bash scripts/dylint.sh
 fi

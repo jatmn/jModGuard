@@ -103,7 +103,7 @@ classify() {
       all_rust
       return
       ;;
-    dylint.toml|scripts/dylint.sh)
+    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
       add dylint
       return
       ;;

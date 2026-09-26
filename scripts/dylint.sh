@@ -25,6 +25,15 @@ mkdir -p "$scratch"
 export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"
 mkdir -p "$CARGO_HOME"
 
+# Dylint uses `cargo init` for a temporary dependency. Inside this workspace,
+# Cargo writes `edition.workspace = true`; Dylint then isolates the package
+# with `[workspace]`, leaving that edition without a definition.
+dylint_tmpdir="$(cd -P "$scratch" && pwd)"
+root="$(cd -P "$root" && pwd)"
+case "$dylint_tmpdir/" in
+  "$root/"*) dylint_tmpdir=/tmp ;;
+esac
+
 # `cargo-dylint -V` is not a version flag: Cargo only prints it for
 # `cargo dylint -V`. `dylint-link` is a linker wrapper and has no version
 # flag, so read both versions from `cargo install --list`.
@@ -71,4 +80,4 @@ case " ${dylint_rustflags} " in
 esac
 
 echo "dylint: cargo dylint --all -- --locked --all-targets --workspace"
-RUSTFLAGS="$dylint_rustflags" cargo dylint --all -- --locked --all-targets --workspace
+TMPDIR="$dylint_tmpdir" RUSTFLAGS="$dylint_rustflags" cargo dylint --all -- --locked --all-targets --workspace

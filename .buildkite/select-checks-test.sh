@@ -49,7 +49,7 @@ expect "contracts fmt bot updater bootstrap publish-tests supply-chain" Dockerfi
 expect "contracts fmt api updater boundaries integration bootstrap publish-tests supply-chain" Dockerfile.api
 expect "contracts fmt dylint runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
-expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh
+expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
 expect "$rust" src/db/mod.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
