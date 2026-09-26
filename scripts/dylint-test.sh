@@ -37,4 +37,12 @@ esac
   TMPDIR="$fixture/external" RUSTFLAGS='-C debuginfo=0' \
   bash scripts/dylint.sh)
 [ "$(sed -n '1p' "$capture")" = "$fixture/external" ]
+
+# Caller flags may contain the policy flags before a later override. The
+# Dylint flags must be last so both lint levels retain their intended effect.
+caller_flags='-D warnings -A warnings -A deprecated -D deprecated'
+(cd "$fixture/project" && PATH="$fixture/bin:$PATH" DYLINT_TEST_CAPTURE="$capture" \
+  TMPDIR="$fixture/external" RUSTFLAGS="$caller_flags" \
+  bash scripts/dylint.sh)
+[ "$(sed -n '2p' "$capture")" = "$caller_flags -D warnings -A deprecated" ]
 echo 'dylint test: isolated temporary directory and caller flags verified'

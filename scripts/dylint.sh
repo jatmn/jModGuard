@@ -69,15 +69,9 @@ fi
 # (nightly-2026-08-20 at the pinned tag). Allow `deprecated` on that check
 # so a nightly-only rename does not fail a tree that still builds on 1.96.0
 # under Clippy and release builds.
-dylint_rustflags="${RUSTFLAGS:-}"
-case " ${dylint_rustflags} " in
-  *" -D warnings "*) ;;
-  *) dylint_rustflags="${dylint_rustflags:+$dylint_rustflags }-D warnings" ;;
-esac
-case " ${dylint_rustflags} " in
-  *" -A deprecated "*) ;;
-  *) dylint_rustflags="${dylint_rustflags:+$dylint_rustflags }-A deprecated" ;;
-esac
+# Apply the gate's lint levels last: a caller may have an earlier copy of
+# either flag followed by an overriding `-A warnings` or `-D deprecated`.
+dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
 echo "dylint: cargo dylint --all -- --locked --all-targets --workspace"
 TMPDIR="$dylint_tmpdir" RUSTFLAGS="$dylint_rustflags" cargo dylint --all -- --locked --all-targets --workspace
