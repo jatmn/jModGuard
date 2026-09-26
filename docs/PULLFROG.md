@@ -11,6 +11,7 @@ Set the repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key
 before relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
 A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 The agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
 starts with `@pullfrog` followed by a visible instruction on the same first

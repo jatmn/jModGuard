@@ -22,6 +22,18 @@ require_line() {
   grep -Fxq -- "$line" "$root/$path" || fail "missing line in $path: $line"
 }
 
+require_missing_key_skip() {
+  local path="$1"
+  # The missing-key exit must be inside its guard and before the first scan.
+  awk '
+    $0 == "          if [ -z \"$SOCKET_SECURITY_API_KEY\" ]; then" && !guard { guard = NR; inside = 1; next }
+    inside && $0 == "            exit 0" { skip = NR; next }
+    inside && $0 == "          fi" { end = NR; inside = 0; next }
+    $0 == "          socketcli \\" && !scan { scan = NR }
+    END { exit !(guard && skip > guard && end > skip && scan > end) }
+  ' "$root/$path" || fail "missing-key guard must exit 0 before socketcli in $path"
+}
+
 require_absent() {
   local path="$1"
   local needle="$2"
@@ -92,12 +104,12 @@ do
 done
 require_line "$socket_workflow" '    types: [opened, synchronize, reopened]'
 require_line "$socket_workflow" "          EVENT_ACTION: \${{ github.event_name == 'pull_request' && github.event.action == 'reopened' && 'synchronize' || '' }}"
+require_missing_key_skip "$socket_workflow"
 require_absent "$socket_workflow" "issue_comment:"
 require_absent "$socket_workflow" "repo-is-public"
 require_absent "$socket_workflow" "pull-requests: write"
 require_contains "$socket_workflow" "head.repo.full_name == github.repository"
 require_contains "$socket_workflow" "skipping the Socket scan"
-require_absent "$socket_workflow" "exit 1"
 require_contains "$socket_workflow" 'group: socket-scan-${{ github.ref }}'
 require_contains "$socket_workflow" "cancel-in-progress: true"
 # The group is the branch or pull-request ref. Including github.sha gives every
@@ -109,6 +121,7 @@ for doc in AGENTS.md development.md docs/BUILDKITE.md docs/DEPLOY-BUNNY.md docs/
   require_contains "$doc" "uploads discovered Cargo and npm manifests outside ignored paths to Socket"
   require_contains "$doc" "A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest."
   require_contains "$doc" "Push and full-report scans do not fail for alerts. Socket API errors do not fail this check."
+  require_contains "$doc" "without a main baseline, Socket may treat existing dependencies as newly added."
 done
 
 for needle in \
