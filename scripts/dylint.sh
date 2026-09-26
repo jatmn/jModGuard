@@ -73,5 +73,5 @@ fi
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
-echo "dylint: cargo dylint --all -- --locked --all-targets --workspace"
-TMPDIR="$dylint_tmpdir" RUSTFLAGS="$dylint_rustflags" cargo dylint --all -- --locked --all-targets --workspace
+echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace"
+TMPDIR="$dylint_tmpdir" RUSTFLAGS="$dylint_rustflags" cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace

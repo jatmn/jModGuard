@@ -16,7 +16,7 @@ set -euo pipefail
 if [ "$1 $2" = 'install --list' ]; then
   printf 'cargo-dylint v6.1.0:\n    cargo-dylint\n\ndylint-link v6.1.0:\n    dylint-link\n' || :
 elif [ "$1" = dylint ]; then
-  printf '%s\n%s\n' "$TMPDIR" "$RUSTFLAGS" > "$DYLINT_TEST_CAPTURE"
+  printf '%s\n%s\n%s\n' "$TMPDIR" "$RUSTFLAGS" "$*" > "$DYLINT_TEST_CAPTURE"
 else
   exit 1
 fi
@@ -45,4 +45,5 @@ caller_flags='-D warnings -A warnings -A deprecated -D deprecated'
   TMPDIR="$fixture/external" RUSTFLAGS="$caller_flags" \
   bash scripts/dylint.sh)
 [ "$(sed -n '2p' "$capture")" = "$caller_flags -D warnings -A deprecated" ]
+[ "$(sed -n '3p' "$capture")" = 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace' ]
 echo 'dylint test: isolated temporary directory and caller flags verified'
