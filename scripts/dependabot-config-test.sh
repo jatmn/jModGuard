@@ -16,6 +16,12 @@ require_contains() {
   grep -Fq -- "$needle" "$root/$path" || fail "missing in $path: $needle"
 }
 
+require_line() {
+  local path="$1"
+  local line="$2"
+  grep -Fxq -- "$line" "$root/$path" || fail "missing line in $path: $line"
+}
+
 require_absent() {
   local path="$1"
   local needle="$2"
@@ -80,12 +86,15 @@ for needle in \
   "--exit-code-on-api-error 0" \
   "persist-credentials: false" \
   "fetch-depth: 0" \
-  "EVENT_ACTION:"
+  "issues: write"
 do
   require_contains "$socket_workflow" "$needle"
 done
+require_line "$socket_workflow" '    types: [opened, synchronize, reopened]'
+require_line "$socket_workflow" "          EVENT_ACTION: \${{ github.event_name == 'pull_request' && github.event.action == 'reopened' && 'synchronize' || '' }}"
 require_absent "$socket_workflow" "issue_comment:"
 require_absent "$socket_workflow" "repo-is-public"
+require_absent "$socket_workflow" "pull-requests: write"
 require_contains "$socket_workflow" "head.repo.full_name == github.repository"
 require_contains "$socket_workflow" "skipping the Socket scan"
 require_absent "$socket_workflow" "exit 1"
@@ -97,9 +106,9 @@ require_absent "$socket_workflow" "github.sha"
 for doc in AGENTS.md development.md docs/BUILDKITE.md docs/DEPLOY-BUNNY.md docs/PULLFROG.md; do
   require_contains "$doc" "SOCKET_SECURITY_API_KEY"
   require_contains "$doc" "not stored in git."
-  require_contains "$doc" "uploads Cargo.toml and Cargo.lock to Socket"
-  require_contains "$doc" "A new blocking alert fails this check."
-  require_contains "$doc" "An API or infrastructure error does not fail this check."
+  require_contains "$doc" "uploads discovered Cargo and npm manifests outside ignored paths to Socket"
+  require_contains "$doc" "A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest."
+  require_contains "$doc" "Push and full-report scans do not fail for alerts. Socket API errors do not fail this check."
 done
 
 for needle in \

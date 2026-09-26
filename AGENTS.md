@@ -213,8 +213,8 @@ manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
 Actions; it is not CI, image publication, or a Buildkite job. Set the
 repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
 relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
-The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
-A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
 
 ```bash
 bash scripts/ci-preflight.sh

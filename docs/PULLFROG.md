@@ -9,8 +9,8 @@ run GitHub workflows from a PR merge commit. It has no push, PR, schedule, or
 workflow `.github/workflows/socket.yml`, and it does not listen for comments.
 Set the repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key
 before relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
-The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
-A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
 The agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
 starts with `@pullfrog` followed by a visible instruction on the same first

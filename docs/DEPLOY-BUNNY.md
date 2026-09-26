@@ -173,8 +173,8 @@ and manual publication builds still run every check. This repository has no GitH
 image jobs or runner fallback. The Socket Security manifest scan is not a CI or image job. Set the repository
 Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before relying on
 the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
-The scan uploads Cargo.toml and Cargo.lock to Socket and may comment on a pull request with the GitHub Actions token.
-A new blocking alert fails this check. An API or infrastructure error does not fail this check. Buildkite remains the merge gate.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
 Dependabot version updates use GitHub-hosted
 dynamic workflows only while **Dependabot on self-hosted runners** stays
 disabled; they are not image publication. GitHub still displays the Buildkite status and a link to

@@ -65,50 +65,6 @@ should_run() {
   esac
 }
 
-if should_run contracts && [ -d "$root/.github/workflows" ]; then
-  for required in pullfrog.yml socket.yml; do
-    if [ ! -f "$root/.github/workflows/$required" ]; then
-      echo "ci-preflight: missing .github/workflows/$required; CI runs on Buildkite" >&2
-      exit 1
-    fi
-  done
-  while IFS= read -r -d '' workflow; do
-    case "$workflow" in
-      "$root/.github/workflows/pullfrog.yml"|"$root/.github/workflows/socket.yml") ;;
-      *)
-        echo 'ci-preflight: only the Pullfrog and Socket Security workflows are allowed; CI runs on Buildkite' >&2
-        exit 1
-        ;;
-    esac
-  done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
-  socket_workflow="$root/.github/workflows/socket.yml"
-  for needle in \
-    'name: socket-security-workflow' \
-    'SOCKET_SECURITY_API_KEY' \
-    'socketsecurity==2.10.2' \
-    'socketcli' \
-    '--scm github' \
-    'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
-    '--exit-code-on-api-error 0' \
-    'persist-credentials: false' \
-    'fetch-depth: 0' \
-    'EVENT_ACTION:'
-  do
-    if ! grep -Fq -- "$needle" "$socket_workflow"; then
-      echo "ci-preflight: socket workflow missing: $needle" >&2
-      exit 1
-    fi
-  done
-  if grep -Fq 'issue_comment:' "$socket_workflow"; then
-    echo 'ci-preflight: Socket Security must not run from comments' >&2
-    exit 1
-  fi
-  if grep -Fq 'repo-is-public' "$socket_workflow"; then
-    echo 'ci-preflight: Socket Security must not mark this private repository public' >&2
-    exit 1
-  fi
-fi
-
 if should_run contracts; then
   if ! grep -Fq 'bash .buildkite/select-checks.sh upload' "$root/.buildkite/pipeline.yml"; then
     echo 'ci-preflight: .buildkite/pipeline.yml must invoke bash .buildkite/select-checks.sh upload' >&2
