@@ -199,7 +199,7 @@ to match `bot.owner_id` (non-zero) for:
 - request body `"scope": "global"`;
 - deleting a global badword row.
 
-`/api/me` includes `is_bot_owner`, optional `conductor_url`, and `preview` when this
+`/api/me` includes `is_bot_owner` and `preview` when this
 tab is a read-only permission preview. The SPA hides Global scope controls and the
 global-prefix card when that flag is false. Guild admins still see global
 badwords (read-only) because the bot enforces them. Badword list entries include
@@ -213,7 +213,7 @@ and expires after one hour. Administrator, Moderator, and
 Member apply distinct synthetic permission masks to permission-dependent responses;
 the owner's live Manage Server permission is still rechecked before every guild read.
 Preview never makes `is_bot_owner` true.
-The same-origin **Administration** link appears whenever `/api/me` identifies the bot owner. It opens `/administration/index.html` and uses the existing session. An optional `web.conductor_url` still opens the older, separate self-host conductor UI under **Legacy conductor**.
+The same-origin **Administration** link appears whenever `/api/me` identifies the bot owner. It opens `/administration/index.html` and uses the existing session.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / settings) from
@@ -234,7 +234,7 @@ The UI talks to a JSON API under `/api/...`; every guild endpoint checks the
 session can manage that guild (or bot ownership for global scope):
 
 ```
-GET    /api/me                         # includes is_bot_owner, conductor_url, preview
+GET    /api/me                         # includes is_bot_owner, preview
 POST   /api/me                         # same body as GET; SPA login bootstrap (not CDN-cached)
 POST   /api/preview                    # owner-only; returns a tab-scoped preview token
 DELETE /api/preview                    # exit preview; owner session is unchanged

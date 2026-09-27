@@ -47,7 +47,7 @@ if [ -n "${JMODGUARD_DYLINT_PACKAGES:-}" ]; then
   read -r -a packages <<<"$JMODGUARD_DYLINT_PACKAGES"
   for package in "${packages[@]}"; do
     case "$package" in
-      jmodguard|jmodguard-api|jmodguard-bot|jmodguard-conductor|jmodguard-runtime|jmodguard-updater|jmodguard-integration-tests)
+      jmodguard|jmodguard-api|jmodguard-bot|jmodguard-runtime|jmodguard-updater|jmodguard-integration-tests)
         package_args+=(-p "$package") ;;
       *) echo "dylint: unknown package scope: $package" >&2; exit 2 ;;
     esac

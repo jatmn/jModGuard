@@ -8,23 +8,15 @@ Upgrades: `docs/UPGRADE.md`.
 
 The first compatible foundation is integrated here. See `docs/OVERHAUL.md` for scope.
 The workspace has independent `crates/bot` and `crates/api` services, shared root
-`jmodguard` data/configuration, `crates/runtime` process primitives and `crates/conductor`
-control-process foundation. Do not import the root data crate, Serenity or bot/API state
-into runtime/conductor. Root data must not depend on either service; production bot and
+`jmodguard` data/configuration and `crates/runtime` process primitives. Do not import the root data crate, Serenity or bot/API state
+into runtime. Root data must not depend on either service; production bot and
 API dependency graphs must remain independent. Cross-service tests live in
 `crates/integration-tests`; API dev-dependencies also exercise the HTTP-to-worker handoff.
 The existing bot/API state/config invariants below describe current code; replace them deliberately as their overhaul
 slice is implemented, with corresponding regression coverage.
 
-The conductor reports liveness/version always. Readiness is 503 until the control
-store, conductor OAuth and operator identity are configured; then owner Administration
-is available on the conductor origin. Do not route guild Discord credentials or
-tenant routing through it. Backup and restore jobs are conductor-owned and use a
-dedicated backups-only root plus configured local capture paths; they must not import
-`TenantRuntime`. Signed Stable/Nightly discovery polls a configured feed when keys are
-present; `update_available` is true when an update root is also configured and
-owner apply/rollback is registered. There is no silent automatic update.
-Manifest HMAC secrets stay in environment/Buildkite secrets, never git. Guild dashboard View as… is a read-only preview
+Owner Administration uses the existing WebUI and API session.
+Guild dashboard View as… is a read-only preview
 tab on the API. No live provider testing or deployment is part of the current local
 implementation.
 Bot/API configuration remains available. The current baseline requires a fresh database
@@ -33,8 +25,7 @@ family/version checks before bootstrap writes. Never adopt an unmarked old datab
 
 The old general message archive and member/user activity collection are retired.
 The separate rolling guild-store snapshot records only eligible human messages for
-configured edit/delete logs, expires at most 24 hours after original creation, and
-is omitted from application backups. The bounded member directory is a separate
+configured edit/delete logs and expires at most 24 hours after original creation. The bounded member directory is a separate
 current-membership and retained-ban feature; see `docs/MEMBERS.md`. It never
 records general activity. See `docs/LOGGING-DATA.md`. Historical archive tables
 and helpers remain removed. Basic reports use the last retained observation,
@@ -117,15 +108,13 @@ entire configuration bundle. Complete tenant isolation and replica coordination 
 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
-nonsecret. Credentials stay in process configuration. Populated shared/dedicated
-moves are conductor-owned; see `docs/GUILD-MOVES.md`. Never run core migrations/defaults on a guild
+nonsecret. Credentials stay in process configuration. Never run core migrations/defaults on a guild
 store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 14. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
-never authorizes a later write. The conductor still has no tenant routing.
-Stable/Nightly publication uses Release Please plus scheduled Buildkite Nightlies; complete
-`JMODGUARD-RELEASE-1` manifests are HMAC-SHA256 signed. The conductor discovers them without
-deployment authority; see `docs/RELEASES.md`. Nightly IDs never enter the Release Please
-baseline and must not move `latest`. Incomplete publications stay unavailable.
+never authorizes a later write.
+Stable/Nightly image publication uses Release Please plus scheduled Buildkite Nightlies;
+see `docs/RELEASES.md`. Nightly IDs never enter the Release Please baseline and
+must not move `latest`.
 Library contracts for membership, cases, history, sources and evidence remain as
 documented in their TENANT/CASE pages. Runtime routing, selected-case recording,
 authorized serving and live guild erasure are described in `docs/TENANT-RUNTIME.md`.
@@ -200,13 +189,8 @@ attachments after a recorded image-spam ban case using the Hasher CDN contract a
 configured evidence backend; the API does not perform that Discord re-fetch. Test mode
 and `none` skip it. Failures do not undo delete or ban. Process image budgets belong
 only to bot config.
-Owner-selected conductor updates use the local process adapter and R4 checkpoints;
-compatible rollback never restores an old database. Conductor self-replacement
-writes `recover.json` and `jmodguard-conductor recover-update` is independent of
-the replacement process. Public install validation (`init-local`,
-`validate-install`, `/api/install`) does not require the private ops repository.
-Validation checks a plan and does not apply process configuration. Local plans require SQLite and disjoint
-storage paths; Bunny/AWS URL preflight does not. AWS is EC2 plus SQLite or
+Owner-selected image updates use the existing WebUI/API; see `docs/BUNNY-UPDATES.md`.
+Public installation requires no private ops repository. AWS is EC2 plus SQLite or
 libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands
@@ -237,10 +221,9 @@ That script runs lockfile verification, `cargo fmt --check`,
 `bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
 general lints pinned in `dylint.toml`),
 whitespace `git diff --check`, the publisher/release contract tests
-(`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
+(`bash .buildkite/publish-image-test.sh`), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
-API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
-service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
+API `--no-default-features --all-targets`), service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
 (`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
 (`bash scripts/require-host-eslint-node.sh`, then `npm ci --ignore-scripts --prefix tools/eslint`,
@@ -301,7 +284,7 @@ authorize live provider calls or require a Codex skill to contribute.
 
 - Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source, then runs `cargo check --all-targets` for the affected packages selected by Buildkite (the full workspace for local preflight and global changes) under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
-  `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
+  `Dockerfile.{bot,api}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
   Buildkite; see `docs/BUILDKITE.md`. Do not add GitHub Actions CI workflows.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
@@ -505,6 +488,6 @@ crates/bot/src/commands/           engine, behaviors, plans
 crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
 frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless from runtime CDN, not git)
 migrations/             0001_init through 0016_member_sync_pacing
-Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
+Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …
 ```

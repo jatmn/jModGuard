@@ -29,8 +29,8 @@ expect() {
   fi
 }
 
-rust="contracts fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
-all="contracts frontend fmt dylint api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
+rust="contracts fmt dylint api bot runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
+all="contracts frontend fmt dylint api bot runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
@@ -44,23 +44,19 @@ expect "contracts fmt dylint remote-database supply-chain" crates/integration-te
 expect "contracts fmt dylint remote-database supply-chain" crates/integration-tests/tests/guild_store_smoke.rs
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 expect "contracts fmt dylint bot boundaries integration supply-chain" crates/bot/src/main.rs
-expect "contracts fmt dylint conductor boundaries supply-chain" crates/conductor/src/install.rs
-expect "contracts fmt conductor boundaries frontend supply-chain" crates/conductor/frontend/app.js
 expect "contracts fmt bot updater bootstrap publish-tests supply-chain" Dockerfile.bot
 expect "contracts fmt api updater boundaries integration bootstrap publish-tests supply-chain" Dockerfile.api
-expect "contracts fmt dylint runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
+expect "contracts fmt dylint runtime boundaries core integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
 # Core consumers need coverage, but independent packages and shell fixtures do not.
 core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
 # all_rust groups shared src/migrations skip on purpose. A new rust group must
 # join $core or this list; leaving it out of both is a silent shared-source skip.
-core_omits="runtime conductor publish-tests bootstrap"
+core_omits="runtime publish-tests bootstrap"
 expect "$core" src/config.rs src/db.rs
 expect "$core" config.example.toml src/config.rs
-# Conductor tests embed migration SQL even though conductor cannot import core.
-expect "$core conductor" migrations/guild/0009_message_snapshots.sql
-expect "$core conductor" src/config.rs crates/conductor/src/install.rs
+expect "$core" migrations/guild/0009_message_snapshots.sql
 for group in $rust; do
   case " $core $core_omits " in
     *" $group "*) ;;
@@ -115,7 +111,7 @@ expected="$(printf '%s\n' $core frontend | sort)"
 grep -Fq 'PR diff origin/main...HEAD' "$scratch/selection.log" || fail 'missing diff diagnostic'
 grep -Fq 'select-checks: selected:' "$scratch/selection.log" || fail 'missing selected-group diagnostic'
 # Skipped keys must remain available to unchanged publication dependencies.
-for group in runtime conductor bootstrap publish-tests; do
+for group in runtime bootstrap publish-tests; do
   awk -v wanted="$group" '
     /^    key:/ { key = $2 }
     /^    if: "false"$/ && key == wanted { found = 1 }
@@ -143,7 +139,7 @@ fi
 if ! bash "$selector" plan --files frontend/app.js | grep -qx api; then
   fail "root frontend plan omitted api (embed-ui include_str)"
 fi
-if bash "$selector" plan --files crates/api/src/lib.rs | grep -Eq '^(frontend|bot|conductor|remote-database)$'; then
+if bash "$selector" plan --files crates/api/src/lib.rs | grep -Eq '^(frontend|bot|remote-database)$'; then
   fail "api plan included an unrelated group"
 fi
 
@@ -163,7 +159,7 @@ fi
 
 fetch_log="$(mktemp)"
 fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan 2>"$fetch_log" | wc -l)"
-if [ "$fetch_fail_count" -ne 17 ]; then
+if [ "$fetch_fail_count" -ne 16 ]; then
   fail "fetch failure did not select every group (got ${fetch_fail_count})"
 fi
 grep -Fq 'select-checks: all groups: full validation requested or diff unavailable' "$fetch_log" \
@@ -192,7 +188,7 @@ git init -q --initial-branch=main "$scratch/empty"
 )
 grep -Fq 'select-checks: all groups: empty diff' "$scratch/empty.log" || fail 'missing empty-diff reason'
 empty_count="$(wc -l <"$scratch/empty-plan")"
-if [ "$empty_count" -ne 17 ]; then
+if [ "$empty_count" -ne 16 ]; then
   fail "empty diff did not select every group (got ${empty_count})"
 fi
 
@@ -203,13 +199,12 @@ expect_lint_packages() {
   actual="$(BUILDKITE=false bash "$selector" upload --files "$@" | sed -n 's/^      JMODGUARD_DYLINT_PACKAGES: "\(.*\)"$/\1/p')"
   [[ "$actual" == "$expected" ]] || fail "lint scope for $*: expected [$expected], got [$actual]"
 }
-expect_lint_packages 'jmodguard-conductor' crates/conductor/src/install.rs
 expect_lint_packages 'jmodguard-api jmodguard-integration-tests' crates/api/src/lib.rs
 expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-integration-tests' crates/bot/src/main.rs
-expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-conductor jmodguard-runtime jmodguard-updater jmodguard jmodguard-integration-tests' crates/runtime/src/lib.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-runtime jmodguard-updater jmodguard jmodguard-integration-tests' crates/runtime/src/lib.rs
 expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard jmodguard-integration-tests' src/config.rs
 expect_lint_packages 'jmodguard jmodguard-integration-tests' crates/integration-tests/tests/remote_database_smoke.rs
 expect_lint_packages '' Cargo.lock
-expect_lint_packages '' dylint.toml crates/conductor/src/install.rs
+expect_lint_packages '' dylint.toml crates/api/src/lib.rs
 expect_lint_packages '' mystery.bin
 echo 'select-checks-test: ok'

@@ -54,7 +54,7 @@ maintain its reviewed revision and security regression test manually.
 The vendored `tokio-tungstenite` compatibility patch also requires manual
 maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
-and the Buildkite agents. `Dockerfile.{bot,api,conductor}` pin
+and the Buildkite agents. `Dockerfile.{bot,api}` pin
 `rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
 

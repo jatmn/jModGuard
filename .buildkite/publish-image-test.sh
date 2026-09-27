@@ -41,6 +41,19 @@ assert_request() {
   assert_eq "$got" "$1"
 }
 
+# Stable releases retain the root package and version manifest contract.
+node --input-type=commonjs - <<'JS'
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync("release-please-config.json", "utf8"));
+const manifest = JSON.parse(fs.readFileSync(".release-please-manifest.json", "utf8"));
+assert.equal(config["release-type"], "simple");
+assert.equal(config["include-v-in-tag"], true);
+assert.deepEqual(Object.keys(config.packages), ["."]);
+assert.deepEqual(Object.keys(manifest), ["."]);
+assert.match(manifest["."], /^[0-9]+\.[0-9]+\.[0-9]+$/);
+JS
+
 with_main
 assert_request $'main\t'
 BUILDKITE_TAG=v1 BUILDKITE_BRANCH=v1 assert_request $'tag\trefs/tags/v1'
@@ -208,34 +221,6 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
   || fail 'stable must tag the release'
 contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
   && fail 'Stable pointer must move only after verification'
-
-# shellcheck disable=SC1091
-JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
-run_git() {
-  case "$1" in
-    status|rev-parse) if [[ "$1" == status ]]; then printf ''; else printf '%s\n' "$HEAD_SHA"; fi ;;
-    *) fail "unexpected git $*" ;;
-  esac
-}
-run_docker() { fail 'main conductor/manifest must not use docker'; }
-run_bk() { fail 'main conductor/manifest must not use buildkite'; }
-GHCR_USERNAME=jatmn
-export GHCR_USERNAME
-with_main
-publish_component conductor
-publish_component manifest
-
-# UI and API commit-SHA rebuilds must not bootstrap the unused conductor
-# package, read publication credentials, or reach Docker (including retries).
-for build_source in ui api; do
-  for retry in 0 1; do
-    with_main
-    BUILDKITE_SOURCE="$build_source"
-    BUILDKITE_RETRY_COUNT="$retry"
-    JMODGUARD_PUBLISH_SOURCE="$BASE_SHA"
-    publish_component conductor
-  done
-done
 
 reload_publisher() {
   # shellcheck disable=SC1091
@@ -620,12 +605,6 @@ if ( source_image_layout bot "$partial_source" ) >/dev/null 2>&1; then
 fi
 rm -rf "$partial_source"
 
-exercise_publish 0 0 manual '' '' conductor
-printf '%s\n' "$BUILD_LINE" | grep -q "ghcr.io/jatmn/jmodguard-conductor:${BASE_SHA}" \
-  || fail 'explicit manual-tag conductor publication must still build'
-printf '%s\n' "${CALLS[@]}" | grep -q '^verify ' \
-  && fail 'legacy conductor must not enter bot/API/WebUI image verification'
-
 reload_publisher
 run_git() {
   case "$1" in
@@ -649,27 +628,6 @@ digest="$(printf 'a%.0s' {1..64})"
 run_docker() { printf '%s' "{\"digest\":\"sha256:${digest}\",\"size\":9}"; }
 got="$(inspect_digest "ghcr.io/jatmn/jmodguard-bot:${HEAD_SHA}")"
 assert_eq "$got" "$(printf 'sha256:%s\t%s' "$digest" 9)"
-
-reload_publisher
-run_git() {
-  case "$1" in
-    status|rev-parse)
-      if [[ "$1" == status ]]; then printf ''; else printf '%s\n' "$HEAD_SHA"; fi
-      ;;
-    fetch) return 0 ;;
-    *) fail "unexpected git $*" ;;
-  esac
-}
-run_docker() { fail 'manual SHA manifest must not use docker'; }
-run_bk() { fail 'manual SHA manifest must not use buildkite'; }
-read_plan() { printf '%s\t\n' "$HEAD_SHA"; }
-resolve_source() { printf '%s\t\n' "$HEAD_SHA"; }
-with_main
-BUILDKITE_SOURCE=ui
-JMODGUARD_PUBLISH_SOURCE="$HEAD_SHA"
-GHCR_USERNAME=jatmn
-export BUILDKITE_SOURCE JMODGUARD_PUBLISH_SOURCE GHCR_USERNAME
-publish_component manifest
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/publish-image-git-XXXXXX")"
 cleanup_git() { rm -rf "$scratch"; }
@@ -779,8 +737,6 @@ while IFS='|' read -r path affected; do
 done <<'CASES'
 crates/bot/src/main.rs|bot
 crates/api/src/web/api.rs|api
-crates/conductor/src/main.rs|
-crates/conductor/frontend/app.js|
 crates/integration-tests/tests/dual_process_smoke.rs|
 crates/api/tests/tokenless_startup.rs|
 crates/updater/tests/registry.rs|
@@ -791,7 +747,7 @@ migrations/guild/0001_identity.sql|bot api
 migrations/0012_guild_moves.sql|bot api
 src/lib.rs|bot api
 vendor/tokio-tungstenite/src/lib.rs|bot api
-crates/conductor/Cargo.toml|bot api
+crates/runtime/Cargo.toml|bot api
 Cargo.toml|bot api
 Cargo.lock|bot api
 rust-toolchain.toml|bot api

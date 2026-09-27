@@ -10,7 +10,6 @@ export default defineConfig([
     {
         files: [
             "frontend/**/*.js",
-            "crates/conductor/frontend/**/*.js",
         ],
         extends: [js.configs.recommended],
         languageOptions: {

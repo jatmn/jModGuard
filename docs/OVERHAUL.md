@@ -1,7 +1,7 @@
 # Overhaul implementation status
 
 The overhaul lands in independently reviewed changes. The service foundation is followed
-by routine logging/data minimization. The existing bot/API and optional inactive conductor
+by routine logging/data minimization. The bot and API
 remain independently buildable. A fresh schema baseline now removes the archive tables
 and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
 [database setup boundary](DATABASE-BASELINE.md).
@@ -16,49 +16,16 @@ and helpers. See [logging/data behavior](LOGGING-DATA.md) and the explicit
   Bare Cargo commands now select all workspace packages; production builds select a
   service explicitly, and CI uses `--workspace` to include all tests.
 - Bot/API publishing tracks changes to the extracted runtime. Existing image tags and
-  deployment approval flow remain in place; the conductor is not required for startup
-  and is published only on Stable/Nightly, not ordinary main SHA builds.
-- The conductor can serve owner Administration when configured, including local
-  backup and restore when a dedicated backup root is set. It is not an update
-  installer and must not be deployed as one. Guild credentials and tenant
-  routing stay out of this process. Signed release discovery can list complete
-  Stable/Nightly builds when a feed and trust keys are configured; apply stays
-  inactive.
+  deployment approval flow remain in place.
 
-The target has three Rust services (Discord bot, guild API and installation conductor)
-and a static WebUI. Generic setup, releases and recovery tooling will live in this
-repository; private installation credentials stay with the operator. This schema baseline
-does not import old databases. The fuller tenant/case model remains a later change.
+The project has two Rust services (Discord bot and guild API), shared runtime/data
+libraries, and a static WebUI. Private installation credentials stay with the operator.
 
 ## Implemented: service foundation
 
-- The repository is a Cargo workspace. `jmodguard` still contains the existing bot/API
-  data/model/configuration library after the package split below; `jmodguard-runtime`
-  contains shared shutdown and health utilities;
-  `jmodguard-conductor` is an independently built control process.
-- Existing bot/API entry points use the extracted utilities through the existing public
-  module paths. Their startup, health and shutdown behavior remains covered by tests.
-- The conductor has separate process configuration, a single-thread async runtime,
-  stdout logging, liveness/version endpoints and a configurable shutdown grace.
-  When a control store, conductor OAuth client and operator identity are configured,
-  `/ready` becomes 200 and owner Administration (settings, status, telemetry,
-  notifications) is available. Backup controls become available when a dedicated
-  backup root is configured. Guild-store moves become available when a core
-  capture store and configured shared/dedicated guild-store paths are present.
-  Update *install* controls stay inactive; discovery can list signed releases.
-  The conductor still does not import the application crate, Serenity or tenant routing.
-- CI checks that the conductor/runtime dependency trees do not include the application
-  crate, bot/API service crates or Serenity. It tests the actual conductor process with
-  local HTTP and process signals. Existing frontend and application checks remain.
-- All three Docker build definitions understand the workspace. The conductor image is
-  a development artifact; it is not included in automated main SHA publication.
-  Stable/Nightly builds can publish the conductor image with a complete signed
-  manifest.
-
-See [the conductor developer guide](CONDUCTOR.md) for commands and the current API.
-This is application source, not a separate proof project. No prototype's fixture
-schema, hardcoded test budgets, synthetic login or same-host recovery lock is being
-presented as a completed production control system.
+- The Cargo workspace separates bot/API services from shared data and runtime libraries.
+- Startup, health and shutdown behavior remains covered by tests.
+- CI verifies independent service dependency graphs; Docker builds select each service.
 
 ## Implemented: routine logging without SQL history
 
@@ -93,8 +60,8 @@ with primary-confirmed version observation and protection against concurrent loc
 
 State separation introduced no schema/dependency change and does not establish measured
 memory savings. Administrative activation below removes the API's bot token; the later
-package split now confines each service's implementation and production dependencies. The optional
-conductor remains inactive. See [runtime ownership](ARCHITECTURE.md#runtime-state-ownership).
+package split now confines each service's implementation and production dependencies. The runtime library
+remains independent. See [runtime ownership](ARCHITECTURE.md#runtime-state-ownership).
 
 ## Implemented: typed process configuration
 
@@ -227,7 +194,7 @@ credentials are still shared. See [runtime controls](BOT-ACTIONS.md#runtime-cont
 
 Bot and API source now live in `crates/bot` and `crates/api`; the root library contains
 shared configuration/model/database code. The API production dependency graph excludes
-Serenity and WebSockets; the bot excludes Axum and dashboard sessions. Runtime/conductor
+Serenity and WebSockets; the bot excludes Axum and dashboard sessions. Runtime
 boundaries remain. No external package version changes or new third-party packages are
 introduced: shared config directly uses the existing url/http types, and API tests use
 existing async-trait instead of Serenity's macro re-export.
@@ -420,97 +387,21 @@ objects and does not perform that Discord re-fetch. Test mode and a `none`
 backend skip capture. Failures do not undo delete or ban. Live Discord CDN and Bunny
 zone privacy remain provider checks.
 
-## Implemented: conductor owner administration
+## Implemented: owner administration and image updates
 
-The conductor can open a local control store and verify the installation operator
-through a Discord OAuth client independent of the guild API. Sessions are durable
-and revocable. Administration covers applied conductor settings, service health
-probes, bounded telemetry, owner webhook notifications and local backups. Release
-discovery is available when a feed and keys are configured; install buttons are
-not exposed. The guild WebUI offers owner-only View as… preview in a
-separate tab; preview requests cannot write and never inherit owner authority.
-See [CONDUCTOR.md](CONDUCTOR.md).
+Owner Administration uses the existing WebUI, API owner check and Discord session.
+Bot, API and WebUI updates use independent GHCR images; see [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
+Release Please manages Stable versions. Scheduled Nightly image tags remain separate
+from the stable baseline and do not move `latest`; see [RELEASES.md](RELEASES.md).
 
-## Implemented: local backup and recovery
+## Implemented: public installation
 
-Owners can schedule, create, download, upload and restore authenticated encrypted
-archives from conductor Administration. Defaults are a six-hour cadence, 24
-scheduled points, seven daily points and three release checkpoints. Scheduled
-failures retry and alert, remain visible for explicit retry, and do not pause writes.
-Capture uses SQLite `VACUUM INTO` on configured
-local stores, excludes pending Discord actions, and recursively preserves
-evidence paths in a backups-only directory distinct from the live evidence root.
-Portable downloads use an export password. Restore builds in a marked sibling
-stage, atomically publishes to the configured absent target, applies surviving
-cleanup intents, and requires an explicit acknowledgment after total policy-state
-loss. Interrupted restore staging is recovered on retry. Live
-Bunny consistency/durability remains a separate gate.
-See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
-
-## Implemented: guild database moves
-
-Owners can move one enrolled guild between an already-configured shared store and
-its dedicated store. The conductor copies that guild's tenant rows, freezes its
-core writes, switches placement, and removes the source copy after verification.
-A neighboring guild on the shared database is left in place. Destination
-credentials stay in bot/API process configuration; adding a new store requires
-restarting those services first. Discord actions are not replayed. Rollback after
-cutover is restore from an R4 checkpoint, not a placement pointer flip.
-See [GUILD-MOVES.md](GUILD-MOVES.md).
-
-## Implemented: complete releases and update discovery
-
-Release Please manages Stable version tags and changelog on trusted main
-pushes. Scheduled Buildkite Nightlies use a distinct `nightly-YYYYMMDD-<sha12>`
-identity that cannot enter that baseline or move `latest`. Complete publications
-sign `JMODGUARD-RELEASE-1` manifests covering bot, API, conductor and frontend.
-The conductor polls a configured feed, verifies HMAC trust/rotation, filters
-channels and records compatibility. Incomplete or unsigned artifacts stay unlistable.
-See [RELEASES.md](RELEASES.md).
-
-## Implemented: point-and-click updates and rollback
-
-Owners can install a selected compatible release through Administration. Apply
-uses an R4 checkpoint when capture is configured, exclusive bot ownership, local
-process drain/stage/activate/readiness, and component order frontend → API → bot
-→ conductor. `update_available` is true when an update root is configured with
-discovery. There is no silent automatic update. Compatible rollback switches
-retained binaries and does not restore the previous database. Conductor
-self-replacement writes sidecar `recover.json`; `jmodguard-conductor recover-update`
-does not use the replacement process or private ops. Local tests cover success,
-missing artifacts, failed readiness, backup failure, interrupted jobs, old-instance
-restart and recover-update. Provider HTTP fixtures are not live Bunny cutover proof.
-See [UPDATES.md](UPDATES.md).
-
-## Implemented: public installation and release acceptance
-
-A new operator can install from this public repository without the private ops
-repo. `jmodguard-conductor init-local` and `validate-install` (and owner
-`GET /api/install` / `POST /api/install/validate`) check Bunny, local, and AWS
-topologies, scope-limited URLs, and that private ops is not required. Validation
-does not apply process configuration. A local plan must be SQLite on both
-databases, include the same disjoint storage paths `init-local` writes, and keep
-those roots disjoint. Bunny and AWS URL preflight still validate origin,
-database kinds, and credentials without requiring those local paths. AWS is EC2
-plus the local adapter and SQLite or compatible libSQL; RDS/Postgres URLs are
-refused. The PolyForm Noncommercial license is unchanged.
-
-Bunny Storage publication from public `frontend/` or from the independently
-published WebUI GHCR package is the required path. Buildkite publishes the
-package on changed main revisions but does not upload it to Bunny Storage.
-The Guild WebUI loads daisyUI and Headless UI from a CDN at runtime; those
-libraries are not extra Storage objects. Owner setup, backup-key portability
-and recover-update are documented in
-[INSTALL.md](INSTALL.md). Cost formulas use local RSS/backup
-samples plus current provider list prices ([COST.md](COST.md)).
-
-The isolation/update/move/backup/recovery matrix stays in the existing conductor
-and dual-process tests, plus `crates/conductor/tests/install.rs` and
-`scripts/public-install-acceptance-test.sh`. Local tests are not live Bunny,
-Discord, or AWS proof; the operator guide lists the remaining provider checks.
-
-See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and
-[DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+Operators can install from this public repository without the private ops repo.
+See [INSTALL.md](INSTALL.md), [DEPLOY-AWS.md](DEPLOY-AWS.md) and [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md).
+Buildkite publishes the WebUI package but does not upload it to Bunny Storage.
+The Guild WebUI loads daisyUI and Headless UI from a CDN at runtime; those libraries
+are not extra Storage objects. `scripts/public-install-acceptance-test.sh` checks
+public-source documentation. Local tests do not prove live Bunny, Discord or AWS readiness.
 
 ## Implemented: Discord attachment capture
 

@@ -4,8 +4,7 @@ The old general SQL message archive remains retired. A separate, rolling guild-s
 snapshot keeps the latest observed text and attachment metadata for eligible human
 messages in guilds with an edit, delete or bulk-delete log destination. It expires
 at most 24 hours after the original message creation; edits never extend that time.
-Capacity pressure can evict it earlier. It stores no attachment bytes and is omitted
-from application backups. The bounded [member directory](MEMBERS.md) retains current
+Capacity pressure can evict it earlier. It stores no attachment bytes. The bounded [member directory](MEMBERS.md) retains current
 member identity and known join dates, plus people with confirmed ban history. It does
 not maintain message activity counters or the retired general user archive.
 Joining, leaving and talking still do not maintain a general activity archive.
@@ -128,9 +127,7 @@ require the [fresh database baseline](DATABASE-BASELINE.md); their databases are
 
 The bot admits up to `log.discord_concurrency` reports (default 8), with a total deadline
 of `log.discord_timeout_secs` (default 10). Both have environment overrides documented
-in `config.example.toml`. Conductor Administration can store owner-notification and
-monitoring budgets after operator login; bot Discord report concurrency remains a bot
-process setting until a later credential-delivery feature. Routine and startup
+in `config.example.toml`. Bot Discord report concurrency is a bot process setting. Routine and startup
 report admission never waits, so overload drops those reports rather than building
 a content backlog. On graceful shutdown, the bot attempts one system notice
 for each cached server with a configured system channel. That notice may wait
@@ -170,8 +167,7 @@ table counts. The fresh schema omits `messages`, `members`, `users` and `mutes`;
 archive helpers are removed. Old internal retention fields have no live collection
 effect. Databases from before this baseline are unsupported and are not adopted or
 erased. Publish matching frontend/API artifacts. Routing guilds across stores remains
-subsequent work. Local conductor backup excludes pending Discord actions and can
-sanitize controlled copies against surviving cleanup intents.
+subsequent work. Backup-copy cleanup is unavailable; application cleanup intents remain durable.
 
 Local tests cover real report mapping, rendered payload flags/limits, guild routing,
 unavailable SQL history tables, overload, timeout/capacity recovery and API/UI removal.

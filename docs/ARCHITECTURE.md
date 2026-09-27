@@ -32,7 +32,7 @@ by processes on different hosts.
 - `jmodguard-api` owns HTTP/OAuth, sessions and dashboard state. Its production graph
   contains no Serenity or WebSocket stack. Default `embed-ui` embeds root `frontend/`;
   Bunny builds `cargo build --locked -p jmodguard-api --no-default-features` for JSON/OAuth.
-- Runtime and conductor retain their independent graphs. Integration tests explicitly
+- Runtime retains its independent dependency graph. Integration tests explicitly
   join service libraries; the API's dev-only bot dependency retains HTTP-to-worker tests.
 - Bare workspace commands include every package. Select production builds with `-p`;
   the former root `web` feature no longer exists. Binary names, config and wire contracts
@@ -170,9 +170,7 @@ batch cleanup. Bot and API now record selected outcomes and serve authorized cas
 administration; see [tenant runtime](TENANT-RUNTIME.md). The bot captures proving
 Discord attachments for selected image-spam enforcement through that runtime; the API
 serves authorized journal-available objects and does not perform that Discord re-fetch.
-Live Bunny backup-copy
-cleanup remains later work. Local conductor archives can already
-be sanitized against surviving cleanup intents.
+Backup-copy cleanup is unavailable. Application cleanup intents remain durable.
 
 ## Migrations
 

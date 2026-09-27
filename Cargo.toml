@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = [".", "crates/runtime", "crates/conductor", "crates/bot", "crates/api", "crates/updater", "crates/integration-tests"]
+members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/updater", "crates/integration-tests"]
 # Bare workspace commands validate all packages. Production builds select a service with -p.
-default-members = [".", "crates/runtime", "crates/conductor", "crates/bot", "crates/api", "crates/updater", "crates/integration-tests"]
+default-members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/updater", "crates/integration-tests"]
 
 [workspace.package]
 version = "0.1.0"

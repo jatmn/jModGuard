@@ -694,11 +694,6 @@ async fn api_me(
         },
         "guilds": guilds,
         "is_bot_owner": is_bot_owner(&state, &auth),
-        "conductor_url": if state.cfg.web.conductor_url.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::String(state.cfg.web.conductor_url.clone())
-        },
         "preview": preview::current().map(|preview| serde_json::json!({
             "guild_id": preview.guild_id.to_string(),
             "profile": preview.profile,

@@ -1,122 +1,68 @@
 # Public installation
 
-A new operator can install from **this public repository** without the private
-ops repo or this development workspace. Bunny.net remains the first-class cloud
-path. Local Linux and an honest AWS EC2 route are documented here.
-
-The license stays **PolyForm Noncommercial 1.0.0** (`LICENSE.md`).
-
-This page is source-delivery acceptance: a disposable local install and recovery
-drill that uses public artifacts and docs. It is **not** live Bunny, Discord, or
-AWS proof. Eight merged overhaul PRs do not prove production cutover.
+Install from **this public repository** without the private ops repo; private
+operator automation is not required. The license is **PolyForm Noncommercial 1.0.0**
+(`LICENSE.md`). Bunny.net remains the first-class cloud path.
 
 ## Choose a topology
 
-| Path | Doc | What it is |
+| Path | Guide | Services and storage |
 |---|---|---|
-| Bunny (first-class) | [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) | CDN admin UI, private Magic Containers, Bunny Database / libSQL |
-| Local Linux | [SETUP.md](SETUP.md) | Bot + API on one machine; optional conductor |
-| AWS | [DEPLOY-AWS.md](DEPLOY-AWS.md) | EC2 with the local adapter and SQLite or compatible libSQL. Not RDS/Postgres. |
-| Cost | [COST.md](COST.md) | Formulas from local measurements plus current provider list prices |
-
-Buildkite publishes changed bot, API, and WebUI images from this repository on main SHAs.
-Manual commit-SHA builds skip conductor and signed manifests. They publish the
-eligible bot/API/WebUI images, with WebUI skipped for sources predating that package.
-Conductor images require explicit tag builds (including manual `refs/tags/...`
-sources) or scheduled Nightly builds. Complete signed `JMODGUARD-RELEASE-1`
-manifests require scheduled Nightly or Stable `vMAJOR.MINOR.PATCH` tag builds,
-including manual Stable-tag builds ([BUILDKITE.md](BUILDKITE.md)).
+| Bunny | [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) | CDN WebUI, private bot/API Magic Containers, Bunny Database / libSQL |
+| Local Linux | [SETUP.md](SETUP.md) | Bot and API with local SQLite or compatible libSQL |
+| AWS | [DEPLOY-AWS.md](DEPLOY-AWS.md) | EC2 with SQLite or compatible libSQL; not RDS/Postgres |
+| Cost | [COST.md](COST.md) | Operator measurements and current provider list prices |
 
 ## Public artifacts
 
-Use a source commit SHA or the matching Buildkite image digests:
+Use a source commit or verified image digest:
 
-- source: `https://github.com/jatmn/jModGuard`
-- independently published images on main: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui` (source SHA and `latest` tags for each changed component)
-- conductor image: explicit tag or scheduled Nightly builds
-  (`ghcr.io/jatmn/jmodguard-conductor`), including manual tag builds; for a main
-  or manual commit SHA, build from source (`cargo build --locked -p jmodguard-conductor`)
-  or pin a tagged release
-- installable signed release manifest: scheduled Nightly or Stable tag builds,
-  including manual Stable-tag builds; other tags and manual commit SHAs
-  do not produce a signed manifest
-- admin UI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`, `frontend/administration/index.html`, `frontend/administration.js`
-  (the browser also fetches daisyUI CSS and Headless UI from a CDN at runtime;
-  those libraries are not extra files in this repository)
-  (from source or the independent WebUI GHCR package; Buildkite does not upload
-  the files to Bunny Storage—see [BUILDKITE.md](BUILDKITE.md))
-- license: `LICENSE.md`
+- Source: `https://github.com/jatmn/jModGuard`
+- Images: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui`
+- WebUI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`,
+  `frontend/administration/index.html`, `frontend/administration.js`
 
-Do not copy secrets into git. Bunny Storage passwords, Discord tokens, OAuth
-secrets, and database tokens stay with the operator.
+Buildkite publishes changed images on main. Manual commit-SHA builds publish all
+eligible components; WebUI is skipped for source revisions predating that package.
+Stable tags and scheduled Nightlies use the image channels in [RELEASES.md](RELEASES.md).
+Buildkite does not upload WebUI files to Bunny Storage. Publish from source or the
+WebUI image using the [WebUI guide](WEBUI.md). The browser also fetches daisyUI CSS
+and Headless UI from a CDN; these are not extra repository files.
 
-## Validate a plan
+## Setup
 
-The conductor checks topology, scope-limited URLs, and that private ops is not required.
-Validation does **not** apply process configuration. A **local** plan
-must be SQLite on both databases, include the same storage paths `init-local`
-writes, and keep those roots disjoint. Bunny and AWS URL preflight still
-validate origin, database kinds, and credentials without requiring those local
-paths:
+1. Follow [SETUP.md](SETUP.md) for Discord credentials and process configuration.
+   Keep bot tokens on the bot and dashboard OAuth credentials on the API.
+2. Create a fresh core database or use the recognized `jmodguard-core-1` family.
+   Never adopt an unmarked old database; see [DATABASE-BASELINE.md](DATABASE-BASELINE.md).
+3. Configure a separate guild store. Never point guild data at the core database
+   or public frontend storage. Keep credentials out of git.
+4. Start the bot to apply migrations, then start the API. For a source checkout:
 
-```bash
-cargo build --locked -p jmodguard-conductor
-jmodguard-conductor init-local --root /var/lib/jmodguard
-jmodguard-conductor validate-install --plan /var/lib/jmodguard/plan.json
-```
+   ```bash
+   cargo run --locked -p jmodguard-bot
+   # In a separate terminal after the bot initializes the database:
+   cargo run --locked -p jmodguard-api
+   ```
 
-`init-local` writes disjoint `backup/`, `evidence/`, `update/`, `artifacts/`,
-`capture/`, and `guild/` directories, env examples without secrets, and
-`NEXT-STEPS.txt`. On Unix the install root and those directories are mode
-`0700` and generated files are `0600`. It does **not** create `restore/` —
-restore writes into an absent target.
+5. Open the WebUI and log in as the configured bot owner. **Administration** uses
+   the existing session. For Bunny image updates and required launcher/provider
+   configuration, follow [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
+6. Verify an operator-controlled backup and restore procedure before production.
+   The application does not provide automatic archive or backup-copy cleanup.
 
-Owner Administration can run the same check (it still does not apply settings):
-Installation → Validate install plan (`GET /api/install`, `GET /api/install/plan`,
-`POST /api/install/validate`).
-
-## Guided owner setup
-
-1. Create a **fresh** `jmodguard-core-1` database or empty local SQLite file.
-   Never adopt an unmarked old database ([DATABASE-BASELINE.md](DATABASE-BASELINE.md)).
-2. Create a **separate** guild store. Never point guild data at the core
-   database, the public frontend zone, or the backups-only zone.
-3. Fill bot token only on the bot process. Fill dashboard OAuth only on the API.
-   Fill conductor OAuth (`identify` only) only on the conductor.
-4. Start **bot**, then **API**, then **conductor**.
-5. Login as the configured owner. The first successful conductor login stamps
-   operator identity.
-6. Record the backup key before the first portable export
-   ([BACKUP-RESTORE.md](BACKUP-RESTORE.md)).
-7. Practice restore into the absent restore target. After conductor
-   self-replacement, run `jmodguard-conductor recover-update` independently of
-   OAuth and private ops ([UPDATES.md](UPDATES.md)).
-8. Open **Members** in the guild dashboard to see the automatic initial import
+7. Open **Members** in the guild dashboard to see the automatic initial import
    and its progress. The bot fetches the roster itself in pages of 100 at least
    15 seconds apart. About 11,000 members take roughly 28 minutes for the
    member phase before retries, other guilds and later phases. See
    [MEMBERS.md](MEMBERS.md) for completion, pause, and explicit reconciliation.
 
-## Local disposable install and recovery drill
+## Local validation
 
-```bash
-cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable
-# fill the generated env examples locally
-cargo run --locked -p jmodguard-bot
-cargo run --locked -p jmodguard-api
-cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor
-```
-
-Recovery without live providers:
-
-- Local backup/restore tests: `cargo test --locked -p jmodguard-conductor --test backup`
-- Update/rollback and recover-update: `cargo test --locked -p jmodguard-conductor --test updates`
-- Guild-store moves: `cargo test --locked -p jmodguard-conductor --test moves`
-- Public install/resource checks: `cargo test --locked -p jmodguard-conductor --test install`
-- Dual-process bot/API: `cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke`
-
-`scripts/public-install-acceptance-test.sh` checks that these docs stay public-source
-and do not require private ops.
+`cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke`
+exercises local bot/API process compatibility. `scripts/public-install-acceptance-test.sh`
+checks public-source documentation. These checks do not provision a provider account
+or prove production cutover.
 
 ## Still-deferred live provider checks
 

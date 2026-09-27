@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Upload frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
 #
-# Public installs can upload the same files from this repository or from
-# frontend/ paths in a signed release manifest. Keep Storage passwords out of git.
+# Public installs can upload the same files from this repository
+# or the WebUI image. Keep Storage passwords out of git.
 set -euo pipefail
 
 pull_zone="$(bash "$(dirname "$0")/frontend_publication.sh" zone)"

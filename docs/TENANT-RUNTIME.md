@@ -8,8 +8,7 @@ file (`jmodguard.db.guild.db`) and, on Unix, a private local evidence directory
 `JMODGUARD_GUILD_STORE_TOKEN` environment pair. Catalog rows store only opaque IDs and shared/dedicated
 policy; URLs and tokens stay in process configuration.
 
-This is not a guild move. Populated-guild shared/dedicated moves are conductor-owned;
-see [guild moves](GUILD-MOVES.md). The conductor still has no tenant routing.
+This routing does not move a populated guild between stores.
 
 ## Routing and handles
 
@@ -89,11 +88,7 @@ in transactions of at most 100 rows, and deletes remaining store identity only
 after those snapshots are gone,
 records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
-join cannot be resurrected. There is no permanent departed-guild ledger. The conductor
-backup worker sanitizes complete local archives against surviving intents and
-acknowledges those rows after at least one complete archive is rewritten; it
-does not import tenant routing. Live Bunny backup-copy
-deletion remains later work. The durable job can resume its
+join cannot be resurrected. There is no permanent departed-guild ledger. Backup-copy cleanup is unavailable; intents remain durable. The durable job can resume its
 core cleanup suffix after the store binding has already been erased: the exact store
 identity and absence of the guild binding are checked without weakening normal data-scope
 validation. If activation stopped after placement binding but before membership insertion,
@@ -113,14 +108,9 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished live provider checks stay deferred; public installation validation is
-available on the conductor. Owner-selected updates and rollback are available on the conductor when an update
-root is configured; see [UPDATES.md](UPDATES.md).
-Signed Stable/Nightly discovery can list complete publications when a feed and
-trust keys are configured; see [RELEASES.md](RELEASES.md). Local encrypted
-backup/restore and guild-store moves are available on the conductor when their process
-paths are configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) and
-[GUILD-MOVES.md](GUILD-MOVES.md).
+Public installation is documented in [INSTALL.md](INSTALL.md). Owner-selected
+image updates use the existing WebUI/API; see [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
+Live provider checks remain deferred.
 Image and text spam enforcement is implemented separately; see
 [IMAGE-SPAM.md](IMAGE-SPAM.md). The bot captures proving Discord attachments for
 selected image-spam enforcement through tenant runtime; the API serves authorized

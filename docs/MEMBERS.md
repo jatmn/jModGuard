@@ -144,7 +144,7 @@ Member profile and stay ownership belongs to the guild store. Case reasons and
 evidence stay in canonical case storage; directory history links those cases
 without copying private payloads. Authorized case removal deletes its projection
 from member history. Guild erasure removes the directory with the existing
-enrollment erasure policy. Supported guild moves and backups preserve the
+enrollment erasure policy. Operator-managed backups must preserve the
 initial completion record and retained history. A deliberate fresh database is
 a new installation and cannot restore history that was not backed up.
 

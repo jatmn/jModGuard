@@ -37,7 +37,6 @@ require_contains docs/INSTALL.md "ops repo"
 require_contains docs/INSTALL.md "not required"
 require_contains docs/INSTALL.md "Still-deferred live provider checks"
 require_contains docs/INSTALL.md "Live Bunny Database"
-require_contains docs/INSTALL.md "recover-update"
 require_contains docs/INSTALL.md "LICENSE.md"
 
 # test_aws_path_does_not_promise_rds
@@ -48,7 +47,6 @@ require_contains docs/DEPLOY-AWS.md "libSQL"
 if grep -Fiq "create an RDS instance" "$root/docs/DEPLOY-AWS.md"; then
   fail "forbidden in docs/DEPLOY-AWS.md: create an RDS instance"
 fi
-require_absent docs/DEPLOY-AWS.md 'jmodguard-bot`, `jmodguard-api`, `jmodguard-conductor`'
 
 # test_public_artifact_wording_matches_install
 require_contains docs/INSTALL.md "Buildkite does not upload"
@@ -57,12 +55,6 @@ require_absent docs/WEBUI.md "matching Buildkite artifact"
 require_contains docs/WEBUI.md "does not upload a separate frontend"
 require_absent docs/OVERHAUL.md "or Buildkite artifacts is the required path"
 require_contains docs/OVERHAUL.md "does not upload it to Bunny Storage"
-require_absent crates/conductor/src/install.rs "Buildkite already publishes public bot/API/conductor/frontend artifacts"
-for relative in docs/INSTALL.md crates/conductor/src/install.rs; do
-  require_contains "$relative" "Manual commit-SHA builds skip conductor and signed manifests."
-  require_contains "$relative" "manual Stable-tag builds"
-  require_contains "$relative" "do not produce a signed manifest"
-done
 
 # test_bunny_and_webui_do_not_require_private_ops
 require_absent docs/DEPLOY-BUNNY.md "The UI files are published by **GitHub Actions in your private ops repo**."
@@ -178,8 +170,7 @@ for relative in \
   README.md \
   scripts/ci-preflight.sh \
   scripts/publish-frontend-bunny.sh \
-  scripts/frontend_publication.sh \
-  crates/conductor/src/install.rs
+  scripts/frontend_publication.sh
 do
   require_absent "$relative" "frontend_release.py"
   require_absent "$relative" "frontend-release-test.py"
@@ -189,8 +180,6 @@ do
   require_absent "$relative" "Reverting an ops release"
   require_absent "$relative" "in-flight runs"
 done
-require_absent crates/conductor/frontend/app.js "Private ops automation"
-require_contains crates/conductor/frontend/app.js "private ops repository is not required"
 
 # test_cost_formulas_are_measured_not_invented
 if ! grep -Fiq "local measurements" "$root/docs/COST.md"; then
@@ -199,37 +188,9 @@ fi
 if ! grep -Fiq "does not invent" "$root/docs/COST.md"; then
   fail "missing in docs/COST.md: does not invent"
 fi
-require_contains docs/COST.md "256 MiB"
 if ! grep -Fiq "list prices" "$root/docs/COST.md"; then
   fail "missing in docs/COST.md: list prices"
 fi
-
-# test_validate_contract_is_check_not_apply_across_operator_surfaces
-for relative in \
-  docs/INSTALL.md \
-  docs/OVERHAUL.md \
-  docs/CONDUCTOR.md \
-  docs/DEPLOY-AWS.md \
-  docs/DEPLOY-BUNNY.md \
-  docs/WEBUI.md \
-  docs/SETUP.md \
-  AGENTS.md \
-  README.md \
-  crates/conductor/src/install.rs \
-  crates/conductor/frontend/app.js
-do
-  require_absent "$relative" "Install plan accepted"
-  require_absent "$relative" "topologies, disjoint private roots, scope-limited URLs"
-  require_absent "$relative" "The conductor checks topology, distinct private roots"
-done
-require_contains docs/INSTALL.md "does **not** apply process configuration"
-require_contains docs/INSTALL.md "without requiring those local"
-require_contains docs/INSTALL.md '`0700`'
-require_contains docs/OVERHAUL.md "does not apply process configuration"
-require_contains docs/OVERHAUL.md "without requiring those local paths"
-require_contains docs/CONDUCTOR.md "without applying conductor"
-require_contains crates/conductor/frontend/app.js "Install plan validated (not applied)"
-require_contains crates/conductor/src/install.rs "does not apply process configuration"
 
 # test_readme_points_at_public_install
 require_contains README.md "docs/INSTALL.md"
@@ -241,10 +202,7 @@ require_absent README.md "Point-and-click install remains later work"
 [[ ! -e "$root/scripts/public-install-acceptance-test.py" ]] || fail "scripts/public-install-acceptance-test.py must not exist"
 require_absent docs/INSTALL.md "install-local.py"
 require_absent docs/INSTALL.md "python3 scripts/install-local"
-require_contains docs/INSTALL.md "cargo run --locked -p jmodguard-conductor --bin jmodguard-conductor -- init-local --root /tmp/jmodguard-disposable"
-if grep -Fq "cargo run --locked -p jmodguard-conductor -- init-local" "$root/docs/INSTALL.md"; then
-  fail "docs/INSTALL.md still has cargo run without --bin for init-local"
-fi
+
 require_contains docs/INSTALL.md "scripts/public-install-acceptance-test.sh"
 require_contains docs/OVERHAUL.md "scripts/public-install-acceptance-test.sh"
 require_contains scripts/ci-preflight.sh "bash scripts/public-install-acceptance-test.sh"

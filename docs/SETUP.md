@@ -115,13 +115,9 @@ Binaries:
 
 There are **no system dependencies** — SQLite is compiled in, TLS is rustls.
 Start the bot once before the API so the schema is migrated. Select each production
-service with `-p` as above. Bare `cargo build --bins` builds all workspace binaries,
-including the conductor. For a Bunny API without embedded pages, use
+service with `-p` as above. Bare `cargo build --bins` builds all workspace binaries. For a Bunny API without embedded pages, use
 `cargo build --locked --release -p jmodguard-api --no-default-features`.
 
-The optional conductor does not read `config.toml`. Local backup/restore uses
-`JMODGUARD_CONDUCTOR_BACKUP_ROOT` and the other conductor-only keys in
-[CONDUCTOR.md](CONDUCTOR.md). Guild API sessions cannot authenticate that origin.
 
 ## 6. Configure
 

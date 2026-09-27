@@ -1215,30 +1215,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jmodguard-conductor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "futures-util",
- "jmodguard-runtime",
- "libc",
- "libsql",
- "percent-encoding",
- "rand 0.10.3",
- "reqwest 0.13.5",
- "ring",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "jmodguard-integration-tests"
 version = "0.1.0"
 dependencies = [

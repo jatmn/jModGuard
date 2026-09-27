@@ -3,8 +3,7 @@
 The data layer stores nonsecret directory metadata for shared and dedicated guild
 stores. Bot and API processes now route live tenant data through `TenantRuntime`; see
 [tenant runtime](TENANT-RUNTIME.md). Catalog rows still never store URLs or tokens.
-Populated-guild shared/dedicated moves are operator-started from the conductor; see
-[guild moves](GUILD-MOVES.md).
+There is no supported operator workflow for moving populated guilds between stores.
 
 ## Stored identities
 
@@ -114,8 +113,8 @@ move a guild or stop an older process from writing. Runtime adoption must includ
 the captured checks used by tenant log-channel operations across the remaining data model,
 bounded handle/transport reuse, shared/dedicated routing, global-policy separation and
 coordinated quiescing before moves. `verify_placement` alone is insufficient.
-There is deliberately no store-delete library operation. Conductor-owned
-populated moves update placement through a fenced rebind; see [guild moves](GUILD-MOVES.md).
+There is deliberately no store-delete library operation. Placement rebinding
+requires write fencing; it is a library contract, not an operator workflow.
 Raw SQL is not a supported move mechanism for operators.
 
 The catalog tables remain in the existing application database; identity and tenant

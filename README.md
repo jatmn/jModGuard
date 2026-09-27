@@ -6,12 +6,8 @@
 `jmodguard-core-1` family. Earlier databases/backups require their matching old release;
 they cannot be adopted by this baseline. See [database setup and recovery](docs/DATABASE-BASELINE.md).
 
-An optional conductor can serve owner Administration locally when configured,
-including local backup, restore, guild-store moves, signed release discovery,
-and owner-selected updates. Public install validation lives on the conductor
-(`init-local`, `validate-install`, `/api/install`). See
-[public installation](docs/INSTALL.md). The existing bot/API installation does
-not require the conductor. See [implementation status](docs/OVERHAUL.md).
+Owner Administration is available on the existing WebUI and API.
+See [public installation](docs/INSTALL.md). See [implementation status](docs/OVERHAUL.md).
 
 A **data-driven Discord moderation bot** written in Rust — open source, dual-process
 (bot + API/WebUI), libSQL-backed, multi-server.
@@ -83,7 +79,7 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 | Public install (Bunny, local, AWS) | [docs/INSTALL.md](docs/INSTALL.md) |
 | Single host / VPS (binaries or your own containers) | [docs/SETUP.md](docs/SETUP.md) |
 | Bunny Database + private Magic Containers + CDN admin UI | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) |
-| AWS EC2 + local adapter + SQLite/libSQL | [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) |
+| AWS EC2 + SQLite/libSQL | [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) |
 | Cost formulas | [docs/COST.md](docs/COST.md) |
 | Dual-process design | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 
@@ -93,10 +89,9 @@ Upgrading an existing install: **[docs/UPGRADE.md](docs/UPGRADE.md)**.
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | from zero to a running bot on Linux |
 | [docs/INSTALL.md](docs/INSTALL.md) | public Bunny/local/AWS install and deferred live checks |
-| [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) | EC2 + local adapter; not RDS |
-| [docs/COST.md](docs/COST.md) | measured local resource formulas |
+| [docs/DEPLOY-AWS.md](docs/DEPLOY-AWS.md) | EC2 + SQLite/libSQL; not RDS |
+| [docs/COST.md](docs/COST.md) | deployment cost estimation |
 | [docs/UPGRADE.md](docs/UPGRADE.md) | backup, migrate, rollout, rollback |
-| [docs/BACKUP-RESTORE.md](docs/BACKUP-RESTORE.md) | local recovery procedure and Bunny production blocker |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | bot + API, shared DB, `config_version` |
 | [docs/DEPLOY-BUNNY.md](docs/DEPLOY-BUNNY.md) | Bunny: CDN admin UI, private bot/API containers, Database |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | built-in commands, permissions, custom command plans |
@@ -146,8 +141,7 @@ crates/api/src/            HTTP/OAuth API and dashboard state
 crates/api/tests/          actual API startup regression
 crates/integration-tests/  shared-DB, cross-service and optional remote-libSQL regressions
 crates/runtime/            shared process health/shutdown utilities
-crates/conductor/          independent control service (owner Administration and local backups)
 frontend/                  static dashboard (Bunny Storage/CDN or local API embed; daisyUI/Headless at runtime)
 migrations/                jmodguard-core-1, steps 0001–0009
-Dockerfile.bot / Dockerfile.api / Dockerfile.conductor
+Dockerfile.bot / Dockerfile.api
 ```

@@ -353,7 +353,7 @@ impl TenantRuntime {
     pub async fn activate(&self, enrollment: GuildEnrollment) -> Result<Option<GuildDataScope>> {
         let lock = self.lock(enrollment.guild_id);
         let _guard = lock.lock().await;
-        // Catalog placement is the live assignment after a conductor move.
+        // Catalog placement is the live assignment after a placement change.
         // Config (dedicated-wins) is only the initial-placement hint.
         let store_id = match guild_placement(&self.core, enrollment.guild_id).await? {
             Some(existing) => existing.store_id().clone(),

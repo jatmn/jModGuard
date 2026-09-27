@@ -472,7 +472,7 @@ do not prove that the action queue is working.
 ## Operating constraints
 
 - Bunny Database is Public Preview. Internal snapshots are not an
-  operator backup. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md).
+  operator backup. Verify a complete database and evidence restore drill before production.
 - One bot replica. One API replica (in-memory sessions). Sticky sessions
   are enabled on the API Magic Container endpoint **after** it exists, not
   on the add-endpoint screen. Prefer cookie `jmodguard_session` when the
@@ -505,6 +505,5 @@ do not prove that the action queue is working.
 - [Bunny Storage static sites](https://docs.bunny.net/storage/static-site-hosting)
 - [Magic Containers endpoints](https://docs.bunny.net/magic-containers/endpoints)
 - [Magic Containers health checks](https://docs.bunny.net/magic-containers/health-checks)
-- [Backup and restore status](BACKUP-RESTORE.md)
 - [Configuration reference](CONFIGURATION.md)
 - [Architecture](ARCHITECTURE.md)
