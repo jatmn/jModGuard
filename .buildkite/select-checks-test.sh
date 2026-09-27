@@ -34,6 +34,7 @@ all="contracts frontend fmt dylint api bot conductor runtime updater core integr
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
+expect "contracts" config.example.toml
 expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
 expect "contracts frontend" tools/eslint/package.json
 expect "contracts frontend" tools/eslint-web-selftest.sh
@@ -50,12 +51,80 @@ expect "contracts fmt api updater boundaries integration bootstrap publish-tests
 expect "contracts fmt dylint runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
-expect "$rust" src/db/mod.rs
+# Core consumers need coverage, but independent packages and shell fixtures do not.
+core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
+# all_rust groups shared src/migrations skip on purpose. A new rust group must
+# join $core or this list; leaving it out of both is a silent shared-source skip.
+core_omits="runtime conductor publish-tests bootstrap"
+expect "$core" src/config.rs src/db.rs
+expect "$core" config.example.toml src/config.rs
+# Conductor tests embed migration SQL even though conductor cannot import core.
+expect "$core conductor" migrations/guild/0009_message_snapshots.sql
+expect "$core conductor" src/config.rs crates/conductor/src/install.rs
+for group in $rust; do
+  case " $core $core_omits " in
+    *" $group "*) ;;
+    *) fail "rust group $group is neither a core consumer nor an explicit omission" ;;
+  esac
+done
+for group in $core_omits; do
+  case " $rust " in
+    *" $group "*) ;;
+    *) fail "core omission $group is not in the rust plan" ;;
+  esac
+  case " $core " in
+    *" $group "*) fail "core omission $group is selected for shared source" ;;
+  esac
+done
+expect "$rust" vendor/tokio-tungstenite/src/lib.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
 expect "$all" mystery.bin
 expect "contracts publish-tests supply-chain" .buildkite/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
+
+# Exercise diff discovery and the generated pipeline with real local Git history.
+# A frontend commit followed by a core edit on one PR must select the union.
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+git init -q --initial-branch=main "$scratch/repo"
+(
+  cd "$scratch/repo"
+  git config user.name 'Selector test'
+  git config user.email 'selector@example.invalid'
+  mkdir -p .buildkite src frontend
+  cp "$root/.buildkite/pipeline.steps.yml" .buildkite/
+  echo base >src/config.rs
+  git add .
+  git commit -qm base
+  git remote add origin .
+  git switch -qc test-pr
+  echo frontend >frontend/app.js
+  git add .
+  git commit -qm frontend
+  echo change >>src/config.rs
+  git commit -qam core
+  BUILDKITE=false BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
+    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
+    bash "$selector" upload >"$scratch/pipeline.yml" 2>"$scratch/selection.log"
+)
+# Extract only enabled check keys, not the unchanged publication expressions.
+actual="$(awk '/^    key:/ { key = $2 } /^    if: "true"$/ { print key }' "$scratch/pipeline.yml" | sort)"
+expected="$(printf '%s\n' $core frontend | sort)"
+[ "$actual" = "$expected" ] || fail "PR upload selected unexpected check steps: $actual"
+grep -Fq 'PR diff origin/main...HEAD' "$scratch/selection.log" || fail 'missing diff diagnostic'
+grep -Fq 'select-checks: selected:' "$scratch/selection.log" || fail 'missing selected-group diagnostic'
+# Skipped keys must remain available to unchanged publication dependencies.
+for group in runtime conductor bootstrap publish-tests; do
+  awk -v wanted="$group" '
+    /^    key:/ { key = $2 }
+    /^    if: "false"$/ && key == wanted { found = 1 }
+    END { exit !found }
+  ' "$scratch/pipeline.yml" || fail "$group not uploaded as skipped"
+done
+sed -n '/  # group: publish$/,$p' "$root/.buildkite/pipeline.steps.yml" | sed '/^  # group: /d' >"$scratch/publish.expected"
+sed -n '/  - label: "prepare image publication"/,$p' "$scratch/pipeline.yml" >"$scratch/publish.actual"
+cmp "$scratch/publish.expected" "$scratch/publish.actual" || fail 'publication steps changed'
 
 schedule="$(BUILDKITE_SOURCE=schedule bash "$selector" plan)"
 if [ "$(printf '%s\n' "$schedule" | sort)" != "$(printf '%s\n' $all | sort)" ]; then
@@ -92,9 +161,55 @@ if grep -Fq "'\$\$GITHUB_TOKEN'" "$root/.buildkite/with-cargo-auth.sh"; then
   fail "with-cargo-auth must not match only the YAML-escaped placeholder"
 fi
 
-fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan | wc -l)"
+fetch_log="$(mktemp)"
+fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan 2>"$fetch_log" | wc -l)"
 if [ "$fetch_fail_count" -ne 17 ]; then
   fail "fetch failure did not select every group (got ${fetch_fail_count})"
 fi
+grep -Fq 'select-checks: all groups: full validation requested or diff unavailable' "$fetch_log" \
+  || fail 'missing diff-unavailable reason'
 
+reason_log="$(mktemp)"
+bash "$selector" plan --files mystery.bin >/dev/null 2>"$reason_log"
+grep -Fq 'select-checks: all groups: unclassified path: mystery.bin' "$reason_log" \
+  || fail 'missing unclassified-path reason'
+bash "$selector" plan --files .buildkite/pipeline.yml >/dev/null 2>"$reason_log"
+grep -Fq 'select-checks: all groups: CI control changed: .buildkite/pipeline.yml' "$reason_log" \
+  || fail 'missing CI-control reason'
+
+git init -q --initial-branch=main "$scratch/empty"
+(
+  cd "$scratch/empty"
+  git config user.name 'Selector test'
+  git config user.email 'selector@example.invalid'
+  git commit -q --allow-empty -m base
+  git remote add origin .
+  git switch -qc empty-pr
+  git commit -q --allow-empty -m empty
+  BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
+    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
+    bash "$selector" plan >"$scratch/empty-plan" 2>"$scratch/empty.log"
+)
+grep -Fq 'select-checks: all groups: empty diff' "$scratch/empty.log" || fail 'missing empty-diff reason'
+empty_count="$(wc -l <"$scratch/empty-plan")"
+if [ "$empty_count" -ne 17 ]; then
+  fail "empty diff did not select every group (got ${empty_count})"
+fi
+
+# Scope the expensive lint compilation to selected Rust targets/consumers.
+expect_lint_packages() {
+  local expected="$1" actual
+  shift
+  actual="$(BUILDKITE=false bash "$selector" upload --files "$@" | sed -n 's/^      JMODGUARD_DYLINT_PACKAGES: "\(.*\)"$/\1/p')"
+  [[ "$actual" == "$expected" ]] || fail "lint scope for $*: expected [$expected], got [$actual]"
+}
+expect_lint_packages 'jmodguard-conductor' crates/conductor/src/install.rs
+expect_lint_packages 'jmodguard-api jmodguard-integration-tests' crates/api/src/lib.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-integration-tests' crates/bot/src/main.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-conductor jmodguard-runtime jmodguard-updater jmodguard jmodguard-integration-tests' crates/runtime/src/lib.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard jmodguard-integration-tests' src/config.rs
+expect_lint_packages 'jmodguard jmodguard-integration-tests' crates/integration-tests/tests/remote_database_smoke.rs
+expect_lint_packages '' Cargo.lock
+expect_lint_packages '' dylint.toml crates/conductor/src/install.rs
+expect_lint_packages '' mystery.bin
 echo 'select-checks-test: ok'

@@ -85,7 +85,7 @@ run_dylint() {
       DYLINT_TEST_CAPTURE="$capture" \
       DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
       TMPDIR="$tmpdir" \
-      env -u CARGO_TARGET_DIR "$@" bash scripts/dylint.sh
+      env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES "$@" bash scripts/dylint.sh
   )
 }
 
@@ -127,4 +127,12 @@ expect "$install_capture" CARGO_ENCODED_RUSTFLAGS unset
 expect "$install_capture" argv 'install cargo-dylint dylint-link --locked --version 6.1.0 --force'
 expect "$capture" RUSTFLAGS unset
 expect "$capture" DYLINT_RUSTFLAGS '-Z unstable-options -D warnings -A deprecated'
+# A scoped CI lint must check the selected targets, not the whole workspace.
+run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES='jmodguard-api jmodguard-integration-tests'
+expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets -p jmodguard-api -p jmodguard-integration-tests'
+if run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES='--workspace' >/dev/null 2>&1; then
+  fail 'invalid package scope must fail, not become Cargo options'
+fi
+run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES=''
+expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 echo 'dylint test: isolated temporary directory and caller flags verified'
