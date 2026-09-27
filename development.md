@@ -52,10 +52,7 @@ merging dependency updates.
 The `libsql-sqlite3-parser` Git patch is excluded from automatic updates:
 maintain its reviewed revision and security regression test manually.
 The vendored `tokio-tungstenite` compatibility patch also requires manual
-maintenance. The `libsql` 0.9.30 patch removes only its unused Hyper HTTP/2
-feature; see `vendor/libsql/JMODGUARD-PATCH.md` for source provenance and
-upgrade/removal criteria. Keep its remote HTTP/1.1 transport and run the
-remote-database container checks when updating it. Container images remain manual: Rust builder versions must
+maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
 and the Buildkite agents. `Dockerfile.{bot,api,conductor}` pin
 `rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is

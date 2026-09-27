@@ -168,9 +168,7 @@ services=(jmodguard-bot jmodguard-api jmodguard-conductor jmodguard-integration-
 bot_stack=(serenity tokio-tungstenite tungstenite)
 api_stack=(axum tower-sessions tower-sessions-core tower-sessions-memory-store)
 
-# Shared-core legacy Hyper clients use HTTP/1.1. Do not restore vulnerable h2 0.3
-# through libSQL feature unification (RUSTSEC-2026-0258).
-check_tree jmodguard -- h2 "${services[@]}" "${bot_stack[@]}" "${api_stack[@]}"
+check_tree jmodguard -- "${services[@]}" "${bot_stack[@]}" "${api_stack[@]}"
 check_tree jmodguard-bot -- jmodguard-api jmodguard-conductor jmodguard-integration-tests "${api_stack[@]}"
 check_tree jmodguard-api -- jmodguard-bot jmodguard-conductor jmodguard-integration-tests "${bot_stack[@]}"
 check_tree jmodguard-api --no-default-features -- jmodguard-bot jmodguard-conductor jmodguard-integration-tests "${bot_stack[@]}"
