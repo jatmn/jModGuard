@@ -402,7 +402,7 @@ pub struct BotState {
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
     pub(crate) gateway_ready_generation: AtomicU64,
-    ban_observations: Mutex<HashSet<(u64, u64)>>,
+    ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
 }
@@ -463,7 +463,7 @@ impl BotState {
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
-            ban_observations: Mutex::new(HashSet::new()),
+            ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
         }))
     }
@@ -542,11 +542,26 @@ impl BotState {
     /// Returns whether another ban or unban callback for this user is already
     /// inside its handler. Local start time is not Gateway order.
     pub(crate) fn begin_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
-        !self.ban_observations.lock().insert((guild_id, user_id))
+        let mut observations = self.ban_observations.lock();
+        let owners = observations.entry((guild_id, user_id)).or_default();
+        let contested = *owners > 0;
+        *owners = owners
+            .checked_add(1)
+            .expect("ban observation owners overflow");
+        contested
     }
 
     pub(crate) fn end_ban_observation(&self, guild_id: u64, user_id: u64) {
-        self.ban_observations.lock().remove(&(guild_id, user_id));
+        let mut observations = self.ban_observations.lock();
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            observations.entry((guild_id, user_id))
+        {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
     }
 
     /// A shard's first READY is startup. A later READY from that same shard is
@@ -1062,6 +1077,42 @@ mod tests {
     use crate::config::BotProcessConfig;
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
+
+    #[test]
+    fn overlapping_ban_observations_remain_contested_until_last_owner_finishes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_ban_owners_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
+        assert!(!app.begin_ban_observation(10, 20));
+        assert!(app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        assert!(app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        app.end_ban_observation(10, 20);
+        assert!(!app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        drop(app);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
+    }
 
     #[test]
     fn failed_member_observations_remain_queued_until_the_same_generation_is_acknowledged() {

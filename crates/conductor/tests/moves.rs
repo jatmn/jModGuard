@@ -78,6 +78,10 @@ async fn setup() -> Harness {
 }
 
 async fn setup_with_legacy_cases(legacy_cases: bool) -> Harness {
+    setup_with_schema(legacy_cases, false).await
+}
+
+async fn setup_with_schema(legacy_cases: bool, v8_only: bool) -> Harness {
     let (discord, task) = discord_stub(42).await;
     let root = unique_root();
     std::fs::create_dir_all(&root).unwrap();
@@ -85,18 +89,17 @@ async fn setup_with_legacy_cases(legacy_cases: bool) -> Harness {
     let shared = root.join("shared.guild.db");
     let dedicated = root.join("dedicated.guild.db");
     write_core(&core).await;
-    init_guild(
-        &shared,
-        SHARED,
-        None,
-        &[
-            (10, ENROLL_10, REV_10, CASE_10, SRC_10),
-            (20, ENROLL_20, REV_20, CASE_20, SRC_20),
-        ],
-        legacy_cases,
-    )
-    .await;
-    init_guild(&dedicated, DEDICATED, Some(10), &[], false).await;
+    let guilds = &[
+        (10, ENROLL_10, REV_10, CASE_10, SRC_10),
+        (20, ENROLL_20, REV_20, CASE_20, SRC_20),
+    ];
+    if v8_only {
+        init_guild_v8_only(&shared, SHARED, None, guilds).await;
+        init_guild_v8_only(&dedicated, DEDICATED, Some(10), &[]).await;
+    } else {
+        init_guild(&shared, SHARED, None, guilds, legacy_cases).await;
+        init_guild(&dedicated, DEDICATED, Some(10), &[], false).await;
+    }
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         log_filter: "warn".into(),
@@ -1046,6 +1049,25 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         0
     );
 
+    // Guild 20 is already seeded on the shared destination. Moving guild 10
+    // back must not treat its active pacing lease as a restored backup lease.
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=20",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms) VALUES(20,?,42,1000,2000)",libsql::params![ENROLL_20]).await.unwrap();
+    drop(conn);
+    drop(db);
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch("CREATE TABLE member_sync_pacing(bot_id INTEGER PRIMARY KEY,request_after_ms INTEGER,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER); INSERT INTO member_sync_pacing VALUES(42,500000,'neighbor-worker',9000000000000,7);").await.unwrap();
+    drop(conn);
+    drop(db);
+
     let (status, body, _) = call(
         &h.router,
         "POST",
@@ -1069,6 +1091,22 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         )
         .await,
         SHARED
+    );
+    assert_eq!(
+        text(
+            &core,
+            "SELECT lease_owner FROM member_sync_pacing WHERE bot_id=42"
+        )
+        .await,
+        "neighbor-worker"
+    );
+    assert_eq!(
+        scalar(
+            &core,
+            "SELECT lease_until_ms FROM member_sync_pacing WHERE bot_id=42"
+        )
+        .await,
+        9_000_000_000_000
     );
     assert_eq!(
         scalar(
@@ -1103,6 +1141,54 @@ async fn shared_to_dedicated_and_back_preserves_the_neighbor() {
         )
         .await,
         0
+    );
+}
+
+#[tokio::test]
+async fn v8_move_retry_after_source_cleanup_finishes_without_snapshot_table() {
+    let h = setup_with_schema(false, true).await;
+    let cookie = login(&h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(&h).await;
+    let job = h
+        .conductor
+        .store()
+        .unwrap()
+        .list_jobs(8)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.kind == "guild_move")
+        .unwrap();
+    assert_eq!(job.status, "succeeded", "{:?}", job.last_error);
+    assert_eq!(
+        scalar(
+            &h.root.join("shared.guild.db"),
+            "SELECT COUNT(*) FROM guild_bindings WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    // Replaying this payload exercises the interrupted window after cutover
+    // and source cleanup, before the worker acknowledges the job.
+    jmodguard_conductor::guild_move::run(&h.conductor, &job.payload_json)
+        .await
+        .unwrap();
+    assert_eq!(
+        text(
+            &h.root.join("core.db"),
+            "SELECT store_id FROM guild_store_placements WHERE guild_id=10"
+        )
+        .await,
+        DEDICATED
     );
 }
 

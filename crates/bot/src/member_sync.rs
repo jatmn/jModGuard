@@ -853,11 +853,9 @@ pub async fn run(
                                         Some(db::guild_data::MemberSyncError::Stale)
                                     ) && check.reason != "ambiguous_departure"
                                         && let Err(queue_error) = store
-                                            .queue_member_target_check(
+                                            .refresh_stale_member_target_check(
                                                 scope.clone(),
-                                                check.user_id,
-                                                check.kind,
-                                                &check.reason,
+                                                check.clone(),
                                                 chrono::Utc::now().timestamp_millis(),
                                             )
                                             .await
