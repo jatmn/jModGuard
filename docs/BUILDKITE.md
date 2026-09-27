@@ -86,13 +86,23 @@ also runs the publisher contract tests. An `crates/api` diff runs the API test, 
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
 conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs `cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace` with the Trail of Bits lints listed in `dylint.toml`. The gate compiles the workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` and migrations run the Rust packages and the remote-database job.
-The root lockfile and toolchain do too, and they also run the publisher and
-bootstrap contract tests, because those files are image inputs. An
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs `cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace` with the Trail of Bits lints listed in `dylint.toml`. The gate compiles the workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
+checks, formatting/lints, supply-chain, and remote-database checks. It does not
+select independent runtime/conductor package tests or the bootstrap/publisher
+shell contract tests. Migration edits also select conductor because its tests
+embed migration SQL. Vendor changes retain all Rust checks. The operator sample
+`config.example.toml` selects contracts, like documentation; it is not loaded
+by CI or embedded in the services.
+The root manifest, lockfile and toolchain select all Rust checks, including the
+publisher and bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and
 manual `JMODGUARD_PUBLISH_SOURCE` builds run every check. A diff that
-cannot be computed also runs every check. Pull requests use the
-three-dot diff against the base branch. Other builds union every path
+cannot be computed also runs every check. The selector logs the diff range, reasons for full selection, and selected groups
+in the `select checks` job. `plan` keeps its machine-readable list on stdout and
+writes those diagnostics to stderr. Pull requests use the
+three-dot diff against the base branch: every commit reruns checks for the entire
+PR, not just the latest commit. A small follow-up to a PR that changed a lockfile
+or CI control script therefore still needs broad checks. Other builds union every path
 changed between the previous `origin/<branch>` tip recorded before fetch and
 `BUILDKITE_COMMIT`. When that push range cannot be established on a `main`
 webhook build, every check group runs instead of classifying only the tip

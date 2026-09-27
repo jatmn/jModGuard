@@ -14,6 +14,7 @@ Usage: bash .buildkite/select-checks.sh plan [--files PATH]...
 plan prints one selected step group per line. upload rewrites
 .buildkite/pipeline.steps.yml with if: true or if: false and, on a
 Buildkite agent, uploads that pipeline. A missing diff selects every group.
+Selection reasons go to stderr; stdout remains the plan or generated YAML.
 EOF
 }
 
@@ -52,6 +53,7 @@ add() {
 }
 
 all_groups() {
+  echo "select-checks: all groups: $*" >&2
   full=1
   selected=""
   local group
@@ -63,6 +65,15 @@ all_groups() {
 all_rust() {
   local group
   for group in fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
+    add "$group"
+  done
+}
+
+# Root data is consumed by bot, API, updater and integration tests. Runtime and
+# conductor deliberately do not import it; conductor embeds migration SQL below.
+core_consumers() {
+  local group
+  for group in fmt dylint api bot updater core integration boundaries remote-database; do
     add "$group"
   done
 }
@@ -88,7 +99,7 @@ classify() {
   local top="${path%%/*}"
   case "$path" in
     .buildkite/pipeline.yml|.buildkite/pipeline.steps.yml|.buildkite/select-checks.sh|.buildkite/select-checks-test.sh|.buildkite/with-cargo-auth.sh|scripts/ci-preflight.sh)
-      all_groups
+      all_groups "CI control changed: $path"
       return
       ;;
     .buildkite/publish-image.sh|.buildkite/publish-image-test.sh)
@@ -96,7 +107,7 @@ classify() {
       return
       ;;
     .buildkite/*)
-      all_groups
+      all_groups "CI control changed: $path"
       return
       ;;
     Cargo.lock|rust-toolchain.toml|deny.toml|Cargo.toml)
@@ -186,8 +197,15 @@ classify() {
       ;;
   esac
   case "$top" in
-    vendor|src|migrations)
+    vendor)
       all_rust
+      ;;
+    src)
+      core_consumers
+      ;;
+    migrations)
+      core_consumers
+      add conductor
       ;;
     frontend)
       # Default API embed-ui compiles these files with include_str!.
@@ -207,13 +225,13 @@ classify() {
         runtime) add fmt; add dylint; add runtime; add boundaries; runtime_consumers ;;
         updater) add fmt; add dylint; add updater; updater_consumers ;;
         integration-tests) add fmt; add dylint; add integration ;;
-        *) all_groups ;;
+        *) all_groups "unclassified path: $path" ;;
       esac
       ;;
     *)
       case "$path" in
-        *.md|LICENSE|AGENTS.md|README.md|development.md) add contracts ;;
-        *) all_groups ;;
+        *.md|LICENSE|AGENTS.md|README.md|development.md|config.example.toml) add contracts ;;
+        *) all_groups "unclassified path: $path" ;;
       esac
       ;;
   esac
@@ -221,15 +239,18 @@ classify() {
 
 prove_diff() {
   if [ "${#files[@]}" -gt 0 ]; then
+    echo "select-checks: explicit file list" >&2
     printf '%s\n' "${files[@]}"
     return 0
   fi
   if [ "${BUILDKITE_SOURCE:-}" = "schedule" ] || [ -n "${BUILDKITE_TAG:-}" ] || [ -n "${JMODGUARD_PUBLISH_SOURCE:-}" ]; then
+    echo "select-checks: scheduled, tag, or manual publication build" >&2
     return 1
   fi
   if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
     local base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
     git fetch --no-tags origin "$base" || return 1
+    echo "select-checks: PR diff origin/${base}...HEAD" >&2
     git diff --name-only "origin/${base}...HEAD" || return 1
     return 0
   fi
@@ -245,25 +266,28 @@ prove_diff() {
     case "$before" in
       0000000000000000000000000000000000000000) return 1 ;;
     esac
+    echo "select-checks: branch diff $before..$after" >&2
     git diff --name-only "$before" "$after" || return 1
     return 0
   fi
   if [ "${BUILDKITE_SOURCE:-}" = "webhook" ] \
       && [ "$branch" = "main" ] \
       && [ -z "${BUILDKITE_TAG:-}" ]; then
+    echo "select-checks: main push range unavailable" >&2
     return 1
   fi
   if ! git rev-parse --verify --quiet "${after}^1" >/dev/null; then
     return 1
   fi
+  echo "select-checks: first-parent diff ${after}^1..${after}" >&2
   git diff --name-only "${after}^1" "$after"
 }
 
 add contracts
 if ! names="$(prove_diff)"; then
-  all_groups
+  all_groups "full validation requested or diff unavailable"
 elif [ -z "${names}" ]; then
-  all_groups
+  all_groups "empty diff"
 else
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -282,6 +306,7 @@ ensure_supply_chain() {
   done
 }
 ensure_supply_chain
+echo "select-checks: selected:${selected}" >&2
 
 if [ "$mode" = "plan" ]; then
   for group in "${groups[@]}"; do

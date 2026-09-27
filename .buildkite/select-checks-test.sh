@@ -34,6 +34,7 @@ all="contracts frontend fmt dylint api bot conductor runtime updater core integr
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
+expect "contracts" config.example.toml
 expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
 expect "contracts frontend" tools/eslint/package.json
 expect "contracts frontend" tools/eslint-web-selftest.sh
@@ -50,12 +51,62 @@ expect "contracts fmt api updater boundaries integration bootstrap publish-tests
 expect "contracts fmt dylint runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
-expect "$rust" src/db/mod.rs
+# Core consumers need coverage, but independent packages and shell fixtures do not.
+core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
+expect "$core" src/config.rs src/db.rs
+expect "$core" config.example.toml src/config.rs
+# Conductor tests embed migration SQL even though conductor cannot import core.
+expect "$core conductor" migrations/guild/0009_message_snapshots.sql
+expect "$core conductor" src/config.rs crates/conductor/src/install.rs
+expect "$rust" vendor/tokio-tungstenite/src/lib.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
 expect "$all" mystery.bin
 expect "contracts publish-tests supply-chain" .buildkite/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
+
+# Exercise diff discovery and the generated pipeline with real local Git history.
+# A frontend commit followed by a core edit on one PR must select the union.
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+git init -q --initial-branch=main "$scratch/repo"
+(
+  cd "$scratch/repo"
+  git config user.name 'Selector test'
+  git config user.email 'selector@example.invalid'
+  mkdir -p .buildkite src frontend
+  cp "$root/.buildkite/pipeline.steps.yml" .buildkite/
+  echo base >src/config.rs
+  git add .
+  git commit -qm base
+  git remote add origin .
+  git switch -qc test-pr
+  echo frontend >frontend/app.js
+  git add .
+  git commit -qm frontend
+  echo change >>src/config.rs
+  git commit -qam core
+  BUILDKITE=false BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
+    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
+    bash "$selector" upload >"$scratch/pipeline.yml" 2>"$scratch/selection.log"
+)
+# Extract only enabled check keys, not the unchanged publication expressions.
+actual="$(awk '/^    key:/ { key = $2 } /^    if: "true"$/ { print key }' "$scratch/pipeline.yml" | sort)"
+expected="$(printf '%s\n' $core frontend | sort)"
+[ "$actual" = "$expected" ] || fail "PR upload selected unexpected check steps: $actual"
+grep -Fq 'PR diff origin/main...HEAD' "$scratch/selection.log" || fail 'missing diff diagnostic'
+grep -Fq 'select-checks: selected:' "$scratch/selection.log" || fail 'missing selected-group diagnostic'
+# Skipped keys must remain available to unchanged publication dependencies.
+for group in runtime conductor bootstrap publish-tests; do
+  awk -v wanted="$group" '
+    /^    key:/ { key = $2 }
+    /^    if: "false"$/ && key == wanted { found = 1 }
+    END { exit !found }
+  ' "$scratch/pipeline.yml" || fail "$group not uploaded as skipped"
+done
+sed -n '/  # group: publish$/,$p' "$root/.buildkite/pipeline.steps.yml" | sed '/^  # group: /d' >"$scratch/publish.expected"
+sed -n '/  - label: "prepare image publication"/,$p' "$scratch/pipeline.yml" >"$scratch/publish.actual"
+cmp "$scratch/publish.expected" "$scratch/publish.actual" || fail 'publication steps changed'
 
 schedule="$(BUILDKITE_SOURCE=schedule bash "$selector" plan)"
 if [ "$(printf '%s\n' "$schedule" | sort)" != "$(printf '%s\n' $all | sort)" ]; then
