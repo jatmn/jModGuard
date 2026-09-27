@@ -48,6 +48,12 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 
 ## libsql 0.9.30
 
+- The published crate is vendored with only the Hyper `http2` feature removed.
+  Its Rust logic and database engine version are unchanged. The legacy remote
+  connector already uses HTTP/1.1; this removes unpatched `h2` 0.3.27
+  (RUSTSEC-2026-0258). Other HTTP clients use patched `h2` 0.4.19 or later.
+  See `vendor/libsql/JMODGUARD-PATCH.md` for provenance and maintenance limits.
+
 - Bunny Database uses the remote libSQL protocol. Build it with
   `Builder::new_remote(url, token)` plus the in-tree rustls 0.23 connector
   (`src/remote_https.rs`); local installs use `Builder::new_local`.

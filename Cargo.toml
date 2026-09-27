@@ -55,3 +55,6 @@ rustls-webpki = { version = "0.103.13", default-features = false, features = ["r
 [patch.crates-io]
 libsql-sqlite3-parser = { git = "https://github.com/jatmn/jModGuard", rev = "f2391d613c4bb8018873964e779341f50ce05447" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite" }
+# Keep libSQL's existing HTTP/1.1 transport without legacy h2 0.3 (RUSTSEC-2026-0258).
+# The published Rust sources are unchanged; see vendor/libsql/JMODGUARD-PATCH.md.
+libsql = { path = "vendor/libsql" }
