@@ -1,6 +1,6 @@
-# cargo-dylint reads [workspace.metadata.dylint] from this file.
-# Keeping the pin here leaves Cargo.toml cargo-native and makes the
-# lint-library cache key a hash of this file.
+# cargo-dylint 6.1.0 reads [workspace.metadata.dylint] from this standalone file
+# (see from_dylint_toml in the pinned release). Keeping the pin here leaves
+# Cargo.toml cargo-native.
 #
 # cargo-dylint and dylint-link must match this tag. A library built by a
 # different dylint_linting version is refused.
@@ -8,7 +8,8 @@
 # These are individual Trail of Bits general lints. They share the toolchain
 # in examples/general/rust-toolchain.toml (nightly-2026-08-20 at v6.1.0).
 # `cargo dylint` runs one workspace `cargo check --all-targets` under that
-# nightly (into the step's `target-dylint` tree). Clippy, tests, and images
+# nightly (into `target-dylint`; see scripts/dylint.sh and with-cargo-auth.sh).
+# Clippy, tests, and images
 # stay on rust-toolchain.toml (1.96.0). scripts/dylint.sh passes
 # `-D warnings -A deprecated` through DYLINT_RUSTFLAGS, which the driver
 # applies only while it is RUSTC_WORKSPACE_WRAPPER. The script unsets

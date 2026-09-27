@@ -40,7 +40,12 @@ enforces this before `npm ci --ignore-scripts --prefix tools/eslint` and
 `npm audit --prefix tools/eslint --audit-level=high`, which fails the frontend
 group on any high or critical advisory and on advisory-endpoint failure, with
 no fail-open switch), Rust 1.96.0 with Clippy and
-rustfmt, `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
+rustfmt, rustup able to install **nightly-2026-08-20** (the Dylint lint
+libraries' toolchain at tag `v6.1.0`) with `rustc-dev` and
+`llvm-tools-preview`, outbound HTTPS to `github.com` and
+`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers` (the
+`dylint` group installs matching `cargo-dylint` and `dylint-link` from
+source on cold agents), `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`
 for each selected group after GitHub git-credential setup on cargo steps
@@ -81,7 +86,7 @@ also runs the publisher contract tests. An `crates/api` diff runs the API test, 
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
 conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). A Rust source diff also runs the `dylint` group. That group runs `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source and runs `cargo dylint --all` with the Trail of Bits general lints listed in `dylint.toml`. That gate compiles the whole workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into the step's `target-dylint` directory. Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` and migrations run the Rust packages and the remote-database job.
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs `cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace` with the Trail of Bits lints listed in `dylint.toml`. The gate compiles the workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` and migrations run the Rust packages and the remote-database job.
 The root lockfile and toolchain do too, and they also run the publisher and
 bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and

@@ -8,7 +8,10 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/project/scripts" "$fixture/bin" "$fixture/external"
 git init -q "$fixture/project"
 cp "$root/scripts/dylint.sh" "$fixture/project/scripts/dylint.sh"
-printf 'tag = "v6.1.0"\n' > "$fixture/project/dylint.toml"
+cat > "$fixture/project/dylint.toml" <<'EOF'
+[[workspace.metadata.dylint.libraries]]
+tag = "v6.1.0"
+EOF
 
 fail() {
   echo "dylint test: $*" >&2
@@ -42,6 +45,7 @@ elif [ "${1:-}" = dylint ]; then
     field RUSTFLAGS
     field CARGO_ENCODED_RUSTFLAGS
     field DYLINT_RUSTFLAGS
+    field CARGO_TARGET_DIR
     printf 'argv=%s\n' "$*"
   } > "$DYLINT_TEST_CAPTURE"
 else
@@ -81,7 +85,7 @@ run_dylint() {
       DYLINT_TEST_CAPTURE="$capture" \
       DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
       TMPDIR="$tmpdir" \
-      env "$@" bash scripts/dylint.sh
+      env -u CARGO_TARGET_DIR "$@" bash scripts/dylint.sh
   )
 }
 
@@ -97,6 +101,7 @@ expect "$capture" CARGO_HOME "$inside/cargo-home"
 expect "$capture" RUSTFLAGS unset
 expect "$capture" CARGO_ENCODED_RUSTFLAGS unset
 expect "$capture" DYLINT_RUSTFLAGS '-C debuginfo=0 -D warnings -A deprecated'
+expect "$capture" CARGO_TARGET_DIR target-dylint
 
 run_dylint "$fixture/external" \
   RUSTFLAGS='-C debuginfo=0' CARGO_ENCODED_RUSTFLAGS='-D warnings'

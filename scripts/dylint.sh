@@ -11,11 +11,35 @@ if [ -z "$root" ]; then
 fi
 cd "$root"
 
-version="$(sed -n 's/^tag = "v\(.*\)".*/\1/p' dylint.toml | head -1)"
-if [ -z "$version" ]; then
+read_library_tags() {
+  awk '
+    /^\[\[workspace\.metadata\.dylint\.libraries\]\]/ { inlib = 1; next }
+    inlib && /^\[/ { inlib = 0 }
+    inlib && /^tag = "/ {
+      line = $0
+      sub(/^tag = "v/, "", line)
+      sub(/".*$/, "", line)
+      print line
+    }
+  ' dylint.toml
+}
+
+mapfile -t library_tags < <(read_library_tags)
+if [ "${#library_tags[@]}" -eq 0 ]; then
   echo "dylint: could not read library tag from dylint.toml" >&2
   exit 1
 fi
+version="${library_tags[0]}"
+if [ "${#library_tags[@]}" -gt 1 ]; then
+  for tag in "${library_tags[@]}"; do
+    if [ "$tag" != "$version" ]; then
+      echo "dylint: dylint.toml has multiple library tags; use one tag for all [[workspace.metadata.dylint.libraries]] entries" >&2
+      exit 1
+    fi
+  done
+fi
+
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-dylint}"
 
 # Buildkite runs many cargo steps in parallel on one agent. Give dylint its own
 # CARGO_HOME so `cargo fetch` for Trail of Bits lint libraries does not race
@@ -25,13 +49,11 @@ mkdir -p "$scratch"
 export CARGO_HOME="${DYLINT_CARGO_HOME:-$scratch/cargo-home}"
 mkdir -p "$CARGO_HOME"
 
-# `cargo dylint --all` builds two temporary projects under TMPDIR.
-# Resolving the git library runs `cargo init`, then appends `[workspace]`.
-# Inside this repository, `cargo init` writes `edition.workspace = true`,
-# which has no edition once that package is its own workspace.
-# The rustc driver package is written by hand (`edition = "2018"`, no
-# `[workspace]`). Cargo still walks up to this repository's `[workspace]`
-# and rejects the unlisted package. Keep both projects outside the workspace.
+# cargo-dylint creates temporary packages under TMPDIR while resolving git
+# libraries. Inside this repository those trees must stay outside the Cargo
+# workspace root or Cargo walks up to the root [workspace] and rejects
+# unlisted members. The rustc driver is built separately and cached under
+# $HOME/.dylint_drivers (or DYLINT_DRIVER_PATH), not in this TMPDIR.
 dylint_tmpdir="$(cd -P "$scratch" && pwd)"
 root="$(cd -P "$root" && pwd)"
 case "$dylint_tmpdir/" in

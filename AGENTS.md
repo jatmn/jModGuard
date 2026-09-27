@@ -228,7 +228,8 @@ bash scripts/ci-preflight.sh
 ```
 
 That script runs lockfile verification, `cargo fmt --check`,
-`bash scripts/dylint.sh` (the Trail of Bits general lints pinned in `dylint.toml`),
+`bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
+general lints pinned in `dylint.toml`),
 whitespace `git diff --check`, the publisher/release contract tests
 (`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
