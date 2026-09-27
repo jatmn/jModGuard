@@ -227,8 +227,10 @@ bash scripts/ci-preflight.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That script runs lockfile verification, `cargo fmt --check`, whitespace
-`git diff --check`, the publisher/release contract tests
+That script runs lockfile verification, `cargo fmt --check`,
+`bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
+general lints pinned in `dylint.toml`),
+whitespace `git diff --check`, the publisher/release contract tests
 (`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
@@ -291,6 +293,7 @@ authorize live provider calls or require a Codex skill to contribute.
 
 ## Version pins (verified)
 
+- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source, then runs one workspace `cargo check --all-targets` under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
   `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use

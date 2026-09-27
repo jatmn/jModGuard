@@ -17,7 +17,7 @@ Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
 Run the Buildkite test gates locally or on a Buildkite linux agent.
 With no --only, run the full suite (local hooks and a complete check).
 Buildkite uploads one step per selected group. Known groups: contracts,
-frontend, fmt, api, bot, conductor, runtime, updater, core, integration,
+frontend, fmt, dylint, api, bot, conductor, runtime, updater, core, integration,
 boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
 By default the whitespace diff base is origin/main. Pass --base origin/<branch>
 for a PR whose base is not main. Scheduled Buildkite builds set
@@ -27,7 +27,7 @@ EOF
 
 base_ref="${JMODGUARD_PREFLIGHT_BASE:-origin/main}"
 only_names=""
-known_only="contracts frontend fmt api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
+known_only="contracts frontend fmt dylint api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
@@ -224,7 +224,7 @@ whitespace_check() {
 }
 
 run_cargo() {
-  if should_run fmt || should_run api || should_run bot || should_run conductor || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
+  if should_run fmt || should_run dylint || should_run api || should_run bot || should_run conductor || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
     return 0
   fi
   return 1
@@ -238,6 +238,13 @@ fi
 if should_run fmt; then
   echo 'ci-preflight: cargo fmt --check'
   cargo fmt --check
+fi
+
+if should_run dylint; then
+  echo 'ci-preflight: bash scripts/dylint-test.sh'
+  bash scripts/dylint-test.sh
+  echo 'ci-preflight: bash scripts/dylint.sh'
+  bash scripts/dylint.sh
 fi
 
 if should_run contracts; then

@@ -37,7 +37,7 @@ done
 [ -n "$mode" ] || { usage >&2; exit 2; }
 
 groups=(
-  contracts frontend fmt api bot conductor runtime updater core
+  contracts frontend fmt dylint api bot conductor runtime updater core
   integration boundaries publish-tests bootstrap pullfrog supply-chain
   remote-database
 )
@@ -62,7 +62,7 @@ all_groups() {
 
 all_rust() {
   local group
-  for group in fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
+  for group in fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
     add "$group"
   done
 }
@@ -103,30 +103,34 @@ classify() {
       all_rust
       return
       ;;
+    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
+      add dylint
+      return
+      ;;
     crates/api/Cargo.toml)
-      add fmt; add api; add boundaries; add integration; add supply-chain
+      add fmt; add dylint; add api; add boundaries; add integration; add supply-chain
       return
       ;;
     crates/bot/Cargo.toml)
-      add fmt; add bot; add boundaries; add integration; add supply-chain
+      add fmt; add dylint; add bot; add boundaries; add integration; add supply-chain
       return
       ;;
     crates/conductor/Cargo.toml)
-      add fmt; add conductor; add boundaries; add supply-chain
+      add fmt; add dylint; add conductor; add boundaries; add supply-chain
       return
       ;;
     crates/runtime/Cargo.toml)
-      add fmt; add runtime; add boundaries; add supply-chain
+      add fmt; add dylint; add runtime; add boundaries; add supply-chain
       runtime_consumers
       return
       ;;
     crates/updater/Cargo.toml)
-      add fmt; add updater; add supply-chain
+      add fmt; add dylint; add updater; add supply-chain
       updater_consumers
       return
       ;;
     crates/integration-tests/Cargo.toml)
-      add fmt; add integration; add remote-database; add supply-chain
+      add fmt; add dylint; add integration; add remote-database; add supply-chain
       return
       ;;
     Dockerfile.webui)
@@ -176,6 +180,7 @@ classify() {
       ;;
     crates/integration-tests/tests/remote_database_smoke.rs|crates/integration-tests/tests/guild_store_smoke.rs)
       add fmt
+      add dylint
       add remote-database
       return
       ;;
@@ -196,12 +201,12 @@ classify() {
       local crate="${path#crates/}"
       crate="${crate%%/*}"
       case "$crate" in
-        api) add fmt; add api; add boundaries; add integration ;;
-        bot) add fmt; add bot; add boundaries; add integration ;;
-        conductor) add fmt; add conductor; add boundaries ;;
-        runtime) add fmt; add runtime; add boundaries; runtime_consumers ;;
-        updater) add fmt; add updater; updater_consumers ;;
-        integration-tests) add fmt; add integration ;;
+        api) add fmt; add dylint; add api; add boundaries; add integration ;;
+        bot) add fmt; add dylint; add bot; add boundaries; add integration ;;
+        conductor) add fmt; add dylint; add conductor; add boundaries ;;
+        runtime) add fmt; add dylint; add runtime; add boundaries; runtime_consumers ;;
+        updater) add fmt; add dylint; add updater; updater_consumers ;;
+        integration-tests) add fmt; add dylint; add integration ;;
         *) all_groups ;;
       esac
       ;;
@@ -270,7 +275,7 @@ fi
 # cargo deny / cargo audit stay on every plan that compiles or publishes Rust.
 ensure_supply_chain() {
   local group
-  for group in fmt api bot conductor runtime updater core integration boundaries remote-database publish-tests bootstrap; do
+  for group in fmt dylint api bot conductor runtime updater core integration boundaries remote-database publish-tests bootstrap; do
     case " ${selected} " in
       *" ${group} "*) add supply-chain; return ;;
     esac
