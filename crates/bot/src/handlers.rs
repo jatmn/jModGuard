@@ -46,12 +46,10 @@ fn audit_case_action(
     }
 }
 
-fn record_unresolved_gateway_observation(
-    suppressed_by_owned_action: bool,
-    _saved_state_changed: Option<bool>,
-) -> bool {
-    // The directory state is only a snapshot. Equal state does not identify
-    // this delivered action after a missed opposite Gateway event.
+fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bool {
+    // Directory state is only a snapshot. Equal saved state does not identify
+    // this delivered action after a missed opposite Gateway event, so recording
+    // depends only on whether this delivery is the bot's own suppressed echo.
     !suppressed_by_owned_action
 }
 
@@ -356,7 +354,7 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let directory_transition = crate::member_directory::observe_ban(
+        crate::member_directory::observe_ban(
             &app,
             guild_id.get(),
             &banned_user,
@@ -389,7 +387,7 @@ impl EventHandler for Handler {
         // Every unsuppressed delivery is a distinct unresolved observation.
         // A matching saved status is not an action identity: an opposite event
         // may have been missed while Gateway coverage was unavailable.
-        if record_unresolved_gateway_observation(suppressed, directory_transition) {
+        if record_unresolved_gateway_observation(suppressed) {
             let recorded = crate::cases::record(
                 &app,
                 enrollment.clone(),
@@ -489,7 +487,7 @@ impl EventHandler for Handler {
         );
         let app = Arc::clone(self.app());
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
-        let directory_transition = crate::member_directory::observe_unban(
+        crate::member_directory::observe_unban(
             &app,
             guild_id.get(),
             &unbanned_user,
@@ -504,7 +502,7 @@ impl EventHandler for Handler {
             guild_id.get(),
             unbanned_user.id.get(),
         );
-        if record_unresolved_gateway_observation(suppressed, directory_transition) {
+        if record_unresolved_gateway_observation(suppressed) {
             let recorded = crate::cases::record(
                 &app,
                 enrollment,
@@ -970,10 +968,8 @@ mod tests {
 
     #[test]
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
-        assert!(record_unresolved_gateway_observation(false, Some(false)));
-        assert!(record_unresolved_gateway_observation(false, Some(true)));
-        assert!(record_unresolved_gateway_observation(false, None));
-        assert!(!record_unresolved_gateway_observation(true, Some(false)));
+        assert!(record_unresolved_gateway_observation(false));
+        assert!(!record_unresolved_gateway_observation(true));
     }
 
     #[test]

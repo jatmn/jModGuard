@@ -4834,3 +4834,16 @@ async fn linking_an_audit_that_is_already_attached_still_retains_the_unban() {
             .ever_banned
     );
 }
+
+#[tokio::test]
+async fn status_counts_due_absence_rows_instead_of_the_unused_sync_column() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 88).await;
+    let due = store
+        .member_sync_status(scope.clone(), 42, 400_000)
+        .await
+        .unwrap();
+    assert_eq!(due.unseen_candidate_count, 1);
+    let waiting = store.member_sync_status(scope, 42, 2_500).await.unwrap();
+    assert_eq!(waiting.unseen_candidate_count, 0);
+}

@@ -1238,32 +1238,46 @@ pub async fn run(
                     }
                     Err(error) => {
                         tracing::warn!(guild_id = gid, "member sync page discarded: {error:#}");
-                        if matches!(
+                        // Every discarded page releases this claim. A stale revision
+                        // retries on the shared pace; any other commit failure backs
+                        // off instead of holding the lease until it expires.
+                        let stale = matches!(
                             error.downcast_ref::<db::guild_data::MemberSyncError>(),
                             Some(db::guild_data::MemberSyncError::Stale)
-                        ) {
-                            // A live event may have advanced the guild revision while
-                            // HTTP was in flight. The page stays discarded, but release
-                            // this exact claim now so the worker can refetch after the
-                            // existing shared request pace instead of waiting for its
-                            // ninety-second lease to expire. A replaced run or owner
-                            // fails the claim fence in defer_member_sync.
-                            let now_ms = chrono::Utc::now().timestamp_millis();
-                            if let Err(defer_error) = store
-                                .defer_member_sync(
-                                    scope,
-                                    claim,
-                                    "directory_changed".to_owned(),
-                                    now_ms,
-                                    now_ms,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    guild_id = gid,
-                                    "stale member page claim release failed: {defer_error:#}"
-                                );
-                            }
+                        );
+                        if !stale {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                        }
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let delay = if stale {
+                            Duration::ZERO
+                        } else {
+                            retry_delay(&app, consecutive_failures).max(Duration::from_secs(
+                                u64::from(app.cfg.member_sync.min_request_interval_secs),
+                            ))
+                        };
+                        let next_ms = now_ms
+                            .saturating_add(delay.as_millis() as i64)
+                            .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                        if let Err(defer_error) = store
+                            .defer_member_sync(
+                                scope,
+                                claim,
+                                if stale {
+                                    "directory_changed"
+                                } else {
+                                    "commit_failed"
+                                }
+                                .to_owned(),
+                                next_ms,
+                                now_ms,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member page claim release failed: {defer_error:#}"
+                            );
                         }
                     }
                 },

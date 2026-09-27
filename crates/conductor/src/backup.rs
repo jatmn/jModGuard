@@ -275,14 +275,10 @@ async fn capture_inner(
         )?;
         let snapshot = scratch.join(format!("{}.sqlite", safe_name(&capture.role)));
         snapshot_sqlite(&capture.path, &snapshot).await?;
-        if capture.role != "core" {
-            if let Some(core) = cfg
-                .capture_stores
-                .iter()
-                .find(|store| store.role == "core")
-            {
-                release_member_sync_pacing_from_guild_store(&capture.path, &core.path).await?;
-            }
+        if capture.role != "core"
+            && let Some(core) = cfg.capture_stores.iter().find(|store| store.role == "core")
+        {
+            release_member_sync_pacing_from_guild_store(&capture.path, &core.path).await?;
         }
         ensure_record_fits(
             &writer,

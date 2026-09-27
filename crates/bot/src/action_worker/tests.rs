@@ -537,6 +537,10 @@ async fn queued_retry_and_resume_after_initial_completion_keep_the_seed_checkpoi
             "completed_resume",
             crate::bot_actions::MemberSyncOperation::Resume,
         ),
+        (
+            "completed_pause",
+            crate::bot_actions::MemberSyncOperation::Pause,
+        ),
     ] {
         let job = f.enqueue(10, label, Action::MemberSync { operation }).await;
         drain_with_state(&app, &discord, &WorkerLimits::default())
@@ -558,7 +562,7 @@ async fn queued_retry_and_resume_after_initial_completion_keep_the_seed_checkpoi
         assert_eq!(status.run_kind.as_deref(), Some("initial"));
     }
     assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(discord.checks.load(Ordering::SeqCst), 2);
+    assert_eq!(discord.checks.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

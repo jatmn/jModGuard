@@ -416,6 +416,34 @@ test('Members polls acknowledged Resume until its receipt and newer status agree
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
+test('Members clears a Pause that lands after the import already completed', async () => {
+  const guildId = '987654321098765432';
+  const action = { id: 'sync-action-pause-late', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      return response(statusReads === 1
+        ? { status: 'running', phase: 'members', run_id: 'initial-1', progress_revision: 4 }
+        : { status: 'complete', phase: 'complete', run_id: 'initial-1', progress_revision: 4, initial_completed_at: 1790000000000 });
+    }
+    if (url.endsWith('/actions')) return response([{ ...action, outcome: 'member_sync_already_completed' }]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Pause').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Pause requested/);
+  action.state = 'succeeded';
+  await runMemberPoll(h);
+  assert.doesNotMatch(textOf(panel), /Pause requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
 test('Members stops pending-control polling when the bot action fails', async () => {
   const action = { id: 'sync-action-failed', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment' };
   const h = harness(async (url) => {

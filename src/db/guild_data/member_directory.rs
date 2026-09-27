@@ -588,7 +588,7 @@ fn status(
         pace_ms,
         share,
         lease_until,
-        candidates,
+        _stored_candidates,
         request_after,
     )) = row
     {
@@ -626,7 +626,19 @@ fn status(
         };
         out.last_success_at = last_success;
         (out.last_success_processed,out.last_success_inserted,out.last_success_updated,out.last_success_unchanged)=conn.query_row("SELECT last_success_processed,last_success_inserted,last_success_updated,last_success_unchanged FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        out.unseen_candidate_count = candidates;
+        // The sync column is not maintained. Count the same due absence rows
+        // the cleanup worker selects, so the Members card can show a real backlog.
+        let (gap_at, completed_at, backfill_done): (Option<i64>, Option<i64>, bool) = conn.query_row(
+            "SELECT gap_at_ms,initial_completed_at_ms,case_backfill_done FROM guild_member_seed WHERE guild_id=?1",
+            params![scope.guild_id()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let history_ready = completed_at.is_some() && backfill_done;
+        out.unseen_candidate_count = conn.query_row(
+            "SELECT COUNT(*) FROM guild_member_directory d WHERE d.guild_id=?1 AND d.enrollment_id=?2 AND d.is_current=0 AND d.is_banned=0 AND d.ever_banned=0 AND d.cleanup_after_ms<=?3 AND (?4=1 OR coalesce(d.cleanup_member_checked_at_ms,-1)<max(coalesce(?5,0),coalesce(d.departed_at_ms,0))) AND NOT EXISTS(SELECT 1 FROM guild_member_pending_bans p WHERE p.guild_id=d.guild_id AND p.enrollment_id=d.enrollment_id AND p.user_id=d.user_id) AND NOT EXISTS(SELECT 1 FROM guild_member_target_checks t WHERE t.guild_id=d.guild_id AND t.enrollment_id=d.enrollment_id AND t.user_id=d.user_id)",
+            params![scope.guild_id(), scope.enrollment.id.as_str(), now_ms, i64::from(history_ready), gap_at],
+            |r| Ok(r.get(0)?),
+        )?;
         if state == "running" && lease_until.is_some_and(|v| v < now_ms) {
             out.status = "waiting".into();
             out.status_reason = Some("worker unavailable; waiting for a new claim".into());

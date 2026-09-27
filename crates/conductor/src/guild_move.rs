@@ -605,12 +605,16 @@ async fn clear_fence(cfg: &Config, guild: i64, generation: &str) -> Result<()> {
     }
 }
 
-async fn copy_guild(
-    source: &Path,
-    dest: &Path,
-    core: &Path,
-    directory: &Directory,
-) -> Result<()> {
+/// v10 has `guild_member_seed` without `gap_generation` (added in 0011).
+fn seed_reconciliation_sql(schema_version: i64) -> &'static str {
+    if schema_version >= 11 {
+        "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id=?"
+    } else {
+        "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),directory_revision=directory_revision+1 WHERE guild_id=?"
+    }
+}
+
+async fn copy_guild(source: &Path, dest: &Path, core: &Path, directory: &Directory) -> Result<()> {
     let src = open(source).await?;
     let dest_conn = open(dest).await?;
     let guild = directory.guild;
@@ -712,10 +716,13 @@ async fn copy_guild(
         copy_member_table(&src, &dest_conn, "guild_member_case_index", guild).await?;
         if table_exists(&dest_conn, "guild_member_sync").await? {
             dest_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
-            dest_conn.execute("UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id=?",libsql::params![guild]).await?;
-            dest_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
-            dest_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE guild_id=? AND status!='complete' AND cursor IS NOT NULL",libsql::params![guild]).await?;
-            dest_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=? AND initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",libsql::params![guild]).await?;
+            let dest_version = scalar(&dest_conn, "PRAGMA user_version", ()).await?;
+            dest_conn.execute(seed_reconciliation_sql(dest_version), libsql::params![guild]).await?;
+            if table_exists(&dest_conn, "guild_member_audit_recovery").await? {
+                dest_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
+                dest_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE guild_id=? AND status!='complete' AND cursor IS NOT NULL",libsql::params![guild]).await?;
+                dest_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=? AND initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",libsql::params![guild]).await?;
+            }
             crate::backup::release_member_sync_pacing_from_guild_store(dest, core).await?;
         }
         copy_history(&src, &dest_conn, guild).await?;

@@ -340,8 +340,11 @@ async fn execute_inner(
                         }
                     }
                     Ok(status)
-                        if matches!(operation, crate::bot_actions::MemberSyncOperation::Resume)
-                            && status.status == "complete" =>
+                        if matches!(
+                            operation,
+                            crate::bot_actions::MemberSyncOperation::Resume
+                                | crate::bot_actions::MemberSyncOperation::Pause
+                        ) && status.status == "complete" =>
                     {
                         Outcome::succeeded("member_sync_already_completed")
                     }

@@ -2212,6 +2212,9 @@ function tabMembers() {
   const actionApplied = (sync, pending) => {
     if (!sync) return false;
     if (pending.state !== "succeeded") return false;
+    // Pause queued while the import was still active can land after completion.
+    // That store no-op does not bump progress_revision or change status.
+    if (pending.operation === "pause" && sync.status === "complete") return true;
     if (Number(sync.progress_revision ?? 0) <= pending.revision) return false;
     if (pending.operation === "pause") return sync.status === "paused";
     if (pending.operation === "reconcile") return sync.run_kind === "reconcile" && sync.run_id !== pending.runId;
