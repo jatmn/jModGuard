@@ -44,6 +44,7 @@ groups=(
 )
 selected=""
 full=0
+dylint_full=0
 
 add() {
   case " ${selected} " in
@@ -55,6 +56,7 @@ add() {
 all_groups() {
   echo "select-checks: all groups: $*" >&2
   full=1
+  dylint_full=1
   selected=""
   local group
   for group in "${groups[@]}"; do
@@ -63,6 +65,7 @@ all_groups() {
 }
 
 all_rust() {
+  dylint_full=1
   local group
   for group in fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
     add "$group"
@@ -117,6 +120,7 @@ classify() {
       return
       ;;
     dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
+      dylint_full=1
       add dylint
       return
       ;;
@@ -319,15 +323,47 @@ if [ "$mode" = "plan" ]; then
   exit 0
 fi
 
+# Reuse the selected check targets; Cargo also compiles their dependencies.
+# Remote DB has both integration-test binaries and one root-library test.
+# Empty scope means the full workspace for global/tooling/fallback plans.
+dylint_packages=""
+if [ "$dylint_full" -eq 0 ]; then
+  lint_targets="$selected"
+  # API unit tests call bot code. Runtime consumers have binary/unit-test
+  # targets that compiling them only as dependencies would not check.
+  case " $selected " in *" bot "*) lint_targets="$lint_targets api" ;; esac
+  case " $selected " in *" runtime "*) lint_targets="$lint_targets api bot updater" ;; esac
+  for group in api bot conductor runtime updater core integration; do
+    wanted=0
+    case " ${lint_targets} " in *" $group "*) wanted=1 ;; esac
+    case "$group" in
+      core|integration)
+        case " ${selected} " in *" remote-database "*) wanted=1 ;; esac ;;
+    esac
+    if [ "$wanted" -eq 1 ]; then
+      package="jmodguard-${group}"
+      case "$group" in
+        core) package=jmodguard ;;
+        integration) package=jmodguard-integration-tests ;;
+      esac
+      dylint_packages="${dylint_packages:+$dylint_packages }$package"
+    fi
+  done
+fi
+
 steps="$root/.buildkite/pipeline.steps.yml"
 generated="$(mktemp)"
-awk -v selected=" ${selected} " '
+awk -v selected=" ${selected} " -v lint_packages="$dylint_packages" '
   /^  # group: / { group = $3; next }
   {
     line = $0
     if (line ~ /if: __SELECTED__/) {
       if (index(selected, " " group " ") > 0) print "    if: \"true\""
       else print "    if: \"false\""
+      if (group == "dylint") {
+        print "    env:"
+        print "      JMODGUARD_DYLINT_PACKAGES: \"" lint_packages "\""
+      }
       next
     }
     print line

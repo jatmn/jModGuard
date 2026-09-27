@@ -196,4 +196,20 @@ if [ "$empty_count" -ne 17 ]; then
   fail "empty diff did not select every group (got ${empty_count})"
 fi
 
+# Scope the expensive lint compilation to selected Rust targets/consumers.
+expect_lint_packages() {
+  local expected="$1" actual
+  shift
+  actual="$(BUILDKITE=false bash "$selector" upload --files "$@" | sed -n 's/^      JMODGUARD_DYLINT_PACKAGES: "\(.*\)"$/\1/p')"
+  [[ "$actual" == "$expected" ]] || fail "lint scope for $*: expected [$expected], got [$actual]"
+}
+expect_lint_packages 'jmodguard-conductor' crates/conductor/src/install.rs
+expect_lint_packages 'jmodguard-api jmodguard-integration-tests' crates/api/src/lib.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-integration-tests' crates/bot/src/main.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-conductor jmodguard-runtime jmodguard-updater jmodguard jmodguard-integration-tests' crates/runtime/src/lib.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard jmodguard-integration-tests' src/config.rs
+expect_lint_packages 'jmodguard jmodguard-integration-tests' crates/integration-tests/tests/remote_database_smoke.rs
+expect_lint_packages '' Cargo.lock
+expect_lint_packages '' dylint.toml crates/conductor/src/install.rs
+expect_lint_packages '' mystery.bin
 echo 'select-checks-test: ok'

@@ -244,7 +244,12 @@ if should_run dylint; then
   echo 'ci-preflight: bash scripts/dylint-test.sh'
   bash scripts/dylint-test.sh
   echo 'ci-preflight: bash scripts/dylint.sh'
-  bash scripts/dylint.sh
+  if [ -z "${only_names}" ]; then
+    # Full local gates must not inherit an affected-only Buildkite scope.
+    JMODGUARD_DYLINT_PACKAGES= bash scripts/dylint.sh
+  else
+    bash scripts/dylint.sh
+  fi
 fi
 
 if should_run contracts; then

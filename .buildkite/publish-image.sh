@@ -165,9 +165,20 @@ changed_since_publication() {
   IFS= read -r previous <<<"${rev%%$'\n'*}"
   IFS= read -r source <<<"${rev#*$'\n'}"
   [[ "$source" == "$REPOSITORY" && "$previous" =~ $SHA_RE ]] || return 0
-  local -a inputs=("Dockerfile.${component}" Cargo.toml Cargo.lock rust-toolchain.toml src crates migrations vendor .buildkite scripts/bootstrap-container.sh)
+  # COPY crates/ supplies Cargo workspace layout, not a production dependency
+  # on every service. Keep every manifest (resolution), but only linked source.
+  local -a inputs=(
+    "Dockerfile.${component}" "Dockerfile.${component}.dockerignore" .dockerignore
+    Cargo.toml Cargo.lock rust-toolchain.toml ':(glob)crates/*/Cargo.toml'
+    src migrations vendor "crates/${component}" crates/runtime crates/updater
+    .buildkite/publish-image.sh scripts/bootstrap-container.sh
+    ':(exclude,glob)crates/*/tests/**'
+    ':(exclude,glob)crates/*/benches/**'
+    ':(exclude,glob)crates/*/examples/**'
+  )
   if [[ "$component" == "webui" ]]; then
-    inputs=(Dockerfile.webui frontend scripts/package-webui.mjs .buildkite)
+    inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
+      frontend scripts/package-webui.mjs .buildkite/publish-image.sh)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0

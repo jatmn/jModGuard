@@ -749,36 +749,64 @@ if ! changed_since_publication bot "$head" image; then
   fail 'src change since last image must rebuild'
 fi
 
-for path in \
-  crates/bot/src/main.rs \
-  crates/api/src/web/api.rs \
-  crates/runtime/src/health.rs \
-  migrations/guild/0001_identity.sql \
-  migrations/0012_guild_moves.sql
-do
+# Actual Git diffs, with a complete matching registry publication, distinguish
+# component inputs from source copied only to satisfy Cargo workspace layout.
+while IFS='|' read -r path affected; do
   mkdir -p "$(dirname "$path")"
-  echo changed >"$path"
+  echo changed >>"$path"
   git add .
   git commit -m "$path" >/dev/null
   head="$(git rev-parse HEAD)"
-  previous="$(git rev-parse HEAD~1)"
-  INSPECT_REVISION="$previous"
+  INSPECT_REVISION="$(git rev-parse HEAD~1)"
   registry_inspect() {
     local ref="$1"
     shift
     if [[ "$ref" == image:latest && "$*" == *--format* ]]; then
-      printf '%s' "$(oci_config "$INSPECT_REVISION")"
-      return 0
+      oci_config "$INSPECT_REVISION"
+    elif [[ "$*" == *--raw* && ( "$ref" == image:latest || "$ref" == "image:${INSPECT_REVISION}" ) ]]; then
+      printf '%s' '{"schemaVersion":2}'
+    else
+      return 1
     fi
-    return 1
   }
-  if ! changed_since_publication bot "$head" image; then
-    fail "bot must rebuild after $path"
-  fi
-  if ! changed_since_publication api "$head" image; then
-    fail "api must rebuild after $path"
-  fi
-done
+  for component in bot api webui; do
+    actual=skip
+    if changed_since_publication "$component" "$head" image; then actual=build; fi
+    expected=skip
+    case " $affected " in *" $component "*) expected=build ;; esac
+    [[ "$actual" == "$expected" ]] || fail "$component after $path: expected $expected, got $actual"
+  done
+done <<'CASES'
+crates/bot/src/main.rs|bot
+crates/api/src/web/api.rs|api
+crates/conductor/src/main.rs|
+crates/conductor/frontend/app.js|
+crates/integration-tests/tests/dual_process_smoke.rs|
+crates/api/tests/tokenless_startup.rs|
+crates/updater/tests/registry.rs|
+crates/runtime/src/health.rs|bot api
+crates/updater/src/main.rs|bot api
+crates/updater/build.rs|bot api
+migrations/guild/0001_identity.sql|bot api
+migrations/0012_guild_moves.sql|bot api
+src/lib.rs|bot api
+vendor/tokio-tungstenite/src/lib.rs|bot api
+crates/conductor/Cargo.toml|bot api
+Cargo.toml|bot api
+Cargo.lock|bot api
+rust-toolchain.toml|bot api
+Dockerfile.bot|bot
+Dockerfile.api|api
+Dockerfile.webui|webui
+.dockerignore|bot api webui
+scripts/bootstrap-container.sh|bot api
+frontend/style.css|webui
+scripts/package-webui.mjs|webui
+.buildkite/publish-image.sh|bot api webui
+.buildkite/select-checks.sh|
+.buildkite/publish-image-test.sh|
+docs/INSTALL.md|
+CASES
 
 reload_publisher
 registry_inspect() {

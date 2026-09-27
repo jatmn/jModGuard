@@ -86,7 +86,7 @@ also runs the publisher contract tests. An `crates/api` diff runs the API test, 
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
 conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs `cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace` with the Trail of Bits lints listed in `dylint.toml`. The gate compiles the workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs the Trail of Bits lints listed in `dylint.toml` with `--locked --all-targets`. For a scoped plan, the selector sets `JMODGUARD_DYLINT_PACKAGES` on the Dylint job to the selected Rust check packages and affected test/binary consumers: bot changes include API unit tests; runtime changes include all service/updater targets; remote-database includes root and integration tests. Cargo also checks their dependencies. For example, a conductor-only PR lints conductor rather than every workspace test target. Global Cargo/toolchain/vendor changes, lint-tool changes, unknown paths and full plans retain `--workspace`. Full local preflight clears the scoped setting and always lints the whole workspace. The gate uses `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) and `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
 checks, formatting/lints, supply-chain, and remote-database checks. It does not
 select independent runtime/conductor package tests or the bootstrap/publisher
 shell contract tests. Migration edits also select conductor because its tests
@@ -122,10 +122,30 @@ There is one publisher per component, including migration changes. Keep those
 concurrency group names consistent if another pipeline publishes the same packages.
 
 Main builds compare each package's last published source revision to the new
-commit across the Dockerfile, Cargo/toolchain files, shared source trees and
-publishing configuration. This includes all intervening commits, not just the
-last commit in a push. Frontend/docs-only changes skip image compilation when
-the published source can be verified. That skip inspects public GHCR history
+commit across that component's production inputs. This includes all intervening
+commits, not just the last commit in a push:
+
+| Changed input | Images rebuilt on ordinary main publication |
+| --- | --- |
+| Bot source | Bot |
+| API source | API |
+| Shared core, runtime, updater, migrations or vendor | Bot and API |
+| Conductor source/UI or standalone crate tests | None |
+| Root frontend or WebUI packager | WebUI |
+| Workspace manifests, lockfile or Rust toolchain | Bot and API |
+| Component Dockerfile or its Docker ignore file | That component |
+| Publisher script or root Docker ignore file | Bot, API and WebUI |
+| Check selector, CI test fixtures or docs | None |
+
+Bot/API Dockerfiles copy the workspace for Cargo resolution, but do not link
+other services or integration tests into their production executables. All
+workspace manifests remain shared inputs because they affect resolution. Their
+shared launcher/bootstrap remains an input to both images; API images build
+without embedded UI. A frontend-only main change therefore publishes WebUI,
+while PR checks still validate the API's optional embedded-UI configuration.
+Publisher jobs still run the short history/integrity check; unchanged components
+keep their existing SHA and `latest` tags and do not build or push a new version.
+The table assumes a verifiable complete previous publication. That skip inspects public GHCR history
 before fetching `GHCR_TOKEN` or logging in, so missing push credentials cannot
 fail a docs-only main build. Missing image labels, unavailable Git
 history or registry inspection errors cause a rebuild. Bot and API images use
