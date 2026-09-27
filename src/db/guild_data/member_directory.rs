@@ -280,8 +280,8 @@ impl MemberSyncStatus {
     }
 
     pub fn allows_member_sync_retry(&self) -> bool {
-        self.audit_pagination_stalled()
-            || matches!(self.status.as_str(), "needs_attention" | "waiting")
+        matches!(self.status.as_str(), "needs_attention" | "waiting")
+            || (self.status == "complete" && self.audit_pagination_stalled())
     }
 
     /// True when a Retry on a completed import re-queued stalled audit recovery.
@@ -1256,7 +1256,7 @@ impl GuildDataStore {
                 }
                 if state==banned {
                     tx.ensure_mutation_receipt()?;
-                    tx.member_execute("UPDATE guild_member_directory SET ban_observed_at_ms=?4,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
+                    tx.member_execute("UPDATE guild_member_directory SET ever_banned=1,cleanup_after_ms=NULL,ban_observed_at_ms=?4,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,observed_at_ms])?;
                     if let Some((username,global_name))=&identity { update_ban_identity(&tx,&scope,user_id,username,global_name)?; }
                     if banned { close_current_for_ban(&tx,&scope,user_id,observed_at_ms)?; }
                     if order_uncertain {
@@ -2406,7 +2406,7 @@ impl GuildDataStore {
             let Some((kind,state,last_key))=current else {return Err(MemberSyncError::MissingJob.into())};
             let audit_stalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled')",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok(r.get(0)?))?;
             if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state=="complete") || (action==MemberSyncAction::Retry && state=="complete" && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;return Ok(out)}
-            let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>audit_stalled||matches!(state.as_str(),"needs_attention"|"waiting"),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
+            let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>matches!(state.as_str(),"needs_attention"|"waiting")||(state=="complete"&&audit_stalled),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
             anyhow::ensure!(allowed,MemberSyncError::Invalid);
             tx.ensure_mutation_receipt()?;
             match action {
@@ -2418,7 +2418,7 @@ impl GuildDataStore {
                 }
                 MemberSyncAction::Reconcile=>{tx.member_execute("UPDATE guild_member_sync SET run_id=?2,run_kind='reconcile',phase='members',status='queued',status_reason=NULL,cursor=NULL,processed=0,member_processed=0,ban_processed=0,verify_processed=0,audit_processed=0,member_page_interval_ms=NULL,inserted=0,updated=0,unchanged=0,total_estimate=NULL,started_at_ms=?3,last_progress_at_ms=NULL,completed_at_ms=NULL,next_attempt_at_ms=?3,reconcile_gap_generation=(SELECT gap_generation FROM guild_member_seed WHERE guild_id=?1),lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?4 WHERE guild_id=?1",params![scope.guild_id(),random_id(),now_ms,operation_key])?;}
             }
-            let _=kind;tx.commit()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;Ok(out)
+            let _=kind;let out=status(&tx,&scope,bot_id,now_ms)?;tx.commit()?;Ok(out)
         }).await
     }
 }

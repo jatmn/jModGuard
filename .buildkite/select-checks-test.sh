@@ -29,23 +29,27 @@ expect() {
   fi
 }
 
-rust="contracts fmt api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
-all="contracts frontend fmt api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
+rust="contracts fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
+all="contracts frontend fmt dylint api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
 expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
-expect "contracts fmt api boundaries integration supply-chain" crates/api/src/lib.rs
-expect "contracts fmt integration supply-chain" crates/integration-tests/tests/dual_process_smoke.rs
-expect "contracts fmt remote-database supply-chain" crates/integration-tests/tests/remote_database_smoke.rs
+expect "contracts frontend" tools/eslint/package.json
+expect "contracts frontend" tools/eslint-web-selftest.sh
+expect "contracts fmt dylint api boundaries integration supply-chain" crates/api/src/lib.rs
+expect "contracts fmt dylint integration supply-chain" crates/integration-tests/tests/dual_process_smoke.rs
+expect "contracts fmt dylint remote-database supply-chain" crates/integration-tests/tests/remote_database_smoke.rs
+expect "contracts fmt dylint remote-database supply-chain" crates/integration-tests/tests/guild_store_smoke.rs
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
-expect "contracts fmt bot boundaries integration supply-chain" crates/bot/src/main.rs
-expect "contracts fmt conductor boundaries supply-chain" crates/conductor/src/install.rs
+expect "contracts fmt dylint bot boundaries integration supply-chain" crates/bot/src/main.rs
+expect "contracts fmt dylint conductor boundaries supply-chain" crates/conductor/src/install.rs
 expect "contracts fmt conductor boundaries frontend supply-chain" crates/conductor/frontend/app.js
 expect "contracts fmt bot updater bootstrap publish-tests supply-chain" Dockerfile.bot
 expect "contracts fmt api updater boundaries integration bootstrap publish-tests supply-chain" Dockerfile.api
-expect "contracts fmt runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
-expect "contracts fmt updater api bot boundaries supply-chain" crates/updater/src/lib.rs
+expect "contracts fmt dylint runtime boundaries core conductor integration supply-chain" crates/runtime/src/lib.rs
+expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
+expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
 expect "$rust" src/db/mod.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
@@ -89,7 +93,7 @@ if grep -Fq "'\$\$GITHUB_TOKEN'" "$root/.buildkite/with-cargo-auth.sh"; then
 fi
 
 fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan | wc -l)"
-if [ "$fetch_fail_count" -ne 16 ]; then
+if [ "$fetch_fail_count" -ne 17 ]; then
   fail "fetch failure did not select every group (got ${fetch_fail_count})"
 fi
 

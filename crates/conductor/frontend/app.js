@@ -27,7 +27,7 @@ async function api(path, method = "GET", body = null) {
   if (body !== null) { opts.headers["content-type"] = "application/json"; opts.body = JSON.stringify(body); }
   const res = await fetch(path, opts);
   const text = await res.text();
-  let data = null;
+  let data;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
   if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
   return data;

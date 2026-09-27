@@ -170,6 +170,61 @@ fn page(phase: MemberSyncPhase, cursor: Option<String>, terminal: bool) -> Membe
 }
 
 #[tokio::test]
+async fn long_request_lease_commits_member_and_audit_pages_after_ninety_seconds() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 1_000, 150_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Members, None, true),
+            121_000,
+        )
+        .await
+        .unwrap();
+
+    // The separate audit recovery lane uses the same lease budget.
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.member_execute(
+                "UPDATE guild_member_seed SET initial_completed_at_ms=121001 WHERE guild_id=10",
+                (),
+            )?;
+            tx.member_execute(
+                "UPDATE guild_member_sync SET phase='complete',status='complete' WHERE guild_id=10",
+                (),
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .await
+        .unwrap();
+    let audit = store
+        .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), 122_000, 150_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_audit_recovery_page(scope, audit, vec![], (None, true), 242_000, 15_000)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
     let (_f, store, scope) = ready().await;
     let initial = store
@@ -1467,6 +1522,119 @@ async fn retry_requeues_audit_pagination_stall_after_initial_complete() {
     assert_eq!(status.audit_recovery_status.as_deref(), Some("queued"));
     assert_eq!(status.audit_recovery_reason, None);
     assert!(status.audit_recovery_next_attempt_at.unwrap_or(0) >= 6_000);
+}
+
+#[tokio::test]
+async fn retry_does_not_resume_paused_reconciliation_for_stalled_audit() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 5_000)
+        .await
+        .unwrap();
+    store.db.with_conn(|conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        tx.ensure_mutation_receipt()?;
+        tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10", ())?;
+        tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=5000 WHERE guild_id=10", ())?;
+        tx.member_execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed) VALUES(10,(SELECT enrollment_id FROM guild_member_seed WHERE guild_id=10),42,'audit-run',5000,'needs_attention','pagination_stalled',0,0)", ())?;
+        tx.commit()
+    }).await.unwrap();
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Reconcile,
+            "reconcile".into(),
+            6_000,
+        )
+        .await
+        .unwrap();
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Pause,
+            "pause".into(),
+            6_001,
+        )
+        .await
+        .unwrap();
+    let before = store
+        .member_sync_status(scope.clone(), 42, 6_002)
+        .await
+        .unwrap();
+    assert_eq!(before.status, "paused");
+    assert!(!before.allows_member_sync_retry());
+    let error = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Retry,
+            "retry".into(),
+            6_003,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::Invalid)
+    ));
+    let after = store
+        .member_sync_status(scope.clone(), 42, 6_003)
+        .await
+        .unwrap();
+    assert_eq!(after.status, "paused");
+    assert_eq!(
+        after.audit_recovery_status.as_deref(),
+        Some("needs_attention")
+    );
+    assert_eq!(after.progress_revision, before.progress_revision);
+}
+
+#[tokio::test]
+async fn control_status_failure_rolls_back_instead_of_reporting_committed_failure() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    // A trigger changes the bot identity after the control update, so the
+    // subsequent status projection fails. The control must roll back with it.
+    store
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER bad_pause_status AFTER UPDATE OF status ON guild_member_sync WHEN NEW.status='paused' BEGIN UPDATE guild_member_seed SET bot_id=999 WHERE guild_id=NEW.guild_id; END;",
+                SCHEMA_BATCH_LIMIT,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .member_sync_action(
+                scope.clone(),
+                42,
+                MemberSyncAction::Pause,
+                "pause".into(),
+                1_100
+            )
+            .await
+            .is_err()
+    );
+    let (state, bot_id): (String, i64) = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT s.status,seed.bot_id FROM guild_member_sync s JOIN guild_member_seed seed USING(guild_id) WHERE s.guild_id=10",
+                (),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(state, "queued");
+    assert_eq!(bot_id, 42);
 }
 
 #[tokio::test]
@@ -4499,6 +4667,25 @@ async fn departed_member(store: &GuildDataStore, scope: &GuildDataScope, user_id
         .depart_member(scope.clone(), user_id, 2_500)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn confirmed_unban_without_prior_local_ban_retains_departed_member() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 62).await;
+    let before = store.get_member(scope.clone(), 62).await.unwrap().unwrap();
+    assert!(!before.is_banned && !before.ever_banned);
+    store.observe_unban(scope.clone(), 62, 2_600).await.unwrap();
+    let retained = store.get_member(scope.clone(), 62).await.unwrap().unwrap();
+    assert!(!retained.is_banned && retained.ever_banned);
+    assert_eq!(retained.joined_at_ms, Some(1_500));
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 400_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

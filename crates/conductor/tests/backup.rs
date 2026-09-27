@@ -166,6 +166,75 @@ async fn write_core(path: &std::path::Path, with_actions: bool) {
     }
 }
 
+#[tokio::test]
+async fn capture_preserves_live_member_pacing_and_restore_releases_copied_lease() {
+    let h = setup(false).await;
+    let core = h.root.join("core.db");
+    let guild = h.root.join("guild.db");
+    let db = libsql::Builder::new_local(&core).build().await.unwrap();
+    db.connect().unwrap().execute_batch("CREATE TABLE member_sync_pacing(bot_id INTEGER PRIMARY KEY,request_after_ms INTEGER,lease_owner TEXT,lease_until_ms INTEGER,generation INTEGER); INSERT INTO member_sync_pacing VALUES(42,500000,'live-worker',600000,7);").await.unwrap();
+    let guild_db = libsql::Builder::new_local(&guild).build().await.unwrap();
+    guild_db.connect().unwrap().execute_batch("CREATE TABLE guild_member_seed(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,initial_completed_at_ms INTEGER,reconciliation_needed INTEGER,gap_at_ms INTEGER,gap_generation INTEGER,directory_revision INTEGER); INSERT INTO guild_member_seed VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,NULL,0,NULL,0,1); PRAGMA user_version=14;").await.unwrap();
+    let mut cfg = h.conductor.cfg.clone();
+    cfg.capture_stores.push(CaptureStore {
+        role: "guild".into(),
+        path: guild,
+    });
+    let settings = h.conductor.settings().await.unwrap();
+    let archive = jmodguard_conductor::backup::capture(
+        &cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        "manual",
+        &settings,
+    )
+    .await
+    .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT lease_owner,lease_until_ms FROM member_sync_pacing WHERE bot_id=42",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "live-worker");
+    assert_eq!(row.get::<i64>(1).unwrap(), 600_000);
+    drop(rows);
+
+    let restored = jmodguard_conductor::backup::restore_archive(
+        &cfg,
+        h.conductor.store().unwrap(),
+        h.conductor.backup_zone().unwrap(),
+        &archive.id,
+        None,
+        jmodguard_conductor::backup::RestoreRequest {
+            acknowledge_historical: true,
+            current_state_available: true,
+            ..Default::default()
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+    let restored_db = libsql::Builder::new_local(restored.join("core.sqlite"))
+        .build()
+        .await
+        .unwrap();
+    let restored_conn = restored_db.connect().unwrap();
+    let mut restored_rows = restored_conn
+        .query(
+            "SELECT lease_owner,lease_until_ms FROM member_sync_pacing WHERE bot_id=42",
+            (),
+        )
+        .await
+        .unwrap();
+    let restored_row = restored_rows.next().await.unwrap().unwrap();
+    assert!(restored_row.get::<Option<String>>(0).unwrap().is_none());
+    assert!(restored_row.get::<Option<i64>>(1).unwrap().is_none());
+}
+
 async fn call(
     router: &axum::Router,
     method: &str,

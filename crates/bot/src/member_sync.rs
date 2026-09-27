@@ -27,6 +27,12 @@ enum ReadyWork {
     AuditRecovery,
 }
 
+// The claim must outlive the entire configured Discord timeout and leave room
+// for the page to be committed before another worker can take the same slot.
+fn request_lease_ms(timeout_secs: u32) -> i64 {
+    (i64::from(timeout_secs) * 1_000 + 30_000).max(90_000)
+}
+
 fn coverage_gap_for_session(
     newly_initialized: bool,
     session_replaced: bool,
@@ -574,7 +580,7 @@ async fn reserve_request(
         worker_id.to_owned(),
         chrono::Utc::now().timestamp_millis(),
         i64::from(app.cfg.member_sync.min_request_interval_secs) * 1000,
-        90_000,
+        request_lease_ms(app.cfg.member_sync.request_timeout_secs),
     )
     .await
     {
@@ -1087,7 +1093,7 @@ pub async fn run(
                         bot_id,
                         worker_id.clone(),
                         now_ms,
-                        90_000,
+                        request_lease_ms(app.cfg.member_sync.request_timeout_secs),
                     )
                     .await
                 {
@@ -1194,7 +1200,13 @@ pub async fn run(
                 break;
             }
             let claim = match store
-                .claim_member_sync(scope.clone(), bot_id, worker_id.clone(), now_ms, 90_000)
+                .claim_member_sync(
+                    scope.clone(),
+                    bot_id,
+                    worker_id.clone(),
+                    now_ms,
+                    request_lease_ms(app.cfg.member_sync.request_timeout_secs),
+                )
                 .await
             {
                 Ok(Some(claim)) => claim,
@@ -1331,6 +1343,14 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_allowed_discord_request_keeps_all_claims_live() {
+        let lease = request_lease_ms(120);
+        assert!(lease > 120_000);
+        assert!(lease <= 300_000);
+        assert_eq!(request_lease_ms(30), 90_000);
+    }
 
     #[tokio::test]
     async fn timeout_during_known_retry_after_is_reported_as_rate_limited() {

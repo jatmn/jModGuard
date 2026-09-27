@@ -1,9 +1,15 @@
 # Buildkite CI and image publishing
 
 All CI and image publication for this repository run on the self-hosted
-Buildkite `linux` queue. The only GitHub Actions workflow is the owner-command
-Pullfrog agent (`docs/PULLFROG.md`); it is not CI or an image publisher. There
-are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
+Buildkite `linux` queue. GitHub Actions workflow files are the owner-command
+Pullfrog agent (`docs/PULLFROG.md`) and the Socket Security manifest scan
+(`.github/workflows/socket.yml`). Neither is CI or an image publisher. Set the
+repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
+relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
+There are no GHA runner selection/fallback jobs, and this repository has no registered GitHub Actions
 self-hosted runners. GitHub still runs Dependabot version updates as hosted
 dynamic workflows (`Actions → Dependabot Updates`); those are not CI. Keep **Update commit statuses** enabled in the
 pipeline's GitHub settings: the GitHub commit/PR check links to the Buildkite
@@ -28,8 +34,18 @@ steps:
       queue: linux
 ```
 
-The agents need Linux x86-64, Git, Node, Rust 1.96.0 with Clippy and
-rustfmt, `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
+The agents need Linux x86-64, Git, Node.js `^20.19.0`, `^22.13.0`, or `>=24`
+(host ESLint 10 and the frontend checks; `bash scripts/require-host-eslint-node.sh`
+enforces this before `npm ci --ignore-scripts --prefix tools/eslint` and
+`npm audit --prefix tools/eslint --audit-level=high`, which fails the frontend
+group on any high or critical advisory and on advisory-endpoint failure, with
+no fail-open switch), Rust 1.96.0 with Clippy and
+rustfmt, rustup able to install **nightly-2026-08-20** (the Dylint lint
+libraries' toolchain at tag `v6.1.0`) with `rustc-dev` and
+`llvm-tools-preview`, outbound HTTPS to `github.com` and
+`static.rust-lang.org`, and a writable `$HOME` for `.dylint_drivers` (the
+`dylint` group installs matching `cargo-dylint` and `dylint-link` from
+source on cold agents), `cargo-deny` 0.20.x, `cargo-audit` 0.22.x, Docker with the Buildx
 plugin/default Docker builder, and a Buildkite agent supporting `secret get`,
 `redactor add` and `meta-data`. The uploaded pipeline runs `bash scripts/ci-preflight.sh --only <group>`
 for each selected group after GitHub git-credential setup on cargo steps
@@ -48,7 +64,8 @@ advisory-database fetch/load errors) still fail the supply-chain check even on t
 fail-open path. The existing clone credential must also fetch tags and full commits from
 this repository. Publishing uses the existing Docker daemon's BuildKit cache and
 inline cache metadata in the published image; it does not depend on the Actions
-cache service. Do not add GitHub Actions CI workflows. An owner comment
+cache service. Do not add GitHub Actions CI workflows. The Socket Security
+manifest scan is not a CI workflow. An owner comment
 containing `@pullfrog` can start the hosted verifier job and use Actions
 minutes even when the agent rejects it as a non-command. Hosted Dependabot
 Updates are not CI and do not consume those minutes. If a Dependabot job stays queued on a `dependabot`
@@ -69,7 +86,7 @@ also runs the publisher contract tests. An `crates/api` diff runs the API test, 
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
 conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Shared `src/` and migrations run the Rust packages and the remote-database job.
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs `cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace` with the Trail of Bits lints listed in `dylint.toml`. The gate compiles the workspace once under `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) into `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` and migrations run the Rust packages and the remote-database job.
 The root lockfile and toolchain do too, and they also run the publisher and
 bootstrap contract tests, because those files are image inputs. An
 unclassified path runs every check. Scheduled builds, tag builds, and

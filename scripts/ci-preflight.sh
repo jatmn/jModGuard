@@ -2,7 +2,8 @@
 # Single source of truth for Buildkite check groups and the full local suite.
 # The remote-database job (libSQL containers) stays separate.
 # GitHub Actions workflows and GitHub-hosted CI runners are forbidden for CI.
-# The owner-command Pullfrog workflow is the sole GitHub Actions exception.
+# Allowed workflow files are the owner-command Pullfrog workflow and the
+# Socket Security manifest scan. CI runs on Buildkite.
 # Dependabot Updates dynamic workflows are not CI.
 set -euo pipefail
 
@@ -16,7 +17,7 @@ Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
 Run the Buildkite test gates locally or on a Buildkite linux agent.
 With no --only, run the full suite (local hooks and a complete check).
 Buildkite uploads one step per selected group. Known groups: contracts,
-frontend, fmt, api, bot, conductor, runtime, updater, core, integration,
+frontend, fmt, dylint, api, bot, conductor, runtime, updater, core, integration,
 boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
 By default the whitespace diff base is origin/main. Pass --base origin/<branch>
 for a PR whose base is not main. Scheduled Buildkite builds set
@@ -26,7 +27,7 @@ EOF
 
 base_ref="${JMODGUARD_PREFLIGHT_BASE:-origin/main}"
 only_names=""
-known_only="contracts frontend fmt api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
+known_only="contracts frontend fmt dylint api bot conductor runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
@@ -63,15 +64,6 @@ should_run() {
     *) return 1 ;;
   esac
 }
-
-if should_run contracts && [ -d "$root/.github/workflows" ]; then
-  while IFS= read -r -d '' workflow; do
-    if [ "$workflow" != "$root/.github/workflows/pullfrog.yml" ] || [ ! -f "$workflow" ]; then
-      echo 'ci-preflight: only the owner-command Pullfrog workflow is allowed; CI runs on Buildkite' >&2
-      exit 1
-    fi
-  done < <(find "$root/.github/workflows" -mindepth 1 -maxdepth 1 -print0)
-fi
 
 if should_run contracts; then
   if ! grep -Fq 'bash .buildkite/select-checks.sh upload' "$root/.buildkite/pipeline.yml"; then
@@ -232,7 +224,7 @@ whitespace_check() {
 }
 
 run_cargo() {
-  if should_run fmt || should_run api || should_run bot || should_run conductor || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
+  if should_run fmt || should_run dylint || should_run api || should_run bot || should_run conductor || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
     return 0
   fi
   return 1
@@ -246,6 +238,13 @@ fi
 if should_run fmt; then
   echo 'ci-preflight: cargo fmt --check'
   cargo fmt --check
+fi
+
+if should_run dylint; then
+  echo 'ci-preflight: bash scripts/dylint-test.sh'
+  bash scripts/dylint-test.sh
+  echo 'ci-preflight: bash scripts/dylint.sh'
+  bash scripts/dylint.sh
 fi
 
 if should_run contracts; then
@@ -361,6 +360,18 @@ if should_run pullfrog; then
 fi
 
 if should_run frontend; then
+  echo 'ci-preflight: bash scripts/require-host-eslint-node.sh'
+  bash scripts/require-host-eslint-node.sh
+
+  echo 'ci-preflight: npm ci --ignore-scripts --prefix tools/eslint'
+  npm ci --ignore-scripts --prefix tools/eslint
+
+  echo 'ci-preflight: npm audit --prefix tools/eslint --audit-level=high'
+  npm audit --prefix tools/eslint --audit-level=high
+
+  echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
+  bash tools/eslint-web-selftest.sh
+
   echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
   node --test scripts/frontend-state-test.mjs
 

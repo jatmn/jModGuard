@@ -5,3 +5,4 @@ jmodguard.db-*
 logs/
 /config.toml
 jmodguard.secret
+node_modules/

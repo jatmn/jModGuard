@@ -951,10 +951,6 @@ function toast(msg, kind = "info") {
   t._timer = setTimeout(() => (t.className = ""), kind === "error" ? 5000 : 2600);
 }
 
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
 async function init() {
   try {
     const me = await waitForApiMe();
@@ -2043,7 +2039,7 @@ function tabEvents() {
       tbody().innerHTML = "";
       if (!rows.length) tbody().append(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "No matching records." })));
       rows.forEach((r) => {
-        let data = "";
+        let data;
         try { data = JSON.stringify(JSON.parse(r.data || "{}"), null, 1); } catch (_) { data = r.data || ""; }
         tbody().append(el("tr", {},
           el("td", { class: "muted", text: new Date(r.created_at).toLocaleString() }),

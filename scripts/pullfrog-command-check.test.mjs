@@ -195,4 +195,15 @@ test('workflow uses the verified payload, matching pinned action, and owner-only
   assert.match(workflow, /if: steps\.authorize\.outputs\.authorized == 'true'/);
   assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.doesNotMatch(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/);
+  assert.match(workflow, /PULLFROG_MODEL: \$\{\{ secrets\.PULLFROG_MODEL \}\}/);
+  assert.doesNotMatch(workflow, /^\s*model:/m);
+  const docs = readFileSync(new URL('../docs/PULLFROG.md', import.meta.url), 'utf8');
+  assert.match(docs, /`PULLFROG_MODEL`: the full model id OpenCode Go serves, `opencode-go\/<id>`/);
+  assert.match(docs, /non-empty `PULLFROG_MODEL`, after trimming whitespace, before any console/);
+  assert.match(docs, /a console pick does not replace this\s+secret/);
+  assert.match(docs, /If the secret is missing\s+or only whitespace, the action ignores it/);
+  assert.match(docs, /if none is set Pullfrog auto-selects/);
+  assert.doesNotMatch(docs, /Choose an \*\*OpenCode Go\*\* model in the repo's Agent settings/);
+  assert.doesNotMatch(docs, /falls back to the console model/);
 });

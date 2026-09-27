@@ -213,8 +213,15 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 
 Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
 Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
-Do not add GitHub Actions CI workflows. The owner-command Pullfrog workflow is the
-sole exception; see `docs/PULLFROG.md`.
+Do not add GitHub Actions CI workflows. Allowed workflow files are the
+owner-command Pullfrog workflow (`docs/PULLFROG.md`) and the Socket Security
+manifest scan (`.github/workflows/socket.yml`). Socket Security runs on GitHub
+Actions; it is not CI, image publication, or a Buildkite job. Set the
+repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key before
+relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
+The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
+A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. Buildkite remains the merge gate.
+After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 
 ```bash
 bash scripts/ci-preflight.sh
@@ -226,21 +233,31 @@ bash scripts/ci-preflight.sh
 # bash scripts/install-git-hooks.sh --base origin/<base-branch>
 ```
 
-That script runs lockfile verification, `cargo fmt --check`, whitespace
-`git diff --check`, the publisher/release contract tests
+That script runs lockfile verification, `cargo fmt --check`,
+`bash scripts/dylint-test.sh` and `bash scripts/dylint.sh` (the Trail of Bits
+general lints pinned in `dylint.toml`),
+whitespace `git diff --check`, the publisher/release contract tests
 (`bash .buildkite/publish-image-test.sh` plus conductor release tests), workspace and
 no-default-features API tests, Clippy `-D warnings` on `--all-targets` (plus
 API `--no-default-features --all-targets`), a `jmodguard-conductor` build,
 service boundaries (`bash scripts/check-service-boundaries.sh`), public-install acceptance
 (`bash scripts/public-install-acceptance-test.sh`), the Dependabot config contract
-(`bash scripts/dependabot-config-test.sh`), frontend Node tests,
+(`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
+(`bash scripts/require-host-eslint-node.sh`, then `npm ci --ignore-scripts --prefix tools/eslint`,
+then `npm audit --prefix tools/eslint --audit-level=high`,
+then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=24` per
+`tools/eslint/package.json` `engines`),
+frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`
 with `--include-ignored` (that ignored test launches those binaries; the
 workspace test runs only the in-process smoke), the API build without default features,
 `cargo deny check bans licenses sources`, and
 `cargo audit` (fail-closed when `JMODGUARD_AUDIT_FAIL_CLOSED=1`; pull requests
 and ordinary main pushes ignore reported CVE advisories but still fail when
-`cargo audit` cannot run). GitHub-hosted Dependabot Updates dynamic workflows
+`cargo audit` cannot run). `npm audit --prefix tools/eslint --audit-level=high`
+always fails the `frontend` group on a high or critical advisory and on an
+advisory-endpoint failure. There is no fail-open switch and no ignore list;
+an unfixable transitive advisory is handled by pinning or dropping that package. GitHub-hosted Dependabot Updates dynamic workflows
 are not CI; do not add `.github/workflows` for them. Keep **Dependabot on self-hosted runners** disabled. This repository has no GitHub Actions self-hosted
 runners; otherwise jobs queue on a `dependabot` label and GitHub cancels
 them after 24 hours. Do not register leftover Proxmox GHA runners or label
@@ -282,6 +299,7 @@ authorize live provider calls or require a Codex skill to contribute.
 
 ## Version pins (verified)
 
+- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source, then runs one workspace `cargo check --all-targets` under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
   `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use
