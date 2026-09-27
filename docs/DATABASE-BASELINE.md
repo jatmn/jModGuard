@@ -107,13 +107,13 @@ ban rows. Existing rows keep their exact IDs and have no fabricated names.
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version13,
-using `migrations/guild/0001_identity.sql` through `0013_member_unresolved_audits.sql`. This separate
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version14,
+using `migrations/guild/0001_identity.sql` through `0014_member_case_retain_revision.sql`. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
-store atomically; open requires 13. See [tenant runtime](TENANT-RUNTIME.md). Core is at
+store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
 migration 0016. Each opener refuses the other family. No records are moved by startup.
 Core migration 0016 persists a per-bot shared member-sync request gate so
 rate-limit delays and the minimum request interval survive worker restart
@@ -127,6 +127,8 @@ earlier ban, check, or audit counts, so those historical phase counts remain
 unknown after upgrade. Initial completion, run cursors and retries are preserved.
 Guild migration 0013 preserves exact, dated bot-executor audit actions while their
 local case-source association remains unresolved.
+Guild migration 0014 stops case-retention triggers from bumping import page
+`directory_revision` when only ban-history metadata changes.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
 Selected case payload removal, replay-key cleanup and live guild erasure are described in

@@ -455,7 +455,7 @@ async fn copy_and_cutover(
         directory.guild,
     )
     .await?;
-    copy_guild(&source.path, &dest.path, directory).await?;
+    copy_guild(&source.path, &dest.path, core_path(cfg)?, directory).await?;
     *destination_committed = true;
     verify_copy(&source.path, &dest.path, directory.guild).await?;
     ensure_source_cleanup_budget(&source.path, directory.guild).await?;
@@ -605,7 +605,12 @@ async fn clear_fence(cfg: &Config, guild: i64, generation: &str) -> Result<()> {
     }
 }
 
-async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result<()> {
+async fn copy_guild(
+    source: &Path,
+    dest: &Path,
+    core: &Path,
+    directory: &Directory,
+) -> Result<()> {
     let src = open(source).await?;
     let dest_conn = open(dest).await?;
     let guild = directory.guild;
@@ -711,6 +716,7 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
             dest_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by guild move' ELSE status_reason END WHERE guild_id=?",libsql::params![guild]).await?;
             dest_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE guild_id=? AND status!='complete' AND cursor IS NOT NULL",libsql::params![guild]).await?;
             dest_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE guild_id=? AND initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",libsql::params![guild]).await?;
+            crate::backup::release_member_sync_pacing_from_guild_store(dest, core).await?;
         }
         copy_history(&src, &dest_conn, guild).await?;
         copy_extra_sources(&src, &dest_conn, guild).await?;

@@ -189,7 +189,7 @@ pub async fn member_history(
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
-    if query.after.as_ref().is_some_and(|value| value.len() > 256) {
+    if query.after.as_ref().is_some_and(|value| value.len() > 128) {
         return Err(ApiError(anyhow::anyhow!("cursor is too long")));
     }
     let (store, scope) = app.tenant.live(enrollment).await?;

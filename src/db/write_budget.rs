@@ -126,6 +126,22 @@ impl<T: SqlExecutor> BoundedWrites for T {}
 
 /// Member-directory mutations use the same bounded admission as other guild writes.
 pub(crate) trait MemberSqlWrites: BoundedWrites {
+    fn member_execute_rows(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send,
+        rows: u64,
+    ) -> Result<usize> {
+        let head = sql.trim_start();
+        let upper = head.to_ascii_uppercase();
+        anyhow::ensure!(rows > 0, "member write row bound must be positive");
+        if upper.starts_with("INSERT") && upper.contains("SELECT") {
+            self.execute_rows(sql, params, rows)
+        } else {
+            self.member_execute(sql, params)
+        }
+    }
+
     fn member_execute(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
         let head = sql.trim_start();
         let upper = head.to_ascii_uppercase();

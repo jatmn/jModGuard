@@ -22,6 +22,8 @@ const MEMBER_PROGRESS_SCHEMA: &str =
     include_str!("../../migrations/guild/0012_member_sync_progress.sql");
 const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
     include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
+const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
+    include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -251,6 +253,9 @@ fn initialize_store(
         if version < 13 {
             tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
         }
+        if version < 14 {
+            tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -272,6 +277,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",

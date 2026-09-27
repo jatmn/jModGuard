@@ -58,7 +58,7 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0013. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0014. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).

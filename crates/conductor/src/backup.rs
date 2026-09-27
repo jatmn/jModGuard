@@ -275,6 +275,15 @@ async fn capture_inner(
         )?;
         let snapshot = scratch.join(format!("{}.sqlite", safe_name(&capture.role)));
         snapshot_sqlite(&capture.path, &snapshot).await?;
+        if capture.role != "core" {
+            if let Some(core) = cfg
+                .capture_stores
+                .iter()
+                .find(|store| store.role == "core")
+            {
+                release_member_sync_pacing_from_guild_store(&capture.path, &core.path).await?;
+            }
+        }
         ensure_record_fits(
             &writer,
             &record_name,
@@ -521,6 +530,15 @@ async fn restore_files(
             fs::copy(path, dest)?;
         } else if name == "control.json" {
             fs::copy(path, target.join("control.json"))?;
+        }
+    }
+    let core_path = target.join("core.sqlite");
+    if core_path.exists() {
+        for entry in fs::read_dir(target)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "sqlite") && path != core_path {
+                release_member_sync_pacing_from_guild_store(&path, &core_path).await?;
+            }
         }
     }
     Ok(())
@@ -866,6 +884,67 @@ pub async fn clear_restore_fence(path: &Path) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to clear restore fence")))
 }
 
+/// Release installation-wide member-sync pacing leases for bots in this guild store.
+async fn snap_table_exists(conn: &libsql::Connection, table: &str) -> Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            libsql::params![table],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+pub(crate) async fn release_member_sync_pacing_from_guild_store(
+    guild_store: &Path,
+    core_store: &Path,
+) -> Result<()> {
+    let guild_db = libsql::Builder::new_local(guild_store).build().await?;
+    let guild_conn = guild_db.connect()?;
+    let has_seed = {
+        let mut rows = guild_conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='guild_member_seed'",
+                (),
+            )
+            .await?;
+        rows.next().await?.is_some()
+    };
+    if !has_seed {
+        return Ok(());
+    }
+    let core_db = libsql::Builder::new_local(core_store).build().await?;
+    let core_conn = core_db.connect()?;
+    let has_pacing = {
+        let mut rows = core_conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_sync_pacing'",
+                (),
+            )
+            .await?;
+        rows.next().await?.is_some()
+    };
+    if !has_pacing {
+        return Ok(());
+    }
+    let mut rows = guild_conn
+        .query(
+            "SELECT DISTINCT bot_id FROM guild_member_seed WHERE bot_id > 0",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let bot_id = row.get::<i64>(0)?;
+        core_conn
+            .execute(
+                "UPDATE member_sync_pacing SET lease_owner=NULL, lease_until_ms=NULL WHERE bot_id=?",
+                libsql::params![bot_id],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
     if dest.exists() {
         fs::remove_file(dest)?;
@@ -897,20 +976,26 @@ async fn snapshot_sqlite(source: &Path, dest: &Path) -> Result<()> {
             .get::<i64>(0)?;
         snap_conn
             .execute(
-                if member_version >= 10 {
+                if member_version >= 11 {
                     "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),gap_generation=gap_generation+1,directory_revision=directory_revision+1"
                 } else {
-                    // A v9 snapshot is upgraded later. The v10 migration maps
-                    // its retained gap to generation one and fences old runs.
-                    "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000)"
+                    // v10 (0010) has guild_member_seed without gap_generation (0011).
+                    "UPDATE guild_member_seed SET reconciliation_needed=1,gap_at_ms=MAX(coalesce(gap_at_ms,0),unixepoch()*1000),directory_revision=directory_revision+1"
                 },
                 (),
             )
             .await?;
-        snap_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
-        snap_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
-        snap_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE status!='complete' AND cursor IS NOT NULL",()).await?;
-        snap_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",()).await?;
+        let has_member_sync = snap_table_exists(&snap_conn, "guild_member_sync").await?;
+        if has_member_sync {
+            snap_conn.execute("UPDATE guild_member_sync SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
+        }
+        let has_audit_recovery =
+            snap_table_exists(&snap_conn, "guild_member_audit_recovery").await?;
+        if has_audit_recovery {
+            snap_conn.execute("UPDATE guild_member_audit_recovery SET lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,status=CASE WHEN status='running' THEN 'waiting' ELSE status END,status_reason=CASE WHEN status='running' THEN 'worker claim invalidated by backup' ELSE status_reason END",()).await?;
+            snap_conn.execute("UPDATE guild_member_audit_recovery SET restart_requested_at_ms=unixepoch()*1000 WHERE status!='complete' AND cursor IS NOT NULL",()).await?;
+            snap_conn.execute("INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),unixepoch()*1000,'queued',unixepoch()*1000 FROM guild_member_seed WHERE initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1 WHERE guild_member_audit_recovery.status='complete'",()).await?;
+        }
     }
     for table in EXCLUDED_TABLES {
         let _ = snap_conn
@@ -1966,6 +2051,43 @@ mod restore_stage_tests {
 #[cfg(test)]
 mod member_snapshot_tests {
     use super::snapshot_sqlite;
+
+    #[tokio::test]
+    async fn snapshot_v10_seed_update_does_not_reference_gap_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "jmodguard-member-snapshot-v10-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("guild.db");
+        let snapshot = root.join("snapshot.db");
+        let db = libsql::Builder::new_local(&source).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE guild_member_seed(guild_id INTEGER PRIMARY KEY,enrollment_id TEXT,bot_id INTEGER,initial_completed_at_ms INTEGER,reconciliation_needed INTEGER,gap_at_ms INTEGER,directory_revision INTEGER);
+            INSERT INTO guild_member_seed VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,2000,0,NULL,7);",
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 10", ()).await.unwrap();
+        snapshot_sqlite(&source, &snapshot).await.unwrap();
+        let db = libsql::Builder::new_local(&snapshot).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let row = conn
+            .query(
+                "SELECT reconciliation_needed,directory_revision FROM guild_member_seed WHERE guild_id=10",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<i64>(1).unwrap(), 8);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn snapshot_keeps_unknown_time_observations_and_queues_audit_recovery() {

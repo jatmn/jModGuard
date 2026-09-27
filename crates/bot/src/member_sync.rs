@@ -48,7 +48,7 @@ fn due_work(
     if import {
         work.push(ReadyWork::Import);
     }
-    if status.audit_recovery_pending {
+    if status.audit_recovery_pending && !status.audit_pagination_stalled() {
         work.push(ReadyWork::AuditRecovery);
     }
     work
@@ -1116,6 +1116,8 @@ pub async fn run(
                 .await
                 {
                     Ok(page) => {
+                        let claim_for_defer = claim.clone();
+                        let scope_for_defer = scope.clone();
                         if let Err(error) = store
                             .commit_member_audit_recovery_page(
                                 scope,
@@ -1131,6 +1133,30 @@ pub async fn run(
                                 guild_id = gid,
                                 "member audit recovery page discarded: {error:#}"
                             );
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let reason = if matches!(
+                                error.downcast_ref::<db::guild_data::MemberSyncError>(),
+                                Some(db::guild_data::MemberSyncError::Stale)
+                            ) {
+                                "directory_changed"
+                            } else {
+                                "commit_failed"
+                            };
+                            if let Err(defer_error) = store
+                                .defer_member_audit_recovery(
+                                    scope_for_defer,
+                                    claim_for_defer,
+                                    reason.to_owned(),
+                                    now_ms,
+                                    now_ms,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    guild_id = gid,
+                                    "member audit recovery claim release failed: {defer_error:#}"
+                                );
+                            }
                         } else {
                             consecutive_failures = 0;
                         }
@@ -1424,5 +1450,56 @@ mod tests {
             audit_recovery_last_progress_at: None,
         };
         assert_eq!(due_work(&status, 3, 15_000), vec![ReadyWork::AuditRecovery]);
+    }
+
+    #[test]
+    fn stalled_audit_recovery_does_not_schedule_worker_claims() {
+        let status = db::guild_data::MemberSyncStatus {
+            initial_completed_at: Some(1),
+            reconciliation_needed: false,
+            reconciliation_reason: None,
+            audit_recovery_pending: true,
+            audit_recovery_status: Some("needs_attention".into()),
+            audit_recovery_reason: Some("pagination_stalled".into()),
+            audit_recovery_phase: None,
+            audit_recovery_processed: 0,
+            audit_recovery_next_attempt_at: None,
+            audit_recovery_last_progress_at: None,
+            run_id: None,
+            run_kind: None,
+            phase: None,
+            status: "complete".into(),
+            status_reason: None,
+            progress_revision: 0,
+            processed: 0,
+            member_processed: None,
+            ban_processed: None,
+            verify_processed: None,
+            audit_processed: None,
+            local_history_complete: true,
+            inserted: 0,
+            updated: 0,
+            unchanged: 0,
+            total_estimate: None,
+            total_is_estimated: false,
+            percent: None,
+            started_at: None,
+            last_progress_at: None,
+            as_of: 0,
+            next_attempt_at: None,
+            phase_remaining_seconds: None,
+            phase_finish_at: None,
+            overall_remaining_seconds: None,
+            overall_finish_at: None,
+            estimate_reason: None,
+            last_success_at: None,
+            last_success_processed: None,
+            last_success_inserted: None,
+            last_success_updated: None,
+            last_success_unchanged: None,
+            unseen_candidate_count: 0,
+        };
+        assert!(status.audit_pagination_stalled());
+        assert!(due_work(&status, 0, 15_000).is_empty());
     }
 }

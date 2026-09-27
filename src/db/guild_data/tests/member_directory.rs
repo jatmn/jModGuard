@@ -1444,6 +1444,11 @@ async fn retry_requeues_audit_pagination_stall_after_initial_complete() {
         )?;
         tx.commit()
     }).await.unwrap();
+    let stalled = store
+        .member_sync_status(scope.clone(), 42, 5_500)
+        .await
+        .unwrap();
+    assert!(!stalled.audit_recovery_pending);
     store
         .member_sync_action(
             scope.clone(),
