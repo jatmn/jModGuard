@@ -53,11 +53,29 @@ expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/upd
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
 # Core consumers need coverage, but independent packages and shell fixtures do not.
 core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
+# all_rust groups shared src/migrations skip on purpose. A new rust group must
+# join $core or this list; leaving it out of both is a silent shared-source skip.
+core_omits="runtime conductor publish-tests bootstrap"
 expect "$core" src/config.rs src/db.rs
 expect "$core" config.example.toml src/config.rs
 # Conductor tests embed migration SQL even though conductor cannot import core.
 expect "$core conductor" migrations/guild/0009_message_snapshots.sql
 expect "$core conductor" src/config.rs crates/conductor/src/install.rs
+for group in $rust; do
+  case " $core $core_omits " in
+    *" $group "*) ;;
+    *) fail "rust group $group is neither a core consumer nor an explicit omission" ;;
+  esac
+done
+for group in $core_omits; do
+  case " $rust " in
+    *" $group "*) ;;
+    *) fail "core omission $group is not in the rust plan" ;;
+  esac
+  case " $core " in
+    *" $group "*) fail "core omission $group is selected for shared source" ;;
+  esac
+done
 expect "$rust" vendor/tokio-tungstenite/src/lib.rs
 expect "$rust" Cargo.lock
 expect "$all" .buildkite/pipeline.yml
@@ -143,9 +161,39 @@ if grep -Fq "'\$\$GITHUB_TOKEN'" "$root/.buildkite/with-cargo-auth.sh"; then
   fail "with-cargo-auth must not match only the YAML-escaped placeholder"
 fi
 
-fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan | wc -l)"
+fetch_log="$(mktemp)"
+fetch_fail_count="$(BUILDKITE_PULL_REQUEST=true BUILDKITE_PULL_REQUEST_BASE_BRANCH=__no_such_branch__ bash "$selector" plan 2>"$fetch_log" | wc -l)"
 if [ "$fetch_fail_count" -ne 17 ]; then
   fail "fetch failure did not select every group (got ${fetch_fail_count})"
+fi
+grep -Fq 'select-checks: all groups: full validation requested or diff unavailable' "$fetch_log" \
+  || fail 'missing diff-unavailable reason'
+
+reason_log="$(mktemp)"
+bash "$selector" plan --files mystery.bin >/dev/null 2>"$reason_log"
+grep -Fq 'select-checks: all groups: unclassified path: mystery.bin' "$reason_log" \
+  || fail 'missing unclassified-path reason'
+bash "$selector" plan --files .buildkite/pipeline.yml >/dev/null 2>"$reason_log"
+grep -Fq 'select-checks: all groups: CI control changed: .buildkite/pipeline.yml' "$reason_log" \
+  || fail 'missing CI-control reason'
+
+git init -q --initial-branch=main "$scratch/empty"
+(
+  cd "$scratch/empty"
+  git config user.name 'Selector test'
+  git config user.email 'selector@example.invalid'
+  git commit -q --allow-empty -m base
+  git remote add origin .
+  git switch -qc empty-pr
+  git commit -q --allow-empty -m empty
+  BUILDKITE_PULL_REQUEST=123 BUILDKITE_PULL_REQUEST_BASE_BRANCH=main \
+    BUILDKITE_SOURCE=webhook BUILDKITE_TAG= JMODGUARD_PUBLISH_SOURCE= \
+    bash "$selector" plan >"$scratch/empty-plan" 2>"$scratch/empty.log"
+)
+grep -Fq 'select-checks: all groups: empty diff' "$scratch/empty.log" || fail 'missing empty-diff reason'
+empty_count="$(wc -l <"$scratch/empty-plan")"
+if [ "$empty_count" -ne 17 ]; then
+  fail "empty diff did not select every group (got ${empty_count})"
 fi
 
 echo 'select-checks-test: ok'

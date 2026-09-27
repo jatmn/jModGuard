@@ -71,6 +71,8 @@ all_rust() {
 
 # Root data is consumed by bot, API, updater and integration tests. Runtime and
 # conductor deliberately do not import it; conductor embeds migration SQL below.
+# publish-tests and bootstrap stay out too. Every all_rust group this function
+# does not add must stay listed in select-checks-test.sh core_omits.
 core_consumers() {
   local group
   for group in fmt dylint api bot updater core integration boundaries remote-database; do
