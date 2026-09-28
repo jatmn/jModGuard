@@ -178,4 +178,68 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+
+    #[test]
+    fn finish_rejects_superseded_and_foreign_claims() {
+        let path = std::env::temp_dir().join(format!(
+            "member_sync_pacing_fence_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = Db::open(&path, 2).unwrap();
+        runtime.block_on(async {
+            let first =
+                claim_member_sync_request(&db, 10, "worker-a".into(), 100_000, 15_000, 90_000)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            extend_member_sync_request_after(&db, 10, 200_000)
+                .await
+                .unwrap();
+            let second =
+                claim_member_sync_request(&db, 10, "worker-a".into(), 200_001, 15_000, 90_000)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(second.generation > first.generation);
+            assert!(!finish_member_sync_request(&db, first, 210_000).await.unwrap());
+            let foreign = MemberSyncRequestClaim {
+                bot_id: second.bot_id,
+                worker_id: "worker-b".into(),
+                generation: second.generation,
+            };
+            assert!(!finish_member_sync_request(&db, foreign, 210_000).await.unwrap());
+            let held = db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT lease_owner,lease_until_ms,generation FROM member_sync_pacing WHERE bot_id=10",
+                        params![],
+                        |row| {
+                            Ok((
+                                row.get::<String>(0)?,
+                                row.get::<i64>(1)?,
+                                row.get::<i64>(2)?,
+                            ))
+                        },
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(held.0, "worker-a");
+            assert_eq!(held.1, 200_001 + 90_000);
+            assert_eq!(held.2, second.generation);
+            assert!(
+                finish_member_sync_request(&db, second, 220_000)
+                    .await
+                    .unwrap()
+            );
+        });
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

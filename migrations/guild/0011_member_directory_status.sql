@@ -1,5 +1,6 @@
--- Compatible upgrade for persisted v9 member directories. Existing in-flight
--- reconciliation has no captured coverage generation, so it cannot clear a gap.
+-- Compatible upgrade from guild schema 10 (0010) to 11. 0010 creates the member
+-- directory; this step adds gap_generation. Existing in-flight reconciliation
+-- has no captured coverage generation, so it cannot clear a gap.
 ALTER TABLE guild_member_seed ADD COLUMN gap_generation INTEGER NOT NULL DEFAULT 0;
 UPDATE guild_member_seed SET gap_generation=1 WHERE reconciliation_needed=1;
 

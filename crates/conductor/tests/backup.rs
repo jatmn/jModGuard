@@ -226,14 +226,16 @@ async fn capture_preserves_live_member_pacing_and_restore_releases_copied_lease(
     let restored_conn = restored_db.connect().unwrap();
     let mut restored_rows = restored_conn
         .query(
-            "SELECT lease_owner,lease_until_ms FROM member_sync_pacing WHERE bot_id=42",
+            "SELECT request_after_ms,lease_owner,lease_until_ms,generation FROM member_sync_pacing WHERE bot_id=42",
             (),
         )
         .await
         .unwrap();
     let restored_row = restored_rows.next().await.unwrap().unwrap();
-    assert!(restored_row.get::<Option<String>>(0).unwrap().is_none());
-    assert!(restored_row.get::<Option<i64>>(1).unwrap().is_none());
+    assert_eq!(restored_row.get::<i64>(0).unwrap(), 500_000);
+    assert!(restored_row.get::<Option<String>>(1).unwrap().is_none());
+    assert!(restored_row.get::<Option<i64>>(2).unwrap().is_none());
+    assert_eq!(restored_row.get::<i64>(3).unwrap(), 7);
 }
 
 #[tokio::test]
