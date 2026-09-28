@@ -20,5 +20,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 tracing = "0.1"
 
 [dev-dependencies]
+libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
