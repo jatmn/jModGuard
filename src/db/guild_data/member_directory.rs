@@ -675,6 +675,9 @@ fn status(
                 let recent_progress = anchor_progress.is_some_and(|at| {
                     at <= now_ms && now_ms.saturating_sub(at) <= recent_window_ms
                 });
+                let pages_remaining = (page_size > 0).then(|| {
+                    ((total - processed).max(0) + page_size - 1) / page_size + 1
+                });
                 if out.status == "waiting" {
                     out.estimate_reason = Some(
                         match out.status_reason.as_deref() {
@@ -690,17 +693,19 @@ fn status(
                     );
                     if out.status_reason.as_deref() == Some("rate_limited")
                         && recent_progress
+                        && let Some(pages) = pages_remaining
                         && let Some(deadline) =
                             out.next_attempt_at.filter(|deadline| *deadline > now_ms)
                     {
-                        let pages = ((total - processed).max(0) + page_size - 1) / page_size + 1;
                         let finish = deadline.saturating_add(pages.saturating_mul(cycle_ms));
                         out.phase_finish_at = Some(finish);
                         out.phase_remaining_seconds =
                             Some(finish.saturating_sub(now_ms).saturating_add(999) / 1000);
                     }
-                } else if matches!(out.status.as_str(), "queued" | "running") && recent_progress {
-                    let pages = ((total - processed).max(0) + page_size - 1) / page_size + 1;
+                } else if matches!(out.status.as_str(), "queued" | "running")
+                    && recent_progress
+                    && let Some(pages) = pages_remaining
+                {
                     let anchor = anchor_progress
                         .unwrap()
                         .max(next.unwrap_or(0))
