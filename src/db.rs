@@ -27,6 +27,8 @@ use crate::types::{
 
 mod bot_actions;
 pub use bot_actions::*;
+mod member_sync_pace;
+pub use member_sync_pace::*;
 mod bootstrap;
 pub use bootstrap::*;
 mod enrollments;
@@ -65,6 +67,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0013_log_filters.sql"),
     include_str!("../migrations/0014_ban_display_identity.sql"),
     include_str!("../migrations/0015_component_updates.sql"),
+    include_str!("../migrations/0016_member_sync_pacing.sql"),
 ];
 
 /// A remote request that has not completed within this deadline is cancelled.
