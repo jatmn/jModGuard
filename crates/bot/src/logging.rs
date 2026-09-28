@@ -229,6 +229,29 @@ pub(crate) fn member_join_vars(
         ("time".into(), observed.to_rfc3339()),
     ])
 }
+
+/// A committed stay is preferred to the short-lived member cache for a leave
+/// report. Unknown imported join dates remain visibly unavailable.
+pub(crate) fn member_join_vars_ms(
+    joined_at_ms: Option<i64>,
+    observed: chrono::DateTime<chrono::Utc>,
+) -> BTreeMap<String, String> {
+    let valid = joined_at_ms
+        .filter(|joined| *joined > 0 && *joined <= observed.timestamp_millis())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
+    let (joined, duration) = match valid {
+        Some(joined) => (
+            joined.to_rfc3339(),
+            templates::format_duration((observed - joined).num_seconds().max(0) as u64),
+        ),
+        None => ("Unavailable".into(), "Unavailable".into()),
+    };
+    BTreeMap::from([
+        ("joined".into(), joined),
+        ("duration".into(), duration),
+        ("time".into(), observed.to_rfc3339()),
+    ])
+}
 type EditKey = (u64, u64, u64);
 struct EditObservation {
     edited_at_ms: Option<i64>,
@@ -1627,6 +1650,56 @@ pub(crate) async fn emit_member_event(
     )
     .await
     .1
+}
+
+/// Emits a departure after the paced member check proved the captured stay is
+/// absent. The Gateway handler has already returned, so use the saved profile
+/// and the original event time instead of requiring another Discord lookup.
+pub(crate) async fn emit_verified_member_departure(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    departure: &db::guild_data::MemberDeparture,
+    profile: Option<&db::guild_data::MemberProfile>,
+) {
+    let Some(vars) = verified_member_departure_vars(departure, profile) else {
+        return;
+    };
+    let _ = emit_to_observed_with_audit(
+        app,
+        http,
+        guild_id,
+        "member_leave",
+        vars,
+        None,
+        Admission::Immediate,
+    )
+    .await;
+}
+
+fn verified_member_departure_vars(
+    departure: &db::guild_data::MemberDeparture,
+    profile: Option<&db::guild_data::MemberProfile>,
+) -> Option<BTreeMap<String, String>> {
+    let departed_at =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(departure.departed_at_ms)?;
+    let user_id = departure.user_id as u64;
+    let id_text = user_id.to_string();
+    let username = profile
+        .and_then(|p| p.username.as_deref())
+        .unwrap_or(&id_text);
+    let display_name = profile.map(|p| p.display_name.as_str()).unwrap_or(username);
+    let mut vars = templates::user_vars(user_id, username, display_name);
+    let account_created = serenity::model::id::UserId::new(user_id).created_at();
+    let account_age_seconds =
+        (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
+    vars.insert("account_created".into(), account_created.to_string());
+    vars.insert(
+        "account_age".into(),
+        templates::format_duration(account_age_seconds),
+    );
+    vars.extend(member_join_vars_ms(departure.joined_at_ms, departed_at));
+    Some(vars)
 }
 
 fn default_template(event: &str) -> &'static str {

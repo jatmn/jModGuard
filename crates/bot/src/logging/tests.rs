@@ -1626,6 +1626,42 @@ fn leave_uses_supplied_join_time_and_explicit_missing_context() {
 }
 
 #[test]
+fn deferred_verified_leave_uses_captured_stay_and_original_event_time() {
+    let joined_at_ms = 1_790_000_000_000;
+    let departed_at_ms = joined_at_ms + 3_600_000;
+    let departure = db::guild_data::MemberDeparture {
+        user_id: 9007199254740993,
+        joined_at_ms: Some(joined_at_ms),
+        departed_at_ms,
+        completed_stay_ms: Some(3_600_000),
+    };
+    let profile = db::guild_data::MemberProfile {
+        user_id: departure.user_id.to_string(),
+        display_name: "Saved nickname".into(),
+        username: Some("saved_user".into()),
+        global_name: None,
+        nickname: Some("Saved nickname".into()),
+        is_current: false,
+        is_banned: false,
+        ever_banned: false,
+        current_ban_reason: None,
+        joined_at_ms: Some(joined_at_ms),
+        departed_at_ms: Some(departed_at_ms),
+        observed_at_ms: departed_at_ms,
+        revision: 2,
+    };
+    let vars = verified_member_departure_vars(&departure, Some(&profile)).unwrap();
+    assert_eq!(vars["user"], "Saved nickname");
+    assert_eq!(vars["username"], "saved_user");
+    assert_eq!(vars["duration"], "1 hour");
+    assert_eq!(vars["joined"], "2026-09-21T14:13:20+00:00");
+    assert_eq!(vars["time"], "2026-09-21T15:13:20+00:00");
+    let fallback = verified_member_departure_vars(&departure, None).unwrap();
+    assert_eq!(fallback["user"], departure.user_id.to_string());
+    assert_eq!(fallback["duration"], "1 hour");
+}
+
+#[test]
 fn received_message_join_context_is_scoped_consumed_expiring_and_bounded() {
     let cache = MemberJoinContext::default();
     let joined = serenity::model::Timestamp::from_unix_timestamp(1_760_000_000).unwrap();

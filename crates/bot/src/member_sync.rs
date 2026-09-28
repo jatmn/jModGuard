@@ -626,6 +626,736 @@ async fn finish_request(
 
 /// Run behind the Gateway cache so only confirmed guilds and the current bot
 /// identity are admitted. Each loop considers one guild in round-robin order.
+pub async fn run(
+    app: Arc<BotState>,
+    http: Arc<Http>,
+    cache: Arc<serenity::cache::Cache>,
+    rate_limit_until_ms: Arc<AtomicI64>,
+    sync_bot_id: Arc<AtomicI64>,
+) {
+    // A READY generation is acknowledged per enrollment only after its
+    // directory status and any required coverage gap have been recorded.
+    let mut ready_coverage = ReadyCoverage::default();
+    let mut backfilled = HashSet::<(i64, String)>::new();
+    let mut offset = 0usize;
+    let mut cleanup_offset = 0usize;
+    let worker_id = format!(
+        "{:032x}{:08x}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(1) as u128,
+        std::process::id()
+    );
+    let startup_jitter = (chrono::Utc::now().timestamp_subsec_millis() % 15) as u64;
+    let mut next_request = tokio::time::Instant::now()
+        + Duration::from_secs(
+            u64::from(app.cfg.member_sync.min_request_interval_secs) + startup_jitter,
+        );
+    let mut consecutive_failures = 0u32;
+    let mut cleanup_turn = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let bot_id = cache.current_user().id.get() as i64;
+        if bot_id <= 1 {
+            continue;
+        }
+        sync_bot_id.store(bot_id, Ordering::Relaxed);
+        let mut guilds = cache.guilds();
+        guilds.sort_unstable();
+        if guilds.is_empty() {
+            continue;
+        }
+        // A conservative initial scheduling share: every cached guild may
+        // compete for the single paced Discord request stream.
+        let initial_scheduling_share = guilds.len() as u32;
+        let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut ready = Vec::new();
+        let mut available = Vec::new();
+        for guild_id in guilds {
+            let gid = guild_id.get() as i64;
+            let Some(enrollment) = db::guild_enrollment(&app.db, gid).await.ok().flatten() else {
+                continue;
+            };
+            let Ok((store, scope)) = app.tenant.live(enrollment.clone()).await else {
+                continue;
+            };
+            member_directory::flush_pending_gaps(&app, &store, &scope).await;
+            let key = (gid, enrollment.id.clone());
+            let (newly_initialized, session_replaced) =
+                ready_coverage.pending(&key, ready_generation);
+            let status = if newly_initialized {
+                match store
+                    .initialize_member_directory(scope.clone(), bot_id, now_ms)
+                    .await
+                {
+                    Ok(status) => {
+                        if status.run_kind.as_deref() == Some("initial")
+                            && status.phase.as_deref() == Some("members")
+                            && status.status == "queued"
+                            && status.processed == 0
+                            && status.initial_completed_at.is_none()
+                            && let Some(member_count) = cache
+                                .guild(guild_id)
+                                .map(|guild| guild.member_count as i64)
+                                .filter(|count| *count > 0)
+                            && let Err(error) = store
+                                .set_initial_member_estimate(
+                                    scope.clone(),
+                                    bot_id,
+                                    db::guild_data::MemberInitialEstimate {
+                                        member_count,
+                                        page_size: app.cfg.member_sync.page_size,
+                                        pace_ms: i64::from(
+                                            app.cfg.member_sync.min_request_interval_secs,
+                                        ) * 1000,
+                                        active_guild_count: initial_scheduling_share,
+                                        now_ms,
+                                    },
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "initial member estimate unavailable: {error:#}"
+                            );
+                        }
+                        status
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member directory initialization deferred: {error:#}"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                match store
+                    .member_sync_status(scope.clone(), bot_id, now_ms)
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member directory status unavailable: {error:#}"
+                        );
+                        continue;
+                    }
+                }
+            };
+            if coverage_gap_for_session(
+                newly_initialized,
+                session_replaced,
+                status.initial_completed_at.is_some() || status.last_progress_at.is_some(),
+            ) && let Err(error) = store
+                .mark_member_reconciliation_needed(
+                    scope.clone(),
+                    "gateway continuity interrupted",
+                    now_ms,
+                )
+                .await
+            {
+                tracing::warn!(
+                    guild_id = gid,
+                    "member directory coverage gap could not be recorded: {error:#}"
+                );
+                continue;
+            }
+            ready_coverage.acknowledge(key, ready_generation);
+            let backfill_key = (gid, enrollment.id.clone());
+            if !backfilled.contains(&backfill_key) {
+                match store
+                    .backfill_member_case_index(scope.clone(), bot_id, 100)
+                    .await
+                {
+                    Ok(true) => {
+                        backfilled.insert(backfill_key);
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        guild_id = gid,
+                        "member case index backfill deferred: {error:#}"
+                    ),
+                }
+            }
+            available.push((guild_id, store.clone(), scope.clone()));
+            for work in due_work(
+                &status,
+                now_ms,
+                i64::from(app.cfg.member_sync.min_request_interval_secs) * 1000,
+            ) {
+                ready.push((guild_id, store.clone(), scope.clone(), work));
+            }
+        }
+        if tokio::time::Instant::now() < next_request {
+            continue;
+        }
+        if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
+            continue;
+        }
+        let pace = Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs));
+        if cleanup_turn || ready.is_empty() {
+            let mut cleaned = false;
+            for step in 0..available.len() {
+                let (guild_id, store, scope) =
+                    &available[(cleanup_offset + step) % available.len()];
+                let targeted = match store.next_member_target_check(scope.clone(), now_ms).await {
+                    Ok(check) => check,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = guild_id.get(),
+                            "member target check lookup failed: {error:#}"
+                        );
+                        None
+                    }
+                };
+                if let Some(check) = targeted {
+                    let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await
+                    else {
+                        cleaned = true;
+                        break;
+                    };
+                    if rate_limit_until_ms.load(Ordering::Relaxed)
+                        > chrono::Utc::now().timestamp_millis()
+                    {
+                        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                        cleaned = true;
+                        break;
+                    }
+                    cleaned = true;
+                    cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                    next_request = tokio::time::Instant::now() + pace;
+                    match fetch_target_check(&app, &http, *guild_id, &check).await {
+                        Ok(verification) => {
+                            match store
+                                .settle_member_target_check(
+                                    scope.clone(),
+                                    check.clone(),
+                                    verification,
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await
+                            {
+                                Ok(Some(departure)) => {
+                                    let profile = match store
+                                        .get_member(scope.clone(), departure.user_id)
+                                        .await
+                                    {
+                                        Ok(profile) => profile,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                guild_id = guild_id.get(),
+                                                user_id = departure.user_id,
+                                                "verified departure profile read failed; logging with user ID: {error:#}"
+                                            );
+                                            None
+                                        }
+                                    };
+                                    crate::logging::emit_verified_member_departure(
+                                        &app,
+                                        &http,
+                                        *guild_id,
+                                        &departure,
+                                        profile.as_ref(),
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        guild_id = guild_id.get(),
+                                        "member target check settlement failed: {error:#}"
+                                    );
+                                    if matches!(
+                                        error.downcast_ref::<db::guild_data::MemberSyncError>(),
+                                        Some(db::guild_data::MemberSyncError::Stale)
+                                    ) && check.reason != "ambiguous_departure"
+                                        && let Err(queue_error) = store
+                                            .refresh_stale_member_target_check(
+                                                scope.clone(),
+                                                check.clone(),
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            guild_id = guild_id.get(),
+                                            "stale target check requeue failed: {queue_error:#}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let (_, denied) = retry_reason(&error);
+                            let delay = if denied {
+                                Duration::from_secs(3600)
+                            } else {
+                                retry_delay(&app, 1)
+                            };
+                            let retry_at = chrono::Utc::now()
+                                .timestamp_millis()
+                                .saturating_add(delay.as_millis() as i64)
+                                .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                            if let Err(save_error) = store
+                                .defer_member_target_check(scope.clone(), check, retry_at)
+                                .await
+                            {
+                                tracing::warn!(
+                                    guild_id = guild_id.get(),
+                                    "member target check retry checkpoint failed: {save_error:#}"
+                                );
+                            }
+                        }
+                    }
+                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    break;
+                }
+                let pending = match store
+                    .next_member_pending_ban_verification(scope.clone(), now_ms)
+                    .await
+                {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = guild_id.get(),
+                            "pending ban verification lookup failed: {error:#}"
+                        );
+                        None
+                    }
+                };
+                if let Some(candidate) = pending {
+                    let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await
+                    else {
+                        cleaned = true;
+                        break;
+                    };
+                    if rate_limit_until_ms.load(Ordering::Relaxed)
+                        > chrono::Utc::now().timestamp_millis()
+                    {
+                        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                        cleaned = true;
+                        break;
+                    }
+                    cleaned = true;
+                    cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                    next_request = tokio::time::Instant::now() + pace;
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs)),
+                        http.get_ban(*guild_id, UserId::new(candidate.user_id as u64)),
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(ban)) => {
+                            if let Err(error) = store
+                                .settle_member_pending_ban_verification(
+                                    scope.clone(),
+                                    candidate,
+                                    ban.is_some(),
+                                    chrono::Utc::now().timestamp_millis(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    guild_id = guild_id.get(),
+                                    "pending ban verification settlement failed: {error:#}"
+                                );
+                            }
+                        }
+                        result => {
+                            let (_reason, denied) = match &result {
+                                Ok(Err(error)) => retry_reason_http(error),
+                                _ => ("discord_unavailable", false),
+                            };
+                            let delay = if denied {
+                                Duration::from_secs(3600)
+                            } else {
+                                retry_delay(&app, 1)
+                            };
+                            let retry_at = chrono::Utc::now()
+                                .timestamp_millis()
+                                .saturating_add(delay.as_millis() as i64)
+                                .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                            if let Err(error) = store
+                                .defer_member_pending_ban_verification(
+                                    scope.clone(),
+                                    candidate,
+                                    retry_at,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    guild_id = guild_id.get(),
+                                    "pending ban verification retry checkpoint failed: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    break;
+                }
+                let candidate = match store
+                    .next_member_cleanup_candidate(scope.clone(), now_ms)
+                    .await
+                {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = guild_id.get(),
+                            "member cleanup lookup failed: {error:#}"
+                        );
+                        continue;
+                    }
+                };
+                let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
+                    cleaned = true;
+                    break;
+                };
+                if rate_limit_until_ms.load(Ordering::Relaxed)
+                    > chrono::Utc::now().timestamp_millis()
+                {
+                    finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                    cleaned = true;
+                    break;
+                }
+                cleaned = true;
+                cleanup_offset = cleanup_offset.wrapping_add(step + 1);
+                next_request = tokio::time::Instant::now() + pace;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs)),
+                    http.get_ban(*guild_id, UserId::new(candidate.user_id as u64)),
+                )
+                .await;
+                match result {
+                    Ok(Ok(ban)) => {
+                        if let Err(error) = store
+                            .settle_member_cleanup(
+                                scope.clone(),
+                                candidate,
+                                ban.is_some(),
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = guild_id.get(),
+                                "member cleanup settlement failed: {error:#}"
+                            );
+                        }
+                    }
+                    result => {
+                        let (reason, denied) = match &result {
+                            Ok(Err(error)) => retry_reason_http(error),
+                            _ => ("discord_unavailable", false),
+                        };
+                        let delay = if denied {
+                            Duration::from_secs(3600)
+                        } else {
+                            retry_delay(&app, 1)
+                        };
+                        tracing::warn!(
+                            guild_id = guild_id.get(),
+                            user_id = candidate.user_id,
+                            reason,
+                            "member cleanup verification deferred"
+                        );
+                        let retry_at = chrono::Utc::now()
+                            .timestamp_millis()
+                            .saturating_add(delay.as_millis() as i64)
+                            .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                        if let Err(error) = store
+                            .defer_member_cleanup(scope.clone(), candidate, retry_at)
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = guild_id.get(),
+                                "member cleanup retry checkpoint failed: {error:#}"
+                            );
+                        }
+                    }
+                }
+                finish_request(&app, request_claim, &rate_limit_until_ms).await;
+                break;
+            }
+            cleanup_turn = false;
+            if cleaned {
+                continue;
+            }
+        }
+        if ready.is_empty() {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            continue;
+        }
+        let active_guild_count = ready.len() as u32;
+        let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
+            continue;
+        };
+        if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
+            finish_request(&app, request_claim, &rate_limit_until_ms).await;
+            continue;
+        }
+        next_request = tokio::time::Instant::now() + pace;
+        let mut attempted = false;
+        for _ in 0..ready.len() {
+            let (guild_id, store, scope, work) = ready[offset % ready.len()].clone();
+            offset = offset.wrapping_add(1);
+            let gid = guild_id.get() as i64;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if work == ReadyWork::AuditRecovery {
+                let claim = match store
+                    .claim_member_audit_recovery(
+                        scope.clone(),
+                        bot_id,
+                        worker_id.clone(),
+                        now_ms,
+                        request_lease_ms(app.cfg.member_sync.request_timeout_secs),
+                    )
+                    .await
+                {
+                    Ok(Some(claim)) => claim,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member audit recovery claim failed: {error:#}"
+                        );
+                        continue;
+                    }
+                };
+                attempted = true;
+                cleanup_turn = true;
+                next_request = tokio::time::Instant::now() + pace;
+                let timeout =
+                    Duration::from_secs(u64::from(app.cfg.member_sync.request_timeout_secs));
+                match fetch_audit_page(
+                    &http,
+                    guild_id,
+                    claim.cursor.as_deref(),
+                    claim.not_before_ms,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(page) => {
+                        let claim_for_defer = claim.clone();
+                        let scope_for_defer = scope.clone();
+                        if let Err(error) = store
+                            .commit_member_audit_recovery_page(
+                                scope,
+                                claim,
+                                page.audits,
+                                (page.next_cursor, page.terminal),
+                                chrono::Utc::now().timestamp_millis(),
+                                pace.as_millis() as i64,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member audit recovery page discarded: {error:#}"
+                            );
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let reason = if matches!(
+                                error.downcast_ref::<db::guild_data::MemberSyncError>(),
+                                Some(db::guild_data::MemberSyncError::Stale)
+                            ) {
+                                "directory_changed"
+                            } else {
+                                "commit_failed"
+                            };
+                            if let Err(defer_error) = store
+                                .defer_member_audit_recovery(
+                                    scope_for_defer,
+                                    claim_for_defer,
+                                    reason.to_owned(),
+                                    now_ms,
+                                    now_ms,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    guild_id = gid,
+                                    "member audit recovery claim release failed: {defer_error:#}"
+                                );
+                            }
+                        } else {
+                            consecutive_failures = 0;
+                        }
+                    }
+                    Err(error) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let (reason, denied) =
+                            retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
+                        let delay = if denied {
+                            Duration::from_secs(3600)
+                        } else {
+                            retry_delay(&app, consecutive_failures)
+                        };
+                        let next_ms = chrono::Utc::now()
+                            .timestamp_millis()
+                            .saturating_add(delay.max(pace).as_millis() as i64)
+                            .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                        if let Err(save_error) = store
+                            .defer_member_audit_recovery(
+                                scope,
+                                claim,
+                                reason.to_owned(),
+                                next_ms,
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member audit recovery retry checkpoint failed: {save_error:#}"
+                            );
+                        }
+                    }
+                }
+                break;
+            }
+            let claim = match store
+                .claim_member_sync(
+                    scope.clone(),
+                    bot_id,
+                    worker_id.clone(),
+                    now_ms,
+                    request_lease_ms(app.cfg.member_sync.request_timeout_secs),
+                )
+                .await
+            {
+                Ok(Some(claim)) => claim,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(guild_id = gid, "member sync claim failed: {error:#}");
+                    continue;
+                }
+            };
+            attempted = true;
+            cleanup_turn = true;
+            // Set the next local slot before HTTP so errors and cancellations
+            // cannot cause an immediate second Discord request.
+            next_request = tokio::time::Instant::now()
+                + Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs));
+            let member_estimate = cache
+                .guild(guild_id)
+                .map(|g| g.member_count as i64)
+                .filter(|n| *n > 0);
+            match fetch_page(
+                &app,
+                &http,
+                guild_id,
+                &claim,
+                member_estimate,
+                active_guild_count,
+            )
+            .await
+            {
+                Ok(page) => match store
+                    .commit_member_page(
+                        scope.clone(),
+                        claim.clone(),
+                        page,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(error) => {
+                        tracing::warn!(guild_id = gid, "member sync page discarded: {error:#}");
+                        // Every discarded page releases this claim. A stale revision
+                        // retries on the shared pace; any other commit failure backs
+                        // off instead of holding the lease until it expires.
+                        let stale = matches!(
+                            error.downcast_ref::<db::guild_data::MemberSyncError>(),
+                            Some(db::guild_data::MemberSyncError::Stale)
+                        );
+                        if !stale {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                        }
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let delay = if stale {
+                            Duration::ZERO
+                        } else {
+                            retry_delay(&app, consecutive_failures).max(Duration::from_secs(
+                                u64::from(app.cfg.member_sync.min_request_interval_secs),
+                            ))
+                        };
+                        let next_ms = now_ms
+                            .saturating_add(delay.as_millis() as i64)
+                            .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                        if let Err(defer_error) = store
+                            .defer_member_sync(
+                                scope,
+                                claim,
+                                if stale {
+                                    "directory_changed"
+                                } else {
+                                    "commit_failed"
+                                }
+                                .to_owned(),
+                                next_ms,
+                                now_ms,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member page claim release failed: {defer_error:#}"
+                            );
+                        }
+                    }
+                },
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::warn!(guild_id = gid, "member sync request failed: {error:#}");
+                    let (reason, denied) =
+                        retry_reason_with_rate_limit(&error, &rate_limit_until_ms);
+                    let delay = if denied {
+                        Duration::from_secs(3600)
+                    } else {
+                        retry_delay(&app, consecutive_failures)
+                    };
+                    let delay = delay.max(Duration::from_secs(u64::from(
+                        app.cfg.member_sync.min_request_interval_secs,
+                    )));
+                    next_request = tokio::time::Instant::now()
+                        + Duration::from_secs(u64::from(
+                            app.cfg.member_sync.min_request_interval_secs,
+                        ));
+                    let next_ms = chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_add(delay.as_millis() as i64)
+                        .max(rate_limit_until_ms.load(Ordering::Relaxed));
+                    if let Err(save_error) = store
+                        .defer_member_sync(
+                            scope,
+                            claim,
+                            reason.to_owned(),
+                            next_ms,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member sync retry checkpoint failed: {save_error:#}"
+                        );
+                    }
+                }
+            }
+            break;
+        }
+        finish_request(&app, request_claim, &rate_limit_until_ms).await;
+        if !attempted {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,6 +53,21 @@ fn record_unresolved_gateway_observation(suppressed_by_owned_action: bool) -> bo
     !suppressed_by_owned_action
 }
 
+fn departure_joined_at_ms(
+    decision: Option<&crate::db::guild_data::MemberDepartureDecision>,
+    payload_joined_at_ms: Option<i64>,
+    observed_joined_at_ms: Option<i64>,
+) -> Option<i64> {
+    match decision {
+        Some(crate::db::guild_data::MemberDepartureDecision::NeedsVerification) => None,
+        Some(crate::db::guild_data::MemberDepartureDecision::Applied(Some(departure))) => departure
+            .joined_at_ms
+            .or(payload_joined_at_ms)
+            .or(observed_joined_at_ms),
+        _ => payload_joined_at_ms.or(observed_joined_at_ms),
+    }
+}
+
 fn select_update_authors(
     event_author: Option<u64>,
     text_author: Option<u64>,
@@ -266,6 +281,12 @@ impl EventHandler for Handler {
         let uid = new_member.user.id.get();
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
+        crate::member_directory::observe_join(
+            &app,
+            &new_member,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
         logging::emit_member_event(
             &app,
             &ctx,
@@ -293,10 +314,33 @@ impl EventHandler for Handler {
             .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
         let observed_join = app.member_joins.take(guild_id.get(), user.id.get());
-        let extra = logging::member_join_vars(
-            member_data.and_then(|m| m.joined_at).or(observed_join),
-            chrono::Utc::now(),
+        let departed_at = chrono::Utc::now();
+        let expected_joined_at_ms = member_data
+            .as_ref()
+            .and_then(|member| member.joined_at)
+            .map(|joined| joined.timestamp_millis());
+        let departed = crate::member_directory::observe_departure(
+            &app,
+            guild_id.get(),
+            &user,
+            departed_at.timestamp_millis(),
+            expected_joined_at_ms,
+        )
+        .await;
+        if matches!(
+            departed,
+            Some(crate::db::guild_data::MemberDepartureDecision::NeedsVerification)
+        ) {
+            // A paced target check will either discard this stale remove or
+            // emit the leave with the saved duration once absence is proven.
+            return;
+        }
+        let joined_at_ms = departure_joined_at_ms(
+            departed.as_ref(),
+            expected_joined_at_ms,
+            observed_join.map(|joined| joined.timestamp_millis()),
         );
+        let extra = logging::member_join_vars_ms(joined_at_ms, departed_at);
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra, None).await;
     }
 
@@ -859,6 +903,12 @@ impl EventHandler for Handler {
             .text_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
         let app = Arc::clone(self.app());
+        crate::member_directory::observe_update(
+            &app,
+            &event,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
         let Some(new) = new_if_available else { return };
         let guild_id = new.guild_id;
         let old_to = old_if_available.and_then(|o| o.communication_disabled_until);
@@ -908,7 +958,10 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_case_action, record_unresolved_gateway_observation, select_update_authors};
+    use super::{
+        audit_case_action, departure_joined_at_ms, record_unresolved_gateway_observation,
+        select_update_authors,
+    };
     use crate::{db::Db, logging, state::BotState};
     use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
@@ -917,6 +970,32 @@ mod tests {
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {
         assert!(record_unresolved_gateway_observation(false));
         assert!(!record_unresolved_gateway_observation(true));
+    }
+
+    #[test]
+    fn ambiguous_departure_does_not_log_a_new_stays_duration() {
+        use crate::db::guild_data::{MemberDeparture, MemberDepartureDecision};
+        assert_eq!(
+            departure_joined_at_ms(
+                Some(&MemberDepartureDecision::NeedsVerification),
+                Some(200),
+                Some(100)
+            ),
+            None,
+        );
+        let saved = MemberDepartureDecision::Applied(Some(MemberDeparture {
+            user_id: 7,
+            joined_at_ms: Some(100),
+            departed_at_ms: 300,
+            completed_stay_ms: Some(200),
+        }));
+        // A normal seeded stay still supplies the duration when Serenity did
+        // not include the optional member payload or a recent cache entry.
+        assert_eq!(departure_joined_at_ms(Some(&saved), None, None), Some(100));
+        assert_eq!(
+            departure_joined_at_ms(Some(&saved), Some(200), None),
+            Some(100)
+        );
     }
 
     #[test]
