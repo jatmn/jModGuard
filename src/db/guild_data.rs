@@ -4,7 +4,7 @@ use super::write_budget::BoundedWrites;
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = 9;
+const VERSION: i64 = include!("../../migrations/guild/current_version.rs");
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
@@ -15,6 +15,15 @@ const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evi
 const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
 const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.sql");
 const SNAPSHOT_SCHEMA: &str = include_str!("../../migrations/guild/0009_message_snapshots.sql");
+const MEMBER_SCHEMA: &str = include_str!("../../migrations/guild/0010_member_directory.sql");
+const MEMBER_STATUS_SCHEMA: &str =
+    include_str!("../../migrations/guild/0011_member_directory_status.sql");
+const MEMBER_PROGRESS_SCHEMA: &str =
+    include_str!("../../migrations/guild/0012_member_sync_progress.sql");
+const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
+    include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
+const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
+    include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -29,6 +38,8 @@ pub use cases::*;
 mod erasure;
 mod snapshots;
 pub use snapshots::*;
+mod member_directory;
+pub use member_directory::*;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
 mod tenant_settings;
@@ -51,12 +62,6 @@ pub struct GuildDataStore {
     expected: StoreRegistration,
     /// When set, tenant mutations consult core `guild_write_fences` before writing.
     core: Option<Db>,
-}
-
-impl GuildDataStore {
-    pub fn capacity_runtime_status(&self) -> crate::db::CapacityRuntimeStatus {
-        self.db.capacity_runtime_status()
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +178,14 @@ fn verify_identity_version(
         let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_message_snapshots','guild_snapshot_health')) OR (type='index' AND name='guild_snapshot_expiry') OR (type='trigger' AND name IN ('guild_snapshot_insert','guild_snapshot_update','guild_snapshot_account_insert','guild_snapshot_account_update','guild_snapshot_account_delete','guild_membership_delete'))", (), |r| Ok(r.get(0)?))?;
         anyhow::ensure!(objects == 9, StoreCheckError::Schema);
     }
+    if wanted >= 10 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('guild_member_feature','guild_member_seed','guild_member_sync','guild_member_directory','guild_member_stays','guild_member_case_index','guild_member_pending_bans','guild_member_state_observations','guild_member_target_checks','guild_member_audit_recovery')", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 10, StoreCheckError::Schema);
+    }
+    if wanted >= 13 {
+        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_member_unresolved_audits') OR (type='index' AND name='guild_member_unresolved_audits_user') OR (type='trigger' AND name IN ('guild_member_unresolved_audit_insert','guild_member_unresolved_audit_update','guild_member_unresolved_audit_delete'))", (), |r| Ok(r.get(0)?))?;
+        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
+    }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {
         return Err(StoreCheckError::Schema.into());
@@ -211,9 +224,6 @@ fn initialize_store(
             tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
         }
         if version < 5 {
-            // Migration 0005 copies one source row for every existing case and
-            // creates two indexes. The whole source allocation is a conservative
-            // upper bound for those rows; reserve twice that plus B-tree space.
             let source_bound = crate::capacity::allocated_bytes(&tx)?
                 .saturating_mul(2)
                 .saturating_add(32_000_000);
@@ -228,7 +238,24 @@ fn initialize_store(
         if version < 8 {
             tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
         }
-        tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
+        if version < 9 {
+            tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
+        }
+        if version < 10 {
+            tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
+        }
+        if version < 11 {
+            tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
+        }
+        if version < 12 {
+            tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
+        }
+        if version < 13 {
+            tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
+        }
+        if version < 14 {
+            tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -246,8 +273,17 @@ fn initialize_store(
     tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
-    tx.execute_rows("INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)", params![FAMILY,expected.id().as_str(),owner(expected)], 1)?;
+    tx.execute_rows(
+        "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
+        params![FAMILY, expected.id().as_str(), owner(expected)],
+        1,
+    )?;
     tx.pragma_update(None, "user_version", VERSION)?;
     // The receipt table did not exist at transaction start. Verify the complete
     // identity/schema marker on primary if initialization's COMMIT response is lost.
@@ -264,11 +300,16 @@ fn initialize_store(
 }
 
 impl GuildDataStore {
+    pub fn capacity_runtime_status(&self) -> crate::db::CapacityRuntimeStatus {
+        self.db.capacity_runtime_status()
+    }
+
     /// Whole-store usage, measured on the store primary with identity verification.
     pub async fn measure_usage(&self, details: bool) -> Result<crate::db::usage::DatabaseUsage> {
         crate::db::usage::measure_database_usage(&self.db, details, Some(self.expected.clone()))
             .await
     }
+
     /// Initialize only an empty store, or reopen this exact recognized identity.
     /// Synchronous like Db::open_with; callers must use a startup/blocking worker.
     pub fn initialize(options: GuildStoreOptions, expected: StoreRegistration) -> Result<Self> {

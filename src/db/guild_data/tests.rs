@@ -82,7 +82,11 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         .unwrap();
     store.db.with_conn(|c| {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
-        assert_eq!(count, 13, "store contains identity, bindings, receipts, membership, log routing, selected cases and evidence, tenant settings, transient snapshots and health");
+        assert_eq!(
+            count,
+            24,
+            "store contains tenant tables, transient snapshots, and member-directory tables"
+        );
         Ok(())
     }).await.unwrap();
     assert!(
