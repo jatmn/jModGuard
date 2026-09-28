@@ -299,7 +299,7 @@ authorize live provider calls or require a Codex skill to contribute.
 
 ## Version pins (verified)
 
-- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source, then runs one workspace `cargo check --all-targets` under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
+- Dylint **6.1.0** — `dylint.toml` pins selected `examples/general` lints at tag `v6.1.0`. `scripts/dylint.sh` installs matching `cargo-dylint` and `dylint-link` from source, then runs `cargo check --all-targets` for the affected packages selected by Buildkite (the full workspace for local preflight and global changes) under **nightly-2026-08-20** (the lint libraries' toolchain at that tag). Clippy, `cargo test`, and image builds still use **1.96.0** from `rust-toolchain.toml`.
 - Rust **1.96.0** — `rust-toolchain.toml`, the Buildkite agents, and
   `Dockerfile.{bot,api,conductor}` (`rust:1.96-bookworm` linux/amd64 digest)
   must stay aligned. `Cargo.toml` `rust-version = "1.96"`. Do not float the agent toolchain on `stable`. CI and image publishing use

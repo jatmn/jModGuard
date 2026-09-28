@@ -85,16 +85,17 @@ impl GuildDataStore {
             }
             if let Some(existing) = source_match(&tx, &scope, &key)? {
                 anyhow::ensure!(existing.id == id, CaseError::Conflict);
-                if audit_entry_id.is_some() && !parent.removed {
+                let staged_entry = audit_entry_id.filter(|_| staged.is_some());
+                let repair_retention = audit_entry_id.is_some() && !parent.removed &&
+                    super::member_directory::confirmed_ban_history_needs_retention(&tx, &scope, &key)?;
+                if staged_entry.is_some() || repair_retention {
                     tx.ensure_mutation_receipt()?;
-                    super::member_directory::retain_confirmed_ban_history(&tx, &scope, &key)?;
-                    if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
+                    if repair_retention {
+                        super::member_directory::retain_confirmed_ban_history(&tx, &scope, &key)?;
+                    }
+                    if let Some(entry_id) = staged_entry {
                         tx.execute_rows("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id], 1)?;
                     }
-                    tx.commit()?;
-                } else if let Some(entry_id)=audit_entry_id.filter(|_|staged.is_some()) {
-                    tx.ensure_mutation_receipt()?;
-                    tx.execute_rows("DELETE FROM guild_member_unresolved_audits WHERE guild_id=?1 AND enrollment_id=?2 AND entry_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),entry_id], 1)?;
                     tx.commit()?;
                 } else {tx.finish_read()?;}
                 return Ok(LinkCaseSource::Existing(existing));

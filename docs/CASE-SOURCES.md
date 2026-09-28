@@ -26,8 +26,11 @@ The [member directory](MEMBERS.md) indexes canonical cases by subject for its
 timeline. Bounded audit recovery uses stable Discord audit IDs as replay keys;
 current-ban snapshots alone do not create dated action cases. Neither a subject
 ID nor a nearby timestamp is sufficient to merge distinct ban/unban actions.
-There is no unbounded alias list. An identical association returns `Existing` without writes;
-a new association returns `Linked`. A source already owned by a different case, an occupied
+There is no unbounded alias list. An identical association returns `Existing` without
+rewriting its source or case facts. It makes no write when member retention is already
+complete and no staged audit needs clearing; a confirmed ban or unban with missing retention
+is repaired in that transaction.
+A new association returns `Linked`. A source already owned by a different case, an occupied
 source kind, a missing/wrong anchor or a conflicting target ID fails. No source is reassigned.
 Two independently recorded cases remain separate and produce a conflict; this slice does
 not silently merge their original facts or histories.

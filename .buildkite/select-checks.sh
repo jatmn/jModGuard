@@ -14,6 +14,7 @@ Usage: bash .buildkite/select-checks.sh plan [--files PATH]...
 plan prints one selected step group per line. upload rewrites
 .buildkite/pipeline.steps.yml with if: true or if: false and, on a
 Buildkite agent, uploads that pipeline. A missing diff selects every group.
+Selection reasons go to stderr; stdout remains the plan or generated YAML.
 EOF
 }
 
@@ -43,6 +44,7 @@ groups=(
 )
 selected=""
 full=0
+dylint_full=0
 
 add() {
   case " ${selected} " in
@@ -52,7 +54,9 @@ add() {
 }
 
 all_groups() {
+  echo "select-checks: all groups: $*" >&2
   full=1
+  dylint_full=1
   selected=""
   local group
   for group in "${groups[@]}"; do
@@ -61,8 +65,20 @@ all_groups() {
 }
 
 all_rust() {
+  dylint_full=1
   local group
   for group in fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
+    add "$group"
+  done
+}
+
+# Root data is consumed by bot, API, updater and integration tests. Runtime and
+# conductor deliberately do not import it; conductor embeds migration SQL below.
+# publish-tests and bootstrap stay out too. Every all_rust group this function
+# does not add must stay listed in select-checks-test.sh core_omits.
+core_consumers() {
+  local group
+  for group in fmt dylint api bot updater core integration boundaries remote-database; do
     add "$group"
   done
 }
@@ -88,7 +104,7 @@ classify() {
   local top="${path%%/*}"
   case "$path" in
     .buildkite/pipeline.yml|.buildkite/pipeline.steps.yml|.buildkite/select-checks.sh|.buildkite/select-checks-test.sh|.buildkite/with-cargo-auth.sh|scripts/ci-preflight.sh)
-      all_groups
+      all_groups "CI control changed: $path"
       return
       ;;
     .buildkite/publish-image.sh|.buildkite/publish-image-test.sh)
@@ -96,7 +112,7 @@ classify() {
       return
       ;;
     .buildkite/*)
-      all_groups
+      all_groups "CI control changed: $path"
       return
       ;;
     Cargo.lock|rust-toolchain.toml|deny.toml|Cargo.toml)
@@ -104,6 +120,7 @@ classify() {
       return
       ;;
     dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh)
+      dylint_full=1
       add dylint
       return
       ;;
@@ -186,8 +203,15 @@ classify() {
       ;;
   esac
   case "$top" in
-    vendor|src|migrations)
+    vendor)
       all_rust
+      ;;
+    src)
+      core_consumers
+      ;;
+    migrations)
+      core_consumers
+      add conductor
       ;;
     frontend)
       # Default API embed-ui compiles these files with include_str!.
@@ -207,13 +231,13 @@ classify() {
         runtime) add fmt; add dylint; add runtime; add boundaries; runtime_consumers ;;
         updater) add fmt; add dylint; add updater; updater_consumers ;;
         integration-tests) add fmt; add dylint; add integration ;;
-        *) all_groups ;;
+        *) all_groups "unclassified path: $path" ;;
       esac
       ;;
     *)
       case "$path" in
-        *.md|LICENSE|AGENTS.md|README.md|development.md) add contracts ;;
-        *) all_groups ;;
+        *.md|LICENSE|AGENTS.md|README.md|development.md|config.example.toml) add contracts ;;
+        *) all_groups "unclassified path: $path" ;;
       esac
       ;;
   esac
@@ -221,15 +245,18 @@ classify() {
 
 prove_diff() {
   if [ "${#files[@]}" -gt 0 ]; then
+    echo "select-checks: explicit file list" >&2
     printf '%s\n' "${files[@]}"
     return 0
   fi
   if [ "${BUILDKITE_SOURCE:-}" = "schedule" ] || [ -n "${BUILDKITE_TAG:-}" ] || [ -n "${JMODGUARD_PUBLISH_SOURCE:-}" ]; then
+    echo "select-checks: scheduled, tag, or manual publication build" >&2
     return 1
   fi
   if [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; then
     local base="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
     git fetch --no-tags origin "$base" || return 1
+    echo "select-checks: PR diff origin/${base}...HEAD" >&2
     git diff --name-only "origin/${base}...HEAD" || return 1
     return 0
   fi
@@ -245,25 +272,28 @@ prove_diff() {
     case "$before" in
       0000000000000000000000000000000000000000) return 1 ;;
     esac
+    echo "select-checks: branch diff $before..$after" >&2
     git diff --name-only "$before" "$after" || return 1
     return 0
   fi
   if [ "${BUILDKITE_SOURCE:-}" = "webhook" ] \
       && [ "$branch" = "main" ] \
       && [ -z "${BUILDKITE_TAG:-}" ]; then
+    echo "select-checks: main push range unavailable" >&2
     return 1
   fi
   if ! git rev-parse --verify --quiet "${after}^1" >/dev/null; then
     return 1
   fi
+  echo "select-checks: first-parent diff ${after}^1..${after}" >&2
   git diff --name-only "${after}^1" "$after"
 }
 
 add contracts
 if ! names="$(prove_diff)"; then
-  all_groups
+  all_groups "full validation requested or diff unavailable"
 elif [ -z "${names}" ]; then
-  all_groups
+  all_groups "empty diff"
 else
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -282,6 +312,7 @@ ensure_supply_chain() {
   done
 }
 ensure_supply_chain
+echo "select-checks: selected:${selected}" >&2
 
 if [ "$mode" = "plan" ]; then
   for group in "${groups[@]}"; do
@@ -292,15 +323,47 @@ if [ "$mode" = "plan" ]; then
   exit 0
 fi
 
+# Reuse the selected check targets; Cargo also compiles their dependencies.
+# Remote DB has both integration-test binaries and one root-library test.
+# Empty scope means the full workspace for global/tooling/fallback plans.
+dylint_packages=""
+if [ "$dylint_full" -eq 0 ]; then
+  lint_targets="$selected"
+  # API unit tests call bot code. Runtime consumers have binary/unit-test
+  # targets that compiling them only as dependencies would not check.
+  case " $selected " in *" bot "*) lint_targets="$lint_targets api" ;; esac
+  case " $selected " in *" runtime "*) lint_targets="$lint_targets api bot updater" ;; esac
+  for group in api bot conductor runtime updater core integration; do
+    wanted=0
+    case " ${lint_targets} " in *" $group "*) wanted=1 ;; esac
+    case "$group" in
+      core|integration)
+        case " ${selected} " in *" remote-database "*) wanted=1 ;; esac ;;
+    esac
+    if [ "$wanted" -eq 1 ]; then
+      package="jmodguard-${group}"
+      case "$group" in
+        core) package=jmodguard ;;
+        integration) package=jmodguard-integration-tests ;;
+      esac
+      dylint_packages="${dylint_packages:+$dylint_packages }$package"
+    fi
+  done
+fi
+
 steps="$root/.buildkite/pipeline.steps.yml"
 generated="$(mktemp)"
-awk -v selected=" ${selected} " '
+awk -v selected=" ${selected} " -v lint_packages="$dylint_packages" '
   /^  # group: / { group = $3; next }
   {
     line = $0
     if (line ~ /if: __SELECTED__/) {
       if (index(selected, " " group " ") > 0) print "    if: \"true\""
       else print "    if: \"false\""
+      if (group == "dylint") {
+        print "    env:"
+        print "      JMODGUARD_DYLINT_PACKAGES: \"" lint_packages "\""
+      }
       next
     }
     print line

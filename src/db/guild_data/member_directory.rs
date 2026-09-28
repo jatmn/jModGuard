@@ -1357,7 +1357,7 @@ fn settle_verified_state(
                 conn.member_execute("UPDATE guild_member_stays SET ended_unknown=1 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay])?;
             }
             if prior.is_some() {
-                conn.member_execute("UPDATE guild_member_directory SET is_current=0,current_stay_id=NULL,departed_at_ms=CASE WHEN is_current=1 THEN NULL ELSE departed_at_ms END,cleanup_after_ms=CASE WHEN ever_banned=1 THEN NULL WHEN is_current=1 THEN MAX(coalesce(cleanup_after_ms,0),?4) ELSE cleanup_after_ms END,cleanup_member_checked_at_ms=?5,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),v.user_id,now_ms.saturating_add(300_000),now_ms])?;
+                conn.member_execute("UPDATE guild_member_directory SET is_current=0,current_stay_id=CASE WHEN is_current=0 AND ever_banned=1 THEN current_stay_id ELSE NULL END,departed_at_ms=CASE WHEN is_current=1 THEN NULL ELSE departed_at_ms END,cleanup_after_ms=CASE WHEN ever_banned=1 THEN NULL WHEN is_current=1 THEN MAX(coalesce(cleanup_after_ms,0),?4) ELSE cleanup_after_ms END,cleanup_member_checked_at_ms=?5,revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),v.user_id,now_ms.saturating_add(300_000),now_ms])?;
                 if prior.is_some_and(|(current, _)| current) {
                     conn.member_execute("INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(?1,?2,?3,?4,'member_absent',?5)",params![scope.guild_id(),scope.enrollment.id.as_str(),random_id(),v.user_id,now_ms])?;
                 }
@@ -1378,6 +1378,18 @@ fn settle_verified_state(
     Ok(())
 }
 
+pub(super) fn confirmed_ban_history_needs_retention(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    source_key: &str,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM guild_case_sources s JOIN guild_cases c USING(guild_id,enrollment_id,case_id) LEFT JOIN guild_member_directory d ON d.guild_id=s.guild_id AND d.enrollment_id=s.enrollment_id AND d.user_id=CAST(json_extract(c.payload,'$.subject_id') AS INTEGER) WHERE s.guild_id=?1 AND s.enrollment_id=?2 AND s.source_key=?3 AND c.deleted=0 AND json_valid(c.payload) AND json_extract(c.payload,'$.outcome')='succeeded' AND json_extract(c.payload,'$.action') IN ('ban','unban') AND CAST(json_extract(c.payload,'$.subject_id') AS INTEGER)>0 AND CAST(json_extract(c.payload,'$.occurred_at_ms') AS INTEGER)>0 AND (d.user_id IS NULL OR d.ever_banned=0 OR d.cleanup_after_ms IS NOT NULL))",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), source_key],
+        |r| Ok(r.get(0)?),
+    )
+}
+
 pub(super) fn retain_confirmed_ban_history(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
@@ -1394,7 +1406,7 @@ pub(super) fn retain_confirmed_ban_history(
     if user_id <= 0 || occurred_at_ms <= 0 {
         return Ok(());
     }
-    conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1", params![scope.guild_id(), scope.enrollment.id.as_str(), user_id, occurred_at_ms])?;
+    conn.member_execute("INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,ever_banned,observed_at_ms) VALUES(?1,?2,?3,1,?4) ON CONFLICT(guild_id,enrollment_id,user_id) DO UPDATE SET ever_banned=1,cleanup_after_ms=NULL,revision=revision+1 WHERE guild_member_directory.ever_banned=0 OR guild_member_directory.cleanup_after_ms IS NOT NULL", params![scope.guild_id(), scope.enrollment.id.as_str(), user_id, occurred_at_ms])?;
     Ok(())
 }
 

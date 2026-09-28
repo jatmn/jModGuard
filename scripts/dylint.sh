@@ -39,6 +39,22 @@ if [ "${#library_tags[@]}" -gt 1 ]; then
   done
 fi
 
+# The selector supplies known workspace packages for an affected-only CI job.
+# Direct/local invocations and global changes default to the full workspace.
+package_args=(--workspace)
+if [ -n "${JMODGUARD_DYLINT_PACKAGES:-}" ]; then
+  package_args=()
+  read -r -a packages <<<"$JMODGUARD_DYLINT_PACKAGES"
+  for package in "${packages[@]}"; do
+    case "$package" in
+      jmodguard|jmodguard-api|jmodguard-bot|jmodguard-conductor|jmodguard-runtime|jmodguard-updater|jmodguard-integration-tests)
+        package_args+=(-p "$package") ;;
+      *) echo "dylint: unknown package scope: $package" >&2; exit 2 ;;
+    esac
+  done
+  [ "${#package_args[@]}" -gt 0 ] || { echo 'dylint: empty package scope' >&2; exit 2; }
+fi
+
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-dylint}"
 
 # Buildkite runs many cargo steps in parallel on one agent. Give dylint its own
@@ -107,7 +123,7 @@ fi
 # either flag followed by an overriding `-A warnings` or `-D deprecated`.
 dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
 
-echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace"
+echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
 env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
   TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
-  cargo dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace
+  cargo dylint --all --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"

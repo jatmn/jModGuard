@@ -381,7 +381,7 @@ test('Members keeps polling audit-only recovery while visible and stops when it 
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
-test('Members polls acknowledged Resume until its receipt and newer status agree', async () => {
+test('Members follows a succeeded Resume receipt with a fresh primary status read', async () => {
   const guildId = '987654321098765432';
   const action = { id: 'sync-action-1', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
   const statuses = [
@@ -409,10 +409,8 @@ test('Members polls acknowledged Resume until its receipt and newer status agree
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
   action.state = 'succeeded';
   await runMemberPoll(h);
-  assert.equal(statusReads, 3);
-  assert.doesNotMatch(textOf(panel), /Resume requested/);
-  await runMemberPoll(h);
   assert.equal(statusReads, 4);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
@@ -442,6 +440,30 @@ test('Members clears a Pause that lands after the import already completed', asy
   await runMemberPoll(h);
   assert.doesNotMatch(textOf(panel), /Pause requested/);
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members releases a reused successful Retry after reading current status', async () => {
+  const guildId = '987654321098765432';
+  const session = new Map();
+  const receipt = { id: 'earlier-retry', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'succeeded' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(receipt);
+    if (url.endsWith('/member-sync')) return response({ status: 'waiting', phase: 'members', run_id: 'initial-1', progress_revision: 8 });
+    if (url.endsWith('/actions')) return response([receipt]);
+    return response({ members: [], next_cursor: null });
+  }, new Map(), session);
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const key = `${h.app.workspaceKey()}:action:POST:/api/guilds/${guildId}/member-sync/actions:{"operation":"retry"}`;
+  session.set(key, JSON.stringify({ request_id: '1000_previous', enrollment_id: 'member-enrollment' }));
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert(retry && !retry.disabled);
+  await retry.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Retry requested/);
+  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry').disabled, false);
 });
 
 test('Members stops pending-control polling when the bot action fails', async () => {

@@ -2205,17 +2205,6 @@ function tabMembers() {
   const memberSyncRetryEnabled = (sync) =>
     ["needs_attention", "waiting"].includes(sync?.status) ||
     (sync?.status === "complete" && auditPaginationStalled(sync));
-  const actionApplied = (sync, pending) => {
-    if (!sync) return false;
-    if (pending.state !== "succeeded") return false;
-    // Pause queued while the import was still active can land after completion.
-    // That store no-op does not bump progress_revision or change status.
-    if (pending.operation === "pause" && sync.status === "complete") return true;
-    if (Number(sync.progress_revision ?? 0) <= pending.revision) return false;
-    if (pending.operation === "pause") return sync.status === "paused";
-    if (pending.operation === "reconcile") return sync.run_kind === "reconcile" && sync.run_id !== pending.runId;
-    return ["queued", "running", "waiting", "complete"].includes(sync.status);
-  };
   const schedulePoll = () => {
     clearTimer();
     if (!aliveHere() || document.visibilityState !== "visible") return;
@@ -2328,14 +2317,11 @@ function tabMembers() {
         controls.append(el("button", { class: "btn small", text: label, disabled, onclick: async () => {
           if (!latestStatus?.run_id) return;
           if (operation === "reconcile" && !confirm("Request a full current-member and current-ban reconciliation from Discord? This can take a while.")) return;
-          const beforeRevision = latestStatusRevision;
-          const beforeRunId = latestStatus?.run_id;
           const job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", { operation });
           if (!aliveHere()) return;
           syncActionOutcome = null;
           if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
-            pendingSyncAction = { id: job.id, operation, state: job.state, revision: beforeRevision, runId: beforeRunId };
-            if (actionApplied(latestStatus, pendingSyncAction)) pendingSyncAction = null;
+            pendingSyncAction = { id: job.id, operation, state: job.state };
           } else {
             syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
           }
@@ -2349,6 +2335,9 @@ function tabMembers() {
     syncCard.replaceChildren(...parts);
   };
   const loadStatus = async () => {
+    // A succeeded receipt is durable before this primary status read starts.
+    // Its effect (or a later state) must therefore be visible in the result.
+    const succeededId = pendingSyncAction?.state === "succeeded" ? pendingSyncAction.id : null;
     const request = ++statusRequest;
     statusAbort?.abort();
     statusAbort = new AbortController();
@@ -2361,7 +2350,7 @@ function tabMembers() {
         pendingSyncAction = null;
       }
       statusRetryNeeded = false;
-      if (pendingSyncAction && actionApplied(sync, pendingSyncAction)) pendingSyncAction = null;
+      if (succeededId && pendingSyncAction?.id === succeededId) pendingSyncAction = null;
       latestStatus = sync;
       latestStatusRevision = revision;
       latestStatusReceivedAt = Date.now();
@@ -2378,7 +2367,11 @@ function tabMembers() {
             pendingSyncAction = null;
           } else if (job) {
             pendingSyncAction.state = job.state;
-            if (actionApplied(sync, pendingSyncAction)) pendingSyncAction = null;
+            if (job.state === "succeeded") {
+              // This status was read before the receipt. Read again in causal order.
+              loadStatus();
+              return;
+            }
           }
           renderStatus(sync);
           schedulePoll();

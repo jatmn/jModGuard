@@ -1268,6 +1268,29 @@ async fn verified_absence_has_unknown_event_time_and_gap_cleanup_is_targeted() {
         .await
         .unwrap();
     assert!(ended);
+    let departed = store
+        .depart_member_checked(scope.clone(), 12, 2_200, None)
+        .await
+        .unwrap();
+    let MemberDepartureDecision::Applied(Some(departed)) = departed else {
+        panic!("a later matching remove should close the pending stay");
+    };
+    assert_eq!(departed.user_id, 12);
+    assert_eq!(departed.joined_at_ms, Some(500));
+    assert_eq!(departed.departed_at_ms, 2_200);
+    assert_eq!(departed.completed_stay_ms, Some(1_700));
+    let stay: (Option<i64>, bool) = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT departed_at_ms,ended_unknown FROM guild_member_stays WHERE guild_id=10 AND user_id=12",
+                (),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(stay, (Some(2_200), false));
     store.observe_ban(scope.clone(), 13, 2_200).await.unwrap();
     store
         .queue_member_target_check(
@@ -4330,6 +4353,17 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
         .await
         .unwrap()
         .unwrap();
+    let revision_before: i64 = reopened
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT revision FROM guild_member_directory WHERE guild_id=10 AND user_id=77",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
     reopened
         .commit_member_audit_recovery_page(
             scope.clone(),
@@ -4341,6 +4375,21 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
         )
         .await
         .unwrap();
+    let revision_after: i64 = reopened
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT revision FROM guild_member_directory WHERE guild_id=10 AND user_id=77",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        revision_after, revision_before,
+        "replayed audit should not rewrite an already retained profile"
+    );
     assert_eq!(
         reopened
             .member_history(scope.clone(), 77, None, 50)
