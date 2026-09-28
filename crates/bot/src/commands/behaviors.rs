@@ -29,6 +29,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .guild(env.guild_id)
                 .and_then(|g| g.members.get(&target).cloned());
             refuse_fenced_discord_mutation(env).await?;
+            let pending_ban = crate::member_directory::begin_ban_attempt(
+                env.app,
+                env.guild_id.get(),
+                target.get(),
+            )
+            .await?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 env.guild_id.get(),
@@ -57,6 +63,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::db::guild_data::CaseEvidence::Unavailable,
             )
             .await;
+            pending_ban.finish(env.app, outcome.clone()).await;
             match outcome {
                 crate::db::guild_data::CaseOutcome::Succeeded => {
                     db::record_enrolled_ban_with_identity(
