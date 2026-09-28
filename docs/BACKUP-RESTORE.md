@@ -26,7 +26,14 @@ encrypted archives when `JMODGUARD_CONDUCTOR_BACKUP_ROOT` is set. See
   downloads wrap the same payload with an export password that is never stored.
 - Capture snapshots each configured local SQLite store with `VACUUM INTO`, then
   drops `bot_actions`, `mutation_receipts` and `nickname_reconcile` so restore
-  cannot replay Discord. The distinct live evidence root is copied recursively
+  cannot replay Discord. When a guild snapshot contains `guild_member_seed`,
+  that copy (not the live store) is marked for member reconciliation, in-flight
+  member-sync and audit-recovery claims in the copy are invalidated, and a
+  completed audit recovery is requeued. Core `member_sync_pacing` deadlines and
+  generations stay in the archive. Restore then clears every copied pacing
+  lease on the restored core (`lease_owner` and `lease_until_ms` only), including
+  when enrollment removal deleted the guild seeds those bots came from. The
+  distinct live evidence root is copied recursively
   with relative paths preserved. Evidence for departed enrollments, cases and
   object keys listed in `backup_cleanup_intents` is omitted at capture time.
   SQLite snapshots are still full until a queued `backup_sanitize` job rewrites

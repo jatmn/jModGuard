@@ -523,15 +523,11 @@ async fn restore_files(
             fs::copy(path, target.join("control.json"))?;
         }
     }
-    let core_path = target.join("core.sqlite");
-    if core_path.exists() {
-        for entry in fs::read_dir(target)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == "sqlite") && path != core_path {
-                release_member_sync_pacing_from_guild_store(&path, &core_path).await?;
-            }
-        }
-    }
+    // Copied core leases are installation-wide. Clear them on the restored core
+    // itself. Do not derive the set from surviving guild seeds: enrollment
+    // removal already deleted those rows, and a seed-scoped update would
+    // republish the archived lease.
+    release_copied_member_sync_leases(&target.join("core.sqlite")).await?;
     Ok(())
 }
 
@@ -875,7 +871,6 @@ pub async fn clear_restore_fence(path: &Path) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to clear restore fence")))
 }
 
-/// Release installation-wide member-sync pacing leases for bots in this guild store.
 async fn snap_table_exists(conn: &libsql::Connection, table: &str) -> Result<bool> {
     let mut rows = conn
         .query(
@@ -886,53 +881,23 @@ async fn snap_table_exists(conn: &libsql::Connection, table: &str) -> Result<boo
     Ok(rows.next().await?.is_some())
 }
 
-pub(crate) async fn release_member_sync_pacing_from_guild_store(
-    guild_store: &Path,
-    core_store: &Path,
-) -> Result<()> {
-    let guild_db = libsql::Builder::new_local(guild_store).build().await?;
-    let guild_conn = guild_db.connect()?;
-    let has_seed = {
-        let mut rows = guild_conn
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='guild_member_seed'",
-                (),
-            )
-            .await?;
-        rows.next().await?.is_some()
-    };
-    if !has_seed {
+/// Drop every copied pacing lease on a restored core. Deadlines and generations
+/// stay so a later claim still honors the captured request budget.
+async fn release_copied_member_sync_leases(core_store: &Path) -> Result<()> {
+    if !core_store.exists() {
         return Ok(());
     }
     let core_db = libsql::Builder::new_local(core_store).build().await?;
     let core_conn = core_db.connect()?;
-    let has_pacing = {
-        let mut rows = core_conn
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='member_sync_pacing'",
-                (),
-            )
-            .await?;
-        rows.next().await?.is_some()
-    };
-    if !has_pacing {
+    if !snap_table_exists(&core_conn, "member_sync_pacing").await? {
         return Ok(());
     }
-    let mut rows = guild_conn
-        .query(
-            "SELECT DISTINCT bot_id FROM guild_member_seed WHERE bot_id > 0",
+    core_conn
+        .execute(
+            "UPDATE member_sync_pacing SET lease_owner=NULL, lease_until_ms=NULL",
             (),
         )
         .await?;
-    while let Some(row) = rows.next().await? {
-        let bot_id = row.get::<i64>(0)?;
-        core_conn
-            .execute(
-                "UPDATE member_sync_pacing SET lease_owner=NULL, lease_until_ms=NULL WHERE bot_id=?",
-                libsql::params![bot_id],
-            )
-            .await?;
-    }
     Ok(())
 }
 
