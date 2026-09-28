@@ -227,13 +227,13 @@ test('blocked browser storage does not block navigation or restoration', () => {
   assert.equal(app.state.guildId, app.state.guilds[0].id);
 });
 
-test('saved Members tab falls back to the dashboard after history removal', () => {
+test('saved Members tab restores for the selected guild', () => {
   const { app, storage } = harness();
   const guildId = app.state.guilds[1].id;
   storage.set(app.workspaceKey(), JSON.stringify({ guildId, tab: 'members' }));
   app.restoreWorkspace();
   assert.equal(app.state.guildId, guildId);
-  assert.equal(app.state.tab, 'dashboard');
+  assert.equal(app.state.tab, 'members');
 });
 
 test('dropdown option arrays become real nodes and boolean false stays false', () => {
