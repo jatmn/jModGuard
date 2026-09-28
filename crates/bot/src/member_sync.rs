@@ -13,7 +13,7 @@ use serenity::{
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -39,6 +39,25 @@ fn coverage_gap_for_session(
     had_progress: bool,
 ) -> bool {
     had_progress && (newly_initialized || session_replaced)
+}
+
+#[derive(Default)]
+struct ReadyCoverage {
+    acknowledged: HashMap<(i64, String), u64>,
+}
+
+impl ReadyCoverage {
+    fn pending(&self, key: &(i64, String), generation: u64) -> (bool, bool) {
+        let previous = self.acknowledged.get(key).copied();
+        (
+            previous.is_none(),
+            previous.is_some_and(|value| value != generation),
+        )
+    }
+
+    fn acknowledge(&mut self, key: (i64, String), generation: u64) {
+        self.acknowledged.insert(key, generation);
+    }
 }
 
 fn due_work(
@@ -614,8 +633,9 @@ pub async fn run(
     rate_limit_until_ms: Arc<AtomicI64>,
     sync_bot_id: Arc<AtomicI64>,
 ) {
-    let mut initialized = HashSet::<(i64, String)>::new();
-    let mut seen_ready = app.gateway_ready_generation.load(Ordering::Relaxed);
+    // A READY generation is acknowledged per enrollment only after its
+    // directory status and any required coverage gap have been recorded.
+    let mut ready_coverage = ReadyCoverage::default();
     let mut backfilled = HashSet::<(i64, String)>::new();
     let mut offset = 0usize;
     let mut cleanup_offset = 0usize;
@@ -647,8 +667,6 @@ pub async fn run(
         // compete for the single paced Discord request stream.
         let initial_scheduling_share = guilds.len() as u32;
         let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
-        let session_replaced = ready_generation != seen_ready;
-        seen_ready = ready_generation;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut ready = Vec::new();
         let mut available = Vec::new();
@@ -662,7 +680,8 @@ pub async fn run(
             };
             member_directory::flush_pending_gaps(&app, &store, &scope).await;
             let key = (gid, enrollment.id.clone());
-            let newly_initialized = initialized.insert(key);
+            let (newly_initialized, session_replaced) =
+                ready_coverage.pending(&key, ready_generation);
             let status = if newly_initialized {
                 match store
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
@@ -702,7 +721,6 @@ pub async fn run(
                         status
                     }
                     Err(error) => {
-                        initialized.remove(&(gid, enrollment.id));
                         tracing::warn!(
                             guild_id = gid,
                             "member directory initialization deferred: {error:#}"
@@ -737,13 +755,13 @@ pub async fn run(
                 )
                 .await
             {
-                initialized.remove(&(gid, enrollment.id.clone()));
                 tracing::warn!(
                     guild_id = gid,
                     "member directory coverage gap could not be recorded: {error:#}"
                 );
                 continue;
             }
+            ready_coverage.acknowledge(key, ready_generation);
             let backfill_key = (gid, enrollment.id.clone());
             if !backfilled.contains(&backfill_key) {
                 match store
@@ -1411,6 +1429,30 @@ mod tests {
         assert!(coverage_gap_for_session(false, true, true));
         assert!(!coverage_gap_for_session(false, true, false));
         assert!(!coverage_gap_for_session(true, true, false));
+    }
+
+    #[test]
+    fn failed_guild_read_keeps_replaced_ready_pending_for_that_enrollment() {
+        let mut coverage = ReadyCoverage::default();
+        let first = (10, "first".to_owned());
+        let second = (11, "second".to_owned());
+        assert_eq!(coverage.pending(&first, 1), (true, false));
+        coverage.acknowledge(first.clone(), 1);
+        coverage.acknowledge(second.clone(), 1);
+
+        assert_eq!(coverage.pending(&first, 2), (false, true));
+        // A failed enrollment/status read must leave this generation pending.
+        assert_eq!(coverage.pending(&first, 2), (false, true));
+        coverage.acknowledge(second.clone(), 2);
+        assert_eq!(coverage.pending(&second, 2), (false, false));
+        assert_eq!(coverage.pending(&first, 2), (false, true));
+
+        coverage.acknowledge(first.clone(), 2);
+        assert_eq!(coverage.pending(&first, 2), (false, false));
+        assert_eq!(
+            coverage.pending(&(10, "new-enrollment".to_owned()), 2),
+            (true, false)
+        );
     }
 
     #[test]

@@ -73,6 +73,19 @@ async fn drain_nickname_reconciles(
     }
 }
 
+// Serenity invokes rate-limit callbacks synchronously before it waits for the
+// provider deadline. Commit the shared request gate before that wait can be
+// cancelled or the process can shut down.
+fn persist_member_sync_rate_limit(db: &db::Db, bot_id: i64, deadline_ms: i64) -> Result<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(db::extend_member_sync_request_after(
+            db,
+            bot_id,
+            deadline_ms,
+        ))
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = BotProcessConfig::load()?;
@@ -166,20 +179,16 @@ async fn main() -> Result<()> {
                 let deadline = chrono::Utc::now()
                     .timestamp_millis()
                     .saturating_add(info.timeout.as_millis().min(i64::MAX as u128) as i64);
-                if deadline > until.fetch_max(deadline, Ordering::Relaxed) {
-                    let bot_id = bot_id.load(Ordering::Relaxed);
-                    if bot_id > 0 {
-                        let db = pace_db.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                db::extend_member_sync_request_after(&db, bot_id, deadline).await
-                            {
-                                tracing::warn!(
-                                    "failed to persist Discord retry deadline: {error:#}"
-                                );
-                            }
-                        });
-                    }
+                until.fetch_max(deadline, Ordering::Relaxed);
+                let bot_id = bot_id.load(Ordering::Relaxed);
+                if bot_id > 0
+                    && let Err(error) = persist_member_sync_rate_limit(
+                        &pace_db,
+                        bot_id,
+                        until.load(Ordering::Relaxed),
+                    )
+                {
+                    tracing::warn!("failed to persist Discord retry deadline: {error:#}");
                 }
             }
         }));
@@ -468,4 +477,56 @@ async fn main() -> Result<()> {
     }
     tracing::info!("bot process stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn callback_deadline_is_committed_before_request_can_be_cancelled() {
+        let path = std::env::temp_dir().join(format!(
+            "bot_member_sync_rate_limit_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = db::Db::open(&path, 2).unwrap();
+        db::claim_member_sync_request(&db, 42, "first".into(), 100_000, 15_000, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        persist_member_sync_rate_limit(&db, 42, 250_000).unwrap();
+        drop(db);
+
+        let reopened = db::Db::open(&path, 2).unwrap();
+        assert!(
+            db::claim_member_sync_request(
+                &reopened,
+                42,
+                "after-restart".into(),
+                190_001,
+                15_000,
+                90_000,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            db::claim_member_sync_request(
+                &reopened,
+                42,
+                "after-restart".into(),
+                250_000,
+                15_000,
+                90_000,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

@@ -1638,6 +1638,77 @@ async fn control_status_failure_rolls_back_instead_of_reporting_committed_failur
 }
 
 #[tokio::test]
+async fn retry_accepts_expired_running_lease_and_fences_old_worker() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let old_claim = store
+        .claim_member_sync(scope.clone(), 42, "old-worker".into(), 1_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        store
+            .member_sync_status(scope.clone(), 42, 91_000)
+            .await
+            .unwrap()
+            .status,
+        "running"
+    );
+    let error = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Retry,
+            "active-lease".into(),
+            91_000,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::Invalid)
+    ));
+
+    let expired = store
+        .member_sync_status(scope.clone(), 42, 91_001)
+        .await
+        .unwrap();
+    assert_eq!(expired.status, "waiting");
+    assert!(expired.allows_member_sync_retry());
+    let retried = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Retry,
+            "expired-lease".into(),
+            91_001,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.status, "queued");
+
+    let error = store
+        .defer_member_sync(scope.clone(), old_claim, "transient".into(), 92_000, 91_001)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::Stale)
+    ));
+    assert!(
+        store
+            .claim_member_sync(scope, 42, "new-worker".into(), 91_001, 90_000)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion() {
     let (_f, store, scope) = ready().await;
     store

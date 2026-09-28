@@ -2485,11 +2485,11 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;let completed=ensure_seed_bot(&tx,&scope,bot_id)?.ok_or(MemberSyncError::Stale)?;
-            let current=tx.query_row("SELECT run_kind,status,last_operation_key FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?))).optional()?;
-            let Some((kind,state,last_key))=current else {return Err(MemberSyncError::MissingJob.into())};
+            let current=tx.query_row("SELECT run_kind,status,last_operation_key,lease_until_ms FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<String>>(2)?,r.get::<Option<i64>>(3)?))).optional()?;
+            let Some((kind,state,last_key,lease_until))=current else {return Err(MemberSyncError::MissingJob.into())};
             let audit_stalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled')",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok(r.get(0)?))?;
             if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state=="complete") || (action==MemberSyncAction::Retry && state=="complete" && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_read()?;let out=status(&read,&scope,bot_id,now_ms)?;read.finish_read()?;return Ok(out)}
-            let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>matches!(state.as_str(),"needs_attention"|"waiting")||(state=="complete"&&audit_stalled),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
+            let allowed=match action {MemberSyncAction::Pause=>matches!(state.as_str(),"queued"|"running"|"waiting"),MemberSyncAction::Resume=>state=="paused",MemberSyncAction::Retry=>matches!(state.as_str(),"needs_attention"|"waiting")||(state=="running"&&lease_until.is_some_and(|until|until<now_ms))||(state=="complete"&&audit_stalled),MemberSyncAction::Reconcile=>completed.is_some()&&state=="complete"};
             anyhow::ensure!(allowed,MemberSyncError::Invalid);
             tx.ensure_mutation_receipt()?;
             match action {
