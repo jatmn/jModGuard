@@ -33,6 +33,11 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 
 Administrative policy (`[actions]`) is shared by bot/API; scheduling (`[action_worker]`)
 is bot-only. See [all action defaults and environment overrides](BOT-ACTIONS.md#runtime-controls).
+Bot-only `[member_sync]` config sets `page_size = 100` (allowed 1–500),
+`min_request_interval_secs = 15` (minimum 15), `request_timeout_secs = 30`,
+`retry_base_secs = 30`, and `retry_max_secs = 3600`. The corresponding
+`JMODGUARD_MEMBER_SYNC_*` environment values override TOML. The single paced
+worker shares its request budget across guilds; see [MEMBERS.md](MEMBERS.md).
 
 Environment-only (not in `config.toml`):
 
@@ -45,7 +50,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0014_ban_display_identity.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0016_member_sync_pacing.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it

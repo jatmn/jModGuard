@@ -5,8 +5,10 @@ snapshot keeps the latest observed text and attachment metadata for eligible hum
 messages in guilds with an edit, delete or bulk-delete log destination. It expires
 at most 24 hours after the original message creation; edits never extend that time.
 Capacity pressure can evict it earlier. It stores no attachment bytes and is omitted
-from application backups. Joining, leaving and talking still do not maintain a
-persistent member/user roster or activity counters.
+from application backups. The bounded [member directory](MEMBERS.md) retains current
+member identity and known join dates, plus people with confirmed ban history. It does
+not maintain message activity counters or the retired general user archive.
+Joining, leaving and talking still do not maintain a general activity archive.
 
 ## Basic reports
 
@@ -49,7 +51,8 @@ persistent member/user roster or activity counters.
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
   ambiguous timeout is never resent. The transcript is not archived.
-- Join/leave reports use the delivered user and optional cached member join timestamp.
+- Join/leave reports use the delivered user, saved actual member join timestamp
+  when known from the member directory, and optional cached member join timestamp.
   Leave reports also use join timestamps already supplied with recent messages when
   the member cache is missing that user. This fallback retains only guild/user IDs
   and join timestamps in memory (at most 4096 entries, usable for one hour after
@@ -151,7 +154,8 @@ ban lookup above can save moderator and reason on a retained ban row, but it doe
 not establish a durable Discord audit source for a selected case. Truthful
 partial-action outcomes and selected evidence capture remain work.
 
-The Members view/endpoint and message-retention UI/API field are removed. Guild stats
+The retired general message-retention UI/API field remains removed. The bounded
+Members view is described in [MEMBERS.md](MEMBERS.md). Guild stats
 report identified moderation counts only. Counts include moderation events and live
 warn/timeout/kick/ban automod records, excluding dry runs. New moderation-plan summaries
 carry a `moderation: true` classification flag, which does not assert step success. Older

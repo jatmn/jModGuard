@@ -58,7 +58,7 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0009. Version1 introduced
+The separate `jmodguard-guild-1` family uses migrations 0001–0014. Version1 introduced
 an immutable singleton identity (family, store ID, shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
@@ -71,14 +71,22 @@ Version8 allows closed-scope erasure after owned data is gone and stores delegat
 case-removal role IDs. Version9 adds bounded, latest-observed message snapshots with
 fixed 24-hour expiry and store-level capture health. Departure erasure deletes
 those rows in transactions of at most 100 and removes membership only after
-they are gone. There are no core
+they are gone. Version10 adds the bounded member directory, stays, case projection,
+sync state and immutable initial-seed completion ([MEMBERS.md](MEMBERS.md)).
+Version11 adds member-state observations, durable targeted checks and bounded audit
+recovery. Version12 adds nullable committed counts by import phase and a measured
+member-page interval; old aggregate counts do not invent historical phase counts.
+Version13 preserves exact, dated bot-executor audit actions while their local case
+source association remains unresolved; a later exact source link consumes the staged
+action without creating a duplicate case. Version14 lets case-retention updates
+preserve in-flight member import pages. There are no core
 configuration/default/enrollment tables or general event archives. Core bootstrap
-never applies this schema; the existing core version is 13.
+never applies this schema; the existing core version is 16.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching version1–8 store to version9, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version9 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version14, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current version14 schema, identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 
@@ -113,9 +121,11 @@ tables belong to separate guild-store databases. The directory/global-policy dat
 case/evidence records or credentials are copied into these tables; historical guild data
 and membership are unchanged. This is not the final tenant schema or removal/purge mechanism.
 
-Start matching bot/API binaries with bot migration first. Version9 binaries reject version10;
+Start matching bot/API binaries with bot migration first. Version10 and version11 binaries reject version12;
 rollback needs the pre-upgrade database and matching binaries. No backup automation, live
-Bunny validation, resource measurement or distributed consistency certification is supplied.
+Bunny validation or distributed consistency certification is supplied. The local
+SQLite [member-directory sizing fixtures](MEMBERS.md#storage-sizing) estimate
+stored bytes only.
 Local tests cover separate schema rejection, identity replacement after open, conflicting
 revisions and receipt-free binding retries, as well as fresh/recognized-core startup,
 persistence, no automatic placement, shared/dedicated isolation, conflicting/concurrent requests, receipt-free retries and SQL

@@ -35,7 +35,8 @@ hot-reload and automatic shared-service restarts are not claimed.
    queued-action receipts still expire on their existing `expires_at`; they are
    not held `pending` merely because the guild is fenced.
 4. **Copy** binds the destination with a new placement revision and copies this
-   guild's membership, log mappings, cases, extra sources, history and live
+   guild's membership, member directory and immutable initial-seed completion,
+   log mappings, cases, extra sources, history and live
    evidence. Global defaults and credentials are not copied. Pending Discord
    action tables stay in core and are not replayed.
 5. **Verify** checks copied membership/case/log/history counts.

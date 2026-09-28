@@ -108,6 +108,11 @@ Never put a database URL or token in these files.
 `http://localhost:8080` → **Login with Discord** → pick a server. Only servers
 where your account has **Manage Server** permission are shown, so one WebUI
 instance manages all your servers.
+The **Members** tab searches saved member IDs and names without a browser-side
+Discord roster request. It shows current status, known join dates, linked
+moderation cases and the [durable import state](MEMBERS.md). All its reads
+require the loaded page's enrollment token. A read-only preview can inspect
+the directory but cannot request Pause, Resume, Retry or Reconcile.
 
 ## Workspace and saved changes
 
