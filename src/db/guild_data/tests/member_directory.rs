@@ -2807,6 +2807,201 @@ async fn known_rate_limit_has_retry_deadline_and_recent_anchored_finish() {
 }
 
 #[tokio::test]
+async fn stalled_initial_import_checks_departures_then_preserves_stays_until_history_is_ready() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for user_id in [85, 86] {
+        store
+            .observe_member(scope.clone(), observed(user_id, Some(500), 1_000))
+            .await
+            .unwrap();
+        store
+            .depart_member(scope.clone(), user_id, 1_100)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 301_101)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (user_id, checked_at) in [(85, 301_102), (86, 301_104)] {
+        let check = store
+            .next_member_target_check(scope.clone(), checked_at - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            check.user_id, user_id,
+            "a checked row cannot starve the next departure"
+        );
+        assert_eq!(check.reason, "cleanup_before_initial_coverage");
+        store
+            .settle_member_target_check(
+                scope.clone(),
+                check.clone(),
+                MemberVerification {
+                    user_id,
+                    revision: check.revision,
+                    kind: MemberVerifyKind::Member,
+                    present: false,
+                    member: None,
+                    ban: None,
+                },
+                checked_at,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .next_member_cleanup_candidate(scope.clone(), checked_at + 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let saved = store.get_member(scope.clone(), 85).await.unwrap().unwrap();
+    assert_eq!(saved.joined_at_ms, Some(500));
+    assert!(
+        store
+            .settle_member_cleanup(
+                scope.clone(),
+                MemberCleanupCandidate {
+                    user_id: 85,
+                    revision: saved.revision,
+                },
+                false,
+                301_106,
+            )
+            .await
+            .is_err(),
+        "a stale candidate cannot bypass the initial-history gate"
+    );
+
+    let members = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 301_106, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            members,
+            page(MemberSyncPhase::Members, None, true),
+            301_107,
+        )
+        .await
+        .unwrap();
+    let bans = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 316_107, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            bans,
+            page(MemberSyncPhase::Bans, None, true),
+            316_108,
+        )
+        .await
+        .unwrap();
+    let ban_audit = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 331_108, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ban_page = page(MemberSyncPhase::Audit, None, true);
+    ban_page.audits = vec![MemberAuditSnapshot {
+        entry_id: 101,
+        user_id: 85,
+        executor_id: Some(42),
+        action: MemberAuditAction::Ban,
+        occurred_at_ms: 100,
+        reason: None,
+    }];
+    store
+        .commit_member_page(scope.clone(), ban_audit, ban_page, 331_109)
+        .await
+        .unwrap();
+    let unban_audit = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 346_109, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut unban_page = page(MemberSyncPhase::Audit, Some("unban:".into()), true);
+    unban_page.audits = vec![MemberAuditSnapshot {
+        entry_id: 102,
+        user_id: 85,
+        executor_id: Some(42),
+        action: MemberAuditAction::Unban,
+        occurred_at_ms: 200,
+        reason: None,
+    }];
+    let waiting = store
+        .commit_member_page(scope.clone(), unban_audit, unban_page, 346_110)
+        .await
+        .unwrap();
+    assert_eq!(waiting.status, "waiting");
+    assert!(
+        waiting.initial_completed_at.is_none(),
+        "local case backfill is pending"
+    );
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 346_111)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    let completed = store
+        .member_sync_status(scope.clone(), 42, 346_112)
+        .await
+        .unwrap();
+    assert!(completed.initial_completed_at.is_some());
+    assert_eq!(completed.status, "complete");
+    let retained = store.get_member(scope.clone(), 85).await.unwrap().unwrap();
+    assert!(retained.ever_banned);
+    assert!(!retained.is_banned);
+    assert_eq!(retained.joined_at_ms, Some(500));
+    let history = store
+        .member_history(scope.clone(), 85, None, 50)
+        .await
+        .unwrap();
+    assert!(history.entries.iter().any(|entry| entry.kind == "ban"));
+    assert!(history.entries.iter().any(|entry| entry.kind == "unban"));
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 346_112)
+            .await
+            .unwrap()
+            .is_some_and(|candidate| candidate.user_id == 86)
+    );
+    let ordinary = store
+        .next_member_cleanup_candidate(scope.clone(), 346_112)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .settle_member_cleanup(scope.clone(), ordinary, false, 346_113)
+        .await
+        .unwrap();
+    assert!(store.get_member(scope.clone(), 86).await.unwrap().is_none());
+    assert!(store.get_member(scope.clone(), 85).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn undated_ban_snapshot_adds_one_state_observation_without_action_case() {
     let (_f, store, scope) = ready().await;
     store
@@ -2897,6 +3092,783 @@ async fn undated_ban_snapshot_adds_one_state_observation_without_action_case() {
             .len(),
         1
     );
+}
+
+async fn finish_empty_reconcile(store: &GuildDataStore, scope: &GuildDataScope, start: i64) {
+    for (index, phase) in [
+        MemberSyncPhase::Members,
+        MemberSyncPhase::Bans,
+        MemberSyncPhase::Verify,
+        MemberSyncPhase::Audit,
+        MemberSyncPhase::Audit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = start + index as i64 * 15_001;
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), now, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.phase, phase);
+        store
+            .commit_member_page(
+                scope.clone(),
+                claim.clone(),
+                page(phase, claim.cursor.clone(), true),
+                now + 1,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn newer_gap_survives_reconcile_final_and_last_summary_survives_next_run() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .backfill_member_case_index(scope.clone(), 42, 100)
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .await
+        .unwrap();
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Reconcile,
+            "first-reconcile".into(),
+            3_001,
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 3_001, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Members, None, true),
+            3_002,
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 18_002, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Bans, None, true),
+            18_003,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "newer_gap", 18_004)
+        .await
+        .unwrap();
+    for (index, phase) in [
+        MemberSyncPhase::Verify,
+        MemberSyncPhase::Audit,
+        MemberSyncPhase::Audit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = 33_004 + index as i64 * 15_001;
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), now, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit_member_page(
+                scope.clone(),
+                claim.clone(),
+                page(phase, claim.cursor.clone(), true),
+                now + 1,
+            )
+            .await
+            .unwrap();
+    }
+    let completed = store
+        .member_sync_status(scope.clone(), 42, 63_007)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, "complete");
+    assert!(completed.reconciliation_needed);
+    assert_eq!(
+        completed.reconciliation_reason.as_deref(),
+        Some("newer_gap")
+    );
+    assert_eq!(completed.last_success_at, Some(63_007));
+    assert_eq!(completed.last_success_processed, Some(completed.processed));
+    let old_summary = (
+        completed.last_success_at,
+        completed.last_success_processed,
+        completed.last_success_inserted,
+        completed.last_success_updated,
+        completed.last_success_unchanged,
+    );
+    let next = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Reconcile,
+            "second-reconcile".into(),
+            80_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.processed, 0);
+    assert_eq!(
+        (
+            next.last_success_at,
+            next.last_success_processed,
+            next.last_success_inserted,
+            next.last_success_updated,
+            next.last_success_unchanged
+        ),
+        old_summary
+    );
+    finish_empty_reconcile(&store, &scope, 80_000).await;
+    assert!(
+        !store
+            .member_sync_status(scope.clone(), 42, 140_005)
+            .await
+            .unwrap()
+            .reconciliation_needed
+    );
+}
+
+#[tokio::test]
+async fn delayed_case_backfill_finishes_run_but_cannot_clear_newer_gap() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .await
+        .unwrap();
+    store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            MemberSyncAction::Reconcile,
+            "backfill-reconcile".into(),
+            3_001,
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 3_001, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Members, None, true),
+            3_002,
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 18_002, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Bans, None, true),
+            18_003,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), "newer_gap", 18_004)
+        .await
+        .unwrap();
+    for (index, phase) in [
+        MemberSyncPhase::Verify,
+        MemberSyncPhase::Audit,
+        MemberSyncPhase::Audit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = 33_004 + index as i64 * 15_001;
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), now, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit_member_page(
+                scope.clone(),
+                claim.clone(),
+                page(phase, claim.cursor.clone(), true),
+                now + 1,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .member_sync_status(scope.clone(), 42, 63_007)
+            .await
+            .unwrap()
+            .status,
+        "waiting"
+    );
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    let done = store
+        .member_sync_status(scope.clone(), 42, 63_008)
+        .await
+        .unwrap();
+    assert_eq!(done.status, "complete");
+    assert!(done.reconciliation_needed);
+    assert!(done.last_success_at.is_some());
+    assert_eq!(done.last_success_processed, Some(done.processed));
+}
+
+#[tokio::test]
+async fn version_nine_upgrade_preserves_completion_and_unknown_time_history() {
+    use crate::db_compat::Connection;
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 10).await;
+    let raw = Connection::open(&f.store_path).unwrap();
+    for schema in [
+        SCHEMA,
+        TENANT_SCHEMA,
+        CASE_SCHEMA,
+        HISTORY_SCHEMA,
+        SOURCE_SCHEMA,
+        EVIDENCE_SCHEMA,
+        BUNNY_SCHEMA,
+        ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
+        MEMBER_SCHEMA,
+    ] {
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
+    }
+    raw.execute_bounded(
+        "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
+        params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_bounded(
+        "INSERT INTO guild_bindings VALUES(10,?1)",
+        params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+        UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
+        INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,reconciliation_needed,gap_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1,2100);
+        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,inserted,updated,unchanged,started_at_ms,last_success_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1,1,1,1000,2000);
+        INSERT INTO guild_member_state_observations(guild_id,enrollment_id,observation_id,user_id,kind,observed_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd',87,'ban_absent',1500);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 10).unwrap();
+    drop(raw);
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    let scope = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    let status = store
+        .member_sync_status(scope.clone(), 42, 3_000)
+        .await
+        .unwrap();
+    assert_eq!(status.initial_completed_at, Some(2_000));
+    assert!(status.reconciliation_needed);
+    assert_eq!(
+        (
+            status.last_success_processed,
+            status.last_success_inserted,
+            status.last_success_updated,
+            status.last_success_unchanged
+        ),
+        (Some(3), Some(1), Some(1), Some(1))
+    );
+    let history = store
+        .member_history(scope.clone(), 87, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(history.entries[0].kind, "ban_absent_state_observation");
+    assert_eq!(history.entries[0].occurred_at_ms, None);
+    let version: i64 = store
+        .db
+        .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
+        .await
+        .unwrap();
+    assert_eq!(version, VERSION);
+}
+
+#[tokio::test]
+async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_unknown() {
+    use crate::db_compat::Connection;
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 10).await;
+    let raw = Connection::open(&f.store_path).unwrap();
+    for schema in [
+        SCHEMA,
+        TENANT_SCHEMA,
+        CASE_SCHEMA,
+        HISTORY_SCHEMA,
+        SOURCE_SCHEMA,
+        EVIDENCE_SCHEMA,
+        BUNNY_SCHEMA,
+        ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
+        MEMBER_SCHEMA,
+        MEMBER_STATUS_SCHEMA,
+    ] {
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
+    }
+    raw.execute_bounded(
+        "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
+        params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_bounded(
+        "INSERT INTO guild_bindings VALUES(10,?1)",
+        params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+        UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
+        INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,case_backfill_done) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1);
+        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,processed,inserted,updated,unchanged,started_at_ms,last_success_at_ms) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','initial','complete','complete',3,1,1,1,1000,2000);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 11).unwrap();
+    drop(raw);
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    let scope = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    let status = store.member_sync_status(scope, 42, 3_000).await.unwrap();
+    assert_eq!(
+        status.run_id.as_deref(),
+        Some("cccccccccccccccccccccccccccccccc")
+    );
+    assert_eq!(status.last_success_at, Some(2_000));
+    assert_eq!(status.ban_processed, None);
+    assert_eq!(status.verify_processed, None);
+    assert_eq!(status.audit_processed, None);
+    assert!(status.local_history_complete);
+    let version: i64 = store
+        .db
+        .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
+        .await
+        .unwrap();
+    assert_eq!(version, VERSION);
+}
+
+#[tokio::test]
+async fn failed_historical_ban_does_not_hide_confirmed_undated_ban_state() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .record_case(
+            scope.clone(),
+            CaseId::new(),
+            CaseData {
+                source: CaseSource::Application {
+                    operation_id: CaseId::new(),
+                },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Failed,
+                subject_id: 88,
+                actor_id: Some(42),
+                occurred_at_ms: 900,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 1_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_member_page(
+            scope.clone(),
+            claim,
+            page(MemberSyncPhase::Members, None, true),
+            1_001,
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 16_001, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bans = page(MemberSyncPhase::Bans, None, true);
+    bans.bans = vec![MemberBanSnapshot {
+        user_id: 88,
+        username: None,
+        global_name: None,
+        reason: None,
+    }];
+    store
+        .commit_member_page(scope.clone(), claim, bans, 16_002)
+        .await
+        .unwrap();
+    let history = store
+        .member_history(scope.clone(), 88, None, 50)
+        .await
+        .unwrap();
+    assert!(
+        history
+            .entries
+            .iter()
+            .any(|e| e.kind == "ban" && e.outcome.as_deref() == Some("failed"))
+    );
+    assert!(
+        history
+            .entries
+            .iter()
+            .any(|e| e.kind == "ban_present_state_observation"
+                && e.occurred_at_ms.is_none()
+                && e.observed_at_ms == Some(16_002)
+                && e.case_id.is_none())
+    );
+    assert!(
+        store
+            .get_member(scope.clone(), 88)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_banned
+    );
+}
+
+#[tokio::test]
+async fn admitted_missing_sync_job_rejects_controls_without_reseeding() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.member_execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    for (index, action) in [
+        MemberSyncAction::Pause,
+        MemberSyncAction::Resume,
+        MemberSyncAction::Retry,
+        MemberSyncAction::Reconcile,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = store
+            .member_sync_action(
+                scope.clone(),
+                42,
+                action,
+                format!("missing-{index}"),
+                1_100 + index as i64,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<MemberSyncError>(),
+            Some(MemberSyncError::MissingJob)
+        ));
+    }
+    assert_eq!(
+        store
+            .member_sync_status(scope.clone(), 42, 1_200)
+            .await
+            .unwrap()
+            .status,
+        "needs_attention"
+    );
+    assert_eq!(
+        store
+            .initialize_member_directory(scope.clone(), 42, 1_300)
+            .await
+            .unwrap()
+            .status,
+        "needs_attention"
+    );
+}
+
+#[tokio::test]
+async fn equal_millisecond_opposite_ban_events_need_persisted_target_check() {
+    let (f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store.observe_ban(scope.clone(), 89, 2_000).await.unwrap();
+    store.observe_unban(scope.clone(), 89, 2_000).await.unwrap();
+    assert!(
+        store
+            .get_member(scope.clone(), 89)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_banned
+    );
+    let reopened = GuildDataStore::open(f.options(), store.expected.clone()).unwrap();
+    let check = reopened
+        .next_member_target_check(scope.clone(), 2_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.kind, MemberVerifyKind::Ban);
+    assert_eq!(check.reason, "ban_order_uncertain");
+    reopened
+        .settle_member_target_check(
+            scope.clone(),
+            check.clone(),
+            MemberVerification {
+                user_id: 89,
+                revision: check.revision,
+                kind: MemberVerifyKind::Ban,
+                present: false,
+                member: None,
+                ban: None,
+            },
+            2_100,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !reopened
+            .get_member(scope.clone(), 89)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_banned
+    );
+    reopened
+        .observe_unban(scope.clone(), 90, 3_000)
+        .await
+        .unwrap();
+    reopened
+        .observe_ban(scope.clone(), 90, 3_000)
+        .await
+        .unwrap();
+    let check = reopened
+        .next_member_target_check(scope.clone(), 3_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.reason, "ban_order_uncertain");
+    reopened
+        .settle_member_target_check(
+            scope.clone(),
+            check.clone(),
+            MemberVerification {
+                user_id: 90,
+                revision: check.revision,
+                kind: MemberVerifyKind::Ban,
+                present: true,
+                member: None,
+                ban: Some(MemberBanSnapshot {
+                    user_id: 90,
+                    username: None,
+                    global_name: None,
+                    reason: None,
+                }),
+            },
+            3_100,
+        )
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .get_member(scope.clone(), 90)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_banned
+    );
+    for (user_id, first_id, second_id) in [(89, 189, 190), (90, 191, 192)] {
+        for (entry_id, action) in [(first_id, CaseAction::Ban), (second_id, CaseAction::Unban)] {
+            reopened
+                .record_case(
+                    scope.clone(),
+                    CaseId::new(),
+                    CaseData {
+                        source: CaseSource::DiscordAudit { entry_id },
+                        action,
+                        outcome: CaseOutcome::Succeeded,
+                        subject_id: user_id,
+                        actor_id: Some(42),
+                        occurred_at_ms: if user_id == 89 { 2_000 } else { 3_000 },
+                        reason: None,
+                        evidence: CaseEvidence::Unavailable,
+                    },
+                    CaseLimits::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let history = reopened
+            .member_history(scope.clone(), user_id, None, 50)
+            .await
+            .unwrap();
+        let cases: Vec<_> = history
+            .entries
+            .iter()
+            .filter(|entry| entry.case_id.is_some())
+            .collect();
+        assert_eq!(
+            cases.len(),
+            2,
+            "opposite equal-time actions keep distinct cases"
+        );
+        assert!(cases.iter().any(|entry| entry.kind == "ban"));
+        assert!(cases.iter().any(|entry| entry.kind == "unban"));
+        assert_ne!(cases[0].case_id, cases[1].case_id);
+    }
+}
+
+#[tokio::test]
+async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
+    use crate::db_compat::Connection;
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 10).await;
+    let raw = Connection::open(&f.store_path).unwrap();
+    for schema in [
+        SCHEMA,
+        TENANT_SCHEMA,
+        CASE_SCHEMA,
+        HISTORY_SCHEMA,
+        SOURCE_SCHEMA,
+        EVIDENCE_SCHEMA,
+        BUNNY_SCHEMA,
+        ERASURE_SCHEMA,
+        SNAPSHOT_SCHEMA,
+        MEMBER_SCHEMA,
+        MEMBER_STATUS_SCHEMA,
+        MEMBER_PROGRESS_SCHEMA,
+    ] {
+        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
+            .unwrap();
+    }
+    raw.execute_bounded(
+        "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
+        params![FAMILY, reg.id().as_str()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_bounded(
+        "INSERT INTO guild_bindings VALUES(10,?1)",
+        params![placement.revision()],
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+        UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10;
+        INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,initial_completed_at_ms,case_backfill_done) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,1000,2000,1);
+        INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,cursor,started_at_ms,member_processed,ban_processed,verify_processed,audit_processed) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',42,'cccccccccccccccccccccccccccccccc','reconcile','members','queued','123',2100,7,2,1,3);",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 12).unwrap();
+    drop(raw);
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    let scope = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    let status = store
+        .initialize_member_directory(scope.clone(), 42, 3_000)
+        .await
+        .unwrap();
+    assert_eq!(status.initial_completed_at, Some(2_000));
+    assert_eq!(
+        status.run_id.as_deref(),
+        Some("cccccccccccccccccccccccccccccccc")
+    );
+    assert_eq!(status.member_processed, Some(7));
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), 3_000, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.cursor.as_deref(), Some("123"));
+    let version: i64 = store
+        .db
+        .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?)))
+        .await
+        .unwrap();
+    assert_eq!(version, VERSION);
+    let unresolved_table: i64 = store
+        .db
+        .with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_member_unresolved_audits'", (), |r| Ok(r.get(0)?)))
+        .await
+        .unwrap();
+    assert_eq!(unresolved_table, 1);
 }
 
 async fn departed_member(store: &GuildDataStore, scope: &GuildDataScope, user_id: i64) {
