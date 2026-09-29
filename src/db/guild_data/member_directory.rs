@@ -64,6 +64,8 @@ pub struct MemberTargetCheck {
     /// -1 denotes that no directory row existed when the check was queued.
     pub revision: i64,
     pub reason: String,
+    /// Queue time for most reasons. For `ambiguous_departure` member checks this is the
+    /// gateway remove `departed_at_ms` captured when the check was created.
     pub requested_at_ms: i64,
     pub expected_stay_id: Option<String>,
 }
@@ -1124,6 +1126,7 @@ impl GuildDataStore {
             if strict && (expected_joined_at_ms.is_some_and(|v| Some(v)!=joined) || joined.is_some_and(|v|v>departed_at_ms) || stay.is_none() || rejoined_without_token) {
                 tx.ensure_mutation_receipt()?;
                 let reason=if rejoined_without_token {"ambiguous_departure"}else{"mismatched_departure"};
+                // Store the gateway remove time in requested_at_ms for later settlement.
                 queue_target_check_tx(&tx,&scope,user_id,MemberVerifyKind::Member,reason,revision,departed_at_ms)?;
                 if rejoined_without_token {
                     tx.member_execute("UPDATE guild_member_target_checks SET expected_stay_id=coalesce(expected_stay_id,?5) WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind='member' AND row_revision=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,revision,stay.as_deref()])?;
@@ -1338,7 +1341,7 @@ fn queue_target_check_tx(
     revision: i64,
     now_ms: i64,
 ) -> Result<()> {
-    conn.member_execute("INSERT INTO guild_member_target_checks(guild_id,enrollment_id,user_id,kind,reason,row_revision,requested_at_ms,next_attempt_at_ms,expected_stay_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,NULL) ON CONFLICT(guild_id,enrollment_id,user_id,kind) DO UPDATE SET reason=excluded.reason,row_revision=excluded.row_revision,requested_at_ms=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.requested_at_ms ELSE MAX(guild_member_target_checks.requested_at_ms+1,excluded.requested_at_ms) END,next_attempt_at_ms=MIN(guild_member_target_checks.next_attempt_at_ms,excluded.next_attempt_at_ms),expected_stay_id=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.expected_stay_id ELSE NULL END",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,kind.as_str(),reason,revision,now_ms])?;
+    conn.member_execute("INSERT INTO guild_member_target_checks(guild_id,enrollment_id,user_id,kind,reason,row_revision,requested_at_ms,next_attempt_at_ms,expected_stay_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,NULL) ON CONFLICT(guild_id,enrollment_id,user_id,kind) DO UPDATE SET reason=excluded.reason,row_revision=excluded.row_revision,requested_at_ms=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND excluded.requested_at_ms<=guild_member_target_checks.requested_at_ms THEN guild_member_target_checks.requested_at_ms WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' THEN excluded.requested_at_ms ELSE MAX(guild_member_target_checks.requested_at_ms+1,excluded.requested_at_ms) END,next_attempt_at_ms=MIN(guild_member_target_checks.next_attempt_at_ms,excluded.next_attempt_at_ms),expected_stay_id=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' THEN coalesce(guild_member_target_checks.expected_stay_id,excluded.expected_stay_id) ELSE NULL END",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,kind.as_str(),reason,revision,now_ms])?;
     Ok(())
 }
 
@@ -2081,7 +2084,15 @@ impl GuildDataStore {
             let revision:i64=tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id],|r|Ok(r.get(0)?)).optional()?.unwrap_or(-1);
             if revision==check.revision {tx.finish_read()?;return Ok(false);}
             tx.ensure_mutation_receipt()?;
-            queue_target_check_tx(&tx,&scope,check.user_id,check.kind,&check.reason,revision,now_ms)?;
+            queue_target_check_tx(
+                &tx,
+                &scope,
+                check.user_id,
+                check.kind,
+                &check.reason,
+                revision,
+                check.requested_at_ms,
+            )?;
             tx.commit()?;Ok(true)
         }).await
     }
@@ -2116,7 +2127,6 @@ impl GuildDataStore {
         self.db.with_conn(move |conn|{let mut tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
             let saved=tx.query_row("SELECT row_revision,reason,requested_at_ms,expected_stay_id FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,check.kind.as_str()],|r|Ok((r.get::<i64>(0)?,r.get::<String>(1)?,r.get::<i64>(2)?,r.get::<Option<String>>(3)?))).optional()?;
             anyhow::ensure!(saved.as_ref().is_some_and(|(revision,reason,requested,stay)| *revision==check.revision && reason==&check.reason && *requested==check.requested_at_ms && stay==&check.expected_stay_id) && verification.revision==check.revision,MemberSyncError::Stale);
-            let (_,_,departed_at_ms,_) = saved.unwrap();
             let actual=tx.query_row("SELECT revision FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id],|r|Ok(r.get::<i64>(0)?)).optional()?;
             if actual.unwrap_or(-1)!=check.revision && check.reason=="ambiguous_departure" {
                 // A later stay/state superseded the captured removal. Dismiss
@@ -2130,12 +2140,14 @@ impl GuildDataStore {
             tx.ensure_mutation_receipt()?;
             let mut departure=None;
             if check.reason=="ambiguous_departure" && check.kind==MemberVerifyKind::Member && !verification.present {
+                // Gateway remove time was stored in requested_at_ms when the check was queued.
+                let departure_observed_at_ms = check.requested_at_ms;
                 let row=tx.query_row("SELECT is_current,joined_at_ms,current_stay_id,ever_banned FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id],|r|Ok((r.get::<bool>(0)?,r.get::<Option<i64>>(1)?,r.get::<Option<String>>(2)?,r.get::<bool>(3)?))).optional()?;
-                if let Some((current,joined,Some(stay),retained))=row && (current || retained) && Some(stay.as_str())==check.expected_stay_id.as_deref() && joined.is_none_or(|v|v<=departed_at_ms) {
-                    tx.member_execute("UPDATE guild_member_stays SET departed_at_ms=?4,ended_unknown=0 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,departed_at_ms])?;
-                    tx.member_execute("UPDATE guild_member_directory SET is_current=0,current_stay_id=NULL,departed_at_ms=?4,cleanup_after_ms=?5,cleanup_member_checked_at_ms=?6,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,departed_at_ms,if retained{None}else{Some(departed_at_ms.saturating_add(300_000))},now_ms])?;
+                if let Some((current,joined,Some(stay),retained))=row && (current || retained) && Some(stay.as_str())==check.expected_stay_id.as_deref() && joined.is_none_or(|v|v<=departure_observed_at_ms) {
+                    tx.member_execute("UPDATE guild_member_stays SET departed_at_ms=?4,ended_unknown=0 WHERE guild_id=?1 AND enrollment_id=?2 AND stay_id=?3 AND departed_at_ms IS NULL",params![scope.guild_id(),scope.enrollment.id.as_str(),stay,departure_observed_at_ms])?;
+                    tx.member_execute("UPDATE guild_member_directory SET is_current=0,current_stay_id=NULL,departed_at_ms=?4,cleanup_after_ms=?5,cleanup_member_checked_at_ms=?6,observed_at_ms=MAX(observed_at_ms,?4),revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,departure_observed_at_ms,if retained{None}else{Some(departure_observed_at_ms.saturating_add(300_000))},now_ms])?;
                     bump_revision(&tx,&scope)?;
-                    departure=Some(MemberDeparture{user_id:check.user_id,joined_at_ms:joined,departed_at_ms,completed_stay_ms:joined.map(|v|departed_at_ms-v)});
+                    departure=Some(MemberDeparture{user_id:check.user_id,joined_at_ms:joined,departed_at_ms:departure_observed_at_ms,completed_stay_ms:joined.map(|v|departure_observed_at_ms-v)});
                 } else { settle_verified_state(&tx,&scope,&verification,now_ms)?; }
             } else { settle_verified_state(&tx,&scope,&verification,now_ms)?; }
             tx.member_execute("DELETE FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind=?4 AND row_revision=?5 AND expected_stay_id IS ?6 AND requested_at_ms=?7",params![scope.guild_id(),scope.enrollment.id.as_str(),check.user_id,check.kind.as_str(),check.revision,check.expected_stay_id.as_deref(),check.requested_at_ms])?;
