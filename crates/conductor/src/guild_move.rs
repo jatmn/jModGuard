@@ -619,6 +619,64 @@ fn seed_reconciliation_sql(schema_version: i64) -> &'static str {
     }
 }
 
+const MEMBER_GUILD_MIGRATIONS: &[&str] = &[
+    include_str!("../../../migrations/guild/0010_member_directory.sql"),
+    include_str!("../../../migrations/guild/0011_member_directory_status.sql"),
+    include_str!("../../../migrations/guild/0012_member_sync_progress.sql"),
+    include_str!("../../../migrations/guild/0013_member_unresolved_audits.sql"),
+    include_str!("../../../migrations/guild/0014_member_case_retain_revision.sql"),
+];
+
+const MEMBER_COPY_TABLES: [&str; 11] = [
+    "guild_member_feature",
+    "guild_member_seed",
+    "guild_member_sync",
+    "guild_member_directory",
+    "guild_member_pending_bans",
+    "guild_member_stays",
+    "guild_member_state_observations",
+    "guild_member_target_checks",
+    "guild_member_audit_recovery",
+    "guild_member_unresolved_audits",
+    "guild_member_case_index",
+];
+
+async fn source_guild_has_member_rows(src: &libsql::Connection, guild: i64) -> Result<bool> {
+    for table in MEMBER_COPY_TABLES {
+        if !table_exists(src, table).await? {
+            continue;
+        }
+        let count: i64 = scalar(
+            src,
+            &format!("SELECT COUNT(*) FROM {table} WHERE guild_id=?"),
+            libsql::params![guild],
+        )
+        .await?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn ensure_dest_member_schema(dest: &libsql::Connection) -> Result<()> {
+    if table_exists(dest, "guild_member_feature").await? {
+        return Ok(());
+    }
+    for sql in MEMBER_GUILD_MIGRATIONS {
+        dest.execute_batch(sql).await?;
+    }
+    dest.execute(
+        &format!(
+            "PRAGMA user_version = {}",
+            crate::release::GUILD_SCHEMA_VERSION
+        ),
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result<()> {
     let src = open(source).await?;
     let dest_conn = open(dest).await?;
@@ -712,7 +770,21 @@ async fn copy_guild(source: &Path, dest: &Path, directory: &Directory) -> Result
                     .await?;
             }
         }
-        for table in ["guild_member_feature", "guild_member_seed", "guild_member_sync", "guild_member_directory", "guild_member_pending_bans", "guild_member_stays", "guild_member_state_observations", "guild_member_target_checks", "guild_member_audit_recovery", "guild_member_unresolved_audits"] {
+        if source_guild_has_member_rows(&src, guild).await? {
+            ensure_dest_member_schema(&dest_conn).await?;
+        }
+        for table in [
+            "guild_member_feature",
+            "guild_member_seed",
+            "guild_member_sync",
+            "guild_member_directory",
+            "guild_member_pending_bans",
+            "guild_member_stays",
+            "guild_member_state_observations",
+            "guild_member_target_checks",
+            "guild_member_audit_recovery",
+            "guild_member_unresolved_audits",
+        ] {
             copy_member_table(&src, &dest_conn, table, guild).await?;
         }
         ensure_member_feature_admission(&dest_conn, guild, &enrollment_id).await?;
@@ -799,6 +871,19 @@ async fn copy_member_table(
         "unsupported member table"
     );
     if !table_exists(src, table).await? {
+        return Ok(());
+    }
+    if !table_exists(dest, table).await? {
+        let count: i64 = scalar(
+            src,
+            &format!("SELECT COUNT(*) FROM {table} WHERE guild_id=?"),
+            libsql::params![guild],
+        )
+        .await?;
+        ensure!(
+            count == 0,
+            "destination store lacks {table} required for copied member data"
+        );
         return Ok(());
     }
     // Later guild migrations add columns. Copy the names both schemas share so

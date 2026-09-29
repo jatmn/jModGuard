@@ -677,9 +677,8 @@ fn status(
                 let recent_progress = anchor_progress.is_some_and(|at| {
                     at <= now_ms && now_ms.saturating_sub(at) <= recent_window_ms
                 });
-                let pages_remaining = (page_size > 0).then(|| {
-                    ((total - processed).max(0) + page_size - 1) / page_size + 1
-                });
+                let pages_remaining = (page_size > 0)
+                    .then(|| ((total - processed).max(0) + page_size - 1) / page_size + 1);
                 if out.status == "waiting" {
                     out.estimate_reason = Some(
                         match out.status_reason.as_deref() {
