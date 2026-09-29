@@ -137,7 +137,7 @@ async fn concurrent_links_conflicts_and_retries_do_not_rewrite_or_add_receipts()
         );
     }
     store.db.with_conn(|c| {
-        c.execute_batch_bounded("CREATE TRIGGER refuse_source BEFORE INSERT ON guild_case_sources BEGIN SELECT RAISE(ABORT,'unexpected write'); END; CREATE TRIGGER refuse_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END", 64 * 1024 * 1024)?;
+        c.execute_batch_bounded("CREATE TRIGGER refuse_source BEFORE INSERT ON guild_case_sources BEGIN SELECT RAISE(ABORT,'unexpected write'); END; CREATE TRIGGER refuse_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'unexpected receipt'); END; CREATE TRIGGER refuse_profile_rewrite BEFORE UPDATE ON guild_member_directory BEGIN SELECT RAISE(ABORT,'unexpected member profile rewrite'); END", 64 * 1024 * 1024)?;
         Ok(())
     }).await.unwrap();
     assert_eq!(

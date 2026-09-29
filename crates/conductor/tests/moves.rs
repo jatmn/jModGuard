@@ -74,6 +74,10 @@ fn unique_root() -> PathBuf {
 }
 
 async fn setup() -> Harness {
+    setup_with_destination_version(9).await
+}
+
+async fn setup_with_destination_version(destination_version: i64) -> Harness {
     let (discord, task) = discord_stub(42).await;
     let root = unique_root();
     std::fs::create_dir_all(&root).unwrap();
@@ -89,9 +93,10 @@ async fn setup() -> Harness {
             (10, ENROLL_10, REV_10, CASE_10, SRC_10),
             (20, ENROLL_20, REV_20, CASE_20, SRC_20),
         ],
+        9,
     )
     .await;
-    init_guild(&dedicated, DEDICATED, Some(10), &[]).await;
+    init_guild(&dedicated, DEDICATED, Some(10), &[], destination_version).await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         log_filter: "warn".into(),
@@ -175,21 +180,48 @@ async fn init_guild(
     store_id: &str,
     dedicated: Option<i64>,
     guilds: &[(i64, &str, &str, &str, &str)],
+    version: i64,
 ) {
     let db = libsql::Builder::new_local(path).build().await.unwrap();
     let conn = db.connect().unwrap();
-    for sql in [
-        include_str!("../../../migrations/guild/0001_identity.sql"),
-        include_str!("../../../migrations/guild/0002_tenant_log_channels.sql"),
-        include_str!("../../../migrations/guild/0003_cases.sql"),
-        include_str!("../../../migrations/guild/0004_case_history.sql"),
-        include_str!("../../../migrations/guild/0005_case_sources.sql"),
-        include_str!("../../../migrations/guild/0006_case_evidence.sql"),
-        include_str!("../../../migrations/guild/0007_bunny_evidence.sql"),
-        include_str!("../../../migrations/guild/0008_erasure.sql"),
-        include_str!("../../../migrations/guild/0009_message_snapshots.sql"),
+    for (migration, sql) in [
+        (
+            1,
+            include_str!("../../../migrations/guild/0001_identity.sql"),
+        ),
+        (
+            2,
+            include_str!("../../../migrations/guild/0002_tenant_log_channels.sql"),
+        ),
+        (3, include_str!("../../../migrations/guild/0003_cases.sql")),
+        (
+            4,
+            include_str!("../../../migrations/guild/0004_case_history.sql"),
+        ),
+        (
+            5,
+            include_str!("../../../migrations/guild/0005_case_sources.sql"),
+        ),
+        (
+            6,
+            include_str!("../../../migrations/guild/0006_case_evidence.sql"),
+        ),
+        (
+            7,
+            include_str!("../../../migrations/guild/0007_bunny_evidence.sql"),
+        ),
+        (
+            8,
+            include_str!("../../../migrations/guild/0008_erasure.sql"),
+        ),
+        (
+            9,
+            include_str!("../../../migrations/guild/0009_message_snapshots.sql"),
+        ),
     ] {
-        conn.execute_batch(sql).await.unwrap();
+        if migration <= version {
+            conn.execute_batch(sql).await.unwrap();
+        }
     }
     conn.execute(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,'jmodguard-guild-1',?,?)",
@@ -197,7 +229,9 @@ async fn init_guild(
     )
     .await
     .unwrap();
-    conn.execute("PRAGMA user_version = 9", ()).await.ok();
+    conn.execute(&format!("PRAGMA user_version = {version}"), ())
+        .await
+        .unwrap();
     for (guild, enrollment, revision, case_id, source) in guilds {
         conn.execute(
             "INSERT INTO guild_bindings(guild_id,revision) VALUES(?,?)",
@@ -327,6 +361,42 @@ async fn text(path: &Path, sql: &str) -> String {
     let conn = db.connect().unwrap();
     let mut rows = conn.query(sql, ()).await.unwrap();
     rows.next().await.unwrap().unwrap().get(0).unwrap()
+}
+
+async fn upgrade_guild(path: &Path, from: i64, to: i64) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for version in from + 1..=to {
+        let sql = match version {
+            10 => include_str!("../../../migrations/guild/0010_member_directory.sql"),
+            11 => include_str!("../../../migrations/guild/0011_member_directory_status.sql"),
+            12 => include_str!("../../../migrations/guild/0012_member_sync_progress.sql"),
+            13 => include_str!("../../../migrations/guild/0013_member_unresolved_audits.sql"),
+            14 => include_str!("../../../migrations/guild/0014_member_case_retain_revision.sql"),
+            _ => panic!("unsupported fixture migration {version}"),
+        };
+        conn.execute_batch(sql).await.unwrap();
+    }
+    conn.execute(&format!("PRAGMA user_version = {to}"), ())
+        .await
+        .unwrap();
+}
+
+async fn start_dedicated_move(h: &Harness) -> (String, Option<String>) {
+    let cookie = login(h).await;
+    let (status, body, _) = call(
+        &h.router,
+        "POST",
+        "/api/moves",
+        Some(&cookie),
+        Some(r#"{"guild_id":"10","destination_store_id":"22222222222222222222222222222222","preop":"skip","confirm_shared_impact":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_until_idle(h).await;
+    let jobs = h.conductor.store().unwrap().list_jobs(8).await.unwrap();
+    let job = jobs.iter().find(|job| job.kind == "guild_move").unwrap();
+    (job.status.clone(), job.last_error.clone())
 }
 
 const DEST_REV: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -748,5 +818,173 @@ async fn move_budget_ignores_source_free_pages_and_unrelated_rows() {
         )
         .await,
         1
+    );
+}
+
+#[tokio::test]
+async fn move_upgrades_old_destination_before_member_copy() {
+    for destination_version in [8, 10] {
+        let h = setup_with_destination_version(destination_version).await;
+        let shared = h.root.join("shared.guild.db");
+        let dedicated = h.root.join("dedicated.guild.db");
+        upgrade_guild(&shared, 9, 14).await;
+        if destination_version > 9 {
+            upgrade_guild(&dedicated, 9, destination_version).await;
+        }
+        let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=10",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO guild_member_seed(guild_id,enrollment_id,bot_id,initialized_at_ms,reconciliation_needed,gap_generation) VALUES(10,?,42,1000,1,2)",
+            libsql::params![ENROLL_10],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO guild_member_sync(guild_id,enrollment_id,bot_id,run_id,run_kind,phase,status,started_at_ms,reconcile_gap_generation) VALUES(10,?,42,'run','reconcile','members','waiting',1000,2)",
+            libsql::params![ENROLL_10],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        drop(db);
+
+        let (status, error) = start_dedicated_move(&h).await;
+        assert_eq!(status, "succeeded", "v{destination_version}: {error:?}");
+        assert_eq!(scalar(&dedicated, "PRAGMA user_version").await, 14);
+        assert_eq!(
+            scalar(
+                &dedicated,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name='guild_message_snapshots'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &dedicated,
+                "SELECT seed_admitted FROM guild_member_feature WHERE guild_id=10"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &dedicated,
+                "SELECT reconcile_gap_generation FROM guild_member_sync WHERE guild_id=10"
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            scalar(
+                &shared,
+                "SELECT COUNT(*) FROM guild_bindings WHERE guild_id=10"
+            )
+            .await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn move_upgrades_destination_for_unresolved_audit_rows() {
+    let h = setup().await;
+    let shared = h.root.join("shared.guild.db");
+    let dedicated = h.root.join("dedicated.guild.db");
+    upgrade_guild(&shared, 9, 14).await;
+    upgrade_guild(&dedicated, 9, 12).await;
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_unresolved_audits(guild_id,enrollment_id,entry_id,user_id,action,occurred_at_ms) VALUES(10,?,123,7,'ban',1000)",
+        libsql::params![ENROLL_10],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    let (status, error) = start_dedicated_move(&h).await;
+    assert_eq!(status, "succeeded", "{error:?}");
+    assert_eq!(scalar(&dedicated, "PRAGMA user_version").await, 14);
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_member_unresolved_audits WHERE guild_id=10 AND entry_id=123"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn member_heavy_move_refuses_insufficient_pre_copy_capacity() {
+    let h = setup().await;
+    let shared = h.root.join("shared.guild.db");
+    let dedicated = h.root.join("dedicated.guild.db");
+    upgrade_guild(&shared, 9, 14).await;
+    upgrade_guild(&dedicated, 9, 14).await;
+    let db = libsql::Builder::new_local(&shared).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    for user_id in 1..=150_i64 {
+        conn.execute(
+            "INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,observed_at_ms) VALUES(10,?,?,1000)",
+            libsql::params![ENROLL_10, user_id],
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+    drop(db);
+    let db = libsql::Builder::new_local(&dedicated)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE fixture_unrelated(payload BLOB)", ())
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO fixture_unrelated VALUES(zeroblob(892000000))",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+    assert!(
+        scalar(&dedicated, "PRAGMA page_count").await
+            * scalar(&dedicated, "PRAGMA page_size").await
+            < 896_000_000
+    );
+
+    let (status, error) = start_dedicated_move(&h).await;
+    assert_eq!(status, "failed");
+    assert!(
+        error
+            .unwrap_or_default()
+            .contains("application database capacity budget exhausted")
+    );
+    assert_eq!(
+        scalar(
+            &dedicated,
+            "SELECT COUNT(*) FROM guild_bindings WHERE guild_id=10"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        text(
+            &h.root.join("core.db"),
+            "SELECT store_id FROM guild_store_placements WHERE guild_id=10"
+        )
+        .await,
+        SHARED
     );
 }

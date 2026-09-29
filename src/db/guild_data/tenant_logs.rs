@@ -107,6 +107,7 @@ impl GuildDataStore {
             }
             tx.ensure_mutation_receipt()?;
             tx.execute_rows("INSERT INTO guild_memberships(guild_id,enrollment_id,joined_at_ns,active,config_revision) VALUES(?1,?2,?3,1,?4)", params![scope.guild_id(), scope.enrollment.id.as_str(), scope.enrollment.joined_at_ns, new_revision()], 1)?;
+            tx.execute_rows("INSERT INTO guild_member_feature(guild_id,enrollment_id,seed_admitted) VALUES(?1,?2,0)", params![scope.guild_id(), scope.enrollment.id.as_str()], 1)?;
             tx.commit()
         }).await
     }
