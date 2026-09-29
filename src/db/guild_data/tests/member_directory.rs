@@ -2164,79 +2164,109 @@ async fn known_count_has_fixed_preliminary_eta_only_during_recent_queued_initial
     assert_eq!(stale.estimate_reason.as_deref(), Some("worker_unconfirmed"));
 }
 
+fn member_verification(
+    check: &MemberTargetCheck,
+    member: Option<MemberObservation>,
+) -> MemberVerification {
+    MemberVerification {
+        user_id: check.user_id,
+        revision: check.revision,
+        kind: MemberVerifyKind::Member,
+        present: member.is_some(),
+        member,
+        ban: None,
+    }
+}
+
 #[tokio::test]
 async fn tokenless_second_stay_leave_verifies_absence_then_returns_saved_duration_after_reopen() {
-    let (f, store, scope) = ready().await;
-    store
-        .initialize_member_directory(scope.clone(), 42, 1_000)
-        .await
-        .unwrap();
-    store
-        .observe_member(scope.clone(), observed(64, Some(500), 1_000))
-        .await
-        .unwrap();
-    store.depart_member(scope.clone(), 64, 1_100).await.unwrap();
-    store
-        .observe_member(scope.clone(), observed(64, Some(1_500), 1_600))
-        .await
-        .unwrap();
-    assert!(matches!(
+    for (replace_revision, remove_time) in [(true, 2_000), (false, 2_050), (false, 2_000)] {
+        let (f, store, scope) = ready().await;
         store
-            .depart_member_checked(scope.clone(), 64, 2_000, None)
+            .initialize_member_directory(scope.clone(), 42, 1_000)
             .await
-            .unwrap(),
-        MemberDepartureDecision::NeedsVerification
-    ));
-    assert!(matches!(
+            .unwrap();
         store
-            .depart_member_checked(scope.clone(), 64, 2_050, None)
+            .observe_member(scope.clone(), observed(64, Some(500), 1_000))
             .await
-            .unwrap(),
-        MemberDepartureDecision::NeedsVerification
-    ));
-    let reopened = GuildDataStore::open(f.options(), store.expected.clone()).unwrap();
-    let check = reopened
-        .next_member_target_check(scope.clone(), 2_000)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(check.reason, "ambiguous_departure");
-    assert!(check.expected_stay_id.is_some());
-    let departure = reopened
-        .settle_member_target_check(
-            scope.clone(),
-            check.clone(),
-            MemberVerification {
-                user_id: 64,
-                revision: check.revision,
-                kind: MemberVerifyKind::Member,
-                present: false,
-                member: None,
-                ban: None,
-            },
-            2_100,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(departure.joined_at_ms, Some(1_500));
-    assert_eq!(departure.departed_at_ms, 2_000);
-    assert_eq!(departure.completed_stay_ms, Some(500));
-    assert!(
-        !reopened
-            .get_member(scope.clone(), 64)
+            .unwrap();
+        store.depart_member(scope.clone(), 64, 1_100).await.unwrap();
+        store
+            .observe_member(scope.clone(), observed(64, Some(1_500), 1_600))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .depart_member_checked(scope.clone(), 64, 2_000, None)
+                .await
+                .unwrap(),
+            MemberDepartureDecision::NeedsVerification
+        ));
+        let old = store
+            .next_member_target_check(scope.clone(), 2_000)
             .await
             .unwrap()
-            .unwrap()
-            .is_current
-    );
-    assert!(
-        reopened
-            .next_member_target_check(scope.clone(), 2_100)
+            .unwrap();
+        if replace_revision {
+            let mut changed = observed(64, Some(1_500), 2_000);
+            changed.username = Some(Some("changed profile".into()));
+            store.observe_member(scope.clone(), changed).await.unwrap();
+        }
+        assert!(matches!(
+            store
+                .depart_member_checked(scope.clone(), 64, remove_time, None)
+                .await
+                .unwrap(),
+            MemberDepartureDecision::NeedsVerification
+        ));
+        let verification = member_verification(&old, Some(observed(64, Some(1_500), 2_020)));
+        let err = store
+            .settle_member_target_check(scope.clone(), old.clone(), verification, 2_100)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<MemberSyncError>(),
+            Some(MemberSyncError::Stale)
+        ));
+        let reopened = GuildDataStore::open(f.options(), store.expected.clone()).unwrap();
+        let check = reopened
+            .next_member_target_check(scope.clone(), 2_000)
             .await
             .unwrap()
-            .is_none()
-    );
+            .unwrap();
+        assert_eq!(check.reason, "ambiguous_departure");
+        assert!(check.expected_stay_id.is_some());
+        assert_eq!(check.expected_stay_id, old.expected_stay_id);
+        assert_eq!(check.requested_at_ms, 2_000);
+        let departure = reopened
+            .settle_member_target_check(
+                scope.clone(),
+                check.clone(),
+                member_verification(&check, None),
+                2_100,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(departure.joined_at_ms, Some(1_500));
+        assert_eq!(departure.departed_at_ms, 2_000);
+        assert_eq!(departure.completed_stay_ms, Some(500));
+        assert!(
+            !reopened
+                .get_member(scope.clone(), 64)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_current
+        );
+        assert!(
+            reopened
+                .next_member_target_check(scope.clone(), 2_100)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 #[tokio::test]
@@ -2272,14 +2302,7 @@ async fn tokenless_second_stay_leave_preserves_present_or_newer_stay_without_orp
             .settle_member_target_check(
                 scope.clone(),
                 check.clone(),
-                MemberVerification {
-                    user_id: 65,
-                    revision: check.revision,
-                    kind: MemberVerifyKind::Member,
-                    present: true,
-                    member: Some(observed(65, Some(1_500), 2_100)),
-                    ban: None
-                },
+                member_verification(&check, Some(observed(65, Some(1_500), 2_100))),
                 2_100
             )
             .await
@@ -2323,14 +2346,7 @@ async fn tokenless_second_stay_leave_preserves_present_or_newer_stay_without_orp
             .settle_member_target_check(
                 scope.clone(),
                 stale.clone(),
-                MemberVerification {
-                    user_id: 65,
-                    revision: stale.revision,
-                    kind: MemberVerifyKind::Member,
-                    present: false,
-                    member: None,
-                    ban: None
-                },
+                member_verification(&stale, None),
                 3_200
             )
             .await
@@ -2399,14 +2415,7 @@ async fn retained_short_second_stay_confirms_ban_then_saved_departure() {
         .settle_member_target_check(
             scope.clone(),
             check.clone(),
-            MemberVerification {
-                user_id: 67,
-                revision: check.revision,
-                kind: MemberVerifyKind::Member,
-                present: false,
-                member: None,
-                ban: None,
-            },
+            member_verification(&check, None),
             1_900,
         )
         .await

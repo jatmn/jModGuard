@@ -1128,7 +1128,10 @@ impl GuildDataStore {
                 // Store the gateway remove time in requested_at_ms for later settlement.
                 queue_target_check_tx(&tx,&scope,user_id,MemberVerifyKind::Member,reason,revision,departed_at_ms)?;
                 if rejoined_without_token {
-                    tx.member_execute("UPDATE guild_member_target_checks SET expected_stay_id=coalesce(expected_stay_id,?5) WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind='member' AND row_revision=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,revision,stay.as_deref()])?;
+                    // Fence earlier verification results without advancing the captured departure time.
+                    tx.member_execute("UPDATE guild_member_directory SET revision=revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id])?;
+                    tx.member_execute("UPDATE guild_member_target_checks SET expected_stay_id=coalesce(expected_stay_id,?5),row_revision=row_revision+1 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND kind='member' AND row_revision=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,revision,stay.as_deref()])?;
+                    bump_revision(&tx,&scope)?;
                 }
                 tx.commit()?;
                 return Ok(MemberDepartureDecision::NeedsVerification);
@@ -1342,7 +1345,7 @@ fn queue_target_check_tx(
 ) -> Result<()> {
     // Repeated removals for the same revision retain the first event time and stay.
     // A newer revision replaces that capture so it cannot reuse an older stay.
-    conn.member_execute("INSERT INTO guild_member_target_checks(guild_id,enrollment_id,user_id,kind,reason,row_revision,requested_at_ms,next_attempt_at_ms,expected_stay_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,NULL) ON CONFLICT(guild_id,enrollment_id,user_id,kind) DO UPDATE SET reason=excluded.reason,row_revision=excluded.row_revision,requested_at_ms=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.requested_at_ms ELSE MAX(guild_member_target_checks.requested_at_ms+1,excluded.requested_at_ms) END,next_attempt_at_ms=MIN(guild_member_target_checks.next_attempt_at_ms,excluded.next_attempt_at_ms),expected_stay_id=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.expected_stay_id ELSE NULL END",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,kind.as_str(),reason,revision,now_ms])?;
+    conn.member_execute("INSERT INTO guild_member_target_checks(guild_id,enrollment_id,user_id,kind,reason,row_revision,requested_at_ms,next_attempt_at_ms,expected_stay_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?7,NULL) ON CONFLICT(guild_id,enrollment_id,user_id,kind) DO UPDATE SET reason=excluded.reason,row_revision=excluded.row_revision,requested_at_ms=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.requested_at_ms WHEN excluded.reason='ambiguous_departure' THEN excluded.requested_at_ms ELSE MAX(guild_member_target_checks.requested_at_ms+1,excluded.requested_at_ms) END,next_attempt_at_ms=MIN(guild_member_target_checks.next_attempt_at_ms,excluded.next_attempt_at_ms),expected_stay_id=CASE WHEN guild_member_target_checks.reason='ambiguous_departure' AND excluded.reason='ambiguous_departure' AND guild_member_target_checks.row_revision=excluded.row_revision THEN guild_member_target_checks.expected_stay_id ELSE NULL END",params![scope.guild_id(),scope.enrollment.id.as_str(),user_id,kind.as_str(),reason,revision,now_ms])?;
     Ok(())
 }
 
