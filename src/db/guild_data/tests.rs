@@ -417,5 +417,7 @@ mod case_sources;
 
 mod case_evidence;
 
+mod member_directory;
+
 #[cfg(unix)]
 mod bunny_transfer;
