@@ -60,7 +60,10 @@ removing avoidable serial provider round trips from each save.
 No new dependency, connection pool, cache or per-message work is added. These checks are
 not a transaction spanning Discord and SQL. Shared/dedicated routing, selected cases and
 live guild erasure now run through [tenant runtime](TENANT-RUNTIME.md). The current
-schema remains `jmodguard-core-1`, migrations 0001–0014.
+core schema is `jmodguard-core-1`, migrations 0001–0016. Migration 0015 stores
+component-update coordination; migration 0016 persists the shared per-bot
+[member-sync request gate](MEMBERS.md) across guilds and worker restarts. Captured
+configuration operations add no migration of their own.
 
 Local tests cover stale scopes before and after rejoin, empty patches, nickname re-sync,
 source/destination copy checks, global writes from a stale guild context, modified identity,

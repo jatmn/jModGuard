@@ -154,9 +154,21 @@ another database.
 
 ## Storage sizing
 
-The final v12 guild schema was measured in local SQLite with 4 KiB pages and
-`VACUUM`. The measurement includes the nullable stay identity on paced
-target checks; these bulk fixtures have no pending checks or unresolved audits.
+The directory fixtures below were measured against guild schema v12 in local
+SQLite with 4 KiB pages and `VACUUM`. These are historical measurements, not
+absolute sizes measured for the current v14 schema. They include the nullable
+stay identity on paced target checks; the bulk fixtures have no pending checks.
+
+Migration 0013 adds the unresolved-audit table and its user-history index,
+plus scope/source guards. It adds empty-store overhead and storage for each
+unresolved audit, including any saved reason. Migration 0014 replaces the
+case-retention trigger without adding tables, indexes or columns. Neither
+migration changes the directory, stay, case-index or state-observation row
+layouts measured below. The same-row-mix growth comparisons therefore remain
+useful estimates when unresolved audits are absent, but the v12 absolute totals
+do not include v13's added schema overhead. Measure a current v14 store for its
+absolute footprint and account separately for unresolved-audit rows.
+
 An empty guild store measured 274,432 bytes. With one saved stay per
 current member, 11,000 ordinary-name members measured 7,888,896 bytes total
 (7,614,464 bytes above the empty store). A fixture using long Unicode global
@@ -164,8 +176,9 @@ names and nicknames measured 12,189,696 bytes total (11,915,264 bytes above
 empty). Adding two extra stays, four case-index identities, and one unknown-time
 state observation for each of 110 retained banned people raised the ordinary
 fixture by 212,992 bytes to 8,101,888 bytes total. A separate hypothetical
-fixture with 110 unresolved own-audit rows added 28,672 bytes to the ordinary
-fixture; this row count is a storage sensitivity, not an assumed ban frequency.
+fixture using the unresolved-audit extension with 110 own-audit rows added
+28,672 bytes to the ordinary fixture; this row count is a storage sensitivity,
+not an assumed ban frequency.
 Canonical case payloads, WAL files, backups, and provider replication are
 outside these directory/index measurements.
 
@@ -175,7 +188,7 @@ measured 30,658,560 bytes total (30,384,128 bytes above the empty store).
 The difference from the same-name 11,000-member fixture is 22,769,664 bytes
 over ten years, or about 2.28 MB (2.17 MiB) per year under the same row mix
 and indexing. Churn and retained ban/case frequency can change that rate. The plan's earlier 2.50 MB
-ordinary and 3.26 MB Unicode figures excluded final stays and indexes; use
-the v12 measured fixtures above for sizing. The earlier candidate
+ordinary and 3.26 MB Unicode figures excluded final stays and indexes; the
+historical v12 fixtures above include those rows and indexes. The earlier candidate
 measurements used a different row shape and name generator, so their difference
 from these figures is not a pure schema overhead estimate.

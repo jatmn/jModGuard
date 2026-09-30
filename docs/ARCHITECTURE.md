@@ -177,13 +177,16 @@ be sanitized against surviving cleanup intents.
 ## Migrations
 
 The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0014. Migration 0006 adds action storage and its replay floor.
+migrations 0001–0016. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
 Migration 0011 adds live-erasure jobs and backup-copy cleanup intents. Migration 0012
 adds guild-write fences for populated store moves. Migration 0013 stores per-event
-log exclusions. Migration 0014 stores known ban display names. Bot/API startup
+log exclusions. Migration 0014 stores known ban display names. Migration 0015
+stores component-update coordination. Migration 0016 adds the per-bot shared
+[member-sync request gate](MEMBERS.md), preserving minimum request intervals and
+rate-limit delays across guilds and worker restarts. Bot/API startup
 opens [tenant runtime](TENANT-RUNTIME.md) against that catalog. Unban/log-channel WebUI
 operations now use API admission and bot dispatch.
 
@@ -217,7 +220,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness (bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless loaded at runtime, not vendored)
-migrations/                0001_init through 0014_ban_display_identity
+migrations/                0001_init through 0016_member_sync_pacing
 Dockerfile.bot
 Dockerfile.api
 ```
