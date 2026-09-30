@@ -8,8 +8,10 @@ import { randomUUID } from 'node:crypto';
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
 // Minimal DOM boundary: assertions inspect the actual children/attributes that
 // production el() sends to the browser, without duplicating its implementation.
-function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timers = { setTimeout: () => 0, clearTimeout() {} }) {
+function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timerImpl = null) {
   const elements = [];
+  let clockOffsetMs = 0;
+  class TestDate extends Date { static now() { return Date.now() + clockOffsetMs; } }
   const location = {
     search: '', pathname: '/', hash: '', replaced: null,
     replace(value) { this.replaced = value; },
@@ -19,7 +21,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const node = (tag) => {
     const classes = new Set();
     return {
-      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false,
+      tag, tagName: String(tag).toUpperCase(), nodeType: 1, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, disabled: false, value: '',
       classList: {
         toggle(name, force) {
           const enabled = force === undefined ? !classes.has(name) : !!force;
@@ -85,11 +87,16 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   for (const key of ['#startup-view', '#login-view', '#main-view', '#preview-return-link']) {
     nodes.get(key).classList.add('hidden');
   }
+  const timers = new Map();
+  let nextTimer = 1;
+  const documentListeners = new Map();
+  const timerApi = timerImpl ?? {
+    setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  };
   const context = vm.createContext({
     document: {
-      visibilityState: 'visible', listeners: {},
-      addEventListener(name, handler) { this.listeners[name] = handler; },
-      removeEventListener(name, handler) { if (this.listeners[name] === handler) delete this.listeners[name]; },
+      visibilityState: 'visible', addEventListener(name, fn) { documentListeners.set(name, fn); }, removeEventListener(name, fn) { if (documentListeners.get(name) === fn) documentListeners.delete(name); },
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       getElementById: (id) => nodes.get('#' + id) || null,
@@ -98,13 +105,15 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, confirm, crypto: { randomUUID },
+    fetch: fetchImpl, console, AbortController, URLSearchParams, Date: TestDate,
+    setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabMembers, tabActions, tabBans, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win };
+  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document: context.document, documentListeners,
+    advanceTime(ms) { clockOffsetMs += ms; } };
 }
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
 
@@ -119,6 +128,14 @@ function findNode(root, predicate) {
 
 function textOf(root) {
   return (root.textContent || '') + (root.children || []).map(textOf).join('');
+}
+
+async function runMemberPoll(h) {
+  const pending = [...h.timers].find(([, timer]) => timer.delay === 10000);
+  assert(pending, 'expected a visible Members status poll');
+  h.timers.delete(pending[0]);
+  await pending[1].fn();
+  await new Promise(resolve => setImmediate(resolve));
 }
 
 test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
@@ -348,6 +365,628 @@ test('Members empty copy follows status completion without refetching the direct
   assert.match(textOf(panel), /complete · complete/);
   assert.equal(textOf(panel.querySelector('tbody')), 'No members match these filters.');
   assert.equal(calls.filter(url => url.includes('/members?')).length, 1);
+});
+
+test('Members uses saved identity, keeps large IDs exact and labels partial import', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.endsWith('/member-sync')) return response({ status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: '🌻 Willow', username: 'willow', is_current: true, is_banned: false, ever_banned: false, joined_at_ms: null }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /🌻 Willow/);
+  assert.match(textOf(panel), /1800882749273538599/);
+  assert.match(textOf(panel), /Results are partial/);
+  assert.match(textOf(panel), /Unknown/);
+  assert.equal(calls.length, 2);
+  assert(calls.every(call => call.opts.method === 'POST' && call.opts.headers['x-jmodguard-enrollment'] === 'member-enrollment'));
+});
+
+test('Members separates current ban reason from an unresolved Gateway action', async () => {
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
+    if (url.includes('/history')) return response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'gateway_observation_unlinked', case_id: 'case-1' }], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: true, ever_banned: true, current_ban_reason: 'Current rule' }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Current reason: Current rule/);
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Gateway observation; action time unconfirmed/);
+  assert.match(textOf(panel), /Case case-1/);
+});
+
+test('Members renders a dated unresolved Discord audit entry, then its exact case link', async () => {
+  let linked = false;
+  const reason = '<img src=x onerror=alert(1)>';
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000 });
+    if (url.includes('/history')) return response({ entries: [linked
+      ? { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'application_audit_linked', case_id: 'case-linked', observation_id: null, moderator_id: '42', reason, outcome: 'succeeded' }
+      : { kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit_unresolved', case_id: null, observation_id: '123456789012345678', moderator_id: '42', reason, outcome: 'succeeded' }], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const historyButton = findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history');
+  historyButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Ban audit entry · /);
+  assert.doesNotMatch(textOf(panel), /Ban audit entry · Unknown/);
+  assert.match(textOf(panel), /Confirmed Discord audit action; local case association unresolved/);
+  assert.match(textOf(panel), /Audit entry 123456789012345678/);
+  assert.match(textOf(panel), /moderator 42/);
+  assert.match(textOf(panel), /<img src=x onerror=alert\(1\)>/);
+  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n).startsWith('Case ')), null);
+  assert.equal(findNode(panel, n => n.tag === 'img'), null, 'audit reason is text, not markup');
+
+  linked = true;
+  historyButton.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /local case association unresolved/);
+  assert.doesNotMatch(textOf(panel), /Audit entry 123456789012345678/);
+  assert.match(textOf(panel), /Bot action linked to Discord audit/);
+  assert.match(textOf(panel), /Case case-linked/);
+});
+
+test('Members labels verified state changes with unknown event time and separate check time', async () => {
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete', progress_revision: 3, initial_completed_at: 1790000000000, reconciliation_needed: true, audit_recovery_status: 'waiting', audit_recovery_phase: 'unban', audit_recovery_processed: 3, audit_recovery_reason: 'rate_limited', audit_recovery_next_attempt_at: 1790000000000, audit_recovery_last_progress_at: 1789999990000 });
+    if (url.includes('/history')) return response({ entries: [
+      { kind: 'member_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'ban_absent_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'ban_present_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+      { kind: 'membership_state_observation', occurred_at_ms: null, observed_at_ms: 1790000000000, source_kind: 'state_reconciliation', case_id: null },
+    ], next_cursor: null });
+    return response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow', is_current: false, is_banned: false, ever_banned: true }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Membership absence · Unknown/);
+  assert.match(textOf(panel), /Membership state check · Unknown/);
+  assert.match(textOf(panel), /Ban absent \(time unknown\) · Unknown/);
+  assert.match(textOf(panel), /Ban present \(time unknown\) · Unknown/);
+  assert.doesNotMatch(textOf(panel), /Ban present \(time unknown\) · \d{4}/);
+  assert.match(textOf(panel), /Checked /);
+  assert.match(textOf(panel), /Bounded audit recovery: Unban actions · waiting · 3 entries checked · rate_limited/);
+  assert.match(textOf(panel), /Audit recovery next attempt:/);
+  assert.match(textOf(panel), /Audit recovery last progressed:/);
+  assert.doesNotMatch(textOf(panel), /Case /);
+});
+
+test('Members keeps polling audit-only recovery while visible and stops when it completes or hides', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      return response({ status: 'complete', phase: 'complete', progress_revision: 7, initial_completed_at: 1790000000000,
+        audit_recovery_status: statusReads < 3 ? 'waiting' : 'complete', audit_recovery_phase: 'ban' });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 1);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  h.document.visibilityState = 'hidden';
+  h.documentListeners.get('visibilitychange')();
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+  h.document.visibilityState = 'visible';
+  h.documentListeners.get('visibilitychange')();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 2);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 3);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members follows a succeeded Resume receipt with a fresh primary status read', async () => {
+  const guildId = '987654321098765432';
+  const action = { id: 'sync-action-1', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  const statuses = [
+    { status: 'paused', progress_revision: 5 },
+    { status: 'paused', progress_revision: 5 },
+    { status: 'queued', progress_revision: 6 },
+    { status: 'complete', progress_revision: 7 },
+  ];
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) return response({ phase: 'members', run_id: 'initial-1', initial_completed_at: null, ...statuses[statusReads++] });
+    if (url.endsWith('/actions')) return response([action]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 1);
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Resume requested · bot action pending/);
+  assert.equal(statusReads, 2);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  action.state = 'succeeded';
+  await runMemberPoll(h);
+  assert.equal(statusReads, 4);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members clears a Pause that lands after the import already completed', async () => {
+  const guildId = '987654321098765432';
+  const action = { id: 'sync-action-pause-late', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      return response(statusReads === 1
+        ? { status: 'running', phase: 'members', run_id: 'initial-1', progress_revision: 4 }
+        : { status: 'complete', phase: 'complete', run_id: 'initial-1', progress_revision: 4, initial_completed_at: 1790000000000 });
+    }
+    if (url.endsWith('/actions')) return response([{ ...action, outcome: 'member_sync_already_completed' }]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Pause').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Pause requested/);
+  action.state = 'succeeded';
+  await runMemberPoll(h);
+  assert.doesNotMatch(textOf(panel), /Pause requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members releases a reused successful Retry after reading current status', async () => {
+  const guildId = '987654321098765432';
+  const session = new Map();
+  const receipt = { id: 'earlier-retry', guild_id: guildId, actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'succeeded' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(receipt);
+    if (url.endsWith('/member-sync')) return response({ status: 'waiting', phase: 'members', run_id: 'initial-1', progress_revision: 8 });
+    if (url.endsWith('/actions')) return response([receipt]);
+    return response({ members: [], next_cursor: null });
+  }, new Map(), session);
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const key = `${h.app.workspaceKey()}:action:POST:/api/guilds/${guildId}/member-sync/actions:{"operation":"retry"}`;
+  session.set(key, JSON.stringify({ request_id: '1000_previous', enrollment_id: 'member-enrollment' }));
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert(retry && !retry.disabled);
+  await retry.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Retry requested/);
+  assert.equal(findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry').disabled, false);
+});
+
+test('Members stops pending-control polling when the bot action fails', async () => {
+  const action = { id: 'sync-action-failed', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response({ ...action, state: 'pending' });
+    if (url.endsWith('/member-sync')) return response({ status: 'paused', phase: 'members', run_id: 'initial-1', progress_revision: 5 });
+    if (url.endsWith('/actions')) return response([{ ...action, state: 'failed' }]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /resume action failed. Check Bot actions for details/);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members retains an acknowledged control and retries after a status refresh error', async () => {
+  let statusReads = 0;
+  const action = { id: 'sync-action-delayed', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads > 1) throw new Error('temporary outage');
+      return response({ status: 'paused', phase: 'members', run_id: 'initial-1', progress_revision: 5 });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Resume requested · bot action pending/);
+  assert.match(textOf(panel), /Could not refresh import status/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+});
+
+test('Members retries its first failed visible status read and renders the recovered status', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads === 1) throw new Error('temporary outage');
+      return response({ status: 'complete', phase: 'complete', run_id: 'restored-run', progress_revision: 2,
+        initial_completed_at: 1790000000000, processed: 12, total_estimate: 12, total_is_estimated: false, percent: 100 });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Could not load import status. Retrying shortly while visible/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 1);
+  await runMemberPoll(h);
+  assert.equal(statusReads, 2);
+  assert.match(textOf(panel), /12 records committed in this run/);
+  assert.doesNotMatch(textOf(panel), /Could not load import status/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members accepts a later primary restore status but rejects an older in-flight response', async () => {
+  let statusReads = 0;
+  let resolveOldRequest;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) {
+      statusReads++;
+      if (statusReads === 2) return new Promise(resolve => { resolveOldRequest = resolve; });
+      return response(statusReads === 1
+        ? { status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 20, processed: 99 }
+        : { status: 'complete', phase: 'complete', run_id: 'restored-run', progress_revision: 3, processed: 3,
+            initial_completed_at: 1790000000000, reconciliation_needed: true });
+    }
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  refresh.listeners.click();
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(statusReads, 3);
+  assert.match(textOf(panel), /3 records committed in this run/);
+  assert.match(textOf(panel), /Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement/);
+  resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /3 records committed in this run/);
+  assert.doesNotMatch(textOf(panel), /777 records committed/);
+});
+
+test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
+  const action = { id: 'sync-action-before-restore', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'member-enrollment', state: 'pending' };
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) return response(action);
+    if (url.endsWith('/member-sync')) return response(statusReads++ === 0
+      ? { status: 'paused', phase: 'members', run_id: 'before-restore', progress_revision: 10 }
+      : { status: 'paused', phase: 'members', run_id: 'restored-run', progress_revision: 2, reconciliation_needed: true });
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  await findNode(panel, n => n.tag === 'button' && textOf(n) === 'Resume').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Import status changed after a restore. Check Bot actions/);
+  assert.doesNotMatch(textOf(panel), /Resume requested/);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
+});
+
+test('Members shows 100 percent on completed status and labels a live member ETA preliminary', async () => {
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response(statusReads++ === 0
+      ? { status: 'queued', phase: 'members', run_id: 'initial-1', progress_revision: 1, processed: 10,
+          total_estimate: 100, total_is_estimated: true, percent: 10, phase_remaining_seconds: 900,
+          phase_finish_at: 1790000900000, estimate_reason: 'preliminary member-stage estimate; later stages have unknown totals' }
+      : { status: 'complete', phase: 'complete', run_id: 'initial-1', progress_revision: 2, processed: 100,
+          total_estimate: 100, total_is_estimated: false, percent: 100 });
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Preliminary member-stage estimate; later stages have unknown totals/);
+  assert.match(textOf(panel), /10% of estimated member phase/);
+  await runMemberPoll(h);
+  const bar = findNode(panel, n => n.tag === 'progress');
+  assert.equal(bar.attrs.value, '100');
+  assert.equal(bar.attrs['aria-valuetext'], 'Complete');
+  assert.match(textOf(panel), /100% complete/);
+  assert.doesNotMatch(textOf(panel), /99%/);
+});
+
+test('Members keeps completed phases done while local case history finishes and shows phase counts', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ status: 'waiting', phase: 'complete', run_id: 'initial-1', progress_revision: 12,
+        status_reason: 'finishing local case history', processed: 24, member_processed: 20,
+        ban_processed: 3, verify_processed: 1, audit_processed: 2,
+        local_history_complete: false, total_estimate: 20, total_is_estimated: false,
+        percent: null, as_of: 1790000000000 })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const copy = textOf(panel);
+  assert.match(copy, /Members: done · 20 committed/);
+  assert.match(copy, /Current bans: done · 3 committed/);
+  assert.match(copy, /Candidate checks: done · 1 committed/);
+  assert.match(copy, /Available audit history: done · 2 committed/);
+  assert.match(copy, /Local case history: waiting/);
+  assert.doesNotMatch(copy, /100% complete/);
+  const bar = findNode(panel, n => n.tag === 'progress');
+  assert.equal(bar.attrs.value, undefined);
+});
+
+test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ status: 'queued', phase: 'bans', progress_revision: 9, processed: 80, total_estimate: 80, total_is_estimated: false,
+        estimate_reason: 'worker_unconfirmed', phase_remaining_seconds: null, phase_finish_at: 1790999999999, as_of: 1790000000000 })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const copy = textOf(panel);
+  assert.match(copy, /80 members counted/);
+  assert.match(copy, /Current bans: queued · committed count unknown/);
+  assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
+  assert.match(copy, /bot may be between paced pages/);
+  assert.doesNotMatch(copy, /worker is offline/i);
+});
+
+test('Members keeps controls unavailable until a real first job exists and after corrupt metadata loss', async () => {
+  const statuses = [
+    { status: 'queued', phase: 'members', run_kind: 'initial', run_id: null, progress_revision: 0,
+      status_reason: 'awaiting first bot initialization' },
+    { status: 'needs_attention', phase: null, run_id: null, progress_revision: 0,
+      status_reason: 'member import metadata is missing' },
+    { status: 'queued', phase: 'members', run_kind: 'initial', run_id: 'real-first-run', progress_revision: 1 },
+  ];
+  let reads = 0, actionPosts = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync/actions')) { actionPosts++; return response({ id: 'action', state: 'pending' }); }
+    if (url.endsWith('/member-sync')) return response(statuses[reads++]);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const controls = () => ['Pause', 'Resume', 'Retry', 'Reconcile from Discord']
+    .map(label => findNode(panel, n => n.tag === 'button' && textOf(n) === label));
+  assert.match(textOf(panel), /bot will create the first import job when it is online/);
+  assert(controls().every(button => button.disabled));
+  await controls()[0].listeners.click();
+  assert.equal(actionPosts, 0, 'even a stale programmatic click cannot submit without a job');
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
+  assert(controls().every(button => button.disabled));
+  await controls()[2].listeners.click();
+  assert.equal(actionPosts, 0);
+  refresh.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(controls()[0].disabled, false, 'Pause becomes available once the first run exists');
+});
+
+test('Members enables Retry when audit recovery pagination stalls after initial complete', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({
+      status: 'complete',
+      phase: 'complete',
+      run_id: 'initial-done',
+      progress_revision: 7,
+      initial_completed_at: 1790000000000,
+      audit_recovery_status: 'needs_attention',
+      audit_recovery_reason: 'pagination_stalled',
+    })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert.equal(retry.disabled, false);
+  const reconcile = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Reconcile from Discord');
+  assert.equal(reconcile.disabled, false);
+});
+
+test('Members keeps Retry disabled after initial complete when audit recovery is healthy', async () => {
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({
+      status: 'complete',
+      phase: 'complete',
+      run_id: 'initial-done',
+      progress_revision: 7,
+      initial_completed_at: 1790000000000,
+      audit_recovery_status: 'complete',
+    })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  const retry = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Retry');
+  assert.equal(retry.disabled, true);
+});
+
+test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
+  const asOf = 1790000000000;
+  const statuses = [
+    { status: 'waiting', status_reason: 'rate_limited', estimate_reason: 'rate_limited',
+      next_attempt_at: asOf + 90000, phase_remaining_seconds: 240, phase_finish_at: asOf + 240000,
+      processed: 0, last_progress_at: asOf - 60000, as_of: asOf,
+      last_success_at: asOf - 120000, last_success_processed: 11000, last_success_inserted: 10900,
+      last_success_updated: 50, last_success_unchanged: 50 },
+    { status: 'waiting', status_reason: 'discord_unavailable', estimate_reason: 'discord_unavailable',
+      next_attempt_at: asOf + 90000, phase_remaining_seconds: 240, phase_finish_at: asOf + 240000,
+      last_progress_at: asOf - 60000, as_of: asOf },
+    { status: 'paused', estimate_reason: 'paused', phase_remaining_seconds: 240,
+      phase_finish_at: asOf + 240000, as_of: asOf },
+    { status: 'queued', estimate_reason: 'worker_offline', phase_remaining_seconds: 240,
+      phase_finish_at: asOf + 240000, as_of: asOf },
+  ];
+  let reads = 0;
+  const h = harness(async (url) => url.endsWith('/member-sync')
+    ? response({ phase: 'members', progress_revision: reads + 1, ...statuses[reads++] })
+    : response({ members: [], next_cursor: null }));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  let copy = textOf(panel);
+  assert.match(copy, /Rate limit: retry in 1m 30s/);
+  assert.match(copy, /Remaining: about 4 minutes for this phase · Expected finish: (?!Unknown)/);
+  assert.match(copy, /0 records committed in this run/);
+  assert.match(copy, /Last successful run: .*11,000 processed · 10,900 inserted · 50 updated · 50 unchanged/);
+  assert.match(copy, /Last committed progress:/);
+  assert.match(copy, /Status read at/);
+  assert.doesNotMatch(copy, /Status updated/);
+  const countdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(countdown, 'known rate limit schedules a visible countdown');
+  h.advanceTime(1500);
+  h.timers.delete(countdown[0]);
+  countdown[1].fn();
+  assert.match(textOf(panel), /Rate limit: retry in 1m 29s/);
+  h.advanceTime(60000);
+  const laterCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(laterCountdown);
+  h.timers.delete(laterCountdown[0]);
+  laterCountdown[1].fn();
+  assert.match(textOf(panel), /Remaining: about 3 minutes for this phase/);
+  assert.match(textOf(panel), /Rate limit: retry in 0m 29s/);
+  h.advanceTime(190000);
+  const expiredCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
+  assert(expiredCountdown);
+  h.timers.delete(expiredCountdown[0]);
+  expiredCountdown[1].fn();
+  assert.match(textOf(panel), /Remaining: Unknown · Expected finish: Unknown/);
+  assert.match(textOf(panel), /Rate limit: retry due now/);
+  const refresh = findNode(panel, n => n.tag === 'button' && textOf(n) === 'Refresh');
+  for (const reason of ['discord_unavailable', 'paused', 'worker_offline']) {
+    refresh.listeners.click();
+    await new Promise(resolve => setImmediate(resolve));
+    copy = textOf(panel);
+    assert.match(copy, /Remaining: Unknown · Expected finish: Unknown|Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
+    assert.doesNotMatch(copy, /Rate limit: retry in/);
+    assert.equal([...h.timers.values()].filter(timer => timer.delay === 1000).length, 0, reason);
+  }
+});
+
+test('Members rejects a pending old search result before the debounce fires', async () => {
+  const pending = [];
+  const h = harness((url, opts) => url.endsWith('/member-sync')
+    ? Promise.resolve(response({ status: 'complete', phase: 'complete' }))
+    : new Promise(resolve => pending.push({ url, opts, resolve })));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  assert.equal(pending.length, 1);
+  const search = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Search members');
+  search.value = 'New Query';
+  search.listeners.input();
+  assert.equal(pending[0].opts.signal.aborted, true);
+  pending[0].resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Old Result' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Old Result/);
+  const debounce = [...h.timers].find(([, timer]) => timer.delay === 300);
+  assert(debounce);
+  h.timers.delete(debounce[0]);
+  debounce[1].fn();
+  assert.equal(pending.length, 2);
+  assert.match(pending[1].url, /q=New\+Query/);
+  pending[1].resolve(response({ members: [{ user_id: '1800882749273538600', display_name: 'New Result' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /New Result/);
+  assert.doesNotMatch(textOf(panel), /Old Result/);
+});
+
+test('Members filter, date, and sort changes discard old history and list responses immediately', async () => {
+  const pending = [];
+  let listReads = 0;
+  const h = harness((url, opts) => {
+    if (url.endsWith('/member-sync')) return Promise.resolve(response({ status: 'complete', phase: 'complete' }));
+    if (url.includes('/history')) return new Promise(resolve => pending.push({ type: 'history', url, opts, resolve }));
+    if (listReads++ === 0) return Promise.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Willow' }] }));
+    return new Promise(resolve => pending.push({ type: 'list', url, opts, resolve }));
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await new Promise(resolve => setImmediate(resolve));
+  findNode(panel, n => n.tag === 'button' && textOf(n) === 'View history').listeners.click();
+  const history = pending.find(item => item.type === 'history');
+  assert(history);
+  const filter = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Member status');
+  filter.value = 'banned';
+  filter.listeners.change();
+  assert.equal(history.opts.signal.aborted, true);
+  history.resolve(response({ entries: [{ kind: 'ban', occurred_at_ms: 1790000000000, source_kind: 'discord_audit' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Discord audit action/);
+  const oldList = pending.find(item => item.type === 'list');
+  assert.match(oldList.url, /status=banned/);
+  const date = findNode(panel, n => n.tag === 'input' && n.attrs['aria-label'] === 'Joined from date, UTC');
+  date.value = '2026-09-01';
+  date.listeners.input();
+  assert.equal(oldList.opts.signal.aborted, true);
+  oldList.resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong Filter' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Wrong Filter/);
+  const sort = findNode(panel, n => n.tag === 'select' && n.attrs['aria-label'] === 'Join date order');
+  sort.value = 'joined_oldest';
+  sort.listeners.change();
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 300).length, 0);
+  const newList = pending.filter(item => item.type === 'list').at(-1);
+  assert.match(newList.url, /joined_from=2026-09-01/);
+  assert.match(newList.url, /sort=joined_oldest/);
+  newList.resolve(response({ members: [{ user_id: '1800882749273538601', display_name: 'Right Filter' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(panel), /Right Filter/);
+});
+
+test('Members drops responses from a previous server and page enrollment', async () => {
+  const pending = [];
+  const h = harness((url) => new Promise(resolve => pending.push({ url, resolve })));
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'old-enrollment' };
+  const panel = h.app.tabMembers();
+  h.app.state.config = { enrollment_id: 'replacement-enrollment' };
+  pending.find(item => item.url.endsWith('/member-sync')).resolve(response({ status: 'complete', phase: 'complete', progress_revision: 100, processed: 1 }));
+  pending.find(item => item.url.includes('/members?')).resolve(response({ members: [{ user_id: '1800882749273538599', display_name: 'Wrong server' }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(textOf(panel), /Wrong server/);
+  assert.doesNotMatch(textOf(panel), /Initial member import/);
 });
 
 test('dropdown option arrays become real nodes and boolean false stays false', () => {
@@ -1330,11 +1969,11 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   assert.match(calls[3].url, /\/actions\/log-run$/);
 });
 
-test('moderation reads send the loaded page membership including query-string routes', async () => {
+test('moderation and member reads send the loaded page membership including query-string routes', async () => {
   const calls = [];
   const h = harness(async (url, opts) => { calls.push({url,opts}); return response({}); });
   h.app.state.config = { enrollment_id: 'page-membership' };
-  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles']) {
+  for (const suffix of ['events?event=member_ban&user=123', 'bans?limit=100', 'stats', 'cases', 'cases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'case-delete-roles', 'members?q=willow', 'members/1800882749273538599/history', 'member-sync']) {
     await h.app.api(`/api/guilds/${h.app.state.guildId}/${suffix}`);
     assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], 'page-membership');
   }
@@ -1343,7 +1982,7 @@ test('moderation reads send the loaded page membership including query-string ro
   h.app.state.config = null;
   await h.app.api(`/api/guilds/${h.app.state.guildId}/stats`);
   assert.equal(calls.at(-1).opts.headers['x-jmodguard-enrollment'], undefined);
-  assert.equal(calls.length, 8, 'reads must not silently load a new membership');
+  assert.equal(calls.length, 11, 'reads must not silently load a new membership');
 });
 
 test('individual configuration GETs retain loaded membership without rebinding global or foreign scopes', async () => {
