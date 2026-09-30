@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
 // Minimal DOM boundary: assertions inspect the actual children/attributes that
 // production el() sends to the browser, without duplicating its implementation.
-function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true) {
+function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timers = { setTimeout: () => 0, clearTimeout() {} }) {
   const elements = [];
   const location = {
     search: '', pathname: '/', hash: '', replaced: null,
@@ -87,6 +87,9 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   }
   const context = vm.createContext({
     document: {
+      visibilityState: 'visible', listeners: {},
+      addEventListener(name, handler) { this.listeners[name] = handler; },
+      removeEventListener(name, handler) { if (this.listeners[name] === handler) delete this.listeners[name]; },
       createElement(tag) { const n = node(tag); elements.push(n); return n; },
       createTextNode(text) { return { nodeType: 3, textContent: String(text) }; },
       getElementById: (id) => nodes.get('#' + id) || null,
@@ -95,9 +98,9 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     window: win,
     location,
     history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: () => 0, clearTimeout() {}, confirm, crypto: { randomUUID },
+    fetch: fetchImpl, console, AbortController, URLSearchParams, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabMembers, tabActions, tabBans, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -234,6 +237,117 @@ test('saved Members tab restores for the selected guild', () => {
   app.restoreWorkspace();
   assert.equal(app.state.guildId, guildId);
   assert.equal(app.state.tab, 'members');
+});
+
+const flushMembers = () => new Promise(resolve => setImmediate(resolve));
+function memberTimers() {
+  const active = new Map();
+  let next = 0;
+  return { active, setTimeout(fn, delay) { const id = ++next; active.set(id, { fn, delay }); return id; }, clearTimeout(id) { active.delete(id); } };
+}
+function memberView(h) {
+  h.app.state.config = { enrollment_id: 'membership' };
+  h.app.state.tab = 'members';
+  return h.app.tabMembers();
+}
+
+for (const completed of [false, true]) test(`Members reads status after success before releasing controls (${completed ? 'already completed' : 'pause applied'})`, async () => {
+  const requests = [];
+  const timers = memberTimers();
+  const h = harness((url, opts) => new Promise(resolve => requests.push({ url, opts, resolve })), new Map(), new Map(), undefined, timers);
+  const panel = memberView(h);
+  const syncReads = () => requests.filter(r => r.url.endsWith('/member-sync'));
+  syncReads()[0].resolve(response({ run_id: 'run', status: 'running', phase: 'members', progress_revision: 10 }));
+  requests.find(r => r.url.includes('/members?')).resolve(response({ members: [] }));
+  await flushMembers();
+  const click = findNode(panel, n => n.textContent === 'Pause').listeners.click({});
+  requests.find(r => r.url.endsWith('/member-sync/actions')).resolve(response(queuedAction('pending')));
+  await click;
+  // This primary read began before the worker completed; its old status is legitimate.
+  syncReads()[1].resolve(response({ run_id: 'run', status: 'running', phase: 'members', progress_revision: 10 }));
+  await flushMembers();
+  requests.find(r => r.url === `/api/guilds/${h.app.state.guildId}/actions`).resolve(response([{ ...queuedAction('succeeded'), outcome: completed ? 'member_sync_already_completed' : 'member_sync_updated' }]));
+  await flushMembers();
+  assert.equal(syncReads().length, 3, 'success must issue a fresh status request');
+  assert.match(textOf(panel), /Waiting for the import status to reflect it/);
+  assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
+  assert.ok([...timers.active.values()].some(t => t.delay === 10000));
+  // A completed-import no-op succeeds without incrementing progress_revision.
+  syncReads()[2].resolve(response({ run_id: 'run', status: completed ? 'complete' : 'paused', phase: completed ? 'complete' : 'members', progress_revision: completed ? 10 : 11 }));
+  await flushMembers();
+  assert.doesNotMatch(textOf(panel), /Waiting for the import status to reflect it/);
+  assert.match(textOf(panel), completed ? /complete · complete/ : /members · paused/);
+  assert.equal([...timers.active.values()].filter(t => t.delay === 10000).length, 0);
+  for (const request of requests) assert.equal(request.opts.headers['x-jmodguard-enrollment'], 'membership');
+});
+
+for (const code of ['member_sync_missing_job', 'member_sync_invalid_operation']) test(`Members shows ${code} inline and refreshes rejected controls`, async () => {
+  const calls = [];
+  const message = code === 'member_sync_missing_job' ? 'Import job is unavailable.' : 'This control is no longer available.';
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.endsWith('/member-sync/actions')) return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ code, error: message }) };
+    if (url.endsWith('/member-sync')) return response(calls.some(c => c.url.endsWith('/member-sync/actions'))
+      ? { run_id: code === 'member_sync_missing_job' ? null : 'run', status: code === 'member_sync_missing_job' ? 'needs_attention' : 'paused' }
+      : { run_id: 'run', status: 'running', phase: 'members' });
+    return response({ members: [] });
+  });
+  const panel = memberView(h);
+  await flushMembers();
+  await findNode(panel, n => n.textContent === 'Pause').listeners.click({});
+  await flushMembers();
+  assert.match(textOf(panel), new RegExp(message.replace(/\./g, '\\.')));
+  assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
+  assert.equal(calls.filter(c => c.url.endsWith('/member-sync')).length, 2);
+  assert.equal(calls.filter(c => c.url.endsWith('/member-sync/actions')).length, 1);
+  assert.equal(h.session.size, 1, 'denial must preserve the submitted request identity');
+});
+
+for (const route of ['same guild', 'late callback', 'cancelled navigation']) test(`Members case handoff: ${route}`, async () => {
+  const calls = [];
+  const h = harness(async url => {
+    calls.push(url);
+    if (url.endsWith('/member-sync')) return response({ status: 'complete' });
+    if (url.includes('/members?')) return response({ members: [{ user_id: '7' }] });
+    if (url.includes('/members/7/history')) return response({ entries: [{ kind: 'ban', case_id: 'case-one' }] });
+    return response({ cases: [], history: [] });
+  }, new Map(), new Map(), () => false);
+  const panel = memberView(h);
+  const originalGuild = h.app.state.guildId;
+  await flushMembers();
+  await findNode(panel, n => n.textContent === 'View history').listeners.click({});
+  await flushMembers();
+  const jump = findNode(panel, n => n.textContent === 'Case case-one');
+  if (route === 'late callback') h.app.state.guildId = h.app.state.guilds[1].id;
+  if (route === 'cancelled navigation') h.app.markDirty();
+  await jump.listeners.click({});
+  await flushMembers();
+  if (route === 'same guild') {
+    assert.ok(calls.includes(`/api/guilds/${originalGuild}/cases/case-one`));
+    assert.equal(h.app.state.tab, 'cases');
+  } else {
+    h.app.state.guildId = h.app.state.guilds[1].id;
+    h.app.tabCases();
+    await flushMembers();
+    assert.equal(calls.filter(url => url.includes('/cases/case-one')).length, 0, 'old case intent must not follow a changed/cancelled view');
+  }
+});
+
+test('Members empty copy follows status completion without refetching the directory', async () => {
+  const timers = memberTimers();
+  const calls = [];
+  let sync = { run_id: 'run', status: 'running', phase: 'members', progress_revision: 1 };
+  const h = harness(async url => { calls.push(url); return response(url.endsWith('/member-sync') ? sync : { members: [] }); }, new Map(), new Map(), undefined, timers);
+  const panel = memberView(h);
+  await flushMembers();
+  assert.match(textOf(panel.querySelector('tbody')), /Import may still be incomplete/);
+  const [id, poll] = [...timers.active].find(([, timer]) => timer.delay === 10000);
+  timers.active.delete(id);
+  sync = { run_id: 'run', status: 'complete', phase: 'complete', progress_revision: 2 };
+  await poll.fn();
+  assert.match(textOf(panel), /complete · complete/);
+  assert.equal(textOf(panel.querySelector('tbody')), 'No members match these filters.');
+  assert.equal(calls.filter(url => url.includes('/members?')).length, 1);
 });
 
 test('dropdown option arrays become real nodes and boolean false stays false', () => {

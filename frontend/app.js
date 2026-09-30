@@ -77,7 +77,7 @@ const pendingLogChannelActions = new Map();
 const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 80000, 120000, 150000];
 const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "members", "bans", "actions", "cases", "settings"];
 let disposeMembersView = null;
-let pendingCaseId = null;
+let pendingCase = null;
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -969,6 +969,7 @@ async function init() {
     sel.addEventListener("change", async () => {
       if (!canLeave()) { sel.value = state.guildId || ""; if (sel._searchRefresh) sel._searchRefresh(); return; }
       pendingDrafts = null;
+      pendingCase = null;
       state.guildId = sel.value;
       state.config = null;
       dirty = false;
@@ -2196,6 +2197,9 @@ function tabMembers() {
   let latestStatus = null, latestStatusRevision = -1, statusRetryNeeded = false;
   let latestStatusReceivedAt = 0;
   let pendingSyncAction = null, syncActionOutcome = null;
+  let emptyMembersCell = null;
+  const emptyMembersText = () => latestStatus?.status === "complete"
+    ? "No members match these filters." : "No saved members match yet. Import may still be incomplete.";
   const aliveHere = () => !disposed && alive();
   const clearTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
   const clearCountdown = () => { if (countdownTimer !== null) clearTimeout(countdownTimer); countdownTimer = null; };
@@ -2317,7 +2321,17 @@ function tabMembers() {
         controls.append(el("button", { class: "btn small", text: label, disabled, onclick: async () => {
           if (!latestStatus?.run_id) return;
           if (operation === "reconcile" && !confirm("Request a full current-member and current-ban reconciliation from Discord? This can take a while.")) return;
-          const job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", { operation });
+          let job;
+          try {
+            job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", { operation });
+          } catch (error) {
+            if (error.status !== 409 || !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)) throw error;
+            if (!aliveHere()) return;
+            syncActionOutcome = error.message;
+            renderStatus(latestStatus);
+            loadStatus();
+            return;
+          }
           if (!aliveHere()) return;
           syncActionOutcome = null;
           if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
@@ -2354,6 +2368,7 @@ function tabMembers() {
       latestStatus = sync;
       latestStatusRevision = revision;
       latestStatusReceivedAt = Date.now();
+      if (emptyMembersCell) emptyMembersCell.textContent = emptyMembersText();
       renderStatus(sync);
       schedulePoll();
       if (pendingSyncAction) {
@@ -2392,6 +2407,7 @@ function tabMembers() {
     const request = ++listRequest;
     listAbort?.abort();
     listAbort = new AbortController();
+    emptyMembersCell = null;
     body.replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading members…" })));
     try {
       const q = new URLSearchParams({ limit: "50", status: statusFilter.value, sort: sort.value });
@@ -2414,7 +2430,8 @@ function tabMembers() {
         el("td", {}, member.is_banned ? "Currently banned" : member.is_current ? "Current" : member.ever_banned ? "Previously banned" : "Departed",
           member.is_banned && member.current_ban_reason ? el("small", { class: "muted", text: ` · Current reason: ${member.current_ban_reason}` }) : null),
         el("td", {}, el("button", { class: "btn small", text: "View history", onclick: () => openMember(member.user_id, member.display_name) }))));
-      body.replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: 5, class: "muted", text: latestStatus?.status === "complete" ? "No members match these filters." : "No saved members match yet. Import may still be incomplete." }))]));
+      emptyMembersCell = rows.length ? null : el("td", { colspan: 5, class: "muted", text: emptyMembersText() });
+      body.replaceChildren(...(rows.length ? rows : [el("tr", {}, emptyMembersCell)]));
     } catch (error) {
       if (!aliveHere() || request !== listRequest || error.message === "Failed to fetch") return;
       body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load members. Refresh to retry." })));
@@ -2452,7 +2469,11 @@ function tabMembers() {
           event.kind === "ban_absent_state_observation" || event.kind === "ban_state_observation" ? "Ban absent (time unknown)" : eventLabel;
         detail.append(el("p", {},
           el("strong", { text: `${visibleLabel} · ${asDate(event.occurred_at_ms)}` }),
-          event.case_id ? el("button", { class: "btn small", text: `Case ${event.case_id}`, onclick: () => { pendingCaseId = event.case_id; navigate("cases"); } }) : null,
+          event.case_id ? el("button", { class: "btn small", text: `Case ${event.case_id}`, onclick: () => {
+            if (!aliveHere()) return;
+            pendingCase = { guildId, caseId: event.case_id };
+            try { navigate("cases"); } finally { pendingCase = null; }
+          } }) : null,
           el("span", { class: "muted", text: `${sourceLabel ? ` ${sourceLabel}` : ""}${event.source_kind === "discord_audit_unresolved" && event.observation_id ? ` · Audit entry ${event.observation_id}` : ""}${event.observed_at_ms && event.source_kind === "state_reconciliation" ? ` · Checked ${asDate(event.observed_at_ms)}` : ""}${event.outcome ? ` · ${event.outcome}` : ""}${event.moderator_id ? ` · moderator ${event.moderator_id}` : ""}${event.reason ? ` · ${event.reason}` : ""}` })));
       }
       cursor = page.next_cursor || null;
@@ -2465,6 +2486,7 @@ function tabMembers() {
   const invalidateResults = () => {
     ++listRequest;
     listAbort?.abort();
+    emptyMembersCell = null;
     ++detailRequest;
     detailAbort?.abort();
     after = "";
@@ -2652,11 +2674,9 @@ function tabCases() {
     }
   };
   run();
-  if (pendingCaseId) {
-    const id = pendingCaseId;
-    pendingCaseId = null;
-    openCase(id);
-  }
+  const handoff = pendingCase;
+  pendingCase = null;
+  if (handoff?.guildId === guildId) openCase(handoff.caseId);
   return el("div", {},
     el("h2", { text: "Cases" }),
     el("p", { class: "muted", text: "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord." }),
