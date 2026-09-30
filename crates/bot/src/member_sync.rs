@@ -79,6 +79,11 @@ fn due_work(
     work
 }
 
+// Import and audit recovery share one guild in persisted pacing/ETA metadata.
+fn ready_guild_count(guilds: impl Iterator<Item = GuildId>) -> u32 {
+    guilds.collect::<HashSet<_>>().len() as u32
+}
+
 fn cursor_id(cursor: &Option<String>) -> anyhow::Result<Option<u64>> {
     cursor
         .as_deref()
@@ -1087,7 +1092,8 @@ pub async fn run(
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         }
-        let active_guild_count = ready.len() as u32;
+        let active_guild_count =
+            ready_guild_count(ready.iter().map(|(guild_id, _, _, _)| *guild_id));
         let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
             continue;
         };
@@ -1476,9 +1482,8 @@ mod tests {
         assert!(audit_position(Some("123")).is_err());
     }
 
-    #[test]
-    fn audit_only_recovery_is_ready_after_completed_import() {
-        let status = db::guild_data::MemberSyncStatus {
+    fn completed_import_with_audit_recovery() -> db::guild_data::MemberSyncStatus {
+        db::guild_data::MemberSyncStatus {
             initial_completed_at: Some(1),
             reconciliation_needed: true,
             reconciliation_reason: Some("gateway continuity interrupted".into()),
@@ -1522,8 +1527,38 @@ mod tests {
             audit_recovery_next_attempt_at: Some(3),
             audit_recovery_reason: None,
             audit_recovery_last_progress_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn audit_only_recovery_is_ready_after_completed_import() {
+        let status = completed_import_with_audit_recovery();
         assert_eq!(due_work(&status, 3, 15_000), vec![ReadyWork::AuditRecovery]);
+    }
+
+    #[test]
+    fn ready_guild_count_does_not_double_count_import_and_audit_recovery() {
+        assert_eq!(ready_guild_count(std::iter::empty()), 0);
+        let mut status = completed_import_with_audit_recovery();
+        status.status = "queued".into();
+        status.phase = Some("members".into());
+        status.run_kind = Some("reconcile".into());
+        let work = due_work(&status, 3, 15_000);
+        assert_eq!(work, vec![ReadyWork::Import, ReadyWork::AuditRecovery]);
+        let mut ready: Vec<_> = work
+            .into_iter()
+            .map(|work| (GuildId::new(10), work))
+            .collect();
+        assert_eq!(ready_guild_count(ready.iter().map(|(guild, _)| *guild)), 1);
+
+        // Another guild with only audit recovery adds one scheduling share.
+        ready.extend(
+            due_work(&completed_import_with_audit_recovery(), 3, 15_000)
+                .into_iter()
+                .map(|work| (GuildId::new(11), work)),
+        );
+        assert_eq!(ready.len(), 3);
+        assert_eq!(ready_guild_count(ready.iter().map(|(guild, _)| *guild)), 2);
     }
 
     #[test]
