@@ -3826,6 +3826,7 @@ async fn measured_second_member_page_accounts_for_competing_paced_check() {
         .unwrap()
         .phase_finish_at
         .unwrap();
+    assert_eq!(first_eta, 61_002);
     store
         .queue_member_target_check(
             scope.clone(),
@@ -3888,7 +3889,9 @@ async fn measured_second_member_page_accounts_for_competing_paced_check() {
         .await
         .unwrap();
     assert_eq!(status.member_processed, Some(2));
-    assert!(status.phase_finish_at.unwrap() > first_eta);
+    // The next request is due at 46_003; one member page and the terminal
+    // request each take the measured 30_001 ms cycle, including the check.
+    assert_eq!(status.phase_finish_at, Some(106_005));
     assert_eq!(
         store
             .member_sync_status(scope.clone(), 42, 32_000)
