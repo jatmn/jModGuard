@@ -40,6 +40,9 @@ fn managed_guild(id: u64) -> oauth::DiscordGuild {
 }
 impl Fixture {
     async fn new(operator: bool) -> Self {
+        Self::with_oauth_client_id(operator, "42").await
+    }
+    async fn with_oauth_client_id(operator: bool, oauth_client_id: &str) -> Self {
         let discord = Arc::new(DiscordStub {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
             failed: AtomicBool::new(false),
@@ -160,6 +163,7 @@ impl Fixture {
         let db = db::Db::open(&path, 2).unwrap();
         let mut cfg = crate::config::ApiProcessConfig::default();
         cfg.bot.owner_id = if operator { 42 } else { 99 };
+        cfg.web.oauth_client_id = oauth_client_id.into();
         let mut app = ApiState::new(cfg, db).unwrap();
         Arc::get_mut(&mut app).unwrap().oauth.guilds_endpoint =
             Some(format!("http://{address}/guilds"));
@@ -1008,6 +1012,267 @@ async fn configuration_snapshot_checks_its_captured_membership() {
 
 fn action_key(label: &str) -> String {
     format!("{}_{}", chrono::Utc::now().timestamp(), label)
+}
+
+#[tokio::test]
+async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fails() {
+    use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
+
+    struct Allowed;
+    #[async_trait::async_trait]
+    impl DiscordActions for Allowed {
+        fn bot_user_id(&self) -> Option<i64> {
+            Some(42)
+        }
+        async fn membership_matches(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+    }
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let path = "/api/guilds/10/member-sync/actions";
+    let body =
+        serde_json::json!({"request_id":action_key("unadmitted"),"operation":"pause"}).to_string();
+    let (status, rejected) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_missing_job");
+    let (_, actions) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(actions.as_array().unwrap().len(), 0);
+
+    let seeded = store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert!(seeded.run_id.is_some());
+    let body =
+        serde_json::json!({"request_id":action_key("queued"),"operation":"pause"}).to_string();
+    let (status, queued) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    jmodguard_bot::action_worker::drain_with_tenant(
+        &f.app.db,
+        &f.app.tenant,
+        &Allowed,
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    let (_, actions) = f.request("GET", "/api/guilds/10/actions", "").await;
+    assert_eq!(actions[0]["id"], queued["id"]);
+    assert_eq!(actions[0]["state"], "failed");
+    assert_eq!(actions[0]["outcome"], "member_sync_missing_job");
+
+    let body =
+        serde_json::json!({"request_id":action_key("missing"),"operation":"retry"}).to_string();
+    let (status, rejected) = f.request("POST", path, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_missing_job");
+    let still_missing = store
+        .initialize_member_directory(scope, 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert!(still_missing.run_id.is_none());
+    assert_eq!(still_missing.status, "needs_attention");
+}
+
+#[tokio::test]
+async fn member_sync_controls_reject_invalid_operations_before_queueing() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let path = "/api/guilds/10/member-sync/actions";
+    let reconcile = serde_json::json!({
+        "request_id": action_key("reconcile-early"),
+        "operation": "reconcile"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &reconcile).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE guild_member_sync SET status='needs_attention',status_reason='permission_denied',request_after_ms=? WHERE guild_id=10",
+            libsql::params![chrono::Utc::now().timestamp_millis() + 60_000],
+        )
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    let resume = serde_json::json!({
+        "request_id": action_key("resume-needs-attention"),
+        "operation": "resume"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &resume).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+
+    let retry = serde_json::json!({
+        "request_id": action_key("retry-needs-attention"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, queued) = f.request("POST", path, &retry).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+}
+
+#[tokio::test]
+async fn member_sync_retry_admits_audit_pagination_stall_after_initial_complete() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let enrollment_id = enrollment.id.clone();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let completed_at = chrono::Utc::now().timestamp_millis();
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db_path = std::path::PathBuf::from(guild_path.clone());
+    let guild_db = libsql::Builder::new_local(guild_db_path)
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=?1,last_success_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
+         VALUES(10,?1,42,'audit-run',?2,'needs_attention','pagination_stalled',0,0)
+         ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
+        libsql::params![enrollment_id.as_str(), completed_at],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(guild_db);
+
+    let path = "/api/guilds/10/member-sync/actions";
+    let retry = serde_json::json!({
+        "request_id": action_key("retry-audit-stall"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, queued) = f.request("POST", path, &retry).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    guild_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE guild_member_audit_recovery SET status='complete',status_reason=NULL WHERE guild_id=10",
+            (),
+        )
+        .await
+        .unwrap();
+    drop(guild_db);
+
+    let noop = serde_json::json!({
+        "request_id": action_key("retry-complete-no-stall"),
+        "operation": "retry"
+    })
+    .to_string();
+    let (status, rejected) = f.request("POST", path, &noop).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["code"], "member_sync_invalid_operation");
+}
+
+#[tokio::test]
+async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
+    let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["run_id"].as_str().is_some(), "{body}");
 }
 
 #[tokio::test]

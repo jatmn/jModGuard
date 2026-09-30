@@ -75,7 +75,9 @@ const pendingLogChannelActions = new Map();
 // Ten action-specific checks span the default 300-second queue lifetime plus
 // the maximum 120-second dispatch timeout without polling the general Actions page.
 const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 80000, 120000, 150000];
-const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "bans", "actions", "cases", "settings"];
+const tabs = ["dashboard", "rules", "badwords", "commands", "templates", "logchannels", "events", "members", "bans", "actions", "cases", "settings"];
+let disposeMembersView = null;
+let pendingCase = null;
 
 function workspaceKey() {
   return `jmodguard.workspace:${apiBase()}:${state.me.user.id}`;
@@ -590,8 +592,8 @@ function returnFromPreview() {
 function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
-  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|logfilters|unban|actions|events|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/);
-  if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "bans", "stats", "cases", "case-delete-roles"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
+  const edit = path.match(/^\/api\/guilds\/(\d+)\/(settings|rules|badwords|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/);
+  if (edit && (method !== "GET" || ["rules", "badwords", "commands", "templates", "logchannels", "actions", "events", "members", "member-sync", "bans", "stats", "cases", "case-delete-roles"].includes(edit[2])) && edit[1] !== "0" && edit[1] === state.guildId && state.config?.enrollment_id) {
     return state.config.enrollment_id;
   }
   return null;
@@ -967,6 +969,7 @@ async function init() {
     sel.addEventListener("change", async () => {
       if (!canLeave()) { sel.value = state.guildId || ""; if (sel._searchRefresh) sel._searchRefresh(); return; }
       pendingDrafts = null;
+      pendingCase = null;
       state.guildId = sel.value;
       state.config = null;
       dirty = false;
@@ -1142,7 +1145,7 @@ function renderTab() {
   const map = {
     dashboard: tabDashboard, rules: tabRules, badwords: tabBadwords, commands: tabCommands,
     templates: tabTemplates, logchannels: tabLogChannels,
-    events: tabEvents, bans: tabBans, actions: tabActions, cases: tabCases, settings: tabSettings,
+    events: tabEvents, members: tabMembers, bans: tabBans, actions: tabActions, cases: tabCases, settings: tabSettings,
   };
   document.querySelectorAll("#tabs button").forEach((b) => {
     const on = b.dataset.tab === state.tab;
@@ -1154,6 +1157,7 @@ function renderTab() {
   });
   const fn = map[state.tab] || tabDashboard;
   const content = $("#content");
+  if (disposeMembersView) { disposeMembersView(); disposeMembersView = null; }
   unmountVendorWidgets(content);
   content.innerHTML = "";
   dirty = false;
@@ -2136,7 +2140,8 @@ function tabActions() {
       if (!jobs.length) body.append(el("tr", {}, el("td", { colspan: 6, text: "No bot actions yet." })));
       for (const job of jobs) {
         const target = job.action.kind === "unban" ? `Unban ${job.action.user_id}` :
-          `${job.action.event}: ${job.action.channel_id || "clear log channel"}`;
+          job.action.kind === "member_sync" ? `Member sync: ${job.action.operation}` :
+            `${job.action.event}: ${job.action.channel_id || "clear log channel"}`;
         body.append(el("tr", {},
           el("td", { text: new Date(job.created_at * 1000).toLocaleString() }),
           el("td", { text: target }), el("td", { text: job.actor_id }),
@@ -2157,6 +2162,377 @@ function tabActions() {
   return el("div", {}, el("h2", { text: "Bot actions" }),
     el("p", { class: "muted", text: "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. Cancel unstarted work, including claimed requests the bot has not dispatched. Force-cancel a stuck log-channel request that is running or unknown so a new save can run; this does not undo Discord." }),
     el("button", { class: "btn standalone-action", text: "Refresh", onclick: run }), table);
+}
+
+function memberTime(value) {
+  if (value === null || value === undefined || value === "") return "Unknown";
+  const date = new Date(typeof value === "string" && !/^\d+$/.test(value) ? value : Number(value));
+  return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString(undefined, { timeZoneName: "short" });
+}
+
+function tabMembers() {
+  const guildId = state.guildId;
+  const enrollmentId = state.config?.enrollment_id;
+  const alive = () => state.guildId === guildId && state.config?.enrollment_id === enrollmentId && state.tab === "members";
+  const search = el("input", { type: "search", placeholder: "User ID, mention, display name or username", "aria-label": "Search members" });
+  const statusFilter = el("select", { "aria-label": "Member status" },
+    ...[["current", "Current members"], ["banned", "Currently banned"], ["previously_banned", "Previously banned"], ["all", "All retained"]]
+      .map(([value, label]) => el("option", { value, text: label })));
+  const joinedFrom = el("input", { type: "date", "aria-label": "Joined from date, UTC" });
+  const joinedTo = el("input", { type: "date", "aria-label": "Joined through date, UTC" });
+  const sort = el("select", { "aria-label": "Join date order" },
+    el("option", { value: "joined_newest", text: "Newest join first" }),
+    el("option", { value: "joined_oldest", text: "Oldest join first" }));
+  const syncCard = el("section", { class: "card", "aria-label": "Member import status" }, el("p", { text: "Loading import status…" }));
+  const body = el("tbody", {});
+  const detail = el("section", { class: "card", "aria-label": "Member history" });
+  const table = el("table", {}, el("thead", {}, el("tr", {},
+    ...["Member", "User ID", "Joined", "Status", "History"].map((label) => el("th", { text: label })))), body);
+  const first = el("button", { class: "btn", text: "First page", disabled: true });
+  const next = el("button", { class: "btn", text: "Next page", disabled: true });
+  const refresh = el("button", { class: "btn", text: "Refresh" });
+  let listRequest = 0, statusRequest = 0, detailRequest = 0;
+  let listAbort = null, statusAbort = null, detailAbort = null;
+  let timer = null, countdownTimer = null, debounce = null, disposed = false, after = "", nextAfter = null;
+  let latestStatus = null, latestStatusRevision = -1, statusRetryNeeded = false;
+  let latestStatusReceivedAt = 0;
+  let pendingSyncAction = null, syncActionOutcome = null;
+  let emptyMembersCell = null;
+  const emptyMembersText = () => latestStatus?.status === "complete"
+    ? "No members match these filters." : "No saved members match yet. Import may still be incomplete.";
+  const aliveHere = () => !disposed && alive();
+  const clearTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
+  const clearCountdown = () => { if (countdownTimer !== null) clearTimeout(countdownTimer); countdownTimer = null; };
+  const auditPaginationStalled = (sync) =>
+    sync?.audit_recovery_status === "needs_attention" &&
+    sync?.audit_recovery_reason === "pagination_stalled";
+  const memberSyncRetryEnabled = (sync) =>
+    ["needs_attention", "waiting"].includes(sync?.status) ||
+    (sync?.status === "complete" && auditPaginationStalled(sync));
+  const schedulePoll = () => {
+    clearTimer();
+    if (!aliveHere() || document.visibilityState !== "visible") return;
+    const active = statusRetryNeeded || pendingSyncAction || (latestStatus && (
+      ["queued", "running", "waiting"].includes(latestStatus.status) ||
+      ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
+    if (active) timer = setTimeout(loadStatus, 10000);
+  };
+  const asDate = (value) => memberTime(value);
+  const renderStatus = (sync) => {
+    clearCountdown();
+    const parts = [];
+    const title = sync.run_kind === "reconcile" ? "Reconcile from Discord" : "Initial member import";
+    parts.push(el("h3", { text: title }));
+    const stage = [sync.phase || "pending", sync.status || "needs attention"].join(" · ");
+    parts.push(el("p", { role: "status", text: `${stage}${sync.status_reason ? ` — ${sync.status_reason}` : ""}` }));
+    if (!sync.run_id && sync.status === "queued") {
+      parts.push(el("p", { class: "muted", text: "The bot will create the first import job when it is online. Import controls become available after that job exists." }));
+    } else if (!sync.run_id && sync.status === "needs_attention") {
+      parts.push(el("p", { class: "alert alert-warning", text: "Import metadata is unavailable. Controls are disabled until the saved job is restored or repaired." }));
+    }
+    const phaseCounts = { members: sync.member_processed, bans: sync.ban_processed, verify: sync.verify_processed, audit: sync.audit_processed };
+    const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
+    const phaseProcessed = phaseCounts[sync.phase] == null ? null : Number(phaseCounts[sync.phase]);
+    const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
+    const percent = sync.status === "complete" ? 100 : sync.percent == null ? null : Math.min(99, Math.max(0, Number(sync.percent)));
+    const totalKind = sync.total_is_estimated === false ? "counted" : "estimated";
+    const bar = el("progress", { max: "100", value: sync.status === "complete" ? "100" : percent, "aria-label": "Import progress", "aria-valuetext": sync.status === "complete" ? "Complete" : percent === null ? `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown` : `${Math.round(percent)} percent of ${totalKind} member stage` });
+    if (sync.status !== "complete" && percent === null) bar.removeAttribute("value");
+    parts.push(bar);
+    const memberPhase = sync.phase === "members";
+    let totalDescription = "current phase total unknown";
+    if (total !== null && sync.total_is_estimated === false) totalDescription = `${total.toLocaleString()} members counted`;
+    else if (total !== null && memberPhase) totalDescription = `approximately ${total.toLocaleString()} members estimated`;
+    const progressText = sync.status === "complete" ? " · 100% complete" : percent === null ? "" : ` · ${Math.round(percent)}% of ${totalKind} member phase`;
+    parts.push(el("p", { text: `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}` }));
+    const phases = ["members", "bans", "verify", "audit", "local_history"];
+    const phaseLabels = { members: "Members", bans: "Current bans", verify: "Candidate checks", audit: "Available audit history", local_history: "Local case history" };
+    const currentPhase = sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
+      ? phases.indexOf("local_history") : phases.indexOf(String(sync.phase || ""));
+    parts.push(el("p", { class: "muted", text: phases.map((phase, index) => {
+      const state = sync.status === "complete" || (currentPhase >= 0 && index < currentPhase) ? "done" :
+        index === currentPhase ? sync.status : "pending";
+      const count = phaseCounts[phase] == null ? " · committed count unknown" : ` · ${Number(phaseCounts[phase]).toLocaleString()} committed`;
+      return `${phaseLabels[phase]}: ${state}${count}`;
+    }).join(" · ") }));
+    const serverReadAt = Number(sync.as_of ?? sync.as_of_ms);
+    const statusNow = Number.isFinite(serverReadAt) && serverReadAt > 0
+      ? serverReadAt + Math.max(0, Date.now() - latestStatusReceivedAt) : Date.now();
+    const elapsed = sync.elapsed_seconds ?? (sync.started_at ? Math.max(0, (statusNow - Number(sync.started_at)) / 1000) : null);
+    const workerUnconfirmed = ["worker_unconfirmed", "worker_offline"].includes(sync.estimate_reason);
+    const forecastUnknown = workerUnconfirmed || ["paused", "needs_attention"].includes(sync.status) ||
+      (sync.status === "waiting" && sync.estimate_reason !== "rate_limited") ||
+      sync.estimate_reason === "discord_unavailable";
+    const phaseFinish = Number(sync.phase_finish_at);
+    const forecastAvailable = !forecastUnknown && sync.phase_remaining_seconds != null &&
+      sync.phase_finish_at != null && Number.isFinite(phaseFinish) && phaseFinish > statusNow;
+    const remaining = workerUnconfirmed ? "Unknown until worker activity is confirmed" :
+      !forecastAvailable
+        ? "Unknown" : `about ${Math.ceil((phaseFinish - statusNow) / 60000)} minutes for this phase`;
+    const overallFinish = Number(sync.overall_finish_at);
+    const finish = forecastAvailable ? asDate(sync.overall_finish_at != null && Number.isFinite(overallFinish) && overallFinish > statusNow
+      ? sync.overall_finish_at : sync.phase_finish_at) : "Unknown";
+    parts.push(el("p", { class: "muted", text: `Elapsed: ${elapsed == null ? "Unknown" : `${Math.round(Number(elapsed) / 60)} minutes`} · Remaining: ${remaining} · Expected finish: ${finish}` }));
+    if (sync.phase === "members" && sync.phase_finish_at != null && sync.estimate_reason?.startsWith("preliminary member-stage estimate")) {
+      parts.push(el("p", { class: "muted", text: "Preliminary member-stage estimate; later stages have unknown totals." }));
+    }
+    if (sync.estimate_reason === "worker_unconfirmed") parts.push(el("p", { class: "muted", text: "Worker activity is not recently confirmed. The bot may be between paced pages; timing will resume when activity is confirmed." }));
+    if (sync.estimate_reason === "worker_offline") parts.push(el("p", { class: "muted", text: "The bot worker is offline. Timing will resume when it is online." }));
+    if (sync.next_attempt_at) {
+      const nextAttempt = Number(sync.next_attempt_at);
+      const rateLimited = sync.status === "waiting" && (sync.status_reason === "rate_limited" || sync.estimate_reason === "rate_limited");
+      let retryText = `Next attempt: ${asDate(sync.next_attempt_at)}`;
+      if (rateLimited && Number.isFinite(nextAttempt)) {
+        const seconds = Math.max(0, Math.ceil((nextAttempt - statusNow) / 1000));
+        retryText = `${seconds ? `Rate limit: retry in ${Math.floor(seconds / 60)}m ${seconds % 60}s` : "Rate limit: retry due now"} · ${retryText}`;
+        if (seconds && aliveHere() && document.visibilityState === "visible" && !statusRetryNeeded && latestStatus === sync) {
+          countdownTimer = setTimeout(() => { countdownTimer = null; if (aliveHere() && latestStatus === sync) renderStatus(sync); }, 1000);
+        }
+      }
+      parts.push(el("p", { class: "muted", text: retryText }));
+    }
+    if (sync.initial_completed_at_ms || sync.initial_completed_at) parts.push(el("p", { text: `Initial import completed: ${asDate(sync.initial_completed_at_ms ?? sync.initial_completed_at)}` }));
+    if (sync.last_success_at) {
+      const counts = [["processed", "processed"], ["inserted", "inserted"], ["updated", "updated"], ["unchanged", "unchanged"]]
+        .filter(([field]) => sync[`last_success_${field}`] != null)
+        .map(([field, label]) => `${Number(sync[`last_success_${field}`]).toLocaleString()} ${label}`);
+      parts.push(el("p", { class: "muted", text: `Last successful run: ${asDate(sync.last_success_at)}${counts.length ? ` · ${counts.join(" · ")}` : ""}` }));
+    }
+    if (sync.reconciliation_needed) parts.push(el("p", { class: "alert alert-warning", text: "Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement. A full current-member and current-ban check needs an administrator to select Reconcile from Discord." }));
+    if (sync.audit_recovery_status && sync.audit_recovery_status !== "complete") {
+      const phase = sync.audit_recovery_phase === "ban" ? "Ban actions" : sync.audit_recovery_phase === "unban" ? "Unban actions" : "Ban and unban actions";
+      parts.push(el("p", { class: "muted", text: `Bounded audit recovery: ${phase} · ${sync.audit_recovery_status} · ${Number(sync.audit_recovery_processed || 0).toLocaleString()} entries checked${sync.audit_recovery_reason ? ` · ${sync.audit_recovery_reason}` : ""}` }));
+      if (sync.audit_recovery_next_attempt_at) parts.push(el("p", { class: "muted", text: `Audit recovery next attempt: ${asDate(sync.audit_recovery_next_attempt_at)}` }));
+      if (sync.audit_recovery_last_progress_at) parts.push(el("p", { class: "muted", text: `Audit recovery last progressed: ${asDate(sync.audit_recovery_last_progress_at)}` }));
+    }
+    if (Number(sync.unseen_candidate_count || 0) > 0) parts.push(el("p", { class: "muted", text: `${Number(sync.unseen_candidate_count).toLocaleString()} absence candidates still need bounded Discord checks.` }));
+    if (sync.status !== "complete") parts.push(el("p", { class: "muted", text: "Results are partial while import is incomplete. Older join or ban dates may be unavailable." }));
+    parts.push(el("p", { class: "muted", text: `Last committed progress: ${asDate(sync.last_progress_at)}` }));
+    if (sync.as_of_ms || sync.as_of) parts.push(el("p", { class: "muted", text: `Status read at ${asDate(sync.as_of_ms ?? sync.as_of)}` }));
+    if (pendingSyncAction) parts.push(el("p", { role: "status", text: `${pendingSyncAction.operation[0].toUpperCase()}${pendingSyncAction.operation.slice(1)} requested · bot action ${pendingSyncAction.state}. Waiting for the import status to reflect it.` }));
+    if (syncActionOutcome) parts.push(el("p", { class: "err", role: "status", text: syncActionOutcome }));
+    const controls = el("div", { class: "row" });
+    if (!isPreview()) {
+      for (const [operation, label] of [["pause", "Pause"], ["resume", "Resume"], ["retry", "Retry"], ["reconcile", "Reconcile from Discord"]]) {
+        const disabled = !sync.run_id || !!pendingSyncAction || (operation === "pause" && !["queued", "running", "waiting"].includes(sync.status)) ||
+          (operation === "resume" && sync.status !== "paused") ||
+          (operation === "retry" && !memberSyncRetryEnabled(sync)) ||
+          (operation === "reconcile" && (sync.status !== "complete" || !sync.initial_completed_at));
+        controls.append(el("button", { class: "btn small", text: label, disabled, onclick: async () => {
+          if (!latestStatus?.run_id) return;
+          if (operation === "reconcile" && !confirm("Request a full current-member and current-ban reconciliation from Discord? This can take a while.")) return;
+          let job;
+          try {
+            job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", { operation });
+          } catch (error) {
+            if (error.status !== 409 || !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)) throw error;
+            if (!aliveHere()) return;
+            syncActionOutcome = error.message;
+            renderStatus(latestStatus);
+            loadStatus();
+            return;
+          }
+          if (!aliveHere()) return;
+          syncActionOutcome = null;
+          if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
+            pendingSyncAction = { id: job.id, operation, state: job.state };
+          } else {
+            syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
+          }
+          renderStatus(latestStatus);
+          schedulePoll();
+          loadStatus();
+        } }));
+      }
+    }
+    parts.push(controls);
+    syncCard.replaceChildren(...parts);
+  };
+  const loadStatus = async () => {
+    // A succeeded receipt is durable before this primary status read starts.
+    // Its effect (or a later state) must therefore be visible in the result.
+    const succeededId = pendingSyncAction?.state === "succeeded" ? pendingSyncAction.id : null;
+    const request = ++statusRequest;
+    statusAbort?.abort();
+    statusAbort = new AbortController();
+    try {
+      const sync = await apiRead(`/api/guilds/${guildId}/member-sync`, statusAbort.signal);
+      if (!aliveHere() || request !== statusRequest) return;
+      const revision = Number(sync.progress_revision ?? 0);
+      if (latestStatus && revision < latestStatusRevision && pendingSyncAction) {
+        syncActionOutcome = "Import status changed after a restore. Check Bot actions before repeating the requested control.";
+        pendingSyncAction = null;
+      }
+      statusRetryNeeded = false;
+      if (succeededId && pendingSyncAction?.id === succeededId) pendingSyncAction = null;
+      latestStatus = sync;
+      latestStatusRevision = revision;
+      latestStatusReceivedAt = Date.now();
+      if (emptyMembersCell) emptyMembersCell.textContent = emptyMembersText();
+      renderStatus(sync);
+      schedulePoll();
+      if (pendingSyncAction) {
+        const pendingId = pendingSyncAction.id;
+        try {
+          const jobs = await apiRead(`/api/guilds/${guildId}/actions`, statusAbort.signal);
+          if (!aliveHere() || request !== statusRequest || pendingSyncAction?.id !== pendingId) return;
+          const job = jobs.find((item) => item.id === pendingId);
+          if (job && ["failed", "uncertain", "cancelled", "expired"].includes(job.state)) {
+            syncActionOutcome = `${pendingSyncAction.operation} action ${job.state}. Check Bot actions for details.`;
+            pendingSyncAction = null;
+          } else if (job) {
+            pendingSyncAction.state = job.state;
+            if (job.state === "succeeded") {
+              // This status was read before the receipt. Read again in causal order.
+              loadStatus();
+              return;
+            }
+          }
+          renderStatus(sync);
+          schedulePoll();
+        } catch (error) {
+          // Keep the acknowledged request visible and retry its receipt on the next poll.
+        }
+      }
+    } catch (error) {
+      if (!aliveHere() || request !== statusRequest) return;
+      statusRetryNeeded = true;
+      if (latestStatus) renderStatus(latestStatus);
+      else syncCard.replaceChildren();
+      syncCard.append(el("p", { class: "err", role: "status", text: latestStatus ? "Could not refresh import status. Showing the last saved status; retrying shortly while visible." : "Could not load import status. Retrying shortly while visible." }));
+      schedulePoll();
+    }
+  };
+  const loadMembers = async () => {
+    const request = ++listRequest;
+    listAbort?.abort();
+    listAbort = new AbortController();
+    emptyMembersCell = null;
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading members…" })));
+    try {
+      const q = new URLSearchParams({ limit: "50", status: statusFilter.value, sort: sort.value });
+      const rawSearch = String(search.value || "").trim();
+      const mention = rawSearch.match(/^<@!?(\d+)>$/);
+      if (rawSearch) q.set("q", mention ? mention[1] : rawSearch);
+      if (joinedFrom.value) q.set("joined_from", joinedFrom.value);
+      if (joinedTo.value) q.set("joined_to", joinedTo.value);
+      if (after) q.set("after", after);
+      const page = await apiRead(`/api/guilds/${guildId}/members?${q}`, listAbort.signal);
+      if (!aliveHere() || request !== listRequest) return;
+      nextAfter = page.next_cursor || null;
+      first.disabled = !after;
+      next.disabled = !nextAfter;
+      const rows = (page.members || []).map((member) => el("tr", {},
+        el("td", {}, el("strong", { text: member.display_name || member.username || member.user_id }),
+          member.username ? el("small", { class: "muted", text: ` @${member.username}` }) : null),
+        el("td", {}, el("code", { text: member.user_id }), " ", el("button", { class: "btn small", text: "Copy", "aria-label": `Copy user ID ${member.user_id}`, onclick: () => navigator.clipboard.writeText(member.user_id) })),
+        el("td", { text: asDate(member.joined_at_ms) }),
+        el("td", {}, member.is_banned ? "Currently banned" : member.is_current ? "Current" : member.ever_banned ? "Previously banned" : "Departed",
+          member.is_banned && member.current_ban_reason ? el("small", { class: "muted", text: ` · Current reason: ${member.current_ban_reason}` }) : null),
+        el("td", {}, el("button", { class: "btn small", text: "View history", onclick: () => openMember(member.user_id, member.display_name) }))));
+      emptyMembersCell = rows.length ? null : el("td", { colspan: 5, class: "muted", text: emptyMembersText() });
+      body.replaceChildren(...(rows.length ? rows : [el("tr", {}, emptyMembersCell)]));
+    } catch (error) {
+      if (!aliveHere() || request !== listRequest || error.message === "Failed to fetch") return;
+      body.replaceChildren(el("tr", {}, el("td", { colspan: 5, class: "err", text: "Could not load members. Refresh to retry." })));
+    }
+  };
+  const openMember = async (userId, displayName) => {
+    const request = ++detailRequest;
+    detailAbort?.abort();
+    detailAbort = new AbortController();
+    let cursor = null;
+    detail.replaceChildren(el("p", { text: "Loading member history…" }));
+    const appendPage = async () => {
+      const q = new URLSearchParams({ limit: "50" });
+      if (cursor) q.set("after", cursor);
+      const page = await apiRead(`/api/guilds/${guildId}/members/${userId}/history?${q}`, detailAbort.signal);
+      if (!aliveHere() || request !== detailRequest) return;
+      if (!cursor) detail.replaceChildren(el("h3", { text: displayName ? `History for ${displayName} (${userId})` : `History for ${userId}` }));
+      for (const event of page.entries || []) {
+        const sourceLabel = ({
+          discord_audit: "Discord audit action",
+          discord_audit_unresolved: "Confirmed Discord audit action; local case association unresolved",
+          application_audit_linked: "Bot action linked to Discord audit",
+          gateway_observation_unlinked: "Gateway observation; action time unconfirmed",
+          state_reconciliation: "Verified from current Discord state; transition time unknown",
+          application: "Bot action",
+        })[event.source_kind] || "";
+        const eventLabel = event.source_kind === "gateway_observation_unlinked"
+          ? `${event.kind || "Ban state"} observation`
+          : event.source_kind === "discord_audit_unresolved"
+            ? `${event.kind === "ban" ? "Ban" : event.kind === "unban" ? "Unban" : "Discord"} audit entry`
+            : event.kind || "Observation";
+        const visibleLabel = event.kind === "member_state_observation" ? "Membership absence" :
+          event.kind === "membership_state_observation" ? "Membership state check" :
+          event.kind === "ban_present_state_observation" ? "Ban present (time unknown)" :
+          event.kind === "ban_absent_state_observation" || event.kind === "ban_state_observation" ? "Ban absent (time unknown)" : eventLabel;
+        detail.append(el("p", {},
+          el("strong", { text: `${visibleLabel} · ${asDate(event.occurred_at_ms)}` }),
+          event.case_id ? el("button", { class: "btn small", text: `Case ${event.case_id}`, onclick: () => {
+            if (!aliveHere()) return;
+            pendingCase = { guildId, caseId: event.case_id };
+            try { navigate("cases"); } finally { pendingCase = null; }
+          } }) : null,
+          el("span", { class: "muted", text: `${sourceLabel ? ` ${sourceLabel}` : ""}${event.source_kind === "discord_audit_unresolved" && event.observation_id ? ` · Audit entry ${event.observation_id}` : ""}${event.observed_at_ms && event.source_kind === "state_reconciliation" ? ` · Checked ${asDate(event.observed_at_ms)}` : ""}${event.outcome ? ` · ${event.outcome}` : ""}${event.moderator_id ? ` · moderator ${event.moderator_id}` : ""}${event.reason ? ` · ${event.reason}` : ""}` })));
+      }
+      cursor = page.next_cursor || null;
+      if (cursor) detail.append(el("button", { class: "btn small", text: "More history", onclick: (event) => { event.currentTarget.remove(); appendPage().catch(reportApiError); } }));
+      else if (!(page.entries || []).length) detail.append(el("p", { class: "muted", text: "No known events. Older history may be unavailable." }));
+    };
+    try { await appendPage(); }
+    catch (error) { if (aliveHere() && request === detailRequest && error.message !== "Failed to fetch") detail.replaceChildren(el("p", { class: "err", text: "Could not load history." })); }
+  };
+  const invalidateResults = () => {
+    ++listRequest;
+    listAbort?.abort();
+    emptyMembersCell = null;
+    ++detailRequest;
+    detailAbort?.abort();
+    after = "";
+    nextAfter = null;
+    first.disabled = true;
+    next.disabled = true;
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 5, text: "Loading members…" })));
+    detail.replaceChildren();
+  };
+  const queueFilteredList = () => {
+    if (!aliveHere()) return;
+    invalidateResults();
+    clearTimeout(debounce);
+    debounce = setTimeout(() => { debounce = null; if (aliveHere()) loadMembers(); }, 300);
+  };
+  const loadChangedFilters = () => {
+    if (!aliveHere()) return;
+    clearTimeout(debounce);
+    debounce = null;
+    invalidateResults();
+    loadMembers();
+  };
+  search.addEventListener("input", queueFilteredList);
+  search.addEventListener("change", loadChangedFilters);
+  for (const control of [joinedFrom, joinedTo]) {
+    control.addEventListener("input", queueFilteredList);
+    control.addEventListener("change", loadChangedFilters);
+  }
+  for (const control of [statusFilter, sort]) {
+    control.addEventListener("input", queueFilteredList);
+    control.addEventListener("change", loadChangedFilters);
+  }
+  first.addEventListener("click", () => { after = ""; loadMembers(); });
+  next.addEventListener("click", () => { if (nextAfter) { after = nextAfter; loadMembers(); } });
+  refresh.addEventListener("click", () => { loadStatus(); loadMembers(); });
+  const visibility = () => { if (document.visibilityState === "visible" && aliveHere()) loadStatus(); else { clearTimer(); clearCountdown(); } };
+  document.addEventListener("visibilitychange", visibility);
+  disposeMembersView = () => { disposed = true; clearTimer(); clearCountdown(); clearTimeout(debounce); listAbort?.abort(); statusAbort?.abort(); detailAbort?.abort(); document.removeEventListener("visibilitychange", visibility); };
+  loadStatus();
+  loadMembers();
+  return el("div", {}, el("h2", { text: "Members" }),
+    el("p", { class: "muted", text: "Search saved member identities and known join dates. Import and historical coverage are shown below." }),
+    syncCard,
+    el("section", { class: "card" },
+      el("div", { class: "row" }, search, statusFilter, joinedFrom, joinedTo, sort),
+      el("div", { class: "row" }, refresh, first, next), table), detail);
 }
 
 function tabCases() {
@@ -2298,6 +2674,9 @@ function tabCases() {
     }
   };
   run();
+  const handoff = pendingCase;
+  pendingCase = null;
+  if (handoff?.guildId === guildId) openCase(handoff.caseId);
   return el("div", {},
     el("h2", { text: "Cases" }),
     el("p", { class: "muted", text: "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord." }),
@@ -2557,7 +2936,7 @@ function bootUi() {
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
-    if (event.target.matches("input, textarea, select") && !event.target.classList.contains("search-select-input") && !["events", "bans"].includes(state.tab)) markDirty();
+    if (event.target.matches("input, textarea, select") && !event.target.classList.contains("search-select-input") && !["events", "members", "bans"].includes(state.tab)) markDirty();
   });
   window.addEventListener("beforeunload", (event) => {
     if (dirty || busy) { event.preventDefault(); event.returnValue = ""; }

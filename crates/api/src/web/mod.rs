@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod cases;
+pub mod members;
 pub mod oauth;
 pub mod preview;
 pub mod state;
@@ -980,6 +981,26 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/api/guilds/{guild_id}/stats", get_post(api::stats))
         .route("/api/guilds/{guild_id}/cases", get_post(cases::list_cases))
         .route(
+            "/api/guilds/{guild_id}/members",
+            get_post(members::list_members),
+        )
+        .route(
+            "/api/guilds/{guild_id}/members/{user_id}",
+            get_post(members::get_member),
+        )
+        .route(
+            "/api/guilds/{guild_id}/members/{user_id}/history",
+            get_post(members::member_history),
+        )
+        .route(
+            "/api/guilds/{guild_id}/member-sync",
+            get_post(members::sync_status),
+        )
+        .route(
+            "/api/guilds/{guild_id}/member-sync/actions",
+            axum::routing::post(members::sync_action),
+        )
+        .route(
             "/api/guilds/{guild_id}/cases/{case_id}",
             get(cases::get_case)
                 .post(cases::get_case)
@@ -1330,17 +1351,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_members_history_endpoint_is_not_served() {
-        let response = test_app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/guilds/123/members")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    async fn member_directory_requires_authorization() {
+        let app = test_app();
+        for (method, uri, body) in [
+            ("GET", "/api/guilds/123/members", ""),
+            ("GET", "/api/guilds/123/members/1", ""),
+            ("GET", "/api/guilds/123/members/1/history", ""),
+            ("GET", "/api/guilds/123/member-sync", ""),
+            (
+                "POST",
+                "/api/guilds/123/member-sync/actions",
+                r#"{"request_id":"1758140000_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","operation":"pause"}"#,
+            ),
+        ] {
+            assert_unauthenticated(app.clone(), method, uri, body).await;
+        }
     }
 
     #[tokio::test]

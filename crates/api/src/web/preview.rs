@@ -227,13 +227,23 @@ fn is_preview_post_read(path: &str) -> bool {
         (parts.next(), parts.next(), parts.next(), parts.next()),
         (
             Some(
-                "config" | "case-delete-roles" | "actions" | "events" | "bans" | "stats" | "cases"
+                "config"
+                    | "case-delete-roles"
+                    | "actions"
+                    | "events"
+                    | "bans"
+                    | "stats"
+                    | "cases"
+                    | "members"
+                    | "member-sync"
             ),
             None,
             None,
             None
         ) | (Some("cases"), Some(_), None, None)
             | (Some("cases"), Some(_), Some("evidence"), None)
+            | (Some("members"), Some(_), None, None)
+            | (Some("members"), Some(_), Some("history"), None)
             | (Some("logchannels"), Some(_), None, None)
     )
 }
@@ -281,6 +291,10 @@ mod tests {
             "/api/guilds/10/cases",
             "/api/guilds/10/cases/abc",
             "/api/guilds/10/cases/abc/evidence",
+            "/api/guilds/10/members",
+            "/api/guilds/10/members/123",
+            "/api/guilds/10/members/123/history",
+            "/api/guilds/10/member-sync",
             "/api/guilds/10/logchannels/message_edit",
         ] {
             assert!(is_preview_post_read(path), "{path}");
@@ -295,6 +309,7 @@ mod tests {
             "/api/guilds/10/cases/abc/history",
             "/api/guilds/10/cases/abc/evidence/file",
             "/api/guilds/10/actions/job",
+            "/api/guilds/10/member-sync/actions",
         ] {
             assert!(!is_preview_post_read(path), "{path}");
         }
