@@ -1657,7 +1657,7 @@ pub(crate) async fn emit_member_event(
 /// and the original event time instead of requiring another Discord lookup.
 pub(crate) async fn emit_verified_member_departure(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: &impl LogDelivery,
     guild_id: GuildId,
     departure: &db::guild_data::MemberDeparture,
     profile: Option<&db::guild_data::MemberProfile>,

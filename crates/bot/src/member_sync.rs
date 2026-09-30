@@ -593,6 +593,68 @@ async fn fetch_target_check(
     })
 }
 
+async fn settle_target_check(
+    app: &Arc<BotState>,
+    sink: &impl crate::logging::LogDelivery,
+    guild_id: GuildId,
+    store: &db::guild_data::GuildDataStore,
+    scope: db::guild_data::GuildDataScope,
+    check: db::guild_data::MemberTargetCheck,
+    verification: MemberVerification,
+) -> anyhow::Result<()> {
+    let suppressed_remove_absent = check.kind == MemberVerifyKind::Member
+        && check.reason == "mismatched_departure"
+        && !verification.present;
+    let settled = store
+        .settle_member_target_check(
+            scope.clone(),
+            check.clone(),
+            verification,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+    if settled.is_none() && !suppressed_remove_absent {
+        return Ok(());
+    }
+    let profile = match store.get_member(scope, check.user_id).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id = check.user_id,
+                "verified departure profile read failed; logging with user ID: {error:#}"
+            );
+            None
+        }
+    };
+    let departure = settled.unwrap_or_else(|| {
+        // Snapshot settlement does not return an event. Preserve the captured
+        // remove time, and never borrow a join date from a later directory revision.
+        let joined_at_ms = profile
+            .as_ref()
+            .filter(|profile| {
+                !profile.is_current && profile.revision == check.revision.saturating_add(1)
+            })
+            .and_then(|profile| profile.joined_at_ms)
+            .filter(|joined| *joined > 0 && *joined <= check.requested_at_ms);
+        db::guild_data::MemberDeparture {
+            user_id: check.user_id,
+            joined_at_ms,
+            departed_at_ms: check.requested_at_ms,
+            completed_stay_ms: joined_at_ms.map(|joined| check.requested_at_ms - joined),
+        }
+    });
+    crate::logging::emit_verified_member_departure(
+        app,
+        sink,
+        guild_id,
+        &departure,
+        profile.as_ref(),
+    )
+    .await;
+    Ok(())
+}
+
 async fn reserve_request(
     app: &BotState,
     bot_id: i64,
@@ -835,40 +897,18 @@ pub async fn run(
                     next_request = tokio::time::Instant::now() + pace;
                     match fetch_target_check(&app, &http, *guild_id, &check).await {
                         Ok(verification) => {
-                            match store
-                                .settle_member_target_check(
-                                    scope.clone(),
-                                    check.clone(),
-                                    verification,
-                                    chrono::Utc::now().timestamp_millis(),
-                                )
-                                .await
+                            match settle_target_check(
+                                &app,
+                                http.as_ref(),
+                                *guild_id,
+                                store,
+                                scope.clone(),
+                                check.clone(),
+                                verification,
+                            )
+                            .await
                             {
-                                Ok(Some(departure)) => {
-                                    let profile = match store
-                                        .get_member(scope.clone(), departure.user_id)
-                                        .await
-                                    {
-                                        Ok(profile) => profile,
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                guild_id = guild_id.get(),
-                                                user_id = departure.user_id,
-                                                "verified departure profile read failed; logging with user ID: {error:#}"
-                                            );
-                                            None
-                                        }
-                                    };
-                                    crate::logging::emit_verified_member_departure(
-                                        &app,
-                                        &http,
-                                        *guild_id,
-                                        &departure,
-                                        profile.as_ref(),
-                                    )
-                                    .await;
-                                }
-                                Ok(None) => {}
+                                Ok(()) => {}
                                 Err(error) => {
                                     tracing::warn!(
                                         guild_id = guild_id.get(),
@@ -1366,6 +1406,150 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct LeaveSink(std::sync::Mutex<Vec<serde_json::Value>>);
+
+    #[serenity::async_trait]
+    impl crate::logging::LogDelivery for LeaveSink {
+        async fn send(
+            &self,
+            _channel: serenity::all::ChannelId,
+            message: serenity::all::CreateMessage,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(serde_json::to_value(message)?);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_departure_emits_only_after_verified_absence() {
+        use crate::{
+            config::BotProcessConfig,
+            db::{
+                Db,
+                guild_data::{MemberDepartureDecision, MemberObservation},
+            },
+        };
+        use serenity::all::User;
+        let directory =
+            std::env::temp_dir().join(format!("verified_leave_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.db.path = directory.join("core.db");
+        let app = BotState::new(cfg.clone(), Db::open(&cfg.db.path, 2).unwrap()).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let removed_at = chrono::Utc::now().timestamp_millis() - 60_000;
+        store
+            .initialize_member_directory(scope.clone(), 42, removed_at - 1000)
+            .await
+            .unwrap();
+        db::upsert_log_channel(&app.db, 10, "member_leave", 456)
+            .await
+            .unwrap();
+        db::upsert_template(&app.db, 10, "member_leave", "{user}|{duration}|{time}")
+            .await
+            .unwrap();
+        let sink = LeaveSink::default();
+        for (id, present) in [(7, false), (8, true)] {
+            let observation = MemberObservation {
+                user_id: id,
+                username: Some(Some("saved-user".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(removed_at - 3_600_000),
+                observed_at_ms: removed_at - 1000,
+                is_join: false,
+            };
+            store
+                .observe_member(scope.clone(), observation.clone())
+                .await
+                .unwrap();
+            let mut user = User::default();
+            user.id = UserId::new(id as u64);
+            assert!(matches!(
+                member_directory::observe_departure(
+                    &app,
+                    10,
+                    &user,
+                    removed_at,
+                    Some(removed_at - 7_200_000)
+                )
+                .await,
+                Some(MemberDepartureDecision::NeedsVerification)
+            ));
+            let check = store
+                .next_member_target_check(scope.clone(), removed_at)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(check.reason, "mismatched_departure");
+            assert_eq!(check.requested_at_ms, removed_at);
+            let verification = MemberVerification {
+                user_id: id,
+                revision: check.revision,
+                kind: MemberVerifyKind::Member,
+                present,
+                member: present.then_some(observation),
+                ban: None,
+            };
+            settle_target_check(
+                &app,
+                &sink,
+                GuildId::new(10),
+                &store,
+                scope.clone(),
+                check.clone(),
+                verification.clone(),
+            )
+            .await
+            .unwrap();
+            // The original queued check cannot be replayed into a second leave.
+            assert!(
+                settle_target_check(
+                    &app,
+                    &sink,
+                    GuildId::new(10),
+                    &store,
+                    scope.clone(),
+                    check,
+                    verification
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                store
+                    .get_member(scope.clone(), id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_current,
+                present
+            );
+        }
+        let messages = std::mem::take(&mut *sink.0.lock().unwrap());
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "verified absence must emit the suppressed leave exactly once"
+        );
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("saved-user"));
+        assert!(content.contains("|1 hour|"));
+        assert!(
+            content.contains(
+                &chrono::DateTime::<chrono::Utc>::from_timestamp_millis(removed_at)
+                    .unwrap()
+                    .format("%b %d, %Y • %H:%M:%S UTC")
+                    .to_string()
+            )
+        );
+    }
 
     #[tokio::test]
     async fn initial_eta_counts_only_ready_enrolled_guilds() {
