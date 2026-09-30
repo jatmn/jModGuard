@@ -15,6 +15,18 @@ pub enum Action {
         #[serde(with = "optional_snowflake")]
         channel_id: Option<i64>,
     },
+    MemberSync {
+        operation: MemberSyncOperation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberSyncOperation {
+    Pause,
+    Resume,
+    Retry,
+    Reconcile,
 }
 mod snowflake {
     pub use crate::ids::de_i64 as deserialize;
@@ -44,6 +56,7 @@ impl Action {
                     "channel_id must be positive"
                 );
             }
+            Self::MemberSync { .. } => {}
         }
         Ok(())
     }
@@ -51,6 +64,7 @@ impl Action {
         match self {
             Self::Unban { user_id, .. } => format!("unban:{user_id}"),
             Self::SetLogChannel { event, .. } => format!("log:{event}"),
+            Self::MemberSync { .. } => "member_sync".to_owned(),
         }
     }
 }

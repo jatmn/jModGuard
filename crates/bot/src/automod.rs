@@ -101,6 +101,18 @@ impl AutomodEngine {
         self.member_joins.get(&(guild, user)).map(|e| *e.value())
     }
 
+    /// `evaluate` marks a strike fired before Discord runs. If the retention
+    /// marker cannot be written, the ban must be eligible again on the next
+    /// message instead of disappearing until the bucket expires.
+    pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, at: u32) {
+        let Some(mut bucket) = self.state.get_mut(&(guild, user)) else {
+            return;
+        };
+        if let Some(state) = bucket.get_mut(rule_id) {
+            state.fired.remove(&at);
+        }
+    }
+
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
         let now = Instant::now();
@@ -493,6 +505,29 @@ pub async fn execute_pending(
             }
         }
         "ban" => {
+            let pending_ban = match crate::member_directory::begin_ban_attempt(
+                app,
+                guild_id.get(),
+                target.id.get(),
+            )
+            .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    app.automod.release_fired(
+                        guild_id.get(),
+                        target.id.get(),
+                        pending.rule_id,
+                        pending.action.at,
+                    );
+                    tracing::warn!(
+                        guild_id = guild_id.get(),
+                        user_id = target.id.get(),
+                        "automod ban deferred until retention marker is available: {error:#}"
+                    );
+                    return;
+                }
+            };
             let suppression = app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 guild_id.get(),
@@ -523,7 +558,7 @@ pub async fn execute_pending(
                 app,
                 enrollment.clone(),
                 crate::db::guild_data::CaseAction::Ban,
-                outcome,
+                outcome.clone(),
                 target.id.get(),
                 None,
                 Some(reason.clone()),
@@ -535,6 +570,7 @@ pub async fn execute_pending(
                 ),
             )
             .await;
+            pending_ban.finish(app, outcome).await;
         }
         other => {
             tracing::warn!("unknown automod action `{other}`");
@@ -582,8 +618,15 @@ fn member_for_selected_action(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
     use crate::cases::discord_attempt_outcome;
     use crate::db::guild_data::CaseOutcome;
+    use crate::state::CachedGuildConfig;
+    use crate::types::{ActionDef, GuildSettings, RuleDef};
+
+    use super::{AutomodEngine, MsgCtx};
 
     #[test]
     fn selected_kick_timeout_cases_require_a_discord_attempt() {
@@ -592,5 +635,65 @@ mod tests {
             discord_attempt_outcome(true, None),
             Some(CaseOutcome::Succeeded)
         );
+    }
+
+    #[test]
+    fn releasing_a_fired_ban_lets_the_next_message_select_it_again() {
+        let engine = AutomodEngine::new();
+        let mut rules = HashMap::new();
+        rules.insert(
+            "invite".into(),
+            RuleDef {
+                name: "invites".into(),
+                description: String::new(),
+                enabled: true,
+                dry_run: false,
+                params: serde_json::json!({}),
+                actions: vec![ActionDef {
+                    at: 1,
+                    action: "ban".into(),
+                    duration_minutes: 0,
+                    delete_days: 0,
+                    reason: "invite".into(),
+                }],
+                whitelist_roles: Vec::new(),
+                whitelist_channels: Vec::new(),
+                whitelist_users: Vec::new(),
+            },
+        );
+        let cfg = CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: Instant::now(),
+            settings: GuildSettings::default(),
+            rules,
+            commands: HashMap::new(),
+            templates: HashMap::new(),
+            log_channels: HashMap::new(),
+            log_filters: HashMap::new(),
+            regexes: Vec::new(),
+        };
+        let roles = [];
+        let message = MsgCtx {
+            guild_id: 1,
+            message_id: 9,
+            channel_id: 8,
+            author_id: 2,
+            content: "discord.gg/spam",
+            attachment_count: 0,
+            everyone_mentions: 0,
+            here_mentions: 0,
+            role_mentions: 0,
+            joined_secs_ago: None,
+            account_age_days: Some(30),
+            member_roles: &roles,
+        };
+        let first = engine.evaluate(&cfg, &message).expect("first ban");
+        assert_eq!(first.action.action, "ban");
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        engine.release_fired(1, 2, first.rule_id, first.action.at);
+        let retry = engine.evaluate(&cfg, &message).expect("retried ban");
+        assert_eq!(retry.action.action, "ban");
+        assert_eq!(retry.action.at, 1);
     }
 }

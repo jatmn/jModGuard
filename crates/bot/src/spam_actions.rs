@@ -407,6 +407,25 @@ async fn enforce(
     let mut ban_outcome = None;
     let mut ban_case = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
+        let pending_ban = match crate::member_directory::begin_ban_attempt(
+            app,
+            found.guild,
+            found.author,
+        )
+        .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                app.spam_gate
+                    .finish_ban(found.guild, found.author, now, false);
+                tracing::warn!(
+                    guild_id = found.guild,
+                    user_id = found.author,
+                    "spam ban deferred until retention marker is available: {error:#}"
+                );
+                return ReportDisposition::Retryable;
+            }
+        };
         let suppression = app.suppress_next_gateway_case(
             crate::state::GatewayCaseAction::Ban,
             found.guild,
@@ -451,13 +470,14 @@ async fn enforce(
             app,
             Some(enrollment.clone()),
             CaseAction::Ban,
-            outcome,
+            outcome.clone(),
             found.author,
             None,
             Some(found.reason.clone()),
             evidence(found.excerpts.clone()),
         )
         .await;
+        pending_ban.finish(app, outcome).await;
     }
     if found.kind == Kind::Image
         && let Some(case_id) = ban_case

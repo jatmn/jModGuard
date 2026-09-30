@@ -474,6 +474,7 @@ async fn finish_bot_action_inner(
                 Action::SetLogChannel { event, channel_id } => {
                     write_log_channel_conn(&tx, job.guild_id, event, *channel_id)?;
                 }
+                Action::MemberSync { .. } => {}
             }
         }
         tx.commit()?;

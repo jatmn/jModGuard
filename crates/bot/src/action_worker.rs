@@ -39,6 +39,9 @@ impl Outcome {
 }
 #[serenity::async_trait]
 pub trait DiscordActions: Send + Sync {
+    fn bot_user_id(&self) -> Option<i64> {
+        None
+    }
     async fn membership_matches(&self, job: &BotAction) -> Result<bool>;
     /// A positive live membership observation used to repair a missed rejoin.
     /// Implementations may return `None` when they cannot expose the identity.
@@ -55,6 +58,9 @@ pub struct LiveDiscord<'a> {
 }
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
+    fn bot_user_id(&self) -> Option<i64> {
+        i64::try_from(self.bot_user_id.get()).ok()
+    }
     async fn membership_matches(&self, job: &BotAction) -> Result<bool> {
         let Some(joined_at_ns) = self.membership_joined_at_ns(job).await? else {
             anyhow::bail!("Discord member has no supported join timestamp");
@@ -119,7 +125,7 @@ fn actor_authorized(
 ) -> bool {
     let needed = match action {
         Action::Unban { .. } => Permissions::BAN_MEMBERS,
-        Action::SetLogChannel { .. } => Permissions::MANAGE_GUILD,
+        Action::SetLogChannel { .. } | Action::MemberSync { .. } => Permissions::MANAGE_GUILD,
     };
     let permissions = guild.member_permissions(member);
     if guild.owner_id == member.user.id || permissions.administrator() {
@@ -143,6 +149,21 @@ fn classify_unban_response(status: u16, code: isize) -> Outcome {
         Outcome::failed("discord_rejected")
     } else {
         Outcome::uncertain("discord_outcome_unknown")
+    }
+}
+
+fn unban_case_outcome(outcome: &Outcome) -> crate::db::guild_data::CaseOutcome {
+    use crate::db::guild_data::CaseOutcome;
+    if outcome.code == "already_unbanned" {
+        // Discord confirmed there was no ban to remove. The job succeeded as
+        // an idempotent request, but its case is not evidence of a ban cycle.
+        CaseOutcome::Attempted
+    } else {
+        match outcome.state {
+            "succeeded" => CaseOutcome::Succeeded,
+            "failed" => CaseOutcome::Failed,
+            _ => CaseOutcome::Uncertain,
+        }
     }
 }
 
@@ -265,6 +286,87 @@ async fn execute_inner(
             Err(_) => return Outcome::failed("enrollment_check_unavailable"),
         }
         match &job.action {
+            Action::MemberSync { operation } => {
+                let Some(tenant) = tenant else {
+                    return Outcome::failed("tenant_unavailable");
+                };
+                let enrollment = match (&job.enrollment_id, job.joined_at_ns) {
+                    (Some(id), Some(joined_at_ns)) => db::GuildEnrollment {
+                        guild_id: job.guild_id,
+                        id: id.clone(),
+                        joined_at_ns,
+                    },
+                    _ => return Outcome::failed("enrollment_ended"),
+                };
+                let Ok((store, scope)) = tenant.live(enrollment).await else {
+                    return Outcome::failed("enrollment_ended");
+                };
+                let action = match operation {
+                    crate::bot_actions::MemberSyncOperation::Pause => {
+                        crate::db::guild_data::MemberSyncAction::Pause
+                    }
+                    crate::bot_actions::MemberSyncOperation::Resume => {
+                        crate::db::guild_data::MemberSyncAction::Resume
+                    }
+                    crate::bot_actions::MemberSyncOperation::Retry => {
+                        crate::db::guild_data::MemberSyncAction::Retry
+                    }
+                    crate::bot_actions::MemberSyncOperation::Reconcile => {
+                        crate::db::guild_data::MemberSyncAction::Reconcile
+                    }
+                };
+                mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
+                let Some(bot_id) = discord.bot_user_id() else {
+                    return Outcome::failed("bot_identity_unavailable");
+                };
+                match store
+                    .member_sync_action(
+                        scope,
+                        bot_id,
+                        action,
+                        job.id.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                {
+                    Ok(status)
+                        if matches!(operation, crate::bot_actions::MemberSyncOperation::Retry)
+                            && status.status == "complete" =>
+                    {
+                        if status.member_sync_retry_requeued_audit() {
+                            Outcome::succeeded("member_sync_updated")
+                        } else {
+                            Outcome::succeeded("member_sync_already_completed")
+                        }
+                    }
+                    Ok(status)
+                        if matches!(
+                            operation,
+                            crate::bot_actions::MemberSyncOperation::Resume
+                                | crate::bot_actions::MemberSyncOperation::Pause
+                        ) && status.status == "complete" =>
+                    {
+                        Outcome::succeeded("member_sync_already_completed")
+                    }
+                    Ok(_) => Outcome::succeeded("member_sync_updated"),
+                    Err(error) => {
+                        tracing::warn!(action_id = %job.id, guild_id = job.guild_id, "member sync control failed: {error:#}");
+                        if matches!(
+                            error.downcast_ref::<crate::db::guild_data::MemberSyncError>(),
+                            Some(crate::db::guild_data::MemberSyncError::MissingJob)
+                        ) {
+                            Outcome::failed("member_sync_missing_job")
+                        } else if matches!(
+                            error.downcast_ref::<crate::db::guild_data::MemberSyncError>(),
+                            Some(crate::db::guild_data::MemberSyncError::Invalid)
+                        ) {
+                            Outcome::failed("member_sync_invalid_operation")
+                        } else {
+                            Outcome::failed("member_sync_unavailable")
+                        }
+                    }
+                }
+            }
             Action::Unban { user_id, reason } => {
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
@@ -325,11 +427,7 @@ async fn execute_inner(
         };
         let operation_id = crate::db::guild_data::CaseId::try_from(job.id.clone()).ok();
         if let (Some(enrollment), Some(operation_id)) = (enrollment, operation_id) {
-            let case_outcome = match outcome.state {
-                "succeeded" => crate::db::guild_data::CaseOutcome::Succeeded,
-                "failed" => crate::db::guild_data::CaseOutcome::Failed,
-                _ => crate::db::guild_data::CaseOutcome::Uncertain,
-            };
+            let case_outcome = unban_case_outcome(&outcome);
             let data = crate::db::guild_data::CaseData {
                 source: crate::db::guild_data::CaseSource::Application { operation_id },
                 action: crate::db::guild_data::CaseAction::Unban,
@@ -341,6 +439,31 @@ async fn execute_inner(
                 evidence: crate::db::guild_data::CaseEvidence::Unavailable,
             };
             let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
+            if outcome.state == "succeeded" && outcome.code != "already_unbanned" {
+                // A successful Discord unban proves the target was banned;
+                // the idempotent 10026 response does not. Persist that state
+                // directly because old application unban cases cannot safely
+                // distinguish these responses during a later backfill.
+                let observed = match tenant.live(enrollment.clone()).await {
+                    Ok((store, scope)) => {
+                        store
+                            .observe_unban(scope, *user_id, data.occurred_at_ms)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = observed {
+                    tracing::warn!(action_id = %job.id, guild_id = job.guild_id, user_id, "confirmed unban state not saved: {error:#}");
+                    if let Some(app) = app {
+                        app.remember_member_gap(
+                            job.guild_id as u64,
+                            Some(enrollment.id.clone()),
+                            Some(*user_id),
+                            "confirmed unban persistence unavailable",
+                        );
+                    }
+                }
+            }
             if let (Some(app), Some(case_id)) = (app, case_id) {
                 let expects_discord_audit =
                     crate::cases::queued_unban_expects_discord_audit(outcome.state, outcome.code);

@@ -82,6 +82,7 @@ fn log_channel(channel_id: Option<i64>) -> Action {
     }
 }
 struct MockDiscord {
+    bot_id: Option<i64>,
     authorized: bool,
     membership_matches: bool,
     valid_channel: bool,
@@ -95,6 +96,7 @@ struct MockDiscord {
 impl Default for MockDiscord {
     fn default() -> Self {
         Self {
+            bot_id: None,
             authorized: true,
             membership_matches: true,
             valid_channel: true,
@@ -109,6 +111,9 @@ impl Default for MockDiscord {
 }
 #[serenity::async_trait]
 impl DiscordActions for MockDiscord {
+    fn bot_user_id(&self) -> Option<i64> {
+        self.bot_id
+    }
     async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
         anyhow::ensure!(
             self.check_error != Some("membership"),
@@ -451,6 +456,188 @@ async fn production_drain_records_one_stable_truthful_case_for_a_queued_unban() 
         assert_eq!(case.actor_id, Some(42));
         assert_eq!(case.reason.as_deref(), Some("test reason"));
     }
+}
+
+#[tokio::test]
+async fn queued_retry_and_resume_after_initial_completion_keep_the_seed_checkpoint() {
+    async fn checkpoint(
+        conn: &libsql::Connection,
+    ) -> (i64, String, Option<String>, i64, String, String) {
+        let mut rows = conn
+            .query(
+                "SELECT seed.initial_completed_at_ms,sync.run_id,sync.cursor,sync.generation,sync.phase,sync.status
+                 FROM guild_member_seed seed JOIN guild_member_sync sync
+                 ON sync.guild_id=seed.guild_id AND sync.enrollment_id=seed.enrollment_id
+                 WHERE seed.guild_id=10",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get(3).unwrap(),
+            row.get(4).unwrap(),
+            row.get(5).unwrap(),
+        )
+    }
+
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+    let completed_at = chrono::Utc::now().timestamp_millis() - 1_000;
+    let initial = store
+        .initialize_member_directory(scope.clone(), 42, completed_at - 1_000)
+        .await
+        .unwrap();
+    assert_eq!(initial.run_kind.as_deref(), Some("initial"));
+
+    // Model a completed first import in its real tenant store. The test then
+    // uses queued bot actions and the production drain, including its receipt.
+    let guild_path = std::path::PathBuf::from(format!("{}.guild.db", f.path.display()));
+    let guild_db = libsql::Builder::new_local(&guild_path)
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1,case_backfill_done=1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=?1,last_success_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    let before = checkpoint(&conn).await;
+    assert_eq!(before.4, "complete");
+    assert_eq!(before.5, "complete");
+
+    let discord = MockDiscord {
+        bot_id: Some(42),
+        ..Default::default()
+    };
+    for (label, operation) in [
+        (
+            "completed_retry",
+            crate::bot_actions::MemberSyncOperation::Retry,
+        ),
+        (
+            "completed_resume",
+            crate::bot_actions::MemberSyncOperation::Resume,
+        ),
+        (
+            "completed_pause",
+            crate::bot_actions::MemberSyncOperation::Pause,
+        ),
+    ] {
+        let job = f.enqueue(10, label, Action::MemberSync { operation }).await;
+        drain_with_state(&app, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            f.persisted_status(&job).await,
+            (
+                "succeeded".into(),
+                Some("member_sync_already_completed".into())
+            )
+        );
+        assert_eq!(checkpoint(&conn).await, before, "{label} changed the seed");
+        let status = store
+            .member_sync_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+        assert_eq!(status.initial_completed_at, Some(completed_at));
+        assert_eq!(status.run_kind.as_deref(), Some("initial"));
+    }
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(discord.checks.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn completed_retry_requeues_stalled_audit_recovery() {
+    let f = Fixture::new();
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let enrollment_id = enrollment.id.clone();
+    let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+    let completed_at = chrono::Utc::now().timestamp_millis() - 1_000;
+    store
+        .initialize_member_directory(scope.clone(), 42, completed_at - 1_000)
+        .await
+        .unwrap();
+    let guild_path = std::path::PathBuf::from(format!("{}.guild.db", f.path.display()));
+    let guild_db = libsql::Builder::new_local(&guild_path)
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1,case_backfill_done=1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete',completed_at_ms=?1,last_success_at_ms=?1 WHERE guild_id=10",
+        libsql::params![completed_at],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,status_reason,generation,processed)
+         VALUES(10,?1,42,'audit-run',?2,'needs_attention','pagination_stalled',0,0)
+         ON CONFLICT(guild_id) DO UPDATE SET status='needs_attention',status_reason='pagination_stalled',lease_owner=NULL,lease_until_ms=NULL",
+        libsql::params![enrollment_id.as_str(), completed_at],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(guild_db);
+    let job = f
+        .enqueue(
+            10,
+            "retry-audit-stall",
+            Action::MemberSync {
+                operation: crate::bot_actions::MemberSyncOperation::Retry,
+            },
+        )
+        .await;
+    drain_with_state(
+        &app,
+        &MockDiscord {
+            bot_id: Some(42),
+            ..Default::default()
+        },
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        f.persisted_status(&job).await,
+        ("succeeded".into(), Some("member_sync_updated".into()))
+    );
+    let status = store
+        .member_sync_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .await
+        .unwrap();
+    assert_eq!(status.audit_recovery_status.as_deref(), Some("queued"));
 }
 
 #[tokio::test]
@@ -1522,6 +1709,8 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
     )
     .await
     .unwrap();
+    let (store, scope) = app.tenant.live(enrollment.clone()).await.unwrap();
+    assert!(store.get_member(scope, 99).await.unwrap().is_none());
     let real_job = f.enqueue(10, "real", unban(99)).await;
     drain_with_state(
         &app,
@@ -1566,11 +1755,40 @@ async fn already_unbanned_does_not_bind_a_later_real_unban_audit() {
         .unwrap();
     let audit_case = store
         .case_for_source(
-            scope,
+            scope.clone(),
             crate::db::guild_data::CaseSource::DiscordAudit { entry_id: 555 },
         )
         .await
         .unwrap();
+    let noop_data = store
+        .case(
+            scope.clone(),
+            noop_case.id.clone(),
+            crate::db::guild_data::CaseLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let real_data = store
+        .case(
+            scope.clone(),
+            real_case.id.clone(),
+            crate::db::guild_data::CaseLimits::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        noop_data.outcome,
+        crate::db::guild_data::CaseOutcome::Attempted
+    );
+    assert_eq!(
+        real_data.outcome,
+        crate::db::guild_data::CaseOutcome::Succeeded
+    );
+    let member = store.get_member(scope, 99).await.unwrap().unwrap();
+    assert!(member.ever_banned);
+    assert!(!member.is_banned);
     assert_ne!(noop_case.id, real_case.id);
     assert_eq!(
         audit_case.as_ref().map(|m| m.id.as_str()),
