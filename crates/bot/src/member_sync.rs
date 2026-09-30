@@ -668,13 +668,11 @@ pub async fn run(
         if guilds.is_empty() {
             continue;
         }
-        // A conservative initial scheduling share: every cached guild may
-        // compete for the single paced Discord request stream.
-        let initial_scheduling_share = guilds.len() as u32;
         let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut ready = Vec::new();
         let mut available = Vec::new();
+        let mut initial_estimates = Vec::new();
         for guild_id in guilds {
             let gid = guild_id.get() as i64;
             let Some(enrollment) = db::guild_enrollment(&app.db, gid).await.ok().flatten() else {
@@ -692,39 +690,7 @@ pub async fn run(
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
                     .await
                 {
-                    Ok(status) => {
-                        if status.run_kind.as_deref() == Some("initial")
-                            && status.phase.as_deref() == Some("members")
-                            && status.status == "queued"
-                            && status.processed == 0
-                            && status.initial_completed_at.is_none()
-                            && let Some(member_count) = cache
-                                .guild(guild_id)
-                                .map(|guild| guild.member_count as i64)
-                                .filter(|count| *count > 0)
-                            && let Err(error) = store
-                                .set_initial_member_estimate(
-                                    scope.clone(),
-                                    bot_id,
-                                    db::guild_data::MemberInitialEstimate {
-                                        member_count,
-                                        page_size: app.cfg.member_sync.page_size,
-                                        pace_ms: i64::from(
-                                            app.cfg.member_sync.min_request_interval_secs,
-                                        ) * 1000,
-                                        active_guild_count: initial_scheduling_share,
-                                        now_ms,
-                                    },
-                                )
-                                .await
-                        {
-                            tracing::warn!(
-                                guild_id = gid,
-                                "initial member estimate unavailable: {error:#}"
-                            );
-                        }
-                        status
-                    }
+                    Ok(status) => status,
                     Err(error) => {
                         tracing::warn!(
                             guild_id = gid,
@@ -790,6 +756,43 @@ pub async fn run(
                 i64::from(app.cfg.member_sync.min_request_interval_secs) * 1000,
             ) {
                 ready.push((guild_id, store.clone(), scope.clone(), work));
+            }
+            if newly_initialized
+                && status.run_kind.as_deref() == Some("initial")
+                && status.phase.as_deref() == Some("members")
+                && status.status == "queued"
+                && status.processed == 0
+                && status.initial_completed_at.is_none()
+                && let Some(member_count) = cache
+                    .guild(guild_id)
+                    .map(|guild| guild.member_count as i64)
+                    .filter(|count| *count > 0)
+            {
+                initial_estimates.push((guild_id, store, scope, member_count));
+            }
+        }
+        let active_guild_count =
+            ready_guild_count(ready.iter().map(|(guild_id, _, _, _)| *guild_id));
+        // Initial hints and committed pages use the same admitted scheduling share.
+        for (guild_id, store, scope, member_count) in initial_estimates {
+            if let Err(error) = store
+                .set_initial_member_estimate(
+                    scope,
+                    bot_id,
+                    db::guild_data::MemberInitialEstimate {
+                        member_count,
+                        page_size: app.cfg.member_sync.page_size,
+                        pace_ms: i64::from(app.cfg.member_sync.min_request_interval_secs) * 1000,
+                        active_guild_count,
+                        now_ms,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    guild_id = guild_id.get(),
+                    "initial member estimate unavailable: {error:#}"
+                );
             }
         }
         if tokio::time::Instant::now() < next_request {
@@ -1092,8 +1095,6 @@ pub async fn run(
             tokio::time::sleep(Duration::from_secs(8)).await;
             continue;
         }
-        let active_guild_count =
-            ready_guild_count(ready.iter().map(|(guild_id, _, _, _)| *guild_id));
         let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
             continue;
         };
@@ -1365,6 +1366,72 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_eta_counts_only_ready_enrolled_guilds() {
+        use crate::{config::BotProcessConfig, db::Db};
+        use serenity::all::{Cache, CurrentUser, Guild, GuildCreateEvent, UserUpdateEvent};
+
+        let directory =
+            std::env::temp_dir().join(format!("member_sync_eta_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.db.path = directory.join("core.db");
+        let app = BotState::new(cfg.clone(), Db::open(&cfg.db.path, 2).unwrap()).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        // Guild 11 is unenrolled; guild 12 has no admitted tenant placement.
+        let unavailable = db::enroll_guild(&app.db, 12, 100).await.unwrap().unwrap();
+        assert!(app.tenant.live(unavailable).await.is_err());
+        let cache = Arc::new(Cache::new());
+        let mut user = CurrentUser::default();
+        user.id = UserId::new(42);
+        let mut event: UserUpdateEvent =
+            serde_json::from_value(serde_json::to_value(user).unwrap()).unwrap();
+        cache.update(&mut event);
+        for id in [10, 11, 12] {
+            let mut guild = Guild::default();
+            guild.id = GuildId::new(id);
+            guild.member_count = 200;
+            let mut event: GuildCreateEvent =
+                serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+            cache.update(&mut event);
+        }
+        let worker = tokio::spawn(run(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            cache,
+            Arc::new(AtomicI64::new(i64::MAX)), // Suppress all Discord requests.
+            Arc::new(AtomicI64::new(0)),
+        ));
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = store
+                    .member_sync_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+                    .await
+                    .unwrap();
+                if status.total_estimate.is_some() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        let status = status.unwrap();
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(status.total_estimate, Some(200));
+        assert_eq!(status.phase.as_deref(), Some("members"));
+        assert_eq!(status.status, "queued");
+        // Two member pages plus the terminal probe, with one scheduling participant.
+        assert_eq!(
+            status.phase_finish_at.unwrap() - status.started_at.unwrap(),
+            45_000
+        );
+    }
 
     #[test]
     fn longest_allowed_discord_request_keeps_all_claims_live() {
