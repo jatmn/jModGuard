@@ -143,6 +143,16 @@ cleanup_interval_secs = 3600
 batch_size = 4
 request_timeout_secs = 15
 
+# Bot-only member directory importer. One request at a time across guilds;
+# Discord's rate limiter can make the effective pace slower. 11,000 members
+# take approximately 28 minutes at the default pace, plus current bans.
+[member_sync]
+page_size = 100
+min_request_interval_secs = 15
+request_timeout_secs = 30
+retry_base_secs = 30
+retry_max_secs = 3600
+
 # Bot-only exact-image test budgets; restart the bot after changing these.
 # Optional JMODGUARD_IMAGE_SPAM_LIMITS JSON replaces this section (missing keys
 # use defaults). Guild thresholds/test mode live in the WebUI rule editor.

@@ -12,6 +12,7 @@ use crate::db::{DbOpenOptions, MAX_RETENTION_DAYS};
 struct Config {
     pub actions: crate::bot_actions::Limits,
     pub action_worker: ActionWorkerConfig,
+    pub member_sync: MemberSyncConfig,
     pub enrollment: EnrollmentConfig,
     pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
@@ -371,6 +372,7 @@ impl EnrollmentConfig {
 pub struct BotProcessConfig {
     pub actions: crate::bot_actions::Limits,
     pub action_worker: ActionWorkerConfig,
+    pub member_sync: MemberSyncConfig,
     pub enrollment: EnrollmentConfig,
     pub image_spam: crate::image_spam::Limits,
     pub discord: DiscordConfig,
@@ -402,6 +404,7 @@ impl From<Config> for BotProcessConfig {
         Self {
             actions: c.actions,
             action_worker: c.action_worker,
+            member_sync: c.member_sync,
             enrollment: c.enrollment,
             image_spam: c.image_spam,
             discord: c.discord,
@@ -431,6 +434,7 @@ impl From<BotProcessConfig> for Config {
         Self {
             actions: c.actions,
             action_worker: c.action_worker,
+            member_sync: c.member_sync,
             enrollment: c.enrollment,
             image_spam: c.image_spam,
             discord: c.discord,
@@ -448,6 +452,7 @@ impl From<ApiProcessConfig> for Config {
         Self {
             actions: c.actions,
             action_worker: ActionWorkerConfig::default(),
+            member_sync: MemberSyncConfig::default(),
             enrollment: EnrollmentConfig::default(),
             image_spam: crate::image_spam::Limits::default(),
             discord: DiscordConfig::default(),
@@ -523,6 +528,7 @@ impl Config {
             cfg.enrollment.validate()?;
             cfg.image_spam.validate()?;
             cfg.action_worker.validate()?;
+            cfg.member_sync.validate()?;
         }
         Ok(cfg)
     }
@@ -652,6 +658,7 @@ impl Config {
             }
             self.enrollment.apply_env()?;
             self.action_worker.apply_env()?;
+            self.member_sync.apply_env()?;
             if let Ok(v) = env::var("JMODGUARD_DISCORD_TOKEN") {
                 self.discord.token = v.trim().to_string();
             }
@@ -1537,6 +1544,80 @@ pub struct ActionWorkerConfig {
     pub cleanup_interval_secs: u32,
     #[serde(flatten)]
     pub limits: crate::bot_actions::WorkerLimits,
+}
+
+/// One paced directory importer per bot process. Discord imposes its own bucket
+/// limits in addition to this deliberately slower installation-wide budget.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MemberSyncConfig {
+    pub page_size: u16,
+    pub min_request_interval_secs: u32,
+    pub request_timeout_secs: u32,
+    pub retry_base_secs: u32,
+    pub retry_max_secs: u32,
+}
+impl Default for MemberSyncConfig {
+    fn default() -> Self {
+        Self {
+            page_size: 100,
+            min_request_interval_secs: 15,
+            request_timeout_secs: 30,
+            retry_base_secs: 30,
+            retry_max_secs: 3600,
+        }
+    }
+}
+impl MemberSyncConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=500).contains(&self.page_size),
+            "member sync page size must be 1..=500"
+        );
+        anyhow::ensure!(
+            self.min_request_interval_secs >= 15,
+            "member sync interval must be at least 15 seconds"
+        );
+        anyhow::ensure!(
+            self.request_timeout_secs > 0 && self.request_timeout_secs <= 120,
+            "member sync request timeout must be 1..=120 seconds"
+        );
+        anyhow::ensure!(
+            self.retry_base_secs > 0 && self.retry_max_secs >= self.retry_base_secs,
+            "invalid member sync retry interval"
+        );
+        Ok(())
+    }
+    fn apply_env(&mut self) -> Result<()> {
+        for (name, target) in [("JMODGUARD_MEMBER_SYNC_PAGE_SIZE", &mut self.page_size)] {
+            if let Ok(value) = env::var(name) {
+                *target = value.parse().with_context(|| format!("invalid {name}"))?;
+            }
+        }
+        for (name, target) in [
+            (
+                "JMODGUARD_MEMBER_SYNC_INTERVAL_SECS",
+                &mut self.min_request_interval_secs,
+            ),
+            (
+                "JMODGUARD_MEMBER_SYNC_TIMEOUT_SECS",
+                &mut self.request_timeout_secs,
+            ),
+            (
+                "JMODGUARD_MEMBER_SYNC_RETRY_BASE_SECS",
+                &mut self.retry_base_secs,
+            ),
+            (
+                "JMODGUARD_MEMBER_SYNC_RETRY_MAX_SECS",
+                &mut self.retry_max_secs,
+            ),
+        ] {
+            if let Ok(value) = env::var(name) {
+                *target = value.parse().with_context(|| format!("invalid {name}"))?;
+            }
+        }
+        self.validate()
+    }
 }
 impl Default for ActionWorkerConfig {
     fn default() -> Self {
