@@ -204,6 +204,20 @@ async fn main() -> Result<()> {
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
 
+    // One process-wide importer shares its Discord request budget across all
+    // enrolled guilds. The job claim/cursor lives in the guild store.
+    {
+        let app = Arc::clone(&app);
+        let http = Arc::clone(&http);
+        let cache = Arc::clone(&cache);
+        let rate_limit_until_ms = Arc::clone(&rate_limit_until_ms);
+        let sync_bot_id = Arc::clone(&sync_bot_id);
+        tokio::spawn(async move {
+            jmodguard_bot::member_sync::run(app, http, cache, rate_limit_until_ms, sync_bot_id)
+                .await
+        });
+    }
+
     if cfg.enrollment.enabled {
         let app = Arc::clone(&app);
         let http = Arc::clone(&http);
