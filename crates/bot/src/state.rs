@@ -53,6 +53,74 @@ struct GatewayCaseSuppressions {
     entries: HashMap<GatewayCaseSuppression, ((GatewayCaseAction, u64, u64), Instant)>,
 }
 
+/// A write failure cannot be recorded in the same unavailable guild store.
+/// Keep its enrollment and affected users until the worker can persist the gap.
+#[derive(Clone)]
+pub(crate) struct PendingMemberGap {
+    pub(crate) guild_id: u64,
+    pub(crate) enrollment_id: Option<String>,
+    pub(crate) users: Vec<(i64, bool)>,
+    pub(crate) reason: String,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct PendingMemberGaps {
+    generation: u64,
+    by_scope: HashMap<(u64, Option<String>), PendingMemberGap>,
+}
+
+impl PendingMemberGaps {
+    fn remember(
+        &mut self,
+        guild_id: u64,
+        enrollment_id: Option<String>,
+        user_id: Option<i64>,
+        reason: &str,
+    ) {
+        const MAX_AFFECTED_USERS: usize = 1024;
+        self.generation = self.generation.wrapping_add(1);
+        let key = (guild_id, enrollment_id.clone());
+        let gap = self
+            .by_scope
+            .entry(key)
+            .or_insert_with(|| PendingMemberGap {
+                guild_id,
+                enrollment_id,
+                users: Vec::new(),
+                reason: reason.to_owned(),
+                generation: self.generation,
+            });
+        gap.generation = self.generation;
+        gap.reason = reason.to_owned();
+        if let Some(user_id) = user_id.filter(|id| *id > 0)
+            && !gap.users.contains(&(user_id, reason.contains("ban")))
+            && gap.users.len() < MAX_AFFECTED_USERS
+        {
+            gap.users.push((user_id, reason.contains("ban")));
+        }
+    }
+
+    fn snapshot(&self, guild_id: u64) -> Vec<PendingMemberGap> {
+        self.by_scope
+            .values()
+            .filter(|gap| gap.guild_id == guild_id)
+            .cloned()
+            .collect()
+    }
+
+    fn acknowledge(&mut self, gap: &PendingMemberGap) {
+        let key = (gap.guild_id, gap.enrollment_id.clone());
+        if self
+            .by_scope
+            .get(&key)
+            .is_some_and(|stored| stored.generation == gap.generation)
+        {
+            self.by_scope.remove(&key);
+        }
+    }
+}
+
 impl GatewayCaseSuppressions {
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, (_, expires)| *expires > now);
@@ -331,6 +399,12 @@ pub struct BotState {
     slash_sync_progress: Mutex<Option<SlashSyncProgress>>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pending_audit_links: Mutex<PendingAuditLinks>,
+    pending_member_gaps: Mutex<PendingMemberGaps>,
+    /// Increments on each Gateway READY. Resume does not change it.
+    pub(crate) gateway_ready_generation: AtomicU64,
+    ban_observations: Mutex<HashMap<(u64, u64), usize>>,
+    /// Shards that have already delivered READY in this process.
+    ready_shards: Mutex<HashSet<u32>>,
 }
 
 impl BotState {
@@ -387,6 +461,10 @@ impl BotState {
             slash_sync_progress: Mutex::new(None),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
+            pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
+            gateway_ready_generation: AtomicU64::new(0),
+            ban_observations: Mutex::new(HashMap::new()),
+            ready_shards: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -439,6 +517,60 @@ impl BotState {
         self.gateway_case_suppressions
             .lock()
             .remove(action, guild, user)
+    }
+
+    pub(crate) fn remember_member_gap(
+        &self,
+        guild_id: u64,
+        enrollment_id: Option<String>,
+        user_id: Option<i64>,
+        reason: &str,
+    ) {
+        self.pending_member_gaps
+            .lock()
+            .remember(guild_id, enrollment_id, user_id, reason);
+    }
+
+    pub(crate) fn pending_member_gaps(&self, guild_id: u64) -> Vec<PendingMemberGap> {
+        self.pending_member_gaps.lock().snapshot(guild_id)
+    }
+
+    pub(crate) fn acknowledge_member_gap(&self, gap: &PendingMemberGap) {
+        self.pending_member_gaps.lock().acknowledge(gap);
+    }
+
+    /// Returns whether another ban or unban callback for this user is already
+    /// inside its handler. Local start time is not Gateway order.
+    pub(crate) fn begin_ban_observation(&self, guild_id: u64, user_id: u64) -> bool {
+        let mut observations = self.ban_observations.lock();
+        let owners = observations.entry((guild_id, user_id)).or_default();
+        let contested = *owners > 0;
+        *owners = owners
+            .checked_add(1)
+            .expect("ban observation owners overflow");
+        contested
+    }
+
+    pub(crate) fn end_ban_observation(&self, guild_id: u64, user_id: u64) {
+        let mut observations = self.ban_observations.lock();
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            observations.entry((guild_id, user_id))
+        {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+
+    /// A shard's first READY is startup. A later READY from that same shard is
+    /// a replaced session and advances the coverage-gap generation.
+    pub(crate) fn note_shard_ready(&self, shard_id: u32) {
+        if !self.ready_shards.lock().insert(shard_id) {
+            self.gateway_ready_generation
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn remember_application_audit(
@@ -945,6 +1077,65 @@ mod tests {
     use crate::config::BotProcessConfig;
     use crate::db::{self, Db, DbOpenOptions};
     use crate::types::GuildSettings;
+
+    #[test]
+    fn overlapping_ban_observations_remain_contested_until_last_owner_finishes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "jmodguard_ban_owners_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with(DbOpenOptions {
+            path: tmp.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: true,
+            default_prefix: "!".into(),
+            retention_days: 7,
+        })
+        .unwrap();
+        let app = BotState::new(BotProcessConfig::default(), db).unwrap();
+        assert!(!app.begin_ban_observation(10, 20));
+        assert!(app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        assert!(app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        app.end_ban_observation(10, 20);
+        assert!(!app.begin_ban_observation(10, 20));
+        app.end_ban_observation(10, 20);
+        drop(app);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        crate::tenant::remove_sidecars(&tmp);
+    }
+
+    #[test]
+    fn failed_member_observations_remain_queued_until_the_same_generation_is_acknowledged() {
+        let mut gaps = PendingMemberGaps::default();
+        gaps.remember(
+            42,
+            Some("enrollment-a".into()),
+            Some(7),
+            "member join persistence unavailable",
+        );
+        let first = gaps.snapshot(42).pop().expect("queued gap");
+        gaps.remember(
+            42,
+            Some("enrollment-a".into()),
+            Some(8),
+            "member departure persistence unavailable",
+        );
+        gaps.acknowledge(&first);
+        let current = gaps.snapshot(42).pop().expect("newer failure retained");
+        assert_eq!(current.users, vec![(7, false), (8, false)]);
+        gaps.acknowledge(&current);
+        assert!(gaps.snapshot(42).is_empty());
+    }
 
     #[test]
     fn gateway_case_suppressions_are_scoped_consumed_and_bounded() {
