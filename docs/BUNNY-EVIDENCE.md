@@ -6,7 +6,7 @@ Current bot/API services do not call Bunny HTTP from a background worker.
 After selected image-spam enforcement, the bot re-fetches proving attachments with the
 Hasher CDN contract and tenant runtime can stream that local capture file into this
 adapter; the API does not perform that Discord re-fetch. Operator
-resolution of uncertain uploads and backup-copy lifecycle are not enabled.
+resolution of uncertain uploads is not enabled.
 
 ## Installation boundary
 
@@ -18,13 +18,13 @@ account API key. There are no arbitrary request URLs, redirects, proxies, automa
 retries or decompression. The client reuses the existing hyper/rustls connector and ring
 hashing, sharing its connection pool among clones. No SDK or new locked package is added.
 
-Use a dedicated **private evidence zone**, separate from the backups-only zone. The installer
+Use a dedicated **private evidence zone**, separate from any operator-managed backups. Operators
 must verify that no public delivery is attached and provision `jmodguard-evidence-identity`
 with exactly `jmodguard-bunny-evidence-1\n{storage_id}\n` (actual newlines, including the last).
 Every operation verifies this small authenticated marker. The adapter never creates/adopts
 zones or markers, lists arbitrary directories, or deletes a directory/root. A marker proves
 matching configured identity, not absence of a Pull Zone: the storage password does not give
-this adapter a control-plane privacy audit. Installer verification and protection of that
+this adapter a control-plane privacy audit. Operator verification and protection of that
 binding remain prerequisites to runtime activation. Administrators can copy markers or
 restore databases; these checks do not fence such copies or hostile credential holders.
 
@@ -33,7 +33,7 @@ the journal. No caller-supplied key, raw attachment URL or filename reaches the 
 The resolved regional zone binding is persisted with each attempt; a different binding for
 the same alias is refused while another attempt in that guild store retains it. Recovery and
 cleanup require an exact binding match. Installation-wide alias/credential management remains
-trusted lifecycle work across databases. Keys remain stable across future guild-store moves.
+trusted lifecycle work across databases.
 
 ## Capture and recovery
 

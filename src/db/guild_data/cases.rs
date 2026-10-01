@@ -375,25 +375,8 @@ impl GuildDataStore {
         }).await
     }
 
-    /// Prove a removal tombstone exists in this exact live membership. Used to
-    /// recover the cross-store backup intent, never to accept arbitrary case IDs.
-    pub async fn case_removed(&self, scope: GuildDataScope, id: CaseId) -> Result<bool> {
-        self.check_target(&scope.placement)?;
-        let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
-            verify_scope(&tx, &expected, &scope, true)?;
-            let removed = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=1)",
-                params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(r.get(0)?),
-            )?;
-            tx.finish_read()?;
-            Ok(removed)
-        }).await
-    }
-
     /// Bounded payload/replay-key cleanup only after the exact membership is closed.
-    /// No service worker or full directory/backup erasure is activated by this helper.
+    /// Directory erasure is coordinated separately by tenant runtime.
     pub async fn purge_closed_cases(
         &self,
         scope: GuildDataScope,

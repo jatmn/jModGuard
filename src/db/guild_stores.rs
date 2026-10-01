@@ -1,5 +1,5 @@
 //! Nonsecret directory catalog foundation. Not live routing or user authorization.
-//! Initial placement is still one-shot; populated moves use a fenced rebind.
+//! Initial placement is one-shot.
 use super::*;
 
 /// Opaque installation-assigned identity, never a database URL, token or provider ID.
@@ -103,7 +103,7 @@ pub enum CatalogConflict {
     Placement,
 }
 
-/// Guild-scoped freeze while a populated store move copies and cuts over.
+/// Persisted guild-scoped fence; an upgrade must not silently unlock existing state.
 #[derive(Debug, thiserror::Error)]
 #[error("this server is frozen for a database move")]
 pub struct GuildWriteFenced;
@@ -326,165 +326,6 @@ pub async fn clear_erased_placement(
             }
             Some(_) => Err(CatalogConflict::Placement.into()),
         }
-    })
-    .await
-}
-
-/// Freeze guild-scoped writes. Matching retries with the same destination keep
-/// the original generation. This is not user authorization.
-pub async fn set_guild_write_fence(
-    db: &Db,
-    guild: i64,
-    destination: StoreId,
-    destination_revision: String,
-    phase: &str,
-) -> Result<String> {
-    anyhow::ensure!(guild > 0, "invalid guild id");
-    StoreId::parse(&destination_revision)?;
-    anyhow::ensure!(
-        matches!(phase, "freeze" | "copy" | "verify" | "switch"),
-        "invalid move phase"
-    );
-    let phase = phase.to_owned();
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let store = registration_conn(&tx, &destination)?.ok_or(CatalogConflict::UnknownStore)?;
-        anyhow::ensure!(store.policy.permits(guild), CatalogConflict::DedicatedOwner);
-        if let Some((generation, dest, revision)) = tx
-            .query_row(
-                "SELECT generation, destination_store_id, destination_revision FROM guild_write_fences WHERE guild_id=?1",
-                params![guild],
-                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<String>(2)?)),
-            )
-            .optional()?
-        {
-            anyhow::ensure!(
-                dest == destination.as_str() && revision == destination_revision,
-                CatalogConflict::Placement
-            );
-            if phase != "freeze" {
-                tx.ensure_mutation_receipt()?;
-                tx.execute_rows(
-                    "UPDATE guild_write_fences SET phase=?1 WHERE guild_id=?2",
-                    params![phase.as_str(), guild], 1,
-                )?;
-                tx.commit()?;
-            } else {
-                tx.finish_read()?;
-            }
-            return Ok(generation);
-        }
-        let generation = format!("{:032x}", rand::random::<u128>());
-        tx.ensure_mutation_receipt()?;
-        tx.execute_rows(
-            "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at) VALUES(?1,?2,?3,?4,?5,unixepoch())",
-            params![
-                guild,
-                generation.as_str(),
-                phase.as_str(),
-                destination.as_str(),
-                destination_revision.as_str()
-            ], 1,
-        )?;
-        tx.commit()?;
-        Ok(generation)
-    })
-    .await
-}
-
-pub async fn clear_guild_write_fence(db: &Db, guild: i64, generation: &str) -> Result<bool> {
-    anyhow::ensure!(guild > 0, "invalid guild id");
-    StoreId::parse(generation)?;
-    let generation = generation.to_owned();
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT generation FROM guild_write_fences WHERE guild_id=?1",
-                params![guild],
-                |r| Ok(r.get(0)?),
-            )
-            .optional()?;
-        match current {
-            Some(current) if current == generation => {
-                tx.prepare_reclaim()?;
-                tx.execute_reclaim(
-                    "DELETE FROM guild_write_fences WHERE guild_id=?1 AND generation=?2",
-                    params![guild, generation.as_str()],
-                )?;
-                tx.commit()?;
-                Ok(true)
-            }
-            None => {
-                tx.finish_read()?;
-                Ok(false)
-            }
-            Some(_) => Err(CatalogConflict::Placement.into()),
-        }
-    })
-    .await
-}
-
-/// Cut over an existing placement after a fenced copy. Expected source identity
-/// must still match. Destination must already be registered and permitted.
-pub async fn rebind_placement(
-    db: &Db,
-    expected: GuildPlacement,
-    destination: StoreId,
-    destination_revision: String,
-) -> Result<GuildPlacement> {
-    anyhow::ensure!(expected.guild_id() > 0, "invalid guild id");
-    StoreId::parse(&destination_revision)?;
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let Some(current) = placement_conn(&tx, expected.guild_id())? else {
-            return Err(CatalogConflict::Placement.into());
-        };
-        anyhow::ensure!(
-            current.store_id == expected.store_id && current.revision == expected.revision,
-            CatalogConflict::Placement
-        );
-        let store = registration_conn(&tx, &destination)?.ok_or(CatalogConflict::UnknownStore)?;
-        anyhow::ensure!(store.policy.permits(expected.guild_id()), CatalogConflict::DedicatedOwner);
-        let queued: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
-            params![expected.guild_id()],
-            |r| Ok(r.get(0)?),
-        )?;
-        anyhow::ensure!(!queued, CatalogConflict::Placement);
-        let fence = tx
-            .query_row(
-                "SELECT destination_store_id, destination_revision FROM guild_write_fences WHERE guild_id=?1",
-                params![expected.guild_id()],
-                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
-            )
-            .optional()?
-            .ok_or(CatalogConflict::Placement)?;
-        anyhow::ensure!(
-            fence.0 == destination.as_str() && fence.1 == destination_revision,
-            CatalogConflict::Placement
-        );
-        tx.ensure_mutation_receipt()?;
-        tx.execute_rows(
-            "UPDATE guild_store_placements SET store_id=?1, revision=?2 WHERE guild_id=?3 AND store_id=?4 AND revision=?5",
-            params![
-                destination.as_str(),
-                destination_revision.as_str(),
-                expected.guild_id(),
-                expected.store_id.as_str(),
-                expected.revision.as_str()
-            ], 1,
-        )?;
-        tx.execute_rows(
-            "UPDATE guild_write_fences SET phase='switch' WHERE guild_id=?1",
-            params![expected.guild_id()], 1,
-        )?;
-        tx.commit()?;
-        Ok(GuildPlacement {
-            guild_id: expected.guild_id(),
-            store_id: destination,
-            revision: destination_revision,
-        })
     })
     .await
 }

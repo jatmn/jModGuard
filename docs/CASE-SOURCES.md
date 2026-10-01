@@ -86,7 +86,7 @@ No independent source deletion or unlink API exists. SQL guards reject replaceme
 orphan inserts and active-membership deletion without relying on FK/recursive-trigger PRAGMAs.
 Administrators can still replace schema definitions; this is not a database privilege boundary.
 
-Full departed-guild erasure/rejoin and backup removal remain separate lifecycle work.
+Live departed-guild erasure is coordinated by [tenant runtime](TENANT-RUNTIME.md).
 These active replay markers do not prescribe a permanent departed-guild ledger. No external
 file evidence or backup copy is created by this slice.
 

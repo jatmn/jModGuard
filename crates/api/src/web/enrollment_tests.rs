@@ -2172,11 +2172,11 @@ async fn case_delete_reports_cleanup_pending_when_object_cleanup_fails() {
         })
         .await
         .unwrap();
-    assert_eq!(intents, 1);
+    assert_eq!(intents, 0);
 }
 
 #[tokio::test]
-async fn removed_case_retry_recovers_backup_intent() {
+async fn case_delete_and_retry_ignore_retired_backup_queue() {
     use crate::db::SqlExecutor;
     use crate::db::guild_data::*;
     let f = Fixture::new(false).await;
@@ -2215,14 +2215,6 @@ async fn removed_case_retry_recovers_backup_intent() {
     let (status, first) = f.request("DELETE", &url, "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first["removed"], true);
-    f.app
-        .db
-        .with_conn(|c| {
-            c.execute_batch_bounded("DROP TRIGGER review_fail", 64 * 1024 * 1024)?;
-            Ok(())
-        })
-        .await
-        .unwrap();
     let (status, second) = f.request("DELETE", &url, "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second["removed"], false);
@@ -2236,8 +2228,8 @@ async fn removed_case_retry_recovers_backup_intent() {
         })
         .await
         .unwrap();
-    assert_eq!(count, 1);
-    assert_eq!(first["cleanup_pending"], true);
+    assert_eq!(count, 0);
+    assert_eq!(first["cleanup_pending"], false);
     assert_eq!(second["cleanup_pending"], false);
     let (_, removed) = f
         .request("GET", "/api/guilds/10/cases?removed=true", "")
@@ -2256,7 +2248,7 @@ async fn removed_case_retry_recovers_backup_intent() {
         })
         .await
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
     f.request(
         "DELETE",
         &format!("/api/guilds/10/cases/{}", "f".repeat(32)),
@@ -2273,7 +2265,7 @@ async fn removed_case_retry_recovers_backup_intent() {
         })
         .await
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]

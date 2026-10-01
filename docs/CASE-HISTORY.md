@@ -78,8 +78,8 @@ work. An interrupted failed transaction leaves the parent and its history togeth
 Guards prevent history updates, cross-scope/orphan insertions and INSERT OR REPLACE bypass,
 and refuse direct deletion while the parent is live and its membership active. They work
 without foreign-key or recursive-trigger settings. Database administrators can still replace
-schema; this is not a database privilege boundary. Full guild erasure/rejoin, directory and
-backup cleanup, external evidence ownership and distributed writer exclusion remain later.
+schema; this is not a database privilege boundary. Live guild erasure and external evidence ownership are coordinated by
+[tenant runtime](TENANT-RUNTIME.md). Distributed writer exclusion remains separate work.
 
 ## Schema and validation
 

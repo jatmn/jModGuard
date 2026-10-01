@@ -11,8 +11,7 @@ use crate::db::guild_stores::{
 };
 use crate::db::{
     self, Db, GuildEnrollment, GuildErasureJob, SqlExecutor, finish_guild_erasure,
-    next_guild_erasure_after, queue_guild_erasure, record_backup_cleanup_intent,
-    wipe_departed_directory_guild_data,
+    next_guild_erasure_after, queue_guild_erasure, wipe_departed_directory_guild_data,
 };
 use crate::db_compat::OptionalExtension;
 use anyhow::{Context, Result, anyhow, bail};
@@ -697,16 +696,6 @@ impl TenantRuntime {
             {}
             while !handle.erase_closed_scope(scope.clone()).await? {}
         }
-        record_backup_cleanup_intent(
-            &self.core,
-            "guild",
-            job.guild_id,
-            Some(&job.enrollment.id),
-            None,
-            None,
-            None,
-        )
-        .await?;
         if !wipe_departed_directory_guild_data(&self.core, job.guild_id).await? {
             tracing::info!(
                 guild_id = job.guild_id,
@@ -785,23 +774,6 @@ impl TenantRuntime {
             }
         }
         Ok(())
-    }
-
-    pub async fn record_case_cleanup(
-        &self,
-        scope: &GuildDataScope,
-        case: &crate::db::guild_data::CaseId,
-    ) -> Result<()> {
-        record_backup_cleanup_intent(
-            &self.core,
-            "case",
-            scope.guild_id(),
-            Some(&scope.enrollment().id),
-            Some(case.as_str()),
-            None,
-            None,
-        )
-        .await
     }
 
     fn store_for_guild(&self, guild: i64) -> Result<StoreId> {

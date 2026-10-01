@@ -529,13 +529,20 @@ async fn configuration_copy_cannot_write_a_fenced_destination() {
     )
     .await
     .unwrap();
-    crate::db::guild_stores::set_guild_write_fence(
-        &f.db,
-        20,
-        store,
-        format!("{:032x}", 10u128),
-        "freeze",
-    )
+    {
+        use crate::db::SqlExecutor as _;
+        let destination = store;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![20, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
 

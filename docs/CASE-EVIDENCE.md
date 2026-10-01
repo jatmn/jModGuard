@@ -6,8 +6,6 @@ by itself. The bot captures proving Discord attachments for selected image-spam 
 through [tenant runtime](TENANT-RUNTIME.md); that path reserves journal rows and streams bytes
 through the opt-in [local transfer backend](LOCAL-EVIDENCE.md) or [Bunny adapter](BUNNY-EVIDENCE.md).
 The API serves authorized journal-available objects and does not perform that Discord re-fetch.
-Backup-copy
-cleanup remains later work.
 
 ## Reservation and identity
 
@@ -17,8 +15,8 @@ channel/message/attachment IDs. No source URL, filename, token or arbitrary obje
 stored. Producers must independently verify attachment ownership and permission.
 
 Keys are derived as `evidence/{guild}/{enrollment}/{case}/{evidence}`, using validated IDs.
-They remain stable across guild-store moves. Trusted installation configuration must bind
-the alias to a stable, allowlisted private evidence resource, never the backups-only zone.
+Trusted installation configuration must bind the alias to a stable, allowlisted private
+evidence resource, separate from any operator-managed backups.
 It cannot silently reassign that alias while objects remain. This library neither establishes
 resource privacy nor loads provider credentials. These internal types are not HTTP wire models.
 
@@ -91,7 +89,6 @@ Guild0006 adds the journal, three indexes and ownership/transition triggers. Fre
 Open requires 9 after the rolling-snapshot extension. Rollback needs matching pre-upgrade
 database/binary. Core is at migration 0016. The bot captures proving attachments through
 tenant runtime as described above; the API does not perform that Discord re-fetch.
-Backup-copy cleanup remains later work.
 
 Local tests cover concurrent reservations, retries/conflicts, budgets, late uploads, removal
 races, scope denial, bounded closed cleanup/pages, SQL guards, cancellation/purge rollback

@@ -227,20 +227,9 @@ pub async fn delete_case(
             true
         }
     };
-    let mut backup_cleanup_pending = false;
-    if (removed || store.case_removed(scope.clone(), id.clone()).await?)
-        && let Err(error) = app.tenant.record_case_cleanup(&scope, &id).await
-    {
-        backup_cleanup_pending = true;
-        tracing::warn!(
-            guild_id,
-            case_id = %id.as_str(),
-            "backup cleanup intent not recorded after case removal: {error:#}"
-        );
-    }
     Ok(Json(serde_json::json!({
         "removed": removed,
-        "cleanup_pending": cleanup_pending || backup_cleanup_pending,
+        "cleanup_pending": cleanup_pending,
         "discord_action_reversed": false,
     })))
 }

@@ -167,7 +167,7 @@ table counts. The fresh schema omits `messages`, `members`, `users` and `mutes`;
 archive helpers are removed. Old internal retention fields have no live collection
 effect. Databases from before this baseline are unsupported and are not adopted or
 erased. Publish matching frontend/API artifacts. Routing guilds across stores remains
-subsequent work. Backup-copy cleanup is unavailable; application cleanup intents remain durable.
+subsequent work.
 
 Local tests cover real report mapping, rendered payload flags/limits, guild routing,
 unavailable SQL history tables, overload, timeout/capacity recovery and API/UI removal.

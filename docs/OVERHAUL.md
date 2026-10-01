@@ -279,8 +279,8 @@ After membership closure, bounded cleanup can remove records/markers while stale
 denied. Reads and mutations reuse captured primary scope and receipt recovery; no new
 library, task or runtime recorder is enabled. Core stays10. See [case contracts](TENANT-CASES.md).
 
-File evidence, richer proof, trusted runtime source matching, permissions, capacity monitoring
-and backup-aware lifecycle remain before runtime adoption. History and explicit source
+File evidence, richer proof, trusted runtime source matching, permissions and capacity monitoring
+remain before runtime adoption. History and explicit source
 association are implemented below.
 No general chat/event archive, automatic age expiry or full-erasure claim is introduced.
 
@@ -295,7 +295,7 @@ library/task/recorder is enabled. See [history contracts](CASE-HISTORY.md).
 
 Trusted runtime source matching beyond bot-owned in-process Ban/Unban/Kick (see
 Discord-audit source association below), permission/presentation, file evidence and
-complete lifecycle/backup cleanup remain pending. Corrections are observations, not inferred
+complete lifecycle integration remain pending. Corrections are observations, not inferred
 Discord success or automatic rewriting of effective state. Core remains10.
 
 ## Implemented: explicit case source association (wave 22)
@@ -324,7 +324,7 @@ unsettled evidence and removes acknowledged ownership atomically. See [evidence 
 No file bytes are fetched, uploaded, served or deleted by this journal. No new dependency,
 cache, task or service adoption is introduced; core0010 stays unchanged. Storage bindings,
 streaming adapters, exclusive writer coordination, uncertain-upload reconciliation, backend
-permissions and backup-copy lifecycle remain required before runtime activation. Local state
+permissions remain required before runtime activation. Local state
 transitions are not provider verification or a complete file-evidence implementation.
 
 ## Implemented: opt-in local evidence transfer (wave 24)
@@ -340,7 +340,7 @@ objects. See [local transfer contracts](LOCAL-EVIDENCE.md).
 This is real local file I/O, exercised with local and disposable remote SQL. No new schema,
 runtime worker, source fetcher or serving endpoint is enabled. Bunny resource binding and
 uncertain remote writes need a separate adapter; local locks are not a distributed lease.
-Permission checks, backup-copy lifecycle and complete tenant adoption remain pending.
+Permission checks and complete tenant adoption remain pending.
 
 ## Implemented: opt-in Bunny evidence transfers (wave 25)
 
@@ -353,13 +353,13 @@ and cleanup verifies object absence before SQL acknowledgment. See [Bunny eviden
 
 Regional endpoints are allowlisted and authenticated resource markers checked; redirects,
 proxies and automatic request retries are absent. Existing HTTP/TLS/hash dependencies are
-reused. Installer privacy checks, uncertain-upload operator resolution, live provider
-validation and backup-copy lifecycle remain later work. Serving of available objects is
+reused. Operator privacy checks, uncertain-upload operator resolution, live provider
+validation remain later work. Serving of available objects is
 now wired; see [tenant runtime](TENANT-RUNTIME.md).
 
 ## Next implementation slices
 
-Live Bunny evidence zone privacy, backup-copy cleanup, durable cross-restart
+Live Bunny evidence zone privacy, durable cross-restart
 Discord-audit reconciliation and dashboard presentation of linked sources,
 database credential hot-reload, writer leases and multi-replica sessions remain
 later work.

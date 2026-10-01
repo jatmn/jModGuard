@@ -9,7 +9,7 @@ record selected action outcomes and expose private case administration; see
 
 `CaseId` is a portable opaque32-character lowercase hexadecimal identifier. Generate it once
 and retain it across retries. Its parser and serde reject malformed values. Ownership is
-always the guild and enrollment; the ID alone grants no access. Copies/moves must preserve
+always the guild and enrollment; the ID alone grants no access. Stored records must preserve
 that ownership as well as IDs. No automatic cross-store import is implemented.
 
 `CaseData` explicitly distinguishes ban, kick, formal warning, timeout, unban and timeout
@@ -36,7 +36,7 @@ from the case. No attachment URLs, arbitrary object keys, downloads or external 
 references are accepted by `CaseData`. Separate [evidence ownership](CASE-EVIDENCE.md)
 now journals selected attachment reservations and cleanup. The bot captures proving
 Discord attachments for selected image-spam enforcement through [tenant runtime](TENANT-RUNTIME.md).
-Backup-copy cleanup remains later work. The API serves authorized
+The API serves authorized
 journal-available objects through [tenant runtime](TENANT-RUNTIME.md) and does not perform
 that Discord re-fetch. Text evidence is a selected subset, not a completeness guarantee or general history.
 Discord snowflake serialization reuses the existing string helpers.
@@ -90,9 +90,9 @@ Closing membership immediately denies all normal case access/writes. Case cleanu
 separate bounded operation; it can remove retained payloads and replay markers after closure
 without admitting stale work. A parent with unsettled file-evidence ownership now blocks that
 purge batch until capture settlement and object deletion are acknowledged. Other guilds are untouched. The closed membership identity
-still blocks rebinding. This is not full guild erasure/rejoin or removal from backups: no
-backup copies or file evidence are created here, and directory/identity/backup lifecycle
-coordination remains required. No permanent departed-guild ledger is the product target.
+still blocks rebinding. Live guild erasure/rejoin, directory cleanup and evidence ownership
+are coordinated by [tenant runtime](TENANT-RUNTIME.md). This case-storage library does not
+create or manage backup copies. No permanent departed-guild ledger is the product target.
 
 ## Schema and validation
 

@@ -122,7 +122,7 @@ Identity/placement/membership checks must share the data transaction, including 
 paths. Keep per-membership edit revisions and closure atomic with mappings; never rebind or
 reopen a closed scope automatically. Initial binding is trusted lifecycle work, not
 permission checking. A successful snapshot check never authorizes a later write. Cloned
-backups can retain the same identity/revision. Writer exclusion for moves uses core `guild_write_fences`. Bunny credential hot-reload remains pending.
+backups can retain the same identity/revision. Persisted core `guild_write_fences` must continue blocking writes and erasure after an upgrade. Bunny credential hot-reload remains pending.
 
 Version3 adds inactive selected cases/text evidence; see `docs/TENANT-CASES.md`. Reuse
 captured scope checks with data; preserve immutable source/payload retry semantics, bounded
@@ -154,8 +154,8 @@ closed cancellation is batched. Parent purge refuses unacknowledged evidence. Jo
 not leases or provider proof. Authorized serving of available objects is now
 implemented; the bot captures proving Discord attachments for selected image-spam
 enforcement through tenant runtime. The API serves authorized journal-available objects
-and does not perform that Discord re-fetch. Backup-copy cleanup remains later work.
-Private evidence and backups-only resources must remain separate.
+and does not perform that Discord re-fetch.
+Private evidence and operator-managed backup resources must remain separate.
 
 The opt-in Unix local evidence backend uses real bounded streaming and durable receipts;
 see `docs/LOCAL-EVIDENCE.md`. Hold its stable OS resource lock through I/O and SQL settlement,
@@ -165,15 +165,14 @@ only verified file absence can acknowledge cleanup. Local advisory locks require
 writers and trusted parents; they do not establish remote PUT completion or restore fencing.
 Bot and API open this backend through tenant runtime for authorized serving of available
 objects. The bot captures proving Discord attachments for selected image-spam enforcement
-through tenant runtime; the API does not perform that Discord re-fetch. Backup-copy
-cleanup remains later work.
+through tenant runtime; the API does not perform that Discord re-fetch.
 
 The opt-in Bunny evidence adapter uses guild schema7 single-use attempts and durable201
 acceptance before readback/settlement; see `docs/BUNNY-EVIDENCE.md`. Preserve immutable scoped
 binding, checksum scrubbing and blocked unresolved PUTs. Never use timeout/early404/matching
 bytes as acceptance, retry a PUT, follow redirects or accept arbitrary endpoints. Resource
-markers do not prove zone privacy; installation checks, provider resolution, runtime authority
-and backup-copy lifecycle remain before activation. Core is at migration 0016. Local HTTP/SQL fixtures
+markers do not prove zone privacy; operator checks, provider resolution and runtime authority
+remain before activation. Core is at migration 0016. Local HTTP/SQL fixtures
 must not be reported as live Bunny proof or measured resource usage.
 
 The attachment and repeated-text rules now use bounded Gateway exact-image and

@@ -186,7 +186,7 @@ async fn stale_membership_does_not_read_or_write() {
 }
 
 #[tokio::test]
-async fn erasure_clears_owned_rows_and_queues_backup_intent() {
+async fn erasure_clears_owned_rows_without_backup_jobs() {
     let f = Fixture::new();
     let enrollment = enroll(&f, 10, 100).await;
     f.tenant
@@ -218,7 +218,7 @@ async fn erasure_clears_owned_rows_and_queues_backup_intent() {
         })
         .await
         .unwrap();
-    assert_eq!(intents, 1);
+    assert_eq!(intents, 0);
 }
 
 #[tokio::test]
@@ -464,7 +464,6 @@ async fn empty_implicit_shared_store_id_stays_stable_across_runtime_reopen() {
 #[tokio::test]
 async fn erasure_resumes_after_core_failure_and_reopen() {
     for (operation, table) in [
-        ("INSERT", "backup_cleanup_intents"),
         ("DELETE", "guild_settings"),
         ("DELETE", "guild_store_placements"),
         ("DELETE", "guild_erasure_jobs"),
@@ -967,7 +966,7 @@ async fn departure_without_placement_settles_directory_in_retirement() {
         })
         .await
         .unwrap();
-    assert_eq!(reminders, 1);
+    assert_eq!(reminders, 0);
 }
 
 #[tokio::test]
@@ -1407,13 +1406,20 @@ async fn live_tenant_writes_fail_closed_while_the_guild_is_fenced() {
     )
     .await
     .unwrap();
-    crate::db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        dest,
-        format!("{:032x}", 9u128),
-        "freeze",
-    )
+    {
+        use crate::db::SqlExecutor as _;
+        let destination = dest;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
     let live = f.tenant.live(enrollment.clone()).await;
@@ -1446,13 +1452,20 @@ async fn guild_store_writes_after_live_respect_move_fence() {
     )
     .await
     .unwrap();
-    crate::db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        dest,
-        format!("{:032x}", 9u128),
-        "freeze",
-    )
+    {
+        use crate::db::SqlExecutor as _;
+        let destination = dest;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
     let error = store
@@ -1472,7 +1485,7 @@ async fn guild_store_writes_after_live_respect_move_fence() {
 }
 
 #[tokio::test]
-async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
+async fn activate_follows_persisted_catalog_over_initial_configuration() {
     let dedicated = std::env::temp_dir().join(format!(
         "jmodguard_tenant_{:032x}.dedicated.db",
         rand::random::<u128>()
@@ -1498,22 +1511,18 @@ async fn activate_follows_catalog_after_dedicated_to_shared_rebind() {
     let current = guild_placement(&f.db, 10).await.unwrap().unwrap();
     assert_eq!(current.store_id(), &dedicated_id);
 
-    let dest_revision = format!("{:032x}", 9u128);
-    let generation = crate::db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        shared_id.clone(),
-        dest_revision.clone(),
-        "switch",
-    )
+    // Represent an existing catalog assignment that differs from initial config.
+    let persisted_id = shared_id.clone();
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE guild_store_placements SET store_id=?1, revision=?2 WHERE guild_id=10",
+            libsql::params![persisted_id.as_str(), format!("{:032x}", 9u128)],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    })
     .await
     .unwrap();
-    crate::db::guild_stores::rebind_placement(&f.db, current, shared_id.clone(), dest_revision)
-        .await
-        .unwrap();
-    crate::db::guild_stores::clear_guild_write_fence(&f.db, 10, &generation)
-        .await
-        .unwrap();
 
     let scope = f
         .tenant
