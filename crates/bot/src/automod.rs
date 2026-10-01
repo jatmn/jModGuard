@@ -378,7 +378,7 @@ pub async fn execute_pending(
         tracing::warn!(
             guild_id = guild_id.get(),
             action = rule.action,
-            "automod Discord mutation skipped during guild move fence"
+            "automod Discord mutation skipped because the guild is write-fenced"
         );
         return;
     }

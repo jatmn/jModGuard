@@ -76,6 +76,5 @@ Routing must still combine this storage layer with authoritative membership coor
 global policy/configuration, bounded store handles, queue completion/version observation
 and channel/user authorization. Closing this scope does not retire core membership, clear
 service caches or recall an already-sent Discord request. A database clone can retain the
-same identity and revisions; this is not distributed writer exclusion or a guild-move
-protocol. Selected cases/text evidence now use this same captured scope. File evidence, other tenant
+same identity and revisions; this is not distributed writer exclusion. Selected cases/text evidence now use this same captured scope. File evidence, other tenant
 configuration and complete guild erasure remain later work. No live Bunny/Discord or resource-usage assurance is established by local tests.

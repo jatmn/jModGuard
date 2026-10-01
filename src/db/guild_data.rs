@@ -373,7 +373,7 @@ impl GuildDataStore {
         })
     }
 
-    /// Bot/API tenant runtimes attach the core database so move fences fail closed on
+    /// Bot/API tenant runtimes attach the core database so persisted write fences fail closed on
     /// guild-store mutations, not only at `TenantRuntime::live` handle acquisition.
     pub fn with_core_write_fence(self, core: Db) -> Self {
         Self {

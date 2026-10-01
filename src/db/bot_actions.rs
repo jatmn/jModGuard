@@ -300,7 +300,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
-        // Housekeeping (expiry/uncertain) is independent of move fences. Claim
+        // Housekeeping (expiry/uncertain) is independent of write fences. Claim
         // selection still excludes fenced guilds in the UPDATE/SELECT below.
         let due: i64 = conn.query_row(
             &format!(

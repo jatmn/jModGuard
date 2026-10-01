@@ -99,13 +99,13 @@ pub enum CatalogConflict {
     UnknownStore,
     #[error("dedicated store belongs to another guild")]
     DedicatedOwner,
-    #[error("guild already has a different placement; a coordinated move is required")]
+    #[error("guild already has a different database placement")]
     Placement,
 }
 
 /// Persisted guild-scoped fence; an upgrade must not silently unlock existing state.
 #[derive(Debug, thiserror::Error)]
-#[error("this server is frozen for a database move")]
+#[error("this server has an unresolved database write fence")]
 pub struct GuildWriteFenced;
 
 pub(super) fn guild_write_fenced(conn: &impl SqlExecutor, guild: i64) -> Result<bool> {
@@ -294,7 +294,7 @@ fn assign_initial_placement_transaction(
     })
 }
 
-/// Remove a placement after owned live data is erased. This is not a guild move.
+/// Remove a placement after owned live data is erased.
 pub async fn clear_erased_placement(
     db: &Db,
     guild: i64,

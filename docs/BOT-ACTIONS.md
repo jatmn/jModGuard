@@ -79,14 +79,14 @@ The existing guild-ID helpers remain trusted internal operations: they resolve c
 membership at the operation, without protecting an earlier authorization snapshot. They
 must not replace captured-scope helpers in dashboard routes. Status reads hide
 old/unbound memberships. `bot_action_dispatch` rechecks running claim identity,
-current membership and guild-move fencing at the primary, preserving whether dispatch
-was blocked by enrollment replacement or a move. It does not perform Discord validation
-or a mutation. Claim selection excludes fenced guilds; expiry of overdue `pending`/`claimed`
+current membership and persisted guild write fences at the primary, preserving whether
+dispatch was blocked by enrollment replacement or a write fence. It does not perform
+Discord validation or a mutation. Claim selection excludes fenced guilds; expiry of overdue `pending`/`claimed`
 work and `running`→`uncertain` still run when `expires_at` has passed, even if no other
-guild has claimable work. Local log-channel completion checks the move fence again in the same
+guild has claimable work. Local log-channel completion checks the write fence again in the same
 transaction as the setting write so a fence raised during Discord channel validation
 still fails closed. Unban completion preserves the Discord result but skips its local
-ban-mirror and event writes if a move fence was raised after dispatch.
+ban-mirror and event writes if a write fence appeared after dispatch.
 
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
@@ -111,8 +111,9 @@ timestamp may match a Gateway timestamp after omitting its subseconds, but any l
 positive timestamp—even later in the same Unix second—is replacement evidence. Exact
 stored enrollment IDs and timestamps remain the durable dispatch fence, so an observed
 replacement still cancels stale work instead of replaying it.
-If a guild-move fence races that repair, the old claim finishes as `guild_move_fenced`
-without dispatch. Other repair-storage failures use the existing unavailable outcome when
+If a persisted guild write fence races that repair, the old claim finishes without
+dispatch. Its outcome code remains `guild_move_fenced` for compatibility with stored
+action receipts. Other repair-storage failures use the existing unavailable outcome when
 a receipt can still be written; expiry remains the fallback when the database itself cannot
 persist that receipt.
 

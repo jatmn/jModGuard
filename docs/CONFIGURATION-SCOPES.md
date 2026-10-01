@@ -52,7 +52,7 @@ though it changes nothing, then returns without a mutation receipt or version ch
 Actual settings writes enable recovery receipts after scope verification while retaining
 the primary transaction lock. Existing lost-commit reconciliation still applies. Other
 mutations retain their existing receipt and no-op version behavior. Captured configuration
-writes check the exact enrollment and any target-guild move fence in one SQL statement.
+writes check the exact enrollment and any persisted target-guild write fence in one SQL statement.
 On remote libSQL, transaction setup likewise checks the restore fence and creates the
 lost-commit receipt in one statement. These preserve the same fail-closed checks while
 removing avoidable serial provider round trips from each save.
