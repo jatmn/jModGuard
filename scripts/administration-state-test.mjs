@@ -805,11 +805,11 @@ test("schema upgrades expose the paired action and active pairs block independen
   api.candidate.result_schema = 17;
   api.candidate.upgrade = { guild_schema: 15 };
   render(view, api);
-  vm.runInContext(`snapshot.coordinated_upgrade_path = "/api/service-upgrade/recovery";
+  vm.runInContext(`snapshot.coordinated_upgrade_path = "/updates/recovery";
     snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; render();`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   const link = find(view.elements.get("update-cards"), item => item.tag === "a" && item.textContent.includes("together"));
-  assert.ok(link?.href.endsWith("/api/service-upgrade/recovery"));
+  assert.ok(link?.href.endsWith("/updates/recovery"));
   assert.ok(find(view.elements.get("update-cards"), item => item.textContent.includes("both services will briefly stop")));
   vm.runInContext(`snapshot.compatibility.api.installable = true;
     snapshot.service_upgrade = { phase: "preparing", error: null }; render();`, view.context);
@@ -820,13 +820,14 @@ test("schema upgrades expose the paired action and active pairs block independen
 test("normal update explains a required launcher step and separates optional launcher updates", () => {
   const view = page();
   render(view, record());
-  vm.runInContext(`snapshot.launchers = { api: { state: "required_first", installable: true,
+  vm.runInContext(`snapshot.launchers = { api: { state: "required_first", installable: false,
     reason: "Update will install the required launcher first, then the application." } }; render();`, view.context);
   const card = view.elements.get("update-cards");
   assert.match(textOf(card), /required launcher first/);
   assert.ok(find(card, (node) => node.tag === "button" && node.textContent === "Update"));
   const advanced = find(card, (node) => node.tag === "details" && textOf(node).includes("Advanced launcher controls"));
   assert.ok(advanced);
+  assert.equal(find(advanced, (node) => node.tag === "button").disabled, true);
   vm.runInContext(`snapshot.launchers.api = { state: "satisfied", installable: false,
     reason: "Current launcher supports this application; no launcher update is required." }; render();`, view.context);
   assert.match(textOf(card), /no launcher update is required/);

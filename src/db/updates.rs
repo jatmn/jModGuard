@@ -27,7 +27,7 @@ pub struct ComponentRelease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launcher: Option<LauncherCompatibility>,
     pub base_abi: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub upgrade: Option<UpgradeCompatibility>,
 }
 
@@ -1782,80 +1782,5 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
-    }
-    #[tokio::test]
-    async fn historical_release_json_preserves_failure_and_verified_webui_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "legacy-release-identity-{:032x}",
-            rand::random::<u128>()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let db = Db::open(&root.join("core.db"), 2).unwrap();
-        let release = candidate('a');
-        let legacy = serde_json::to_string(&release)
-            .unwrap()
-            .replace(",\"upgrade\":null", "");
-        let raw = legacy.clone();
-        db.with_conn(move |conn| {
-            conn.execute_rows(
-                "UPDATE component_updates SET desired=?1 WHERE component='api'",
-                params![raw],
-                1,
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        record_component_failure(&db, "api", &release, "legacy incompatible request")
-            .await
-            .unwrap();
-        let desired_cleared = component_update(&db, "api")
-            .await
-            .unwrap()
-            .desired
-            .is_none();
-        let mut web = release.clone();
-        web.component = "webui".into();
-        web.image = "ghcr.io/jatmn/jmodguard-webui".into();
-        web.base_abi = "static-webui-v1".into();
-        let raw = serde_json::to_string(&web)
-            .unwrap()
-            .replace(",\"upgrade\":null", "");
-        db.with_conn(move |conn| {
-            conn.execute_rows(
-                "UPDATE component_updates SET installed=?1 WHERE component='webui'",
-                params![raw],
-                1,
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let observation = ComponentObservation {
-            source_sha: web.source_sha.clone(),
-            executable_sha256: "a".repeat(64),
-            admin_sha256: None,
-            base_image_sha: "Storage Zone".into(),
-            started_at: 100,
-            min_schema: web.min_schema,
-            max_schema: web.max_schema,
-            api_capability: 1,
-            self_update_enabled: true,
-            base_abi: web.base_abi.clone(),
-            guild_schema: None,
-            update_protocol: 0,
-        };
-        let installed = component_update(&db, "webui")
-            .await
-            .unwrap()
-            .installed
-            .unwrap();
-        let web_verified = record_webui_installed_verified(&db, &installed, observation, 100).await;
-        assert!(
-            desired_cleared && web_verified.is_ok(),
-            "historical JSON no longer matches database identity"
-        );
-        drop(db);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

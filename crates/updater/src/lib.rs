@@ -141,7 +141,7 @@ pub fn launcher_status(row: &db::ComponentUpdate, now: i64) -> serde_json::Value
     let newer = seen.launcher_revision < contract.revision;
     serde_json::json!({"state":if required { "required_first" } else if newer { "optional" } else { "satisfied" },
         "running":seen.launcher_revision,"minimum":contract.min_revision,"available":contract.revision,
-        "installable":seen.self_update_enabled && newer,
+        "installable":seen.self_update_enabled && newer && !required,
         "reason":if required { "Update will install the required launcher first, then the application." }
         else if newer { "Current launcher supports this application. A newer launcher is optional." }
         else { "Current launcher supports this application; no launcher update is required." }})

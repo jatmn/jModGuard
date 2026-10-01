@@ -4,9 +4,9 @@
 <h1>Update bot and API together</h1>
 <p>Database changes require both services to update. Any required launcher updates are installed first and can restart a service. Both applications are downloaded and verified before the database migration sequence begins. The bot then migrates the databases, and the matching API starts. Expect a brief service interruption and another sign-in.</p>
 <p>After migration starts, recovery uses the selected release or a newer compatible pair. An older release cannot safely be restored. Closing this page does not cancel an upgrade.</p>
-<p><a href="/login?return_to=%2Fapi%2Fservice-upgrade%2Frecovery">Sign in with Discord</a></p>
+<p><a href="/login?return_to=%2Fupdates%2Frecovery">Sign in with Discord</a></p>
 <p>This page remains available from the API address if application startup fails. Updates stay inside the containers; they cannot replace the base operating system.</p>
-<p>Checking a pair selects that channel for both services and turns their automatic installation off. If either image is missing, or the check cannot be stored, neither service's channel or candidate changes.</p>
+<p>Checking a pair selects that channel for both services and turns their automatic installation off.</p>
 <label>Release channel <select id="channel"><option value="latest">Latest published build</option><option value="stable">Stable</option><option value="nightly">Nightly</option></select></label>
 <button id="check">Check matching bot/API pair</button>
 <pre id="candidate">Check for a matching pair before confirming.</pre>

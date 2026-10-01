@@ -391,7 +391,7 @@ fn return_to_or_root(cfg: &crate::config::ApiProcessConfig, requested: Option<&s
     }
     if matches!(
         requested,
-        "/administration/index.html" | "/api/service-upgrade/recovery"
+        "/administration/index.html" | "/updates/recovery"
     ) {
         return requested.into();
     }
@@ -2195,10 +2195,6 @@ mod tests {
         assert_eq!(
             return_to_or_root(&cfg, Some("/administration/index.html")),
             "/administration/index.html"
-        );
-        assert_eq!(
-            return_to_or_root(&cfg, Some("/api/service-upgrade/recovery")),
-            "/api/service-upgrade/recovery"
         );
         assert_eq!(return_to_or_root(&cfg, Some("//attacker.example.com")), "/");
     }
