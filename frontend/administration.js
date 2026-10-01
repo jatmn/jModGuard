@@ -337,6 +337,17 @@ function render() {
     line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
     if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
     const compatibility = snapshot.compatibility?.[record.component];
+    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/updates/recovery") {
+      const target = record.candidate;
+      const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
+        target.upgrade?.guild_schema !== observed.guild_schema);
+      if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
+      if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
+      const pair = node("a", "Update bot and API together / recovery");
+      pair.href = `${apiBase()}/updates/recovery`;
+      content.append(pair);
+    }
+
     if (candidateCurrent) line(content, "Compatibility", compatibility?.installable ? "Ready for this deployment" : compatibility?.reason || "Unable to verify");
     line(content, "Last check", record.checked_at ? age(record.checked_at) : "never");
     const bakedSourceCurrent = record.component !== "webui" && !record.installed && observed &&
@@ -363,7 +374,8 @@ function render() {
     line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
     line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
     line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
-    const canApply = snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
+    const pairActive = snapshot.service_upgrade && !["complete", "aborted"].includes(snapshot.service_upgrade.phase);
+    const canApply = !pairActive && snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
     const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
     const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
     view.check.disabled = busy || stale;

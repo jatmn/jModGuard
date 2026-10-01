@@ -233,11 +233,18 @@ for component in bot api webui; do
   done
 done
 
+# Migration origins are distinct from exact application runtime ranges.
+for field in update-control=2 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=14; do
+  contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
+done
+
 # Publishing an older source must keep its schema, not the publisher's schema.
 schema_source="$(mktemp -d)"
 mkdir -p "$schema_source/src"
 sed '/include_str!("..\/migrations\/0016_/d' src/db.rs >"$schema_source/src/db.rs"
 readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source")
+contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
+
 for field in min-schema max-schema result-schema; do
   contains_arg "io.jmodguard.${field}=15" "${old_schema_args[@]}" \
     || fail "historical source must retain schema15 (${field})"
@@ -774,8 +781,8 @@ while IFS='|' read -r path affected; do
     [[ "$actual" == "$expected" ]] || fail "$component after $path: expected $expected, got $actual"
   done
 done <<'CASES'
-crates/bot/src/main.rs|bot
-crates/api/src/web/api.rs|api
+crates/bot/src/main.rs|bot api
+crates/api/src/web/api.rs|bot api
 crates/integration-tests/tests/dual_process_smoke.rs|
 crates/api/tests/tokenless_startup.rs|
 crates/updater/tests/registry.rs|

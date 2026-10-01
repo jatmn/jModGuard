@@ -227,8 +227,41 @@ impl Registry {
             matches!(channel, "latest" | "stable" | "nightly"),
             "invalid release channel"
         );
+        self.discover_ref(component, channel, channel).await
+    }
+
+    /// Resolve a counterpart at the selected full source revision, never a
+    /// second moving channel tag. All normal repository/platform checks apply.
+    pub async fn discover_source(
+        &self,
+        component: &str,
+        channel: &str,
+        sha: &str,
+    ) -> Result<ComponentRelease> {
+        ensure!(
+            sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid source revision"
+        );
+        let release = self.discover_ref(component, channel, sha).await?;
+        ensure!(
+            release.source_sha == sha,
+            "counterpart source revision mismatch"
+        );
+        Ok(release)
+    }
+
+    async fn discover_ref(
+        &self,
+        component: &str,
+        channel: &str,
+        reference: &str,
+    ) -> Result<ComponentRelease> {
+        ensure!(
+            matches!(channel, "latest" | "stable" | "nightly"),
+            "invalid channel"
+        );
         let repo = repository(component)?;
-        let (manifest, image_digest) = self.manifest(repo, channel).await?;
+        let (manifest, image_digest) = self.manifest(repo, reference).await?;
         let config = self.config(repo, &manifest).await?;
         ensure!(
             config.architecture == "amd64" && config.os == "linux",
@@ -255,6 +288,16 @@ impl Registry {
             "channel label mismatch"
         );
         let release = ComponentRelease {
+            upgrade: if labels.contains_key("io.jmodguard.update-control") {
+                Some(jmodguard::db::UpgradeCompatibility {
+                    control_protocol: label("io.jmodguard.update-control")?.parse()?,
+                    min_core: label("io.jmodguard.upgrade-min-core")?.parse()?,
+                    min_guild: label("io.jmodguard.upgrade-min-guild")?.parse()?,
+                    guild_schema: label("io.jmodguard.guild-schema")?.parse()?,
+                })
+            } else {
+                None
+            },
             component: component.into(),
             channel: channel.into(),
             release_id: label("io.jmodguard.release-id")?,

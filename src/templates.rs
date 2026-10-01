@@ -379,6 +379,7 @@ mod presentation_tests {
     fn release_stats_hide_stale_observations_and_report_checked_update() {
         use crate::db::{ComponentObservation, ComponentRelease, ComponentUpdate};
         let candidate = ComponentRelease {
+            upgrade: None,
             component: "api".into(),
             channel: "stable".into(),
             release_id: "v1".into(),
@@ -395,6 +396,8 @@ mod presentation_tests {
             base_abi: "debian-bookworm-amd64".into(),
         };
         let observed = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: "a".repeat(40),
             executable_sha256: "c".repeat(64),
             admin_sha256: None,

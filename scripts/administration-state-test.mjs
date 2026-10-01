@@ -795,3 +795,23 @@ test("Database Usage renders disjoint physical groups and unknown guard status",
     assert.match(content, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
 });
+
+test("schema upgrades expose the paired action and active pairs block independent installs", () => {
+  const view = page();
+  const api = record();
+  api.observed.max_schema = 16;
+  api.observed.guild_schema = 14;
+  api.candidate.result_schema = 17;
+  api.candidate.upgrade = { guild_schema: 15 };
+  render(view, api);
+  vm.runInContext(`snapshot.coordinated_upgrade_path = "/updates/recovery";
+    snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; render();`, view.context);
+  assert.equal(updateButton(view, "api").disabled, true);
+  const link = find(view.elements.get("update-cards"), item => item.tag === "a" && item.textContent.includes("together"));
+  assert.ok(link?.href.endsWith("/updates/recovery"));
+  assert.ok(find(view.elements.get("update-cards"), item => item.textContent.includes("both services will briefly stop")));
+  vm.runInContext(`snapshot.compatibility.api.installable = true;
+    snapshot.service_upgrade = { phase: "preparing", error: null }; render();`, view.context);
+  assert.equal(updateButton(view, "api").disabled, true);
+  assert.equal(updateButton(view, "api", true).disabled, true);
+});

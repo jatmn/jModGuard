@@ -6,7 +6,7 @@ use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Dashboard state cannot run the moderation engine.
 /// ```compile_fail
@@ -18,7 +18,7 @@ pub struct ApiState {
     pub db: Db,
     pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<ApiProcessConfig>,
-    pub oauth: OAuthClient,
+    pub oauth: Arc<OAuthClient>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -29,25 +29,7 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(cfg: ApiProcessConfig, db: Db) -> Result<Arc<Self>> {
-        let http = reqwest::Client::builder()
-            .user_agent("jModGuard (Discord dashboard)")
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("failed to build OAuth HTTP client")?;
-        let oauth = OAuthClient {
-            client_id: cfg.web.oauth_client_id.clone(),
-            client_secret: cfg.web.oauth_client_secret.clone(),
-            redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
-            http,
-            guild_list: std::sync::Arc::new(std::sync::Mutex::new(
-                super::oauth::GuildListGate::new(),
-            )),
-            guild_flights: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            #[cfg(test)]
-            guilds_endpoint: None,
-            #[cfg(test)]
-            token_endpoint: None,
-        };
+        let oauth = Arc::new(OAuthClient::from_config(&cfg)?);
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;
         db.require_config_version(primed.config);

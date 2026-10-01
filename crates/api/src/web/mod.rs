@@ -5,6 +5,7 @@ pub mod cases;
 pub mod members;
 pub mod oauth;
 pub mod preview;
+pub mod recovery;
 pub mod state;
 pub mod updates;
 pub mod usage;
@@ -388,7 +389,10 @@ fn return_to_or_root(cfg: &crate::config::ApiProcessConfig, requested: Option<&s
     if requested.is_empty() {
         return "/".into();
     }
-    if requested == "/administration/index.html" {
+    if matches!(
+        requested,
+        "/administration/index.html" | "/updates/recovery"
+    ) {
         return requested.into();
     }
     if cfg
@@ -407,10 +411,18 @@ async fn login(
     state: axum::extract::State<Arc<ApiState>>,
     Query(query): Query<ReturnToQuery>,
 ) -> Response {
+    login_response(&state.cfg, &state.oauth, query)
+}
+
+fn login_response(
+    cfg: &crate::config::ApiProcessConfig,
+    oauth: &oauth::OAuthClient,
+    query: ReturnToQuery,
+) -> Response {
     let state_token = random_oauth_state();
-    let return_to = return_to_or_root(&state.cfg, query.return_to.as_deref());
-    let url = state.oauth.authorize_url(&state_token);
-    let (secure, same_site) = public_cookie_policy(&state.cfg);
+    let return_to = return_to_or_root(cfg, query.return_to.as_deref());
+    let url = oauth.authorize_url(&state_token);
+    let (secure, same_site) = public_cookie_policy(cfg);
     append_oauth_cookies(
         axum::response::Redirect::to(&url).into_response(),
         &state_token,
@@ -573,10 +585,20 @@ async fn callback(
     headers: HeaderMap,
     query: axum::extract::Query<CallbackQuery>,
 ) -> Response {
+    callback_response(session, &state.cfg, &state.oauth, headers, query.0).await
+}
+
+async fn callback_response(
+    session: Session,
+    cfg: &crate::config::ApiProcessConfig,
+    oauth: &oauth::OAuthClient,
+    headers: HeaderMap,
+    query: CallbackQuery,
+) -> Response {
     // Handshake cookies are single-use. Clear them on every callback
     // outcome, including CSRF reject, so a failed attempt cannot leave
     // a live secret for the next request.
-    let (secure, same_site) = public_cookie_policy(&state.cfg);
+    let (secure, same_site) = public_cookie_policy(cfg);
     let finish = |response: Response| clear_oauth_cookies(response, secure, same_site);
     // Reject missing/empty CSRF cookie — skipping the check enables CSRF.
     // The secret lives on the client so an API restart between /login and
@@ -587,14 +609,14 @@ async fn callback(
     let Some(code) = &query.code else {
         return finish(error_page("missing authorization code"));
     };
-    let tok = match state.oauth.exchange_code(code).await {
+    let tok = match oauth.exchange_code(code).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("oauth callback: token exchange failed: {e:#}");
             return finish(error_page(&format!("token exchange failed: {e:#}")));
         }
     };
-    let user = match state.oauth.me(&tok.access_token).await {
+    let user = match oauth.me(&tok.access_token).await {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("oauth callback: me request failed: {e:#}");
@@ -614,7 +636,7 @@ async fn callback(
         return finish(error_page("failed to rotate session"));
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
-    let return_to = return_to_or_root(&state.cfg, requested_return_to.as_deref());
+    let return_to = return_to_or_root(cfg, requested_return_to.as_deref());
     finish(axum::response::Redirect::to(&return_to).into_response())
 }
 
@@ -1017,6 +1039,12 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             "/api/guilds/{guild_id}/case-delete-roles",
             get_post(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
         )
+        .merge(recovery::routes(Arc::new(recovery::RecoveryState {
+            cfg: Arc::clone(&app.cfg),
+            oauth: Arc::clone(&app.oauth),
+            control: crate::db::UpdateControl::from_application(&app.db),
+            apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+        })))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),

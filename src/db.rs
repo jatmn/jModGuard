@@ -47,6 +47,8 @@ mod settings;
 pub use settings::*;
 mod updates;
 pub use updates::*;
+mod update_control;
+pub use update_control::*;
 pub mod usage;
 mod write_budget;
 use write_budget::BoundedWrites;

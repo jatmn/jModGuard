@@ -170,7 +170,7 @@ changed_since_publication() {
   local -a inputs=(
     "Dockerfile.${component}" "Dockerfile.${component}.dockerignore" .dockerignore
     Cargo.toml Cargo.lock rust-toolchain.toml ':(glob)crates/*/Cargo.toml'
-    src migrations vendor "crates/${component}" crates/runtime crates/updater
+    src migrations vendor crates/bot crates/api crates/runtime crates/updater
     .buildkite/publish-image.sh scripts/bootstrap-container.sh
     ':(exclude,glob)crates/*/tests/**'
     ':(exclude,glob)crates/*/benches/**'
@@ -178,7 +178,7 @@ changed_since_publication() {
   )
   if [[ "$component" == "webui" ]]; then
     inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
-      frontend scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs)
+      frontend scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs src/db/update_control.rs migrations/guild/current_version.rs)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0
@@ -242,6 +242,17 @@ JS
       --label "io.jmodguard.max-api=1"
       --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
     )
+    if [[ -f "$context/src/db/update_control.rs" ]]; then
+      local guild_schema
+      guild_schema="$(cat "$context/migrations/guild/current_version.rs")"
+      [[ "$guild_schema" =~ ^[1-9][0-9]*$ ]] || publish_fail 'invalid selected guild schema'
+      args+=(
+        --label "io.jmodguard.update-control=2"
+        --label "io.jmodguard.upgrade-min-core=15"
+        --label "io.jmodguard.upgrade-min-guild=1"
+        --label "io.jmodguard.guild-schema=${guild_schema}"
+      )
+    fi
     # Historical schema16 images still contain the schema15-reporting launcher.
     # They remain dashboard artifacts, but must not reinstall that launcher on
     # a repaired deployment. Without protocol metadata discovery rejects them.

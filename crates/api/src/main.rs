@@ -25,6 +25,9 @@ async fn main() -> Result<()> {
     }
 
     init_tracing(&cfg.log, "api");
+    if std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1") {
+        return web::recovery::serve(cfg).await;
+    }
 
     if offline_write {
         jmodguard_api::startup::write_shared_config(cfg).await?;

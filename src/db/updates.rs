@@ -19,6 +19,8 @@ pub struct ComponentRelease {
     pub max_api: i64,
     pub launcher_protocol: u32,
     pub base_abi: String,
+    #[serde(default)]
+    pub upgrade: Option<UpgradeCompatibility>,
 }
 
 impl ComponentRelease {
@@ -47,6 +49,16 @@ impl ComponentRelease {
             "resulting schema is outside candidate range"
         );
         anyhow::ensure!(self.launcher_protocol == 1, "unsupported launcher protocol");
+        if let Some(upgrade) = &self.upgrade {
+            anyhow::ensure!(
+                upgrade.control_protocol == UPDATE_CONTROL_PROTOCOL
+                    && upgrade.min_core >= 15
+                    && upgrade.min_core <= self.result_schema
+                    && upgrade.min_guild >= 1
+                    && upgrade.min_guild <= upgrade.guild_schema,
+                "unsupported schema upgrade contract"
+            );
+        }
         anyhow::ensure!(
             matches!(
                 self.base_abi.as_str(),
@@ -81,6 +93,10 @@ pub struct ComponentObservation {
     pub self_update_enabled: bool,
     #[serde(default)]
     pub base_abi: String,
+    #[serde(default)]
+    pub guild_schema: Option<i64>,
+    #[serde(default)]
+    pub update_protocol: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,9 +139,9 @@ fn parse_observation(raw: Option<String>) -> Result<Option<ComponentObservation>
         .transpose()
 }
 
-const COLS: &str = "component,channel,cadence,candidate,checked_at,check_error,desired,desired_launcher,installed,installed_launcher,launcher_sha256,launcher_installed_at,previous,observed,observed_at,installed_at,state,last_error";
+pub(super) const COLS: &str = "component,channel,cadence,candidate,checked_at,check_error,desired,desired_launcher,installed,installed_launcher,launcher_sha256,launcher_installed_at,previous,observed,observed_at,installed_at,state,last_error";
 
-fn row_update(row: &Row) -> Result<ComponentUpdate> {
+pub(super) fn row_update(row: &Row) -> Result<ComponentUpdate> {
     Ok(ComponentUpdate {
         component: row.get(0)?,
         channel: row.get(1)?,
@@ -211,7 +227,7 @@ pub async fn record_update_check(
     }).await
 }
 
-fn checked_install_candidate(
+pub(super) fn checked_install_candidate(
     raw: Option<String>,
     channel: &str,
     checked_at: Option<i64>,
@@ -274,6 +290,7 @@ pub async fn request_component_install(
             check_error: Option<String>,
         }
         let tx = conn.transaction_immediate()?;
+        update_control::ensure_no_service_upgrade(&tx)?;
         let state: InstallState = tx.query_row("SELECT candidate,installed,previous,desired,channel,checked_at,check_error FROM component_updates WHERE component=?1", params![component.clone()], |row| Ok(InstallState {candidate:row.get(0)?,installed:row.get(1)?,previous:row.get(2)?,desired:row.get(3)?,channel:row.get(4)?,checked_at:row.get(5)?,check_error:row.get(6)?}))?;
         let candidate = checked_install_candidate(state.candidate, &state.channel, state.checked_at, state.check_error, &digest, now)?;
         let installed = parse_release(state.installed)?;
@@ -303,6 +320,7 @@ pub async fn request_launcher_install(
     let digest = digest.to_owned();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
+        update_control::ensure_no_service_upgrade(&tx)?;
         let (candidate, installed, channel, checked_at, check_error): (Option<String>, Option<String>, String, Option<i64>, Option<String>) = tx.query_row(
             "SELECT candidate,installed_launcher,channel,checked_at,check_error FROM component_updates WHERE component=?1",
             params![component.clone()],
@@ -344,7 +362,7 @@ pub async fn record_launcher_running(
     );
     db.with_conn(move |conn| {
         let tx=conn.transaction_immediate()?;
-        let changed=tx.execute_rows("UPDATE component_updates SET installed_launcher=?2,launcher_sha256=?3,launcher_installed_at=?4 WHERE component=?1 AND desired_launcher=?2",params![component,release,hash,now], 1)?;
+        let changed=tx.execute_rows("UPDATE component_updates SET installed_launcher=?2,launcher_sha256=?3,launcher_installed_at=?4 WHERE component=?1 AND (desired_launcher=?2 OR installed_launcher=?2)",params![component,release,hash,now], 1)?;
         anyhow::ensure!(changed==1,"desired launcher changed before activation");
         tx.commit()?;
         Ok(())
@@ -417,7 +435,7 @@ pub async fn record_component_running(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if let Some(release) = release {
-            let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND desired=?2", params![component,release,now,observation], 1)?;
+            let changed = tx.execute_rows("UPDATE component_updates SET previous=CASE WHEN installed IS NOT ?2 THEN installed ELSE previous END,installed=?2,installed_at=CASE WHEN installed IS NOT ?2 THEN ?3 ELSE installed_at END,observed=?4,observed_at=?3,state='running',last_error=NULL WHERE component=?1 AND (desired=?2 OR installed=?2)", params![component,release,now,observation], 1)?;
             anyhow::ensure!(changed == 1, "desired release changed before activation");
         } else {
             tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3 WHERE component=?1", params![component,observation,now], 1)?;
@@ -427,9 +445,9 @@ pub async fn record_component_running(
     }).await
 }
 
-/// A container restart always starts the baked child first. Its source SHA may
-/// match an earlier managed release, but the old OCI digest is not verified for
-/// the baked executable. Keep a pending request so the launcher can restage it.
+/// Record a verified first/baked start when there is no selected managed app.
+/// Managed cold starts restore their durable selection before launching and
+/// use record_component_running instead, retaining install identity and time.
 pub async fn record_baked_component_running(
     db: &Db,
     component: &str,
@@ -635,6 +653,7 @@ pub async fn request_due_automatic_install(
             check_error:Option<String>,last_digest:Option<String>,last_window:Option<String>,
         }
         let tx=conn.transaction_immediate()?;
+        if update_control::ensure_no_service_upgrade(&tx).is_err() { tx.commit()?; return Ok(None); }
         let state:AutoState = tx.query_row(
             "SELECT channel,cadence,candidate,installed,previous,desired,checked_at,check_error,auto_last_digest,auto_last_window FROM component_updates WHERE component=?1",
             params![component.clone()],|row| Ok(AutoState {
@@ -760,6 +779,7 @@ mod tests {
 
     fn candidate(sha: char) -> ComponentRelease {
         ComponentRelease {
+            upgrade: None,
             component: "api".into(),
             channel: "latest".into(),
             release_id: format!("v1.0.{sha}"),
@@ -1069,6 +1089,8 @@ mod tests {
         next.image = old.image.clone();
         next.base_abi = old.base_abi.clone();
         let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: old.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: Some("d".repeat(64)),
@@ -1221,6 +1243,8 @@ mod tests {
                 .is_none()
         );
         let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1295,6 +1319,8 @@ mod tests {
                 .is_some()
         );
         let observed = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1386,6 +1412,9 @@ mod tests {
         assert_eq!(state.state, "queued");
 
         let observation = ComponentObservation {
+            guild_schema: None,
+
+            update_protocol: 0,
             source_sha: "c".repeat(40),
             executable_sha256: "d".repeat(64),
             admin_sha256: None,
@@ -1420,6 +1449,8 @@ mod tests {
         let first = candidate('a');
         let second = candidate('b');
         let observed = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: None,
@@ -1532,6 +1563,8 @@ mod tests {
             newer.channel = "stable".into();
             newer.image = format!("ghcr.io/jatmn/jmodguard-{component}");
             let observation = ComponentObservation {
+                guild_schema: None,
+                update_protocol: 0,
                 source_sha: selected.source_sha.clone(),
                 executable_sha256: "c".repeat(64),
                 admin_sha256: None,

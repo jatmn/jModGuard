@@ -81,6 +81,7 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
     fixture.objects.insert(config_digest, config);
     fixture.objects.insert(layer_digest, layer);
     let manifest_digest = digest(&manifest);
+    fixture.objects.insert(sha, manifest.clone());
     fixture.objects.insert(manifest_digest.clone(), manifest);
     manifest_digest
 }
@@ -106,6 +107,27 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     assert_eq!(approved.digest, old);
     state.write().await.tag = new.clone();
     assert_eq!(
+        registry
+            .discover_source("api", "latest", &"a".repeat(40))
+            .await
+            .unwrap()
+            .digest,
+        old
+    );
+    assert!(
+        registry
+            .discover_source("api", "latest", &"f".repeat(40))
+            .await
+            .is_err()
+    );
+    assert!(
+        registry
+            .discover_source("api", "latest", "../../other-image")
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
         registry.discover("api", "latest").await.unwrap().digest,
         new
     );
@@ -126,6 +148,18 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
             .await
             .unwrap()["usr/local/bin/jmodguard-api"],
         b"\x7fELFfirst"
+    );
+    let wrong_revision_manifest = state.read().await.objects[&new].clone();
+    state
+        .write()
+        .await
+        .objects
+        .insert("a".repeat(40), wrong_revision_manifest);
+    assert!(
+        registry
+            .discover_source("api", "latest", &"a".repeat(40))
+            .await
+            .is_err()
     );
     let config_digest = {
         let guard = state.read().await;
