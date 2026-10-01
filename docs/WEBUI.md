@@ -108,6 +108,11 @@ Never put a database URL or token in these files.
 `http://localhost:8080` → **Login with Discord** → pick a server. Only servers
 where your account has **Manage Server** permission are shown, so one WebUI
 instance manages all your servers.
+The **Members** tab searches saved member IDs and names without a browser-side
+Discord roster request. It shows current status, known join dates, linked
+moderation cases and the [durable import state](MEMBERS.md). All its reads
+require the loaded page's enrollment token. A read-only preview can inspect
+the directory but cannot request Pause, Resume, Retry or **Reconcile from Discord**.
 
 ## Workspace and saved changes
 
@@ -162,12 +167,14 @@ the editor does not undo an acknowledged global write.
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
 | **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot; save per-event ignored user/bot IDs and source channel IDs |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
+| **Members** | search the saved bounded directory; inspect known join dates, linked cases and import state; request Pause, Resume, Retry or **Reconcile from Discord** when permitted |
 | **Bans** | recorded bot and observed Discord bans with known user name, exact ID, and audit-attributed moderator when available; unknown details remain unavailable; unban is queued for the bot |
 | **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
-Routine message/member history and chat-retention controls are removed. Saved Members
-tabs reopen on Dashboard. Publish matching API/frontend versions; older pages submitting
+The retired general message/member activity archive and chat-retention controls remain
+removed. Saved Members selections reopen the bounded directory described above.
+Publish matching API/frontend versions; older pages submitting
 retention settings must reload. See [logging/data behavior](LOGGING-DATA.md).
 
 ## Global vs per-server config

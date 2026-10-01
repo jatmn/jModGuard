@@ -31,6 +31,9 @@ membership or enqueue erasure of a replacement membership.
 Membership checks run on real reads and writes. A closed or stale enrollment cannot
 record, list, serve or delete another membership's cases. Offline stores fail closed
 without mutating directory rows.
+The bounded [member directory](MEMBERS.md) uses the same captured tenant scope
+for observations, history, status, and WebUI reads; its initial completion is
+bound to the bot identity and enrollment rather than a software version.
 
 ## Cases, history and evidence
 

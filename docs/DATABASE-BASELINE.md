@@ -104,16 +104,34 @@ Migration 0013 adds per-guild, per-event `log_filters` for ignored user/bot IDs
 and source channel IDs. Start the bot before the API so the new table exists.
 Migration 0014 adds optional banned-user and moderator display names to retained
 ban rows. Existing rows keep their exact IDs and have no fabricated names.
+Migration 0015 adds component-update coordination and managed-WebUI asset metadata.
+Core migration 0016 persists a per-bot shared member-sync request gate so
+rate-limit delays and the minimum request interval survive worker restart
+across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version9,
-using `migrations/guild/0001_identity.sql` through `0009_message_snapshots.sql`. This separate
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version14,
+using `migrations/guild/0001_identity.sql` through `0014_member_case_retain_revision.sql`. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
-progress, tenant settings and bounded latest-message snapshots. Initialize verifies and upgrades a matching version1–8
-store atomically; open requires 9. See [tenant runtime](TENANT-RUNTIME.md). Core is at
+progress, tenant settings, bounded latest-message snapshots and the bounded
+[member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
+store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
 migration 0016. Each opener refuses the other family. No records are moved by startup.
+Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
+and store-level capture health. Guild migration 0010 adds the member directory,
+stays, case projection, sync state and immutable initial-seed completion.
+Guild migration 0011 tracks coverage-gap generations and last-successful-run
+totals, and updates member-state observation constraints.
+Guild migration 0012 adds nullable per-phase committed counters and the measured
+member-page interval. Existing version10 aggregate progress cannot reconstruct
+earlier ban, check, or audit counts, so those historical phase counts remain
+unknown after upgrade. Initial completion, run cursors and retries are preserved.
+Guild migration 0013 preserves exact, dated bot-executor audit actions while their
+local case-source association remains unresolved.
+Guild migration 0014 stops case-retention triggers from bumping import page
+`directory_revision` when only ban-history metadata changes.
 See [store initialization and recovery limits](GUILD-STORES.md#separate-store-schema-and-handle).
 
 Selected case payload removal, replay-key cleanup and live guild erasure are described in
