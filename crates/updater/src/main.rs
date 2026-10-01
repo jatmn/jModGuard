@@ -191,8 +191,14 @@ fn observation(running: &Running, base_sha: &str) -> ComponentObservation {
         admin_sha256: None,
         base_image_sha: base_sha.into(),
         started_at: running.started_at,
-        min_schema: 15,
-        max_schema: 15,
+        min_schema: running
+            .release
+            .as_ref()
+            .map_or(db::CORE_SCHEMA_VERSION, |release| release.min_schema),
+        max_schema: running
+            .release
+            .as_ref()
+            .map_or(db::CORE_SCHEMA_VERSION, |release| release.max_schema),
         api_capability: 1,
         self_update_enabled: update_enabled(),
         base_abi: std::env::var("JMODGUARD_BASE_ABI").unwrap_or_else(|_| "unknown".into()),
@@ -358,6 +364,110 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn published_schema_and_launcher_observations_allow_only_matching_services() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = Command::new("bash")
+            .current_dir(&root)
+            .args([
+                "-c",
+                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source .buildkite/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test .",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let args = String::from_utf8(output.stdout).unwrap();
+        let label = |name: &str| {
+            args.split('\0')
+                .find_map(|arg| arg.strip_prefix(&format!("io.jmodguard.{name}=")))
+                .unwrap()
+                .to_owned()
+        };
+        let candidate = ComponentRelease {
+            component: "api".into(),
+            channel: "latest".into(),
+            release_id: "test".into(),
+            source_sha: "a".repeat(40),
+            published_at: label("published-at"),
+            image: "ghcr.io/jatmn/jmodguard-api".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            min_schema: label("min-schema").parse().unwrap(),
+            max_schema: label("max-schema").parse().unwrap(),
+            result_schema: label("result-schema").parse().unwrap(),
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            base_abi: label("base-abi"),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("jmodguard-schema-{:032x}", rand::random::<u128>()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let db = Db::open(&dir.join("core.db"), 2).unwrap();
+        let schema = db::core_schema_version(&db).await.unwrap();
+        assert_eq!(candidate.result_schema, schema);
+        assert_eq!(candidate.min_schema, schema);
+        assert_eq!(candidate.max_schema, schema);
+
+        // An exited fixture supplies Running without leaving a child behind.
+        // Real service startup is covered by dual_process_smoke.
+        let mut running = launch(Path::new("/bin/true"), &candidate.source_sha, None)
+            .await
+            .unwrap();
+        running.child.wait().await.unwrap();
+        let mut baked = observation(&running, &candidate.source_sha);
+        // Supply the deployment ABI normally injected by the image environment.
+        baked.base_abi = candidate.base_abi.clone();
+        assert_eq!((baked.min_schema, baked.max_schema), (schema, schema));
+        for component in ["bot", "api"] {
+            db::record_component_running(&db, component, None, baked.clone(), 100)
+                .await
+                .unwrap();
+        }
+        compatible(&db, &candidate, 100).await.unwrap();
+
+        // Preserve the refusal of a counterpart or rollback binary from before
+        // the migration, even when the candidate matches the current database.
+        let mut older = baked.clone();
+        older.min_schema = schema - 1;
+        older.max_schema = schema - 1;
+        db::record_component_running(&db, "bot", None, older.clone(), 100)
+            .await
+            .unwrap();
+        assert!(
+            compatible(&db, &candidate, 100)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("counterpart")
+        );
+        db::record_component_running(&db, "bot", None, baked, 100)
+            .await
+            .unwrap();
+        db::record_component_running(&db, "api", None, older, 100)
+            .await
+            .unwrap();
+        assert!(
+            compatible(&db, &candidate, 100)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rollback")
+        );
+
+        // A managed child's observations describe that release, not its launcher.
+        let mut managed = candidate;
+        managed.min_schema = schema - 1;
+        running.release = Some(managed);
+        let observed = observation(&running, &running.source_sha);
+        assert_eq!(
+            (observed.min_schema, observed.max_schema),
+            (schema - 1, schema)
+        );
+        drop(db);
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
 
     #[tokio::test]
     async fn readiness_requires_live_child_marker_and_stop_reaps_it() {

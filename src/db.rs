@@ -70,6 +70,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0016_member_sync_pacing.sql"),
 ];
 
+/// Completed core schema required by service startup and release observations.
+pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
 /// because the server may have committed before the response was lost.

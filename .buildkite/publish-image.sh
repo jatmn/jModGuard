@@ -178,7 +178,7 @@ changed_since_publication() {
   )
   if [[ "$component" == "webui" ]]; then
     inputs=(Dockerfile.webui Dockerfile.webui.dockerignore .dockerignore
-      frontend scripts/package-webui.mjs .buildkite/publish-image.sh)
+      frontend scripts/package-webui.mjs .buildkite/publish-image.sh src/db.rs)
   fi
   if ! names="$(skip_source_diff "$previous" "$sha" -- "${inputs[@]}")"; then
     return 0
@@ -217,19 +217,40 @@ build_args() {
   # Old manual-source images can be dashboard rollback images, but they have
   # no launcher and must not appear compatible with the owner updater.
   if [[ "$layout" != "legacy" ]]; then
+    # Startup requires the selected source's completed core migrations. Read
+    # that source, including for historical publication, rather than labeling
+    # a migrating binary with the publisher's former schema version.
+    local schema
+    schema="$(node - "$context/src/db.rs" <<'JS'
+const fs = require("node:fs");
+const source = fs.readFileSync(process.argv[2], "utf8");
+const migrations = source.match(/const MIGRATIONS: &\[&str\] = &\[([\s\S]*?)\];/);
+const count = migrations?.[1].match(/include_str!\("\.\.\/migrations\/\d{4}_[^"\n]+\.sql"\)/g)?.length;
+if (!count || count < 15) throw new Error("selected source has no supported updater schema");
+process.stdout.write(String(count));
+JS
+)" || publish_fail 'cannot determine selected source core schema'
     args+=(
       --label "io.jmodguard.component=${component}"
       --label "io.jmodguard.channel=${release_channel}"
       --label "io.jmodguard.release-id=${label:-$sha}"
       --label "io.jmodguard.published-at=${published_at}"
-      --label "io.jmodguard.min-schema=15"
-      --label "io.jmodguard.max-schema=15"
-      --label "io.jmodguard.result-schema=15"
+      --label "io.jmodguard.min-schema=${schema}"
+      --label "io.jmodguard.max-schema=${schema}"
+      --label "io.jmodguard.result-schema=${schema}"
       --label "io.jmodguard.min-api=1"
       --label "io.jmodguard.max-api=1"
-      --label "io.jmodguard.launcher-protocol=1"
       --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
     )
+    # Historical schema16 images still contain the schema15-reporting launcher.
+    # They remain dashboard artifacts, but must not reinstall that launcher on
+    # a repaired deployment. Without protocol metadata discovery rejects them.
+    if [[ "$component" != webui && "$schema" != 15 ]] \
+        && grep -Eq '(min|max)_schema: 15,' "$context/crates/updater/src/main.rs"; then
+      echo 'Selected source has stale launcher schema observations; owner updates unavailable' >&2
+    else
+      args+=(--label "io.jmodguard.launcher-protocol=1")
+    fi
   fi
   args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
   if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
@@ -478,6 +499,7 @@ publish_component() {
     node "$context/scripts/package-webui.mjs" "$context" "$sha" >/dev/null
   fi
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout")
+  [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
   verify_published_image "$component" "${image}:${sha}" "$context" "$layout"

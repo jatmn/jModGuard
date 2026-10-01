@@ -28,6 +28,33 @@ The update policy supports Off, Daily, Weekly, and Monthly UTC windows for promo
 
 An owner install request requires a successful release check for the currently selected channel within the last two hours. If the last check failed or expired, use **Check now** before installing; this applies to the service application, launcher, and WebUI controls.
 
+## Schema upgrades and recovery
+
+Independent application and launcher switches require the candidate, current
+rollback binary, and other service to support the same core schema. Published
+schema labels follow the selected source's migrations; launcher observations use
+the running release's declared range (or the baked build's schema). A schema
+upgrade requires a coordinated deployment of matching bot/API images through
+Bunny, following [the upgrade guide](UPGRADE.md#5-rollout-order).
+
+Builds through `a5e02070e9e602cecafd1f0ccbc3d8c5b694e31d` incorrectly advertised
+core schema 15 even after migration 0016 was added. Updating the bot alone could
+therefore migrate to 16 while the old API and launcher kept reporting 15. Later
+checks show **candidate cannot open current database schema** and disable both
+application and launcher controls. Reloading the WebUI cannot repair this state. Republishing those historical service
+sources keeps their true schema labels but omits updater protocol eligibility, so
+their old launcher cannot be installed onto a repaired deployment.
+
+For an affected deployment, select matching bot/API base images supporting schema
+16 in Bunny's dashboard, including the corrected launcher and publication metadata
+once available. Stop the old API, deploy/start the matching bot image, then start
+the matching API image and verify readiness before using **Check now**. Replacing
+base images also replaces the old baked binaries used on restart. Updating only
+the WebUI or restarting an old base image does not fix compatibility. Do not lower
+`user_version`, edit recorded compatibility ranges, or bypass the install checks;
+old binaries reject newer schemas on startup. Image rollback requires the matching
+pre-upgrade database backups described in the upgrade guide.
+
 ## Storage Zone publication
 
 The API needs `BUNNY_STORAGE_ENDPOINT` (regional Storage hostname, default `storage.bunnycdn.com`), `BUNNY_STORAGE_ZONE`, and that **zone's Storage password** as `BUNNY_STORAGE_PASSWORD`. The password can read/write/delete within the entire zone. Keep it in Bunny's container environment, not source or browser code. The updater restricts operations to `index.html`, `administration/index.html`, and exact filenames under `assets/releases/<40-character source SHA>/`. It never deletes a directory or a legacy root file. A missing password disables WebUI installation while discovery remains available.
