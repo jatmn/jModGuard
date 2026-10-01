@@ -55,9 +55,10 @@ source commits, image releases, schema upgrades, restarts, and redeployments do
 not start another initial import. An empty directory or missing job metadata is
 not permission to reseed. Retry on a completed initial import is a no-op,
 except it resumes audit recovery that stopped because a Discord page did not
-advance. Pause, resume, and retry apply only while the saved import state still
-allows that control; a queued control that arrives after the state has changed
-does not overwrite needs attention or a pause. After
+advance. Controls recheck the saved import state at execution; a queued control
+that is no longer allowed does not overwrite needs attention or a pause.
+A queued Pause or Resume delivered after the import reaches `complete` instead
+succeeds as a no-op with a `member_sync_already_completed` receipt. After
 completion, a full current-member and current-ban scan runs only when a guild
 administrator explicitly selects **Reconcile from Discord**. An outage,
 restore, bot restart or redeploy, or a replaced Gateway session on an already

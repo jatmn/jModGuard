@@ -215,13 +215,17 @@ credentials only to the API; ignoring a shared file's fields does not hide its r
 The Members status card uses `POST .../member-sync/actions` for typed
 `pause`, `resume`, `retry`, and `reconcile` requests with the same stable
 request-key, page-membership, and fresh Manage Guild checks. The bot records a
-receipt after applying a control to scoped guild-store sync state. The bot
-applies pause, resume, and retry only when the saved import state still allows
-that control; a stale queued control fails with `member_sync_invalid_operation`
-instead of overwriting needs attention or a pause. `retry` on a
-completed initial import returns an `already_completed` receipt without starting
-another seed, unless audit recovery stopped because a Discord page did not
-advance. `reconcile` is the
+receipt after applying a control to scoped guild-store sync state. The store
+rechecks the saved import state at execution. Replaying an already applied
+operation key returns the current status without changing it. Otherwise, a
+control incompatible with the saved state fails with
+`member_sync_invalid_operation` instead of overwriting needs attention or a
+pause, with one completed-state exception: a queued `pause` or `resume` delivered
+after the import reaches `complete` succeeds as a no-op with a
+`member_sync_already_completed` receipt. `retry` on a completed initial import
+also returns that receipt without starting another seed, unless audit recovery
+stopped because a Discord page did not advance; requeueing that recovery returns
+`member_sync_updated`. `reconcile` is the
 separate explicit full Discord scan. See [MEMBERS.md](MEMBERS.md).
 
 ## Runtime controls
