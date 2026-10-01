@@ -149,18 +149,21 @@ async fn stage(
     Ok(target)
 }
 
-fn observation(running: &Running, base_sha: &str) -> ComponentObservation {
+fn observation(
+    running: &Running,
+    base_sha: &str,
+    baked: &db::BakedCompatibility,
+) -> ComponentObservation {
     ComponentObservation {
         guild_schema: Some(
             running
                 .release
                 .as_ref()
                 .and_then(|release| release.upgrade.as_ref())
-                .map_or(db::guild_data::SCHEMA_VERSION, |upgrade| {
-                    upgrade.guild_schema
-                }),
+                .map_or(baked.guild, |upgrade| upgrade.guild_schema),
         ),
         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
         source_sha: running.source_sha.clone(),
         executable_sha256: running.executable_sha256.clone(),
         admin_sha256: None,
@@ -169,11 +172,11 @@ fn observation(running: &Running, base_sha: &str) -> ComponentObservation {
         min_schema: running
             .release
             .as_ref()
-            .map_or(db::CORE_SCHEMA_VERSION, |release| release.min_schema),
+            .map_or(baked.core, |release| release.min_schema),
         max_schema: running
             .release
             .as_ref()
-            .map_or(db::CORE_SCHEMA_VERSION, |release| release.max_schema),
+            .map_or(baked.core, |release| release.max_schema),
         api_capability: 1,
         self_update_enabled: update_enabled(),
         base_abi: std::env::var("JMODGUARD_BASE_ABI").unwrap_or_else(|_| "unknown".into()),
@@ -185,8 +188,9 @@ fn deployment_observation(
     base_sha: &str,
     base_abi: &str,
     enabled: bool,
+    baked: &db::BakedCompatibility,
 ) -> ComponentObservation {
-    let mut seen = observation(running, base_sha);
+    let mut seen = observation(running, base_sha, baked);
     seen.base_abi = base_abi.into();
     seen.self_update_enabled = enabled;
     seen
@@ -199,7 +203,9 @@ struct Supervisor {
     base_sha: String,
     base_abi: String,
     enabled: bool,
+    launcher_revision: u32,
     baked: PathBuf,
+    baked_compatibility: db::BakedCompatibility,
     registry: Registry,
     control: UpdateControl,
     instance: String,
@@ -210,8 +216,6 @@ struct Supervisor {
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
-    // Failed independent selection awaiting verified prior-service readiness.
-    rollback: Option<(ComponentRelease, String)>,
     reported: bool,
     last_observed: Option<Instant>,
 }
@@ -267,6 +271,9 @@ impl Supervisor {
         sha: &str,
         release: Option<ComponentRelease>,
     ) -> Result<()> {
+        if let Some(release) = &release {
+            release.supports_launcher(self.launcher_revision)?;
+        }
         self.end_idle().await?;
         self.running = Some(launch(path, sha, release).await?);
         self.reported = false;
@@ -283,8 +290,7 @@ impl Supervisor {
         }
         if tokio::fs::metadata(&child.ready_file).await.is_err() {
             ensure!(
-                self.rollback.is_some()
-                    || child.release.is_none()
+                child.release.is_none()
                     || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
                 "replacement child readiness timed out"
             );
@@ -300,7 +306,13 @@ impl Supervisor {
                     .running(
                         &self.role,
                         None,
-                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        deployment_observation(
+                            child,
+                            &self.base_sha,
+                            &self.base_abi,
+                            self.enabled,
+                            &self.baked_compatibility,
+                        ),
                         now(),
                     )
                     .await
@@ -310,24 +322,17 @@ impl Supervisor {
                 }
             }
         } else {
-            if let Some((failed, error)) = &self.rollback {
-                self.control
-                    .rolled_back(
-                        &self.role,
-                        failed,
-                        child.release.clone(),
-                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
-                        error,
-                        now(),
-                    )
-                    .await?;
-                self.rollback = None;
-                self.standby = None;
-            } else if child.release.is_none() {
+            if child.release.is_none() {
                 self.control
                     .baked_running(
                         &self.role,
-                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        deployment_observation(
+                            child,
+                            &self.base_sha,
+                            &self.base_abi,
+                            self.enabled,
+                            &self.baked_compatibility,
+                        ),
                         now(),
                     )
                     .await?;
@@ -336,7 +341,13 @@ impl Supervisor {
                     .running(
                         &self.role,
                         child.release.clone(),
-                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        deployment_observation(
+                            child,
+                            &self.base_sha,
+                            &self.base_abi,
+                            self.enabled,
+                            &self.baked_compatibility,
+                        ),
                         now(),
                     )
                     .await?;
@@ -347,17 +358,14 @@ impl Supervisor {
         Ok(true)
     }
 
-    async fn pair(&mut self, id: &str) -> Result<()> {
+    async fn pair(&mut self, id: &str) -> Result<bool> {
+        // Independent rollback artifacts cannot survive a potential core OR
+        // guild migration, even after later operations replace the status row.
+        self.standby = None;
         let op = self
             .control
             .join_upgrade(id, &self.role, &self.instance)
             .await?;
-        // Pending independent recovery can resume if this reversible pair is
-        // cancelled. No prior artifacts may survive the migration fence.
-        if op.irreversible || self.rollback.is_none() {
-            self.standby = None;
-            self.rollback = None;
-        }
         if op.error.is_some() {
             self.stop_application().await?;
             if !op.service(&self.role)?.stopped {
@@ -365,7 +373,7 @@ impl Supervisor {
                     .acknowledge(id, &self.role, &self.instance, Ack::Stopped)
                     .await?;
             }
-            return Ok(());
+            return Ok(false);
         }
         let target = op.service(&self.role)?.release.clone();
         ensure!(
@@ -376,6 +384,9 @@ impl Supervisor {
             target.base_abi == self.base_abi,
             "paired release requires a different base ABI"
         );
+        if self.required_launcher(&target, Some(id)).await? {
+            return Ok(true);
+        }
         if self
             .prepared
             .as_ref()
@@ -394,7 +405,7 @@ impl Supervisor {
             self.control
                 .acknowledge(id, &self.role, &self.instance, Ack::Prepared)
                 .await?;
-            return Ok(());
+            return Ok(false);
         }
         let must_stop = match self.role.as_str() {
             "api" => matches!(
@@ -410,7 +421,7 @@ impl Supervisor {
             self.control
                 .acknowledge(id, &self.role, &self.instance, Ack::Stopped)
                 .await?;
-            return Ok(());
+            return Ok(false);
         }
         let may_start = (self.role == "bot"
             && op.phase == Phase::StartingBot
@@ -423,8 +434,6 @@ impl Supervisor {
             self.control
                 .acknowledge(id, &self.role, &self.instance, Ack::Starting)
                 .await?;
-            self.standby = None;
-            self.rollback = None;
             let path = self
                 .prepared
                 .as_ref()
@@ -433,22 +442,18 @@ impl Supervisor {
                 .clone();
             self.start(&path, &target.source_sha, Some(target.clone()))
                 .await?;
-            return Ok(());
+            return Ok(false);
         }
-        // Preparation owns desired; publishing an independent rollback here
-        // could clear an explicitly retried pair with the same failed digest.
-        if self.rollback.is_none() && self.report_ready().await? && may_start {
+        if self.report_ready().await? && may_start {
             self.control
                 .acknowledge(id, &self.role, &self.instance, Ack::Ready)
                 .await?;
         }
-        self.idle().await
+        self.idle().await?;
+        Ok(false)
     }
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
-        if let Some((failed, error)) = self.rollback.clone() {
-            return self.rollback_independent(state, failed, error).await;
-        }
         // One-time deployment of this baseline replaces pre-protocol selections
         // whose metadata caused the schema15/16 lockout. Operators stop both old
         // services for this rollout. Never discard a protocol-2 managed selection.
@@ -463,8 +468,8 @@ impl Supervisor {
             && self.control.upgrade().await?.is_none();
         let schema = self.control.schema_version().await?;
         if legacy_baseline
-            && ((self.role == "bot" && schema <= db::CORE_SCHEMA_VERSION)
-                || schema == db::CORE_SCHEMA_VERSION)
+            && ((self.role == "bot" && schema <= self.baked_compatibility.core)
+                || schema == self.baked_compatibility.core)
         {
             let path = self.baked.clone();
             let sha = self.base_sha.clone();
@@ -491,7 +496,7 @@ impl Supervisor {
                 .await?;
         } else {
             ensure!(
-                self.control.schema_version().await? == db::CORE_SCHEMA_VERSION,
+                self.control.schema_version().await? == self.baked_compatibility.core,
                 "baked application cannot open database; use owner recovery"
             );
             let path = self.baked.clone();
@@ -499,6 +504,67 @@ impl Supervisor {
             self.start(&path, &sha, None).await?;
         }
         Ok(())
+    }
+
+    async fn handoff(
+        &mut self,
+        release: &ComponentRelease,
+        operation: Option<&str>,
+        required: bool,
+    ) -> Result<bool> {
+        ensure!(
+            self.enabled,
+            "launcher update requires self-update to be enabled"
+        );
+        ensure!(
+            release.component == self.role,
+            "launcher component mismatch"
+        );
+        jmodguard_updater::launcher_compatible(release, &self.base_abi)?;
+        let path = stage(&self.registry, release, "jmodguard-launcher", &self.staging).await?;
+        let hash = sha256_hex(&tokio::fs::read(&path).await?);
+        if required {
+            self.control
+                .select_required_launcher(release, operation)
+                .await?;
+        }
+        // Production staging is /tmp/jmodguard-updates and PID1 uses its sibling.
+        let control_file = self
+            .staging
+            .parent()
+            .context("missing staging parent")?
+            .join("jmodguard-launcher-next");
+        tokio::fs::write(
+            control_file,
+            format!("{}\n{}\n{}\n", path.display(), hash, release.digest),
+        )
+        .await?;
+        self.stop_application().await?;
+        self.end_idle().await?;
+        Ok(true)
+    }
+
+    async fn required_launcher(
+        &mut self,
+        release: &ComponentRelease,
+        operation: Option<&str>,
+    ) -> Result<bool> {
+        release.validate()?;
+        if self.launcher_revision >= release.required_launcher() {
+            return Ok(false);
+        }
+        if operation.is_none()
+            && std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
+            && self
+                .control
+                .component(&self.role)
+                .await?
+                .desired_launcher
+                .is_none()
+        {
+            bail!("required launcher failed; retry the selected pair from owner recovery");
+        }
+        self.handoff(release, operation, true).await
     }
 
     async fn launcher(&mut self, state: &db::ComponentUpdate) -> Result<bool> {
@@ -510,38 +576,29 @@ impl Supervisor {
             return Ok(false);
         };
         if std::env::var("JMODGUARD_LAUNCHER_RELEASE").as_deref() == Ok(&release.digest)
-            || std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
+            || (std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
+                && state.desired_launcher.is_none())
         {
             return Ok(false);
         }
-        ensure!(
-            release.component == self.role
-                && release.launcher_protocol == 1
-                && release
-                    .upgrade
-                    .as_ref()
-                    .is_some_and(|v| v.control_protocol == db::UPDATE_CONTROL_PROTOCOL)
-                && release.base_abi == self.base_abi,
-            "launcher does not support this control protocol/base runtime"
-        );
-        let path = stage(&self.registry, release, "jmodguard-launcher", &self.staging).await?;
-        let hash = sha256_hex(&tokio::fs::read(&path).await?);
-        tokio::fs::write(
-            "/tmp/jmodguard-launcher-next",
-            format!("{}\n{}\n{}\n", path.display(), hash, release.digest),
-        )
-        .await?;
-        self.stop_application().await?;
-        self.end_idle().await?;
-        Ok(true)
+        if let Some(contract) = &release.launcher {
+            if contract.revision <= self.launcher_revision {
+                self.control
+                    .clear_superseded_launcher(&self.role, release)
+                    .await?;
+                return Ok(false);
+            }
+        } else if state.desired_launcher.is_some() {
+            bail!("selected launcher has no capability contract; check a launcher-aware release");
+        } else {
+            return Ok(false);
+        }
+        self.handoff(release, None, false).await
     }
 
     async fn normal(&mut self) -> Result<bool> {
         let state = self.control.component(&self.role).await?;
-        if self.rollback.is_none()
-            && self.enabled
-            && (state.desired_launcher.is_some() || self.running.is_none())
-        {
+        if self.enabled && (state.desired_launcher.is_some() || self.running.is_none()) {
             match self.launcher(&state).await {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
@@ -561,37 +618,46 @@ impl Supervisor {
                 }
             }
         }
-        if self.running.is_none()
-            && let Err(error) = self.restore(&state).await
-        {
-            if let Some(op) = self.control.upgrade().await?.filter(|op| {
-                self.rollback.is_none()
-                    && op.phase == Phase::Complete
-                    && state.installed.as_ref().is_some_and(|release| {
-                        op.service(&self.role)
-                            .is_ok_and(|service| release.digest == service.release.digest)
-                    })
-            }) {
-                self.control
-                    .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
-                    .await?;
+        if self.running.is_none() {
+            let restored = async {
+                if let Some(installed) = &state.installed
+                    && self.required_launcher(installed, None).await?
+                {
+                    return Ok(true);
+                }
+                self.restore(&state).await?;
+                Ok::<_, anyhow::Error>(false)
             }
-            return Err(error);
+            .await;
+            match restored {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    if let Some(op) = self
+                        .control
+                        .upgrade()
+                        .await?
+                        .filter(|op| op.phase == Phase::Complete)
+                    {
+                        self.control
+                            .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
+                            .await?;
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let restoring_previous = self.rollback.is_some();
         if let Err(error) = self.report_ready().await {
             // After a coordinated migration, never try a previous/baked child.
             if let Some(op) = self.control.upgrade().await?
                 && op.phase == Phase::Complete
-                && self.rollback.is_none()
-                && self
-                    .running
-                    .as_ref()
-                    .and_then(|child| child.release.as_ref())
-                    .is_some_and(|release| {
-                        op.service(&self.role)
-                            .is_ok_and(|service| release.digest == service.release.digest)
-                    })
+                && state.installed.as_ref().is_some_and(|r| {
+                    r.digest
+                        == op
+                            .service(&self.role)
+                            .map(|s| s.release.digest.as_str())
+                            .unwrap_or("")
+                })
             {
                 self.control
                     .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))
@@ -599,28 +665,62 @@ impl Supervisor {
                 self.stop_application().await?;
                 return Ok(false);
             }
-            if self.rollback.is_none() && self.standby.is_some() {
+            if let Some((path, sha, previous)) = self.standby.take() {
+                // Independent switches passed the same core AND guild schema
+                // gate. Recheck the current schema before using that fallback.
+                let schema = self.control.schema_version().await?;
+                ensure!(
+                    previous
+                        .as_ref()
+                        .map_or(schema == self.baked_compatibility.core, |r| schema
+                            >= r.min_schema
+                            && schema <= r.max_schema),
+                    "rollback schema is incompatible"
+                );
+                let previous_guild = previous
+                    .as_ref()
+                    .and_then(|r| r.upgrade.as_ref())
+                    .map_or(self.baked_compatibility.guild, |contract| {
+                        contract.guild_schema
+                    });
+                ensure!(
+                    state.observed.as_ref().and_then(|seen| seen.guild_schema)
+                        == Some(previous_guild),
+                    "rollback guild schema is incompatible"
+                );
                 let failed = self
                     .running
                     .as_ref()
-                    .and_then(|child| child.release.clone())
+                    .and_then(|r| r.release.clone())
                     .context("failed replacement missing")?;
-                self.rollback_independent(&state, failed, format!("{error:#}"))
+                self.stop_application().await?;
+                self.start(&path, &sha, previous.clone()).await?;
+                let child = self.running.as_ref().context("rollback did not start")?;
+                self.control
+                    .rolled_back(
+                        &self.role,
+                        &failed,
+                        previous,
+                        deployment_observation(
+                            child,
+                            &self.base_sha,
+                            &self.base_abi,
+                            self.enabled,
+                            &self.baked_compatibility,
+                        ),
+                        &format!("{error:#}"),
+                        now(),
+                    )
                     .await?;
             } else {
                 self.stop_application().await?;
                 return Err(error);
             }
         }
-        // A rollback receipt may have cleared desired after this tick's read.
-        // Do not retry the stale failed selection, even if the prior is ready.
-        if restoring_previous || self.rollback.is_some() {
-            return Ok(false);
-        }
         if !self.reported || !self.enabled {
             return Ok(false);
         }
-        let Some(candidate) = state.desired.clone() else {
+        let Some(candidate) = state.desired else {
             return Ok(false);
         };
         if self
@@ -636,6 +736,29 @@ impl Supervisor {
                 .failed(&self.role, &candidate, &format!("compatibility: {error:#}"))
                 .await?;
             return Ok(false);
+        }
+        match self.required_launcher(&candidate, None).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                self.control
+                    .launcher_failed(
+                        &self.role,
+                        &candidate.digest,
+                        &format!("required launcher failed: {error:#}"),
+                    )
+                    .await?;
+                self.control
+                    .failed(
+                        &self.role,
+                        &candidate,
+                        &format!(
+                            "required launcher failed: {error:#}; application was not updated"
+                        ),
+                    )
+                    .await?;
+                return Ok(false);
+            }
         }
         let path = match stage(
             &self.registry,
@@ -672,56 +795,15 @@ impl Supervisor {
             child.release.clone(),
         ));
         self.stop_application().await?;
-        if let Err(error) = self
-            .start(&path, &candidate.source_sha, Some(candidate.clone()))
-            .await
-        {
-            self.rollback_independent(&state, candidate, format!("spawn: {error:#}"))
-                .await?;
-        }
+        self.start(&path, &candidate.source_sha, Some(candidate.clone()))
+            .await?;
         Ok(false)
-    }
-
-    async fn rollback_independent(
-        &mut self,
-        state: &db::ComponentUpdate,
-        failed: ComponentRelease,
-        error: String,
-    ) -> Result<()> {
-        let (path, sha, previous) = self
-            .standby
-            .as_ref()
-            .cloned()
-            .context("rollback artifact missing")?;
-        // Independent admission proved both schemas. Recheck before fallback.
-        let schema = self.control.schema_version().await?;
-        ensure!(
-            previous
-                .as_ref()
-                .map_or(schema == db::CORE_SCHEMA_VERSION, |r| schema
-                    >= r.min_schema
-                    && schema <= r.max_schema),
-            "rollback schema is incompatible"
-        );
-        let previous_guild = previous
-            .as_ref()
-            .and_then(|r| r.upgrade.as_ref())
-            .map_or(db::guild_data::SCHEMA_VERSION, |contract| {
-                contract.guild_schema
-            });
-        ensure!(
-            state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(previous_guild),
-            "rollback guild schema is incompatible"
-        );
-        // Keep the failed identity until the live prior marker permits its receipt.
-        self.rollback = Some((failed, error));
-        self.stop_application().await?;
-        self.start(&path, &sha, previous).await
     }
 
     async fn tick(&mut self) -> Result<bool> {
         if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
-            if let Err(error) = self.pair(&op.id).await {
+            let result = self.pair(&op.id).await;
+            if let Err(error) = result {
                 if error.is::<db::UpgradeProgressChanged>() {
                     return Ok(false);
                 }
@@ -732,10 +814,59 @@ impl Supervisor {
                 self.stop_application().await?;
                 return Err(error);
             }
-            return Ok(false);
+            return result;
         }
         self.normal().await
     }
+}
+
+async fn activate_launcher(
+    control: &UpdateControl,
+    role: &str,
+    release: &ComponentRelease,
+    hash: &str,
+) -> Result<()> {
+    ensure!(
+        release
+            .launcher
+            .as_ref()
+            .is_some_and(|v| v.revision == db::LAUNCHER_REVISION),
+        "launcher binary capability does not match its release metadata"
+    );
+    control.launcher_running(role, release, hash, now()).await
+}
+
+/// Verify a replacement (or record the baked controller), then publish compiled
+/// capability. Observation is the owner-visible "running launcher"; it must not
+/// precede a failed activation.
+async fn establish_launcher(
+    control: &UpdateControl,
+    role: &str,
+    hash: &str,
+    handoff_digest: Option<&str>,
+) -> Result<()> {
+    if let Some(digest) = handoff_digest {
+        let state = control.component(role).await?;
+        let release = state
+            .desired_launcher
+            .as_ref()
+            .or(state.installed_launcher.as_ref())
+            .context("launcher selection missing")?;
+        ensure!(
+            release.digest == digest,
+            "launcher selection changed before handoff"
+        );
+        activate_launcher(control, role, release, hash).await?;
+    } else if control
+        .component(role)
+        .await?
+        .installed_launcher
+        .as_ref()
+        .is_none_or(|release| release.upgrade.is_none())
+    {
+        control.baked_launcher(role, hash, now()).await?;
+    }
+    control.observe_launcher(role, db::LAUNCHER_REVISION).await
 }
 
 #[tokio::main]
@@ -803,39 +934,43 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(POLL) => {},
         }
     };
+    let handoff_digest = std::env::var("JMODGUARD_LAUNCHER_RELEASE").ok();
+    let baked_compatibility = control
+        .baked_compatibility(&role, &base_sha, handoff_digest.is_none())
+        .await?;
     let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
-    if let Ok(digest) = std::env::var("JMODGUARD_LAUNCHER_RELEASE") {
-        let state = control.component(&role).await?;
-        let release = state
-            .desired_launcher
-            .as_ref()
-            .or(state.installed_launcher.as_ref())
-            .context("launcher selection missing")?;
-        ensure!(
-            release.digest == digest,
-            "launcher selection changed before handoff"
-        );
-        control
-            .launcher_running(&role, release, &hash, now())
-            .await?;
-    } else if control
-        .component(&role)
-        .await?
-        .installed_launcher
-        .as_ref()
-        .is_none_or(|release| release.upgrade.is_none())
-    {
-        control.baked_launcher(&role, &hash, now()).await?;
-    }
+    // Capability is published only after the pinned release is verified.
+    // A rejected handoff must not leave Administration treating this binary as active.
+    establish_launcher(&control, &role, &hash, handoff_digest.as_deref()).await?;
     if let Ok(failed) = std::env::var("JMODGUARD_LAUNCHER_FAILED") {
         control.launcher_failed(&role, &failed, "updated launcher failed; stable baked controller is recovering the selected application").await?;
+        if let Some(pending) = control
+            .component(&role)
+            .await?
+            .desired
+            .filter(|r| r.digest == failed && r.required_launcher() > db::LAUNCHER_REVISION)
+        {
+            control.failed(&role, &pending, "required launcher failed; application was not updated; retry from Administration").await?;
+        }
+        if let Some(op) = control.upgrade().await?.filter(|op| op.phase.active())
+            && op.service(&role)?.release.digest == failed
+        {
+            control
+                .upgrade_error(
+                    &op.id,
+                    "required launcher failed; retry the selected pair from recovery",
+                )
+                .await?;
+        }
     }
     let mut supervisor = Supervisor {
         role,
         base_sha,
         base_abi: std::env::var("JMODGUARD_BASE_ABI").unwrap_or_else(|_| "unknown".into()),
         enabled: update_enabled(),
+        launcher_revision: db::LAUNCHER_REVISION,
         baked,
+        baked_compatibility,
         registry: Registry::ghcr()?,
         control,
         instance: format!("{:032x}", rand::random::<u128>()),
@@ -846,7 +981,6 @@ async fn main() -> Result<()> {
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
-        rollback: None,
         reported: false,
         last_observed: None,
     };
@@ -911,6 +1045,10 @@ mod tests {
             min_api: 1,
             max_api: 1,
             launcher_protocol: 1,
+            launcher: Some(db::LauncherCompatibility {
+                revision: db::LAUNCHER_REVISION,
+                min_revision: db::REQUIRED_LAUNCHER_REVISION,
+            }),
             base_abi: label("base-abi"),
         };
         let dir =
@@ -928,7 +1066,11 @@ mod tests {
             .await
             .unwrap();
         running.child.wait().await.unwrap();
-        let mut baked = observation(&running, &candidate.source_sha);
+        let mut baked = observation(
+            &running,
+            &candidate.source_sha,
+            &db::BakedCompatibility::compiled(&candidate.source_sha),
+        );
         // Supply the deployment ABI normally injected by the image environment.
         baked.base_abi = candidate.base_abi.clone();
         assert_eq!((baked.min_schema, baked.max_schema), (schema, schema));
@@ -981,7 +1123,11 @@ mod tests {
         let mut managed = candidate;
         managed.min_schema = schema - 1;
         running.release = Some(managed);
-        let observed = observation(&running, &running.source_sha);
+        let observed = observation(
+            &running,
+            &running.source_sha,
+            &db::BakedCompatibility::compiled(&running.source_sha),
+        );
         assert_eq!(
             (observed.min_schema, observed.max_schema),
             (schema - 1, schema)

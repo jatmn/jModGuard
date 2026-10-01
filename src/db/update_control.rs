@@ -3,7 +3,11 @@
 use super::*;
 use serde::Deserialize;
 
-pub const UPDATE_CONTROL_PROTOCOL: u32 = 2;
+pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
+/// Monotonic updater capability, independent of source SHA and shell protocol.
+/// Bump when shipping launcher changes; raise the minimum only when required.
+pub const LAUNCHER_REVISION: u32 = 1;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
 /// A controller restarted, or an owner replaced/cancelled the operation while
@@ -25,6 +29,25 @@ fn require_progress(current: bool) -> Result<()> {
 #[derive(Clone)]
 pub struct UpdateControl {
     db: Db,
+}
+
+/// Immutable application compatibility of this container's baked image. A
+/// downloaded launcher may be compiled for a different application schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakedCompatibility {
+    pub source_sha: String,
+    pub core: i64,
+    pub guild: i64,
+}
+
+impl BakedCompatibility {
+    pub fn compiled(source_sha: &str) -> Self {
+        Self {
+            source_sha: source_sha.into(),
+            core: CORE_SCHEMA_VERSION,
+            guild: guild_data::SCHEMA_VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +391,85 @@ impl UpdateControl {
         record_component_rollback(&self.db, role, failed, previous, observation, error, now).await
     }
 
+    /// Only the baked controller can establish the baked application's schema.
+    pub async fn baked_compatibility(
+        &self,
+        role: &str,
+        base_sha: &str,
+        baked_controller: bool,
+    ) -> Result<BakedCompatibility> {
+        anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+        let key = format!("component_baked_compatibility_{role}_v1");
+        let base_sha = base_sha.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                let result = if baked_controller {
+                    let baked = BakedCompatibility::compiled(&base_sha);
+                    write_meta_string_conn(&tx, &key, &serde_json::to_string(&baked)?)?;
+                    baked
+                } else {
+                    let raw = meta_string_conn(&tx, &key)?.context(
+                        "baked compatibility missing; restart the container's baked controller",
+                    )?;
+                    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
+                    anyhow::ensure!(
+                        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
+                        "baked compatibility does not match this base image"
+                    );
+                    baked
+                };
+                tx.commit()?;
+                Ok(result)
+            })
+            .await
+    }
+
+    /// Refresh actual controller capability without an application heartbeat.
+    pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
+        anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+        let role = role.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                let raw: Option<String> = tx.query_row(
+                    "SELECT observed FROM component_updates WHERE component=?1",
+                    params![role.clone()],
+                    |row| Ok(row.get(0)?),
+                )?;
+                if let Some(raw) = raw {
+                    let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
+                    seen.launcher_revision = revision;
+                    // Preserve pre-protocol baseline adoption until the baked app
+                    // reports readiness; a legacy schema15 row may describe DB16.
+                    if seen.update_protocol != 0 {
+                        seen.update_protocol = UPDATE_CONTROL_PROTOCOL;
+                    }
+                    tx.execute_rows(
+                        "UPDATE component_updates SET observed=?2 WHERE component=?1",
+                        params![role, serde_json::to_string(&seen)?],
+                        1,
+                    )?;
+                }
+                tx.commit()
+            })
+            .await
+    }
+
+    pub async fn clear_superseded_launcher(
+        &self,
+        role: &str,
+        release: &ComponentRelease,
+    ) -> Result<()> {
+        let (role, release) = (role.to_owned(), serde_json::to_string(release)?);
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
+                params![role, release], 1)?;
+            tx.commit()
+        }).await
+    }
+
     pub async fn launcher_running(
         &self,
         role: &str,
@@ -421,6 +523,8 @@ impl UpdateControl {
             target_api.validate()?;
             let bot_contract = target_bot.upgrade.as_ref().context("bot release does not support coordinated upgrades")?;
             let api_contract = target_api.upgrade.as_ref().context("API release does not support coordinated upgrades")?;
+            anyhow::ensure!(bot_contract.control_protocol == UPDATE_CONTROL_PROTOCOL && target_bot.launcher.is_some() && target_api.launcher.is_some(),
+                "release lacks launcher-aware upgrade requirements");
             anyhow::ensure!(target_bot.component == "bot" && target_api.component == "api"
                 && target_bot.source_sha == target_api.source_sha
                 && target_bot.result_schema == target_api.result_schema
@@ -470,6 +574,35 @@ impl UpdateControl {
             }
             tx.commit()?;
             Ok(upgrade)
+        }).await
+    }
+
+    /// Pin a required launcher only while the owning application selection is
+    /// still current. Preparing is reused across the launcher re-exec; the new
+    /// incarnation must prepare again before any schema-changing application.
+    pub async fn select_required_launcher(
+        &self,
+        release: &ComponentRelease,
+        operation: Option<&str>,
+    ) -> Result<()> {
+        release.validate()?;
+        let release = release.clone();
+        let operation = operation.map(str::to_owned);
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            if let Some(id) = operation {
+                let op = read_upgrade(&tx)?.context("upgrade missing")?;
+                require_progress(op.id == id && op.phase == UpgradePhase::Preparing && op.error.is_none()
+                    && op.service(&release.component)?.release == release)?;
+            } else {
+                ensure_no_service_upgrade(&tx)?;
+                let row = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component=?1", updates::COLS), params![release.component.clone()], updates::row_update)?;
+                anyhow::ensure!(row.desired.as_ref() == Some(&release) || row.installed.as_ref() == Some(&release),
+                    "application selection changed before launcher handoff");
+            }
+            tx.execute_rows("UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
+                params![release.component.clone(),serde_json::to_string(&release)?], 1)?;
+            tx.commit()
         }).await
     }
 
@@ -669,6 +802,10 @@ mod tests {
                     min_api: 1,
                     max_api: 1,
                     launcher_protocol: 1,
+                    launcher: Some(crate::db::LauncherCompatibility {
+                        revision: crate::db::LAUNCHER_REVISION,
+                        min_revision: crate::db::REQUIRED_LAUNCHER_REVISION,
+                    }),
                     base_abi: "debian-bookworm-amd64".into(),
                     upgrade: Some(UpgradeCompatibility {
                         control_protocol: UPDATE_CONTROL_PROTOCOL,
@@ -698,6 +835,7 @@ mod tests {
                             base_abi: "debian-bookworm-amd64".into(),
                             guild_schema: Some(guild_data::SCHEMA_VERSION),
                             update_protocol: UPDATE_CONTROL_PROTOCOL,
+                            launcher_revision: 0,
                         },
                         100,
                     )

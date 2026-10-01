@@ -113,11 +113,12 @@ function updateButton(pageState, component, launcher = false) {
   const card = cards.children.find((item) =>
     find(item, (child) => child.tag === "h2")?.textContent === component.toUpperCase());
   assert.ok(card);
-  return find(card, (item) => item.tag === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update application"));
+  return find(card, (item) => item.tag === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update"));
 }
 
 function render(pageState, item) {
   const snapshot = {
+    launchers: { [item.component]: { state: "optional", installable: true, reason: "Optional launcher update" } },
     components: [item], compatibility: { [item.component]: { installable: true } },
     apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
   };
@@ -241,7 +242,7 @@ function response(value, status = 200) {
   return { status, ok: status === 200, json: async () => value };
 }
 function state(items) {
-  return { components: items, compatibility: Object.fromEntries(items.map((item) => [item.component, { installable: true }])),
+  return { launchers: Object.fromEntries(items.map((item) => [item.component, { state: "optional", installable: true, reason: "Optional launcher update" }])), components: items, compatibility: Object.fromEntries(items.map((item) => [item.component, { installable: true }])),
     apply_enabled: true, unattended_enabled: true, webui_storage_configured: true };
 }
 
@@ -814,4 +815,25 @@ test("schema upgrades expose the paired action and active pairs block independen
     snapshot.service_upgrade = { phase: "preparing", error: null }; render();`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   assert.equal(updateButton(view, "api", true).disabled, true);
+});
+
+test("normal update explains a required launcher step and separates optional launcher updates", () => {
+  const view = page();
+  render(view, record());
+  vm.runInContext(`snapshot.launchers = { api: { state: "required_first", installable: true,
+    reason: "Update will install the required launcher first, then the application." } }; render();`, view.context);
+  const card = view.elements.get("update-cards");
+  assert.match(textOf(card), /required launcher first/);
+  assert.ok(find(card, (node) => node.tag === "button" && node.textContent === "Update"));
+  const advanced = find(card, (node) => node.tag === "details" && textOf(node).includes("Advanced launcher controls"));
+  assert.ok(advanced);
+  vm.runInContext(`snapshot.launchers.api = { state: "satisfied", installable: false,
+    reason: "Current launcher supports this application; no launcher update is required." }; render();`, view.context);
+  assert.match(textOf(card), /no launcher update is required/);
+  assert.equal(find(advanced, (node) => node.tag === "button").disabled, true);
+  vm.runInContext(`snapshot.compatibility.api.installable = false;
+    snapshot.launchers.api = { state: "optional", installable: true,
+    reason: "Current launcher supports this application. A newer launcher is optional." }; render();`, view.context);
+  assert.equal(find(advanced, (node) => node.tag === "button").disabled, false,
+    "launcher-only admission is independent of the bundled application's schema");
 });

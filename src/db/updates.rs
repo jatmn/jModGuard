@@ -4,6 +4,12 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LauncherCompatibility {
+    pub revision: u32,
+    pub min_revision: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ComponentRelease {
     pub component: String,
     pub channel: String,
@@ -18,12 +24,29 @@ pub struct ComponentRelease {
     pub min_api: i64,
     pub max_api: i64,
     pub launcher_protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<LauncherCompatibility>,
     pub base_abi: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<UpgradeCompatibility>,
 }
 
 impl ComponentRelease {
+    pub fn required_launcher(&self) -> u32 {
+        self.launcher.as_ref().map_or(0, |v| v.min_revision)
+    }
+
+    pub fn supports_launcher(&self, revision: u32) -> Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            revision >= self.required_launcher(),
+            "launcher update required before application start (need {}, running {})",
+            self.required_launcher(),
+            revision
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_component(&self.component)?;
         anyhow::ensure!(
@@ -51,12 +74,29 @@ impl ComponentRelease {
         anyhow::ensure!(self.launcher_protocol == 1, "unsupported launcher protocol");
         if let Some(upgrade) = &self.upgrade {
             anyhow::ensure!(
-                upgrade.control_protocol == UPDATE_CONTROL_PROTOCOL
+                matches!(upgrade.control_protocol, 2 | UPDATE_CONTROL_PROTOCOL)
                     && upgrade.min_core >= 15
                     && upgrade.min_core <= self.result_schema
                     && upgrade.min_guild >= 1
                     && upgrade.min_guild <= upgrade.guild_schema,
                 "unsupported schema upgrade contract"
+            );
+        }
+        if let Some(launcher) = &self.launcher {
+            anyhow::ensure!(
+                launcher.min_revision > 0 && launcher.revision >= launcher.min_revision,
+                "invalid launcher requirement"
+            );
+        }
+        if self.component != "webui"
+            && self
+                .upgrade
+                .as_ref()
+                .is_some_and(|v| v.control_protocol == UPDATE_CONTROL_PROTOCOL)
+        {
+            anyhow::ensure!(
+                self.launcher.is_some(),
+                "release lacks launcher requirements"
             );
         }
         anyhow::ensure!(
@@ -97,6 +137,8 @@ pub struct ComponentObservation {
     pub guild_schema: Option<i64>,
     #[serde(default)]
     pub update_protocol: u32,
+    #[serde(default)]
+    pub launcher_revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,7 +446,7 @@ pub async fn record_launcher_failure(
         let tx=conn.transaction_immediate()?;
         let desired:Option<String>=tx.query_row("SELECT desired_launcher FROM component_updates WHERE component=?1",params![component.clone()],|row| Ok(row.get(0)?))?;
         if desired.as_deref().is_some_and(|raw| serde_json::from_str::<ComponentRelease>(raw).is_ok_and(|release| release.digest==digest)) {
-            tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL,state='failed',last_error=?2 WHERE component=?1",params![component,error], 1)?;
+            tx.execute_rows("UPDATE component_updates SET installed_launcher=CASE WHEN installed_launcher=desired_launcher THEN NULL ELSE installed_launcher END,desired_launcher=NULL,state='failed',last_error=?2 WHERE component=?1",params![component,error], 1)?;
         }
         tx.commit()?;
         Ok(())
@@ -793,6 +835,10 @@ mod tests {
             min_api: 1,
             max_api: 1,
             launcher_protocol: 1,
+            launcher: Some(crate::db::LauncherCompatibility {
+                revision: crate::db::LAUNCHER_REVISION,
+                min_revision: crate::db::REQUIRED_LAUNCHER_REVISION,
+            }),
             base_abi: "debian-bookworm-amd64".into(),
         }
     }
@@ -1091,6 +1137,7 @@ mod tests {
         let observation = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: old.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: Some("d".repeat(64)),
@@ -1245,6 +1292,7 @@ mod tests {
         let observation = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1321,6 +1369,7 @@ mod tests {
         let observed = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "a".repeat(64),
             admin_sha256: None,
@@ -1415,6 +1464,8 @@ mod tests {
             guild_schema: None,
 
             update_protocol: 0,
+
+            launcher_revision: 0,
             source_sha: "c".repeat(40),
             executable_sha256: "d".repeat(64),
             admin_sha256: None,
@@ -1451,6 +1502,7 @@ mod tests {
         let observed = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: first.source_sha.clone(),
             executable_sha256: "c".repeat(64),
             admin_sha256: None,
@@ -1565,6 +1617,7 @@ mod tests {
             let observation = ComponentObservation {
                 guild_schema: None,
                 update_protocol: 0,
+                launcher_revision: 0,
                 source_sha: selected.source_sha.clone(),
                 executable_sha256: "c".repeat(64),
                 admin_sha256: None,

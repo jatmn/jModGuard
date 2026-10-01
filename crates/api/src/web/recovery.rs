@@ -70,6 +70,7 @@ async fn status(State(state): State<Arc<RecoveryState>>, session: Session) -> Re
     let result = async {
         Ok::<_, anyhow::Error>(json!({
             "operation":control.upgrade().await?,
+            "launchers":control.components().await?.into_iter().filter(|row| row.component != "webui").map(|row| (row.component.clone(), jmodguard_updater::launcher_status(&row, chrono::Utc::now().timestamp()))).collect::<serde_json::Map<String, Value>>(),
             "components":control.components().await?.into_iter().filter(|row| row.component != "webui").collect::<Vec<_>>(),
             "core_schema":control.schema_version().await?,
             "apply_enabled":state.apply_enabled,
@@ -310,6 +311,10 @@ mod tests {
                 min_api: 1,
                 max_api: 1,
                 launcher_protocol: 1,
+                launcher: Some(db::LauncherCompatibility {
+                    revision: db::LAUNCHER_REVISION,
+                    min_revision: db::REQUIRED_LAUNCHER_REVISION,
+                }),
                 base_abi: "debian-bookworm-amd64".into(),
                 upgrade: Some(UpgradeCompatibility {
                     control_protocol: db::UPDATE_CONTROL_PROTOCOL,
@@ -339,6 +344,7 @@ mod tests {
                         base_abi: "debian-bookworm-amd64".into(),
                         guild_schema: Some(db::guild_data::SCHEMA_VERSION),
                         update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+                        launcher_revision: 0,
                     },
                     now,
                 )

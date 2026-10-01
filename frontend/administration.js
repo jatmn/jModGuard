@@ -217,12 +217,15 @@ function createComponentView(record) {
   view.help = node("p", null, "muted administration-help");
   const row = node("div", null, "card-actions administration-actions");
   view.check = action("Check now", (item) => request("/api/updates/check", { component: item.component }), view);
-  view.install = action(record.component === "webui" ? "Update WebUI" : "Update application",
+  view.install = action(record.component === "webui" ? "Update WebUI" : "Update",
     (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }), view);
   row.append(view.check, view.install);
   if (record.component !== "webui") {
     view.launcher = action("Update launcher", (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }), view);
-    row.append(view.launcher);
+    const advanced = node("details", null, "administration-technical");
+    advanced.append(node("summary", "Advanced launcher controls"),
+      node("p", "The launcher starts and recovers this service. Normal Update includes any required launcher update first. Use this control only for an optional launcher update; it restarts the service."), view.launcher);
+    row.append(advanced);
   }
   view.policy = node("fieldset", null, "administration-policy");
   view.policy.append(node("legend", "Release policy"));
@@ -337,14 +340,19 @@ function render() {
     line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
     if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
     const compatibility = snapshot.compatibility?.[record.component];
-    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
+    const launcher = snapshot.launchers?.[record.component];
+    if (record.component !== "webui") {
+      line(content, "Launcher requirement", candidateCurrent ? launcher?.reason || "Check with a launcher-aware API to determine this release's requirement." : "Check now to determine the release requirement.");
+      if (launcher?.running != null) line(details, "Launcher capability", `${launcher.running} running; ${launcher.minimum} required; ${launcher.available} included in release`);
+    }
+    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/updates/recovery") {
       const target = record.candidate;
       const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
         target.upgrade?.guild_schema !== observed.guild_schema);
       if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
       if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
       const pair = node("a", "Update bot and API together / recovery");
-      pair.href = `${apiBase()}/api/service-upgrade/recovery`;
+      pair.href = `${apiBase()}/updates/recovery`;
       content.append(pair);
     }
 
@@ -383,7 +391,7 @@ function render() {
     view.install.disabled = busy || stale || !canApply || applicationCurrent || candidatePending;
     if (view.launcher) {
       view.launcher.hidden = !record.candidate;
-      view.launcher.disabled = busy || stale || !canApply || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest;
+      view.launcher.disabled = busy || stale || pairActive || !snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest;
     }
     view.help.textContent = !snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
       : record.component === "webui" ? !snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""

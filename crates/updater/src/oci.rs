@@ -311,6 +311,16 @@ impl Registry {
             min_api: label("io.jmodguard.min-api")?.parse()?,
             max_api: label("io.jmodguard.max-api")?.parse()?,
             launcher_protocol: label("io.jmodguard.launcher-protocol")?.parse()?,
+            launcher: if labels.contains_key("io.jmodguard.launcher-revision")
+                || labels.contains_key("io.jmodguard.min-launcher-revision")
+            {
+                Some(jmodguard::db::LauncherCompatibility {
+                    revision: label("io.jmodguard.launcher-revision")?.parse()?,
+                    min_revision: label("io.jmodguard.min-launcher-revision")?.parse()?,
+                })
+            } else {
+                None
+            },
             base_abi: label("io.jmodguard.base-abi")?,
         };
         release.validate()?;

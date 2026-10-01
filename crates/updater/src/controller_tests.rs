@@ -23,9 +23,13 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     {
         let mut tar = tar::Builder::new(&mut layer);
         let name = format!("usr/local/bin/jmodguard-{role}");
-        let inventory = format!("{}  bin/jmodguard-{role}\n", sha256_hex(binary));
+        let inventory = format!(
+            "{hash}  bin/jmodguard-{role}\n{hash}  bin/jmodguard-launcher\n",
+            hash = sha256_hex(binary)
+        );
         for (path, bytes) in [
             (name.as_str(), binary),
+            ("usr/local/bin/jmodguard-launcher", binary),
             (
                 "usr/local/share/jmodguard/files.sha256",
                 inventory.as_bytes(),
@@ -64,6 +68,10 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
         min_api: 1,
         max_api: 1,
         launcher_protocol: 1,
+        launcher: Some(db::LauncherCompatibility {
+            revision: db::LAUNCHER_REVISION,
+            min_revision: db::REQUIRED_LAUNCHER_REVISION,
+        }),
         base_abi: "debian-bookworm-amd64".into(),
         upgrade: Some(db::UpgradeCompatibility {
             control_protocol: db::UPDATE_CONTROL_PROTOCOL,
@@ -142,7 +150,9 @@ fn controller(
         base_sha: "b".repeat(40),
         base_abi: "debian-bookworm-amd64".into(),
         enabled: true,
+        launcher_revision: db::LAUNCHER_REVISION,
         baked,
+        baked_compatibility: db::BakedCompatibility::compiled(&"b".repeat(40)),
         registry,
         control,
         instance: format!("{:032x}", rand::random::<u128>()),
@@ -153,7 +163,6 @@ fn controller(
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
-        rollback: None,
         reported: false,
         last_observed: None,
     }
@@ -166,7 +175,6 @@ async fn restart(service: &mut Supervisor) {
     service.prepared = None;
     service.instance = format!("{:032x}", rand::random::<u128>());
     service.standby = None;
-    service.rollback = None;
 }
 
 #[tokio::test]
@@ -178,7 +186,6 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     let old_api = executable(&root, "old-api").await;
     let new_bot = executable(&root, "new-bot").await;
     let new_api = executable(&root, "new-api").await;
-    let independent_api = executable(&root, "independent-api").await;
     let mut objects = HashMap::new();
     let bot_release = image(
         &mut objects,
@@ -189,11 +196,6 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         &mut objects,
         "api",
         &tokio::fs::read(new_api).await.unwrap(),
-    );
-    let independent_release = image(
-        &mut objects,
-        "api",
-        &tokio::fs::read(independent_api).await.unwrap(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -254,17 +256,13 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             base_abi: "debian-bookworm-amd64".into(),
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
         };
         control
             .running(&legacy.component.clone(), Some(legacy), seen, now())
             .await
             .unwrap();
     }
-    db.with_conn(|conn| {
-        // Pre-protocol releases were serialized without this key, not null.
-        conn.execute_bounded("UPDATE component_updates SET installed=json_remove(installed,'$.upgrade'), desired=json_remove(desired,'$.upgrade') WHERE component IN ('bot','api')", (), 65536)?;
-        Ok(())
-    }).await.unwrap();
     let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
     let mut api = controller("api", old_api, registry, control.clone(), &root);
     let delayed_baked = root.join("hold-old-bot-ready");
@@ -323,6 +321,47 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         .request_upgrade(&bot_release.digest, &api_release.digest, false, now())
         .await
         .unwrap();
+    // Simulate an older capable controller executing the real prerequisite path.
+    // OCI extraction, stop/reap and PID1 handoff file are real; re-execution at
+    // the newer capability is represented by rebuilding the local supervisor.
+    bot.launcher_revision = 0;
+    assert!(
+        bot.tick().await.unwrap(),
+        "required launcher must hand off before application preparation"
+    );
+    assert!(bot.running.is_none());
+    let waiting = control.upgrade().await.unwrap().unwrap();
+    assert_eq!(waiting.phase, Phase::Preparing);
+    assert!(!waiting.bot.prepared && !waiting.irreversible);
+    let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+        .await
+        .unwrap();
+    assert!(handoff.ends_with(&format!("{}\n", bot_release.digest)));
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .desired_launcher
+            .unwrap(),
+        bot_release
+    );
+    assert!(
+        !tokio::fs::read_to_string(root.join("events"))
+            .await
+            .unwrap()
+            .contains("new-bot.start")
+    );
+    bot.launcher_revision = db::LAUNCHER_REVISION;
+    activate_launcher(
+        &control,
+        "bot",
+        &bot_release,
+        handoff.lines().nth(1).unwrap(),
+    )
+    .await
+    .unwrap();
+    restart(&mut bot).await;
     // Restart the bot while the API is inside a real graceful stop. Its
     // subsequent stop acknowledgement is stale progress, not an upgrade error.
     while control.upgrade().await.unwrap().unwrap().phase != Phase::StoppingApi {
@@ -391,64 +430,6 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         api.tick().await.unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
-    // Failure of a later independent same-schema release must not reopen P.
-    control
-        .checked(
-            "api",
-            "latest",
-            Some(independent_release.clone()),
-            None,
-            now(),
-        )
-        .await
-        .unwrap();
-    db::request_component_install(&db, "api", &independent_release.digest, now())
-        .await
-        .unwrap();
-    tokio::fs::write(root.join("fail-independent-api"), "fail")
-        .await
-        .unwrap();
-    api.tick().await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while api
-        .running
-        .as_mut()
-        .unwrap()
-        .child
-        .try_wait()
-        .unwrap()
-        .is_none()
-    {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    api.tick().await.unwrap();
-    assert_eq!(
-        control.upgrade().await.unwrap().unwrap().phase,
-        Phase::Complete
-    );
-    while !api.reported {
-        assert!(Instant::now() < deadline);
-        api.tick().await.unwrap();
-        bot.tick().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let restored = control.component("api").await.unwrap();
-    assert!(restored.desired.is_none());
-    assert_eq!(restored.installed.unwrap().digest, api_release.digest);
-    assert_eq!(
-        control.upgrade().await.unwrap().unwrap().phase,
-        Phase::Complete
-    );
-    assert!(
-        bot.running
-            .as_mut()
-            .unwrap()
-            .child
-            .try_wait()
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(restarted.len(), 5);
     assert!(Db::open_with(opts.clone()).is_err());
     let events = tokio::fs::read_to_string(root.join("events"))
@@ -458,6 +439,16 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     assert!(events.find("new-bot.ready").unwrap() < events.find("new-api.start").unwrap());
     let old_starts =
         events.matches("old-api.start").count() + events.matches("old-bot.start").count();
+    // A failed replacement / old baked fallback cannot use installed_launcher
+    // as proof of its own capability and must never start the dependent app.
+    restart(&mut bot).await;
+    bot.launcher_revision = 0;
+    assert!(
+        bot.tick().await.unwrap(),
+        "cold restore must restore its prerequisite first"
+    );
+    assert!(bot.running.is_none());
+    bot.launcher_revision = db::LAUNCHER_REVISION;
     // Cold starts have no local artifacts and an old baked executable. They
     // must fetch the installed selection without launching either old app.
     restart(&mut bot).await;
@@ -532,48 +523,20 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
 }
 
 #[tokio::test]
-async fn independent_spawn_failure_settles_once() {
-    independent_failure(false, false).await;
-}
-
-#[tokio::test]
-async fn independent_rollback_waits_for_baked_and_managed_prior_readiness() {
-    independent_failure(true, false).await;
-    independent_failure(true, true).await;
-}
-
-async fn independent_failure(exits_before_ready: bool, managed_prior: bool) {
+async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_download_failure() {
     let root = std::env::temp_dir().join(format!(
-        "independent-processes-{:032x}",
+        "launcher-prerequisite-{:032x}",
         rand::random::<u128>()
     ));
     tokio::fs::create_dir_all(&root).await.unwrap();
-    let old_bot = executable(&root, "old-bot").await;
-    let old_api = executable(&root, "old-api").await;
-    let bad_api = executable(&root, "bad-api").await;
+    let baked = executable(&root, "old-bot").await;
+    let next = executable(&root, "new-bot").await;
     let mut objects = HashMap::new();
-    let mut prior = image(
-        &mut objects,
-        "api",
-        &tokio::fs::read(&old_api).await.unwrap(),
-    );
-    let binary = if exits_before_ready {
-        tokio::fs::read(bad_api).await.unwrap()
-    } else {
-        b"\x7fELFnot-an-executable".to_vec()
-    };
-    let mut candidate = image(&mut objects, "api", &binary);
-    let mut pair_bot = image(
-        &mut objects,
-        "bot",
-        &tokio::fs::read(&old_bot).await.unwrap(),
-    );
-    for release in [&mut prior, &mut candidate, &mut pair_bot] {
-        release.min_schema = db::CORE_SCHEMA_VERSION;
-        release.max_schema = db::CORE_SCHEMA_VERSION;
-        release.result_schema = db::CORE_SCHEMA_VERSION;
-        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
-    }
+    let mut release = image(&mut objects, "bot", &tokio::fs::read(next).await.unwrap());
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
     let server = tokio::spawn(async move {
@@ -584,245 +547,311 @@ async fn independent_failure(exits_before_ready: bool, managed_prior: bool) {
                 .with_state(Arc::new(objects)),
         )
         .await
-        .unwrap()
+        .unwrap();
     });
     let db = Db::open(&root.join("core.db"), 2).unwrap();
     let control = UpdateControl::from_application(&db);
-    let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
-    let mut api = controller("api", old_api, registry, control.clone(), &root);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !bot.reported || !api.reported {
+    let mut bot = controller("bot", baked, registry.clone(), control.clone(), &root);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bot.reported {
         assert!(Instant::now() < deadline);
         bot.tick().await.unwrap();
-        api.tick().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    if managed_prior {
-        control
-            .checked("api", "latest", Some(prior.clone()), None, now())
-            .await
-            .unwrap();
-        db::request_component_install(&db, "api", &prior.digest, now())
-            .await
-            .unwrap();
-        while control.component("api").await.unwrap().installed.is_none() {
-            assert!(Instant::now() < deadline);
-            api.tick().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-    api.running.as_mut().unwrap().started_at = now() - 100;
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control.running("api", None, seen, now()).await.unwrap();
     control
-        .running(
-            "api",
-            None,
-            deployment_observation(
-                api.running.as_ref().unwrap(),
-                &api.base_sha,
-                &api.base_abi,
-                api.enabled,
-            ),
-            now(),
-        )
+        .checked("bot", "latest", Some(release.clone()), None, now())
         .await
         .unwrap();
-    let mut before = control.component("api").await.unwrap().observed.unwrap();
-    control
-        .checked("api", "latest", Some(candidate.clone()), None, now())
-        .await
-        .unwrap();
-    db::request_component_install(&db, "api", &candidate.digest, now())
-        .await
-        .unwrap();
-    if exits_before_ready {
-        if managed_prior {
-            // Also exercise runtime failure after Q's activation: installed=Q
-            // must stay truthful until the prior process is verified again.
-            api.tick().await.unwrap();
-            while !api.reported {
-                assert!(Instant::now() < deadline);
-                api.tick().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            api.running.as_mut().unwrap().started_at = now() - 50;
-            control
-                .running(
-                    "api",
-                    None,
-                    deployment_observation(
-                        api.running.as_ref().unwrap(),
-                        &api.base_sha,
-                        &api.base_abi,
-                        api.enabled,
-                    ),
-                    now(),
-                )
-                .await
-                .unwrap();
-            before = control.component("api").await.unwrap().observed.unwrap();
-            api.running.as_mut().unwrap().child.kill().await.unwrap();
-        } else {
-            tokio::fs::write(root.join("fail-bad-api"), "fail")
-                .await
-                .unwrap();
-            api.tick().await.unwrap();
-            while api
-                .running
-                .as_mut()
-                .unwrap()
-                .child
-                .try_wait()
-                .unwrap()
-                .is_none()
-            {
-                assert!(Instant::now() < deadline);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-        tokio::fs::write(root.join("hold-old-api-ready"), "hold")
-            .await
-            .unwrap();
-        api.tick().await.unwrap();
-        assert!(
-            tokio::fs::metadata(&api.running.as_ref().unwrap().ready_file)
-                .await
-                .is_err()
-        );
-        let pending = control.component("api").await.unwrap();
-        assert_eq!(
-            pending.observed.unwrap().started_at,
-            before.started_at,
-            "prior observation must remain unchanged until restoration is ready"
-        );
-        assert!(
-            pending.desired.is_some(),
-            "failed selection must settle only after prior readiness"
-        );
-        // A live predecessor is not a new replacement, even with managed metadata.
-        api.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
-        api.tick().await.unwrap();
-        assert!(
-            api.running
-                .as_mut()
-                .unwrap()
-                .child
-                .try_wait()
-                .unwrap()
-                .is_none()
-        );
-        if managed_prior {
-            assert_eq!(pending.installed.unwrap().digest, candidate.digest);
-            // Losing the unready fallback must retain P, not restore failed Q.
-            api.running.as_mut().unwrap().child.kill().await.unwrap();
-            assert!(api.tick().await.is_err());
-            api.tick().await.unwrap();
-            assert_eq!(
-                api.running
-                    .as_ref()
-                    .unwrap()
-                    .release
-                    .as_ref()
-                    .unwrap()
-                    .digest,
-                prior.digest
-            );
-            assert!(control.component("api").await.unwrap().desired.is_some());
-        }
-        let reversible_pair = if managed_prior {
-            control
-                .checked("bot", "latest", Some(pair_bot), None, now())
-                .await
-                .unwrap();
-            control
-                .checked("api", "latest", Some(candidate.clone()), None, now())
-                .await
-                .unwrap();
-            let op = control
-                .request_upgrade(
-                    &control
-                        .component("bot")
-                        .await
-                        .unwrap()
-                        .candidate
-                        .unwrap()
-                        .digest,
-                    &candidate.digest,
-                    false,
-                    now(),
-                )
-                .await
-                .unwrap();
-            api.tick().await.unwrap();
-            assert_eq!(
-                control.upgrade().await.unwrap().unwrap().phase,
-                Phase::Preparing
-            );
-            Some(op.id)
-        } else {
-            None
-        };
-        tokio::fs::remove_file(root.join("hold-old-api-ready"))
-            .await
-            .unwrap();
-        if let Some(id) = reversible_pair {
-            while tokio::fs::metadata(&api.running.as_ref().unwrap().ready_file)
-                .await
-                .is_err()
-            {
-                assert!(Instant::now() < deadline);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert!(
-                api.tick().await.is_ok(),
-                "paired preparation must not mis-acknowledge the uncommitted prior installation"
-            );
-            let op = control.upgrade().await.unwrap().unwrap();
-            assert!(op.error.is_none());
-            assert!(!op.irreversible);
-            // Cancel must resume P's pending receipt, rather than cold-restore Q.
-            control.abort_upgrade(&id).await.unwrap();
-        }
-    } else {
-        // Spawn errors are intentionally tolerated here so the original head
-        // reaches the durable-settlement oracle, not a setup assertion.
-        let _ = api.tick().await;
-    }
-    while !api.reported || control.component("api").await.unwrap().desired.is_some() {
-        assert!(
-            Instant::now() < deadline,
-            "failed request kept retrying instead of settling"
-        );
-        let _ = api.tick().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let installed = control.component("api").await.unwrap();
-    assert_eq!(installed.state, "failed");
+    let mut row = control.component("bot").await.unwrap();
+    row.observed.as_mut().unwrap().self_update_enabled = true;
+    let mut optional = release.clone();
+    optional.launcher.as_mut().unwrap().revision += 1;
+    row.candidate = Some(optional.clone());
+    let optional_advice = jmodguard_updater::launcher_status(&row, now());
+    assert_eq!(optional_advice["state"], "optional");
+    assert_eq!(optional_advice["installable"], true);
+    optional.launcher.as_mut().unwrap().min_revision += 1;
+    row.candidate = Some(optional.clone());
+    row.installed_launcher = Some(optional); // historical metadata is not active capability
+    let required_advice = jmodguard_updater::launcher_status(&row, now());
+    assert_eq!(required_advice["state"], "required_first");
     assert_eq!(
-        installed.installed.as_ref().map(|r| &r.digest),
-        managed_prior.then_some(&prior.digest)
+        required_advice["installable"], false,
+        "a required launcher is installed by normal Update, not the optional control"
     );
-    let starts = tokio::fs::read_to_string(root.join("events"))
+    row.observed_at = Some(now() - 7201);
+    assert_eq!(
+        jmodguard_updater::launcher_status(&row, now())["state"],
+        "unknown"
+    );
+    control
+        .observe_launcher("bot", db::LAUNCHER_REVISION + 1)
+        .await
+        .unwrap();
+    let active = control.component("bot").await.unwrap();
+    assert_eq!(
+        active.observed.unwrap().launcher_revision,
+        db::LAUNCHER_REVISION + 1
+    );
+    control
+        .observe_launcher("bot", db::LAUNCHER_REVISION)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    let old_pid = bot.running.as_ref().unwrap().child.id();
+    bot.launcher_revision = 0; // simulated older compiled controller, same production paths
+    bot.registry = Registry::new("http://127.0.0.1:1").unwrap();
+    assert!(!bot.tick().await.unwrap());
+    assert_eq!(bot.running.as_ref().unwrap().child.id(), old_pid);
+    let failed = control.component("bot").await.unwrap();
+    assert!(failed.desired.is_none());
+    assert!(
+        failed
+            .last_error
+            .unwrap()
+            .contains("required launcher failed")
+    );
+    bot.registry = registry;
+    db::request_component_install(&db, "bot", &release.digest, now())
+        .await
+        .unwrap();
+    assert!(bot.tick().await.unwrap());
+    assert!(bot.running.is_none());
+    let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+        .await
+        .unwrap();
+    assert!(handoff.ends_with(&format!("{}\n", release.digest)));
+    let mut mislabeled = release.clone();
+    mislabeled.launcher.as_mut().unwrap().revision += 1;
+    let published = control
+        .component("bot")
         .await
         .unwrap()
-        .matches("old-api.start")
-        .count();
-    for _ in 0..3 {
-        api.tick().await.unwrap();
-    }
+        .observed
+        .unwrap()
+        .launcher_revision;
+    assert!(
+        establish_launcher(
+            &control,
+            "bot",
+            handoff.lines().nth(1).unwrap(),
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
+        .await
+        .is_err()
+    );
     assert_eq!(
-        tokio::fs::read_to_string(root.join("events"))
+        control
+            .component("bot")
             .await
             .unwrap()
-            .matches("old-api.start")
-            .count(),
-        starts
+            .observed
+            .unwrap()
+            .launcher_revision,
+        published,
+        "rejected handoff must not publish launcher capability"
     );
-    api.stop_application().await.unwrap();
-    api.end_idle().await.unwrap();
-    bot.stop_application().await.unwrap();
-    bot.end_idle().await.unwrap();
+    assert!(
+        activate_launcher(
+            &control,
+            "bot",
+            &mislabeled,
+            handoff.lines().nth(1).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed_launcher
+            .is_none()
+    );
+    activate_launcher(&control, "bot", &release, handoff.lines().nth(1).unwrap())
+        .await
+        .unwrap();
+    bot.launcher_revision = db::LAUNCHER_REVISION; // re-exec simulated; ELF children are real
+    restart(&mut bot).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while control.component("bot").await.unwrap().installed.is_none() {
+        assert!(Instant::now() < deadline);
+        assert!(!bot.tick().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A newer baked controller can already satisfy an earlier queued launcher
+    // request. Settle that request without claiming the requested bytes ran.
+    let state = control.component("bot").await.unwrap();
+    assert!(!bot.launcher(&state).await.unwrap());
+    assert!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
+    );
+    // A different build with a newer optional launcher must not cause a handoff.
+    let mut optional = release.clone();
+    optional.launcher.as_mut().unwrap().revision += 1;
+    assert!(!bot.required_launcher(&optional, None).await.unwrap());
+    let advice =
+        jmodguard_updater::launcher_status(&control.component("bot").await.unwrap(), now());
+    assert_eq!(advice["state"], "satisfied");
+    // Direct start/rollback cannot bypass a dependency even with valid app bytes.
+    bot.launcher_revision = 0;
+    let path = bot.running.as_ref().unwrap().path.clone();
+    assert!(
+        bot.start(&path, &release.source_sha, Some(release.clone()))
+            .await
+            .is_err()
+    );
+    restart(&mut bot).await;
+    bot.enabled = false;
+    assert!(bot.tick().await.is_err());
+    assert!(bot.running.is_none());
+    bot.enabled = true;
+    assert!(bot.tick().await.unwrap());
+    assert!(bot.running.is_none());
+    restart(&mut bot).await;
     server.abort();
     let _ = server.await;
-    drop((api, bot, control, db));
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
+    let root = std::env::temp_dir().join(format!("baked-contract-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "old-bot").await;
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let base_sha = "b".repeat(40);
+    assert!(
+        control
+            .baked_compatibility("bot", &base_sha, false)
+            .await
+            .is_err()
+    );
+    control
+        .baked_compatibility("bot", &base_sha, true)
+        .await
+        .unwrap();
+    // Represent the persistent record written by an older baked controller.
+    // The executing test launcher is compiled for core16; baked app/DB are15.
+    let old = db::BakedCompatibility {
+        source_sha: base_sha.clone(),
+        core: 15,
+        guild: db::guild_data::SCHEMA_VERSION,
+    };
+    let raw = serde_json::to_string(&old).unwrap();
+    db.with_conn(move |conn| {
+        conn.pragma_update(None, "user_version", 15)?;
+        let tx = conn.transaction_immediate()?;
+        tx.execute_bounded(
+            "UPDATE meta SET value=?1 WHERE key='component_baked_compatibility_bot_v1'",
+            crate::db::params![raw],
+            64 * 1024,
+        )?;
+        tx.commit()
+    })
+    .await
+    .unwrap();
+    let contract = control
+        .baked_compatibility("bot", &base_sha, false)
+        .await
+        .unwrap();
+    assert_eq!(contract.core, 15);
+    assert!(
+        control
+            .baked_compatibility("bot", &"d".repeat(40), false)
+            .await
+            .is_err()
+    );
+    let mut bot = controller(
+        "bot",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    bot.baked_compatibility = contract;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bot.reported {
+        assert!(Instant::now() < deadline);
+        bot.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    assert_eq!(seen.max_schema, 15);
+    control.running("api", None, seen, now()).await.unwrap();
+    let mut objects = HashMap::new();
+    let mut target = image(&mut objects, "bot", b"\x7fELFfixture");
+    target.min_schema = 16;
+    target.max_schema = 16;
+    target.result_schema = 16;
+    target.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let mut api = target.clone();
+    api.component = "api".into();
+    api.image = "ghcr.io/jatmn/jmodguard-api".into();
+    for release in [&target, &api] {
+        control
+            .checked(
+                &release.component,
+                "latest",
+                Some(release.clone()),
+                None,
+                now(),
+            )
+            .await
+            .unwrap();
+    }
+    let op = control
+        .request_upgrade(&target.digest, &api.digest, false, now())
+        .await
+        .unwrap();
+    restart(&mut bot).await; // application stopped for the launcher handoff
+    control.abort_upgrade(&op.id).await.unwrap();
+    assert!(!bot.tick().await.unwrap());
+    assert!(
+        bot.running.is_some(),
+        "cancel must resume baked15, not apply launcher's compiled16 gate"
+    );
+    assert_eq!(control.schema_version().await.unwrap(), 15);
+    restart(&mut bot).await;
+    let refreshed = control
+        .baked_compatibility("bot", &"d".repeat(40), true)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.core, db::CORE_SCHEMA_VERSION);
+    // Protocol2 installed JSON has no launcher field. Preserve canonical bytes
+    // so the existing desired/installed CAS can restore and report it again.
+    let mut legacy = target.clone();
+    legacy.launcher = None;
+    legacy.upgrade.as_mut().unwrap().control_protocol = 2;
+    let legacy_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!legacy_json.contains("\"launcher\":"));
+    let parsed: ComponentRelease = serde_json::from_str(&legacy_json).unwrap();
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), legacy_json);
+    parsed.supports_launcher(db::LAUNCHER_REVISION).unwrap();
+    control
+        .checked("bot", "latest", Some(legacy.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &legacy.digest, now())
+        .await
+        .unwrap();
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control
+        .running("bot", Some(parsed), seen, now())
+        .await
+        .unwrap();
+    drop((bot, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

@@ -393,11 +393,16 @@ mod presentation_tests {
             min_api: 1,
             max_api: 1,
             launcher_protocol: 1,
+            launcher: Some(crate::db::LauncherCompatibility {
+                revision: crate::db::LAUNCHER_REVISION,
+                min_revision: crate::db::REQUIRED_LAUNCHER_REVISION,
+            }),
             base_abi: "debian-bookworm-amd64".into(),
         };
         let observed = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: "a".repeat(40),
             executable_sha256: "c".repeat(64),
             admin_sha256: None,
