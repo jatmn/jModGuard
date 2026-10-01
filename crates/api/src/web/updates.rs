@@ -63,7 +63,7 @@ pub async fn status(State(app): State<Arc<ApiState>>, session: Session) -> Reply
     }
     Ok(Json(json!({
         "components":updates,
-        "coordinated_upgrade_path":"/updates/recovery",
+        "coordinated_upgrade_path":"/api/service-upgrade/recovery",
         "service_upgrade":db::UpdateControl::from_application(&app.db).upgrade().await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update control unavailable"))?,
         "compatibility":compatibility,
         "unattended_enabled":enabled("JMODGUARD_UNATTENDED_UPDATES"),

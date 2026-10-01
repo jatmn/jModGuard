@@ -337,14 +337,14 @@ function render() {
     line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
     if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
     const compatibility = snapshot.compatibility?.[record.component];
-    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/updates/recovery") {
+    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
       const target = record.candidate;
       const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
         target.upgrade?.guild_schema !== observed.guild_schema);
       if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
       if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
       const pair = node("a", "Update bot and API together / recovery");
-      pair.href = `${apiBase()}/updates/recovery`;
+      pair.href = `${apiBase()}/api/service-upgrade/recovery`;
       content.append(pair);
     }
 

@@ -3,7 +3,7 @@
 //! exit behavior are real, while the test explicitly simulates a future migration.
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
-use db::{Db, DbOpenOptions};
+use db::{Db, DbOpenOptions, SqlExecutor};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -153,6 +153,7 @@ fn controller(
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
+        rollback: None,
         reported: false,
         last_observed: None,
     }
@@ -165,6 +166,7 @@ async fn restart(service: &mut Supervisor) {
     service.prepared = None;
     service.instance = format!("{:032x}", rand::random::<u128>());
     service.standby = None;
+    service.rollback = None;
 }
 
 #[tokio::test]
@@ -176,6 +178,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     let old_api = executable(&root, "old-api").await;
     let new_bot = executable(&root, "new-bot").await;
     let new_api = executable(&root, "new-api").await;
+    let independent_api = executable(&root, "independent-api").await;
     let mut objects = HashMap::new();
     let bot_release = image(
         &mut objects,
@@ -186,6 +189,11 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         &mut objects,
         "api",
         &tokio::fs::read(new_api).await.unwrap(),
+    );
+    let independent_release = image(
+        &mut objects,
+        "api",
+        &tokio::fs::read(independent_api).await.unwrap(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -252,6 +260,11 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             .await
             .unwrap();
     }
+    db.with_conn(|conn| {
+        // Pre-protocol releases were serialized without this key, not null.
+        conn.execute_bounded("UPDATE component_updates SET installed=json_remove(installed,'$.upgrade'), desired=json_remove(desired,'$.upgrade') WHERE component IN ('bot','api')", (), 65536)?;
+        Ok(())
+    }).await.unwrap();
     let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
     let mut api = controller("api", old_api, registry, control.clone(), &root);
     let delayed_baked = root.join("hold-old-bot-ready");
@@ -378,6 +391,64 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         api.tick().await.unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
+    // Failure of a later independent same-schema release must not reopen P.
+    control
+        .checked(
+            "api",
+            "latest",
+            Some(independent_release.clone()),
+            None,
+            now(),
+        )
+        .await
+        .unwrap();
+    db::request_component_install(&db, "api", &independent_release.digest, now())
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("fail-independent-api"), "fail")
+        .await
+        .unwrap();
+    api.tick().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while api
+        .running
+        .as_mut()
+        .unwrap()
+        .child
+        .try_wait()
+        .unwrap()
+        .is_none()
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    api.tick().await.unwrap();
+    assert_eq!(
+        control.upgrade().await.unwrap().unwrap().phase,
+        Phase::Complete
+    );
+    while !api.reported {
+        assert!(Instant::now() < deadline);
+        api.tick().await.unwrap();
+        bot.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let restored = control.component("api").await.unwrap();
+    assert!(restored.desired.is_none());
+    assert_eq!(restored.installed.unwrap().digest, api_release.digest);
+    assert_eq!(
+        control.upgrade().await.unwrap().unwrap().phase,
+        Phase::Complete
+    );
+    assert!(
+        bot.running
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(restarted.len(), 5);
     assert!(Db::open_with(opts.clone()).is_err());
     let events = tokio::fs::read_to_string(root.join("events"))
@@ -457,5 +528,301 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     server.abort();
     let _ = server.await;
     drop((bot, api, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_spawn_failure_settles_once() {
+    independent_failure(false, false).await;
+}
+
+#[tokio::test]
+async fn independent_rollback_waits_for_baked_and_managed_prior_readiness() {
+    independent_failure(true, false).await;
+    independent_failure(true, true).await;
+}
+
+async fn independent_failure(exits_before_ready: bool, managed_prior: bool) {
+    let root = std::env::temp_dir().join(format!(
+        "independent-processes-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let old_bot = executable(&root, "old-bot").await;
+    let old_api = executable(&root, "old-api").await;
+    let bad_api = executable(&root, "bad-api").await;
+    let mut objects = HashMap::new();
+    let mut prior = image(
+        &mut objects,
+        "api",
+        &tokio::fs::read(&old_api).await.unwrap(),
+    );
+    let binary = if exits_before_ready {
+        tokio::fs::read(bad_api).await.unwrap()
+    } else {
+        b"\x7fELFnot-an-executable".to_vec()
+    };
+    let mut candidate = image(&mut objects, "api", &binary);
+    let mut pair_bot = image(
+        &mut objects,
+        "bot",
+        &tokio::fs::read(&old_bot).await.unwrap(),
+    );
+    for release in [&mut prior, &mut candidate, &mut pair_bot] {
+        release.min_schema = db::CORE_SCHEMA_VERSION;
+        release.max_schema = db::CORE_SCHEMA_VERSION;
+        release.result_schema = db::CORE_SCHEMA_VERSION;
+        release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap()
+    });
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
+    let mut api = controller("api", old_api, registry, control.clone(), &root);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !bot.reported || !api.reported {
+        assert!(Instant::now() < deadline);
+        bot.tick().await.unwrap();
+        api.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if managed_prior {
+        control
+            .checked("api", "latest", Some(prior.clone()), None, now())
+            .await
+            .unwrap();
+        db::request_component_install(&db, "api", &prior.digest, now())
+            .await
+            .unwrap();
+        while control.component("api").await.unwrap().installed.is_none() {
+            assert!(Instant::now() < deadline);
+            api.tick().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    api.running.as_mut().unwrap().started_at = now() - 100;
+    control
+        .running(
+            "api",
+            None,
+            deployment_observation(
+                api.running.as_ref().unwrap(),
+                &api.base_sha,
+                &api.base_abi,
+                api.enabled,
+            ),
+            now(),
+        )
+        .await
+        .unwrap();
+    let mut before = control.component("api").await.unwrap().observed.unwrap();
+    control
+        .checked("api", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "api", &candidate.digest, now())
+        .await
+        .unwrap();
+    if exits_before_ready {
+        if managed_prior {
+            // Also exercise runtime failure after Q's activation: installed=Q
+            // must stay truthful until the prior process is verified again.
+            api.tick().await.unwrap();
+            while !api.reported {
+                assert!(Instant::now() < deadline);
+                api.tick().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            api.running.as_mut().unwrap().started_at = now() - 50;
+            control
+                .running(
+                    "api",
+                    None,
+                    deployment_observation(
+                        api.running.as_ref().unwrap(),
+                        &api.base_sha,
+                        &api.base_abi,
+                        api.enabled,
+                    ),
+                    now(),
+                )
+                .await
+                .unwrap();
+            before = control.component("api").await.unwrap().observed.unwrap();
+            api.running.as_mut().unwrap().child.kill().await.unwrap();
+        } else {
+            tokio::fs::write(root.join("fail-bad-api"), "fail")
+                .await
+                .unwrap();
+            api.tick().await.unwrap();
+            while api
+                .running
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+            {
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        tokio::fs::write(root.join("hold-old-api-ready"), "hold")
+            .await
+            .unwrap();
+        api.tick().await.unwrap();
+        assert!(
+            tokio::fs::metadata(&api.running.as_ref().unwrap().ready_file)
+                .await
+                .is_err()
+        );
+        let pending = control.component("api").await.unwrap();
+        assert_eq!(
+            pending.observed.unwrap().started_at,
+            before.started_at,
+            "prior observation must remain unchanged until restoration is ready"
+        );
+        assert!(
+            pending.desired.is_some(),
+            "failed selection must settle only after prior readiness"
+        );
+        // A live predecessor is not a new replacement, even with managed metadata.
+        api.running.as_mut().unwrap().started_at = now() - READY_TIMEOUT.as_secs() as i64 - 1;
+        api.tick().await.unwrap();
+        assert!(
+            api.running
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        if managed_prior {
+            assert_eq!(pending.installed.unwrap().digest, candidate.digest);
+            // Losing the unready fallback must retain P, not restore failed Q.
+            api.running.as_mut().unwrap().child.kill().await.unwrap();
+            assert!(api.tick().await.is_err());
+            api.tick().await.unwrap();
+            assert_eq!(
+                api.running
+                    .as_ref()
+                    .unwrap()
+                    .release
+                    .as_ref()
+                    .unwrap()
+                    .digest,
+                prior.digest
+            );
+            assert!(control.component("api").await.unwrap().desired.is_some());
+        }
+        let reversible_pair = if managed_prior {
+            control
+                .checked("bot", "latest", Some(pair_bot), None, now())
+                .await
+                .unwrap();
+            control
+                .checked("api", "latest", Some(candidate.clone()), None, now())
+                .await
+                .unwrap();
+            let op = control
+                .request_upgrade(
+                    &control
+                        .component("bot")
+                        .await
+                        .unwrap()
+                        .candidate
+                        .unwrap()
+                        .digest,
+                    &candidate.digest,
+                    false,
+                    now(),
+                )
+                .await
+                .unwrap();
+            api.tick().await.unwrap();
+            assert_eq!(
+                control.upgrade().await.unwrap().unwrap().phase,
+                Phase::Preparing
+            );
+            Some(op.id)
+        } else {
+            None
+        };
+        tokio::fs::remove_file(root.join("hold-old-api-ready"))
+            .await
+            .unwrap();
+        if let Some(id) = reversible_pair {
+            while tokio::fs::metadata(&api.running.as_ref().unwrap().ready_file)
+                .await
+                .is_err()
+            {
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                api.tick().await.is_ok(),
+                "paired preparation must not mis-acknowledge the uncommitted prior installation"
+            );
+            let op = control.upgrade().await.unwrap().unwrap();
+            assert!(op.error.is_none());
+            assert!(!op.irreversible);
+            // Cancel must resume P's pending receipt, rather than cold-restore Q.
+            control.abort_upgrade(&id).await.unwrap();
+        }
+    } else {
+        // Spawn errors are intentionally tolerated here so the original head
+        // reaches the durable-settlement oracle, not a setup assertion.
+        let _ = api.tick().await;
+    }
+    while !api.reported || control.component("api").await.unwrap().desired.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "failed request kept retrying instead of settling"
+        );
+        let _ = api.tick().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let installed = control.component("api").await.unwrap();
+    assert_eq!(installed.state, "failed");
+    assert_eq!(
+        installed.installed.as_ref().map(|r| &r.digest),
+        managed_prior.then_some(&prior.digest)
+    );
+    let starts = tokio::fs::read_to_string(root.join("events"))
+        .await
+        .unwrap()
+        .matches("old-api.start")
+        .count();
+    for _ in 0..3 {
+        api.tick().await.unwrap();
+    }
+    assert_eq!(
+        tokio::fs::read_to_string(root.join("events"))
+            .await
+            .unwrap()
+            .matches("old-api.start")
+            .count(),
+        starts
+    );
+    api.stop_application().await.unwrap();
+    api.end_idle().await.unwrap();
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    drop((api, bot, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }

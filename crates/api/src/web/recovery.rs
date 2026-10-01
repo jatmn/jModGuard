@@ -55,7 +55,7 @@ async fn mutation(
 pub fn routes<S: Clone + Send + Sync + 'static>(state: Arc<RecoveryState>) -> Router<S> {
     Router::new()
         .route(
-            "/updates/recovery",
+            "/api/service-upgrade/recovery",
             get(|| async { Html(include_str!("recovery.html")) }),
         )
         .route("/api/service-upgrade", get(status).post(apply))
@@ -246,7 +246,7 @@ fn maintenance_router(state: Arc<RecoveryState>, store: MemoryStore) -> Router {
         .merge(routes(state))
         .route(
             "/",
-            get(|| async { axum::response::Redirect::to("/updates/recovery") }),
+            get(|| async { axum::response::Redirect::to("/api/service-upgrade/recovery") }),
         )
         .route("/health", get(health))
         .route("/health/", get(health))
@@ -415,6 +415,26 @@ mod tests {
             );
         }
         assert!(control.upgrade().await.unwrap().is_some());
+        // The HTML and OAuth return both use the existing public /api* proxy.
+        let page = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/service-upgrade/recovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(
+            page.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
         // Maintenance serves no application/guild routes, but shares OAuth's
         // CSRF cookies and redirect allowlist rather than an alternate secret.
         assert_eq!(
@@ -434,7 +454,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/login?return_to=%2Fupdates%2Frecovery")
+                    .uri("/login?return_to=%2Fapi%2Fservice-upgrade%2Frecovery")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -447,6 +467,16 @@ mod tests {
                 .get_all("set-cookie")
                 .iter()
                 .any(|value| value.to_str().unwrap().contains(COOKIE_OAUTH_STATE))
+        );
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .unwrap()
+                    .contains("jmodguard_oauth_return_to=/api/service-upgrade/recovery"))
         );
         drop((control, db));
         for suffix in ["", "-wal", "-shm"] {
