@@ -77,11 +77,6 @@ oauth_client_secret = ""
 # hostname than the API (not the Bunny design). Bunny same-origin CDN proxy
 # leaves this empty. Env: JMODGUARD_CORS_ORIGINS. `*` is not allowed.
 # cors_origins = ["https://admin.example.com"]
-# Public conductor origin for the owner Administration link in the guild WebUI.
-# Empty hides the link. Env: JMODGUARD_CONDUCTOR_URL. This is not a conductor
-# session cookie or OAuth secret. Conductor backup/restore is configured with
-# JMODGUARD_CONDUCTOR_* keys, not this file; see docs/CONDUCTOR.md.
-# conductor_url = "http://127.0.0.1:8081"
 
 # Bot-only positive membership repair; the API ignores this section and its env vars.
 # This checks the bot's own membership, never a member roster. See docs/ENROLLMENTS.md.

@@ -16,7 +16,7 @@ an explicit positive buffer size. `initialize` creates a private root or accepts
 private directory; it refuses a nonempty unmarked resource. `open` requires the exact
 persisted identity and existing stable lock file. Neither method adopts arbitrary files.
 The root's parent must already exist and be trusted. Keep this evidence resource separate
-from the backups-only resource. Identity binding is not a backup resource classifier:
+from any operator-managed backups. Identity binding does not classify backup resources:
 the operator must choose the correct dedicated directory.
 
 Directories have no group/other permissions; files are private regular files with one
@@ -90,7 +90,6 @@ process exclusion, identity/path guards, removal retries, preservation of unrela
 and closed-membership purge. Disposable libSQL also exercises real local files alongside
 lost reservation and deletion-acknowledgment responses.
 
-Live Bunny validation, durable worker scheduling, and portable backup-copy cleanup
-remain separate work. Authorized serving, runtime routing and Cases UI for this backend
+Live Bunny validation and durable worker scheduling remain separate work. Authorized serving, runtime routing and Cases UI for this backend
 are implemented; see [tenant runtime](TENANT-RUNTIME.md). Local filesystem tests establish neither
 provider behavior nor billed CPU/memory use.

@@ -3,8 +3,7 @@
 The data layer stores nonsecret directory metadata for shared and dedicated guild
 stores. Bot and API processes now route live tenant data through `TenantRuntime`; see
 [tenant runtime](TENANT-RUNTIME.md). Catalog rows still never store URLs or tokens.
-Populated-guild shared/dedicated moves are operator-started from the conductor; see
-[guild moves](GUILD-MOVES.md).
+There is no supported operator workflow for moving populated guilds between stores.
 
 ## Stored identities
 
@@ -24,7 +23,7 @@ Membership/enrollment IDs remain a separate lifecycle concept.
 
 ## Library operations
 
-`jmodguard::db::guild_stores` exposes typed IDs, registrations, placements and move helpers:
+`jmodguard::db::guild_stores` exposes typed IDs, registrations and placements:
 
 | Operation | Contract |
 |---|---|
@@ -32,8 +31,6 @@ Membership/enrollment IDs remain a separate lifecycle concept.
 | `store_registration` | Primary lookup of a single ID; missing IDs return `None`. |
 | `assign_initial_placement` | Assign an unplaced guild to a registered, permitted store. Same guild/store retry returns the original revision. Any different placement conflicts. |
 | `guild_placement` | Primary lookup of one guild and validation of its referenced store/ownership. Missing placement returns `None`; invalid references fail. |
-| `set_guild_write_fence` / `clear_guild_write_fence` | Guild-scoped freeze for a populated move. Matching destination retries keep the generation. |
-| `rebind_placement` | Cut over an existing placement after a fence with the matching destination revision. |
 
 Generate a `StoreId` once and retain it across registration retries. Store/placement fields
 are private with read accessors; no deserializer can bypass ID construction checks. Invalid
@@ -109,14 +106,11 @@ third-party dependency, service task, live connection or routing cache is enable
 
 ## Activation and recovery limits
 
-Placement revisions are metadata, not writer leases. Looking up a placement cannot safely
-move a guild or stop an older process from writing. Runtime adoption must include
-the captured checks used by tenant log-channel operations across the remaining data model,
-bounded handle/transport reuse, shared/dedicated routing, global-policy separation and
-coordinated quiescing before moves. `verify_placement` alone is insufficient.
-There is deliberately no store-delete library operation. Conductor-owned
-populated moves update placement through a fenced rebind; see [guild moves](GUILD-MOVES.md).
-Raw SQL is not a supported move mechanism for operators.
+Placement revisions are metadata, not writer leases. A placement lookup cannot stop an
+older process from writing. Live operations require captured tenant checks in the same
+transaction; `verify_placement` alone is insufficient. There is no store-delete or
+placement-rebinding library operation. Persisted `guild_write_fences` still block writes
+and erasure so an interrupted operation cannot silently become writable after an upgrade.
 
 The catalog tables remain in the existing application database; identity and tenant
 tables belong to separate guild-store databases. The directory/global-policy database split remains future work. No core guild data,

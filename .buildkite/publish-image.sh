@@ -232,11 +232,6 @@ build_args() {
     )
   fi
   args+=(--build-arg "SOURCE_SHA=${sha}" --tag "${image}:${sha}")
-  # Independent owner controls discover latest. Publish that moving pointer
-  # only after the pulled final image passes verification below.
-  if [[ "$component" == "conductor" && "$channel" != "nightly" ]]; then
-    args+=(--tag "${image}:latest")
-  fi
   if [[ -n "$label" && "$label" != "latest" && "$label" != "$sha" ]]; then
     args+=(--tag "${image}:${label}")
   fi
@@ -405,15 +400,6 @@ verify_published_image() {
   rm -rf "$scratch"
 }
 
-release_publish_bin() {
-  if [[ -n "${JMODGUARD_RELEASE_PUBLISH_BIN:-}" ]]; then
-    printf '%s\n' "$JMODGUARD_RELEASE_PUBLISH_BIN"
-    return 0
-  fi
-  cargo build --locked -p jmodguard-conductor --bin jmodguard-release-publish >&2
-  printf '%s\n' "${CARGO_TARGET_DIR:-target}/debug/jmodguard-release-publish"
-}
-
 redact_tokens() {
   local token="$1"
   local source_token="$2"
@@ -431,96 +417,8 @@ scratch_dir() {
   mktemp -d "${TMPDIR:-.tmp}/${prefix}-XXXXXX"
 }
 
-publish_manifest() {
-  local selection mode ref head sha label channel release_id key_id secret
-  local scratch context out bin components name digest size image path
-  selection="$(checked_request)"
-  if [[ "$selection" == "skip" ]]; then
-    echo 'Test-only build; no release manifest'
-    return 0
-  fi
-  mode="${selection%%$'\t'*}"
-  local rest="${selection#*$'\t'}"
-  ref="${rest%%$'\t'*}"
-  head="${rest#*$'\t'}"
-  if [[ "$mode" == "main" ]]; then
-    echo 'Main SHA publication is not an installable Stable/Nightly release'
-    return 0
-  fi
-  IFS=$'\t' read -r sha label <<<"$(read_plan "$mode" "$ref" "$head")"
-  channel="$(channel_for "$mode" "$label" || true)"
-  release_id=""
-  if [[ "$channel" == "nightly" ]]; then
-    release_id="$label"
-  elif [[ "$channel" == "stable" ]] && stable_tag "$label"; then
-    release_id="$label"
-  fi
-  if [[ -z "$release_id" ]]; then
-    echo 'Publication source has no installable Stable/Nightly release id; images only (no signed manifest for discovery)'
-    return 0
-  fi
-  key_id="${JMODGUARD_RELEASE_KEY_ID:-}"
-  secret="${JMODGUARD_RELEASE_SIGNING_KEY:-}"
-  if [[ -z "$secret" ]]; then
-    secret="$(run_bk secret get JMODGUARD_RELEASE_SIGNING_KEY)"
-  fi
-  if [[ -z "$key_id" || -z "$secret" ]]; then
-    publish_fail 'complete manifests require JMODGUARD_RELEASE_KEY_ID and signing key'
-  fi
-  scratch="$(scratch_dir manifest)"
-  context="${scratch}/source"
-  components="${scratch}/components.json"
-  cleanup_manifest() {
-    run_git worktree remove --force "$context" >/dev/null 2>&1 || true
-    rm -rf "$scratch"
-  }
-  trap cleanup_manifest EXIT
-  run_git worktree add --detach "$context" "$sha" >/dev/null
-  bin="$(release_publish_bin)"
-  "$bin" frontend-inventory "$context/frontend" >"${scratch}/frontend.json"
-  COMPONENTS="$components" FRONTEND_JSON="${scratch}/frontend.json" node --input-type=commonjs - <<'JS'
-const fs = require("fs");
-const components = { frontend: JSON.parse(fs.readFileSync(process.env.FRONTEND_JSON, "utf8")) };
-fs.writeFileSync(process.env.COMPONENTS, JSON.stringify(components));
-JS
-  for name in bot api conductor; do
-    image="ghcr.io/jatmn/jmodguard-${name}:${sha}"
-    IFS=$'\t' read -r digest size <<<"$(inspect_digest "$image")"
-    NAME="$name" DIGEST="$digest" SIZE="$size" IMAGE="ghcr.io/jatmn/jmodguard-${name}" \
-      COMPONENTS="$components" node --input-type=commonjs - <<'JS'
-const fs = require("fs");
-const path = process.env.COMPONENTS;
-const data = JSON.parse(fs.readFileSync(path, "utf8"));
-data[process.env.NAME] = {
-  digest: process.env.DIGEST,
-  platform: "linux/amd64",
-  size: Number(process.env.SIZE),
-  image: process.env.IMAGE,
-};
-fs.writeFileSync(path, JSON.stringify(data));
-JS
-  done
-  out="${JMODGUARD_RELEASE_OUT:-dist/releases}"
-  export JMODGUARD_RELEASE_SIGNING_KEY="$secret"
-  path="$("$bin" finalize \
-    --channel "$channel" \
-    --release-id "$release_id" \
-    --source-commit "$sha" \
-    --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --components-file "$components" \
-    --key-id "$key_id" \
-    --out "$out")"
-  echo "Published installable manifest ${path}"
-  trap - EXIT
-  cleanup_manifest
-}
-
 publish_component() {
   local component="$1"
-  if [[ "$component" == "manifest" ]]; then
-    publish_manifest
-    return 0
-  fi
   local selection mode ref head sha label image username token source_token scratch context channel layout published_digest published_size promoted_digest
   local -a build_cmd
   selection="$(checked_request)"
@@ -532,13 +430,6 @@ publish_component() {
   local rest="${selection#*$'\t'}"
   ref="${rest%%$'\t'*}"
   head="${rest#*$'\t'}"
-  # A manual SHA rebuild is the same independent-component publication as
-  # main. Only an explicit tag or scheduled release may publish conductor.
-  if [[ "$component" == "conductor" ]] \
-      && { [[ "$mode" == "main" ]] || [[ "$mode" == "manual" && "$ref" =~ $SHA_RE ]]; }; then
-    echo 'conductor: commit-SHA publication only publishes bot/API/WebUI; skipping'
-    return 0
-  fi
   IFS=$'\t' read -r sha label <<<"$(read_plan "$mode" "$ref" "$head")"
   if [[ "$mode" == "manual" ]]; then
     resolve_source manual "$sha" "$head" >/dev/null
@@ -589,13 +480,8 @@ publish_component() {
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout")
   run_docker "${build_cmd[@]:1}"
   IFS=$'\t' read -r published_digest published_size <<<"$(inspect_digest "${image}:${sha}")"
-  # The legacy conductor image has no launcher or file inventory. Preserve its
-  # existing publication path; only the three independent update packages use
-  # the new final-image verifier.
-  if [[ "$component" != "conductor" ]]; then
-    verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
-  fi
-  if [[ "$component" != "conductor" && "$channel" != "nightly" ]]; then
+  verify_published_image "$component" "${image}:${sha}" "$context" "$layout"
+  if [[ "$channel" != "nightly" ]]; then
     run_docker buildx imagetools create --prefer-index=false --tag "${image}:latest" "${image}@${published_digest}" >/dev/null
     IFS=$'\t' read -r promoted_digest published_size <<<"$(inspect_digest "${image}:latest")"
     [[ "$promoted_digest" == "$published_digest" ]] || publish_fail 'latest pointer differs from verified image digest'
@@ -614,9 +500,9 @@ publish_image_main() {
   local component="${1:-}"
   case "$component" in
     prepare) prepare ;;
-    bot|api|webui|conductor|manifest) publish_component "$component" ;;
+    bot|api|webui) publish_component "$component" ;;
     *)
-      echo "usage: bash .buildkite/publish-image.sh prepare|bot|api|webui|conductor|manifest" >&2
+      echo "usage: bash .buildkite/publish-image.sh prepare|bot|api|webui" >&2
       exit 2
       ;;
   esac

@@ -85,7 +85,6 @@ exits if that wait expires).
 | `warns` / `bans` | warnings and ban history |
 | `guild_store_catalog` / `guild_store_placements` | nonsecret shared/dedicated store identities and initial placements |
 | `guild_erasure_jobs` | queued live guild-store erasure; not a departed-guild membership ledger |
-| `backup_cleanup_intents` | application-owned reminders; the conductor backup worker sanitizes complete local archives and clears these rows after at least one complete archive is rewritten |
 
 Environment variables override `config.toml` values (see table).
 
@@ -144,8 +143,8 @@ is still writing.
 
 Bunny's internal snapshots are not an operator-controlled backup. The current
 `bsql .dump` output also omits schema objects required by jModGuard, so it is
-not a complete recovery path. See [BACKUP-RESTORE.md](BACKUP-RESTORE.md) for
-the exact limitation and the restore drill required before production.
+not a complete recovery path. Operators must verify their own complete backup and
+restore procedure before production; the application provides no archive processor.
 
 ### Discord log delivery
 

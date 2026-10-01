@@ -38,7 +38,7 @@ done
 [ -n "$mode" ] || { usage >&2; exit 2; }
 
 groups=(
-  contracts frontend fmt dylint api bot conductor runtime updater core
+  contracts frontend fmt dylint api bot runtime updater core
   integration boundaries publish-tests bootstrap pullfrog supply-chain
   remote-database
 )
@@ -67,13 +67,13 @@ all_groups() {
 all_rust() {
   dylint_full=1
   local group
-  for group in fmt dylint api bot conductor runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
+  for group in fmt dylint api bot runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap; do
     add "$group"
   done
 }
 
-# Root data is consumed by bot, API, updater and integration tests. Runtime and
-# conductor deliberately do not import it; conductor embeds migration SQL below.
+# Root data is consumed by bot, API, updater and integration tests. Runtime
+# deliberately does not import it.
 # publish-tests and bootstrap stay out too. Every all_rust group this function
 # does not add must stay listed in select-checks-test.sh core_omits.
 core_consumers() {
@@ -83,11 +83,10 @@ core_consumers() {
   done
 }
 
-# jmodguard-runtime is a direct dependency of jmodguard (core) and jmodguard-conductor;
+# jmodguard-runtime is a direct dependency of jmodguard (core);
 # bot/API consume it through the root crate. Exercise those groups on runtime edits.
 runtime_consumers() {
   add core
-  add conductor
   add integration
 }
 
@@ -132,10 +131,6 @@ classify() {
       add fmt; add dylint; add bot; add boundaries; add integration; add supply-chain
       return
       ;;
-    crates/conductor/Cargo.toml)
-      add fmt; add dylint; add conductor; add boundaries; add supply-chain
-      return
-      ;;
     crates/runtime/Cargo.toml)
       add fmt; add dylint; add runtime; add boundaries; add supply-chain
       runtime_consumers
@@ -159,19 +154,8 @@ classify() {
       add fmt; add bot; add updater; add bootstrap; add publish-tests
       return
       ;;
-    crates/conductor/frontend/*)
-      add frontend
-      add fmt
-      add conductor
-      add boundaries
-      return
-      ;;
     Dockerfile.api)
       add api; add fmt; add updater; add boundaries; add integration; add bootstrap; add publish-tests
-      return
-      ;;
-    Dockerfile.conductor)
-      add conductor; add fmt; add boundaries; add bootstrap; add publish-tests
       return
       ;;
     scripts/bootstrap-container.sh|scripts/bootstrap-container-test.sh)
@@ -211,7 +195,6 @@ classify() {
       ;;
     migrations)
       core_consumers
-      add conductor
       ;;
     frontend)
       # Default API embed-ui compiles these files with include_str!.
@@ -227,7 +210,6 @@ classify() {
       case "$crate" in
         api) add fmt; add dylint; add api; add boundaries; add integration ;;
         bot) add fmt; add dylint; add bot; add boundaries; add integration ;;
-        conductor) add fmt; add dylint; add conductor; add boundaries ;;
         runtime) add fmt; add dylint; add runtime; add boundaries; runtime_consumers ;;
         updater) add fmt; add dylint; add updater; updater_consumers ;;
         integration-tests) add fmt; add dylint; add integration ;;
@@ -305,7 +287,7 @@ fi
 # cargo deny / cargo audit stay on every plan that compiles or publishes Rust.
 ensure_supply_chain() {
   local group
-  for group in fmt dylint api bot conductor runtime updater core integration boundaries remote-database publish-tests bootstrap; do
+  for group in fmt dylint api bot runtime updater core integration boundaries remote-database publish-tests bootstrap; do
     case " ${selected} " in
       *" ${group} "*) add supply-chain; return ;;
     esac
@@ -333,7 +315,7 @@ if [ "$dylint_full" -eq 0 ]; then
   # targets that compiling them only as dependencies would not check.
   case " $selected " in *" bot "*) lint_targets="$lint_targets api" ;; esac
   case " $selected " in *" runtime "*) lint_targets="$lint_targets api bot updater" ;; esac
-  for group in api bot conductor runtime updater core integration; do
+  for group in api bot runtime updater core integration; do
     wanted=0
     case " ${lint_targets} " in *" $group "*) wanted=1 ;; esac
     case "$group" in

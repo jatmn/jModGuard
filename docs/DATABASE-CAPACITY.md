@@ -30,7 +30,7 @@ pooled connections. Reads and bounded reclamation remain available. Diagnose
 and correct the write bound before restarting the process; restarting clears
 this latch. Other processes still apply their own primary admission checks.
 Cached owner-page measurements cannot authorize a write. Copies measure their
-source within the same write transaction; migrations and conductor moves use
+source within the same write transaction; migrations use
 separate conservative maintenance allowances and can refuse a large operation.
 
 If an already initialized bot database reopens above 900 MB with the current
@@ -118,5 +118,4 @@ prove Bunny-specific quota accounting or production throughput. Live provider
 and controlled Discord checks remain deployment validation, requiring an
 authorized isolated environment.
 
-See [message logging](LOGGING-DATA.md), [backup and restore](BACKUP-RESTORE.md)
-and [guild moves](GUILD-MOVES.md) for the retained payload lifecycle.
+See [message logging](LOGGING-DATA.md) for the retained payload lifecycle.

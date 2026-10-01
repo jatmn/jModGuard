@@ -1,4 +1,4 @@
-//! Directory-side tenant lifecycle: erasure jobs, backup-copy intents, core wipe.
+//! Directory-side tenant lifecycle: erasure jobs and core wipe.
 use super::guild_stores::{GuildPlacement, StoreId};
 use super::*;
 
@@ -110,48 +110,6 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
         tx.execute_reclaim(
             "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
             params![guild],
-        )?;
-        tx.commit()
-    })
-    .await
-}
-
-pub async fn record_backup_cleanup_intent(
-    db: &Db,
-    kind: &str,
-    guild: i64,
-    enrollment_id: Option<&str>,
-    case_id: Option<&str>,
-    evidence_id: Option<&str>,
-    object_key: Option<&str>,
-) -> Result<()> {
-    let intent = format!("{:032x}", rand::random::<u128>());
-    let kind = kind.to_owned();
-    let enrollment_id = enrollment_id.map(str::to_owned);
-    let case_id = case_id.map(str::to_owned);
-    let evidence_id = evidence_id.map(str::to_owned);
-    let object_key = object_key.map(str::to_owned);
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM backup_cleanup_intents WHERE kind=?1 AND guild_id=?2
-             AND enrollment_id IS ?3 AND case_id IS ?4 AND evidence_id IS ?5 AND object_key IS ?6)",
-            params![kind.as_str(),guild,enrollment_id.as_deref(),case_id.as_deref(),evidence_id.as_deref(),object_key.as_deref()],
-            |r| Ok(r.get(0)?),
-        )?;
-        if exists { return tx.finish_read(); }
-        tx.ensure_mutation_receipt()?;
-        tx.execute_rows(
-            "INSERT INTO backup_cleanup_intents(intent_id,kind,guild_id,enrollment_id,case_id,evidence_id,object_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,unixepoch())",
-            params![
-                intent,
-                kind,
-                guild,
-                enrollment_id,
-                case_id,
-                evidence_id,
-                object_key
-            ], 1,
         )?;
         tx.commit()
     })

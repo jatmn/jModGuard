@@ -8,8 +8,7 @@ file (`jmodguard.db.guild.db`) and, on Unix, a private local evidence directory
 `JMODGUARD_GUILD_STORE_TOKEN` environment pair. Catalog rows store only opaque IDs and shared/dedicated
 policy; URLs and tokens stay in process configuration.
 
-This is not a guild move. Populated-guild shared/dedicated moves are conductor-owned;
-see [guild moves](GUILD-MOVES.md). The conductor still has no tenant routing.
+This routing does not move a populated guild between stores.
 
 ## Routing and handles
 
@@ -63,12 +62,11 @@ The dashboard Cases tab pages through the current membership's records in opaque
 order, displays all admitted history (up to 64 entries) and selected inline text, and
 provides authorized private evidence downloads. Case removal clears retained private facts in the guild-store
 journal immediately. It does not reverse a Discord action. The delete HTTP response reports
-`removed` for that journal step; `cleanup_pending` is true when object-backend cleanup or
-backup-reminder persistence could not finish in the same request. The administrator-only
+`removed` for that journal step; `cleanup_pending` is true when object-backend cleanup
+could not finish in the same request. The administrator-only
 Removed records view pages through retained removal identities (`cases?removed=true`)
 and allows explicit cleanup retry, including after a reload. It never restores private
-payloads. Repeating DELETE recovers the backup reminder from a verified removal tombstone;
-reminder insertion is idempotent. There is no automatic active-guild retry worker. Server owners and
+payloads. Repeating DELETE retries owned-evidence cleanup. There is no automatic active-guild retry worker. Server owners and
 Administrators may delete. Delegated case-removal role IDs can be stored, but current
 Discord OAuth (`identify guilds`) does not supply member roles, so those IDs are not applied
 yet.
@@ -86,14 +84,9 @@ Guild Delete with usable membership context retires the core observation and adm
 queue write leaves retirement uncommitted so the confirmed departure can be retried. A bounded bot worker closes store membership, cancels in-flight
 evidence, removes owned objects, purges cases, deletes owned message snapshots
 in transactions of at most 100 rows, and deletes remaining store identity only
-after those snapshots are gone,
-records a `backup_cleanup_intents` row, wipes directory-owned configuration and core
+after those snapshots are gone, wipes directory-owned configuration and core
 moderation rows, and clears placement. Enrollment timestamp fencing stays so an older
-join cannot be resurrected. There is no permanent departed-guild ledger. The conductor
-backup worker sanitizes complete local archives against surviving intents and
-acknowledges those rows after at least one complete archive is rewritten; it
-does not import tenant routing. Live Bunny backup-copy
-deletion remains later work. The durable job can resume its
+join cannot be resurrected. There is no permanent departed-guild ledger. The durable job can resume its
 core cleanup suffix after the store binding has already been erased: the exact store
 identity and absence of the guild binding are checked without weakening normal data-scope
 validation. If activation stopped after placement binding but before membership insertion,
@@ -113,14 +106,9 @@ configuration now owned by the active membership.
 
 ## Fresh installation
 
-Unfinished live provider checks stay deferred; public installation validation is
-available on the conductor. Owner-selected updates and rollback are available on the conductor when an update
-root is configured; see [UPDATES.md](UPDATES.md).
-Signed Stable/Nightly discovery can list complete publications when a feed and
-trust keys are configured; see [RELEASES.md](RELEASES.md). Local encrypted
-backup/restore and guild-store moves are available on the conductor when their process
-paths are configured; see [BACKUP-RESTORE.md](BACKUP-RESTORE.md) and
-[GUILD-MOVES.md](GUILD-MOVES.md).
+Public installation is documented in [INSTALL.md](INSTALL.md). Owner-selected
+image updates use the existing WebUI/API; see [BUNNY-UPDATES.md](BUNNY-UPDATES.md).
+Live provider checks remain deferred.
 Image and text spam enforcement is implemented separately; see
 [IMAGE-SPAM.md](IMAGE-SPAM.md). The bot captures proving Discord attachments for
 selected image-spam enforcement through tenant runtime; the API serves authorized
@@ -137,8 +125,8 @@ Discord calls already dispatched cannot be recalled by these database checks.
 
 A newer positive join also admits cleanup of the displaced enrollment before replacing
 its core identity. Subsequent departure preserves that oldest outstanding store owner.
-A confirmed departure without placement settles directory-only cleanup and its backup
-reminder atomically with retirement, including configuration observation metadata; it
+A confirmed departure without placement settles directory-only cleanup
+atomically with retirement, including configuration observation metadata; it
 does not create a store or infer a provider object's absence.
 
 Gateway suppression retains individual local dispatch tokens. A definitive failure

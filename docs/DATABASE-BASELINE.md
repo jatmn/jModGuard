@@ -94,12 +94,12 @@ bot/API operation continues against the configured database. Deploy matched buil
 first; version10 binaries reject version11. Rollback requires matching pre-upgrade backup
 and binaries. See [catalog scope and limits](GUILD-STORES.md).
 
-Migration 0011 adds `guild_erasure_jobs` and `backup_cleanup_intents`. These are
-application-owned lifecycle rows, not a departed-guild membership ledger. Backup-copy
-workers are not activated.
+Migration 0011 adds live `guild_erasure_jobs` and the historical `backup_cleanup_intents`
+table. The latter has no application producer or consumer; its schema is retained for
+compatibility. These tables are not a departed-guild membership ledger.
 
-Migration 0012 adds `guild_write_fences` for populated shared/dedicated moves. See
-[guild moves](GUILD-MOVES.md).
+Migration 0012 adds `guild_write_fences`. Bot/API operations still enforce these
+fences; retain the table and existing rows when upgrading.
 Migration 0013 adds per-guild, per-event `log_filters` for ignored user/bot IDs
 and source channel IDs. Start the bot before the API so the new table exists.
 Migration 0014 adds optional banned-user and moderator display names to retained

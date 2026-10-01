@@ -32,7 +32,7 @@ by processes on different hosts.
 - `jmodguard-api` owns HTTP/OAuth, sessions and dashboard state. Its production graph
   contains no Serenity or WebSocket stack. Default `embed-ui` embeds root `frontend/`;
   Bunny builds `cargo build --locked -p jmodguard-api --no-default-features` for JSON/OAuth.
-- Runtime and conductor retain their independent graphs. Integration tests explicitly
+- Runtime retains its independent dependency graph. Integration tests explicitly
   join service libraries; the API's dev-only bot dependency retains HTTP-to-worker tests.
 - Bare workspace commands include every package. Select production builds with `-p`;
   the former root `web` feature no longer exists. Binary names, config and wire contracts
@@ -155,7 +155,7 @@ The inactive `GuildDataStore` library opens a separate `jmodguard-guild-1` datab
 verifies its identity/ownership against the catalog. It can bind/check initial guild
 revisions, with the raw pool private and the existing transport/recovery reused. Bot/API
 still creates no such handles. Checks are snapshots, not writer leases or later-operation
-authorization; cloned stores can retain identical stamps. Actual data access and moves
+authorization; cloned stores can retain identical stamps. Actual data access
 must combine checks with tenant operations and coordinated writer exclusion.
 
 [Captured tenant log-channel operations](TENANT-LOG-CHANNELS.md) now demonstrate that
@@ -170,9 +170,6 @@ batch cleanup. Bot and API now record selected outcomes and serve authorized cas
 administration; see [tenant runtime](TENANT-RUNTIME.md). The bot captures proving
 Discord attachments for selected image-spam enforcement through that runtime; the API
 serves authorized journal-available objects and does not perform that Discord re-fetch.
-Live Bunny backup-copy
-cleanup remains later work. Local conductor archives can already
-be sanitized against surviving cleanup intents.
 
 ## Migrations
 
@@ -181,8 +178,9 @@ migrations 0001–0016. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
-Migration 0011 adds live-erasure jobs and backup-copy cleanup intents. Migration 0012
-adds guild-write fences for populated store moves. Migration 0013 stores per-event
+Migration 0011 adds live-erasure jobs and the historical `backup_cleanup_intents` table,
+which no longer receives application writes. Migration 0012 adds persisted guild-write
+fences; existing fences remain enforced for database safety. Migration 0013 stores per-event
 log exclusions. Migration 0014 stores known ban display names. Migration 0015
 stores component-update coordination. Migration 0016 adds the per-bot shared
 [member-sync request gate](MEMBERS.md), preserving minimum request intervals and

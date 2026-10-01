@@ -158,13 +158,20 @@ impl DiscordActions for FenceDuringChannelValidation<'_> {
         Ok(true)
     }
     async fn valid_log_channel(&self, guild: i64, _: i64) -> Result<bool> {
-        db::guild_stores::set_guild_write_fence(
-            self.db,
-            guild,
-            self.destination.clone(),
-            format!("{:032x}", 9u128),
-            "freeze",
-        )
+        {
+            use jmodguard::db::SqlExecutor as _;
+            let destination = self.destination.clone();
+            self.db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    libsql::params![guild, format!("{:032x}", 9u128), destination.as_str()],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
         .await?;
         Ok(true)
     }
@@ -189,13 +196,20 @@ impl DiscordActions for FenceDuringUnban<'_> {
         panic!("unban action must not validate a log channel")
     }
     async fn unban(&self, guild: i64, _: i64, _: &str) -> Outcome {
-        db::guild_stores::set_guild_write_fence(
-            self.db,
-            guild,
-            self.destination.clone(),
-            format!("{:032x}", 10u128),
-            "freeze",
-        )
+        {
+            use jmodguard::db::SqlExecutor as _;
+            let destination = self.destination.clone();
+            self.db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    libsql::params![guild, format!("{:032x}", 9u128), destination.as_str()],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
         .await
         .unwrap();
         Outcome::succeeded("unbanned")
@@ -215,13 +229,19 @@ async fn move_fence_reports_its_own_pre_dispatch_outcome() {
     )
     .await
     .unwrap();
-    db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        destination,
-        format!("{:032x}", 9u128),
-        "freeze",
-    )
+    {
+        use jmodguard::db::SqlExecutor as _;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
 
@@ -1001,13 +1021,21 @@ async fn move_fence_racing_membership_repair_finishes_the_claim_without_dispatch
             Ok(false)
         }
         async fn membership_joined_at_ns(&self, job: &BotAction) -> Result<Option<i64>> {
-            db::guild_stores::set_guild_write_fence(
-                self.db,
-                job.guild_id,
-                self.destination.clone(),
-                format!("{:032x}", 11u128),
-                "freeze",
-            )
+            let guild_id = job.guild_id;
+            {
+                use jmodguard::db::SqlExecutor as _;
+                let destination = self.destination.clone();
+                self.db.with_conn(move |conn| {
+                    conn.execute_bounded(
+                        "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                        libsql::params![guild_id, format!("{:032x}", 9u128), destination.as_str()],
+                        64 * 1024 * 1024,
+                    )?;
+                    Ok(())
+                })
+            }
             .await?;
             Ok(Some(1_000_000_001))
         }

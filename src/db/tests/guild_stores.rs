@@ -445,63 +445,6 @@ async fn guild_move_migration_starts_with_empty_fences() {
 }
 
 #[tokio::test]
-async fn fenced_rebind_moves_placement_and_blocks_unfenced_cutover() {
-    let f = Fixture::new();
-    let shared = StoreId::new();
-    let dedicated = StoreId::new();
-    register_store(&f.db, shared.clone(), StorePolicy::Shared)
-        .await
-        .unwrap();
-    register_store(
-        &f.db,
-        dedicated.clone(),
-        StorePolicy::Dedicated { guild_id: 10 },
-    )
-    .await
-    .unwrap();
-    let first = assign_initial_placement(&f.db, 10, shared.clone())
-        .await
-        .unwrap();
-    let dest_revision = format!("{:032x}", 7u128);
-    assert!(
-        rebind_placement(
-            &f.db,
-            first.clone(),
-            dedicated.clone(),
-            dest_revision.clone()
-        )
-        .await
-        .is_err()
-    );
-    let generation = set_guild_write_fence(
-        &f.db,
-        10,
-        dedicated.clone(),
-        dest_revision.clone(),
-        "freeze",
-    )
-    .await
-    .unwrap();
-    assert!(guild_is_write_fenced(&f.db, 10).await.unwrap());
-    let moved = rebind_placement(
-        &f.db,
-        first.clone(),
-        dedicated.clone(),
-        dest_revision.clone(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(moved.store_id(), &dedicated);
-    assert_eq!(moved.revision(), dest_revision);
-    let current = guild_placement(&f.db, 10).await.unwrap().unwrap();
-    assert_eq!(current.store_id(), &dedicated);
-    clear_guild_write_fence(&f.db, 10, &generation)
-        .await
-        .unwrap();
-    assert!(!guild_is_write_fenced(&f.db, 10).await.unwrap());
-}
-
-#[tokio::test]
 async fn guild_configuration_writers_fail_inside_the_move_fence_transaction() {
     let f = Fixture::new();
     upsert_template(&f.db, 10, "ban", "before").await.unwrap();
@@ -514,9 +457,21 @@ async fn guild_configuration_writers_fail_inside_the_move_fence_transaction() {
     )
     .await
     .unwrap();
-    set_guild_write_fence(&f.db, 10, destination, format!("{:032x}", 8u128), "freeze")
-        .await
-        .unwrap();
+    {
+        use crate::db::SqlExecutor as _;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
+    .await
+    .unwrap();
 
     assert!(upsert_template(&f.db, 10, "ban", "blocked").await.is_err());
     assert!(delete_template(&f.db, 10, "ban").await.is_err());

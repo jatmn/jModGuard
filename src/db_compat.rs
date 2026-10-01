@@ -448,7 +448,6 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_settings"
                     | "guild_erasure_jobs"
                     | "guild_store_placements"
-                    | "guild_write_fences"
                     | "guild_bindings"
                     | "rules"
                     | "commands"
@@ -483,7 +482,6 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_member_unresolved_audits"
                     | "webui_managed_assets"
                     | "component_updates"
-                    | "backup_cleanup_intents"
                     | "mutation_receipts"
             ),
         "reclaim table is not approved"

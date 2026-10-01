@@ -40,7 +40,7 @@ fn digest_hex(digest: ring::digest::Digest) -> String {
     out
 }
 impl BunnyEvidenceStore {
-    /// The installer must verify a dedicated zone without public delivery and provision
+    /// The operator must verify a dedicated zone without public delivery and provision
     /// `jmodguard-evidence-identity` with `jmodguard-bunny-evidence-1\n{storage_id}\n`.
     /// This client verifies that marker but cannot audit Pull Zones using a storage password.
     pub fn new(

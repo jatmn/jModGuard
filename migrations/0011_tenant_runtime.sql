@@ -1,6 +1,6 @@
 -- Application-owned tenant lifecycle. Not a departed-guild membership ledger.
--- Backup-copy workers are not activated; intents exist so a later backup PR
--- can finish controlled-copy cleanup without reconstructing live data.
+-- The backup_cleanup_intents schema is historical and retained for compatibility;
+-- current services neither produce nor consume these rows.
 CREATE TABLE guild_erasure_jobs (
     guild_id INTEGER PRIMARY KEY CHECK(guild_id > 0),
     enrollment_id TEXT NOT NULL

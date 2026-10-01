@@ -34,7 +34,7 @@ upgrading does not trigger another full roster or current-ban scan. See [MEMBERS
 
 Prefer a **git tag** or release (`vX.Y.Z`) over an arbitrary `main` commit.
 Nightly identities (`nightly-YYYYMMDD-<sha12>`) are separate from that stable
-baseline. The conductor can list both; it does not install them. See
+baseline. Owner Administration lists image candidates. See
 [releases](RELEASES.md).
 Read the release notes for:
 
@@ -60,7 +60,7 @@ the `.db` while either process is writing. See [CONFIGURATION.md](CONFIGURATION.
 For Bunny Database, the local file-copy procedure does not apply. An
 operator-controlled recovery method must pass a live drill; `bsql .dump` alone is
 insufficient for the jModGuard schema. Do not perform a production upgrade
-until the acceptance drill in [BACKUP-RESTORE.md](BACKUP-RESTORE.md) passes.
+until a complete restore drill for your databases and evidence passes.
 
 ## 3. Build or pull the new artifacts
 
@@ -151,8 +151,8 @@ inventories. Verify approved digests remain pullable. Rebuilding an old source
 SHA can produce a different digest; approve that replacement explicitly rather
 than silently substituting it. Tags, including SHA tags, can be retagged.
 
-Before incident rollback or manual repair, wait for any active conductor
-`release_update` job or Storage publication you started to finish; overlapping
+Before incident rollback or manual repair, wait for any active owner-selected
+image update or Storage publication you started to finish; overlapping
 changes can leave mixed frontend and API state.
 
 Do not mix a new website with an old API when the page needs new endpoints.
@@ -166,4 +166,3 @@ reverse migrations.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — dual-process and `config_version`
 - [CONFIGURATION.md](CONFIGURATION.md) — config keys
-- [BACKUP-RESTORE.md](BACKUP-RESTORE.md) — provider backup status and restore gate

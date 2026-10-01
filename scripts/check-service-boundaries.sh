@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Guard runtime state ownership and the control service dependency boundary.
+# Guard runtime state ownership and the shared runtime dependency boundary.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -84,19 +84,6 @@ while IFS= read -r -d '' path; do
 done < <(find "$root/src" "$root/crates/bot/src" -name '*.rs' -print0 | sort -z)
 echo 'Captured configuration is confined to DB/API code'
 
-catalog='\<(register_store|assign_initial_placement|clear_erased_placement|GuildStoreOptions)\>'
-runtime='\<(TenantRuntime|GuildDataStore|GuildDataScope|LocalEvidenceStore|BunnyEvidenceStore)\>'
-while IFS= read -r -d '' path; do
-  rel="${path#"$root"/}"
-  if grep -Eq -- "$catalog" "$path"; then
-    fail "Guild-store catalog runtime activation: $rel"
-  fi
-  if grep -Eq -- "$runtime" "$path"; then
-    fail "Guild-store runtime in conductor: $rel"
-  fi
-done < <(find "$root/crates/conductor/src" -name '*.rs' -print0 | sort -z)
-echo 'Guild-store catalog writes stay out of the conductor'
-
 extract_handler() {
   local event="$1"
   awk -v event="$event" '
@@ -164,13 +151,12 @@ check_tree() {
   echo "$package ${flags[*]}: dependency boundary passes ($count package names)"
 }
 
-services=(jmodguard-bot jmodguard-api jmodguard-conductor jmodguard-integration-tests)
+services=(jmodguard-bot jmodguard-api jmodguard-integration-tests)
 bot_stack=(serenity tokio-tungstenite tungstenite)
 api_stack=(axum tower-sessions tower-sessions-core tower-sessions-memory-store)
 
 check_tree jmodguard -- "${services[@]}" "${bot_stack[@]}" "${api_stack[@]}"
-check_tree jmodguard-bot -- jmodguard-api jmodguard-conductor jmodguard-integration-tests "${api_stack[@]}"
-check_tree jmodguard-api -- jmodguard-bot jmodguard-conductor jmodguard-integration-tests "${bot_stack[@]}"
-check_tree jmodguard-api --no-default-features -- jmodguard-bot jmodguard-conductor jmodguard-integration-tests "${bot_stack[@]}"
+check_tree jmodguard-bot -- jmodguard-api jmodguard-integration-tests "${api_stack[@]}"
+check_tree jmodguard-api -- jmodguard-bot jmodguard-integration-tests "${bot_stack[@]}"
+check_tree jmodguard-api --no-default-features -- jmodguard-bot jmodguard-integration-tests "${bot_stack[@]}"
 check_tree jmodguard-runtime -- "${services[@]}" "${bot_stack[@]}" "${api_stack[@]}" jmodguard
-check_tree jmodguard-conductor -- jmodguard-bot jmodguard-api jmodguard-integration-tests "${bot_stack[@]}" jmodguard

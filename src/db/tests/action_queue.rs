@@ -239,13 +239,19 @@ async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() 
     )
     .await
     .unwrap();
-    crate::db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        destination,
-        format!("{:032x}", 11u128),
-        "freeze",
-    )
+    {
+        use crate::db::SqlExecutor as _;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
     assert!(claim_bot_action(&f.db, 1001).await.unwrap().is_none());

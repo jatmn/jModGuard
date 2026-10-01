@@ -2351,7 +2351,7 @@ test('View as hands the preview bearer through a URL fragment', async () => {
   assert.equal(h.opened[0][2], 'noopener');
 });
 
-test('only the owner sees the same-origin Administration link without a conductor URL', () => {
+test('only the owner sees the same-origin Administration link', () => {
   const h = harness();
   h.app.state.me.is_bot_owner = false;
   h.app.bindOwnerTools();

@@ -54,13 +54,6 @@ steps:
     timeout_in_minutes: 45
     command: bash .buildkite/with-cargo-auth.sh bash scripts/ci-preflight.sh --only bot
 
-  # group: conductor
-  - label: "conductor"
-    key: conductor
-    if: __SELECTED__
-    timeout_in_minutes: 45
-    command: bash .buildkite/with-cargo-auth.sh bash scripts/ci-preflight.sh --only conductor
-
   # group: runtime
   - label: "runtime"
     key: runtime
@@ -178,7 +171,6 @@ steps:
         allow_failure: false
       - api
       - bot
-      - conductor
       - runtime
       - updater
       - core
@@ -235,31 +227,12 @@ steps:
     command: bash .buildkite/publish-image.sh webui
 
   # group: publish
-  - label: "publish conductor image"
-    key: publish-conductor
-    depends_on: prepare-images
-    if: *publish_if
-    concurrency: 1
-    concurrency_group: jmodguard/ghcr-conductor
-    timeout_in_minutes: 45
-    command: bash .buildkite/publish-image.sh conductor
-
-  # group: publish
-  - label: "publish release manifest"
-    key: publish-manifest
-    depends_on: [publish-bot, publish-api, publish-conductor]
-    if: *publish_if
-    timeout_in_minutes: 10
-    command: bash .buildkite/publish-image.sh manifest
-
-  # group: publish
   - label: "release please"
     key: release-please
     depends_on:
       - contracts
       - api
       - bot
-      - conductor
       - runtime
       - updater
       - core

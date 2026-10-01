@@ -81,16 +81,15 @@ these ignored tests at an existing installation or share one database between th
 Selected checks must pass before preparation and publication. A docs-only
 diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
-bootstrap, or remote-database jobs. A `frontend/` diff runs the frontend Node checks and the API group, because the default API `embed-ui` build embeds those files. A `crates/conductor/frontend/` diff runs the frontend Node checks plus conductor and boundary checks. `Dockerfile.webui`
+bootstrap, or remote-database jobs. A `frontend/` diff runs the frontend Node checks and the API group, because the default API `embed-ui` build embeds those files. `Dockerfile.webui`
 also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
-build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core,
-conductor, and integration groups so direct and workspace consumers of `jmodguard-runtime`
+build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core
+and integration groups so direct and workspace consumers of `jmodguard-runtime`
 are compiled and tested. A `crates/updater` diff also runs the API, bot, and boundary groups:
-the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` and `crates/conductor/frontend/` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs the Trail of Bits lints listed in `dylint.toml` with `--locked --all-targets`. For a scoped plan, the selector sets `JMODGUARD_DYLINT_PACKAGES` on the Dylint job to the selected Rust check packages and affected test/binary consumers: bot changes include API unit tests; runtime changes include all service/updater targets; remote-database includes root and integration tests. Cargo also checks their dependencies. For example, a conductor-only PR lints conductor rather than every workspace test target. Global Cargo/toolchain/vendor changes, lint-tool changes, unknown paths and full plans retain `--workspace`. Full local preflight clears the scoped setting and always lints the whole workspace. The gate uses `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) and `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
+the API links the updater library, and both the bot and API images build the `jmodguard-launcher` binary. `Dockerfile.bot` and `Dockerfile.api` also select the updater group so that binary target is compiled. Any plan that compiles or publishes Rust also runs the supply-chain group (`cargo deny` and `cargo audit`). Paths that `bash .buildkite/select-checks.sh` classifies for `dylint`—crate sources and `Cargo.toml` files under `crates/`, shared `src/`, `dylint.toml`, and `scripts/dylint*`—also run the `dylint` group; `Dockerfile.*` diffs do not by themselves. That group runs `bash scripts/dylint-test.sh` then `bash scripts/dylint.sh`, which installs `cargo-dylint` and `dylint-link` 6.1.0 from source when needed and runs the Trail of Bits lints listed in `dylint.toml` with `--locked --all-targets`. For a scoped plan, the selector sets `JMODGUARD_DYLINT_PACKAGES` on the Dylint job to the selected Rust check packages and affected test/binary consumers: bot changes include API unit tests; runtime changes include all service/updater targets; remote-database includes root and integration tests. Cargo also checks their dependencies. Global Cargo/toolchain/vendor changes, lint-tool changes, unknown paths and full plans retain `--workspace`. Full local preflight clears the scoped setting and always lints the whole workspace. The gate uses `nightly-2026-08-20` (the lint libraries' toolchain at tag `v6.1.0`) and `target-dylint` (`CARGO_TARGET_DIR`, set by `with-cargo-auth.sh` on Buildkite and defaulted in `scripts/dylint.sh` locally). Clippy, `cargo test`, and image builds stay on Rust 1.96.0. Install those two crates from source; a prebuilt `cargo-dylint` looks for the driver sources at the machine where the binary was built. Shared `src/` runs core, its bot/API/updater consumers, integration and boundary
 checks, formatting/lints, supply-chain, and remote-database checks. It does not
-select independent runtime/conductor package tests or the bootstrap/publisher
-shell contract tests. Migration edits also select conductor because its tests
-embed migration SQL. Vendor changes retain all Rust checks. The operator sample
+select independent runtime package tests or the bootstrap/publisher
+shell contract tests. Migration edits select the same core consumers. Vendor changes retain all Rust checks. The operator sample
 `config.example.toml` selects contracts, like documentation; it is not loaded
 by CI or embedded in the services.
 The root manifest, lockfile and toolchain select all Rust checks, including the
@@ -130,7 +129,7 @@ commits, not just the last commit in a push:
 | Bot source | Bot |
 | API source | API |
 | Shared core, runtime, updater, migrations or vendor | Bot and API |
-| Conductor source/UI or standalone crate tests | None |
+| Standalone crate tests | None |
 | Root frontend or WebUI packager | WebUI |
 | Workspace manifests, lockfile or Rust toolchain | Bot and API |
 | Component Dockerfile or its Docker ignore file | That component |
@@ -150,10 +149,8 @@ before fetching `GHCR_TOKEN` or logging in, so missing push credentials cannot
 fail a docs-only main build. Missing image labels, unavailable Git
 history or registry inspection errors cause a rebuild. Bot and API images use
 the shared source trees, so shared Rust/migration changes can build both images.
-Main and manual commit-SHA publication do not publish the conductor image or an installable
-manifest. Scheduled Nightly and Stable tag/manual builds publish bot, API,
-conductor and a complete signed `JMODGUARD-RELEASE-1` manifest. Nightly tags are
-unique and must not move `latest`. Incomplete publications stay unavailable.
+Scheduled Nightly and tag/manual builds publish eligible bot, API and WebUI images.
+Nightly tags are unique and must not move `latest`.
 Skipping also requires `latest` and its labeled source-SHA tag to contain the
 same manifest. If a previous push updated only one tag, a retry republishes
 the image to repair the incomplete publication.
@@ -173,10 +170,8 @@ and tokens in cluster Secrets
 | Value | Where and purpose |
 |---|---|
 | `GHCR_USERNAME` | Non-secret. Set in this repo's `.buildkite/pipeline.yml` `env:` (already `jatmn`). The other official place is **Pipeline settings → Steps** (YAML editor) with a top-level `env:` before `steps`. |
-| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push `jmodguard-bot`, `jmodguard-api`, `jmodguard-webui`, and the legacy `jmodguard-conductor`. |
+| `GHCR_TOKEN` | Not under the pipeline. Top nav **Agents →** your cluster → **Secrets → New Secret**, key exactly `GHCR_TOKEN`. Then **Access** and restrict to this pipeline's `main` / release-tag builds. The publisher calls `buildkite-agent secret get GHCR_TOKEN`. Must push `jmodguard-bot`, `jmodguard-api`, and `jmodguard-webui`. |
 | `GITHUB_TOKEN` | Optional separate read credential for Cargo's private Git dependency inside Docker and for Release Please. If absent, `GHCR_TOKEN` is used for Docker and must also read this private repository. Release Please is skipped when no token is available. Do not set this to GitHub Actions' automatic token. |
-| `JMODGUARD_RELEASE_KEY_ID` | Non-secret signing key id for complete Stable/Nightly manifests. |
-| `JMODGUARD_RELEASE_SIGNING_KEY` | 32-byte hex HMAC secret. Store as a Buildkite secret, never in git. |
 
 For personal access tokens, GitHub's container registry requires a **classic
 PAT** with `write:packages` and access to the existing packages. While this
@@ -228,11 +223,8 @@ visibility is a separate setting; verify it separately for anonymous pulls.
   without `JMODGUARD_PUBLISH_SOURCE` run tests only. Main webhook
   pushes can publish changed bot/API images. A leftover `JMODGUARD_PUBLISH_SOURCE` on a
   webhook build is ignored so automatic publication still runs.
-- Scheduled builds on `main` publish Nightly images and a complete signed
-  manifest. Nightly IDs never become Release Please versions. The manifest job
-  writes `dist/releases/index.json` and per-release JSON on the agent only;
-  operators sync that tree to the HTTPS origin configured as
-  `JMODGUARD_CONDUCTOR_RELEASE_FEED` (see [releases](RELEASES.md#publishing-the-discovery-feed)).
+- Scheduled builds on `main` publish Nightly images. Nightly IDs never become
+  Release Please versions; see [releases](RELEASES.md).
 - For automatic tag publication, enable **Build tags** in the pipeline's GitHub
   settings and ensure branch filters allow your release tags. Use trusted tags
   containing this Buildkite pipeline. This replaces GitHub's release-published
@@ -249,10 +241,8 @@ visibility is a separate setting; verify it separately for anonymous pulls.
   independent WebUI package existed. A plain branch name such as `main` is
   rejected as a publication source.
   Manual publication by commit SHA publishes bot/API images and the WebUI asset
-  image when it exists in the selected source. The conductor and manifest jobs
-  skip, including on retries. This manual build republishes all three eligible
-  components; it is not a WebUI-only build. Explicit tag and scheduled release
-  publication retain their existing conductor/manifest paths.
+  image when it exists in the selected source. This manual build republishes
+  all three eligible components.
 - A manual build without `JMODGUARD_PUBLISH_SOURCE` runs tests only. Use this in
   place of the retired Actions `CI failover`. No hosted fallback is automatic.
 
@@ -285,8 +275,7 @@ backward; production must keep using approved image digests.
 Local offline publisher tests: `bash .buildkite/publish-image-test.sh`.
 They exercise source identity, event guards, multi-commit change detection,
 credential handling and cleanup without pushing images or contacting Buildkite.
-Release publication contracts live in `jmodguard-conductor` tests and the
-CI-only `jmodguard-release-publish` binary.
+Channel and image publication contracts are covered by the same offline tests.
 See [releases](RELEASES.md).
 
 References: [Buildkite GitHub integration](https://buildkite.com/docs/pipelines/source-control/github),

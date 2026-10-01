@@ -658,13 +658,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let generation = db::guild_stores::set_guild_write_fence(
-            &app.db,
-            10,
-            destination,
-            format!("{:032x}", 9u128),
-            "freeze",
-        )
+        {
+            use jmodguard::db::SqlExecutor as _;
+            app.db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
         .await
         .unwrap();
         remember_recorded_application(&app, enrollment.clone(), &data, case_id.clone(), true).await;
@@ -672,9 +678,19 @@ mod tests {
             !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
             "expected a deferred audit link while the guild store is fenced"
         );
-        db::guild_stores::clear_guild_write_fence(&app.db, 10, &generation)
-            .await
-            .unwrap();
+        {
+            use jmodguard::db::SqlExecutor as _;
+            app.db.with_conn(|conn| {
+                conn.execute_bounded(
+                    "DELETE FROM guild_write_fences WHERE guild_id=10",
+                    (),
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
+        .await
+        .unwrap();
         retry_deferred_discord_audit_links(&app, Some(10)).await;
         assert_eq!(
             linked(&app, enrollment, CaseSource::DiscordAudit { entry_id: 77 })
@@ -754,13 +770,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let generation = db::guild_stores::set_guild_write_fence(
-            &app.db,
-            10,
-            destination,
-            format!("{:032x}", 9u128),
-            "freeze",
-        )
+        {
+            use jmodguard::db::SqlExecutor as _;
+            app.db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
         .await
         .unwrap();
         remember_recorded_application(&app, enrollment.clone(), &data, first.clone(), true).await;
@@ -768,9 +790,19 @@ mod tests {
             !app.deferred_audit_links_for_guild(Some(10)).is_empty(),
             "expected a deferred audit link while the guild store is fenced"
         );
-        db::guild_stores::clear_guild_write_fence(&app.db, 10, &generation)
-            .await
-            .unwrap();
+        {
+            use jmodguard::db::SqlExecutor as _;
+            app.db.with_conn(|conn| {
+                conn.execute_bounded(
+                    "DELETE FROM guild_write_fences WHERE guild_id=10",
+                    (),
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+        }
+        .await
+        .unwrap();
         let second = record_application(
             &app,
             Some(enrollment.clone()),

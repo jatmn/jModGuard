@@ -1236,9 +1236,6 @@ function bindOwnerTools() {
     } }),
     profile,
   ];
-  if (state.me.conductor_url) {
-    children.push(el("a", { class: "btn small", href: state.me.conductor_url, target: "_blank", rel: "noopener noreferrer", text: "Legacy conductor" }));
-  }
   tools.replaceChildren(...children);
 }
 

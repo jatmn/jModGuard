@@ -146,13 +146,19 @@ async fn move_fence_defers_pending_nickname_without_discord_lookup() {
     )
     .await
     .unwrap();
-    let generation = db::guild_stores::set_guild_write_fence(
-        &f.db,
-        10,
-        destination,
-        format!("{:032x}", 9u128),
-        "freeze",
-    )
+    {
+        use jmodguard::db::SqlExecutor as _;
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                libsql::params![10, format!("{:032x}", 9u128), destination.as_str()],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
     .await
     .unwrap();
     assert!(
@@ -165,9 +171,19 @@ async fn move_fence_defers_pending_nickname_without_discord_lookup() {
     assert!(!dispatch_ready(&f.db, &job, &source).await.unwrap());
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
 
-    db::guild_stores::clear_guild_write_fence(&f.db, 10, &generation)
-        .await
-        .unwrap();
+    {
+        use jmodguard::db::SqlExecutor as _;
+        f.db.with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_write_fences WHERE guild_id=10",
+                (),
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+    }
+    .await
+    .unwrap();
     assert_eq!(
         db::pending_nickname_reconciles(&f.db, i64::MAX, 1)
             .await
