@@ -126,7 +126,9 @@ Bot configuration callers retain their existing helpers. No schema change is int
 
 Start matched bot/API builds with the bot first. Migration 0007 adds an empty table;
 it does not infer membership from existing guild settings or old queue jobs. The current
-recognized lineage extends through migration 0014. Older binaries reject newer versions;
+recognized core lineage extends through migration 0016: 0015 stores component-update
+coordination, and 0016 persists shared per-bot member-sync pacing.
+Older binaries reject newer versions;
 rollback needs matching binaries and the pre-upgrade database backup.
 No previous deployment is imported. Live guild-store erasure is described in
 [tenant runtime](TENANT-RUNTIME.md).

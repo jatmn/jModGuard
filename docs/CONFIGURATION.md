@@ -35,9 +35,19 @@ Administrative policy (`[actions]`) is shared by bot/API; scheduling (`[action_w
 is bot-only. See [all action defaults and environment overrides](BOT-ACTIONS.md#runtime-controls).
 Bot-only `[member_sync]` config sets `page_size = 100` (allowed 1–500),
 `min_request_interval_secs = 15` (minimum 15), `request_timeout_secs = 30`,
-`retry_base_secs = 30`, and `retry_max_secs = 3600`. The corresponding
-`JMODGUARD_MEMBER_SYNC_*` environment values override TOML. The single paced
-worker shares its request budget across guilds; see [MEMBERS.md](MEMBERS.md).
+`retry_base_secs = 30`, and `retry_max_secs = 3600`. These exact environment
+variables override the corresponding TOML fields:
+
+| `[member_sync]` field | Environment variable |
+|---|---|
+| `page_size` | `JMODGUARD_MEMBER_SYNC_PAGE_SIZE` |
+| `min_request_interval_secs` | `JMODGUARD_MEMBER_SYNC_INTERVAL_SECS` |
+| `request_timeout_secs` | `JMODGUARD_MEMBER_SYNC_TIMEOUT_SECS` |
+| `retry_base_secs` | `JMODGUARD_MEMBER_SYNC_RETRY_BASE_SECS` |
+| `retry_max_secs` | `JMODGUARD_MEMBER_SYNC_RETRY_MAX_SECS` |
+
+The single paced worker shares its request budget across guilds;
+see [MEMBERS.md](MEMBERS.md).
 
 Environment-only (not in `config.toml`):
 

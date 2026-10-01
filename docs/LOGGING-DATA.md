@@ -51,10 +51,14 @@ Joining, leaving and talking still do not maintain a general activity archive.
   attachment-permission failure uses at most three bounded text chunks with the
   exact number of entries omitted from that fallback; an
   ambiguous timeout is never resent. The transcript is not archived.
-- Join/leave reports use the delivered user, saved actual member join timestamp
-  when known from the member directory, and optional cached member join timestamp.
-  Leave reports also use join timestamps already supplied with recent messages when
-  the member cache is missing that user. This fallback retains only guild/user IDs
+- Join reports use the delivered user and the join timestamp in the Gateway member
+  payload; they do not look up a saved directory join date. Leave reports use the
+  saved directory stay when an authoritative departure decision is available,
+  including an explicitly unknown join date. A departure needing verification waits
+  for a bounded check; the verified leave uses the saved stay. Without an authoritative
+  directory decision, leave reports fall back to the delivered/cached member join
+  timestamp, then a join timestamp already supplied with a recent message.
+  This last fallback retains only guild/user IDs
   and join timestamps in memory (at most 4096 entries, usable for one hour after
   observation), consumes them on leave and clears them on rejoin or guild reload/removal.
   Reports show the join date and elapsed months/weeks/days/hours/minutes/seconds when known. Missing join

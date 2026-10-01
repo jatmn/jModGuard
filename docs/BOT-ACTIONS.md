@@ -91,7 +91,10 @@ ban-mirror and event writes if a move fence was raised after dispatch.
 Pre-0008 actions remain unbound. Migration cancels unstarted work, marks running work
 uncertain, and keeps resolved/uncertain receipts; no old request is assigned to an existing
 membership. Old keys cannot be resubmitted as new work. Start matched bot/API builds,
-bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation adds no schema migration; the current lineage now runs through step 0014.
+bot first; rollback needs matched pre-upgrade backup/binaries. Runtime activation
+adds no schema migration; the current core lineage runs through step 0016.
+Migration 0015 stores component-update coordination; 0016 persists shared per-bot
+member-sync pacing.
 
 ## Dispatch library
 
@@ -214,8 +217,8 @@ credentials only to the API; ignoring a shared file's fields does not hide its r
 
 The Members status card uses `POST .../member-sync/actions` for typed
 `pause`, `resume`, `retry`, and `reconcile` requests with the same stable
-request-key, page-membership, and fresh Manage Guild checks. The bot records a
-receipt after applying a control to scoped guild-store sync state. The store
+`request_id` idempotency key, page-membership, and fresh Manage Guild checks. The
+bot records a receipt after applying a control to scoped guild-store sync state. The store
 rechecks the saved import state at execution. Replaying an already applied
 operation key returns the current status without changing it. Otherwise, a
 control incompatible with the saved state fails with

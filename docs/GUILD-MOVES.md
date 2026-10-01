@@ -39,7 +39,8 @@ hot-reload and automatic shared-service restarts are not claimed.
    log mappings, cases, extra sources, history and live
    evidence. Global defaults and credentials are not copied. Pending Discord
    action tables stay in core and are not replayed.
-5. **Verify** checks copied membership/case/log/history counts.
+5. **Verify** checks copied membership/case/log/history and member-state counts,
+   the immutable initial-seed completion marker, and member-directory row contents.
 6. **Switch** updates `guild_store_placements` in the same core transaction as the
    fence phase change. Stale writers that still hold the old placement fail
    identity/membership checks after source cleanup.

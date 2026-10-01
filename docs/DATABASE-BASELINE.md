@@ -104,6 +104,10 @@ Migration 0013 adds per-guild, per-event `log_filters` for ignored user/bot IDs
 and source channel IDs. Start the bot before the API so the new table exists.
 Migration 0014 adds optional banned-user and moderator display names to retained
 ban rows. Existing rows keep their exact IDs and have no fabricated names.
+Migration 0015 adds component-update coordination and managed-WebUI asset metadata.
+Core migration 0016 persists a per-bot shared member-sync request gate so
+rate-limit delays and the minimum request interval survive worker restart
+across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
@@ -115,12 +119,11 @@ progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
 store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
 migration 0016. Each opener refuses the other family. No records are moved by startup.
-Core migration 0016 persists a per-bot shared member-sync request gate so
-rate-limit delays and the minimum request interval survive worker restart
-across guilds ([MEMBERS.md](MEMBERS.md)).
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
 stays, case projection, sync state and immutable initial-seed completion.
+Guild migration 0011 tracks coverage-gap generations and last-successful-run
+totals, and updates member-state observation constraints.
 Guild migration 0012 adds nullable per-phase committed counters and the measured
 member-page interval. Existing version10 aggregate progress cannot reconstruct
 earlier ban, check, or audit counts, so those historical phase counts remain

@@ -160,9 +160,9 @@ SQLite with 4 KiB pages and `VACUUM`. These are historical measurements, not
 absolute sizes measured for the current v14 schema. They include the nullable
 stay identity on paced target checks; the bulk fixtures have no pending checks.
 
-Migration 0013 adds the unresolved-audit table and its user-history index,
+Guild migration 0013 adds the unresolved-audit table and its user-history index,
 plus scope/source guards. It adds empty-store overhead and storage for each
-unresolved audit, including any saved reason. Migration 0014 replaces the
+unresolved audit, including any saved reason. Guild migration 0014 replaces the
 case-retention trigger without adding tables, indexes or columns. Neither
 migration changes the directory, stay, case-index or state-observation row
 layouts measured below. The same-row-mix growth comparisons therefore remain

@@ -72,10 +72,12 @@ case-removal role IDs. Version9 adds bounded, latest-observed message snapshots 
 fixed 24-hour expiry and store-level capture health. Departure erasure deletes
 those rows in transactions of at most 100 and removes membership only after
 they are gone. Version10 adds the bounded member directory, stays, case projection,
-sync state and immutable initial-seed completion ([MEMBERS.md](MEMBERS.md)).
-Version11 adds member-state observations, durable targeted checks and bounded audit
-recovery. Version12 adds nullable committed counts by import phase and a measured
-member-page interval; old aggregate counts do not invent historical phase counts.
+sync state and immutable initial-seed completion, plus member-state observations,
+durable targeted checks and bounded audit recovery ([MEMBERS.md](MEMBERS.md)).
+Version11 tracks coverage-gap generations and last-successful-run totals, and
+updates member-state observation constraints. Version12 adds nullable committed
+counts by import phase and a measured member-page interval; old aggregate counts
+do not invent historical phase counts.
 Version13 preserves exact, dated bot-executor audit actions while their local case
 source association remains unresolved; a later exact source link consumes the staged
 action without creating a duplicate case. Version14 lets case-retention updates
