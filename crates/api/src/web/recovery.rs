@@ -92,33 +92,34 @@ async fn check(
     if !matches!(input.channel.as_str(), "latest" | "stable" | "nightly") {
         return Err(problem(StatusCode::BAD_REQUEST, "invalid channel"));
     }
+    let now = chrono::Utc::now().timestamp();
+    // Same lease as Administration Check now, held for both services so an
+    // hourly poll cannot interleave. Registry work happens before any row write.
+    let owner = state.control.acquire_pair_check(now).await.map_err(|e| {
+        problem(
+            StatusCode::CONFLICT,
+            format!("matching pair unavailable: {e:#}"),
+        )
+    })?;
     let result = async {
         let registry = jmodguard_updater::oci::Registry::ghcr()?;
         let bot = registry.discover("bot", &input.channel).await?;
         let api = registry
             .discover_source("api", &input.channel, &bot.source_sha)
             .await?;
-        // Both artifacts must exist before exposing a confirmable pair. Missing
-        // counterpart publication causes no downtime or desired-state change.
-        for release in [bot, api] {
-            state
-                .control
-                .set_channel(&release.component, &input.channel)
-                .await?;
-            state
-                .control
-                .checked(
-                    &release.component.clone(),
-                    &input.channel,
-                    Some(release),
-                    None,
-                    chrono::Utc::now().timestamp(),
-                )
-                .await?;
-        }
+        // Both images must resolve before either channel or candidate changes.
+        // One transaction commits the pair; a missing counterpart or a failed
+        // second write leaves the previous selection in place.
+        state
+            .control
+            .record_pair_check(&owner, &input.channel, bot, api, now)
+            .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if let Err(error) = state.control.release_pair_check(&owner).await {
+        tracing::warn!("paired check lease release failed: {error:#}");
+    }
     result.map_err(|e| {
         problem(
             StatusCode::CONFLICT,
