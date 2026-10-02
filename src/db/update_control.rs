@@ -270,6 +270,92 @@ impl UpdateControl {
         record_update_check(&self.db, component, channel, candidate, error, now).await
     }
 
+    /// Hold both service check leases before registry work. A failure to take
+    /// the second lease releases the first so Administration discovery is not stuck.
+    pub async fn acquire_pair_check(&self, now: i64) -> Result<String> {
+        let owner = format!("{:032x}", rand::random::<u128>());
+        if !claim_update_lease(&self.db, "bot", &owner, now, 240).await? {
+            anyhow::bail!("another update operation is running");
+        }
+        match claim_update_lease(&self.db, "api", &owner, now, 240).await {
+            Ok(true) => Ok(owner),
+            Ok(false) => {
+                release_update_lease(&self.db, "bot", &owner).await?;
+                anyhow::bail!("another update operation is running")
+            }
+            Err(error) => {
+                let _ = release_update_lease(&self.db, "bot", &owner).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn release_pair_check(&self, owner: &str) -> Result<()> {
+        release_update_lease(&self.db, "bot", owner).await?;
+        release_update_lease(&self.db, "api", owner).await?;
+        Ok(())
+    }
+
+    /// Persist channel and checked candidate for bot and API in one transaction.
+    /// Either both rows change or the previous selection remains.
+    pub async fn record_pair_check(
+        &self,
+        owner: &str,
+        channel: &str,
+        bot: ComponentRelease,
+        api: ComponentRelease,
+        now: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(channel, "latest" | "stable" | "nightly"),
+            "invalid channel"
+        );
+        anyhow::ensure!(
+            owner.len() == 32 && owner.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid update lease"
+        );
+        bot.validate()?;
+        api.validate()?;
+        anyhow::ensure!(
+            bot.component == "bot"
+                && api.component == "api"
+                && bot.channel == channel
+                && api.channel == channel
+                && bot.source_sha == api.source_sha,
+            "bot and API must be a matching checked pair"
+        );
+        let (owner, channel) = (owner.to_owned(), channel.to_owned());
+        let bot_json = serde_json::to_string(&bot)?;
+        let api_json = serde_json::to_string(&api)?;
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                for (component, candidate) in [("bot", bot_json), ("api", api_json)] {
+                    let renewed = tx.execute_rows(
+                        "UPDATE component_updates SET lease_until=?3 WHERE component=?1 AND lease_owner=?2 AND lease_until>?4",
+                        params![component, owner.clone(), now + 240, now],
+                        1,
+                    )?;
+                    anyhow::ensure!(renewed == 1, "update lease expired or changed");
+                    let channel_rows = tx.execute_rows(
+                        "UPDATE component_updates SET channel=?2,cadence='off',candidate=CASE WHEN channel=?2 THEN candidate ELSE NULL END,checked_at=CASE WHEN channel=?2 THEN checked_at ELSE NULL END,check_error=CASE WHEN channel=?2 THEN check_error ELSE NULL END WHERE component=?1",
+                        params![component, channel.clone()],
+                        1,
+                    )?;
+                    anyhow::ensure!(channel_rows == 1, "paired check could not select the channel");
+                    let checked = tx.execute_rows(
+                        "UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1 AND channel=?4",
+                        params![component, candidate, now, channel.clone()],
+                        1,
+                    )?;
+                    anyhow::ensure!(checked == 1, "release channel changed during check; check again");
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn running(
         &self,
         role: &str,
@@ -791,6 +877,123 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pair_check_commits_both_services_or_leaves_the_previous_selection() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let before_bot = f.control.component("bot").await.unwrap();
+        let before_api = f.control.component("api").await.unwrap();
+        let held = "ab".repeat(16);
+        assert!(
+            claim_update_lease(&f.control.db, "api", &held, 100, 240)
+                .await
+                .unwrap()
+        );
+        assert!(f.control.acquire_pair_check(100).await.is_err());
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        release_update_lease(&f.control.db, "api", &held)
+            .await
+            .unwrap();
+        assert!(
+            claim_update_lease(&f.control.db, "bot", &"ef".repeat(16), 100, 60)
+                .await
+                .unwrap(),
+            "a failed pair-check admission must not keep the bot lease"
+        );
+        release_update_lease(&f.control.db, "bot", &"ef".repeat(16))
+            .await
+            .unwrap();
+
+        let owner = f.control.acquire_pair_check(100).await.unwrap();
+        let mut bot = before_bot.candidate.clone().unwrap();
+        let mut api = before_api.candidate.clone().unwrap();
+        bot.digest = format!("sha256:{}", "1".repeat(64));
+        api.digest = format!("sha256:{}", "2".repeat(64));
+        api.source_sha = "f".repeat(40);
+        assert!(
+            f.control
+                .record_pair_check(&owner, "latest", bot.clone(), api.clone(), 100)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        api.source_sha = bot.source_sha.clone();
+        f.control
+            .db
+            .with_conn(|conn| {
+                conn.execute_rows(
+                    "UPDATE component_updates SET lease_owner=?1 WHERE component='api'",
+                    params!["cd".repeat(16)],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        bot.channel = "stable".into();
+        api.channel = "stable".into();
+        assert!(
+            f.control
+                .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
+                .await
+                .is_err()
+        );
+        assert_eq!(f.control.component("bot").await.unwrap().channel, "latest");
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        let lease_owner = owner.clone();
+        f.control
+            .db
+            .with_conn(move |conn| {
+                conn.execute_rows(
+                    "UPDATE component_updates SET lease_owner=?1,lease_until=?2 WHERE component='api'",
+                    params![lease_owner, 1_000_i64],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        f.control
+            .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
+            .await
+            .unwrap();
+        let saved_bot = f.control.component("bot").await.unwrap();
+        let saved_api = f.control.component("api").await.unwrap();
+        assert_eq!(saved_bot.channel, "stable");
+        assert_eq!(saved_api.channel, "stable");
+        assert_eq!(saved_bot.cadence, "off");
+        assert_eq!(saved_api.cadence, "off");
+        assert_eq!(saved_bot.candidate.unwrap().digest, bot.digest);
+        assert_eq!(saved_api.candidate.unwrap().digest, api.digest);
+        f.control.release_pair_check(&owner).await.unwrap();
     }
 
     #[tokio::test]

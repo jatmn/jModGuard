@@ -805,11 +805,11 @@ test("schema upgrades expose the paired action and active pairs block independen
   api.candidate.result_schema = 17;
   api.candidate.upgrade = { guild_schema: 15 };
   render(view, api);
-  vm.runInContext(`snapshot.coordinated_upgrade_path = "/updates/recovery";
+  vm.runInContext(`snapshot.coordinated_upgrade_path = "/api/service-upgrade/recovery";
     snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; render();`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   const link = find(view.elements.get("update-cards"), item => item.tag === "a" && item.textContent.includes("together"));
-  assert.ok(link?.href.endsWith("/updates/recovery"));
+  assert.ok(link?.href.endsWith("/api/service-upgrade/recovery"));
   assert.ok(find(view.elements.get("update-cards"), item => item.textContent.includes("both services will briefly stop")));
   vm.runInContext(`snapshot.compatibility.api.installable = true;
     snapshot.service_upgrade = { phase: "preparing", error: null }; render();`, view.context);

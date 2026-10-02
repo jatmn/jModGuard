@@ -216,6 +216,8 @@ struct Supervisor {
     staging: PathBuf,
     prepared: Option<(String, PathBuf)>,
     standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
+    // Failed independent selection awaiting verified prior-service readiness.
+    rollback: Option<(ComponentRelease, String)>,
     reported: bool,
     last_observed: Option<Instant>,
 }
@@ -290,7 +292,8 @@ impl Supervisor {
         }
         if tokio::fs::metadata(&child.ready_file).await.is_err() {
             ensure!(
-                child.release.is_none()
+                self.rollback.is_some()
+                    || child.release.is_none()
                     || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
                 "replacement child readiness timed out"
             );
@@ -321,6 +324,27 @@ impl Supervisor {
                     Err(error) => tracing::warn!("release heartbeat failed: {error:#}"),
                 }
             }
+        } else if let Some((failed, error)) = self.rollback.clone() {
+            self.control
+                .rolled_back(
+                    &self.role,
+                    &failed,
+                    child.release.clone(),
+                    deployment_observation(
+                        child,
+                        &self.base_sha,
+                        &self.base_abi,
+                        self.enabled,
+                        &self.baked_compatibility,
+                    ),
+                    &error,
+                    now(),
+                )
+                .await?;
+            self.rollback = None;
+            self.standby = None;
+            self.reported = true;
+            self.last_observed = Some(Instant::now());
         } else {
             if child.release.is_none() {
                 self.control
@@ -362,6 +386,7 @@ impl Supervisor {
         // Independent rollback artifacts cannot survive a potential core OR
         // guild migration, even after later operations replace the status row.
         self.standby = None;
+        self.rollback = None;
         let op = self
             .control
             .join_upgrade(id, &self.role, &self.instance)
@@ -454,6 +479,9 @@ impl Supervisor {
     }
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
+        if let Some((failed, error)) = self.rollback.clone() {
+            return self.rollback_independent(state, failed, error).await;
+        }
         // One-time deployment of this baseline replaces pre-protocol selections
         // whose metadata caused the schema15/16 lockout. Operators stop both old
         // services for this rollout. Never discard a protocol-2 managed selection.
@@ -647,6 +675,7 @@ impl Supervisor {
                 }
             }
         }
+        let restoring_previous = self.rollback.is_some();
         if let Err(error) = self.report_ready().await {
             // After a coordinated migration, never try a previous/baked child.
             if let Some(op) = self.control.upgrade().await?
@@ -717,10 +746,15 @@ impl Supervisor {
                 return Err(error);
             }
         }
+        // A rollback receipt may have cleared desired after this tick's read.
+        // Do not retry the stale failed selection until the next read.
+        if restoring_previous || self.rollback.is_some() {
+            return Ok(false);
+        }
         if !self.reported || !self.enabled {
             return Ok(false);
         }
-        let Some(candidate) = state.desired else {
+        let Some(candidate) = state.desired.clone() else {
             return Ok(false);
         };
         if self
@@ -795,9 +829,53 @@ impl Supervisor {
             child.release.clone(),
         ));
         self.stop_application().await?;
-        self.start(&path, &candidate.source_sha, Some(candidate.clone()))
-            .await?;
+        if let Err(error) = self
+            .start(&path, &candidate.source_sha, Some(candidate.clone()))
+            .await
+        {
+            // Launcher gating already ran. A failed application spawn must
+            // restart the captured standby and settle the failed selection.
+            self.rollback_independent(&state, candidate, format!("spawn: {error:#}"))
+                .await?;
+        }
         Ok(false)
+    }
+
+    async fn rollback_independent(
+        &mut self,
+        state: &db::ComponentUpdate,
+        failed: ComponentRelease,
+        error: String,
+    ) -> Result<()> {
+        let (path, sha, previous) = self
+            .standby
+            .as_ref()
+            .cloned()
+            .context("rollback artifact missing")?;
+        let schema = self.control.schema_version().await?;
+        ensure!(
+            previous
+                .as_ref()
+                .map_or(schema == self.baked_compatibility.core, |r| {
+                    schema >= r.min_schema && schema <= r.max_schema
+                }),
+            "rollback schema is incompatible"
+        );
+        let previous_guild = previous
+            .as_ref()
+            .and_then(|r| r.upgrade.as_ref())
+            .map_or(self.baked_compatibility.guild, |contract| {
+                contract.guild_schema
+            });
+        ensure!(
+            state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(previous_guild),
+            "rollback guild schema is incompatible"
+        );
+        // Keep the failed identity until the restarted prior is ready. A later
+        // report_ready records the receipt; running() must not overwrite it.
+        self.rollback = Some((failed, error));
+        self.stop_application().await?;
+        self.start(&path, &sha, previous).await
     }
 
     async fn tick(&mut self) -> Result<bool> {
@@ -981,6 +1059,7 @@ async fn main() -> Result<()> {
         staging: PathBuf::from("/tmp/jmodguard-updates"),
         prepared: None,
         standby: None,
+        rollback: None,
         reported: false,
         last_observed: None,
     };

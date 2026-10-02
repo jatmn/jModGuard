@@ -163,6 +163,7 @@ fn controller(
         staging: root.join(format!("staged-{role}")),
         prepared: None,
         standby: None,
+        rollback: None,
         reported: false,
         last_observed: None,
     }
@@ -175,6 +176,7 @@ async fn restart(service: &mut Supervisor) {
     service.prepared = None;
     service.instance = format!("{:032x}", rand::random::<u128>());
     service.standby = None;
+    service.rollback = None;
 }
 
 #[tokio::test]
@@ -722,6 +724,111 @@ async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_do
     server.abort();
     let _ = server.await;
     drop((bot, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn independent_spawn_failure_settles_once() {
+    let root =
+        std::env::temp_dir().join(format!("independent-spawn-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let old_bot = executable(&root, "old-bot").await;
+    let old_api = executable(&root, "old-api").await;
+    let mut objects = HashMap::new();
+    let mut candidate = image(&mut objects, "api", b"\x7fELFnot-an-executable");
+    candidate.min_schema = db::CORE_SCHEMA_VERSION;
+    candidate.max_schema = db::CORE_SCHEMA_VERSION;
+    candidate.result_schema = db::CORE_SCHEMA_VERSION;
+    candidate.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let mut bot = controller("bot", old_bot, registry.clone(), control.clone(), &root);
+    let mut api = controller("api", old_api, registry, control.clone(), &root);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !bot.reported || !api.reported {
+        assert!(Instant::now() < deadline);
+        bot.tick().await.unwrap();
+        api.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    api.running.as_mut().unwrap().started_at = now() - 100;
+    control
+        .running(
+            "api",
+            None,
+            deployment_observation(
+                api.running.as_ref().unwrap(),
+                &api.base_sha,
+                &api.base_abi,
+                api.enabled,
+                &api.baked_compatibility,
+            ),
+            now(),
+        )
+        .await
+        .unwrap();
+    control
+        .checked("api", "latest", Some(candidate.clone()), None, now())
+        .await
+        .unwrap();
+    db::request_component_install(&db, "api", &candidate.digest, now())
+        .await
+        .unwrap();
+    // Spawn errors are tolerated so the durable-settlement oracle can run.
+    let _ = api.tick().await;
+    while !api.reported || control.component("api").await.unwrap().desired.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "failed request kept retrying instead of settling"
+        );
+        let _ = api.tick().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let installed = control.component("api").await.unwrap();
+    assert_eq!(installed.state, "failed");
+    assert!(installed.installed.is_none());
+    assert!(
+        installed
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("spawn:")
+    );
+    let starts = tokio::fs::read_to_string(root.join("events"))
+        .await
+        .unwrap()
+        .matches("old-api.start")
+        .count();
+    for _ in 0..3 {
+        api.tick().await.unwrap();
+    }
+    assert_eq!(
+        tokio::fs::read_to_string(root.join("events"))
+            .await
+            .unwrap()
+            .matches("old-api.start")
+            .count(),
+        starts
+    );
+    api.stop_application().await.unwrap();
+    api.end_idle().await.unwrap();
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    drop((api, bot, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 

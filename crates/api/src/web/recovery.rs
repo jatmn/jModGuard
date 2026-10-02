@@ -55,7 +55,7 @@ async fn mutation(
 pub fn routes<S: Clone + Send + Sync + 'static>(state: Arc<RecoveryState>) -> Router<S> {
     Router::new()
         .route(
-            "/updates/recovery",
+            "/api/service-upgrade/recovery",
             get(|| async { Html(include_str!("recovery.html")) }),
         )
         .route("/api/service-upgrade", get(status).post(apply))
@@ -93,33 +93,34 @@ async fn check(
     if !matches!(input.channel.as_str(), "latest" | "stable" | "nightly") {
         return Err(problem(StatusCode::BAD_REQUEST, "invalid channel"));
     }
+    let now = chrono::Utc::now().timestamp();
+    // Same lease as Administration Check now, held for both services so an
+    // hourly poll cannot interleave. Registry work happens before any row write.
+    let owner = state.control.acquire_pair_check(now).await.map_err(|e| {
+        problem(
+            StatusCode::CONFLICT,
+            format!("matching pair unavailable: {e:#}"),
+        )
+    })?;
     let result = async {
         let registry = jmodguard_updater::oci::Registry::ghcr()?;
         let bot = registry.discover("bot", &input.channel).await?;
         let api = registry
             .discover_source("api", &input.channel, &bot.source_sha)
             .await?;
-        // Both artifacts must exist before exposing a confirmable pair. Missing
-        // counterpart publication causes no downtime or desired-state change.
-        for release in [bot, api] {
-            state
-                .control
-                .set_channel(&release.component, &input.channel)
-                .await?;
-            state
-                .control
-                .checked(
-                    &release.component.clone(),
-                    &input.channel,
-                    Some(release),
-                    None,
-                    chrono::Utc::now().timestamp(),
-                )
-                .await?;
-        }
+        // Both images must resolve before either channel or candidate changes.
+        // One transaction commits the pair; a missing counterpart or a failed
+        // second write leaves the previous selection in place.
+        state
+            .control
+            .record_pair_check(&owner, &input.channel, bot, api, now)
+            .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if let Err(error) = state.control.release_pair_check(&owner).await {
+        tracing::warn!("paired check lease release failed: {error:#}");
+    }
     result.map_err(|e| {
         problem(
             StatusCode::CONFLICT,
@@ -246,7 +247,7 @@ fn maintenance_router(state: Arc<RecoveryState>, store: MemoryStore) -> Router {
         .merge(routes(state))
         .route(
             "/",
-            get(|| async { axum::response::Redirect::to("/updates/recovery") }),
+            get(|| async { axum::response::Redirect::to("/api/service-upgrade/recovery") }),
         )
         .route("/health", get(health))
         .route("/health/", get(health))
@@ -420,6 +421,26 @@ mod tests {
             );
         }
         assert!(control.upgrade().await.unwrap().is_some());
+        // The HTML and OAuth return both use the existing public /api* proxy.
+        let page = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/service-upgrade/recovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(
+            page.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
         // Maintenance serves no application/guild routes, but shares OAuth's
         // CSRF cookies and redirect allowlist rather than an alternate secret.
         assert_eq!(
@@ -439,7 +460,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/login?return_to=%2Fupdates%2Frecovery")
+                    .uri("/login?return_to=%2Fapi%2Fservice-upgrade%2Frecovery")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -452,6 +473,16 @@ mod tests {
                 .get_all("set-cookie")
                 .iter()
                 .any(|value| value.to_str().unwrap().contains(COOKIE_OAUTH_STATE))
+        );
+        assert!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .unwrap()
+                    .contains("jmodguard_oauth_return_to=/api/service-upgrade/recovery"))
         );
         drop((control, db));
         for suffix in ["", "-wal", "-shm"] {

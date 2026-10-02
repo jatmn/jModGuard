@@ -345,14 +345,14 @@ function render() {
       line(content, "Launcher requirement", candidateCurrent ? launcher?.reason || "Check with a launcher-aware API to determine this release's requirement." : "Check now to determine the release requirement.");
       if (launcher?.running != null) line(details, "Launcher capability", `${launcher.running} running; ${launcher.minimum} required; ${launcher.available} included in release`);
     }
-    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/updates/recovery") {
+    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
       const target = record.candidate;
       const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
         target.upgrade?.guild_schema !== observed.guild_schema);
       if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
       if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
       const pair = node("a", "Update bot and API together / recovery");
-      pair.href = `${apiBase()}/updates/recovery`;
+      pair.href = `${apiBase()}/api/service-upgrade/recovery`;
       content.append(pair);
     }
 
