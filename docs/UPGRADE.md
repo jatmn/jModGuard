@@ -87,10 +87,14 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 ## 5. Rollout order
 
-With the coordinated-update baseline installed, supported in-container upgrades
+With the launcher-aware coordinated-update baseline installed, supported in-container upgrades
 use **Administration → Updates → Update bot and API together / recovery**.
 That flow enforces the stop/migrate/start ordering below and persists restart
 recovery. See [Bunny updates](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+Normal Update installs a required launcher before its application; the update page
+shows whether that step is necessary. Optional launcher-only updates live under
+Advanced launcher controls. See `BUNNY-UPDATES.md` for release capability labels.
+
 The manual sequence remains for the one-time baseline and changes to the base OS,
 configuration, credentials, or incompatible control protocol.
 

@@ -48,8 +48,15 @@ pub async fn status(State(app): State<Arc<ApiState>>, session: Session) -> Reply
         .await
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update state unavailable"))?;
     let mut compatibility = serde_json::Map::new();
+    let mut launchers = serde_json::Map::new();
     let now = chrono::Utc::now().timestamp();
     for row in &updates {
+        if row.component != "webui" {
+            launchers.insert(
+                row.component.clone(),
+                jmodguard_updater::launcher_status(row, now),
+            );
+        }
         if let Some(candidate) = &row.candidate {
             let result = jmodguard_updater::compatible(&app.db, candidate, now).await;
             compatibility.insert(
@@ -66,6 +73,7 @@ pub async fn status(State(app): State<Arc<ApiState>>, session: Session) -> Reply
         "coordinated_upgrade_path":"/api/service-upgrade/recovery",
         "service_upgrade":db::UpdateControl::from_application(&app.db).upgrade().await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update control unavailable"))?,
         "compatibility":compatibility,
+        "launchers":launchers,
         "unattended_enabled":enabled("JMODGUARD_UNATTENDED_UPDATES"),
         "apply_enabled":enabled("JMODGUARD_UPDATE_APPLY_ENABLED"),
         "webui_storage_configured":storage().is_ok(),
@@ -222,6 +230,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                     ComponentObservation {
                         guild_schema: None,
                         update_protocol: 0,
+                        launcher_revision: 0,
                         source_sha: release.source_sha.clone(),
                         executable_sha256: root_hash,
                         admin_sha256: Some(admin_hash),
@@ -250,6 +259,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 ComponentObservation {
                     guild_schema: None,
                     update_protocol: 0,
+                    launcher_revision: 0,
                     source_sha: installed.source_sha.clone(),
                     executable_sha256: root_hash,
                     admin_sha256: Some(admin_hash),
@@ -451,6 +461,7 @@ pub async fn install(
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update state unavailable"))?;
     let candidate = record
         .candidate
+        .clone()
         .ok_or_else(|| error(StatusCode::CONFLICT, "check for an update first"))?;
     if candidate.digest != input.digest
         || candidate.channel != record.channel
@@ -497,14 +508,26 @@ pub async fn install(
             "WebUI source SHA was republished with a different image digest; file bytes may differ, so use a new source commit",
         ));
     }
-    jmodguard_updater::compatible(&app.db, &candidate, now)
-        .await
-        .map_err(|_| {
-            error(
+    if input.launcher {
+        let advice = jmodguard_updater::launcher_status(&record, now);
+        if advice["installable"] != true {
+            return Err(error(
                 StatusCode::CONFLICT,
-                "candidate is incompatible with current services",
-            )
-        })?;
+                advice["reason"]
+                    .as_str()
+                    .unwrap_or("launcher update is not required or available"),
+            ));
+        }
+    } else {
+        jmodguard_updater::compatible(&app.db, &candidate, now)
+            .await
+            .map_err(|problem| {
+                error(
+                    StatusCode::CONFLICT,
+                    &format!("candidate is incompatible: {problem:#}"),
+                )
+            })?;
+    }
     if input.component == "webui" && storage().is_err() {
         return Err(error(
             StatusCode::CONFLICT,
@@ -607,6 +630,7 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
         let observation = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
+            launcher_revision: 0,
             source_sha: release.source_sha.clone(),
             executable_sha256: sha256_hex(&index),
             admin_sha256: Some(sha256_hex(&admin)),
@@ -707,6 +731,7 @@ mod tests {
             min_api: 1,
             max_api: 1,
             launcher_protocol: 1,
+            launcher: None,
             base_abi: "static-webui-v1".into(),
         };
         db::record_update_check(

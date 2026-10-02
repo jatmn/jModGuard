@@ -27,10 +27,15 @@ pub async fn compatible_control(
     );
     let own = db.component(&release.component).await?;
     if release.component != "webui" {
+        launcher_compatible(release, &release.base_abi)?;
         let current = own
             .observed
             .as_ref()
             .context("current service has not been observed")?;
+        ensure!(
+            current.update_protocol >= db::UPDATE_CONTROL_PROTOCOL && current.launcher_revision > 0,
+            "service needs the launcher-aware baseline before automatic prerequisite updates"
+        );
         ensure!(
             own.observed_at.is_some_and(|seen| now - seen < 7200),
             "current service observation is stale"
@@ -92,4 +97,52 @@ pub async fn compatible_control(
         );
     }
     Ok(())
+}
+
+/// Launcher-only admission depends on the fixed handoff/control/ABI envelope,
+/// not the bundled application's target schema (which may require migration).
+pub fn launcher_compatible(release: &ComponentRelease, base_abi: &str) -> Result<()> {
+    release.validate()?;
+    ensure!(
+        matches!(release.component.as_str(), "bot" | "api")
+            && release.base_abi == base_abi
+            && release
+                .upgrade
+                .as_ref()
+                .is_some_and(|v| v.control_protocol == db::UPDATE_CONTROL_PROTOCOL)
+            && release.launcher.is_some(),
+        "launcher requires a different update baseline or base runtime"
+    );
+    Ok(())
+}
+
+/// Display advice only. Execution always checks its own compiled capability;
+/// neither a heartbeat nor installed_launcher is authority to spawn a child.
+pub fn launcher_status(row: &db::ComponentUpdate, now: i64) -> serde_json::Value {
+    let Some(release) = &row.candidate else {
+        return serde_json::json!({"state":"unknown","reason":"Check a release first."});
+    };
+    let Some(seen) = &row.observed else {
+        return serde_json::json!({"state":"unknown","reason":"Running launcher has not been observed."});
+    };
+    if seen.update_protocol < db::UPDATE_CONTROL_PROTOCOL
+        || seen.launcher_revision == 0
+        || row
+            .observed_at
+            .is_none_or(|at| at > now || now - at >= 7200)
+    {
+        return serde_json::json!({"state":"unknown","reason":"Launcher capability is unknown or stale; verify the launcher-aware baseline."});
+    }
+    if let Err(error) = launcher_compatible(release, &seen.base_abi) {
+        return serde_json::json!({"state":"blocked","reason":error.to_string()});
+    }
+    let contract = release.launcher.as_ref().expect("validated contract");
+    let required = seen.launcher_revision < contract.min_revision;
+    let newer = seen.launcher_revision < contract.revision;
+    serde_json::json!({"state":if required { "required_first" } else if newer { "optional" } else { "satisfied" },
+        "running":seen.launcher_revision,"minimum":contract.min_revision,"available":contract.revision,
+        "installable":seen.self_update_enabled && newer && !required,
+        "reason":if required { "Update will install the required launcher first, then the application." }
+        else if newer { "Current launcher supports this application. A newer launcher is optional." }
+        else { "Current launcher supports this application; no launcher update is required." }})
 }

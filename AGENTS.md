@@ -190,8 +190,11 @@ and `none` skip it. Failures do not undo delete or ban. Process image budgets be
 only to bot config.
 Owner-selected image updates use the existing WebUI/API; see `docs/BUNNY-UPDATES.md`.
 Core or guild schema changes require the durable bot/API paired protocol. Preserve
-protocol-2 update-control tables/meta across future migrations, exact runtime schema
-labels, and separate migration-origin metadata. Launchers must read durable selections
+the existing update-control tables/meta across future migrations, exact runtime schema
+labels, separate migration-origin metadata, and selected-source protocol-3 launcher
+capability/minimum labels. Bump launcher capability for updater fixes; raise the
+application minimum only for a required dependency. Enforce the minimum using the
+executing launcher, never historical installed metadata. Launchers must read durable selections
 before spawning applications; maintenance OAuth control must not construct ApiState or
 open tenant stores. After the irreversible migration fence, recovery is forward-only.
 One container per role is required; heartbeat expiry never proves a child stopped.

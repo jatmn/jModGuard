@@ -3,7 +3,11 @@
 use super::*;
 use serde::Deserialize;
 
-pub const UPDATE_CONTROL_PROTOCOL: u32 = 2;
+pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
+/// Monotonic updater capability, independent of source SHA and shell protocol.
+/// Bump when shipping launcher changes; raise the minimum only when required.
+pub const LAUNCHER_REVISION: u32 = 1;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
 /// A controller restarted, or an owner replaced/cancelled the operation while
@@ -25,6 +29,25 @@ fn require_progress(current: bool) -> Result<()> {
 #[derive(Clone)]
 pub struct UpdateControl {
     db: Db,
+}
+
+/// Immutable application compatibility of this container's baked image. A
+/// downloaded launcher may be compiled for a different application schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakedCompatibility {
+    pub source_sha: String,
+    pub core: i64,
+    pub guild: i64,
+}
+
+impl BakedCompatibility {
+    pub fn compiled(source_sha: &str) -> Self {
+        Self {
+            source_sha: source_sha.into(),
+            core: CORE_SCHEMA_VERSION,
+            guild: guild_data::SCHEMA_VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +391,85 @@ impl UpdateControl {
         record_component_rollback(&self.db, role, failed, previous, observation, error, now).await
     }
 
+    /// Only the baked controller can establish the baked application's schema.
+    pub async fn baked_compatibility(
+        &self,
+        role: &str,
+        base_sha: &str,
+        baked_controller: bool,
+    ) -> Result<BakedCompatibility> {
+        anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+        let key = format!("component_baked_compatibility_{role}_v1");
+        let base_sha = base_sha.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                let result = if baked_controller {
+                    let baked = BakedCompatibility::compiled(&base_sha);
+                    write_meta_string_conn(&tx, &key, &serde_json::to_string(&baked)?)?;
+                    baked
+                } else {
+                    let raw = meta_string_conn(&tx, &key)?.context(
+                        "baked compatibility missing; restart the container's baked controller",
+                    )?;
+                    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
+                    anyhow::ensure!(
+                        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
+                        "baked compatibility does not match this base image"
+                    );
+                    baked
+                };
+                tx.commit()?;
+                Ok(result)
+            })
+            .await
+    }
+
+    /// Refresh actual controller capability without an application heartbeat.
+    pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
+        anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+        let role = role.to_owned();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                let raw: Option<String> = tx.query_row(
+                    "SELECT observed FROM component_updates WHERE component=?1",
+                    params![role.clone()],
+                    |row| Ok(row.get(0)?),
+                )?;
+                if let Some(raw) = raw {
+                    let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
+                    seen.launcher_revision = revision;
+                    // Preserve pre-protocol baseline adoption until the baked app
+                    // reports readiness; a legacy schema15 row may describe DB16.
+                    if seen.update_protocol != 0 {
+                        seen.update_protocol = UPDATE_CONTROL_PROTOCOL;
+                    }
+                    tx.execute_rows(
+                        "UPDATE component_updates SET observed=?2 WHERE component=?1",
+                        params![role, serde_json::to_string(&seen)?],
+                        1,
+                    )?;
+                }
+                tx.commit()
+            })
+            .await
+    }
+
+    pub async fn clear_superseded_launcher(
+        &self,
+        role: &str,
+        release: &ComponentRelease,
+    ) -> Result<()> {
+        let (role, release) = (role.to_owned(), serde_json::to_string(release)?);
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
+                params![role, release], 1)?;
+            tx.commit()
+        }).await
+    }
+
     pub async fn launcher_running(
         &self,
         role: &str,
@@ -421,6 +523,8 @@ impl UpdateControl {
             target_api.validate()?;
             let bot_contract = target_bot.upgrade.as_ref().context("bot release does not support coordinated upgrades")?;
             let api_contract = target_api.upgrade.as_ref().context("API release does not support coordinated upgrades")?;
+            anyhow::ensure!(bot_contract.control_protocol == UPDATE_CONTROL_PROTOCOL && target_bot.launcher.is_some() && target_api.launcher.is_some(),
+                "release lacks launcher-aware upgrade requirements");
             anyhow::ensure!(target_bot.component == "bot" && target_api.component == "api"
                 && target_bot.source_sha == target_api.source_sha
                 && target_bot.result_schema == target_api.result_schema
@@ -470,6 +574,35 @@ impl UpdateControl {
             }
             tx.commit()?;
             Ok(upgrade)
+        }).await
+    }
+
+    /// Pin a required launcher only while the owning application selection is
+    /// still current. Preparing is reused across the launcher re-exec; the new
+    /// incarnation must prepare again before any schema-changing application.
+    pub async fn select_required_launcher(
+        &self,
+        release: &ComponentRelease,
+        operation: Option<&str>,
+    ) -> Result<()> {
+        release.validate()?;
+        let release = release.clone();
+        let operation = operation.map(str::to_owned);
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            if let Some(id) = operation {
+                let op = read_upgrade(&tx)?.context("upgrade missing")?;
+                require_progress(op.id == id && op.phase == UpgradePhase::Preparing && op.error.is_none()
+                    && op.service(&release.component)?.release == release)?;
+            } else {
+                ensure_no_service_upgrade(&tx)?;
+                let row = tx.query_row(&format!("SELECT {} FROM component_updates WHERE component=?1", updates::COLS), params![release.component.clone()], updates::row_update)?;
+                anyhow::ensure!(row.desired.as_ref() == Some(&release) || row.installed.as_ref() == Some(&release),
+                    "application selection changed before launcher handoff");
+            }
+            tx.execute_rows("UPDATE component_updates SET desired_launcher=?2,last_error=NULL WHERE component=?1",
+                params![release.component.clone(),serde_json::to_string(&release)?], 1)?;
+            tx.commit()
         }).await
     }
 
@@ -669,6 +802,10 @@ mod tests {
                     min_api: 1,
                     max_api: 1,
                     launcher_protocol: 1,
+                    launcher: Some(crate::db::LauncherCompatibility {
+                        revision: crate::db::LAUNCHER_REVISION,
+                        min_revision: crate::db::REQUIRED_LAUNCHER_REVISION,
+                    }),
                     base_abi: "debian-bookworm-amd64".into(),
                     upgrade: Some(UpgradeCompatibility {
                         control_protocol: UPDATE_CONTROL_PROTOCOL,
@@ -698,6 +835,7 @@ mod tests {
                             base_abi: "debian-bookworm-amd64".into(),
                             guild_schema: Some(guild_data::SCHEMA_VERSION),
                             update_protocol: UPDATE_CONTROL_PROTOCOL,
+                            launcher_revision: 0,
                         },
                         100,
                     )
@@ -739,6 +877,123 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pair_check_commits_both_services_or_leaves_the_previous_selection() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let before_bot = f.control.component("bot").await.unwrap();
+        let before_api = f.control.component("api").await.unwrap();
+        let held = "ab".repeat(16);
+        assert!(
+            claim_update_lease(&f.control.db, "api", &held, 100, 240)
+                .await
+                .unwrap()
+        );
+        assert!(f.control.acquire_pair_check(100).await.is_err());
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        release_update_lease(&f.control.db, "api", &held)
+            .await
+            .unwrap();
+        assert!(
+            claim_update_lease(&f.control.db, "bot", &"ef".repeat(16), 100, 60)
+                .await
+                .unwrap(),
+            "a failed pair-check admission must not keep the bot lease"
+        );
+        release_update_lease(&f.control.db, "bot", &"ef".repeat(16))
+            .await
+            .unwrap();
+
+        let owner = f.control.acquire_pair_check(100).await.unwrap();
+        let mut bot = before_bot.candidate.clone().unwrap();
+        let mut api = before_api.candidate.clone().unwrap();
+        bot.digest = format!("sha256:{}", "1".repeat(64));
+        api.digest = format!("sha256:{}", "2".repeat(64));
+        api.source_sha = "f".repeat(40);
+        assert!(
+            f.control
+                .record_pair_check(&owner, "latest", bot.clone(), api.clone(), 100)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        api.source_sha = bot.source_sha.clone();
+        f.control
+            .db
+            .with_conn(|conn| {
+                conn.execute_rows(
+                    "UPDATE component_updates SET lease_owner=?1 WHERE component='api'",
+                    params!["cd".repeat(16)],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        bot.channel = "stable".into();
+        api.channel = "stable".into();
+        assert!(
+            f.control
+                .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
+                .await
+                .is_err()
+        );
+        assert_eq!(f.control.component("bot").await.unwrap().channel, "latest");
+        assert_eq!(
+            f.control
+                .component("bot")
+                .await
+                .unwrap()
+                .candidate
+                .unwrap()
+                .digest,
+            before_bot.candidate.as_ref().unwrap().digest
+        );
+        let lease_owner = owner.clone();
+        f.control
+            .db
+            .with_conn(move |conn| {
+                conn.execute_rows(
+                    "UPDATE component_updates SET lease_owner=?1,lease_until=?2 WHERE component='api'",
+                    params![lease_owner, 1_000_i64],
+                    1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        f.control
+            .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
+            .await
+            .unwrap();
+        let saved_bot = f.control.component("bot").await.unwrap();
+        let saved_api = f.control.component("api").await.unwrap();
+        assert_eq!(saved_bot.channel, "stable");
+        assert_eq!(saved_api.channel, "stable");
+        assert_eq!(saved_bot.cadence, "off");
+        assert_eq!(saved_api.cadence, "off");
+        assert_eq!(saved_bot.candidate.unwrap().digest, bot.digest);
+        assert_eq!(saved_api.candidate.unwrap().digest, api.digest);
+        f.control.release_pair_check(&owner).await.unwrap();
     }
 
     #[tokio::test]
@@ -861,123 +1116,6 @@ mod tests {
             .await
             .unwrap();
         assert!(Db::open_with(f.opts.clone()).is_err());
-    }
-
-    #[tokio::test]
-    async fn pair_check_commits_both_services_or_leaves_the_previous_selection() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        let before_bot = f.control.component("bot").await.unwrap();
-        let before_api = f.control.component("api").await.unwrap();
-        let held = "ab".repeat(16);
-        assert!(
-            claim_update_lease(&f.control.db, "api", &held, 100, 240)
-                .await
-                .unwrap()
-        );
-        assert!(f.control.acquire_pair_check(100).await.is_err());
-        assert_eq!(
-            f.control
-                .component("bot")
-                .await
-                .unwrap()
-                .candidate
-                .unwrap()
-                .digest,
-            before_bot.candidate.as_ref().unwrap().digest
-        );
-        release_update_lease(&f.control.db, "api", &held)
-            .await
-            .unwrap();
-        assert!(
-            claim_update_lease(&f.control.db, "bot", &"ef".repeat(16), 100, 60)
-                .await
-                .unwrap(),
-            "a failed pair-check admission must not keep the bot lease"
-        );
-        release_update_lease(&f.control.db, "bot", &"ef".repeat(16))
-            .await
-            .unwrap();
-
-        let owner = f.control.acquire_pair_check(100).await.unwrap();
-        let mut bot = before_bot.candidate.clone().unwrap();
-        let mut api = before_api.candidate.clone().unwrap();
-        bot.digest = format!("sha256:{}", "1".repeat(64));
-        api.digest = format!("sha256:{}", "2".repeat(64));
-        api.source_sha = "f".repeat(40);
-        assert!(
-            f.control
-                .record_pair_check(&owner, "latest", bot.clone(), api.clone(), 100)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            f.control
-                .component("bot")
-                .await
-                .unwrap()
-                .candidate
-                .unwrap()
-                .digest,
-            before_bot.candidate.as_ref().unwrap().digest
-        );
-        api.source_sha = bot.source_sha.clone();
-        f.control
-            .db
-            .with_conn(|conn| {
-                conn.execute_rows(
-                    "UPDATE component_updates SET lease_owner=?1 WHERE component='api'",
-                    params!["cd".repeat(16)],
-                    1,
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        bot.channel = "stable".into();
-        api.channel = "stable".into();
-        assert!(
-            f.control
-                .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
-                .await
-                .is_err()
-        );
-        assert_eq!(f.control.component("bot").await.unwrap().channel, "latest");
-        assert_eq!(
-            f.control
-                .component("bot")
-                .await
-                .unwrap()
-                .candidate
-                .unwrap()
-                .digest,
-            before_bot.candidate.as_ref().unwrap().digest
-        );
-        let lease_owner = owner.clone();
-        f.control
-            .db
-            .with_conn(move |conn| {
-                conn.execute_rows(
-                    "UPDATE component_updates SET lease_owner=?1,lease_until=?2 WHERE component='api'",
-                    params![lease_owner, 1_000_i64],
-                    1,
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        f.control
-            .record_pair_check(&owner, "stable", bot.clone(), api.clone(), 100)
-            .await
-            .unwrap();
-        let saved_bot = f.control.component("bot").await.unwrap();
-        let saved_api = f.control.component("api").await.unwrap();
-        assert_eq!(saved_bot.channel, "stable");
-        assert_eq!(saved_api.channel, "stable");
-        assert_eq!(saved_bot.cadence, "off");
-        assert_eq!(saved_api.cadence, "off");
-        assert_eq!(saved_bot.candidate.unwrap().digest, bot.digest);
-        assert_eq!(saved_api.candidate.unwrap().digest, api.digest);
-        f.control.release_pair_check(&owner).await.unwrap();
     }
 
     #[tokio::test]

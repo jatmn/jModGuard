@@ -243,11 +243,30 @@ JS
       --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
     )
     if [[ -f "$context/src/db/update_control.rs" ]]; then
-      local guild_schema
+      local guild_schema control_protocol launcher_revision min_launcher_revision
+      read -r control_protocol launcher_revision min_launcher_revision < <(node - "$context/src/db/update_control.rs" <<'JS'
+const fs = require("node:fs");
+const source = fs.readFileSync(process.argv[2], "utf8");
+function number(name, fallback) {
+  const match = source.match(new RegExp(`pub const ${name}: u32 = ([0-9]+);`));
+  if (!match && fallback === undefined) throw new Error(`missing ${name}`);
+  return match ? Number(match[1]) : fallback;
+}
+const control = number("UPDATE_CONTROL_PROTOCOL");
+const revision = number("LAUNCHER_REVISION", 0);
+const minimum = number("REQUIRED_LAUNCHER_REVISION", 0);
+if (control >= 3 && (!minimum || revision < minimum)) throw new Error("invalid launcher capability contract");
+console.log(control, revision, minimum);
+JS
+) || publish_fail 'cannot determine selected source launcher contract'
+      if [[ "$component" != webui && "$control_protocol" -ge 3 ]]; then
+        args+=(--label "io.jmodguard.launcher-revision=${launcher_revision}"
+          --label "io.jmodguard.min-launcher-revision=${min_launcher_revision}")
+      fi
       guild_schema="$(cat "$context/migrations/guild/current_version.rs")"
       [[ "$guild_schema" =~ ^[1-9][0-9]*$ ]] || publish_fail 'invalid selected guild schema'
       args+=(
-        --label "io.jmodguard.update-control=2"
+        --label "io.jmodguard.update-control=${control_protocol}"
         --label "io.jmodguard.upgrade-min-core=15"
         --label "io.jmodguard.upgrade-min-guild=1"
         --label "io.jmodguard.guild-schema=${guild_schema}"

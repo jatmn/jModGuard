@@ -22,6 +22,47 @@ Bunny selects the base bot/API images. Runtime updates replace executables insid
 
 Launcher updates use the same verified role images and the fixed shell bootstrap. A selected launcher is restored before normal application startup; the stable baked controller can recover applications if a replacement launcher fails. The one-time baseline must include this controller **and** API maintenance mode. Downloaded execution still needs a controlled proof in the actual Magic Container before enabling the update gates.
 
+### Application and launcher updates
+
+**Update** installs the selected bot/API application and automatically installs its
+required launcher first. The launcher supervises startup, update sequencing and
+recovery; it is a separate executable. A different source SHA is not a dependency.
+Administration shows whether the running launcher already supports the release,
+whether a launcher update is required first, or whether a newer launcher is optional.
+Unknown or stale capability is reported explicitly; check the running baseline.
+The expandable **Advanced launcher controls** are only for a deliberate optional
+launcher update. They restart the service but do not install the bundled application.
+A schema-changing application's launcher can be installed independently when its
+control protocol and base ABI are compatible; the application's schema gate does
+not incorrectly disable that launcher step.
+
+Each published service image declares `io.jmodguard.launcher-revision` and
+`io.jmodguard.min-launcher-revision`. The publisher reads `LAUNCHER_REVISION` and
+`REQUIRED_LAUNCHER_REVISION` from the **selected source**, not the publishing checkout.
+Maintainers increment the launcher revision for launcher behavior/fix changes, and
+raise the required minimum when a release depends on that behavior (including a
+required updater safety fix). Routine application-only changes keep the minimum.
+The bundled launcher must satisfy the minimum. The running launcher checks its own
+compiled revision before every managed application start, including cold restore
+and rollback; a historical installed-launcher row is never proof of capability.
+The replacement verifies its compiled revision against the pinned release before
+recording activation. A failed prerequisite leaves the application uninstalled;
+retry explicitly, or use paired recovery after a schema transition.
+
+Install the **launcher-aware protocol-3 baseline** once in both Bunny containers.
+If adopting the paired-update work and this follow-up together, wait for both to
+merge/publish and perform that single baseline rollout. Protocol-2 launchers cannot
+coordinate these requirements and reject protocol-3 releases; upgrading only the
+WebUI does not change that. New controllers can restore existing protocol-2
+application selections, but new upgrade admissions require the launcher-aware
+contract. Shell handoff protocol 1 and the durable control tables/phase names remain
+unchanged. Per-role `component_baked_compatibility_*_v1` meta records bind the
+baked application's core/guild schemas to its base SHA. Only the actual baked
+controller initializes them; downloaded launchers retain them for cancellation,
+restore and truthful observations even when compiled for a newer app schema.
+Future migrations must retain these records too. This does not make an incompatible future control protocol or base OS
+replaceable through an application download.
+
 For a dashboard-selected bot/API image, the running source SHA can match the checked release without a managed-install digest. Administration reports **no source update (image digest unverified)** in that case. Discord Stats shows ⚠️ for the same state. `first seen`/`Uptime` describe the observed process age; a managed release install time remains unknown until this updater installs one. The status does not claim byte or OCI digest equality for a manually selected image.
 
 The update policy supports Off, Daily, Weekly, and Monthly UTC windows for promoted channels. `latest` allows owner-requested installs only; it cannot be assigned an automatic cadence. A missed hourly poll may run once in its current window. The same failed digest is never retried unattended; the owner can request it again. **Automatic installation is disabled by default** (`JMODGUARD_UNATTENDED_UPDATES` unset or `0`) and remains off while this repository is private. The separate `JMODGUARD_UPDATE_APPLY_ENABLED` and per-container `JMODGUARD_SELF_UPDATE` gates also default off. Do not enable them until the controlled Bunny rollout has passed. Stable/Nightly Git branches and their promotion policy are future work.
@@ -34,13 +75,13 @@ Independent application switches require the current application, candidate, and
 
 For a core or guild schema change, use **Update bot and API together / recovery** in Administration. This opens `/api/service-upgrade/recovery` through the existing `/api*` proxy on the public WebUI host and uses the existing Discord owner login. Check a matching pair, inspect its source SHA and two pinned image digests, and confirm the interruption. Changes to either service publish both service images so an API-only or bot-only forward fix has a matching pair. The API resolves the counterpart from the same full source-SHA tag. The channel and checked candidate for both services are stored in one step, and that check holds both update leases so it cannot overlap Administration discovery. If either image is missing, neither selection changes and nothing is stopped.
 
-The durable operation prepares and verifies both executables, stops and reaps the old API, stops and reaps the old bot, records an irreversible migration boundary, starts the new bot, then starts the matching API only after bot readiness. Completion requires both readiness markers. Closing the browser does not cancel it. A restarted controller invalidates its local staging/stop acknowledgements and resumes the operation; heartbeat expiry is never evidence of shutdown. Run **one container per role** against the shared core and guild stores; overlapping replicas or other writers are not supported by this protocol.
+The durable operation first hands off any required launcher before that role acknowledges preparation, then prepares and verifies both application executables, stops and reaps the old API, stops and reaps the old bot, records an irreversible migration boundary, starts the new bot, then starts the matching API only after bot readiness. Completion requires both readiness markers. Closing the browser does not cancel it. A restarted controller invalidates its local staging/stop acknowledgements and resumes the operation; heartbeat expiry is never evidence of shutdown. Run **one container per role** against the shared core and guild stores; overlapping replicas or other writers are not supported by this protocol.
 
 If preparation or startup fails, both applications stop and the API's restricted maintenance mode retains the recovery page and `/health`. The page opens only the stable update-control tables, not application or guild state. Sign in again if the API restarted. Before the irreversible boundary, **Cancel before migration** resumes the installed pair. After that boundary, use **Retry selected pair** or check and confirm a compatible newer pair. Recovery never downgrades core/guild stores or starts pre-migration rollback binaries. A failed selected digest can be retried without rediscovering a moving tag; a different pair requires a fresh check. A stopped application's stale heartbeat does not prevent an explicitly confirmed recovery, because both controllers must still prepare and acknowledge the new operation.
 
 After the baseline rollout, supported application/schema upgrades and container restarts use this flow without manually reloading Bunny images. The boundary remains the installed Linux/amd64 base ABI, stable control protocol, fixed bootstrap, and working configuration/credentials. This cannot replace Debian/system libraries, repair unavailable database credentials or external stores, or change platform settings. Such changes still require operator deployment. No Bunny management credential is stored.
 
-Future migrations must preserve the `component_updates` column contract and the versioned `meta.component_upgrade_v1` control record. Keep update-control protocol 2 and its migration-origin labels truthful; changing these contracts requires an explicitly compatible baseline. Ordinary `Db` startup retains its strict family/version checks.
+Future migrations must preserve the `component_updates` column contract and the versioned `meta.component_upgrade_v1` control record. Keep update-control protocol 3, launcher capability/minimum, and migration-origin labels truthful; changing these contracts requires an explicitly compatible baseline. Ordinary `Db` startup retains its strict family/version checks.
 
 Builds through `a5e02070e9e602cecafd1f0ccbc3d8c5b694e31d` incorrectly advertised
 core schema 15 even after migration 0016 was added. Updating the bot alone could
@@ -74,7 +115,7 @@ For prompt production cutover, configure a Bunny Edge Rule with zero or short ca
 
 1. Confirm the new WebUI GHCR package and bot/API release images can be read anonymously at `latest` and at each image's own full source-SHA tag. Check each image's source, component, publication-time, and compatibility labels. A trusted `main` publication is sufficient; Buildkite does not publish from PR builds.
 2. Configure the three Storage values on the **existing API container**, and configure short caching for the mutable HTML paths. Preserve the existing API origin routing and session cookies.
-3. For the one-time baseline, stop the old API and bot, select matching new images by full source SHA, start the bot and verify readiness, then start the API. Leave update gates off while verifying both observations and `/api/service-upgrade/recovery`. Retain matching backups; an old image alone cannot undo a schema migration.
+3. For the one-time baseline, stop the old API and bot, select matching launcher-aware protocol-3 images by full source SHA, start the bot and verify readiness, then start the API. Leave update gates off while verifying both observations and `/api/service-upgrade/recovery`. Retain matching backups; an old image alone cannot undo a schema migration.
 4. Prove an on-demand child switch and launcher handoff with the relevant gates enabled, then a paired update and container restart with cleared ephemeral downloads. Verify ordering, real readiness, and owner recovery after a failed candidate. Test WebUI publication/readback and Discord status. If Bunny's sandbox rejects execution from ephemeral storage, leave runtime self-update off and continue with manual image changes. No disposable Bunny app is required.
 5. Keep `JMODGUARD_UNATTENDED_UPDATES=0` during this private-repository rollout. Define public-repository release promotion separately before enabling any scheduled installation.
 

@@ -53,6 +53,9 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
             "io.jmodguard.result-schema":"15","io.jmodguard.min-api":"1",
             "io.jmodguard.max-api":"1","io.jmodguard.launcher-protocol":"1",
             "io.jmodguard.base-abi":"debian-bookworm-amd64",
+            "io.jmodguard.update-control":"3", "io.jmodguard.upgrade-min-core":"15",
+            "io.jmodguard.upgrade-min-guild":"1", "io.jmodguard.guild-schema":"14",
+            "io.jmodguard.launcher-revision":"7", "io.jmodguard.min-launcher-revision":"4",
             "org.opencontainers.image.revision":sha
         }}
     }))
@@ -104,6 +107,11 @@ async fn channel_move_keeps_approved_digest_and_corrupt_blobs_fail() {
     let registry = Registry::new(&format!("http://{addr}")).unwrap();
     let approved = registry.discover("api", "latest").await.unwrap();
     assert_eq!(approved.channel, "latest");
+    assert_eq!(approved.launcher.as_ref().unwrap().revision, 7);
+    assert_eq!(approved.required_launcher(), 4);
+    assert!(approved.supports_launcher(3).is_err());
+    approved.supports_launcher(4).unwrap();
+    approved.supports_launcher(9).unwrap();
     assert_eq!(approved.digest, old);
     state.write().await.tag = new.clone();
     assert_eq!(
