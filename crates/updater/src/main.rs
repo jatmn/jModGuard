@@ -661,12 +661,14 @@ impl Supervisor {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(error) => {
-                    if let Some(op) = self
-                        .control
-                        .upgrade()
-                        .await?
-                        .filter(|op| op.phase == Phase::Complete)
-                    {
+                    if let Some(op) = self.control.upgrade().await?.filter(|op| {
+                        self.rollback.is_none()
+                            && op.phase == Phase::Complete
+                            && state.installed.as_ref().is_some_and(|release| {
+                                op.service(&self.role)
+                                    .is_ok_and(|service| release.digest == service.release.digest)
+                            })
+                    }) {
                         self.control
                             .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
                             .await?;
@@ -680,13 +682,15 @@ impl Supervisor {
             // After a coordinated migration, never try a previous/baked child.
             if let Some(op) = self.control.upgrade().await?
                 && op.phase == Phase::Complete
-                && state.installed.as_ref().is_some_and(|r| {
-                    r.digest
-                        == op
-                            .service(&self.role)
-                            .map(|s| s.release.digest.as_str())
-                            .unwrap_or("")
-                })
+                && self.rollback.is_none()
+                && self
+                    .running
+                    .as_ref()
+                    .and_then(|child| child.release.as_ref())
+                    .is_some_and(|release| {
+                        op.service(&self.role)
+                            .is_ok_and(|service| release.digest == service.release.digest)
+                    })
             {
                 self.control
                     .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))

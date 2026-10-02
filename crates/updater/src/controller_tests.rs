@@ -962,3 +962,251 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
     drop((bot, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
+
+fn release_at(role: &str, digest_byte: char, schema: i64) -> ComponentRelease {
+    ComponentRelease {
+        component: role.into(),
+        channel: "latest".into(),
+        release_id: "paired-fixture".into(),
+        source_sha: "c".repeat(40),
+        published_at: "2026-10-01T00:00:00Z".into(),
+        image: format!("ghcr.io/jatmn/jmodguard-{role}"),
+        digest: format!("sha256:{}", digest_byte.to_string().repeat(64)),
+        min_schema: schema,
+        max_schema: schema,
+        result_schema: schema,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: Some(db::LauncherCompatibility {
+            revision: db::LAUNCHER_REVISION,
+            min_revision: db::REQUIRED_LAUNCHER_REVISION,
+        }),
+        base_abi: "debian-bookworm-amd64".into(),
+        upgrade: Some(db::UpgradeCompatibility {
+            control_protocol: db::UPDATE_CONTROL_PROTOCOL,
+            min_core: 15,
+            min_guild: 1,
+            guild_schema: db::guild_data::SCHEMA_VERSION,
+        }),
+    }
+}
+
+fn fresh_observation(stamp: i64) -> ComponentObservation {
+    ComponentObservation {
+        source_sha: "d".repeat(40),
+        executable_sha256: "e".repeat(64),
+        admin_sha256: None,
+        base_image_sha: "d".repeat(40),
+        started_at: stamp,
+        min_schema: db::CORE_SCHEMA_VERSION,
+        max_schema: db::CORE_SCHEMA_VERSION,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "debian-bookworm-amd64".into(),
+        guild_schema: Some(db::guild_data::SCHEMA_VERSION),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+        launcher_revision: db::LAUNCHER_REVISION,
+    }
+}
+
+fn assert_complete_unchanged(before: &db::ServiceUpgrade, after: &db::ServiceUpgrade) {
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.phase, Phase::Complete);
+    assert!(
+        after.error.is_none(),
+        "completed upgrade was rewritten: {after:?}"
+    );
+}
+
+/// A finished coordinated upgrade stays in meta. Later independent installs are
+/// allowed because `Complete` is not an active phase.
+async fn completed_coordinated_upgrade(root: &Path) -> (Db, UpdateControl, ComponentRelease) {
+    let stamp = now();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let control = UpdateControl::from_application(&db);
+    let bot = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+    let api = release_at("api", 'b', db::CORE_SCHEMA_VERSION);
+    for item in [&bot, &api] {
+        control
+            .checked(&item.component, "latest", Some(item.clone()), None, stamp)
+            .await
+            .unwrap();
+        control
+            .running(&item.component, None, fresh_observation(stamp), stamp)
+            .await
+            .unwrap();
+    }
+    let op = control
+        .request_upgrade(&bot.digest, &api.digest, false, stamp)
+        .await
+        .unwrap();
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control
+        .running("bot", Some(op.bot.release.clone()), seen, stamp)
+        .await
+        .unwrap();
+    for role in ["bot", "api"] {
+        control.join_upgrade(&op.id, role, role).await.unwrap();
+        control
+            .acknowledge(&op.id, role, role, Ack::Prepared)
+            .await
+            .unwrap();
+    }
+    control
+        .acknowledge(&op.id, "api", "api", Ack::Stopped)
+        .await
+        .unwrap();
+    control
+        .acknowledge(&op.id, "bot", "bot", Ack::Stopped)
+        .await
+        .unwrap();
+    control
+        .acknowledge(&op.id, "bot", "bot", Ack::Starting)
+        .await
+        .unwrap();
+    control
+        .acknowledge(&op.id, "bot", "bot", Ack::Ready)
+        .await
+        .unwrap();
+    control
+        .acknowledge(&op.id, "api", "api", Ack::Starting)
+        .await
+        .unwrap();
+    let done = control
+        .acknowledge(&op.id, "api", "api", Ack::Ready)
+        .await
+        .unwrap();
+    assert_eq!(done.phase, Phase::Complete);
+    assert!(done.error.is_none());
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        op.bot.release.digest
+    );
+    (db, control, op.bot.release)
+}
+
+fn offline_controller(role: &str, control: UpdateControl, root: &Path) -> Supervisor {
+    controller(
+        role,
+        root.join(format!("baked-{role}")),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        root,
+    )
+}
+
+#[tokio::test]
+async fn stale_complete_upgrade_ignores_unrelated_restore_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "stale-complete-restore-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control, coordinated) = completed_coordinated_upgrade(&root).await;
+    let stamp = now();
+    let mut independent = release_at("bot", 'c', db::CORE_SCHEMA_VERSION + 1);
+    independent.source_sha = "d".repeat(40);
+    control
+        .checked("bot", "latest", Some(independent.clone()), None, stamp)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &independent.digest, stamp)
+        .await
+        .unwrap();
+    let seen = control.component("bot").await.unwrap().observed.unwrap();
+    control
+        .running("bot", Some(independent.clone()), seen, stamp)
+        .await
+        .unwrap();
+    let installed = control.component("bot").await.unwrap().installed.unwrap();
+    assert_ne!(installed.digest, coordinated.digest);
+    let before = control.upgrade().await.unwrap().unwrap();
+    assert_eq!(before.phase, Phase::Complete);
+    let mut bot = offline_controller("bot", control.clone(), &root);
+    let error = bot.tick().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("installed application cannot open database"),
+        "{error:#}"
+    );
+    assert_complete_unchanged(&before, &control.upgrade().await.unwrap().unwrap());
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn complete_upgrade_restore_during_rollback_is_not_rewritten() {
+    let root = std::env::temp_dir().join(format!(
+        "complete-rollback-restore-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control, coordinated) = completed_coordinated_upgrade(&root).await;
+    let before = control.upgrade().await.unwrap().unwrap();
+    let mut bot = offline_controller("bot", control.clone(), &root);
+    bot.rollback = Some((coordinated, "previous start failed".into()));
+    let error = bot.tick().await.unwrap_err();
+    assert!(
+        error.to_string().contains("rollback artifact missing"),
+        "{error:#}"
+    );
+    assert_complete_unchanged(&before, &control.upgrade().await.unwrap().unwrap());
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn ready_failure_of_another_release_leaves_complete_upgrade() {
+    let root = std::env::temp_dir().join(format!(
+        "complete-ready-mismatch-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control, coordinated) = completed_coordinated_upgrade(&root).await;
+    let before = control.upgrade().await.unwrap().unwrap();
+    assert_eq!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .installed
+            .unwrap()
+            .digest,
+        coordinated.digest
+    );
+    let mut other = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+    other.source_sha = "d".repeat(40);
+    let mut child = launch(
+        Path::new("/bin/true"),
+        &other.source_sha,
+        Some(other.clone()),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture child did not exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut bot = offline_controller("bot", control.clone(), &root);
+    bot.running = Some(child);
+    let error = bot.tick().await.unwrap_err();
+    assert!(
+        error.to_string().contains("application exited"),
+        "{error:#}"
+    );
+    assert_complete_unchanged(&before, &control.upgrade().await.unwrap().unwrap());
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
