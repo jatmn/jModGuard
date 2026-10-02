@@ -11,13 +11,21 @@ use jmodguard::db::{self, ComponentRelease, Db};
 /// launcher immediately before a switch. An unobserved service cannot prove
 /// that the new binary and the retained rollback binary share an ABI.
 pub async fn compatible(db: &Db, release: &ComponentRelease, now: i64) -> Result<()> {
+    compatible_control(&db::UpdateControl::from_application(db), release, now).await
+}
+
+pub async fn compatible_control(
+    db: &db::UpdateControl,
+    release: &ComponentRelease,
+    now: i64,
+) -> Result<()> {
     release.validate()?;
-    let schema = db::core_schema_version(db).await?;
+    let schema = db.schema_version().await?;
     ensure!(
         schema >= release.min_schema && schema <= release.max_schema,
         "candidate cannot open current database schema"
     );
-    let own = db::component_update(db, &release.component).await?;
+    let own = db.component(&release.component).await?;
     if release.component != "webui" {
         let current = own
             .observed
@@ -43,7 +51,7 @@ pub async fn compatible(db: &Db, release: &ComponentRelease, now: i64) -> Result
         "webui" => "api",
         _ => return Err(anyhow::anyhow!("invalid component")),
     };
-    let counterpart = db::component_update(db, observed_component).await?;
+    let counterpart = db.component(observed_component).await?;
     let observed = counterpart
         .observed
         .context("counterpart release has not been observed")?;
@@ -66,5 +74,22 @@ pub async fn compatible(db: &Db, release: &ComponentRelease, now: i64) -> Result
         observed.api_capability >= release.min_api && observed.api_capability <= release.max_api,
         "candidate requires a different API capability"
     );
+    if release.component != "webui" {
+        let current = own
+            .observed
+            .as_ref()
+            .context("current service is unknown")?;
+        // A guild migration is just as irreversible as a core migration. Legacy
+        // artifacts cannot prove that their guild format matches the baseline.
+        let guild = release
+            .upgrade
+            .as_ref()
+            .context("candidate lacks guild schema metadata; use a coordinated baseline release")?
+            .guild_schema;
+        ensure!(
+            current.guild_schema == Some(guild) && observed.guild_schema == Some(guild),
+            "database schema changes require Update bot and API together"
+        );
+    }
     Ok(())
 }

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>jModGuard service upgrades</title>
+<style>body{font:16px system-ui;max-width:65em;margin:2em auto;padding:0 1em}pre{white-space:pre-wrap;overflow-wrap:anywhere}button,select{font:inherit;margin:.4em;padding:.4em}#error{color:#b21}</style>
+<h1>Update bot and API together</h1>
+<p>Database changes require both services to update. Both releases are downloaded and verified before the API stops. The bot then migrates the databases, and the matching API starts. Expect a brief service interruption and another sign-in.</p>
+<p>After migration starts, recovery uses the selected release or a newer compatible pair. An older release cannot safely be restored. Closing this page does not cancel an upgrade.</p>
+<p><a href="/login?return_to=%2Fapi%2Fservice-upgrade%2Frecovery">Sign in with Discord</a></p>
+<p>This page remains available from the API address if application startup fails. Updates stay inside the containers; they cannot replace the base operating system.</p>
+<p>Checking a pair selects that channel for both services and turns their automatic installation off. If either image is missing, or the check cannot be stored, neither service's channel or candidate changes.</p>
+<label>Release channel <select id="channel"><option value="latest">Latest published build</option><option value="stable">Stable</option><option value="nightly">Nightly</option></select></label>
+<button id="check">Check matching bot/API pair</button>
+<pre id="candidate">Check for a matching pair before confirming.</pre>
+<button id="apply" disabled>Update bot and API together</button>
+<button id="retry" disabled>Retry selected pair</button>
+<button id="cancel" disabled>Cancel before migration</button>
+<p id="error" role="alert"></p><pre id="status" aria-live="polite"></pre>
+<script>
+const $=id=>document.getElementById(id);
+let snapshot=null, selection=null, busy=false;
+async function request(path,body){const response=await fetch(path,{method:body?'POST':'GET',credentials:'same-origin',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}); const data=await response.json();if(!response.ok)throw Error(data.error||'Request failed');return data;}
+function render(){const op=snapshot?.operation, active=op&&!['complete','aborted'].includes(op.phase), stopped=op?.bot.stopped&&op?.api.stopped;
+$('status').textContent=op?`Upgrade ${op.id}\nPhase: ${op.phase}\n${op.error||''}\nBot: ${op.bot.release.source_sha}\nAPI: ${op.api.release.source_sha}`:'No coordinated upgrade is running.';
+$('apply').disabled=busy||!snapshot?.apply_enabled||!selection||(active&&!(op.error&&stopped));
+$('retry').disabled=busy||!snapshot?.apply_enabled||!active||!op.error||!stopped;
+$('cancel').disabled=busy||!active||op.irreversible;
+$('check').disabled=busy;
+}
+async function refresh(){snapshot=await request('/api/service-upgrade');render();}
+async function act(work){busy=true;render();$('error').textContent='';try{await work();await refresh();}catch(e){$('error').textContent=e.message;}finally{busy=false;render();}}
+$('check').onclick=()=>act(async()=>{selection=null;const data=await request('/api/service-upgrade/check',{channel:$('channel').value});const bot=data.components.find(x=>x.component==='bot').candidate,api=data.components.find(x=>x.component==='api').candidate;if(!bot||!api||bot.source_sha!==api.source_sha)throw Error('Matching pair changed; check again.');selection={bot_digest:bot.digest,api_digest:api.digest};$('candidate').textContent=`Source: ${bot.source_sha}\nCore schema: ${data.core_schema} → ${bot.result_schema}\nGuild schema target: ${bot.upgrade?.guild_schema??'unsupported'}\nBot digest: ${bot.digest}\nAPI digest: ${api.digest}`;});
+$('apply').onclick=()=>{if(confirm('Update BOTH bot and API to the displayed pair? Services will stop briefly. Once migration starts, only forward recovery is allowed.'))act(()=>request('/api/service-upgrade',{...selection,confirmed:true,recover:true}));};
+$('retry').onclick=()=>{const op=snapshot.operation;if(confirm('Retry the selected bot/API pair?'))act(()=>request('/api/service-upgrade',{bot_digest:op.bot.release.digest,api_digest:op.api.release.digest,confirmed:true,recover:true}));};
+$('cancel').onclick=()=>act(()=>request('/api/service-upgrade/cancel',{id:snapshot.operation.id}));
+refresh().catch(e=>$('error').textContent=e.message);setInterval(()=>{if(!busy)refresh().catch(e=>$('error').textContent=e.message);},5000);
+</script></html>

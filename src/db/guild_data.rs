@@ -4,7 +4,8 @@ use super::write_budget::BoundedWrites;
 use super::*;
 
 const FAMILY: &str = "jmodguard-guild-1";
-const VERSION: i64 = include!("../../migrations/guild/current_version.rs");
+pub const SCHEMA_VERSION: i64 = include!("../../migrations/guild/current_version.rs");
+const VERSION: i64 = SCHEMA_VERSION;
 const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
 
 const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");

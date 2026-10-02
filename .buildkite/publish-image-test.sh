@@ -222,6 +222,51 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
 contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
   && fail 'Stable pointer must move only after verification'
 
+# Every component must describe the core schema in the selected build source.
+# Migration 0016 is already active; advertising 15 admitted a bot-only migration
+# and then stranded the old API behind the same compatibility check.
+for component in bot api webui; do
+  readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" .)
+  for field in min-schema max-schema result-schema; do
+    contains_arg "io.jmodguard.${field}=16" "${schema_args[@]}" \
+      || fail "${component} must advertise current schema16 (${field})"
+  done
+done
+
+# Migration origins are distinct from exact application runtime ranges.
+for field in update-control=2 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=14; do
+  contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
+done
+
+# Publishing an older source must keep its schema, not the publisher's schema.
+schema_source="$(mktemp -d)"
+mkdir -p "$schema_source/src"
+sed '/include_str!("..\/migrations\/0016_/d' src/db.rs >"$schema_source/src/db.rs"
+readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source")
+contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
+
+for field in min-schema max-schema result-schema; do
+  contains_arg "io.jmodguard.${field}=15" "${old_schema_args[@]}" \
+    || fail "historical source must retain schema15 (${field})"
+done
+# The pre-fix schema16 source had literal schema15 launcher observations.
+# Republishing it may produce a dashboard image, never an eligible launcher.
+cp src/db.rs "$schema_source/src/db.rs"
+mkdir -p "$schema_source/crates/updater/src"
+printf 'min_schema: 15,\nmax_schema: 15,\n' >"$schema_source/crates/updater/src/main.rs"
+for component in bot api; do
+  readarray -d '' -t broken_launcher_args < <(build_args "$component" "$BASE_SHA" "" "$schema_source")
+  contains_arg "io.jmodguard.result-schema=16" "${broken_launcher_args[@]}" \
+    || fail 'historical schema16 labels must remain truthful'
+  contains_arg "io.jmodguard.launcher-protocol=1" "${broken_launcher_args[@]}" \
+    && fail 'historical schema15-reporting launcher must not be installable on schema16'
+done
+printf 'invalid source\n' >"$schema_source/src/db.rs"
+if (build_args bot "$HEAD_SHA" "" "$schema_source") >/dev/null 2>&1; then
+  fail 'unknown schema must not produce installable image labels'
+fi
+rm -rf "$schema_source"
+
 reload_publisher() {
   # shellcheck disable=SC1091
   JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/.buildkite/publish-image.sh"
@@ -279,7 +324,8 @@ mock_publish_helpers() {
           mkdir -p "$4"
           cp "$root/Dockerfile.bot" "$root/Dockerfile.api" "$4/"
           if [[ "$SOURCE_LAYOUT" == current ]]; then
-            mkdir -p "$4/scripts" "$4/crates/updater/src"
+            mkdir -p "$4/scripts" "$4/crates/updater/src" "$4/src"
+            cp "$root/src/db.rs" "$4/src/"
             cp "$root/scripts/bootstrap-container.sh" "$root/scripts/package-webui.mjs" "$4/scripts/"
             cp "$root/crates/updater/src/main.rs" "$4/crates/updater/src/"
             cp "$root/Dockerfile.webui" "$4/"
@@ -735,8 +781,8 @@ while IFS='|' read -r path affected; do
     [[ "$actual" == "$expected" ]] || fail "$component after $path: expected $expected, got $actual"
   done
 done <<'CASES'
-crates/bot/src/main.rs|bot
-crates/api/src/web/api.rs|api
+crates/bot/src/main.rs|bot api
+crates/api/src/web/api.rs|bot api
 crates/integration-tests/tests/dual_process_smoke.rs|
 crates/api/tests/tokenless_startup.rs|
 crates/updater/tests/registry.rs|
@@ -746,7 +792,9 @@ crates/updater/build.rs|bot api
 migrations/guild/0001_identity.sql|bot api
 migrations/0012_guild_moves.sql|bot api
 src/lib.rs|bot api
+src/db.rs|bot api webui
 vendor/tokio-tungstenite/src/lib.rs|bot api
+src/db.rs|bot api webui
 crates/runtime/Cargo.toml|bot api
 Cargo.toml|bot api
 Cargo.lock|bot api

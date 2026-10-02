@@ -126,8 +126,8 @@ commits, not just the last commit in a push:
 
 | Changed input | Images rebuilt on ordinary main publication |
 | --- | --- |
-| Bot source | Bot |
-| API source | API |
+| Bot source | Bot and API |
+| API source | Bot and API |
 | Shared core, runtime, updater, migrations or vendor | Bot and API |
 | Standalone crate tests | None |
 | Root frontend or WebUI packager | WebUI |
@@ -136,6 +136,8 @@ commits, not just the last commit in a push:
 | Publisher script or root Docker ignore file | Bot, API and WebUI |
 | Check selector, CI test fixtures or docs | None |
 
+Bot/API production-source changes publish a matching pair at the same source SHA,
+including API-only or bot-only forward fixes needed by owner recovery.
 Bot/API Dockerfiles copy the workspace for Cargo resolution, but do not link
 other services or integration tests into their production executables. All
 workspace manifests remain shared inputs because they affect resolution. Their

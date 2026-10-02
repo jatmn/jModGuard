@@ -1,12 +1,12 @@
-//! Role-specific application supervisor. Bunny still selects the base image
-//! manually; this process can replace only the child executable after the
-//! explicit deployment gate is enabled.
+//! Role-specific application supervisor with durable paired schema upgrades.
 use anyhow::{Context, Result, bail, ensure};
+use db::{UpdateControl, UpgradeAcknowledgement as Ack, UpgradePhase as Phase};
 use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
-use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
+use jmodguard::db::{self, ComponentObservation, ComponentRelease};
+#[cfg(test)]
 use jmodguard_updater::compatible;
+use jmodguard_updater::compatible_control;
 use jmodguard_updater::oci::{Registry, sha256_hex};
-use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,12 +14,6 @@ use tokio::process::{Child, Command};
 
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-
-#[derive(Debug, PartialEq, Eq)]
-enum ServiceReadiness {
-    Ready,
-    Shutdown,
-}
 
 struct Running {
     child: Child,
@@ -61,11 +55,24 @@ async fn launch(
     source_sha: &str,
     release: Option<ComponentRelease>,
 ) -> Result<Running> {
+    launch_mode(path, source_sha, release, false).await
+}
+
+async fn launch_mode(
+    path: &Path,
+    source_sha: &str,
+    release: Option<ComponentRelease>,
+    maintenance: bool,
+) -> Result<Running> {
     let ready_file = ready_path();
     let bytes = tokio::fs::read(path).await?;
     let hash = sha256_hex(&bytes);
     let child = Command::new(path)
         .env("JMODGUARD_READY_FILE", &ready_file)
+        .env(
+            "JMODGUARD_UPDATE_MAINTENANCE",
+            if maintenance { "1" } else { "0" },
+        )
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to launch {}", path.display()))?;
@@ -80,42 +87,6 @@ async fn launch(
     })
 }
 
-async fn wait_ready(running: &mut Running, timeout: Option<Duration>) -> Result<()> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = running.child.try_wait()? {
-            bail!("child exited before readiness: {status}");
-        }
-        if tokio::fs::metadata(&running.ready_file).await.is_ok() {
-            return Ok(());
-        }
-        if let Some(limit) = timeout {
-            ensure!(
-                start.elapsed() < limit,
-                "replacement child readiness timed out"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-/// The baked or prior service already owns the container's process-local
-/// health listener. Wait for its real readiness without a cutover deadline;
-/// a delayed Discord Gateway Ready must not kill an otherwise live bot.
-async fn wait_service_ready(
-    running: &mut Running,
-    shutdown: impl Future<Output = ()>,
-) -> Result<ServiceReadiness> {
-    let outcome = tokio::select! {
-        result = wait_ready(running, None) => { result?; ServiceReadiness::Ready },
-        _ = shutdown => ServiceReadiness::Shutdown,
-    };
-    if outcome == ServiceReadiness::Shutdown {
-        stop(running).await?;
-    }
-    Ok(outcome)
-}
-
 async fn stop(running: &mut Running) -> Result<()> {
     if let Some(pid) = running.child.id() {
         // A child handles SIGTERM through the shared shutdown latch. The
@@ -125,17 +96,22 @@ async fn stop(running: &mut Running) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    if tokio::time::timeout(Duration::from_secs(30), running.child.wait())
-        .await
-        .is_err()
-    {
-        running.child.kill().await?;
+    match tokio::time::timeout(Duration::from_secs(30), running.child.wait()).await {
+        Ok(result) => {
+            result?;
+        }
+        Err(_) => running.child.kill().await?,
     }
     let _ = tokio::fs::remove_file(&running.ready_file).await;
     Ok(())
 }
 
-async fn stage(registry: &Registry, release: &ComponentRelease, name: &str) -> Result<PathBuf> {
+async fn stage(
+    registry: &Registry,
+    release: &ComponentRelease,
+    name: &str,
+    dir: &Path,
+) -> Result<PathBuf> {
     let path = format!("usr/local/bin/{name}");
     let files = registry
         .files(release, &[&path, "usr/local/share/jmodguard/files.sha256"])
@@ -160,7 +136,6 @@ async fn stage(registry: &Registry, release: &ComponentRelease, name: &str) -> R
         "executable does not match image file inventory"
     );
     // PID 1 reads only this fixed directory; TMPDIR is allowed to differ.
-    let dir = PathBuf::from("/tmp/jmodguard-updates");
     tokio::fs::create_dir_all(&dir).await?;
     let target = dir.join(format!("{}-{hash}", release.component));
     let temp = dir.join(format!(".stage-{:032x}", rand::random::<u128>()));
@@ -174,311 +149,848 @@ async fn stage(registry: &Registry, release: &ComponentRelease, name: &str) -> R
     Ok(target)
 }
 
-async fn database(role: &str) -> Result<Db> {
-    let opts = if role == "bot" {
-        BotProcessConfig::load()?.db_open_options()
-    } else {
-        ApiProcessConfig::load()?.db_open_options()
-    };
-    let (attempts, delay) = db::startup_open_retry(&opts);
-    Db::open_with_until_ready(opts, attempts, delay).await
-}
-
 fn observation(running: &Running, base_sha: &str) -> ComponentObservation {
     ComponentObservation {
+        guild_schema: Some(
+            running
+                .release
+                .as_ref()
+                .and_then(|release| release.upgrade.as_ref())
+                .map_or(db::guild_data::SCHEMA_VERSION, |upgrade| {
+                    upgrade.guild_schema
+                }),
+        ),
+        update_protocol: db::UPDATE_CONTROL_PROTOCOL,
         source_sha: running.source_sha.clone(),
         executable_sha256: running.executable_sha256.clone(),
         admin_sha256: None,
         base_image_sha: base_sha.into(),
         started_at: running.started_at,
-        min_schema: 15,
-        max_schema: 15,
+        min_schema: running
+            .release
+            .as_ref()
+            .map_or(db::CORE_SCHEMA_VERSION, |release| release.min_schema),
+        max_schema: running
+            .release
+            .as_ref()
+            .map_or(db::CORE_SCHEMA_VERSION, |release| release.max_schema),
         api_capability: 1,
         self_update_enabled: update_enabled(),
         base_abi: std::env::var("JMODGUARD_BASE_ABI").unwrap_or_else(|_| "unknown".into()),
     }
 }
 
-async fn maybe_update_launcher(
-    db: &Db,
-    registry: &Registry,
-    role: &str,
-    state: &db::ComponentUpdate,
-) -> Result<bool> {
-    let Some(release) = &state.desired_launcher else {
-        return Ok(false);
-    };
-    if state
-        .installed_launcher
-        .as_ref()
-        .is_some_and(|v| v.digest == release.digest)
-    {
-        return Ok(false);
+fn deployment_observation(
+    running: &Running,
+    base_sha: &str,
+    base_abi: &str,
+    enabled: bool,
+) -> ComponentObservation {
+    let mut seen = observation(running, base_sha);
+    seen.base_abi = base_abi.into();
+    seen.self_update_enabled = enabled;
+    seen
+}
+
+/// Local process ownership plus the durable paired operation. One container per
+/// role is required; an expired heartbeat never stands in for a reaped child.
+struct Supervisor {
+    role: String,
+    base_sha: String,
+    base_abi: String,
+    enabled: bool,
+    baked: PathBuf,
+    registry: Registry,
+    control: UpdateControl,
+    instance: String,
+    running: Option<Running>,
+    maintenance: Option<Running>,
+    health: Option<tokio::task::JoinHandle<Result<()>>>,
+    health_bind: Option<String>,
+    staging: PathBuf,
+    prepared: Option<(String, PathBuf)>,
+    standby: Option<(PathBuf, String, Option<ComponentRelease>)>,
+    // Failed independent selection awaiting verified prior-service readiness.
+    rollback: Option<(ComponentRelease, String)>,
+    reported: bool,
+    last_observed: Option<Instant>,
+}
+
+impl Supervisor {
+    async fn idle(&mut self) -> Result<()> {
+        if self.running.is_some() {
+            return Ok(());
+        }
+        if self.role == "api" {
+            if let Some(child) = self.maintenance.as_mut()
+                && child.child.try_wait()?.is_some()
+            {
+                self.maintenance = None;
+            }
+            if self.maintenance.is_none() {
+                self.maintenance =
+                    Some(launch_mode(&self.baked, &self.base_sha, None, true).await?);
+            }
+        } else if self.health.is_none()
+            && let Some(bind) = &self.health_bind
+        {
+            let listener = jmodguard::health::bind(bind).await?;
+            self.health = Some(tokio::spawn(jmodguard::health::serve_listener(listener)));
+        }
+        Ok(())
     }
-    ensure!(
-        release.component == role && release.launcher_protocol == 1,
-        "incompatible release role or launcher protocol"
-    );
-    compatible(db, release, now()).await?;
-    let path = stage(registry, release, "jmodguard-launcher").await?;
-    let hash = sha256_hex(&tokio::fs::read(&path).await?);
-    let control = PathBuf::from("/tmp/jmodguard-launcher-next");
-    let contents = format!("{}\n{}\n{}\n", path.display(), hash, release.digest);
-    tokio::fs::write(&control, contents).await?;
-    Ok(true)
+
+    async fn end_idle(&mut self) -> Result<()> {
+        if let Some(mut child) = self.maintenance.take() {
+            stop(&mut child).await?;
+        }
+        if let Some(task) = self.health.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    async fn stop_application(&mut self) -> Result<()> {
+        // Keep ownership until reaping succeeds. No acknowledgement on error.
+        if let Some(child) = self.running.as_mut() {
+            stop(child).await?;
+        }
+        self.running = None;
+        self.reported = false;
+        self.idle().await
+    }
+
+    async fn start(
+        &mut self,
+        path: &Path,
+        sha: &str,
+        release: Option<ComponentRelease>,
+    ) -> Result<()> {
+        self.end_idle().await?;
+        self.running = Some(launch(path, sha, release).await?);
+        self.reported = false;
+        self.last_observed = None;
+        Ok(())
+    }
+
+    async fn report_ready(&mut self) -> Result<bool> {
+        let Some(child) = self.running.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(status) = child.child.try_wait()? {
+            bail!("application exited: {status}");
+        }
+        if tokio::fs::metadata(&child.ready_file).await.is_err() {
+            ensure!(
+                self.rollback.is_some()
+                    || child.release.is_none()
+                    || now().saturating_sub(child.started_at) < READY_TIMEOUT.as_secs() as i64,
+                "replacement child readiness timed out"
+            );
+            return Ok(false);
+        }
+        if self.reported {
+            if self
+                .last_observed
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
+            {
+                match self
+                    .control
+                    .running(
+                        &self.role,
+                        None,
+                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        now(),
+                    )
+                    .await
+                {
+                    Ok(()) => self.last_observed = Some(Instant::now()),
+                    Err(error) => tracing::warn!("release heartbeat failed: {error:#}"),
+                }
+            }
+        } else {
+            if let Some((failed, error)) = &self.rollback {
+                self.control
+                    .rolled_back(
+                        &self.role,
+                        failed,
+                        child.release.clone(),
+                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        error,
+                        now(),
+                    )
+                    .await?;
+                self.rollback = None;
+                self.standby = None;
+            } else if child.release.is_none() {
+                self.control
+                    .baked_running(
+                        &self.role,
+                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        now(),
+                    )
+                    .await?;
+            } else {
+                self.control
+                    .running(
+                        &self.role,
+                        child.release.clone(),
+                        deployment_observation(child, &self.base_sha, &self.base_abi, self.enabled),
+                        now(),
+                    )
+                    .await?;
+            }
+            self.reported = true;
+            self.last_observed = Some(Instant::now());
+        }
+        Ok(true)
+    }
+
+    async fn pair(&mut self, id: &str) -> Result<()> {
+        let op = self
+            .control
+            .join_upgrade(id, &self.role, &self.instance)
+            .await?;
+        // Pending independent recovery can resume if this reversible pair is
+        // cancelled. No prior artifacts may survive the migration fence.
+        if op.irreversible || self.rollback.is_none() {
+            self.standby = None;
+            self.rollback = None;
+        }
+        if op.error.is_some() {
+            self.stop_application().await?;
+            if !op.service(&self.role)?.stopped {
+                self.control
+                    .acknowledge(id, &self.role, &self.instance, Ack::Stopped)
+                    .await?;
+            }
+            return Ok(());
+        }
+        let target = op.service(&self.role)?.release.clone();
+        ensure!(
+            self.enabled,
+            "self-update was disabled during the paired upgrade"
+        );
+        ensure!(
+            target.base_abi == self.base_abi,
+            "paired release requires a different base ABI"
+        );
+        if self
+            .prepared
+            .as_ref()
+            .is_none_or(|(prepared_id, _)| prepared_id != id)
+        {
+            let path = stage(
+                &self.registry,
+                &target,
+                &format!("jmodguard-{}", self.role),
+                &self.staging,
+            )
+            .await?;
+            self.prepared = Some((id.into(), path));
+        }
+        if !op.service(&self.role)?.prepared {
+            self.control
+                .acknowledge(id, &self.role, &self.instance, Ack::Prepared)
+                .await?;
+            return Ok(());
+        }
+        let must_stop = match self.role.as_str() {
+            "api" => matches!(
+                op.phase,
+                Phase::StoppingApi | Phase::StoppingBot | Phase::StartingBot
+            ),
+            _ => op.phase == Phase::StoppingBot,
+        };
+        if must_stop {
+            self.stop_application().await?;
+            // Repeated acknowledgements also advance a phase whose other
+            // participant restarted and has just re-established its evidence.
+            self.control
+                .acknowledge(id, &self.role, &self.instance, Ack::Stopped)
+                .await?;
+            return Ok(());
+        }
+        let may_start = (self.role == "bot"
+            && op.phase == Phase::StartingBot
+            && op.api.stopped
+            && op.api.prepared)
+            || (self.role == "api" && op.phase == Phase::StartingApi && op.bot.ready);
+        if may_start && self.running.is_none() {
+            // Atomic reservation persists the irreversible fence BEFORE spawn.
+            // A recovery request cannot replace this operation until we reap.
+            self.control
+                .acknowledge(id, &self.role, &self.instance, Ack::Starting)
+                .await?;
+            self.standby = None;
+            self.rollback = None;
+            let path = self
+                .prepared
+                .as_ref()
+                .context("release was not prepared")?
+                .1
+                .clone();
+            self.start(&path, &target.source_sha, Some(target.clone()))
+                .await?;
+            return Ok(());
+        }
+        // Preparation owns desired; publishing an independent rollback here
+        // could clear an explicitly retried pair with the same failed digest.
+        if self.rollback.is_none() && self.report_ready().await? && may_start {
+            self.control
+                .acknowledge(id, &self.role, &self.instance, Ack::Ready)
+                .await?;
+        }
+        self.idle().await
+    }
+
+    async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
+        if let Some((failed, error)) = self.rollback.clone() {
+            return self.rollback_independent(state, failed, error).await;
+        }
+        // One-time deployment of this baseline replaces pre-protocol selections
+        // whose metadata caused the schema15/16 lockout. Operators stop both old
+        // services for this rollout. Never discard a protocol-2 managed selection.
+        let legacy_baseline = state
+            .observed
+            .as_ref()
+            .is_none_or(|seen| seen.update_protocol == 0)
+            && state
+                .installed
+                .as_ref()
+                .is_none_or(|release| release.upgrade.is_none())
+            && self.control.upgrade().await?.is_none();
+        let schema = self.control.schema_version().await?;
+        if legacy_baseline
+            && ((self.role == "bot" && schema <= db::CORE_SCHEMA_VERSION)
+                || schema == db::CORE_SCHEMA_VERSION)
+        {
+            let path = self.baked.clone();
+            let sha = self.base_sha.clone();
+            return self.start(&path, &sha, None).await;
+        }
+        if let Some(release) = &state.installed {
+            let schema = self.control.schema_version().await?;
+            ensure!(
+                schema >= release.min_schema && schema <= release.max_schema,
+                "installed application cannot open database; use owner recovery"
+            );
+            ensure!(
+                release.base_abi == self.base_abi,
+                "installed application requires a different base ABI"
+            );
+            let path = stage(
+                &self.registry,
+                release,
+                &format!("jmodguard-{}", self.role),
+                &self.staging,
+            )
+            .await?;
+            self.start(&path, &release.source_sha, Some(release.clone()))
+                .await?;
+        } else {
+            ensure!(
+                self.control.schema_version().await? == db::CORE_SCHEMA_VERSION,
+                "baked application cannot open database; use owner recovery"
+            );
+            let path = self.baked.clone();
+            let sha = self.base_sha.clone();
+            self.start(&path, &sha, None).await?;
+        }
+        Ok(())
+    }
+
+    async fn launcher(&mut self, state: &db::ComponentUpdate) -> Result<bool> {
+        let Some(release) = state
+            .desired_launcher
+            .as_ref()
+            .or(state.installed_launcher.as_ref())
+        else {
+            return Ok(false);
+        };
+        if std::env::var("JMODGUARD_LAUNCHER_RELEASE").as_deref() == Ok(&release.digest)
+            || std::env::var("JMODGUARD_LAUNCHER_FAILED").as_deref() == Ok(&release.digest)
+        {
+            return Ok(false);
+        }
+        ensure!(
+            release.component == self.role
+                && release.launcher_protocol == 1
+                && release
+                    .upgrade
+                    .as_ref()
+                    .is_some_and(|v| v.control_protocol == db::UPDATE_CONTROL_PROTOCOL)
+                && release.base_abi == self.base_abi,
+            "launcher does not support this control protocol/base runtime"
+        );
+        let path = stage(&self.registry, release, "jmodguard-launcher", &self.staging).await?;
+        let hash = sha256_hex(&tokio::fs::read(&path).await?);
+        tokio::fs::write(
+            "/tmp/jmodguard-launcher-next",
+            format!("{}\n{}\n{}\n", path.display(), hash, release.digest),
+        )
+        .await?;
+        self.stop_application().await?;
+        self.end_idle().await?;
+        Ok(true)
+    }
+
+    async fn normal(&mut self) -> Result<bool> {
+        let state = self.control.component(&self.role).await?;
+        if self.rollback.is_none()
+            && self.enabled
+            && (state.desired_launcher.is_some() || self.running.is_none())
+        {
+            match self.launcher(&state).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "launcher update failed; retaining stable controller: {error:#}"
+                    );
+                    if let Some(release) = state
+                        .desired_launcher
+                        .as_ref()
+                        .or(state.installed_launcher.as_ref())
+                    {
+                        self.control
+                            .launcher_failed(&self.role, &release.digest, &format!("{error:#}"))
+                            .await?;
+                    }
+                }
+            }
+        }
+        if self.running.is_none()
+            && let Err(error) = self.restore(&state).await
+        {
+            if let Some(op) = self.control.upgrade().await?.filter(|op| {
+                self.rollback.is_none()
+                    && op.phase == Phase::Complete
+                    && state.installed.as_ref().is_some_and(|release| {
+                        op.service(&self.role)
+                            .is_ok_and(|service| release.digest == service.release.digest)
+                    })
+            }) {
+                self.control
+                    .upgrade_error(&op.id, &format!("{} restore: {error:#}", self.role))
+                    .await?;
+            }
+            return Err(error);
+        }
+        let restoring_previous = self.rollback.is_some();
+        if let Err(error) = self.report_ready().await {
+            // After a coordinated migration, never try a previous/baked child.
+            if let Some(op) = self.control.upgrade().await?
+                && op.phase == Phase::Complete
+                && self.rollback.is_none()
+                && self
+                    .running
+                    .as_ref()
+                    .and_then(|child| child.release.as_ref())
+                    .is_some_and(|release| {
+                        op.service(&self.role)
+                            .is_ok_and(|service| release.digest == service.release.digest)
+                    })
+            {
+                self.control
+                    .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))
+                    .await?;
+                self.stop_application().await?;
+                return Ok(false);
+            }
+            if self.rollback.is_none() && self.standby.is_some() {
+                let failed = self
+                    .running
+                    .as_ref()
+                    .and_then(|child| child.release.clone())
+                    .context("failed replacement missing")?;
+                self.rollback_independent(&state, failed, format!("{error:#}"))
+                    .await?;
+            } else {
+                self.stop_application().await?;
+                return Err(error);
+            }
+        }
+        // A rollback receipt may have cleared desired after this tick's read.
+        // Do not retry the stale failed selection, even if the prior is ready.
+        if restoring_previous || self.rollback.is_some() {
+            return Ok(false);
+        }
+        if !self.reported || !self.enabled {
+            return Ok(false);
+        }
+        let Some(candidate) = state.desired.clone() else {
+            return Ok(false);
+        };
+        if self
+            .running
+            .as_ref()
+            .and_then(|child| child.release.as_ref())
+            .is_some_and(|r| r.digest == candidate.digest)
+        {
+            return Ok(false);
+        }
+        if let Err(error) = compatible_control(&self.control, &candidate, now()).await {
+            self.control
+                .failed(&self.role, &candidate, &format!("compatibility: {error:#}"))
+                .await?;
+            return Ok(false);
+        }
+        let path = match stage(
+            &self.registry,
+            &candidate,
+            &format!("jmodguard-{}", self.role),
+            &self.staging,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                self.control
+                    .failed(&self.role, &candidate, &format!("download: {error:#}"))
+                    .await?;
+                return Ok(false);
+            }
+        };
+        // Admission may have changed while downloading. A paired operation
+        // blocks independent work before any process is stopped.
+        ensure!(
+            self.control
+                .upgrade()
+                .await?
+                .is_none_or(|op| !op.phase.active()),
+            "coordinated upgrade started"
+        );
+        let child = self
+            .running
+            .as_ref()
+            .context("current application missing")?;
+        self.standby = Some((
+            child.path.clone(),
+            child.source_sha.clone(),
+            child.release.clone(),
+        ));
+        self.stop_application().await?;
+        if let Err(error) = self
+            .start(&path, &candidate.source_sha, Some(candidate.clone()))
+            .await
+        {
+            self.rollback_independent(&state, candidate, format!("spawn: {error:#}"))
+                .await?;
+        }
+        Ok(false)
+    }
+
+    async fn rollback_independent(
+        &mut self,
+        state: &db::ComponentUpdate,
+        failed: ComponentRelease,
+        error: String,
+    ) -> Result<()> {
+        let (path, sha, previous) = self
+            .standby
+            .as_ref()
+            .cloned()
+            .context("rollback artifact missing")?;
+        // Independent admission proved both schemas. Recheck before fallback.
+        let schema = self.control.schema_version().await?;
+        ensure!(
+            previous
+                .as_ref()
+                .map_or(schema == db::CORE_SCHEMA_VERSION, |r| schema
+                    >= r.min_schema
+                    && schema <= r.max_schema),
+            "rollback schema is incompatible"
+        );
+        let previous_guild = previous
+            .as_ref()
+            .and_then(|r| r.upgrade.as_ref())
+            .map_or(db::guild_data::SCHEMA_VERSION, |contract| {
+                contract.guild_schema
+            });
+        ensure!(
+            state.observed.as_ref().and_then(|seen| seen.guild_schema) == Some(previous_guild),
+            "rollback guild schema is incompatible"
+        );
+        // Keep the failed identity until the live prior marker permits its receipt.
+        self.rollback = Some((failed, error));
+        self.stop_application().await?;
+        self.start(&path, &sha, previous).await
+    }
+
+    async fn tick(&mut self) -> Result<bool> {
+        if let Some(op) = self.control.upgrade().await?.filter(|op| op.phase.active()) {
+            if let Err(error) = self.pair(&op.id).await {
+                if error.is::<db::UpgradeProgressChanged>() {
+                    return Ok(false);
+                }
+                let _ = self
+                    .control
+                    .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))
+                    .await;
+                self.stop_application().await?;
+                return Err(error);
+            }
+            return Ok(false);
+        }
+        self.normal().await
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let role = role()?;
     let base_sha = std::env::var("JMODGUARD_BASE_SHA").unwrap_or_else(|_| "unknown".into());
-    let baked = binary_path(&role);
-    let mut running = launch(&baked, &base_sha, None).await?;
-    let db = tokio::select! {
-        opened=database(&role) => opened?,
-        exited=running.child.wait() => bail!("baked service exited before database opened: {}",exited?),
-        _=jmodguard::shutdown_signal() => { stop(&mut running).await?; return Ok(()); },
-    };
-    if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await?
-        == ServiceReadiness::Shutdown
-    {
-        return Ok(());
-    }
-    db::record_baked_component_running(&db, &role, observation(&running, &base_sha), now()).await?;
-    let registry = Registry::ghcr()?;
-    let mut standby: Option<(PathBuf, String, Option<ComponentRelease>)> = None;
-    if let Ok(digest) = std::env::var("JMODGUARD_LAUNCHER_RELEASE") {
-        let state = db::component_update(&db, &role).await?;
-        let release = state
-            .desired_launcher
-            .context("launcher request was cleared before handoff")?;
-        ensure!(
-            release.digest == digest,
-            "launcher request changed before handoff"
-        );
-        let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
-        db::record_launcher_running(&db, &role, &release, &hash, now()).await?;
+    let (opts, health_bind) = if role == "bot" {
+        let cfg = BotProcessConfig::load()?;
+        jmodguard::init_tracing(&cfg.log, "launcher");
+        (cfg.db_open_options(), cfg.health_bind())
     } else {
-        let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
-        db::record_baked_launcher(&db, &role, &hash, now()).await?;
-    }
-    if let Ok(failed) = std::env::var("JMODGUARD_LAUNCHER_FAILED") {
-        db::record_launcher_failure(
-            &db,
-            &role,
-            &failed,
-            "updated launcher failed; using baked launcher",
-        )
-        .await?;
-    }
-    let mut tick = tokio::time::interval(POLL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_observed: Option<Instant> = None;
-    loop {
-        tokio::select! {
-            _=jmodguard::shutdown_signal() => { stop(&mut running).await?; return Ok(()); }
-            result=running.child.wait() => {
-                let status=result?;
-                if running.release.is_some() {
-                    let failed=running.release.clone().expect("updated child has release");
-                    let (path,sha,release)=standby.take().unwrap_or_else(||(baked.clone(),base_sha.clone(),None));
-                    running=launch(&path,&sha,release.clone()).await?;
-                    if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
-                    db::record_component_rollback(&db,&role,&failed,release,observation(&running,&base_sha),&format!("updated child exited: {status}"),now()).await?;
-                } else { bail!("baked service exited: {status}"); }
-            }
-            _=tick.tick() => {
-                if last_observed.is_none_or(|at|at.elapsed()>=Duration::from_secs(60)) {
-                    if let Err(error)=db::record_component_running(&db,&role,None,observation(&running,&base_sha),now()).await {
-                        tracing::warn!("release heartbeat failed: {error:#}");
-                    } else { last_observed=Some(Instant::now()); }
-                }
-                if !update_enabled() { continue; }
-                let state=match db::component_update(&db,&role).await { Ok(v)=>v,Err(error)=>{tracing::warn!("update state unavailable: {error:#}");continue;} };
-                match maybe_update_launcher(&db,&registry,&role,&state).await {
-                    Ok(true)=>{ stop(&mut running).await?; std::process::exit(77); },
-                    Ok(false)=>{},
-                    Err(error)=>{
-                        tracing::warn!("launcher update rejected: {error:#}");
-                        if let Some(release)=&state.desired_launcher {
-                            db::record_launcher_failure(&db,&role,&release.digest,&format!("launcher update: {error:#}")).await?;
-                        }
-                    },
-                }
-                let Some(candidate)=state.desired else { continue; };
-                if state.installed.as_ref().is_some_and(|release| release.digest==candidate.digest)
-                    && running.release.as_ref().is_some_and(|release| release.digest==candidate.digest) { continue; }
-                if candidate.component!=role || candidate.launcher_protocol!=1 {
-                    db::record_component_failure(&db,&role,&candidate,"incompatible release role or launcher protocol").await?;
-                    continue;
-                }
-                if let Err(error)=compatible(&db,&candidate,now()).await {
-                    db::record_component_failure(&db,&role,&candidate,&format!("compatibility check: {error:#}")).await?;
-                    continue;
-                }
-                let new_path=match stage(&registry,&candidate,&format!("jmodguard-{role}")).await {
-                    Ok(path)=>path,
-                    Err(error)=>{db::record_component_failure(&db,&role,&candidate,&format!("download: {error:#}")).await?;continue;}
-                };
-                let previous_path=running.path.clone();
-                let previous_sha=running.source_sha.clone();
-                let previous_release=running.release.clone();
-                stop(&mut running).await?;
-                let replacement=launch(&new_path,&candidate.source_sha,Some(candidate.clone())).await;
-                let switched=match replacement {
-                    Ok(mut child)=>match wait_ready(&mut child, Some(READY_TIMEOUT)).await {
-                        Ok(())=>Ok(child),
-                        Err(error)=>{let _=stop(&mut child).await;Err(error)}
-                    },
-                    Err(error)=>Err(error),
-                };
-                match switched {
-                    Ok(child)=>{
-                        running=child;
-                        if let Err(error)=db::record_component_running(&db,&role,Some(candidate.clone()),observation(&running,&base_sha),now()).await {
-                            stop(&mut running).await?;
-                            running=launch(&previous_path,&previous_sha,previous_release).await?;
-                            if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
-                            db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("activation record: {error:#}"),now()).await?;
-                        } else {
-                            standby=Some((previous_path,previous_sha,previous_release));
-                        }
-                    }
-                    Err(error)=>{
-                        running=launch(&previous_path,&previous_sha,previous_release).await?;
-                        if wait_service_ready(&mut running, jmodguard::shutdown_signal()).await? == ServiceReadiness::Shutdown { return Ok(()); }
-                        db::record_component_rollback(&db,&role,&candidate,running.release.clone(),observation(&running,&base_sha),&format!("readiness: {error:#}"),now()).await?;
-                    }
-                }
+        let cfg = ApiProcessConfig::load()?;
+        jmodguard::init_tracing(&cfg.log, "launcher");
+        (cfg.db_open_options(), None)
+    };
+    let baked = binary_path(&role);
+    // Only a verified empty store permits the baked bot to initialize it.
+    // Neither a network error nor an unknown/newer schema means "start baked".
+    let mut initial: Option<Running> = None;
+    let mut maintenance = if role == "api" {
+        Some(launch_mode(&baked, &base_sha, None, true).await?)
+    } else {
+        None
+    };
+    let mut boot_health = if let Some(bind) = &health_bind {
+        Some(tokio::spawn(jmodguard::health::serve_listener(
+            jmodguard::health::bind(bind).await?,
+        )))
+    } else {
+        None
+    };
+    let control = loop {
+        if let Some(child) = initial.as_mut()
+            && child.child.try_wait()?.is_some()
+        {
+            initial = None;
+            if let Some(bind) = &health_bind {
+                boot_health = Some(tokio::spawn(jmodguard::health::serve_listener(
+                    jmodguard::health::bind(bind).await?,
+                )));
             }
         }
+        let open_opts = opts.clone();
+        match tokio::task::spawn_blocking(move || UpdateControl::open(&open_opts)).await? {
+            Ok(Some(control)) => break control,
+            Ok(None) if role == "bot" && initial.is_none() => {
+                if let Some(task) = boot_health.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                initial = Some(launch(&baked, &base_sha, None).await?);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("update control unavailable; application remains stopped: {error:#}")
+            }
+        }
+        tokio::select! {
+            _ = jmodguard::shutdown_signal() => {
+                if let Some(child) = initial.as_mut() { stop(child).await?; }
+                if let Some(child) = maintenance.as_mut() { stop(child).await?; }
+                if let Some(task) = boot_health { task.abort(); let _ = task.await; }
+                return Ok(());
+            },
+            _ = tokio::time::sleep(POLL) => {},
+        }
+    };
+    let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
+    if let Ok(digest) = std::env::var("JMODGUARD_LAUNCHER_RELEASE") {
+        let state = control.component(&role).await?;
+        let release = state
+            .desired_launcher
+            .as_ref()
+            .or(state.installed_launcher.as_ref())
+            .context("launcher selection missing")?;
+        ensure!(
+            release.digest == digest,
+            "launcher selection changed before handoff"
+        );
+        control
+            .launcher_running(&role, release, &hash, now())
+            .await?;
+    } else if control
+        .component(&role)
+        .await?
+        .installed_launcher
+        .as_ref()
+        .is_none_or(|release| release.upgrade.is_none())
+    {
+        control.baked_launcher(&role, &hash, now()).await?;
     }
+    if let Ok(failed) = std::env::var("JMODGUARD_LAUNCHER_FAILED") {
+        control.launcher_failed(&role, &failed, "updated launcher failed; stable baked controller is recovering the selected application").await?;
+    }
+    let mut supervisor = Supervisor {
+        role,
+        base_sha,
+        base_abi: std::env::var("JMODGUARD_BASE_ABI").unwrap_or_else(|_| "unknown".into()),
+        enabled: update_enabled(),
+        baked,
+        registry: Registry::ghcr()?,
+        control,
+        instance: format!("{:032x}", rand::random::<u128>()),
+        running: initial,
+        maintenance,
+        health: boot_health,
+        health_bind,
+        staging: PathBuf::from("/tmp/jmodguard-updates"),
+        prepared: None,
+        standby: None,
+        rollback: None,
+        reported: false,
+        last_observed: None,
+    };
+    loop {
+        tokio::select! {
+            _ = jmodguard::shutdown_signal() => break,
+            result = supervisor.tick() => match result {
+                Ok(true) => std::process::exit(77),
+                Ok(false) => {},
+                Err(error) => { tracing::warn!("update controller: {error:#}"); supervisor.idle().await?; },
+            },
+        }
+        tokio::select! { _ = jmodguard::shutdown_signal() => break, _ = tokio::time::sleep(POLL) => {} }
+    }
+    supervisor.stop_application().await?;
+    supervisor.end_idle().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::Db;
 
     #[tokio::test]
-    async fn readiness_requires_live_child_marker_and_stop_reaps_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "jmodguard-launch-test-{:032x}",
-            rand::random::<u128>()
-        ));
+    async fn published_schema_and_launcher_observations_allow_only_matching_services() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = Command::new("bash")
+            .current_dir(&root)
+            .args([
+                "-c",
+                "JMODGUARD_PUBLISH_IMAGE_LIB=1 source .buildkite/publish-image.sh; build_args api aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa test .",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let args = String::from_utf8(output.stdout).unwrap();
+        let label = |name: &str| {
+            args.split('\0')
+                .find_map(|arg| arg.strip_prefix(&format!("io.jmodguard.{name}=")))
+                .unwrap()
+                .to_owned()
+        };
+        let candidate = ComponentRelease {
+            upgrade: Some(db::UpgradeCompatibility {
+                control_protocol: db::UPDATE_CONTROL_PROTOCOL,
+                min_core: 15,
+                min_guild: 1,
+                guild_schema: db::guild_data::SCHEMA_VERSION,
+            }),
+            component: "api".into(),
+            channel: "latest".into(),
+            release_id: "test".into(),
+            source_sha: "a".repeat(40),
+            published_at: label("published-at"),
+            image: "ghcr.io/jatmn/jmodguard-api".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            min_schema: label("min-schema").parse().unwrap(),
+            max_schema: label("max-schema").parse().unwrap(),
+            result_schema: label("result-schema").parse().unwrap(),
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            base_abi: label("base-abi"),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("jmodguard-schema-{:032x}", rand::random::<u128>()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let bad = dir.join("bad");
-        tokio::fs::write(&bad, b"#!/bin/sh\nexit 1\n")
-            .await
-            .unwrap();
-        tokio::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700))
-            .await
-            .unwrap();
-        let mut first = launch(&bad, "test", None).await.unwrap();
-        assert!(wait_ready(&mut first, Some(READY_TIMEOUT)).await.is_err());
-        let good = dir.join("good");
-        tokio::fs::write(
-            &good,
-            b"#!/bin/sh\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 10\n",
-        )
-        .await
-        .unwrap();
-        tokio::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700))
-            .await
-            .unwrap();
-        let mut second = launch(&good, "test", None).await.unwrap();
-        wait_ready(&mut second, Some(READY_TIMEOUT)).await.unwrap();
-        stop(&mut second).await.unwrap();
-        assert!(second.child.try_wait().unwrap().is_some());
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
-    }
+        let db = Db::open(&dir.join("core.db"), 2).unwrap();
+        let schema = db::core_schema_version(&db).await.unwrap();
+        assert_eq!(candidate.result_schema, schema);
+        assert_eq!(candidate.min_schema, schema);
+        assert_eq!(candidate.max_schema, schema);
 
-    #[tokio::test]
-    async fn baked_wait_survives_delayed_ready_but_replacement_has_a_deadline() {
-        let dir = std::env::temp_dir().join(format!(
-            "jmodguard-delayed-ready-{:032x}",
-            rand::random::<u128>()
-        ));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let delayed = dir.join("delayed");
-        let allow_ready = dir.join("allow-ready");
-        tokio::fs::write(
-            &delayed,
-            format!(
-                "#!/bin/sh\nwhile [ ! -f \"{}\" ]; do sleep 0.05; done\nprintf ready > \"$JMODGUARD_READY_FILE\"\nexec sleep 10\n",
-                allow_ready.display()
-            ),
-        )
-        .await
-        .unwrap();
-        tokio::fs::set_permissions(&delayed, std::fs::Permissions::from_mode(0o700))
+        // An exited fixture supplies Running without leaving a child behind.
+        // Real service startup is covered by dual_process_smoke.
+        let mut running = launch(Path::new("/bin/true"), &candidate.source_sha, None)
             .await
             .unwrap();
-
-        let mut replacement = launch(&delayed, "test", None).await.unwrap();
-        assert!(
-            wait_ready(&mut replacement, Some(Duration::from_millis(100)))
+        running.child.wait().await.unwrap();
+        let mut baked = observation(&running, &candidate.source_sha);
+        // Supply the deployment ABI normally injected by the image environment.
+        baked.base_abi = candidate.base_abi.clone();
+        assert_eq!((baked.min_schema, baked.max_schema), (schema, schema));
+        for component in ["bot", "api"] {
+            db::record_component_running(&db, component, None, baked.clone(), 100)
                 .await
-                .is_err()
-        );
-        stop(&mut replacement).await.unwrap();
-
-        let mut baked = launch(&delayed, "test", None).await.unwrap();
+                .unwrap();
+        }
+        compatible(&db, &candidate, 100).await.unwrap();
+        let mut guild_upgrade = candidate.clone();
+        guild_upgrade.upgrade.as_mut().unwrap().guild_schema += 1;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(350),
-                wait_service_ready(&mut baked, std::future::pending::<()>())
-            )
-            .await
-            .is_err()
+            compatible(&db, &guild_upgrade, 100)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("together")
         );
-        assert!(baked.child.try_wait().unwrap().is_none());
-        tokio::fs::write(&allow_ready, b"go").await.unwrap();
+
+        // Preserve the refusal of a counterpart or rollback binary from before
+        // the migration, even when the candidate matches the current database.
+        let mut older = baked.clone();
+        older.min_schema = schema - 1;
+        older.max_schema = schema - 1;
+        db::record_component_running(&db, "bot", None, older.clone(), 100)
+            .await
+            .unwrap();
+        assert!(
+            compatible(&db, &candidate, 100)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("counterpart")
+        );
+        db::record_component_running(&db, "bot", None, baked, 100)
+            .await
+            .unwrap();
+        db::record_component_running(&db, "api", None, older, 100)
+            .await
+            .unwrap();
+        assert!(
+            compatible(&db, &candidate, 100)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rollback")
+        );
+
+        // A managed child's observations describe that release, not its launcher.
+        let mut managed = candidate;
+        managed.min_schema = schema - 1;
+        running.release = Some(managed);
+        let observed = observation(&running, &running.source_sha);
         assert_eq!(
-            wait_service_ready(&mut baked, std::future::pending::<()>())
-                .await
-                .unwrap(),
-            ServiceReadiness::Ready
+            (observed.min_schema, observed.max_schema),
+            (schema - 1, schema)
         );
-        stop(&mut baked).await.unwrap();
-        tokio::fs::remove_dir_all(&dir).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn baked_wait_reaps_on_shutdown_and_reports_child_exit() {
-        let dir = std::env::temp_dir().join(format!(
-            "jmodguard-baked-wait-{:032x}",
-            rand::random::<u128>()
-        ));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let sleeping = dir.join("sleeping");
-        tokio::fs::write(&sleeping, b"#!/bin/sh\nexec sleep 10\n")
-            .await
-            .unwrap();
-        tokio::fs::set_permissions(&sleeping, std::fs::Permissions::from_mode(0o700))
-            .await
-            .unwrap();
-        let mut baked = launch(&sleeping, "test", None).await.unwrap();
-        assert_eq!(
-            wait_service_ready(&mut baked, tokio::time::sleep(Duration::from_millis(50)))
-                .await
-                .unwrap(),
-            ServiceReadiness::Shutdown
-        );
-        assert!(baked.child.try_wait().unwrap().is_some());
-
-        let exiting = dir.join("exiting");
-        tokio::fs::write(&exiting, b"#!/bin/sh\nexit 1\n")
-            .await
-            .unwrap();
-        tokio::fs::set_permissions(&exiting, std::fs::Permissions::from_mode(0o700))
-            .await
-            .unwrap();
-        let mut failed = launch(&exiting, "test", None).await.unwrap();
-        assert!(
-            wait_service_ready(&mut failed, std::future::pending::<()>())
-                .await
-                .is_err()
-        );
+        drop(db);
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "controller_tests.rs"]
+mod controller_tests;

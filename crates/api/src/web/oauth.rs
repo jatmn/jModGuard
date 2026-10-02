@@ -460,6 +460,30 @@ pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize)
     }
 }
 
+impl OAuthClient {
+    pub fn from_config(cfg: &crate::config::ApiProcessConfig) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent("jModGuard (Discord dashboard)")
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("failed to build OAuth HTTP client")?;
+        Ok(Self {
+            client_id: cfg.web.oauth_client_id.clone(),
+            client_secret: cfg.web.oauth_client_secret.clone(),
+            redirect_uri: format!("{}/oauth/callback", cfg.web.base_url.trim_end_matches('/')),
+            http,
+            guild_list: std::sync::Arc::new(std::sync::Mutex::new(
+                super::oauth::GuildListGate::new(),
+            )),
+            guild_flights: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            guilds_endpoint: None,
+            #[cfg(test)]
+            token_endpoint: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

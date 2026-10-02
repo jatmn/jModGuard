@@ -87,6 +87,14 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 ## 5. Rollout order
 
+With the coordinated-update baseline installed, supported in-container upgrades
+use **Administration → Updates → Update bot and API together / recovery**.
+That flow enforces the stop/migrate/start ordering below and persists restart
+recovery. See [Bunny updates](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+The manual sequence remains for the one-time baseline and changes to the base OS,
+configuration, credentials, or incompatible control protocol.
+
+
 1. Stop the old API, then the old bot (or stop both).
 2. Install the new binaries/images (and SPA assets if separate).
 3. **Start the bot first** — it runs migrations (`migrate=true`).

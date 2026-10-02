@@ -63,6 +63,8 @@ pub async fn status(State(app): State<Arc<ApiState>>, session: Session) -> Reply
     }
     Ok(Json(json!({
         "components":updates,
+        "coordinated_upgrade_path":"/api/service-upgrade/recovery",
+        "service_upgrade":db::UpdateControl::from_application(&app.db).upgrade().await.map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update control unavailable"))?,
         "compatibility":compatibility,
         "unattended_enabled":enabled("JMODGUARD_UNATTENDED_UPDATES"),
         "apply_enabled":enabled("JMODGUARD_UPDATE_APPLY_ENABLED"),
@@ -218,6 +220,8 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                     "webui",
                     Some(release.clone()),
                     ComponentObservation {
+                        guild_schema: None,
+                        update_protocol: 0,
                         source_sha: release.source_sha.clone(),
                         executable_sha256: root_hash,
                         admin_sha256: Some(admin_hash),
@@ -244,6 +248,8 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 &app.db,
                 installed,
                 ComponentObservation {
+                    guild_schema: None,
+                    update_protocol: 0,
                     source_sha: installed.source_sha.clone(),
                     executable_sha256: root_hash,
                     admin_sha256: Some(admin_hash),
@@ -599,6 +605,8 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
             .await?
             .ok_or_else(|| anyhow::anyhow!("Administration entry HTML is missing after switch"))?;
         let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
             source_sha: release.source_sha.clone(),
             executable_sha256: sha256_hex(&index),
             admin_sha256: Some(sha256_hex(&admin)),
@@ -685,6 +693,7 @@ mod tests {
         ));
         let db = Db::open(&path, 2).unwrap();
         let release = ComponentRelease {
+            upgrade: None,
             component: "webui".into(),
             channel: "latest".into(),
             release_id: "v1.0.0".into(),

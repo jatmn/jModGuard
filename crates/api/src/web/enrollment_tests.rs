@@ -165,10 +165,12 @@ impl Fixture {
         cfg.bot.owner_id = if operator { 42 } else { 99 };
         cfg.web.oauth_client_id = oauth_client_id.into();
         let mut app = ApiState::new(cfg, db).unwrap();
-        Arc::get_mut(&mut app).unwrap().oauth.guilds_endpoint =
-            Some(format!("http://{address}/guilds"));
-        Arc::get_mut(&mut app).unwrap().oauth.token_endpoint =
-            Some(format!("http://{address}/token"));
+        Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
+            .unwrap()
+            .guilds_endpoint = Some(format!("http://{address}/guilds"));
+        Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
+            .unwrap()
+            .token_endpoint = Some(format!("http://{address}/token"));
         tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
         let store = MemoryStore::default();
         let session = Session::new(None, Arc::new(store.clone()), None);

@@ -47,6 +47,8 @@ mod settings;
 pub use settings::*;
 mod updates;
 pub use updates::*;
+mod update_control;
+pub use update_control::*;
 pub mod usage;
 mod write_budget;
 use write_budget::BoundedWrites;
@@ -69,6 +71,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0015_component_updates.sql"),
     include_str!("../migrations/0016_member_sync_pacing.sql"),
 ];
+
+/// Completed core schema required by service startup and release observations.
+pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
