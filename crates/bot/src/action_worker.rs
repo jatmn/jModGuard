@@ -319,7 +319,7 @@ async fn execute_inner(
                 let Some(bot_id) = discord.bot_user_id() else {
                     return Outcome::failed("bot_identity_unavailable");
                 };
-                match store
+                let outcome = match store
                     .member_sync_action(
                         scope,
                         bot_id,
@@ -365,7 +365,13 @@ async fn execute_inner(
                             Outcome::failed("member_sync_unavailable")
                         }
                     }
+                };
+                if outcome.state == "succeeded"
+                    && let Some(app) = app
+                {
+                    app.wake_member_sync();
                 }
+                outcome
             }
             Action::Unban { user_id, reason } => {
                 if chrono::Utc::now().timestamp() >= job.expires_at {

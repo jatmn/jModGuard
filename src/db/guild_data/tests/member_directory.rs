@@ -5168,6 +5168,24 @@ async fn status_counts_due_absence_rows_instead_of_the_unused_sync_column() {
 }
 
 #[tokio::test]
+async fn worker_status_skips_the_absence_backlog_count() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 89).await;
+    let dashboard = store
+        .member_sync_status(scope.clone(), 42, 400_000)
+        .await
+        .unwrap();
+    let worker = store
+        .member_sync_worker_status(scope, 42, 400_000)
+        .await
+        .unwrap();
+    assert_eq!(dashboard.unseen_candidate_count, 1);
+    assert_eq!(worker.unseen_candidate_count, 0);
+    assert_eq!(worker.status, dashboard.status);
+    assert_eq!(worker.next_attempt_at, dashboard.next_attempt_at);
+}
+
+#[tokio::test]
 async fn newer_unchanged_member_observations_fence_delayed_names() {
     let (_f, store, scope) = ready().await;
     store
@@ -5649,4 +5667,138 @@ async fn configured_large_roster_and_ban_pages_commit_with_one_cursor_each() {
         .await
         .unwrap();
     assert_eq!(status.ban_processed, Some(500));
+}
+
+const QUERY_COUNT_GUILD: i64 = 424_242;
+const MEMBER_PAGE_CAP: usize = 500;
+/// Lookup, set-based writes, revision bump, and the last-seen update.
+const STATEMENTS_PER_MEMBER_BATCH: u64 = 14;
+/// Claim seed read plus status() after the page, with a small fixed margin.
+const STATEMENTS_PER_MEMBER_PAGE: u64 = 8;
+
+fn member_batches(members: u64) -> u64 {
+    let batch =
+        u64::try_from(super::super::member_directory::MEMBER_PAGE_WRITE_BATCH_SIZE).unwrap();
+    members.div_ceil(batch)
+}
+
+fn member_pages(members: u64) -> u64 {
+    members.div_ceil(u64::try_from(MEMBER_PAGE_CAP).unwrap())
+}
+
+fn member_statement_bound(members: u64) -> u64 {
+    STATEMENTS_PER_MEMBER_BATCH * member_batches(members)
+        + STATEMENTS_PER_MEMBER_PAGE * member_pages(members)
+}
+
+async fn ready_guild(guild_id: i64) -> (Fixture, GuildDataStore, GuildDataScope) {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let placement = f.placement(&reg, guild_id).await;
+    store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    let scope = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id,
+            id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    store.bind_initial_membership(scope.clone()).await.unwrap();
+    (f, store, scope)
+}
+
+async fn commit_roster(
+    store: &GuildDataStore,
+    scope: &GuildDataScope,
+    members: &[MemberObservation],
+    mut now_ms: i64,
+) -> (u64, i64, MemberSyncStatus) {
+    begin_member_sync_statement_count(scope.guild_id());
+    let mut status = None;
+    for chunk in members.chunks(MEMBER_PAGE_CAP) {
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), now_ms, 90_000)
+            .await
+            .unwrap()
+            .expect("member page is due");
+        assert_eq!(claim.phase, MemberSyncPhase::Members);
+        let mut page = page(MemberSyncPhase::Members, claim.cursor.clone(), false);
+        page.members = chunk.to_vec();
+        page.next_cursor = Some(format!("{}", chunk.last().unwrap().user_id));
+        page.page_size = u16::try_from(MEMBER_PAGE_CAP).unwrap();
+        page.total_estimate = Some(i64::try_from(members.len()).unwrap());
+        page.pace_ms = 15_000;
+        status = Some(
+            store
+                .commit_member_page(scope.clone(), claim, page, now_ms)
+                .await
+                .unwrap(),
+        );
+        now_ms = now_ms.saturating_add(20_000);
+    }
+    (
+        member_sync_statement_count(scope.guild_id()),
+        now_ms,
+        status.unwrap(),
+    )
+}
+
+fn assert_member_statement_bound(kind: &str, members: u64, queries: u64) {
+    let bound = member_statement_bound(members);
+    assert!(
+        queries > 0,
+        "{kind} for {members} members counted no statements"
+    );
+    let batch =
+        u64::try_from(super::super::member_directory::MEMBER_PAGE_WRITE_BATCH_SIZE).unwrap();
+    assert!(
+        queries < members || members <= batch,
+        "{kind} for {members} members issued {queries} statements"
+    );
+    assert!(
+        queries <= bound,
+        "{kind} for {members} members issued {queries} statements, above batch bound {bound}"
+    );
+}
+
+#[tokio::test]
+async fn member_page_statements_scale_by_batch_not_by_member() {
+    for members in [10_usize, 1_000] {
+        let (_f, store, scope) = ready_guild(QUERY_COUNT_GUILD).await;
+        store
+            .initialize_member_directory(scope.clone(), 42, 1_000)
+            .await
+            .unwrap();
+        let imported: Vec<_> = (1..=members as i64)
+            .map(|user_id| observed(user_id, Some(500), 2_000))
+            .collect();
+        let (import_queries, now_ms, import_status) =
+            commit_roster(&store, &scope, &imported, 2_000).await;
+        assert_eq!(import_status.inserted, members as i64);
+        assert_member_statement_bound("import", members as u64, import_queries);
+
+        let refreshed: Vec<_> = (1..=members as i64)
+            .map(|user_id| observed(user_id, Some(500), 100_000 + user_id))
+            .collect();
+        let (refresh_queries, _, refresh_status) =
+            commit_roster(&store, &scope, &refreshed, now_ms).await;
+        assert_eq!(refresh_status.unchanged, members as i64);
+        assert_member_statement_bound("refresh", members as u64, refresh_queries);
+        let first = store.get_member(scope.clone(), 1).await.unwrap().unwrap();
+        let last = store
+            .get_member(scope, members as i64)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.observed_at_ms, 100_001);
+        assert_eq!(last.observed_at_ms, 100_000 + members as i64);
+        assert_eq!(first.revision, 1);
+        assert_eq!(last.revision, 1);
+    }
 }
