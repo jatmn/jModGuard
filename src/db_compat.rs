@@ -1276,11 +1276,18 @@ impl Transaction {
                 // Cleanup only: a successful ROLLBACK response cannot prove a
                 // preceding COMMIT was not accepted when its response was
                 // lost. Callers must reconcile every remote commit error as
-                // an indeterminate outcome.
-                let _rollback = self.runtime.block_on_database(
-                    "rollback after failed commit",
-                    self.inner().execute_batch("ROLLBACK"),
-                );
+                // an indeterminate outcome. An interactive timeout already
+                // closed the stream; ROLLBACK on it waits out the client
+                // deadline and is not cleanup.
+                self.note_remote_stream_loss(&commit_error);
+                if self.stream_exhausted.load(Ordering::Acquire) {
+                    self.connection_tainted.store(true, Ordering::Release);
+                } else {
+                    let _rollback = self.runtime.block_on_database(
+                        "rollback after failed commit",
+                        self.inner().execute_batch("ROLLBACK"),
+                    );
+                }
                 let inner = self.inner.take().expect("transaction already completed");
                 drop_transaction_without_runtime(inner);
                 let Some(receipt) = self.mutation_receipt.as_deref() else {

@@ -630,6 +630,105 @@ fn seeded_database_skips_another_globals_write() {
 }
 
 #[test]
+fn missing_shipped_global_is_restored_when_a_custom_row_keeps_the_count() {
+    let tmp = tmp_db_path("seed_missing_key_hidden_by_custom");
+    let db = Db::open(&tmp, 2).unwrap();
+    let marker = r#"{"name":"stats","response":"operator-owned"}"#.to_string();
+    let owned = marker.clone();
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "DELETE FROM rules WHERE guild_id = 0 AND rule_id = ?1",
+            params![crate::types::RULE_IDS[0]],
+            64 * 1024 * 1024,
+        )?;
+        conn.execute_bounded(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, 'operator-extra', '{}')",
+            (),
+            64 * 1024 * 1024,
+        )?;
+        conn.execute_bounded(
+            "UPDATE commands SET data = ?1 WHERE guild_id = 0 AND name = 'stats'",
+            params![owned],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let conn = Connection::open(&tmp).unwrap();
+    assert!(
+        !super::bootstrap::globals_seed_satisfied(&conn).unwrap(),
+        "a missing shipped rule must not count as seeded because a custom row kept the count"
+    );
+    drop(conn);
+    let db = Db::open(&tmp, 2).unwrap();
+    let (restored, custom_rule, stats) = tokio_test_block_on(db.with_conn(|conn| {
+        let restored: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rules WHERE guild_id = 0 AND rule_id = ?1",
+            params![crate::types::RULE_IDS[0]],
+            |row| Ok(row.get(0)?),
+        )?;
+        let custom_rule: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rules WHERE guild_id = 0 AND rule_id = 'operator-extra'",
+            (),
+            |row| Ok(row.get(0)?),
+        )?;
+        let stats: String = conn.query_row(
+            "SELECT data FROM commands WHERE guild_id = 0 AND name = 'stats'",
+            (),
+            |row| Ok(row.get(0)?),
+        )?;
+        Ok((restored, custom_rule, stats))
+    }))
+    .unwrap();
+    assert_eq!(
+        restored, 1,
+        "INSERT OR IGNORE must put the shipped rule back"
+    );
+    assert_eq!(custom_rule, 1, "the operator row must stay");
+    assert_eq!(stats, marker, "a customized command must not be rewritten");
+    drop(db);
+    let conn = Connection::open(&tmp).unwrap();
+    assert!(super::bootstrap::globals_seed_satisfied(&conn).unwrap());
+    drop(conn);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn extra_custom_global_row_still_counts_as_seeded() {
+    let tmp = tmp_db_path("seed_extra_custom_row");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded(
+            "INSERT INTO rules (guild_id, rule_id, data) VALUES (0, 'operator-extra', '{}')",
+            (),
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    drop(db);
+    let conn = Connection::open(&tmp).unwrap();
+    assert!(
+        super::bootstrap::globals_seed_satisfied(&conn).unwrap(),
+        "an extra custom row must not force another seed when every shipped key is present"
+    );
+    drop(conn);
+    let db = Db::open(&tmp, 2).unwrap();
+    let extra = tokio_test_block_on(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM rules WHERE guild_id = 0 AND rule_id = 'operator-extra'",
+            (),
+            |row| Ok(row.get::<i64>(0)?),
+        )
+    }))
+    .unwrap();
+    assert_eq!(extra, 1);
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn startup_retries_transient_remote_errors_but_not_auth() {
     let timeout = anyhow::anyhow!("remote database connect timed out after 75s");
     assert!(crate::db::is_startup_retryable(&timeout, true));

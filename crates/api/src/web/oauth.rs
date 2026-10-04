@@ -317,7 +317,14 @@ impl OAuthClient {
             .context("oauth token request failed")?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let bytes = resp.bytes().await?;
+        let bytes = match self
+            .read_limited_body("token", status, &headers, resp)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
+            Err(error) => return Err(error.context("oauth token response body failed")),
+        };
         self.observe_route("token", status, &headers, &bytes).await;
         if status.as_u16() == 429 {
             return Err(DiscordRateLimit {
@@ -355,10 +362,11 @@ impl OAuthClient {
             .context("discord me request failed")?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let bytes = resp
-            .bytes()
-            .await
-            .context("discord me response body failed")?;
+        let bytes = match self.read_limited_body(&key, status, &headers, resp).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
+            Err(error) => return Err(error.context("discord me response body failed")),
+        };
         self.observe_route(&key, status, &headers, &bytes).await;
         if status.as_u16() == 429 {
             return Err(DiscordRateLimit {
@@ -421,6 +429,14 @@ impl OAuthClient {
         let mut all = Vec::new();
         let mut after: Option<String> = None;
         loop {
+            // A full page can record remaining 0. The next page has to wait
+            // for that reset instead of spending the exhausted bucket.
+            if let Some(retry_after) = self.route_remaining(user_key) {
+                return Err(GuildListError::RateLimited {
+                    retry_after,
+                    fresh: false,
+                });
+            }
             let mut url = format!("{endpoint}?limit={PAGE_LIMIT}");
             if let Some(ref cursor) = after {
                 url.push_str("&after=");
@@ -583,6 +599,28 @@ impl OAuthClient {
                     "guild list lookup ended before a result"
                 )));
             }
+        }
+    }
+
+    /// A 429 whose body cannot be read still has its headers. Record that
+    /// cooldown and return the rate limit, instead of dropping it on `?`.
+    async fn read_limited_body(
+        &self,
+        key: &str,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        response: reqwest::Response,
+    ) -> Result<Vec<u8>> {
+        match response.bytes().await {
+            Ok(body) => Ok(body.to_vec()),
+            Err(_error) if status.as_u16() == 429 => {
+                self.observe_route(key, status, headers, b"{}").await;
+                Err(DiscordRateLimit {
+                    retry_after: discord_retry_after(header_retry_after(headers), b"{}"),
+                }
+                .into())
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1242,6 +1280,183 @@ mod tests {
             Some(format!("http://{address}/token")),
             None,
         );
+        assert!(
+            client
+                .refresh("one")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert!(
+            client
+                .refresh("two")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn guild_page(count: usize, first_id: u64) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|offset| {
+                serde_json::json!({
+                    "id": (first_id + offset as u64).to_string(),
+                    "name": "n",
+                    "icon": null,
+                    "owner": false,
+                    "permissions": 32
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spent_guild_bucket_does_not_request_the_next_page() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/guilds",
+                axum::routing::get(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        let call = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if call == 0 {
+                            (
+                                [
+                                    ("x-ratelimit-remaining", "0"),
+                                    ("x-ratelimit-reset-after", "5"),
+                                ],
+                                axum::Json(guild_page(200, 1)),
+                            )
+                        } else {
+                            (
+                                [
+                                    ("x-ratelimit-remaining", "1"),
+                                    ("x-ratelimit-reset-after", "1"),
+                                ],
+                                axum::Json(guild_page(1, 201)),
+                            )
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = test_oauth(
+            reqwest::Client::new(),
+            Some(format!("http://{address}/guilds")),
+            None,
+            None,
+        );
+        let error = client.my_guilds(11, "token").await.unwrap_err();
+        assert!(
+            matches!(error, GuildListError::RateLimited { fresh: false, .. }),
+            "{error:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn open_guild_bucket_still_fetches_the_next_page() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/guilds",
+                axum::routing::get(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        let call = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if call == 0 {
+                            (
+                                [("x-ratelimit-remaining", "1")],
+                                axum::Json(guild_page(200, 1)),
+                            )
+                        } else {
+                            (
+                                [("x-ratelimit-remaining", "1")],
+                                axum::Json(guild_page(1, 201)),
+                            )
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = test_oauth(
+            reqwest::Client::new(),
+            Some(format!("http://{address}/guilds")),
+            None,
+            None,
+        );
+        let guilds = client.my_guilds(12, "token").await.unwrap();
+        assert_eq!(guilds.len(), 201);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    async fn truncated_429(path: &str) -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = std::sync::Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 30\r\ncontent-length: 20\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (calls, format!("http://{address}{path}"))
+    }
+
+    #[tokio::test]
+    async fn identity_rate_limit_without_a_body_is_not_fetched_again() {
+        let (calls, endpoint) = truncated_429("/me").await;
+        let client = test_oauth(reqwest::Client::new(), None, None, Some(endpoint));
+        assert!(
+            client
+                .me(4, "token")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert!(
+            client
+                .me(4, "token")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_rate_limit_without_a_body_is_not_exchanged_again() {
+        let (calls, endpoint) = truncated_429("/token").await;
+        let client = test_oauth(reqwest::Client::new(), None, Some(endpoint), None);
         assert!(
             client
                 .refresh("one")
