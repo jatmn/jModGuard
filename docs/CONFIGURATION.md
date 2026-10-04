@@ -89,9 +89,18 @@ exits if that wait expires).
 Environment variables override `config.toml` values (see table).
 
 Remote database calls and waits for a pooled connection have a fixed 75-second
-per-wire-attempt deadline. Transaction rollback cleanup and an authoritative
-receipt check after a failed COMMIT can each use an additional deadline before
-the logical operation returns. A connection whose operation timed out is
+per-wire-attempt deadline. Interactive API calls use a shorter deadline. If
+that deadline fires while a write transaction may still be open, including
+while BEGIN itself is still in flight, one best-effort rollback runs on the
+database runtime under a fresh few-hundred-millisecond deadline. The remote
+client sends the stream close only from a live runtime, so the writer lock is
+not left until the provider steals it. A provider-closed stream is not
+rolled back; that request would wait out the client deadline and cannot change
+the outcome. If the caller stops waiting while the write is still in flight,
+that call ends and releases the pooled connection and any writer lock instead
+of holding both until the operation deadline. Other rollback cleanup and an authoritative receipt check after a
+failed COMMIT can each use an additional deadline before the logical operation
+returns. A connection whose operation timed out is
 discarded rather than reused with potentially stale remote stream state. Each
 normal post-bootstrap application mutation carries a receipt in its transaction;
 idempotent migrations and bootstrap fencing are reverified on startup instead. If a COMMIT
