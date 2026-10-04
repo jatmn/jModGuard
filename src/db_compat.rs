@@ -674,6 +674,7 @@ impl Connection {
             capacity_dirty: AtomicBool::new(false),
             capacity_poisoned: AtomicBool::new(false),
             write_prepared: AtomicBool::new(false),
+            stream_exhausted: AtomicBool::new(false),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
         }
@@ -868,6 +869,9 @@ pub struct Transaction {
     capacity_dirty: AtomicBool,
     capacity_poisoned: AtomicBool,
     write_prepared: AtomicBool,
+    /// The provider already closed this Hrana stream. Drop must not send
+    /// ROLLBACK on it; the connection is tainted and the next open uses a new one.
+    stream_exhausted: AtomicBool,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
 }
@@ -1000,11 +1004,28 @@ impl Transaction {
         Ok(sample.page_size)
     }
 
+    fn note_remote_stream_loss(&self, error: &anyhow::Error) {
+        if is_remote_interactive_timeout(error) {
+            self.stream_exhausted.store(true, Ordering::Release);
+        }
+    }
+
+    fn map_stream<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.note_remote_stream_loss(error);
+        }
+        result
+    }
+
     fn execute_unchecked(&self, sql: &str, params: impl IntoParams + Send) -> Result<usize> {
-        Ok(self.runtime.block_on_database(
-            "transaction internal execute",
-            self.inner().execute(sql, params),
-        )? as usize)
+        self.map_stream(
+            self.runtime
+                .block_on_database(
+                    "transaction internal execute",
+                    self.inner().execute(sql, params),
+                )
+                .map(|rows| rows as usize),
+        )
     }
 
     fn query_row_unchecked<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
@@ -1013,12 +1034,14 @@ impl Transaction {
         P: IntoParams + Send,
         F: FnOnce(&Row) -> Result<T> + Send,
     {
-        self.runtime
-            .block_on_database("transaction internal query", async {
-                let mut rows = self.inner().query(sql, params).await?;
-                let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
-                map(&row)
-            })
+        self.map_stream(
+            self.runtime
+                .block_on_database("transaction internal query", async {
+                    let mut rows = self.inner().query(sql, params).await?;
+                    let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
+                    map(&row)
+                }),
+        )
     }
 
     fn insert_remote_mutation_receipt(&mut self, receipt: &str) -> Result<String> {
@@ -1026,6 +1049,7 @@ impl Transaction {
             Ok(row.get::<String>(0)?)
         }) {
             Ok(inserted) => Ok(inserted),
+            Err(error) if self.stream_exhausted.load(Ordering::Acquire) => Err(error),
             Err(error)
                 if error
                     .chain()
@@ -1103,16 +1127,20 @@ impl Transaction {
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         require_connection_setup_batch(sql)?;
-        self.runtime
-            .block_on_database("transaction execute_batch", self.inner().execute_batch(sql))?;
+        self.map_stream(
+            self.runtime
+                .block_on_database("transaction execute_batch", self.inner().execute_batch(sql)),
+        )?;
         Ok(())
     }
 
     pub fn execute_batch_bounded(&self, sql: &str, max_growth_bytes: u64) -> Result<()> {
         anyhow::ensure!(batch_kind(sql)?, "bounded batch must contain a mutation");
         self.reserve_growth(max_growth_bytes)?;
-        self.runtime
-            .block_on_database("transaction bounded batch", self.inner().execute_batch(sql))?;
+        self.map_stream(
+            self.runtime
+                .block_on_database("transaction bounded batch", self.inner().execute_batch(sql)),
+        )?;
         Ok(())
     }
 
@@ -1361,6 +1389,20 @@ impl Drop for Transaction {
         let Some(_) = self.inner.as_ref() else {
             return;
         };
+        if self.stream_exhausted.load(Ordering::Acquire) {
+            // The provider already ended the transaction. Another ROLLBACK on
+            // this stream fails and can block on the client deadline. Discard
+            // the wrapper; the connection is unusable and the next open builds
+            // a new one.
+            let inner = self.inner.take().expect("transaction already completed");
+            if self.runtime.is_remote() {
+                drop_transaction_without_runtime(inner);
+            } else {
+                std::mem::forget(inner);
+            }
+            self.connection_tainted.store(true, Ordering::Release);
+            return;
+        }
         // Use a borrowed SQL rollback instead of libsql::Transaction::rollback,
         // whose consuming future drops the transaction inside Tokio. libsql's
         // Drop callback would then spawn a second, unbounded best-effort
@@ -1388,7 +1430,11 @@ impl Drop for Transaction {
                     std::mem::forget(inner);
                 }
                 self.connection_tainted.store(true, Ordering::Release);
-                tracing::warn!(%error, "failed to roll back uncommitted database transaction");
+                if self.runtime.is_remote() && is_remote_interactive_timeout(&error) {
+                    tracing::debug!(%error, "discarded timed-out remote transaction stream");
+                } else {
+                    tracing::warn!(%error, "failed to roll back uncommitted database transaction");
+                }
             }
         }
     }

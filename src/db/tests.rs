@@ -567,6 +567,69 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
 }
 
 #[test]
+fn remote_startup_budget_is_wall_clock_and_backs_off() {
+    let remote = startup_open_retry(&DbOpenOptions {
+        path: tmp_db_path("remote_budget_unused"),
+        url: "libsql://database.example".into(),
+        token: "token".into(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    });
+    // Several multi-minute attempts must fit. The old budget was 180*2s.
+    assert!(remote.budget >= Duration::from_secs(150) * 4);
+    assert_eq!(remote.initial_backoff, Duration::from_secs(2));
+    assert_eq!(
+        startup_backoff(1, remote.initial_backoff, remote.max_backoff),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        startup_backoff(2, remote.initial_backoff, remote.max_backoff),
+        Duration::from_secs(4)
+    );
+    assert_eq!(
+        startup_backoff(16, remote.initial_backoff, remote.max_backoff),
+        remote.max_backoff
+    );
+    let local = startup_open_retry(&DbOpenOptions {
+        path: tmp_db_path("local_budget_unused"),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: true,
+        default_prefix: "!".into(),
+        retention_days: 7,
+    });
+    assert_eq!(local.budget, Duration::from_secs(30));
+}
+
+#[test]
+fn seeded_database_skips_another_globals_write() {
+    let tmp = tmp_db_path("seed_already_satisfied");
+    let db = Db::open(&tmp, 2).unwrap();
+    let version = tokio_test_block_on(get_config_version(&db)).unwrap();
+    let slash = tokio_test_block_on(get_slash_registry_version(&db)).unwrap();
+    drop(db);
+    let conn = Connection::open(&tmp).unwrap();
+    assert!(
+        super::bootstrap::globals_seed_satisfied(&conn).unwrap(),
+        "a completed migrate-open must not need another seed transaction"
+    );
+    drop(conn);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_config_version(&db)).unwrap(),
+        version
+    );
+    assert_eq!(
+        tokio_test_block_on(get_slash_registry_version(&db)).unwrap(),
+        slash
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn startup_retries_transient_remote_errors_but_not_auth() {
     let timeout = anyhow::anyhow!("remote database connect timed out after 75s");
     assert!(crate::db::is_startup_retryable(&timeout, true));
@@ -575,6 +638,19 @@ fn startup_retries_transient_remote_errors_but_not_auth() {
     );
     assert!(crate::db::is_remote_interactive_timeout(&interactive));
     assert!(!crate::db::is_database_operation_timeout(&interactive));
+    assert_eq!(
+        crate::db::startup_retry_kind(&interactive, true),
+        Some(crate::db::StartupRetryKind::InteractiveTransaction)
+    );
+    assert!(crate::db::is_startup_retryable(&interactive, true));
+    assert!(
+        !crate::db::is_startup_retryable(&interactive, false),
+        "a local open must not treat a remote transaction timeout as a migrate race"
+    );
+    assert_eq!(
+        crate::db::startup_retry_kind(&timeout, true),
+        Some(crate::db::StartupRetryKind::Transport)
+    );
     assert!(
         !crate::db::is_startup_retryable(&timeout, false),
         "local SQLite must not treat transport timeouts as a migrate race"

@@ -9,6 +9,7 @@ pub mod cases;
 pub mod commands;
 pub mod discord;
 pub mod enrollment_repair;
+pub mod gateway_budget;
 pub mod handlers;
 pub mod image_spam;
 pub mod logging;
