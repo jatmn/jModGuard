@@ -6,7 +6,7 @@ use serde::Deserialize;
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 1;
+pub const LAUNCHER_REVISION: u32 = 2;
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
@@ -466,6 +466,38 @@ impl UpdateControl {
             let tx = conn.transaction_immediate()?;
             tx.execute_rows("UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
                 params![role, release], 1)?;
+            tx.commit()
+        }).await
+    }
+
+    /// Clear a stored launcher selection that has no capability contract.
+    /// Compare the parsed release, then swap on the original stored text.
+    /// Rows saved before launcher labels omit fields this serializer writes.
+    pub async fn clear_uncontracted_launcher(
+        &self,
+        role: &str,
+        release: &ComponentRelease,
+    ) -> Result<()> {
+        anyhow::ensure!(release.launcher.is_none(), "launcher contract is present");
+        let (role, release) = (role.to_owned(), release.clone());
+        self.db.with_conn(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            let stored: Option<String> = tx.query_row(
+                "SELECT desired_launcher FROM component_updates WHERE component=?1",
+                params![role.clone()],
+                |row| Ok(row.get(0)?),
+            )?;
+            let stored = stored.context("desired launcher is already clear")?;
+            let parsed: ComponentRelease = serde_json::from_str(&stored)?;
+            anyhow::ensure!(
+                parsed.launcher.is_none() && parsed == release,
+                "desired launcher changed before clear"
+            );
+            tx.execute_rows(
+                "UPDATE component_updates SET desired_launcher=NULL WHERE component=?1 AND desired_launcher=?2",
+                params![role, stored],
+                1,
+            )?;
             tx.commit()
         }).await
     }

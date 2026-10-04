@@ -617,7 +617,17 @@ impl Supervisor {
                 return Ok(false);
             }
         } else if state.desired_launcher.is_some() {
-            bail!("selected launcher has no capability contract; check a launcher-aware release");
+            // An image from before launcher-revision labels has nothing to run.
+            // Drop it once, the same way a contract that is not newer is dropped,
+            // and keep the baked controller. The row is gone on the next boot.
+            tracing::warn!(
+                "stored launcher selection {} has no capability contract; clearing it and keeping the baked controller",
+                release.digest
+            );
+            self.control
+                .clear_uncontracted_launcher(&self.role, release)
+                .await?;
+            return Ok(false);
         } else {
             return Ok(false);
         }
