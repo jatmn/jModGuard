@@ -129,7 +129,7 @@ pub(super) fn refuse_fenced_write(conn: &impl SqlExecutor, guild: i64) -> Result
 pub async fn guild_is_write_fenced(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let fenced = guild_write_fenced(&tx, guild)?;
         tx.finish_read()?;
         Ok(fenced)
@@ -179,7 +179,7 @@ fn placement_conn(conn: &impl SqlExecutor, guild: i64) -> Result<Option<GuildPla
 pub async fn store_registration(db: &Db, id: &StoreId) -> Result<Option<StoreRegistration>> {
     let id = id.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let value = registration_conn(&tx, &id)?;
         tx.finish_read()?;
         Ok(value)
@@ -220,7 +220,7 @@ pub async fn register_store(
 pub async fn guild_placement(db: &Db, guild: i64) -> Result<Option<GuildPlacement>> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let value = placement_conn(&tx, guild)?;
         tx.finish_read()?;
         Ok(value)
@@ -344,7 +344,7 @@ pub async fn dedicated_store_registration(
 
 async fn catalog_registration(db: &Db, owner: Option<i64>) -> Result<Option<StoreRegistration>> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let row = match owner {
             None => tx
                 .query_row(

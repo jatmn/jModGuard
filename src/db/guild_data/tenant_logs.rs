@@ -120,7 +120,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_bound_placement(&tx, &expected, &placement)?;
                 let row = membership(&tx, placement.guild_id())?;
                 tx.finish_read()?;
@@ -174,7 +174,7 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             let (_, revision) = verify_scope(&tx, &expected, &scope, true)?;
             let mut stmt = tx.prepare("SELECT event_type,channel_id FROM guild_log_channels WHERE guild_id=?1 AND enrollment_id=?2 ORDER BY event_type")?;
             let rows = stmt.query_map(params![scope.guild_id(), scope.enrollment.id.as_str()], |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?)))?;

@@ -147,6 +147,15 @@ impl DbRuntime {
         Self::with_operation_timeout(None)
     }
 
+    pub fn for_operation_timeout(&self, operation_timeout: Option<Duration>) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            _thread: Arc::clone(&self._thread),
+            operation_timeout,
+            growth_paused: Arc::clone(&self.growth_paused),
+        }
+    }
+
     pub fn with_operation_timeout(operation_timeout: Option<Duration>) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -633,9 +642,39 @@ impl Connection {
             self.inner
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
         )?;
-        let mut transaction = self.wrap_transaction(inner, None);
+        let mut transaction = self.wrap_transaction(inner, None, true);
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
+    }
+
+    /// Fresh primary snapshot that does not reserve the writer lock.
+    ///
+    /// `BEGIN DEFERRED` is not classified read-only, so remote libSQL routes it
+    /// to the primary and the snapshot sees committed primary writes. SQLite
+    /// takes a shared lock for the reads and does not take the reserved lock
+    /// until a statement writes. The bot can therefore start a write while this
+    /// snapshot is open, and a held writer does not make the snapshot wait.
+    /// `BEGIN READONLY` is not used here: remote libSQL may serve it from a
+    /// replica. The snapshot cannot be upgraded into a write.
+    pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
+        let inner = self.runtime.block_on_database(
+            "begin primary snapshot",
+            self.inner
+                .transaction_with_behavior(libsql::TransactionBehavior::Deferred),
+        )?;
+        Ok(self.wrap_transaction(inner, None, false))
+    }
+
+    /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
+    /// Remote libSQL may serve it from a replica, so callers that need a fresh
+    /// primary snapshot use [`Self::transaction_primary_snapshot`].
+    pub fn transaction_consistent_read(&self) -> Result<Transaction> {
+        let inner = self.runtime.block_on_database(
+            "begin consistent read",
+            self.inner
+                .transaction_with_behavior(libsql::TransactionBehavior::ReadOnly),
+        )?;
+        Ok(self.wrap_transaction(inner, None, false))
     }
 
     /// Maintenance-only DELETE transaction. It preserves a 16 MB hard-limit
@@ -655,13 +694,14 @@ impl Connection {
             self.inner
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
         )?;
-        Ok(self.wrap_transaction(inner, None))
+        Ok(self.wrap_transaction(inner, None, true))
     }
 
     fn wrap_transaction(
         &self,
         inner: libsql::Transaction,
         mutation_receipt: Option<String>,
+        allows_write: bool,
     ) -> Transaction {
         Transaction {
             inner: Some(inner),
@@ -670,6 +710,7 @@ impl Connection {
             connection_tainted: Arc::clone(&self.tainted),
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
+            allows_write,
             mutation_receipt,
             capacity_dirty: AtomicBool::new(false),
             capacity_poisoned: AtomicBool::new(false),
@@ -865,6 +906,9 @@ pub struct Transaction {
     connection_tainted: Arc<AtomicBool>,
     connection_config_version: Arc<std::sync::atomic::AtomicU64>,
     pending_config_version: std::sync::atomic::AtomicU64,
+    /// False for snapshots and replica reads. Those transactions must not
+    /// upgrade into a write and take the reserved lock.
+    allows_write: bool,
     mutation_receipt: Option<String>,
     capacity_dirty: AtomicBool,
     capacity_poisoned: AtomicBool,
@@ -889,6 +933,10 @@ impl Transaction {
     /// Startup-only privilege probe. The fixed no-op write is rolled back by
     /// `finish_read`, so it creates no receipt or capacity reservation.
     pub(crate) fn probe_write_permission(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.allows_write,
+            "read snapshot cannot take the write lock"
+        );
         let restore_fence: Option<String> = self
             .query_row(
                 "SELECT value FROM meta WHERE key='restore_fence'",
@@ -1072,6 +1120,10 @@ impl Transaction {
     }
 
     fn ensure_mutation_receipt_limit(&mut self, limit_bytes: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.allows_write,
+            "read snapshot cannot take the write lock"
+        );
         if self.mutation_receipt.is_some() {
             return Ok(());
         }
@@ -1321,10 +1373,21 @@ impl Transaction {
     /// Ends a primary-routed read snapshot without using COMMIT semantics.
     /// A lost response cannot make a read's outcome indeterminate.
     pub fn finish_read(mut self) -> Result<()> {
+        if self.stream_exhausted.load(Ordering::Acquire) {
+            // The provider already closed this stream. ROLLBACK would wait out
+            // the client deadline and cannot change the rows already collected.
+            self.connection_tainted.store(true, Ordering::Release);
+            let inner = self.inner.take().expect("transaction already completed");
+            drop_transaction_without_runtime(inner);
+            return Ok(());
+        }
         let result = self.runtime.block_on_database(
             "finish read transaction",
             self.inner().execute_batch("ROLLBACK"),
         );
+        if let Err(error) = &result {
+            self.note_remote_stream_loss(error);
+        }
         let inner = self.inner.take().expect("transaction already completed");
         drop_transaction_without_runtime(inner);
         match result {
@@ -1332,7 +1395,13 @@ impl Transaction {
             // The rows were already collected. The provider closing the stream
             // (TRANSACTION_TIMEOUT) or rejecting ROLLBACK because it already
             // dropped the transaction does not make that snapshot indeterminate.
-            Err(error) if remote_read_rollback_is_complete(&error) => Ok(()),
+            // The stream is not reused.
+            Err(error) if remote_read_rollback_is_complete(&error) => {
+                if self.runtime.is_remote() {
+                    self.connection_tainted.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }
@@ -1530,7 +1599,7 @@ impl SqlExecutor for Transaction {
     }
 
     fn is_write_transaction(&self) -> bool {
-        true
+        self.allows_write
     }
 
     fn capacity_page_size(&self) -> Result<u64> {
@@ -1902,6 +1971,56 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn primary_snapshot_does_not_wait_on_a_held_write_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_snapshot_lock_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
+            .unwrap();
+        let held = writer.transaction_immediate().unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
+        let started = std::time::Instant::now();
+        let snapshot = reader.transaction_primary_snapshot().unwrap();
+        let value: i64 = snapshot
+            .query_row("SELECT 1", (), |row| Ok(row.get(0)?))
+            .unwrap();
+        assert!(!SqlExecutor::is_write_transaction(&snapshot));
+        snapshot.finish_read().unwrap();
+        assert_eq!(value, 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "deferred primary snapshot waited on the writer lock: {:?}",
+            started.elapsed()
+        );
+        let consistent = reader.transaction_consistent_read().unwrap();
+        let consistent_value: i64 = consistent
+            .query_row("SELECT 1", (), |row| Ok(row.get(0)?))
+            .unwrap();
+        assert_eq!(consistent_value, 1);
+        assert!(!SqlExecutor::is_write_transaction(&consistent));
+        consistent.finish_read().unwrap();
+        let mut refused = reader.transaction_primary_snapshot().unwrap();
+        assert!(
+            refused
+                .ensure_mutation_receipt()
+                .unwrap_err()
+                .to_string()
+                .contains("write lock")
+        );
+        refused.finish_read().unwrap();
+        held.commit().unwrap();
+        drop(reader);
+        drop(writer);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ struct HranaState {
     commit_timeouts: usize,
     rollback_requests: usize,
     in_transaction: bool,
+    begin_sql: Vec<String>,
+    timeout_next_cursor: bool,
 }
 
 struct HranaFixture {
@@ -83,6 +85,7 @@ impl HranaFixture {
                 database,
                 runtime,
                 remote: true,
+                busy_timeout_ms: 5_000,
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),
@@ -122,6 +125,14 @@ impl HranaFixture {
 
     fn rollback_requests(&self) -> usize {
         self.state.lock().unwrap().rollback_requests
+    }
+
+    fn begin_sql(&self) -> Vec<String> {
+        self.state.lock().unwrap().begin_sql.clone()
+    }
+
+    fn timeout_next_cursor(&self) {
+        self.state.lock().unwrap().timeout_next_cursor = true;
     }
 }
 
@@ -201,6 +212,14 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             )
         }
         "/v3/cursor" => {
+            if state.timeout_next_cursor {
+                state.timeout_next_cursor = false;
+                let lines = [
+                    json!({"baton": baton}).to_string(),
+                    json!({"type": "step_error", "step": 0, "error": {"message": "Transaction timed out", "code": "TRANSACTION_TIMEOUT"}}).to_string(),
+                ];
+                return body(StatusCode::OK, format!("{}\n", lines.join("\n")));
+            }
             if state.expire_next_cursor {
                 state.expire_next_cursor = false;
                 state.expired_requests += 1;
@@ -254,6 +273,7 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
             }
         });
     } else if sql.starts_with("BEGIN") {
+        state.begin_sql.push(sql);
         state.in_transaction = true;
     } else if sql.starts_with("COMMIT") {
         state.in_transaction = false;
@@ -370,4 +390,40 @@ async fn remote_commit_timeout_does_not_roll_back_the_closed_stream() {
         0,
         "COMMIT already closed the stream"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn primary_snapshot_skips_rollback_when_the_cursor_stream_is_closed() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    fixture.timeout_next_cursor();
+    let started = std::time::Instant::now();
+    let error = db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let query = tx.query_row("SELECT 1", (), |row| Ok(row.get::<i64>(0)?));
+            let finished = tx.finish_read();
+            query?;
+            finished
+        })
+        .await
+        .expect_err("a closed cursor must surface to the caller");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "finish_read must not roll back a closed stream for the client deadline"
+    );
+    assert!(
+        is_remote_interactive_timeout(&error),
+        "cursor timeout must stay an interactive-stream failure: {error:#}"
+    );
+    assert_eq!(fixture.rollback_requests(), 0);
+    let begins = fixture.begin_sql();
+    assert!(
+        begins
+            .iter()
+            .any(|sql| sql.contains("DEFERRED") && !sql.contains("IMMEDIATE")),
+        "primary snapshot must be deferred: {begins:?}"
+    );
+    assert_eq!(db.connections.idle.lock().unwrap().len(), 1);
+    assert_eq!(db.permits.available_permits(), 2);
 }

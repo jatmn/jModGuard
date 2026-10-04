@@ -97,7 +97,7 @@ pub async fn pending_nickname_reconciles(
     limit: u32,
 ) -> Result<Vec<NicknameReconcileJob>> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let mut stmt = tx.prepare(
             "SELECT n.guild_id,n.generation,n.attempt_count,n.nickname,n.job_id,n.enrollment_id,e.joined_at_ns
              FROM nickname_reconcile n JOIN guild_enrollments e
@@ -175,7 +175,7 @@ fn nickname_job_matches_conn(conn: &impl SqlExecutor, job: &NicknameReconcileJob
 pub async fn nickname_reconcile_can_dispatch(db: &Db, job: &NicknameReconcileJob) -> Result<bool> {
     let job = job.clone();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let matches = nickname_job_matches_conn(&tx, &job)?
             && !super::guild_stores::guild_write_fenced(&tx, job.guild_id)?;
         tx.finish_read()?;

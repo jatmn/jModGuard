@@ -289,7 +289,7 @@ async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn moderation_read_rechecks_membership_after_waiting_for_primary_writer() {
+async fn moderation_read_keeps_prior_membership_without_waiting_for_the_writer() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let writer_db = f.db.clone();
@@ -305,14 +305,18 @@ async fn moderation_read_rechecks_membership_after_waiting_for_primary_writer() 
         }).await.unwrap();
     });
     ready.await.unwrap();
-    let read = enrolled_guild_stats(&f.db, scope);
+    let read = enrolled_guild_stats(&f.db, scope.clone());
     tokio::pin!(read);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(30), &mut read)
-            .await
-            .is_err()
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(500), &mut read)
+        .await
+        .expect("a primary snapshot must finish while a writer holds the lock")
+        .expect("the snapshot still shows the membership committed before the writer");
     release.send(()).unwrap();
     writer.await.unwrap();
-    assert!(read.await.unwrap_err().is::<EnrollmentChanged>());
+    assert!(
+        enrolled_guild_stats(&f.db, scope)
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
 }

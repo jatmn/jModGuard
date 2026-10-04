@@ -78,7 +78,19 @@ pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 /// A remote request that has not completed within this deadline is cancelled.
 /// Callers receive `DatabaseOperationTimedOut`; writes are not retried here
 /// because the server may have committed before the response was lost.
+/// Startup and the bot keep this bound. Interactive API work uses
+/// [`API_REMOTE_OPERATION_TIMEOUT`].
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Interactive API and web database work must fail inside the browser abort.
+/// Two of these plus one Discord call stay under that 30 second budget.
+pub const API_REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Local API writes wait this long for the bot's reserved lock, then fail
+/// retriably. They do not sit in the bot's write queue.
+const API_LOCAL_BUSY_TIMEOUT_MS: u32 = 200;
+
+const BOT_LOCAL_BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// Transitional internal settings validation; no chat history is collected.
 /// Remove with the old settings shape in the fresh tenant/config model.
@@ -419,6 +431,7 @@ struct ConnectionPool {
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
     remote: bool,
+    busy_timeout_ms: u32,
 }
 
 struct ConnectionLease {
@@ -440,7 +453,7 @@ impl ConnectionLease {
                 let connection =
                     Connection::from_database(Arc::clone(&pool.database), pool.runtime.clone())
                         .context("failed to replace discarded database connection")?;
-                configure_connection(&connection, pool.remote)?;
+                configure_connection(&connection, pool.remote, pool.busy_timeout_ms)?;
                 connection
             }
         };
@@ -647,11 +660,25 @@ impl Db {
             initialize(&mut bootstrap)?;
 
             let pool_size = opts.pool_size.max(2) as usize;
+            // The API does not migrate. Its pooled work is interactive and must
+            // fail inside the browser abort. Startup above keeps the longer bound.
+            let interactive_api = remote && !opts.migrate;
+            let pool_runtime = if interactive_api {
+                runtime.for_operation_timeout(Some(API_REMOTE_OPERATION_TIMEOUT))
+            } else {
+                runtime.clone()
+            };
+            let busy_timeout_ms = if opts.migrate {
+                BOT_LOCAL_BUSY_TIMEOUT_MS
+            } else {
+                API_LOCAL_BUSY_TIMEOUT_MS
+            };
             let mut connections = Vec::with_capacity(pool_size);
             for _ in 0..pool_size {
-                let connection = Connection::from_database(Arc::clone(&database), runtime.clone())
-                    .context("failed to create pooled database connection")?;
-                configure_connection(&connection, remote)?;
+                let connection =
+                    Connection::from_database(Arc::clone(&database), pool_runtime.clone())
+                        .context("failed to create pooled database connection")?;
+                configure_connection(&connection, remote, busy_timeout_ms)?;
                 connections.push(connection);
             }
 
@@ -670,11 +697,16 @@ impl Db {
                 connections: Arc::new(ConnectionPool {
                     idle: Mutex::new(connections),
                     database,
-                    runtime: runtime.clone(),
+                    runtime: pool_runtime,
                     remote,
+                    busy_timeout_ms,
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
-                permit_timeout: remote.then_some(REMOTE_OPERATION_TIMEOUT),
+                permit_timeout: remote.then_some(if opts.migrate {
+                    REMOTE_OPERATION_TIMEOUT
+                } else {
+                    API_REMOTE_OPERATION_TIMEOUT
+                }),
                 required_config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 config_floor_lock: Arc::new(parking_lot::Mutex::new(())),

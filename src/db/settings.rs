@@ -133,7 +133,7 @@ pub async fn get_settings(db: &Db, guild_id: i64) -> Result<GuildSettings> {
 /// reconciliation after independently running bot/API writers.
 pub async fn get_settings_primary(db: &Db, guild_id: i64) -> Result<GuildSettings> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let defaults = terminal_defaults_conn(&tx)?;
         let settings = effective_settings_conn(&tx, guild_id, &defaults)?;
         tx.finish_read()?;

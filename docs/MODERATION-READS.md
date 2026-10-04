@@ -27,13 +27,15 @@ event user IDs outside the signed database range are rejected rather than wrappe
 the user before using them. The API service guard rejects the old guild-ID moderation reads.
 Bot callers retain those helpers, sharing the same SQL and row decoding with scoped reads.
 
-The existing primary-read primitive starts an IMMEDIATE transaction and closes it with
-ROLLBACK after the read. Membership verification and data queries therefore retain the
-primary writer lock together. No recovery receipt, configuration version change, new table,
-dependency, cache, connection pool or polling task is added. Event/ban results retain their
-1–200 row clamp, ordering and filters. Statistics retain existing definitions, with all
-three counts in one snapshot. Counting scans can take longer as retained records grow;
-this change does not establish large-database performance or distributed read scaling.
+Membership verification and data queries share one deferred primary snapshot (`BEGIN
+DEFERRED`) and close it with ROLLBACK after the read. That snapshot is still routed to the
+primary, and it does not take the writer lock, so a bot write is not queued behind the
+read and a held writer does not stall the read. No recovery receipt, configuration version
+change, new table, dependency, cache, connection pool or polling task is added. Event/ban
+results retain their 1–200 row clamp, ordering and filters. Statistics retain existing
+definitions, with all three counts in one snapshot. Counting scans can take longer as
+retained records grow; this change does not establish large-database performance or
+distributed read scaling.
 
 Membership fencing does not erase historical guild rows or attach those rows to a particular
 installation. After rejoin, a newly authorized page can still read the guild's retained data.
@@ -43,8 +45,9 @@ SQL are not one transaction. The main configuration bundle already has a capture
 individual rule, badword, command, template and log-channel GET reads now also have
 [captured snapshots](CONFIGURATION-SCOPES.md#individual-configuration-reads).
 
-Local tests cover permission loss, old/missing page tokens, forged/stale scopes, waiting for
-a membership-changing writer, empty reads, unavailable membership storage, guild isolation,
+Local tests cover permission loss, old/missing page tokens, forged/stale scopes, a
+membership-changing writer that does not stall the snapshot, empty reads, unavailable
+membership storage, guild isolation,
 filters, ordering, limits, wire values and receipt/version-free reads. Disposable loopback
 libSQL exercises the same captured reads across bot/API connections. These checks do not
 claim live Bunny or Discord validation.

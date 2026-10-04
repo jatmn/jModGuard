@@ -135,7 +135,8 @@ The primary read verifies membership even for empty results, captures the config
 version and reads only the needed section or key. Its version must satisfy the process's
 committed-version floor, as for the main configuration bundle. It adds no mutation receipt,
 version change, schema, dependency, pool, cache or polling. Shared SQL/decoding preserves bot
-helpers and response semantics. The primary writer lock spans verification and data. The
+helpers and response semantics. Verification and data share one deferred primary snapshot
+and do not take the writer lock. The
 WebUI/config-parts bundle uses one SQL statement for the collections so a remote Hrana
 interactive transaction is not a per-table round-trip loop. Individual section reads still
 select only the requested key. This change does not add pagination, resource limits or

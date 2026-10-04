@@ -703,6 +703,9 @@ impl OAuthClient {
         else {
             return;
         };
+        // Kept on this call so a restart still sees the deadline. The API pool
+        // bounds the write, so a locked database fails the record inside the
+        // interactive deadline instead of the bot's. The request continues.
         for _ in 0..4 {
             let (generation, deadlines) = self
                 .guild_list
