@@ -242,9 +242,11 @@ impl EventHandler for Handler {
         if is_new.unwrap_or(false) {
             tracing::info!("joined new guild {gid} ({})", guild.name);
         }
+        self.app.invalidate_member_sync_scope();
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        self.app.invalidate_member_sync_scope();
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());

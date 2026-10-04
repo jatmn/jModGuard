@@ -5168,6 +5168,24 @@ async fn status_counts_due_absence_rows_instead_of_the_unused_sync_column() {
 }
 
 #[tokio::test]
+async fn worker_status_skips_the_absence_backlog_count() {
+    let (_f, store, scope) = ready().await;
+    departed_member(&store, &scope, 89).await;
+    let dashboard = store
+        .member_sync_status(scope.clone(), 42, 400_000)
+        .await
+        .unwrap();
+    let worker = store
+        .member_sync_worker_status(scope, 42, 400_000)
+        .await
+        .unwrap();
+    assert_eq!(dashboard.unseen_candidate_count, 1);
+    assert_eq!(worker.unseen_candidate_count, 0);
+    assert_eq!(worker.status, dashboard.status);
+    assert_eq!(worker.next_attempt_at, dashboard.next_attempt_at);
+}
+
+#[tokio::test]
 async fn newer_unchanged_member_observations_fence_delayed_names() {
     let (_f, store, scope) = ready().await;
     store

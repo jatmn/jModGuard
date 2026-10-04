@@ -402,6 +402,12 @@ pub struct BotState {
     pending_member_gaps: Mutex<PendingMemberGaps>,
     /// Increments on each Gateway READY. Resume does not change it.
     pub(crate) gateway_ready_generation: AtomicU64,
+    /// Gateway membership/ready and config-version changes. The member-sync
+    /// loop drops its enrollment, placement, and fence cache when this moves.
+    pub(crate) member_scope_epoch: AtomicU64,
+    /// Wakes the member-sync loop before its saved attempt, without dropping
+    /// that cache. Dashboard sync controls use this.
+    pub(crate) member_sync_wake: tokio::sync::Notify,
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
@@ -463,6 +469,8 @@ impl BotState {
             pending_audit_links: Mutex::new(PendingAuditLinks::default()),
             pending_member_gaps: Mutex::new(PendingMemberGaps::default()),
             gateway_ready_generation: AtomicU64::new(0),
+            member_scope_epoch: AtomicU64::new(0),
+            member_sync_wake: tokio::sync::Notify::new(),
             ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
         }))
@@ -570,7 +578,20 @@ impl BotState {
         if !self.ready_shards.lock().insert(shard_id) {
             self.gateway_ready_generation
                 .fetch_add(1, Ordering::Relaxed);
+            self.invalidate_member_sync_scope();
         }
+    }
+
+    /// Drop cached member-sync enrollment, placement, and fence state and wake
+    /// the idle loop. Gateway membership and config-version changes call this.
+    pub(crate) fn invalidate_member_sync_scope(&self) {
+        self.member_scope_epoch.fetch_add(1, Ordering::SeqCst);
+        self.member_sync_wake.notify_one();
+    }
+
+    /// Wake the idle loop so it can see a newly saved attempt. Cached scope stays.
+    pub(crate) fn wake_member_sync(&self) {
+        self.member_sync_wake.notify_one();
     }
 
     pub(crate) fn remember_application_audit(
@@ -730,6 +751,7 @@ impl BotState {
         if config_changed {
             self.last_config_version
                 .store(primary.config, Ordering::SeqCst);
+            self.invalidate_member_sync_scope();
             if config_revision_changed {
                 // Snapshot acceptance carries the revision identity, so a
                 // higher pre-failover replica counter cannot bypass rollback

@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -82,6 +82,170 @@ fn due_work(
 // Import and audit recovery share one guild in persisted pacing/ETA metadata.
 fn ready_guild_count(guilds: impl Iterator<Item = GuildId>) -> u32 {
     guilds.collect::<HashSet<_>>().len() as u32
+}
+
+/// Longest quiet period between idle status reads. A sooner saved attempt wins.
+/// This is not a fixed poll; it only bounds a deadline that is hours away.
+const IDLE_RECHECK_CAP: Duration = Duration::from_secs(60);
+
+struct IdleScan {
+    work_due: bool,
+    backfill_pending: bool,
+    earliest_attempt_ms: Option<i64>,
+    next_request: tokio::time::Instant,
+    rate_limit_until_ms: i64,
+    idle_recheck: Duration,
+}
+
+fn deadline_instant(
+    now: tokio::time::Instant,
+    now_ms: i64,
+    deadline_ms: i64,
+) -> tokio::time::Instant {
+    let delay_ms = deadline_ms.saturating_sub(now_ms).max(0);
+    let delay_ms = delay_ms.min(IDLE_RECHECK_CAP.as_millis() as i64) as u64;
+    now.checked_add(Duration::from_millis(delay_ms))
+        .unwrap_or(now + IDLE_RECHECK_CAP)
+}
+
+fn cap_wait(now: tokio::time::Instant, at: tokio::time::Instant) -> tokio::time::Instant {
+    let cap = now + IDLE_RECHECK_CAP;
+    if at > cap { cap } else { at }
+}
+
+/// When nothing is due, wait until the saved attempt (or the pace recheck),
+/// never a fixed two-second tick. When work is due, wait only for the request
+/// gate or an active rate limit.
+fn next_idle_scan(
+    now: tokio::time::Instant,
+    now_ms: i64,
+    scan: &IdleScan,
+) -> Option<tokio::time::Instant> {
+    let at = if scan.work_due {
+        let mut at = scan.next_request;
+        if scan.rate_limit_until_ms > now_ms {
+            at = at.max(deadline_instant(now, now_ms, scan.rate_limit_until_ms));
+        }
+        at
+    } else if scan.backfill_pending {
+        now + Duration::from_secs(1)
+    } else {
+        let attempt = match scan.earliest_attempt_ms.filter(|ms| *ms > now_ms) {
+            Some(ms) => deadline_instant(now, now_ms, ms),
+            None => now + scan.idle_recheck,
+        };
+        attempt.max(scan.next_request)
+    };
+    let at = cap_wait(now, at);
+    (at > now).then_some(at)
+}
+
+fn earlier_attempt(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, right) => right,
+    }
+}
+
+enum CachedScope {
+    Absent,
+    Ready {
+        joined_at_ns: i64,
+        store: Box<db::guild_data::GuildDataStore>,
+        scope: Box<db::guild_data::GuildDataScope>,
+    },
+}
+
+struct ScopeCache {
+    entries: HashMap<i64, CachedScope>,
+    ready_generation: u64,
+    config_version: u64,
+    scope_epoch: u64,
+}
+
+impl ScopeCache {
+    fn capture(app: &BotState) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ready_generation: app.gateway_ready_generation.load(Ordering::Relaxed),
+            config_version: app.last_config_version.load(Ordering::SeqCst),
+            scope_epoch: app.member_scope_epoch.load(Ordering::SeqCst),
+        }
+    }
+
+    fn observe(&mut self, app: &BotState) {
+        let ready = app.gateway_ready_generation.load(Ordering::Relaxed);
+        let config = app.last_config_version.load(Ordering::SeqCst);
+        let epoch = app.member_scope_epoch.load(Ordering::SeqCst);
+        if ready != self.ready_generation
+            || config != self.config_version
+            || epoch != self.scope_epoch
+        {
+            self.entries.clear();
+            self.ready_generation = ready;
+            self.config_version = config;
+            self.scope_epoch = epoch;
+        }
+    }
+
+    fn hit(
+        &mut self,
+        guild: i64,
+        joined_at: Option<i64>,
+    ) -> Option<
+        Option<(
+            db::guild_data::GuildDataStore,
+            db::guild_data::GuildDataScope,
+        )>,
+    > {
+        match self.entries.get(&guild) {
+            Some(CachedScope::Absent) => Some(None),
+            Some(CachedScope::Ready {
+                joined_at_ns,
+                store,
+                scope,
+            }) if joined_at.is_none_or(|value| value == *joined_at_ns) => {
+                Some(Some((store.as_ref().clone(), scope.as_ref().clone())))
+            }
+            Some(CachedScope::Ready { .. }) => {
+                self.entries.remove(&guild);
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoopProbe {
+    scope_lookups: AtomicU64,
+    status_reads: AtomicU64,
+}
+
+impl LoopProbe {
+    fn scope_lookup(&self) {
+        self.scope_lookups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn status_read(&self) {
+        self.status_reads.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn wait_for_member_sync(app: &BotState, until: tokio::time::Instant, seen_epoch: u64) {
+    let notify = app.member_sync_wake.notified();
+    tokio::pin!(notify);
+    notify.as_mut().enable();
+    if app.member_scope_epoch.load(Ordering::SeqCst) != seen_epoch
+        || until <= tokio::time::Instant::now()
+    {
+        return;
+    }
+    tokio::select! {
+        _ = notify => {}
+        _ = tokio::time::sleep_until(until) => {}
+    }
 }
 
 fn cursor_id(cursor: &Option<String>) -> anyhow::Result<Option<u64>> {
@@ -700,6 +864,25 @@ pub async fn run(
     rate_limit_until_ms: Arc<AtomicI64>,
     sync_bot_id: Arc<AtomicI64>,
 ) {
+    run_loop(
+        app,
+        http,
+        cache,
+        rate_limit_until_ms,
+        sync_bot_id,
+        Arc::new(LoopProbe::default()),
+    )
+    .await;
+}
+
+async fn run_loop(
+    app: Arc<BotState>,
+    http: Arc<Http>,
+    cache: Arc<serenity::cache::Cache>,
+    rate_limit_until_ms: Arc<AtomicI64>,
+    sync_bot_id: Arc<AtomicI64>,
+    probe: Arc<LoopProbe>,
+) {
     // A READY generation is acknowledged per enrollment only after its
     // directory status and any required coverage gap have been recorded.
     let mut ready_coverage = ReadyCoverage::default();
@@ -718,16 +901,25 @@ pub async fn run(
         );
     let mut consecutive_failures = 0u32;
     let mut cleanup_turn = false;
+    let mut scope_cache = ScopeCache::capture(&app);
+    let mut defer_until: Option<tokio::time::Instant> = None;
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(until) = defer_until.take() {
+            wait_for_member_sync(&app, until, scope_cache.scope_epoch).await;
+        }
+        scope_cache.observe(&app);
+        let idle_recheck =
+            Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs).max(1));
         let bot_id = cache.current_user().id.get() as i64;
         if bot_id <= 1 {
+            defer_until = Some(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
         sync_bot_id.store(bot_id, Ordering::Relaxed);
         let mut guilds = cache.guilds();
         guilds.sort_unstable();
         if guilds.is_empty() {
+            defer_until = Some(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
         let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
@@ -735,18 +927,45 @@ pub async fn run(
         let mut ready = Vec::new();
         let mut available = Vec::new();
         let mut initial_estimates = Vec::new();
+        let mut earliest_attempt_ms = None;
+        let mut backfill_pending = false;
         for guild_id in guilds {
             let gid = guild_id.get() as i64;
-            let Some(enrollment) = db::guild_enrollment(&app.db, gid).await.ok().flatten() else {
-                continue;
-            };
-            let Ok((store, scope)) = app.tenant.live(enrollment.clone()).await else {
-                continue;
+            // Drop the cache guard before any await. A missing or zero join
+            // timestamp does not invalidate a cached enrollment.
+            let joined_at = cache
+                .guild(guild_id)
+                .and_then(|guild| guild.joined_at.timestamp_nanos_opt())
+                .filter(|joined| *joined > 0);
+            let (store, scope) = match scope_cache.hit(gid, joined_at) {
+                Some(Some(cached)) => cached,
+                Some(None) => continue,
+                None => {
+                    probe.scope_lookup();
+                    let Some(enrollment) = db::guild_enrollment(&app.db, gid).await.ok().flatten()
+                    else {
+                        scope_cache.entries.insert(gid, CachedScope::Absent);
+                        continue;
+                    };
+                    let Ok((store, scope)) = app.tenant.live(enrollment.clone()).await else {
+                        continue;
+                    };
+                    scope_cache.entries.insert(
+                        gid,
+                        CachedScope::Ready {
+                            joined_at_ns: enrollment.joined_at_ns,
+                            store: Box::new(store.clone()),
+                            scope: Box::new(scope.clone()),
+                        },
+                    );
+                    (store, scope)
+                }
             };
             member_directory::flush_pending_gaps(&app, &store, &scope).await;
-            let key = (gid, enrollment.id.clone());
+            let key = (gid, scope.enrollment().id.clone());
             let (newly_initialized, session_replaced) =
                 ready_coverage.pending(&key, ready_generation);
+            probe.status_read();
             let status = if newly_initialized {
                 match store
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
@@ -763,7 +982,7 @@ pub async fn run(
                 }
             } else {
                 match store
-                    .member_sync_status(scope.clone(), bot_id, now_ms)
+                    .member_sync_worker_status(scope.clone(), bot_id, now_ms)
                     .await
                 {
                     Ok(status) => status,
@@ -776,6 +995,9 @@ pub async fn run(
                     }
                 }
             };
+            earliest_attempt_ms = earlier_attempt(earliest_attempt_ms, status.next_attempt_at);
+            earliest_attempt_ms =
+                earlier_attempt(earliest_attempt_ms, status.audit_recovery_next_attempt_at);
             if coverage_gap_for_session(
                 newly_initialized,
                 session_replaced,
@@ -794,21 +1016,23 @@ pub async fn run(
                 );
                 continue;
             }
-            ready_coverage.acknowledge(key, ready_generation);
-            let backfill_key = (gid, enrollment.id.clone());
-            if !backfilled.contains(&backfill_key) {
+            ready_coverage.acknowledge(key.clone(), ready_generation);
+            if !backfilled.contains(&key) {
                 match store
                     .backfill_member_case_index(scope.clone(), bot_id, 100)
                     .await
                 {
                     Ok(true) => {
-                        backfilled.insert(backfill_key);
+                        backfilled.insert(key);
                     }
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(
-                        guild_id = gid,
-                        "member case index backfill deferred: {error:#}"
-                    ),
+                    Ok(false) => backfill_pending = true,
+                    Err(error) => {
+                        backfill_pending = true;
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member case index backfill deferred: {error:#}"
+                        );
+                    }
                 }
             }
             available.push((guild_id, store.clone(), scope.clone()));
@@ -857,10 +1081,40 @@ pub async fn run(
                 );
             }
         }
+        let decision_ms = chrono::Utc::now().timestamp_millis();
+        let work_due = !ready.is_empty();
+        if let Some(until) = next_idle_scan(
+            tokio::time::Instant::now(),
+            decision_ms,
+            &IdleScan {
+                work_due,
+                backfill_pending,
+                earliest_attempt_ms,
+                next_request,
+                rate_limit_until_ms: rate_limit_until_ms.load(Ordering::Relaxed),
+                idle_recheck,
+            },
+        ) {
+            let rate_limited = rate_limit_until_ms.load(Ordering::Relaxed) > decision_ms;
+            let gate_closed = tokio::time::Instant::now() < next_request || rate_limited;
+            // Import work and a closed request gate wait for the saved deadline.
+            // An open gate with nothing due still runs cleanup, then sleeps.
+            if work_due || gate_closed {
+                defer_until = Some(until);
+                continue;
+            }
+            defer_until = Some(until);
+        }
         if tokio::time::Instant::now() < next_request {
+            defer_until = Some(next_request);
             continue;
         }
         if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
+            defer_until = Some(deadline_instant(
+                tokio::time::Instant::now(),
+                chrono::Utc::now().timestamp_millis(),
+                rate_limit_until_ms.load(Ordering::Relaxed),
+            ));
             continue;
         }
         let pace = Duration::from_secs(u64::from(app.cfg.member_sync.min_request_interval_secs));
@@ -1128,22 +1382,32 @@ pub async fn run(
             }
             cleanup_turn = false;
             if cleaned {
+                if defer_until.is_none() {
+                    defer_until = Some(next_request);
+                }
                 continue;
             }
         }
         if ready.is_empty() {
-            tokio::time::sleep(Duration::from_secs(8)).await;
+            if defer_until.is_none() {
+                defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+            }
             continue;
         }
         let Some(request_claim) = reserve_request(&app, bot_id, &worker_id).await else {
+            defer_until = Some(tokio::time::Instant::now() + pace);
             continue;
         };
         if rate_limit_until_ms.load(Ordering::Relaxed) > chrono::Utc::now().timestamp_millis() {
             finish_request(&app, request_claim, &rate_limit_until_ms).await;
+            defer_until = Some(deadline_instant(
+                tokio::time::Instant::now(),
+                chrono::Utc::now().timestamp_millis(),
+                rate_limit_until_ms.load(Ordering::Relaxed),
+            ));
             continue;
         }
         next_request = tokio::time::Instant::now() + pace;
-        let mut attempted = false;
         for _ in 0..ready.len() {
             let (guild_id, store, scope, work) = ready[offset % ready.len()].clone();
             offset = offset.wrapping_add(1);
@@ -1170,7 +1434,6 @@ pub async fn run(
                         continue;
                     }
                 };
-                attempted = true;
                 cleanup_turn = true;
                 next_request = tokio::time::Instant::now() + pace;
                 let timeout =
@@ -1279,7 +1542,6 @@ pub async fn run(
                     continue;
                 }
             };
-            attempted = true;
             cleanup_turn = true;
             // Set the next local slot before HTTP so errors and cancellations
             // cannot cause an immediate second Discord request.
@@ -1397,8 +1659,13 @@ pub async fn run(
             break;
         }
         finish_request(&app, request_claim, &rate_limit_until_ms).await;
-        if !attempted {
-            tokio::time::sleep(Duration::from_secs(8)).await;
+        if defer_until.is_none() {
+            let now = tokio::time::Instant::now();
+            defer_until = Some(if next_request > now {
+                next_request
+            } else {
+                now + pace
+            });
         }
     }
 }
@@ -1861,5 +2128,278 @@ mod tests {
         };
         assert!(status.audit_pagination_stalled());
         assert!(due_work(&status, 0, 15_000).is_empty());
+    }
+
+    fn probe_counts(probe: &LoopProbe) -> (u64, u64) {
+        (
+            probe.scope_lookups.load(Ordering::Relaxed),
+            probe.status_reads.load(Ordering::Relaxed),
+        )
+    }
+
+    async fn drive_until(mut ready: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while !ready() {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "member sync loop did not reach the expected state"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Paused tokio time does not cover `spawn_blocking` database work. Yield
+    /// until that work has parked the loop on its timer.
+    async fn settle_parked(probe: &LoopProbe, lookups: u64, reads: u64) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe_counts(probe), (lookups, reads));
+    }
+
+    fn gateway_cache(guild_id: u64) -> Arc<serenity::cache::Cache> {
+        use serenity::all::{Cache, CurrentUser, Guild, GuildCreateEvent, UserUpdateEvent};
+        let cache = Arc::new(Cache::new());
+        let mut user = CurrentUser::default();
+        user.id = UserId::new(42);
+        let mut event: UserUpdateEvent =
+            serde_json::from_value(serde_json::to_value(user).unwrap()).unwrap();
+        cache.update(&mut event);
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(guild_id);
+        guild.member_count = 200;
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+        cache
+    }
+
+    async fn enrolled_directory() -> (
+        std::path::PathBuf,
+        Arc<BotState>,
+        db::guild_data::GuildDataStore,
+        db::guild_data::GuildDataScope,
+    ) {
+        use crate::{config::BotProcessConfig, db::Db};
+        let directory =
+            std::env::temp_dir().join(format!("member_sync_idle_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut cfg = BotProcessConfig::default();
+        let db_path = directory.join("core.db");
+        cfg.db.path = db_path.clone();
+        let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        (directory, app, store, scope)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_scan_waits_for_the_saved_attempt_instead_of_a_two_second_tick() {
+        let now = tokio::time::Instant::now();
+        let now_ms = 1_000_000_i64;
+        let pace = Duration::from_secs(15);
+        let waiting = next_idle_scan(
+            now,
+            now_ms,
+            &IdleScan {
+                work_due: false,
+                backfill_pending: false,
+                earliest_attempt_ms: Some(now_ms + 45_000),
+                next_request: now,
+                rate_limit_until_ms: 0,
+                idle_recheck: pace,
+            },
+        )
+        .unwrap();
+        assert_eq!(waiting.duration_since(now), Duration::from_secs(45));
+        let recheck = next_idle_scan(
+            now,
+            now_ms,
+            &IdleScan {
+                work_due: false,
+                backfill_pending: false,
+                earliest_attempt_ms: None,
+                next_request: now,
+                rate_limit_until_ms: 0,
+                idle_recheck: pace,
+            },
+        )
+        .unwrap();
+        assert_eq!(recheck.duration_since(now), pace);
+        let gated = next_idle_scan(
+            now,
+            now_ms,
+            &IdleScan {
+                work_due: true,
+                backfill_pending: false,
+                earliest_attempt_ms: Some(now_ms),
+                next_request: now + pace,
+                rate_limit_until_ms: 0,
+                idle_recheck: pace,
+            },
+        )
+        .unwrap();
+        assert_eq!(gated.duration_since(now), pace);
+        assert!(
+            next_idle_scan(
+                now,
+                now_ms,
+                &IdleScan {
+                    work_due: true,
+                    backfill_pending: false,
+                    earliest_attempt_ms: Some(now_ms),
+                    next_request: now,
+                    rate_limit_until_ms: 0,
+                    idle_recheck: pace,
+                },
+            )
+            .is_none()
+        );
+        let capped = next_idle_scan(
+            now,
+            now_ms,
+            &IdleScan {
+                work_due: false,
+                backfill_pending: false,
+                earliest_attempt_ms: Some(now_ms + 7_200_000),
+                next_request: now,
+                rate_limit_until_ms: 0,
+                idle_recheck: pace,
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.duration_since(now), IDLE_RECHECK_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_loop_waits_for_the_saved_attempt() {
+        let (directory, app, store, scope) = enrolled_directory().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .initialize_member_directory(scope.clone(), 42, now_ms)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "idle-test".into(), now_ms, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .defer_member_sync(
+                scope.clone(),
+                claim,
+                "retry".into(),
+                now_ms + 45_000,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
+        settle_parked(&probe, 1, 1).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle_parked(&probe, 1, 1).await;
+        tokio::time::advance(Duration::from_secs(50)).await;
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 2).await;
+        assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 1);
+        assert!(probe.status_reads.load(Ordering::Relaxed) >= 2);
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_scope_lasts_until_gateway_invalidation() {
+        let (directory, app, store, scope) = enrolled_directory().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .initialize_member_directory(scope.clone(), 42, now_ms)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "cache-test".into(), now_ms, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .defer_member_sync(
+                scope.clone(),
+                claim,
+                "retry".into(),
+                now_ms + 45_000,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) >= 1).await;
+        settle_parked(&probe, 1, 1).await;
+        app.invalidate_member_sync_scope();
+        drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) >= 2).await;
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_work_still_claims_a_member_sync() {
+        let (directory, app, store, scope) = enrolled_directory().await;
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
+        settle_parked(&probe, 1, 1).await;
+        let queued = store
+            .member_sync_worker_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap();
+        assert_eq!(queued.status, "queued");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let started = std::time::Instant::now();
+        let claimed = loop {
+            let status = store
+                .member_sync_worker_status(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+            if status.status != "queued" {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "due member sync was not claimed"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_ne!(claimed.status, "queued");
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
