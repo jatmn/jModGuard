@@ -230,6 +230,12 @@ pub(super) fn is_rejected_remote_auth(err: &anyhow::Error) -> bool {
 }
 
 fn is_transient_remote_open(err: &anyhow::Error) -> bool {
+    // A provider TRANSACTION_TIMEOUT is an interactive transaction that lived
+    // too long. It contains the word "timeout", but it is not a transport
+    // failure and must not be classified as one.
+    if is_remote_interactive_timeout(err) {
+        return false;
+    }
     if is_database_operation_timeout(err) {
         return true;
     }
@@ -263,32 +269,85 @@ fn is_transient_remote_open(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Startup retries incomplete schema, SQLite locks, and transient remote
-/// transport errors. Auth failures still fail immediately. Shared by the
-/// API (`migrate=false`) and the bot (`migrate=true`).
-pub fn is_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
-    if err
-        .chain()
-        .any(|e| e.downcast_ref::<UnsupportedSchema>().is_some())
-    {
-        return false;
-    }
-    if is_schema_not_ready(err) || is_sqlite_startup_lock(err) {
-        return true;
-    }
-    remote && !is_rejected_remote_auth(err) && is_transient_remote_open(err)
+/// Why a database open may be tried again. Interactive transaction timeouts
+/// are not transport failures: the timed-out stream is discarded and the next
+/// attempt opens a new connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupRetryKind {
+    Schema,
+    SqliteLock,
+    InteractiveTransaction,
+    Transport,
 }
 
-/// How long the API (and a remote bot) should keep retrying `open_with`.
-/// The attempt count and delay define when new attempts may start. An
-/// in-flight `open_with` is allowed to finish so migrate/bootstrap work is
-/// not abandoned and the last error stays classified.
-pub fn startup_open_retry(opts: &DbOpenOptions) -> (u32, Duration) {
-    if opts.url.trim().is_empty() {
-        (30, Duration::from_secs(1))
-    } else {
-        (180, Duration::from_secs(2))
+/// Startup retries incomplete schema, SQLite locks, remote transport errors,
+/// and a remote interactive transaction timeout. Auth failures still fail
+/// immediately. Shared by the API (`migrate=false`) and the bot (`migrate=true`).
+pub fn startup_retry_kind(err: &anyhow::Error, remote: bool) -> Option<StartupRetryKind> {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<UnsupportedSchema>().is_some())
+    {
+        return None;
     }
+    if is_schema_not_ready(err) {
+        return Some(StartupRetryKind::Schema);
+    }
+    if is_sqlite_startup_lock(err) {
+        return Some(StartupRetryKind::SqliteLock);
+    }
+    if !remote || is_rejected_remote_auth(err) {
+        return None;
+    }
+    if is_remote_interactive_timeout(err) {
+        return Some(StartupRetryKind::InteractiveTransaction);
+    }
+    if is_transient_remote_open(err) {
+        return Some(StartupRetryKind::Transport);
+    }
+    None
+}
+
+pub fn is_startup_retryable(err: &anyhow::Error, remote: bool) -> bool {
+    startup_retry_kind(err, remote).is_some()
+}
+
+/// Wall-clock budget for `open_with_budget`. Attempt duration counts toward
+/// `budget`; it is not multiplied into a fake attempt total.
+#[derive(Clone, Copy, Debug)]
+pub struct StartupOpenBudget {
+    pub budget: Duration,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+/// How long startup should keep retrying `open_with`.
+///
+/// Local SQLite gets a short budget for the migrate/lock race. A remote open
+/// gets a real wall-clock budget. The old `(180, 2s)` pair looked like 180
+/// tries and was actually `180 * 2s` of clock, so a multi-minute attempt exited
+/// after a handful of tries.
+pub fn startup_open_retry(opts: &DbOpenOptions) -> StartupOpenBudget {
+    if opts.url.trim().is_empty() {
+        StartupOpenBudget {
+            budget: Duration::from_secs(30),
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(1),
+        }
+    } else {
+        StartupOpenBudget {
+            budget: Duration::from_secs(30 * 60),
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Backoff after `failed_attempts` failures. The first failure waits
+/// `initial`; later failures double until `max`.
+pub fn startup_backoff(failed_attempts: u32, initial: Duration, max: Duration) -> Duration {
+    let shift = failed_attempts.saturating_sub(1).min(16);
+    initial.saturating_mul(1_u32 << shift).min(max)
 }
 
 /// Options for opening either local SQLite or a remote libSQL database.
@@ -498,19 +557,22 @@ impl Db {
                     if migrate_open_needs_api_fence(bootstrap)? {
                         clear_bootstrap_complete(bootstrap)?;
                     }
-                    migrate_conn(bootstrap)?;
+                    migrate_conn(bootstrap).context("migrate")?;
                     // Bot is authority for terminal defaults: sync from config every
                     // migrate-open so both processes resolve empty global fields from
                     // the same durable meta row (not each process's config.toml).
-                    write_terminal_defaults_meta(bootstrap, &opts_defaults)?;
+                    write_terminal_defaults_meta(bootstrap, &opts_defaults)
+                        .context("terminal defaults")?;
                     seed_globals_conn(
                         bootstrap,
                         &opts.default_prefix,
                         opts.retention_days,
                         &opts_defaults,
-                    )?;
+                    )
+                    .context("seed_globals")?;
                     // Idempotent when guild_settings changed; skipped via checksum when not.
-                    heal_default_guild_settings_conn(bootstrap, &opts_defaults)?;
+                    heal_default_guild_settings_conn(bootstrap, &opts_defaults)
+                        .context("heal_guild_settings")?;
                 } else {
                     // One primary-routed snapshot is the API readiness barrier.
                     // Replica reads can otherwise see an old completed marker
@@ -695,6 +757,57 @@ impl Db {
                     }
                 }
                 Err(err) => return Err(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            anyhow::Error::new(SchemaNotReady("database schema not ready".into()))
+        }))
+        .context("timed out retrying database open")
+    }
+
+    /// Retries `open_with` until `budget.budget` elapses. An attempt already
+    /// running is allowed to finish. The next attempt is a new runtime and
+    /// connection; a timed-out stream from the previous attempt is not reused.
+    pub async fn open_with_budget(opts: DbOpenOptions, budget: StartupOpenBudget) -> Result<Self> {
+        let started = Instant::now();
+        let deadline = started + budget.budget;
+        let remote = !opts.url.trim().is_empty();
+        let mut last = None;
+        let mut attempt = 0_u32;
+        loop {
+            if attempt > 0 && Instant::now() >= deadline {
+                break;
+            }
+            attempt += 1;
+            match Self::open_with_on_worker(opts.clone()).await {
+                Ok(db) => return Ok(db),
+                Err(err) => {
+                    let Some(kind) = startup_retry_kind(&err, remote) else {
+                        return Err(err);
+                    };
+                    last = Some(err);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let sleep_for =
+                        startup_backoff(attempt, budget.initial_backoff, budget.max_backoff)
+                            .min(remaining);
+                    if sleep_for.is_zero() {
+                        break;
+                    }
+                    let elapsed = started.elapsed();
+                    tracing::info!(
+                        attempt,
+                        kind = ?kind,
+                        elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                        budget_ms = u64::try_from(budget.budget.as_millis()).unwrap_or(u64::MAX),
+                        backoff_ms = u64::try_from(sleep_for.as_millis()).unwrap_or(u64::MAX),
+                        "database not ready; retrying: {:#}",
+                        last.as_ref().expect("retry stores the error")
+                    );
+                    tokio::time::sleep(sleep_for).await;
+                }
             }
         }
         Err(last.unwrap_or_else(|| {

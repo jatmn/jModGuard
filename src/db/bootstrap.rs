@@ -60,6 +60,21 @@ fn ensure_schema_family(conn: &impl SqlExecutor) -> Result<()> {
 }
 
 pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
+    // A current database must not open one immediate transaction per migration.
+    // Each of those is a primary write lock and several Hrana round trips, and
+    // the following seed used to keep another write lock open across the same
+    // kind of per-statement loop. Bunny closes that stream with
+    // TRANSACTION_TIMEOUT.
+    {
+        let tx = conn.transaction_primary_read()?;
+        ensure_schema_family(&tx)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+        let current = version >= MIGRATIONS.len() as i64;
+        tx.finish_read()?;
+        if current {
+            return Ok(());
+        }
+    }
     // Migration selection must be authoritative. A lagging remote replica can
     // otherwise report vN-1 after vN committed and make us replay a
     // non-idempotent CREATE/ALTER migration against the primary.
@@ -624,17 +639,189 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
+const SEED_META_MARKERS: [&str; 4] = [
+    "readable_log_defaults_v1",
+    "attachment_delete_template_v1",
+    "retained_message_templates_v1",
+    "retained_bulk_status_template_v1",
+];
+
+/// Unix millis of the last gateway IDENTIFY this process was about to send.
+/// A restart reads it so a crash loop cannot identify again inside the same
+/// session-start window.
+pub const META_GATEWAY_IDENTIFY_MS: &str = "gateway_last_identify_ms";
+
+fn sql_text(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push('\'');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn seed_batch_growth(sql: &str) -> u64 {
+    (sql.len() as u64).saturating_mul(4).saturating_add(65_536)
+}
+
+fn total_changes(conn: &impl SqlExecutor) -> Result<i64> {
+    conn.query_row("SELECT total_changes()", (), |row| Ok(row.get(0)?))
+}
+
+/// Legacy Stats rows the every-boot upgrade still rewrites after the one-time
+/// presentation marker is set. The payloads must match the UPDATE literals.
+fn legacy_stats_payloads(shipped: &crate::types::CommandDef) -> Result<(String, String)> {
+    let mut without_alias = shipped.clone();
+    without_alias.permission = "everyone".into();
+    without_alias.description =
+        "This server's retained moderation counts (records, warns, bans).".into();
+    without_alias.aliases.clear();
+    let mut with_alias = without_alias.clone();
+    with_alias.aliases = vec!["status".into()];
+    Ok((
+        serde_json::to_string(&without_alias)?,
+        serde_json::to_string(&with_alias)?,
+    ))
+}
+
+fn legacy_setname_payload(shipped: &crate::types::CommandDef) -> Result<String> {
+    let mut legacy = shipped.clone();
+    legacy.description =
+        "Set the bot's nickname in this server (omit / clear / - to reset).".into();
+    legacy.response = "Bot nickname set to {name}".into();
+    Ok(serde_json::to_string(&legacy)?)
+}
+
+/// True when a migrate-open has nothing left to write. The check is one short
+/// primary read. The previous seed held BEGIN IMMEDIATE across every default
+/// row, and each statement was its own Hrana round trip.
+pub(crate) fn globals_seed_satisfied(conn: &Connection) -> Result<bool> {
+    let tx = conn.transaction_primary_read()?;
+    let satisfied = globals_seed_satisfied_tx(&tx)?;
+    tx.finish_read()?;
+    Ok(satisfied)
+}
+
+fn globals_seed_satisfied_tx(conn: &impl SqlExecutor) -> Result<bool> {
+    for key in SEED_META_MARKERS {
+        if meta_string_conn(conn, key)?.as_deref() != Some("1") {
+            return Ok(false);
+        }
+    }
+    let settings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM guild_settings WHERE guild_id = ?1",
+        params![GLOBAL_SCOPE],
+        |row| Ok(row.get(0)?),
+    )?;
+    let rules: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM rules WHERE guild_id = ?1",
+        params![GLOBAL_SCOPE],
+        |row| Ok(row.get(0)?),
+    )?;
+    let commands: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM commands WHERE guild_id = ?1",
+        params![GLOBAL_SCOPE],
+        |row| Ok(row.get(0)?),
+    )?;
+    let templates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM templates WHERE guild_id = ?1",
+        params![GLOBAL_SCOPE],
+        |row| Ok(row.get(0)?),
+    )?;
+    if settings < 1
+        || rules < crate::defaults::default_rules().len() as i64
+        || commands < crate::defaults::default_commands().len() as i64
+        || templates < crate::defaults::default_templates().len() as i64
+    {
+        return Ok(false);
+    }
+    let stats = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "stats")
+        .context("shipped stats command")?;
+    let (stats_without_alias, stats_with_alias) = legacy_stats_payloads(&stats)?;
+    let legacy_stats: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM commands WHERE name = 'stats' AND data IN (?1, ?2)",
+        params![stats_without_alias, stats_with_alias],
+        |row| Ok(row.get(0)?),
+    )?;
+    if legacy_stats > 0 {
+        return Ok(false);
+    }
+    let setname = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "setname")
+        .context("shipped setname command")?;
+    let legacy_setname: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM commands WHERE guild_id = ?1 AND name = 'setname' AND data = ?2",
+        params![GLOBAL_SCOPE, legacy_setname_payload(&setname)?],
+        |row| Ok(row.get(0)?),
+    )?;
+    Ok(legacy_setname == 0)
+}
+
 pub(super) fn seed_globals_conn(
     conn: &mut Connection,
     default_prefix: &str,
     retention_days: u32,
     terminal: &GuildSettings,
 ) -> Result<()> {
+    if globals_seed_satisfied(conn)? {
+        return Ok(());
+    }
     let tx = conn.transaction_immediate()?;
-    let conn = &tx;
-    // Seed only config-driven fields, then strip anything equal to terminal
-    // defaults (not hardcoded `GuildSettings::default()`). Never pin empty
-    // bot_name as a global override — that blocked inheritance.
+    // One query decides the status-alias collision. The writes below are a
+    // single Hrana batch per group, not one round trip per default row.
+    let mut stmt = tx.prepare("SELECT data FROM commands")?;
+    let rows = stmt.query_map((), |row| Ok(row.get::<String>(0)?))?;
+    let mut status_taken = false;
+    for row in rows {
+        if let Ok(command) = serde_json::from_str::<crate::types::CommandDef>(&row?)
+            && command.name != "stats"
+            && command.matches("status")
+        {
+            status_taken = true;
+        }
+    }
+    drop(stmt);
+    let (body_sql, command_sql, markers) =
+        seed_globals_sql(default_prefix, retention_days, terminal, &tx, status_taken)?;
+    let before = total_changes(&tx)?;
+    tx.execute_batch_bounded(&body_sql, seed_batch_growth(&body_sql))?;
+    let after_body = total_changes(&tx)?;
+    tx.execute_batch_bounded(&command_sql, seed_batch_growth(&command_sql))?;
+    let after_commands = total_changes(&tx)?;
+    // Marker rows are not configuration changes. Write them after the delta so
+    // a one-time flag cannot bump config_version by itself or twice.
+    let body_changed = after_body > before;
+    let commands_changed = after_commands > after_body;
+    if body_changed || commands_changed {
+        bump_config_version_conn(&tx)?;
+    }
+    if commands_changed {
+        bump_slash_registry_version_conn(&tx)?;
+    }
+    for key in markers {
+        write_meta_string_conn(&tx, key, "1")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn seed_globals_sql(
+    default_prefix: &str,
+    retention_days: u32,
+    terminal: &GuildSettings,
+    conn: &impl SqlExecutor,
+    status_taken: bool,
+) -> Result<(String, String, Vec<&'static str>)> {
+    let mut body = String::new();
+    let mut commands = String::new();
+    let mut markers = Vec::new();
     let seeded = GuildSettingsOverride {
         prefix: Some(default_prefix.to_string()),
         bot_name: None,
@@ -646,189 +833,155 @@ pub(super) fn seed_globals_conn(
     } else {
         serde_json::to_string(&global_settings)?
     };
-    let mut changed = conn.execute_rows(
-        "INSERT OR IGNORE INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
-        params![GLOBAL_SCOPE, json],
-        1,
-    )?;
-    let rules = crate::defaults::default_rules();
-    for (i, rule) in rules.iter().enumerate() {
-        changed += conn.execute_rows(
-            "INSERT OR IGNORE INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)",
-            params![
-                GLOBAL_SCOPE,
-                crate::types::RULE_IDS[i],
-                serde_json::to_string(rule)?
-            ],
-            1,
-        )?;
+    body.push_str(&format!(
+        "INSERT OR IGNORE INTO guild_settings (guild_id, settings) VALUES ({GLOBAL_SCOPE}, {});\n",
+        sql_text(&json)
+    ));
+    for (i, rule) in crate::defaults::default_rules().iter().enumerate() {
+        body.push_str(&format!(
+            "INSERT OR IGNORE INTO rules (guild_id, rule_id, data) VALUES ({GLOBAL_SCOPE}, {}, {});\n",
+            sql_text(crate::types::RULE_IDS[i]),
+            sql_text(&serde_json::to_string(rule)?)
+        ));
     }
-    // One-time presentation upgrade: only byte-for-byte shipped defaults.
-    // Custom templates and customized command definitions remain owned by operators.
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
-    let mut commands_changed = 0usize;
-    // Conservatively preserve an existing status command/alias in any scope.
-    let mut stmt = conn.prepare("SELECT data FROM commands")?;
-    let rows = stmt.query_map((), |row| Ok(row.get::<String>(0)?))?;
-    let mut status_taken = false;
-    for row in rows {
-        if let Ok(command) = serde_json::from_str::<crate::types::CommandDef>(&row?)
-            && command.name != "stats"
-            && command.matches("status")
-        {
-            status_taken = true;
-        }
-    }
     if upgrade_presentation {
         let current_templates = crate::defaults::default_templates();
         for (event, old) in crate::defaults::legacy_log_templates() {
             let new = current_templates
                 .iter()
                 .find(|(name, _)| *name == event)
-                .unwrap()
+                .context("shipped template")?
                 .1;
-            changed += conn.execute_matching(
-                "UPDATE templates SET template = ?1 WHERE event_type = ?2 AND template = ?3",
-                params![new, event, old],
-            )?;
+            body.push_str(&format!(
+                "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
+                sql_text(new),
+                sql_text(event),
+                sql_text(old)
+            ));
         }
         let stats = crate::defaults::default_commands()
             .into_iter()
             .find(|cmd| cmd.name == "stats")
-            .unwrap();
+            .context("shipped stats command")?;
         let mut legacy = stats.clone();
         legacy.aliases.clear();
         legacy.permission = "everyone".into();
         legacy.description =
             "This server's retained moderation counts (records, warns, bans).".into();
         if !status_taken {
-            commands_changed += conn.execute_matching(
-                "UPDATE commands SET data = ?1 WHERE name = 'stats' AND data = ?2",
-                params![
-                    serde_json::to_string(&stats)?,
-                    serde_json::to_string(&legacy)?
-                ],
-            )?;
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = 'stats' AND data = {};\n",
+                sql_text(&serde_json::to_string(&stats)?),
+                sql_text(&serde_json::to_string(&legacy)?)
+            ));
         }
-        write_meta_string_conn(conn, "readable_log_defaults_v1", "1")?;
+        markers.push("readable_log_defaults_v1");
     }
     if meta_string_conn(conn, "attachment_delete_template_v1")?.is_none() {
         let new = crate::defaults::default_templates()
             .into_iter()
             .find(|(event, _)| *event == "message_delete")
-            .unwrap()
+            .context("shipped message_delete template")?
             .1;
-        changed += conn.execute_matching(
-            "UPDATE templates SET template = ?1 WHERE event_type = 'message_delete' AND template = ?2",
-            params![new, crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE],
-        )?;
-        write_meta_string_conn(conn, "attachment_delete_template_v1", "1")?;
+        body.push_str(&format!(
+            "UPDATE templates SET template = {} WHERE event_type = 'message_delete' AND template = {};\n",
+            sql_text(new),
+            sql_text(crate::defaults::PRE_ATTACHMENT_DELETE_TEMPLATE)
+        ));
+        markers.push("attachment_delete_template_v1");
     }
     if meta_string_conn(conn, "retained_message_templates_v1")?.is_none() {
         for (event, old) in crate::defaults::PRE_RETAINED_MESSAGE_TEMPLATES {
             let new = crate::defaults::default_templates()
                 .into_iter()
                 .find(|(name, _)| *name == event)
-                .expect("shipped message template")
+                .context("shipped message template")?
                 .1;
-            changed += conn.execute_matching(
-                "UPDATE templates SET template = ?1 WHERE event_type = ?2 AND template = ?3",
-                params![new, event, old],
-            )?;
+            body.push_str(&format!(
+                "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
+                sql_text(new),
+                sql_text(event),
+                sql_text(old)
+            ));
         }
-        write_meta_string_conn(conn, "retained_message_templates_v1", "1")?;
+        markers.push("retained_message_templates_v1");
     }
     if meta_string_conn(conn, "retained_bulk_status_template_v1")?.is_none() {
         let new = crate::defaults::default_templates()
             .into_iter()
             .find(|(event, _)| *event == "message_bulk_delete")
-            .expect("shipped bulk delete template")
+            .context("shipped bulk delete template")?
             .1;
-        changed += conn.execute_matching(
-            "UPDATE templates SET template=?1 WHERE event_type='message_bulk_delete' AND template=?2",
-            params![new, crate::defaults::PRE_BULK_STATUS_TEMPLATE],
-        )?;
-        write_meta_string_conn(conn, "retained_bulk_status_template_v1", "1")?;
+        body.push_str(&format!(
+            "UPDATE templates SET template = {} WHERE event_type = 'message_bulk_delete' AND template = {};\n",
+            sql_text(new),
+            sql_text(crate::defaults::PRE_BULK_STATUS_TEMPLATE)
+        ));
+        markers.push("retained_bulk_status_template_v1");
     }
     for mut cmd in crate::defaults::default_commands() {
         if cmd.name == "stats" && status_taken {
-            // INSERT OR IGNORE can also restore a deleted global default. Do not
-            // give that restored command an alias already owned by another row.
             cmd.aliases.clear();
         }
         if cmd.name == "stats" {
-            // Change only byte-for-byte shipped definitions. An operator who
-            // deliberately selected `everyone` or edited any other field owns
-            // that definition, even if its permission matches the old default.
-            for had_alias in [false, true] {
-                let mut old = cmd.clone();
-                old.permission = "everyone".into();
-                old.description =
-                    "This server's retained moderation counts (records, warns, bans).".into();
-                old.aliases = if had_alias {
-                    vec!["status".into()]
-                } else {
-                    vec![]
-                };
+            let (without_alias, with_alias) = legacy_stats_payloads(&cmd)?;
+            for (old, had_alias) in [(without_alias, false), (with_alias, true)] {
                 let mut upgraded = cmd.clone();
-                // An untouched old default without an alias gains the shipped
-                // alias unless another command already owns it. An old Stats
-                // alias is the same command, not a collision.
                 upgraded.aliases = if had_alias {
-                    old.aliases.clone()
+                    vec!["status".into()]
                 } else {
                     cmd.aliases.clone()
                 };
-                commands_changed += conn.execute_matching(
-                    "UPDATE commands SET data=?1 WHERE name='stats' AND data=?2",
-                    params![
-                        serde_json::to_string(&upgraded)?,
-                        serde_json::to_string(&old)?
-                    ],
-                )?;
+                commands.push_str(&format!(
+                    "UPDATE commands SET data = {} WHERE name = 'stats' AND data = {};\n",
+                    sql_text(&serde_json::to_string(&upgraded)?),
+                    sql_text(&old)
+                ));
             }
         }
         if cmd.name == "setname" {
-            let mut legacy = cmd.clone();
-            legacy.description =
-                "Set the bot's nickname in this server (omit / clear / - to reset).".into();
-            legacy.response = "Bot nickname set to {name}".into();
-            commands_changed += conn.execute_matching(
-                "UPDATE commands SET data = ?1
-                 WHERE guild_id = ?2 AND name = 'setname' AND data = ?3",
-                params![
-                    serde_json::to_string(&cmd)?,
-                    GLOBAL_SCOPE,
-                    serde_json::to_string(&legacy)?
-                ],
-            )?;
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE guild_id = {GLOBAL_SCOPE} AND name = 'setname' AND data = {};\n",
+                sql_text(&serde_json::to_string(&cmd)?),
+                sql_text(&legacy_setname_payload(&cmd)?)
+            ));
         }
-        commands_changed += conn.execute_rows(
-            "INSERT OR IGNORE INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
-            params![
-                GLOBAL_SCOPE,
-                cmd.name.to_lowercase(),
-                serde_json::to_string(&cmd)?
-            ],
-            1,
-        )?;
+        commands.push_str(&format!(
+            "INSERT OR IGNORE INTO commands (guild_id, name, data) VALUES ({GLOBAL_SCOPE}, {}, {});\n",
+            sql_text(&cmd.name.to_lowercase()),
+            sql_text(&serde_json::to_string(&cmd)?)
+        ));
     }
     for (event, template) in crate::defaults::default_templates() {
-        changed += conn.execute_rows(
-            "INSERT OR IGNORE INTO templates (guild_id, event_type, template) VALUES (?1, ?2, ?3)",
-            params![GLOBAL_SCOPE, event, template],
-            1,
-        )?;
+        body.push_str(&format!(
+            "INSERT OR IGNORE INTO templates (guild_id, event_type, template) VALUES ({GLOBAL_SCOPE}, {}, {});\n",
+            sql_text(event),
+            sql_text(template)
+        ));
     }
-    changed += commands_changed;
-    if changed > 0 {
-        bump_config_version_conn(conn)?;
-    }
-    if commands_changed > 0 {
-        bump_slash_registry_version_conn(conn)?;
-    }
-    tx.commit()?;
-    Ok(())
+    Ok((body, commands, markers))
+}
+
+pub async fn gateway_last_identify_ms(db: &Db) -> Result<Option<i64>> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction_primary_read()?;
+        let value = meta_string_conn(&tx, META_GATEWAY_IDENTIFY_MS)?
+            .and_then(|raw| raw.parse::<i64>().ok());
+        tx.finish_read()?;
+        Ok(value)
+    })
+    .await
+}
+
+pub async fn record_gateway_identify_ms(db: &Db, millis: i64) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        write_meta_string_conn(&tx, META_GATEWAY_IDENTIFY_MS, &millis.to_string())?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
 }
 
 /// Strip override fields that equal the parent layer (global → hardcoded defaults).

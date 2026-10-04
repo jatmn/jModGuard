@@ -19,8 +19,8 @@ fn write_probe_marker(dir: &Path, name: &str, contents: &str) -> Result<()> {
 
 pub async fn open_database(cfg: &ApiProcessConfig) -> Result<Db> {
     let opts = cfg.db_open_options();
-    let (attempts, delay) = db::startup_open_retry(&opts);
-    Db::open_with_until_ready(opts, attempts, delay).await
+    let budget = db::startup_open_retry(&opts);
+    Db::open_with_budget(opts, budget).await
 }
 
 /// Open the shared database without migrating, then commit one prefix change.

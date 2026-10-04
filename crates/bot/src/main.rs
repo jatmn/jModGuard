@@ -455,6 +455,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
+        tracing::info!("shutdown before gateway identify");
+        tracing::info!("bot process stopped");
+        return Ok(());
+    }
+
     tracing::info!("starting shards (bot process; no public HTTP API)");
     let shard_manager = client.shard_manager.clone();
     let shutdown_app = Arc::clone(&app);
