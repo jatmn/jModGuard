@@ -18,9 +18,13 @@ pub(crate) struct CapacitySample {
 
 /// Allocated main-database pages, including reusable pages. Call within the
 /// primary transaction: a replica or a cached UI sample cannot admit writes.
+/// One statement, so a writer lock is not held across two measurement requests.
 pub(crate) fn sample(conn: &impl SqlExecutor) -> Result<CapacitySample> {
-    let pages: i64 = conn.query_row("PRAGMA page_count", (), |r| Ok(r.get(0)?))?;
-    let page_size: i64 = conn.query_row("PRAGMA page_size", (), |r| Ok(r.get(0)?))?;
+    let (pages, page_size): (i64, i64) = conn.query_row(
+        "SELECT * FROM pragma_page_count(), pragma_page_size()",
+        (),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     ensure!(
         pages >= 0 && page_size > 0,
         "database capacity measurement unavailable"
