@@ -12,6 +12,9 @@ struct DiscordStub {
     calls: AtomicUsize,
     token_calls: AtomicUsize,
     rate_limited: AtomicBool,
+    /// Discord marked the 429 as the shared global limit, which also closes `oauth.me`.
+    global_scope: AtomicBool,
+    me_calls: AtomicUsize,
     retry_after: std::sync::Mutex<String>,
     body_retry_after: std::sync::Mutex<Option<f64>>,
     /// First page is a full 200-guild page; the following page is HTTP 429.
@@ -49,6 +52,8 @@ impl Fixture {
             calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
             rate_limited: AtomicBool::new(false),
+            global_scope: AtomicBool::new(false),
+            me_calls: AtomicUsize::new(0),
             retry_after: std::sync::Mutex::new("2".into()),
             body_retry_after: std::sync::Mutex::new(None),
             limit_on_next_page: AtomicBool::new(false),
@@ -60,6 +65,7 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let handler = Arc::clone(&discord);
         let token_handler = Arc::clone(&discord);
+        let me_handler = Arc::clone(&discord);
         let routes = Router::new()
             .route(
                 "/token",
@@ -71,6 +77,21 @@ impl Fixture {
                             "access_token": "refreshed-token",
                             "refresh_token": "refreshed-refresh",
                             "expires_in": 3600,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/me",
+                get(move || {
+                    let handler = Arc::clone(&me_handler);
+                    async move {
+                        handler.me_calls.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "id": "42",
+                            "username": "live-profile",
+                            "global_name": null,
+                            "avatar": null
                         }))
                     }
                 }),
@@ -133,7 +154,16 @@ impl Fixture {
                                 retry_after.parse().unwrap(),
                             );
                         }
+                        if handler.global_scope.load(Ordering::SeqCst) {
+                            headers.insert(
+                                axum::http::HeaderName::from_static("x-ratelimit-scope"),
+                                axum::http::HeaderValue::from_static("global"),
+                            );
+                        }
                         let mut body = serde_json::json!({"message": "You are being rate limited."});
+                        if handler.global_scope.load(Ordering::SeqCst) {
+                            body["global"] = serde_json::json!(true);
+                        }
                         if let Some(seconds) = *handler.body_retry_after.lock().unwrap() {
                             body["retry_after"] = serde_json::json!(seconds);
                         }
@@ -171,6 +201,9 @@ impl Fixture {
         Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
             .unwrap()
             .token_endpoint = Some(format!("http://{address}/token"));
+        Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
+            .unwrap()
+            .me_endpoint = Some(format!("http://{address}/me"));
         tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
         let store = MemoryStore::default();
         let session = Session::new(None, Arc::new(store.clone()), None);
@@ -649,6 +682,115 @@ async fn display_keeps_the_last_guild_list_while_discord_is_rate_limited() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!body["guilds"].as_array().unwrap().is_empty());
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+}
+
+fn profile_older_than_user_ttl() -> std::time::Instant {
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(120))
+        .expect("profile cache must be older than the 60s user ttl")
+}
+
+fn age_user_cache(app: &ApiState, user_id: u64) {
+    let user = {
+        app.user_cache
+            .get(&user_id)
+            .expect("seeded user")
+            .value()
+            .1
+            .clone()
+    };
+    app.user_cache
+        .insert(user_id, (profile_older_than_user_ttl(), user));
+}
+
+fn age_guild_cache(app: &ApiState, user_id: u64) {
+    let guilds = {
+        app.guild_cache
+            .get(&user_id)
+            .expect("seeded guilds")
+            .value()
+            .1
+            .clone()
+    };
+    app.guild_cache
+        .insert(user_id, (profile_older_than_user_ttl(), guilds));
+}
+
+#[tokio::test]
+async fn display_keeps_cached_guilds_when_the_user_cache_is_cold_during_a_global_cooldown() {
+    let f = Fixture::new(false).await;
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    f.discord.global_scope.store(true, Ordering::SeqCst);
+    let limited = f
+        .app
+        .oauth
+        .my_guilds(42, "fixture-token")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        limited,
+        oauth::GuildListError::RateLimited { fresh: true, .. }
+    ));
+    age_user_cache(&f.app, 42);
+    assert!(
+        f.app
+            .guild_cache
+            .get(&42)
+            .expect("warm guild list")
+            .value()
+            .0
+            .elapsed()
+            < std::time::Duration::from_secs(60)
+    );
+
+    let guild_calls = f.discord.calls.load(Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["guilds"].as_array().unwrap().is_empty());
+    assert_eq!(body["user"]["id"], "42");
+    assert_eq!(body["user"]["username"], "tester");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), guild_calls);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    f.app.user_cache.remove(&42);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["guilds"].as_array().unwrap().is_empty());
+    assert_eq!(body["user"]["id"], "42");
+    assert_eq!(body["user"]["username"], "");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), guild_calls);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn display_keeps_cached_guilds_when_a_global_limit_blocks_the_profile_refresh() {
+    let f = Fixture::new(false).await;
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    f.discord.global_scope.store(true, Ordering::SeqCst);
+    age_user_cache(&f.app, 42);
+    age_guild_cache(&f.app, 42);
+
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["guilds"].as_array().unwrap().is_empty());
+    assert_eq!(body["user"]["id"], "42");
+    assert_eq!(body["guilds"][0]["id"], "10");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn display_refreshes_a_cold_user_when_discord_is_not_rate_limited() {
+    let f = Fixture::new(false).await;
+    age_user_cache(&f.app, 42);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["guilds"].as_array().unwrap().is_empty());
+    assert_eq!(body["user"]["username"], "live-profile");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -291,11 +291,9 @@ async fn require_auth_with(
 
     // Display path only: serve a fresh list, or the last good list while
     // Discord is still cooling down. Authorization never takes this branch.
+    // A rate-limited profile lookup must not drop that list.
     if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        let user = match cached_user {
-            Some(u) => u,
-            None => app.oauth.me(user_id, &token).await.map_err(ApiError)?,
-        };
+        let (user, _) = display_identity(app, user_id, &token, cached_user).await?;
         let mut auth = AuthCtx {
             user,
             guilds,
@@ -400,12 +398,8 @@ async fn cached_display_during_limit(
     } else {
         tracing::debug!("webui auth: discord guild-list cooldown still active for user {user_id}");
     }
-    let fetched_user = cached_user.is_none();
-    let user = match cached_user {
-        Some(user) => user,
-        None => app.oauth.me(user_id, token).await.map_err(ApiError)?,
-    };
-    if fetched_user {
+    let (user, live) = display_identity(app, user_id, token, cached_user).await?;
+    if live {
         app.user_cache
             .insert(user_id, (std::time::Instant::now(), user.clone()));
     }
@@ -448,6 +442,44 @@ fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
         Some(user.clone())
     } else {
         None
+    }
+}
+
+/// Identity for a display response that is already returning cached guilds.
+///
+/// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
+/// runs. When that call is rate-limited, the profile still stored after the
+/// 60s TTL — or the session Discord user id — is enough to return the guild
+/// list. Other `me` failures still fail the request. The fallback is not
+/// written back into `user_cache`, so the next display read tries `me` again
+/// once Discord is no longer limiting it.
+async fn display_identity(
+    app: &ApiState,
+    user_id: u64,
+    token: &str,
+    cached_user: Option<DiscordUser>,
+) -> ApiResult<(DiscordUser, bool)> {
+    if let Some(user) = cached_user {
+        return Ok((user, false));
+    }
+    match app.oauth.me(user_id, token).await {
+        Ok(user) => Ok((user, true)),
+        Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => {
+            Ok((display_user_during_limit(app, user_id), false))
+        }
+        Err(error) => Err(ApiError(error)),
+    }
+}
+
+fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
+    if let Some(entry) = app.user_cache.get(&user_id) {
+        return entry.value().1.clone();
+    }
+    DiscordUser {
+        id: user_id.to_string(),
+        username: String::new(),
+        global_name: None,
+        avatar: None,
     }
 }
 
