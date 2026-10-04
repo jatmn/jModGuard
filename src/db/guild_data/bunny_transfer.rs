@@ -40,7 +40,7 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             verify_scope(&tx, &expected, &scope, false)?;
             anyhow::ensure!(record(&tx, &scope, &id)?.ok_or(CaseError::Conflict)?.job.case_id == case, CaseError::Conflict);
             let result=tx.query_row("SELECT binding,sha256,accepted FROM guild_bunny_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r|Ok(BunnyTransfer{binding:r.get(0)?,sha256:r.get(1)?,accepted:r.get(2)?}))?;

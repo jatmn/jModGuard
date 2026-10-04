@@ -436,7 +436,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_bound_placement(&tx, &expected, &placement)?;
                 tx.finish_read()
             })

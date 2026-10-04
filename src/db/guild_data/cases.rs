@@ -277,7 +277,7 @@ impl GuildDataStore {
         limits.validate()?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let row = tx.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN payload ELSE NULL END FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),limits.max_record_bytes as i64], |r| Ok(r.get::<Option<String>>(0)?)).optional()?;
             let result = match row {
@@ -326,7 +326,7 @@ impl GuildDataStore {
         limits.page(count)?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let mut stmt = tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=?5 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
             let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed], |r| Ok(r.get::<String>(0)?))?;
@@ -344,7 +344,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 let count: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0",

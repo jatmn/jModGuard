@@ -13,7 +13,7 @@ pub struct GuildEnrollment {
 pub async fn guild_enrollment(db: &Db, guild: i64) -> Result<Option<GuildEnrollment>> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let result = active_enrollment_conn(&tx, guild)?;
         tx.finish_read()?;
         Ok(result)

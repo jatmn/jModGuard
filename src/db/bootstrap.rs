@@ -1,19 +1,24 @@
 use super::*;
 
-pub(super) fn configure_connection(connection: &Connection, remote: bool) -> Result<()> {
+pub(super) fn configure_connection(
+    connection: &Connection,
+    remote: bool,
+    busy_timeout_ms: u32,
+) -> Result<()> {
     if remote {
         // Hrana opens a new stream for each transaction, so a connection-level
         // foreign_keys pragma would not carry into transactional writes. The
         // current schema has no FOREIGN KEY clauses; add per-transaction stream
-        // setup if a future migration introduces them.
+        // setup if a future migration introduces them. Remote busy timeout is
+        // not honored; the client operation deadline is the bound.
         Ok(())
     } else {
-        connection.execute_batch(
-            "PRAGMA busy_timeout=5000;
+        connection.execute_batch(&format!(
+            "PRAGMA busy_timeout={busy_timeout_ms};
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;",
-        )
+             PRAGMA foreign_keys=ON;"
+        ))
     }
 }
 
@@ -346,7 +351,7 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
 
 pub async fn get_version_state(db: &Db) -> Result<VersionState> {
     db.with_conn(|conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_consistent_read()?;
         let state = get_version_state_conn(&tx)?;
         tx.finish_read()?;
         Ok(state)
@@ -354,12 +359,12 @@ pub async fn get_version_state(db: &Db) -> Result<VersionState> {
     .await
 }
 
-/// Reads both invalidation counters through an IMMEDIATE transaction. Bunny
-/// routes write transactions to the primary, so callers can distinguish an
-/// authoritative failover rollback from one stale replica observation.
+/// Reads both invalidation counters from a deferred primary snapshot. The
+/// statement is not read-only, so remote libSQL still routes it to the primary,
+/// and it does not take the writer lock.
 pub async fn get_primary_versions(db: &Db) -> Result<VersionState> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let state = get_version_state_conn(&tx)?;
         tx.finish_read()?;
         Ok(state)
@@ -376,7 +381,7 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 /// the atomically seeded command registry has converged.
 pub fn get_primary_versions_sync(db: &Db) -> Result<VersionState> {
     db.with_conn_sync(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let state = get_version_state_conn(&tx)?;
         tx.finish_read()?;
         Ok(state)

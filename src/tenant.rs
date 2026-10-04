@@ -187,7 +187,7 @@ impl TenantRuntime {
         let registration = self
             .core
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 let row = tx
                     .query_row(
                         "SELECT dedicated_guild_id FROM guild_store_catalog WHERE store_id=?1",
@@ -228,7 +228,7 @@ impl TenantRuntime {
         let catalog: Vec<StoreRegistration> = self
             .core
             .with_conn(|conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 let mut stmt = tx.prepare(
                     "SELECT store_id,dedicated_guild_id FROM guild_store_catalog ORDER BY store_id",
                 )?;
@@ -903,7 +903,7 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
         use crate::db::SqlExecutor;
         let id = store.registration.id().as_str().to_owned();
         let owned: bool = core.with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             let owned = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM guild_store_placements WHERE store_id=?1) OR EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE store_id=?1)",
                 crate::db::params![id], |row| Ok(row.get(0)?),

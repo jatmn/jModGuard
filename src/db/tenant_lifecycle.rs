@@ -50,7 +50,7 @@ pub async fn queue_guild_erasure(
 pub async fn guild_erasure_queued(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let queued: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1)",
             params![guild],
@@ -73,7 +73,7 @@ pub(crate) async fn next_guild_erasure_after(
     after: Option<i64>,
 ) -> Result<Option<GuildErasureJob>> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let load = |after: i64| {
             tx.query_row(
                 "SELECT guild_id,enrollment_id,joined_at_ns,store_id,placement_revision FROM guild_erasure_jobs WHERE guild_id>?1 ORDER BY guild_id LIMIT 1",
@@ -195,7 +195,7 @@ pub async fn existing_evidence_storage_id(db: &Db, configured: &str) -> Result<O
         return Ok(Some(configured.to_owned()));
     }
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let existing = tx
             .query_row(
                 "SELECT value FROM meta WHERE key='evidence_storage_id'",

@@ -155,7 +155,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 let (active, _) = verify_scope(&tx, &expected, &scope, false)?;
                 let mut job = record(&tx, &scope, &id)?.map(|r| r.job);
                 if let Some(job) = job.as_mut() {
@@ -288,7 +288,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 if !live(&tx, &scope, &case)? {
                     tx.finish_read()?;
@@ -321,7 +321,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 if !live(&tx, &scope, &case)? {
                     tx.finish_read()?;
@@ -405,7 +405,7 @@ impl GuildDataStore {
         };
         let expected = self.expected.clone();
         self.db.with_conn(move|conn|{
-            let tx=conn.transaction_primary_read()?;let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
+            let tx=conn.transaction_primary_snapshot()?;let (active,_)=verify_scope(&tx,&expected,&scope,false)?;
             let mut stmt=tx.prepare("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND (state=?3 OR (?3=-1 AND (state=2 OR (state=0 AND cancelled=1)))) AND evidence_id>?4 ORDER BY evidence_id LIMIT ?5")?;
             let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),state,after.as_ref().map_or("",CaseId::as_str),i64::from(count)],|r|{let mut job=job(r,&scope)?;job.cancelled|=!active;Ok(job)})?;
             let jobs=rows.collect::<Result<Vec<_>>>()?;drop(stmt);tx.finish_read()?;Ok(jobs)

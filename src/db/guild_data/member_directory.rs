@@ -802,7 +802,7 @@ impl GuildDataStore {
     ) -> Result<Option<MemberPendingBanCandidate>> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn|{let tx=conn.transaction_primary_snapshot()?;verify_scope(&tx,&expected,&scope,true)?;
             let row=tx.query_row("SELECT p.user_id,p.operation_id,p.started_at_ms,d.revision FROM guild_member_pending_bans p LEFT JOIN guild_member_directory d ON d.guild_id=p.guild_id AND d.enrollment_id=p.enrollment_id AND d.user_id=p.user_id WHERE p.guild_id=?1 AND p.enrollment_id=?2 AND p.retry_after_ms<=?3 ORDER BY p.retry_after_ms,p.user_id LIMIT 1",params![scope.guild_id(),scope.enrollment.id.as_str(),now_ms],|r|Ok(MemberPendingBanCandidate{user_id:r.get(0)?,operation_id:r.get(1)?,started_at_ms:r.get(2)?,revision:r.get(3)?})).optional()?;
             tx.finish_read()?;Ok(row)
         }).await
@@ -939,7 +939,7 @@ impl GuildDataStore {
                 tx.member_execute("UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=?1 AND enrollment_id=?2 AND seed_admitted=0",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
                 tx.commit()?;
             } else { tx.finish_read()?; }
-            let tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?; let out=status(&tx,&scope,bot_id,now_ms)?; tx.finish_read()?; Ok(out)
+            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?; let out=status(&tx,&scope,bot_id,now_ms)?; tx.finish_read()?; Ok(out)
         }).await
     }
 
@@ -949,7 +949,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 let from_seed: Option<i64> = tx
                     .query_row(
@@ -986,7 +986,7 @@ impl GuildDataStore {
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
                 let out = status(&tx, &scope, bot_id, now_ms)?;
                 tx.finish_read()?;
@@ -2108,7 +2108,7 @@ impl GuildDataStore {
     ) -> Result<Option<MemberTargetCheck>> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn|{let tx=conn.transaction_primary_read()?;verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn|{let tx=conn.transaction_primary_snapshot()?;verify_scope(&tx,&expected,&scope,true)?;
             let row=tx.query_row("SELECT user_id,kind,row_revision,reason,requested_at_ms,expected_stay_id FROM guild_member_target_checks WHERE guild_id=?1 AND enrollment_id=?2 AND next_attempt_at_ms<=?3 ORDER BY next_attempt_at_ms,user_id LIMIT 1",params![scope.guild_id(),scope.enrollment.id.as_str(),now_ms],|r|Ok((r.get::<i64>(0)?,r.get::<String>(1)?,r.get::<i64>(2)?,r.get::<String>(3)?,r.get::<i64>(4)?,r.get::<Option<String>>(5)?))).optional()?;
             tx.finish_read()?;row.map(|(user_id,kind,revision,reason,requested_at_ms,expected_stay_id)|Ok(MemberTargetCheck{user_id,kind:MemberVerifyKind::parse(&kind)?,revision,reason,requested_at_ms,expected_stay_id})).transpose()
         }).await
@@ -2285,7 +2285,7 @@ impl GuildDataStore {
         };
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
             let status=match query.status { MemberStatusFilter::Current=>"is_current=1",MemberStatusFilter::Banned=>"is_banned=1",MemberStatusFilter::PreviouslyBanned=>"ever_banned=1 AND is_banned=0",MemberStatusFilter::All=>"1=1" };
             let order=if query.sort==MemberSort::JoinedNewest { ("<", "DESC") } else { (">", "ASC") };
             let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND {status} AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0) AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6) AND (coalesce(joined_at_ms,0),user_id) {} (?7,?8) ORDER BY coalesce(joined_at_ms,0) {},user_id {} LIMIT ?9",order.0,order.1,order.1);
@@ -2306,7 +2306,7 @@ impl GuildDataStore {
         checked_scope(self, &scope)?;
         anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
             let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3");
             let found=tx.query_row(&sql,params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],profile).optional()?; tx.finish_read()?; Ok(found)
         }).await
@@ -2340,7 +2340,7 @@ impl GuildDataStore {
             (i64::MAX, String::from("z"), String::from("z"))
         };
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_read()?; verify_scope(&tx,&expected,&scope,true)?;
+        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
             let sql="SELECT kind,occurred_at_ms,observed_at_ms,id,joined_at_ms,departed_at_ms,moderator_id,reason,outcome,source_kind FROM (
                 SELECT 'join' AS kind,joined_at_ms AS occurred_at_ms,NULL AS observed_at_ms,stay_id AS id,joined_at_ms,departed_at_ms,NULL AS moderator_id,NULL AS reason,NULL AS outcome,NULL AS source_kind,coalesce(joined_at_ms,0) AS sort_at_ms FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3
                 UNION ALL SELECT 'departure',departed_at_ms,NULL,stay_id,joined_at_ms,departed_at_ms,NULL,NULL,NULL,NULL,departed_at_ms FROM guild_member_stays WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND departed_at_ms IS NOT NULL

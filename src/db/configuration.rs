@@ -600,7 +600,7 @@ async fn add_badword_inner(
 /// replica reads can legitimately lag a just-committed add.
 pub async fn get_badword_primary(db: &Db, id: i64) -> Result<Option<Badword>> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let word = tx
             .query_row(
                 "SELECT id, guild_id, pattern, note FROM badwords WHERE id = ?1",
@@ -1288,7 +1288,7 @@ async fn load_web_config_snapshot_primary(
         let expected = expected.clone();
         async move {
             db.with_conn(move |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 if let Some(scope) = &expected {
                     scope.verify_conn(&tx)?;
                 }
@@ -1324,9 +1324,9 @@ async fn load_config_parts_with_version_routed(
         async move {
             db.with_conn(move |conn| {
                 let tx = if primary {
-                    conn.transaction_primary_read()?
+                    conn.transaction_primary_snapshot()?
                 } else {
-                    conn.transaction()?
+                    conn.transaction_consistent_read()?
                 };
                 let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
                 tx.finish_read()?;
@@ -1367,7 +1367,7 @@ pub async fn load_slash_commands_with_version(
     guild_id: i64,
 ) -> Result<(u64, String, std::collections::HashMap<String, CommandDef>)> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_consistent_read()?;
         let versions = get_version_state_conn(&tx)?;
         let guild: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", guild_id)?;
@@ -1385,7 +1385,7 @@ pub async fn load_slash_commands_with_version_primary(
     guild_id: i64,
 ) -> Result<(u64, String, std::collections::HashMap<String, CommandDef>)> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let versions = get_version_state_conn(&tx)?;
         let guild: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", guild_id)?;
@@ -1527,7 +1527,7 @@ async fn configuration_read<T: Send + 'static>(
 ) -> Result<T> {
     let (version, result) = db
         .with_conn(move |conn| {
-            let tx = conn.transaction_primary_read()?;
+            let tx = conn.transaction_primary_snapshot()?;
             scope.verify_conn(&tx)?;
             let version = get_config_version_conn(&tx)?;
             let result = read(&tx, scope.guild_id())?;

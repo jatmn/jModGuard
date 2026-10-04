@@ -208,7 +208,7 @@ pub(super) fn row_update(row: &Row) -> Result<ComponentUpdate> {
 
 pub async fn component_updates(db: &Db) -> Result<Vec<ComponentUpdate>> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let mut stmt = tx.prepare(&format!(
             "SELECT {COLS} FROM component_updates ORDER BY component"
         ))?;
@@ -226,7 +226,7 @@ pub async fn component_update(db: &Db, component: &str) -> Result<ComponentUpdat
     validate_component(component)?;
     let component = component.to_owned();
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let result = tx.query_row(
             &format!("SELECT {COLS} FROM component_updates WHERE component=?1"),
             params![component],
@@ -455,7 +455,7 @@ pub async fn record_launcher_failure(
 
 pub async fn core_schema_version(db: &Db) -> Result<i64> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let version = tx.query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))?;
         tx.finish_read()?;
         Ok(version)
@@ -604,7 +604,7 @@ pub async fn track_webui_assets(db: &Db, sha: &str, now: i64) -> Result<()> {
 
 pub async fn managed_webui_assets(db: &Db) -> Result<Vec<String>> {
     db.with_conn(|conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         let mut stmt = tx.prepare(
             "SELECT source_sha FROM webui_managed_assets WHERE created_at>=0 ORDER BY created_at",
         )?;

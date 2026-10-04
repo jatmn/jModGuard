@@ -161,7 +161,7 @@ impl UpdateControl {
         let db = Db::open_with_bootstrap(
             opts,
             |conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 let version: i64 =
                     tx.query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))?;
                 let objects: i64 = tx.query_row(
@@ -247,7 +247,7 @@ impl UpdateControl {
     pub async fn upgrade(&self) -> Result<Option<ServiceUpgrade>> {
         self.db
             .with_conn(|conn| {
-                let tx = conn.transaction_primary_read()?;
+                let tx = conn.transaction_primary_snapshot()?;
                 let upgrade = read_upgrade(&tx)?;
                 tx.finish_read()?;
                 Ok(upgrade)

@@ -97,8 +97,8 @@ nickname/checksum/version and validate-before-replace semantics. Empty captured 
 patches verify using a primary read without mutation receipts. Unban/log-channel actions
 use the queue. Moderation event/ban/statistics GET routes also require loaded page membership
 and captured primary reads; see `docs/MODERATION-READS.md`. Keep the API guard against
-unscoped moderation helpers. These reads create no receipts or version changes; the primary
-writer lock spans verification and data. Individual configuration GET reads also require page
+unscoped moderation helpers. These reads create no receipts or version changes. Web, API, and status reads use a
+deferred primary snapshot and do not take the writer lock. Individual configuration GET reads also require page
 membership and captured primary snapshots, preserving the config-version read floor. Keep
 guild/global layers together, badword inheritance and guild-only log-channel mappings; explicit
 global context remains owner-only. The WebUI/config-parts bundle verifies membership then

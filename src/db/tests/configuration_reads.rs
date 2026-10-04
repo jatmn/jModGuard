@@ -230,7 +230,7 @@ async fn configuration_reads_preserve_versions_and_refuse_unavailable_membership
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configuration_read_waiting_for_writer_retains_original_membership() {
+async fn configuration_read_keeps_prior_membership_without_waiting_for_the_writer() {
     let f = Fixture::new();
     let scope = f.scope().await;
     let writer_db = f.db.clone();
@@ -246,16 +246,25 @@ async fn configuration_read_waiting_for_writer_retains_original_membership() {
         }).await.unwrap();
     });
     ready.await.unwrap();
-    let read = get_enrolled_template(&f.db, scope, "absent");
+    let read = get_enrolled_template(&f.db, scope.clone(), "absent");
     tokio::pin!(read);
+    let during = tokio::time::timeout(std::time::Duration::from_millis(500), &mut read)
+        .await
+        .expect("a primary snapshot must finish while a writer holds the lock");
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(30), &mut read)
-            .await
-            .is_err()
+        !during
+            .as_ref()
+            .is_err_and(|error| error.is::<EnrollmentChanged>()),
+        "the snapshot must still show the membership committed before the writer: {during:?}"
     );
     release.send(()).unwrap();
     writer.await.unwrap();
-    assert!(read.await.unwrap_err().is::<EnrollmentChanged>());
+    assert!(
+        get_enrolled_template(&f.db, scope, "absent")
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
 }
 
 #[tokio::test]

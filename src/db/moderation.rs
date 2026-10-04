@@ -362,7 +362,7 @@ async fn enrolled_moderation_read<T: Send + 'static>(
     read: impl FnOnce(&crate::db_compat::Transaction, i64) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         let result = read(&tx, enrollment.guild_id)?;
         tx.finish_read()?;

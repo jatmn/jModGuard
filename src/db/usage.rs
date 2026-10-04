@@ -147,7 +147,7 @@ pub async fn measure_database_usage(
     expected: Option<StoreRegistration>,
 ) -> Result<DatabaseUsage> {
     db.with_conn(move |conn| {
-        let tx = conn.transaction_primary_read()?;
+        let tx = conn.transaction_primary_snapshot()?;
         if let Some(expected) = &expected {
             verify_guild_identity(&tx, expected)?;
         }

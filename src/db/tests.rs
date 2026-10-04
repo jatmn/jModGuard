@@ -25,6 +25,73 @@ fn remote_pool_admission_has_a_deadline() {
 }
 
 #[test]
+fn api_remote_deadline_stays_inside_the_browser_abort() {
+    assert!(API_REMOTE_OPERATION_TIMEOUT < Duration::from_secs(10));
+    assert!(API_REMOTE_OPERATION_TIMEOUT.saturating_mul(3) < Duration::from_secs(30));
+    assert!(API_REMOTE_OPERATION_TIMEOUT < REMOTE_OPERATION_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_write_fails_fast_while_the_bot_holds_the_write_lock() {
+    let tmp = tmp_db_path("api_write_yields");
+    let bot = Db::open(&tmp, 2).unwrap();
+    let api = Db::open_with(DbOpenOptions {
+        path: tmp.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: GuildSettings::default().prefix,
+        retention_days: GuildSettings::default().retention_days,
+    })
+    .unwrap();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let writer_db = bot.clone();
+    let writer = tokio::spawn(async move {
+        writer_db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                locked.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                tx.commit()
+            })
+            .await
+            .unwrap();
+    });
+    ready.await.unwrap();
+    let started = Instant::now();
+    let error = api
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "UPDATE meta SET value=value WHERE key='schema_family'",
+                (),
+                4096,
+            )?;
+            Ok(())
+        })
+        .await
+        .expect_err("an API write must fail instead of queueing behind the bot");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "API write waited {:?} behind the bot",
+        started.elapsed()
+    );
+    let message = format!("{error:#}").to_ascii_lowercase();
+    assert!(
+        message.contains("locked"),
+        "API write should report the database lock: {error:#}"
+    );
+    release.send(()).unwrap();
+    writer.await.unwrap();
+    drop(api);
+    drop(bot);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", tmp.display()));
+    }
+}
+
+#[test]
 fn restore_fence_blocks_primary_writes() {
     let tmp = tmp_db_path("restore_fence");
     let db = Db::open(&tmp, 2).unwrap();

@@ -224,7 +224,7 @@ impl GuildDataStore {
         limits.validate()?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx=conn.transaction_primary_read()?;
+            let tx=conn.transaction_primary_snapshot()?;
             verify_scope(&tx,&expected,&scope,true)?;
             if !live_parent(&tx,&scope,&case)? { tx.finish_read()?; return Ok(None); }
             let row=tx.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?5 THEN payload ELSE NULL END FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),i64::from(limits.entry.max_record_bytes)],|r|Ok(r.get::<Option<String>>(0)?)).optional()?;
@@ -254,7 +254,7 @@ impl GuildDataStore {
         anyhow::ensure!(after_sequence >= 0, CaseError::Invalid);
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let tx=conn.transaction_primary_read()?;
+            let tx=conn.transaction_primary_snapshot()?;
             verify_scope(&tx,&expected,&scope,true)?;
             if !live_parent(&tx,&scope,&case)? { tx.finish_read()?; return Ok(Vec::new()); }
             let mut stmt=tx.prepare("SELECT entry_id,sequence FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND sequence>?4 ORDER BY sequence LIMIT ?5")?;

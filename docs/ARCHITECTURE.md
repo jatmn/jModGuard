@@ -112,12 +112,17 @@ Expect up to one poll interval of lag locally after a cross-process config
 write; remote deployments can additionally wait for provider replica convergence.
 Slash-command resync reads its registry version and command rows in one
 transaction and retries when that snapshot has not reached the target version.
-If a lower counter is observed, jModGuard confirms it through an `IMMEDIATE`
-transaction routed to the primary before rebaselining caches. This recovers
-from Bunny's documented failover-loss window without accepting a stale replica
-as authoritative. Non-reusable revision tokens also distinguish counters that
+If a lower counter is observed, jModGuard confirms it through a deferred primary
+snapshot before rebaselining caches. `BEGIN DEFERRED` is not a read-only statement,
+so remote libSQL still routes it to the primary, and the snapshot does not take the
+writer lock. This recovers from Bunny's documented failover-loss window without
+accepting a stale replica as authoritative and without queueing ahead of bot writes.
+Non-reusable revision tokens also distinguish counters that
 return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
-transactions so they begin on the primary and serialize with other writers.
+transactions so they begin on the primary and serialize with other writers. Web, API,
+and status reads use the deferred snapshot or a read-only transaction instead, so they
+cannot take that lock. API writes keep a short busy and operation timeout and fail
+retriably rather than waiting out a bot write.
 
 Nickname changes commit a durable outbox row in the settings transaction, capturing the
 nickname, random request ID and active membership. The bot drains primary-routed due work,
