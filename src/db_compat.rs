@@ -164,6 +164,11 @@ pub struct DbRuntime {
     /// multi-thread, and `tokio::time::pause` refuses that flavor.
     #[cfg(test)]
     manual_clock: Arc<Mutex<Option<Arc<ManualClock>>>>,
+    /// How many timed-out opens have entered the short release. Tests wait for
+    /// this before unblocking a hung BEGIN, so the response cannot win the
+    /// original deadline race.
+    #[cfg(test)]
+    open_releases: Arc<AtomicU64>,
 }
 
 impl DbRuntime {
@@ -182,6 +187,8 @@ impl DbRuntime {
             growth_paused: Arc::clone(&self.growth_paused),
             #[cfg(test)]
             manual_clock: Arc::clone(&self.manual_clock),
+            #[cfg(test)]
+            open_releases: Arc::clone(&self.open_releases),
         }
     }
 
@@ -225,6 +232,8 @@ impl DbRuntime {
             growth_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             manual_clock: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            open_releases: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -339,8 +348,143 @@ impl DbRuntime {
         })
     }
 
-    fn is_remote(&self) -> bool {
+    /// Drive a remote `BEGIN` on this runtime.
+    ///
+    /// libsql stores the Hrana baton only after the open response is read, and
+    /// it sends stream close only when a tokio runtime is current. Cancelling
+    /// the open at the caller deadline, or dropping it off this runtime, skips
+    /// that close. The server can keep `BEGIN IMMEDIATE` and the writer lock
+    /// until its own timeout. On a deadline or caller-abandon, keep the open
+    /// here for the short release budget, roll it back if it completes, and
+    /// drop whatever remains while this runtime is still current.
+    fn complete_or_release_open<F>(
+        &self,
+        operation: &'static str,
+        future: F,
+    ) -> Result<libsql::Transaction>
+    where
+        F: Future<Output = std::result::Result<libsql::Transaction, libsql::Error>> + Send,
+    {
+        let Some(operation_timeout) = self.operation_timeout else {
+            return self.block_on(future).map_err(Into::into);
+        };
+        let watch = active_caller_abandon();
+        #[cfg(test)]
+        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
+        #[cfg(test)]
+        let open_releases = Arc::clone(&self.open_releases);
+        enum Stop {
+            Abandoned,
+            Deadline,
+        }
+        self.block_on(async move {
+            tokio::pin!(future);
+            let abandoned = async {
+                match &watch {
+                    Some(watch) => watch.wait().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            #[cfg(test)]
+            let deadline = async {
+                if let Some(clock) = &clock {
+                    clock.wait(operation_timeout).await;
+                } else {
+                    tokio::time::sleep(operation_timeout).await;
+                }
+            };
+            #[cfg(not(test))]
+            let deadline = async { tokio::time::sleep(operation_timeout).await };
+            let stop = tokio::select! {
+                biased;
+                result = future.as_mut() => {
+                    return result
+                        .map_err(anyhow::Error::from)
+                        .with_context(|| format!("remote database {operation} failed"));
+                }
+                _ = abandoned, if watch.is_some() => Stop::Abandoned,
+                _ = deadline => Stop::Deadline,
+            };
+            #[cfg(test)]
+            open_releases.fetch_add(1, Ordering::Release);
+            #[cfg(test)]
+            let opened = {
+                let wait = async {
+                    if let Some(clock) = &clock {
+                        clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                    } else {
+                        tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    result = future.as_mut() => Some(result),
+                    _ = wait => None,
+                }
+            };
+            #[cfg(not(test))]
+            let opened = tokio::select! {
+                biased;
+                result = future.as_mut() => Some(result),
+                _ = tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT) => None,
+            };
+            if let Some(Ok(tx)) = opened {
+                #[cfg(test)]
+                let rolled_back = {
+                    let wait = async {
+                        if let Some(clock) = &clock {
+                            clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                        } else {
+                            tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        result = tx.execute_batch("ROLLBACK") => result.is_ok(),
+                        _ = wait => false,
+                    }
+                };
+                #[cfg(not(test))]
+                let rolled_back = tokio::select! {
+                    biased;
+                    result = tx.execute_batch("ROLLBACK") => result.is_ok(),
+                    _ = tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT) => false,
+                };
+                if rolled_back {
+                    // The ending statement already closed the stream. Drop off
+                    // this runtime so libsql does not spawn a second rollback.
+                    drop_transaction_without_runtime(tx);
+                } else {
+                    // Still inside this runtime, so libsql can send close.
+                    drop(tx);
+                }
+            }
+            match stop {
+                Stop::Abandoned => Err(database_caller_abandoned(operation)),
+                Stop::Deadline => Err(database_operation_timed_out(operation, operation_timeout)),
+            }
+        })
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
         self.operation_timeout.is_some()
+    }
+
+    /// Drop a remote connection on this runtime. libsql sends a stream close
+    /// only when a tokio runtime is current; an off-runtime drop logs that no
+    /// runtime was available and never sends it.
+    pub(crate) fn spawn_drop<T>(&self, value: T)
+    where
+        T: Send + 'static,
+    {
+        self.handle.spawn(async move {
+            drop(value);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_release_count(&self) -> u64 {
+        self.open_releases.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -834,11 +978,19 @@ impl Connection {
     /// Starts a write transaction at the primary immediately. Remote libSQL
     /// can reject a deferred transaction when it must upgrade from a replica
     /// read to a primary write while another writer is active.
+    fn open_remote_transaction(
+        &self,
+        operation: &'static str,
+        behavior: libsql::TransactionBehavior,
+    ) -> Result<libsql::Transaction> {
+        let runtime = self.runtime.clone();
+        runtime.complete_or_release_open(operation, self.inner.transaction_with_behavior(behavior))
+    }
+
     pub fn transaction_immediate(&self) -> Result<Transaction> {
-        let inner = self.runtime.block_on_database(
+        let inner = self.open_remote_transaction(
             "begin immediate transaction",
-            self.inner
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
+            libsql::TransactionBehavior::Immediate,
         )?;
         let mut transaction = self.wrap_transaction(inner, None, true);
         transaction.ensure_mutation_receipt()?;
@@ -855,10 +1007,9 @@ impl Connection {
     /// `BEGIN READONLY` is not used here: remote libSQL may serve it from a
     /// replica. The snapshot cannot be upgraded into a write.
     pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
-        let inner = self.runtime.block_on_database(
+        let inner = self.open_remote_transaction(
             "begin primary snapshot",
-            self.inner
-                .transaction_with_behavior(libsql::TransactionBehavior::Deferred),
+            libsql::TransactionBehavior::Deferred,
         )?;
         Ok(self.wrap_transaction(inner, None, false))
     }
@@ -867,10 +1018,9 @@ impl Connection {
     /// Remote libSQL may serve it from a replica, so callers that need a fresh
     /// primary snapshot use [`Self::transaction_primary_snapshot`].
     pub fn transaction_consistent_read(&self) -> Result<Transaction> {
-        let inner = self.runtime.block_on_database(
+        let inner = self.open_remote_transaction(
             "begin consistent read",
-            self.inner
-                .transaction_with_behavior(libsql::TransactionBehavior::ReadOnly),
+            libsql::TransactionBehavior::ReadOnly,
         )?;
         Ok(self.wrap_transaction(inner, None, false))
     }
@@ -887,10 +1037,9 @@ impl Connection {
     /// a mutation receipt. Before non-migration writes, enable a mutation receipt
     /// on the returned transaction so lost COMMIT responses remain recoverable.
     pub fn transaction_primary_read(&self) -> Result<Transaction> {
-        let inner = self.runtime.block_on_database(
+        let inner = self.open_remote_transaction(
             "begin primary read transaction",
-            self.inner
-                .transaction_with_behavior(libsql::TransactionBehavior::Immediate),
+            libsql::TransactionBehavior::Immediate,
         )?;
         Ok(self.wrap_transaction(inner, None, true))
     }
@@ -1651,7 +1800,7 @@ impl Transaction {
 
     fn reconcile_mutation_receipt(&self, receipt: &str) -> Result<bool> {
         let connection = self.database.connect()?;
-        let mut transaction = Some(self.runtime.block_on_database(
+        let mut transaction = Some(self.runtime.complete_or_release_open(
             "begin commit reconciliation",
             connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate),
         )?);
@@ -1765,6 +1914,24 @@ impl Drop for Transaction {
                 }
             }
         }
+    }
+}
+
+pub(crate) fn drop_pooled_connection(connection: Connection) {
+    if connection.runtime.is_remote() {
+        let runtime = connection.runtime.clone();
+        runtime.spawn_drop(connection);
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || drop(connection))
+                .join()
+                .expect("database connection drop thread panicked")
+        });
+    } else {
+        drop(connection);
     }
 }
 

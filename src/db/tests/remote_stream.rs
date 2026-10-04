@@ -24,10 +24,15 @@ struct HranaState {
     timeout_next_cursor: bool,
     hang_next_commit: bool,
     hang_next_statement: bool,
+    hang_next_begin: bool,
+    begin_released: bool,
+    begin_release: Arc<Notify>,
+    skip_immediate_lock: bool,
     hang_rollback: bool,
     write_locked: bool,
     commit_hung: bool,
     statement_hung: bool,
+    begin_hung: bool,
     rollback_started: bool,
     progress: Arc<Notify>,
 }
@@ -48,10 +53,15 @@ impl HranaState {
             timeout_next_cursor: false,
             hang_next_commit: false,
             hang_next_statement: false,
+            hang_next_begin: false,
+            begin_released: false,
+            begin_release: Arc::new(Notify::new()),
+            skip_immediate_lock: false,
             hang_rollback: false,
             write_locked: false,
             commit_hung: false,
             statement_hung: false,
+            begin_hung: false,
             rollback_started: false,
             progress: Arc::new(Notify::new()),
         }
@@ -177,6 +187,16 @@ impl HranaFixture {
         self.state.lock().unwrap().hang_next_statement = true;
     }
 
+    fn hang_next_begin(&self) {
+        self.state.lock().unwrap().hang_next_begin = true;
+    }
+
+    fn release_begin(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.begin_released = true;
+        state.begin_release.notify_waiters();
+    }
+
     fn hang_rollback(&self) {
         self.state.lock().unwrap().hang_rollback = true;
     }
@@ -265,11 +285,46 @@ fn park_request(path: &str, input: &Json, state: &Arc<Mutex<HranaState>>) -> boo
     }
 }
 
+async fn hold_immediate_begin(path: &str, input: &Json, state: &Arc<Mutex<HranaState>>) -> bool {
+    let release = {
+        let mut guard = state.lock().unwrap();
+        if path != "/v3/pipeline" || !guard.hang_next_begin {
+            return false;
+        }
+        let immediate = input["requests"].as_array().is_some_and(|requests| {
+            requests.iter().any(|request| {
+                let sql = statement_sql(request);
+                sql.contains("BEGIN") && sql.contains("IMMEDIATE")
+            })
+        });
+        if !immediate {
+            return false;
+        }
+        guard.hang_next_begin = false;
+        guard.write_locked = true;
+        guard.in_transaction = true;
+        guard.begin_hung = true;
+        guard.progress.notify_waiters();
+        Arc::clone(&guard.begin_release)
+    };
+    loop {
+        let notified = release.notified();
+        if state.lock().unwrap().begin_released {
+            return true;
+        }
+        notified.await;
+    }
+}
+
 async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Response<Body> {
     let path = request.uri().path().to_owned();
     let bytes = hyper::body::to_bytes(request.into_body()).await.unwrap();
     let input: Json = serde_json::from_slice(&bytes).unwrap();
-    if park_request(&path, &input, &state) {
+    if hold_immediate_begin(&path, &input, &state).await {
+        // The lock was taken when the request arrived. This response is that
+        // same BEGIN, so it must not be reported as a second writer.
+        state.lock().unwrap().skip_immediate_lock = true;
+    } else if park_request(&path, &input, &state) {
         std::future::pending::<()>().await;
     }
     let supplied_baton = input["baton"].as_str();
@@ -395,7 +450,7 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
             }
         });
     } else if sql.starts_with("BEGIN") {
-        if sql.contains("IMMEDIATE") && state.write_locked {
+        if sql.contains("IMMEDIATE") && state.write_locked && !state.skip_immediate_lock {
             return json!({
                 "type": "batch",
                 "result": {
@@ -408,6 +463,7 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
             });
         }
         if sql.contains("IMMEDIATE") {
+            state.skip_immediate_lock = false;
             state.write_locked = true;
         }
         state.begin_sql.push(sql);
@@ -708,5 +764,67 @@ async fn abandoned_write_releases_the_connection_for_the_next_writer() {
         .expect("next writer did not get a connection")
         .unwrap()
         .expect("next writer must commit");
+    drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timed_out_begin_releases_the_lock_for_the_next_writer() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    let clock = install_clock(&db);
+    // One spare permit would let the next write bypass a connection that is
+    // still checked out. Hold it so the next write needs this call to return.
+    let held = Arc::clone(&db.permits).acquire_owned().await.unwrap();
+    fixture.hang_next_begin();
+    let first = spawn_write(db.clone(), |conn| {
+        let _tx = conn.transaction_immediate()?;
+        Ok(())
+    });
+    fixture.wait_until(|state| state.begin_hung).await;
+    clock.advance(Duration::from_secs(3) + Duration::from_millis(1));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if db.runtime.open_release_count() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("begin deadline never entered the short release");
+    fixture.release_begin();
+    let error = first
+        .recv_timeout(Duration::from_secs(2))
+        .expect("timed-out begin did not return")
+        .expect_err("a timed-out begin must not report success");
+    assert!(
+        is_database_operation_timeout(&error),
+        "client deadline must stay visible: {error:#}"
+    );
+    assert!(
+        error.to_string().contains("begin immediate transaction"),
+        "unexpected operation: {error:#}"
+    );
+    assert!(
+        !is_remote_interactive_timeout(&error),
+        "our deadline is not a dead stream: {error:#}"
+    );
+    assert!(
+        fixture.rollback_requests() >= 1,
+        "the open must roll back on the database runtime"
+    );
+    assert!(
+        !fixture.write_locked(),
+        "ROLLBACK must drop the writer lock before the next writer"
+    );
+
+    let next = spawn_write(db, |conn| {
+        let tx = conn.transaction_primary_read()?;
+        tx.commit()
+    });
+    next.recv_timeout(Duration::from_secs(2))
+        .expect("next writer stuck behind the timed-out begin")
+        .expect("next writer must commit");
+    assert!(!fixture.write_locked());
     drop(held);
 }

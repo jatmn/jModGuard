@@ -536,16 +536,7 @@ impl Drop for ConnectionLease {
 }
 
 fn drop_connection_without_runtime(connection: Connection) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || drop(connection))
-                .join()
-                .expect("database connection drop thread panicked")
-        });
-    } else {
-        drop(connection);
-    }
+    crate::db_compat::drop_pooled_connection(connection);
 }
 
 impl Db {
