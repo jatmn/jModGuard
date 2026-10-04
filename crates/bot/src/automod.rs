@@ -101,9 +101,9 @@ impl AutomodEngine {
         self.member_joins.get(&(guild, user)).map(|e| *e.value())
     }
 
-    /// `evaluate` marks a strike fired before Discord runs. If the retention
-    /// marker cannot be written, the ban must be eligible again on the next
-    /// message instead of disappearing until the bucket expires.
+    /// `evaluate` marks a strike fired before Discord runs. Release it only
+    /// when this process did not attempt the ban, so a later message can try
+    /// again. A retention-marker failure still bans and must not release.
     pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, at: u32) {
         let Some(mut bucket) = self.state.get_mut(&(guild, user)) else {
             return;
@@ -505,29 +505,9 @@ pub async fn execute_pending(
             }
         }
         "ban" => {
-            let pending_ban = match crate::member_directory::begin_ban_attempt(
-                app,
-                guild_id.get(),
-                target.id.get(),
-            )
-            .await
-            {
-                Ok(pending) => pending,
-                Err(error) => {
-                    app.automod.release_fired(
-                        guild_id.get(),
-                        target.id.get(),
-                        pending.rule_id,
-                        pending.action.at,
-                    );
-                    tracing::warn!(
-                        guild_id = guild_id.get(),
-                        user_id = target.id.get(),
-                        "automod ban deferred until retention marker is available: {error:#}"
-                    );
-                    return;
-                }
-            };
+            let pending_ban =
+                crate::member_directory::begin_ban_attempt(app, guild_id.get(), target.id.get())
+                    .await;
             let suppression = app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 guild_id.get(),

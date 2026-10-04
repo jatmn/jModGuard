@@ -23,3 +23,4 @@ tracing = "0.1"
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 rand = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
