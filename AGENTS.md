@@ -337,15 +337,18 @@ authorize live provider calls or require a Codex skill to contribute.
 - Runtime moderation writers (events/warns/bans) must **not** bump
   `config_version`.
 - Global WebUI routes (`guild_id=0`) and body `scope: "global"` require
-  `bot.owner_id` == logged-in user.
+  `bot.owner_id` == logged-in user. Owner and administration routes that only
+  check that identity use the session user id and do not fetch the Discord
+  guild list.
 - Guild-scoped WebUI authorization (`guild_scope` for real guild ids) always
   re-fetches Discord `/users/@me/guilds` before `can_manage`. The 60s guild
-  cache is **display-only** (`/api/me`). Never authorize mutations from the
-  display cache (post-demotion access window).
-- `AuthCtx` from `guild_scope(0)` may be display-cached (owner identity only).
-  Any secondary Discord guild check (e.g. `copy_config` source) must use
+  cache is **display-only** (`/api/me`). While Discord is rate-limiting that
+  user, display may keep serving the last good list. Never authorize mutations
+  from the display cache (post-demotion access window).
+- `AuthCtx` from `guild_scope(0)` is the session owner only and has no guild
+  list. Any secondary Discord guild check (e.g. `copy_config` source) must use
   `authorize_manage_guild` / `require_auth_fresh` — never `auth.can_manage`
-  on a CachedOk context.
+  on that context.
 - Badword delete is exact-scope: guild admins delete only their guild's rows;
   global rows require owner. All denials return the same `"badword not found"`
   (never distinguish missing / cross-guild / non-owner global).

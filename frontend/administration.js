@@ -16,6 +16,7 @@ let busy = false;
 let stale = true;
 let authorized = false;
 let accessDenied = false;
+let rateLimitUntil = 0;
 let refreshTimer;
 let actionMessage = "";
 const componentViews = new Map();
@@ -60,14 +61,26 @@ function notice(message, tone = "neutral") {
   statusNode.className = `administration-notice administration-${tone}`;
 }
 
+function nextRefreshDelay(normal) {
+  return Math.max(normal, Math.max(0, rateLimitUntil - Date.now()));
+}
+
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   if (accessDenied || document.visibilityState === "hidden") return;
   if (activeView === "usage") {
-    refreshTimer = setTimeout(() => refreshUsage(), 60000);
+    refreshTimer = setTimeout(() => refreshUsage(), nextRefreshDelay(60000));
     return;
   }
-  refreshTimer = setTimeout(() => refresh(), snapshot?.components.some(pending) ? 2000 : 30000);
+  refreshTimer = setTimeout(() => refresh(), nextRefreshDelay(snapshot?.components.some(pending) ? 2000 : 30000));
+}
+
+function retryWaitMs(response) {
+  const header = response.headers && typeof response.headers.get === "function"
+    ? response.headers.get("retry-after") : null;
+  const seconds = Number(header);
+  if (!Number.isFinite(seconds) || seconds < 1) return 1000;
+  return Math.min(seconds, 900) * 1000;
 }
 
 function apiBase() {
@@ -94,6 +107,10 @@ async function request(path, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const value = await response.json().catch(() => ({}));
+  if (response.status === 429) {
+    rateLimitUntil = Date.now() + retryWaitMs(response);
+    throw new Error(value.error || "Discord is temporarily rate limiting requests.");
+  }
   if (response.status === 401 || (path === "/api/me" && response.status === 400) ||
       (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
     authorized = false;
@@ -114,6 +131,7 @@ async function request(path, body) {
     usageView.classList.add("hidden");
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
+  rateLimitUntil = 0;
   return value;
 }
 
@@ -416,20 +434,10 @@ function refresh() {
   refreshButton.disabled = busy;
   refreshing = (async () => {
     try {
-      if (!authorized) {
-        const me = await request("/api/me", {});
-        if (activeView !== "updates" || document.visibilityState === "hidden") return;
-        if (!me.is_bot_owner) {
-          accessDenied = true;
-          updateView.classList.add("hidden");
-          notice("Only the configured bot owner can manage updates.", "bad");
-          return;
-        }
-        authorized = true;
-        accessDenied = false;
-      }
       snapshot = await request("/api/updates", {});
       if (activeView !== "updates" || document.visibilityState === "hidden") return;
+      authorized = true;
+      accessDenied = false;
       if (!busy) actionMessage = "";
       stale = false;
       signIn.classList.add("hidden");
@@ -561,14 +569,6 @@ function renderUsage(database) {
 async function doRefreshUsage() {
   if (activeView !== "usage" || document.visibilityState === "hidden") return;
   try {
-    const me = await request("/api/me", {});
-    if (activeView !== "usage" || document.visibilityState === "hidden") return;
-    if (!me.is_bot_owner || me.preview) {
-      usageCards.replaceChildren();
-      usageView.classList.add("hidden");
-      usageStatus.textContent = "Only the configured bot owner can inspect database usage.";
-      return;
-    }
     const snapshot = await request("/api/database-usage", {});
     if (activeView !== "usage" || document.visibilityState === "hidden") return;
     signIn.classList.add("hidden");

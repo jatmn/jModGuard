@@ -29,7 +29,15 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(cfg: ApiProcessConfig, db: Db) -> Result<Arc<Self>> {
-        let oauth = Arc::new(OAuthClient::from_config(&cfg)?);
+        let oauth = OAuthClient::from_config(&cfg)?;
+        match super::discord_retry::load_deadlines(&db) {
+            Ok(deadlines) => oauth.restore_deadlines(deadlines),
+            Err(error) => {
+                tracing::warn!("discord retry deadlines were not loaded: {error:#}");
+            }
+        }
+        oauth.attach_retry_store(db.clone());
+        let oauth = Arc::new(oauth);
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;
         db.require_config_version(primed.config);

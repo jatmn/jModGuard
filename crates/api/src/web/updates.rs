@@ -1,6 +1,6 @@
 //! Owner-only independent release discovery and on-demand application.
 use super::state::ApiState;
-use super::{is_bot_owner, require_auth, trusted_web_origin};
+use super::{session_owner, trusted_web_origin};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -21,13 +21,13 @@ fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 async fn owner(app: &Arc<ApiState>, session: &Session) -> Result<(), (StatusCode, Json<Value>)> {
-    let auth = require_auth(app, session)
-        .await
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "sign in required"))?;
-    if !is_bot_owner(app, &auth) {
-        return Err(error(StatusCode::FORBIDDEN, "bot owner required"));
+    match session_owner(app, session).await {
+        Ok(_) => Ok(()),
+        Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
+            Err(error(StatusCode::UNAUTHORIZED, "sign in required"))
+        }
+        Err(_) => Err(error(StatusCode::FORBIDDEN, "bot owner required")),
     }
-    Ok(())
 }
 
 fn origin(app: &ApiState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {

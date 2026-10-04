@@ -358,7 +358,7 @@ test("discord guild rate limit is shown once and does not log out or replay", as
       status: 429,
       headers: { get: (name) => (String(name).toLowerCase() === "retry-after" ? "5" : null) },
       text: async () => JSON.stringify({
-        error: "Discord is temporarily rate limiting guild checks. Try again in about 5s.",
+        error: "Discord is temporarily rate limiting requests. Try again in about 5s.",
         code: "discord_rate_limited",
         retry_after: 5,
       }),
