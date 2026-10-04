@@ -3,7 +3,7 @@
 //! exit behavior are real, while the test explicitly simulates a future migration.
 use super::*;
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
-use db::{Db, DbOpenOptions, SqlExecutor};
+use db::{Db, DbOpenOptions, SqlExecutor, params};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -574,7 +574,7 @@ async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_do
     let optional_advice = jmodguard_updater::launcher_status(&row, now());
     assert_eq!(optional_advice["state"], "optional");
     assert_eq!(optional_advice["installable"], true);
-    optional.launcher.as_mut().unwrap().min_revision += 1;
+    optional.launcher.as_mut().unwrap().min_revision = db::LAUNCHER_REVISION + 1;
     row.candidate = Some(optional.clone());
     row.installed_launcher = Some(optional); // historical metadata is not active capability
     let required_advice = jmodguard_updater::launcher_status(&row, now());
@@ -1207,6 +1207,253 @@ async fn ready_failure_of_another_release_leaves_complete_upgrade() {
         "{error:#}"
     );
     assert_complete_unchanged(&before, &control.upgrade().await.unwrap().unwrap());
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+struct ContractWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for ContractWarnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut MessageVisit(&mut message));
+        if message.contains("no capability contract") {
+            self.0.lock().expect("warning log").push(message);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct MessageVisit<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageVisit<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+}
+
+async fn with_contract_warnings<T>(
+    future: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    let value = future.await;
+    drop(guard);
+    (value, logs.lock().expect("warning log").clone())
+}
+
+async fn open_launcher_db(root: &Path) -> (Db, UpdateControl) {
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    let opts = DbOpenOptions {
+        path,
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    (db, control)
+}
+
+fn uncontracted_selection(role: &str, digest_byte: char, omit_null_upgrade: bool) -> String {
+    let mut release = release_at(role, digest_byte, db::CORE_SCHEMA_VERSION);
+    release.launcher = None;
+    if omit_null_upgrade {
+        release.upgrade = None;
+    }
+    let mut value = serde_json::to_value(&release).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("launcher");
+    if omit_null_upgrade {
+        object.remove("upgrade");
+    }
+    serde_json::to_string(&value).unwrap()
+}
+
+async fn store_desired_launcher(db: &Db, role: &str, raw: &str) {
+    let (role, raw) = (role.to_owned(), raw.to_owned());
+    let changed = db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE component_updates SET desired_launcher=?1,installed_launcher=NULL,state='idle',last_error=NULL WHERE component=?2",
+                params![raw, role],
+                64 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+async fn assert_idle_without_desired(control: &UpdateControl, role: &str) {
+    let row = control.component(role).await.unwrap();
+    assert!(row.desired_launcher.is_none(), "{role}");
+    assert!(row.installed_launcher.is_none(), "{role}");
+    assert_eq!(row.state, "idle", "{role}");
+    assert!(row.last_error.is_none(), "{role}");
+}
+
+#[tokio::test]
+async fn stored_launcher_without_contract_is_cleared_once() {
+    let root = std::env::temp_dir().join(format!(
+        "launcher-no-contract-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    // An earlier image has no launcher-revision labels. Stored JSON from before
+    // that field also omits a null upgrade, which the current serializer emits.
+    let historical = uncontracted_selection("bot", 'a', true);
+    let parsed: ComponentRelease = serde_json::from_str(&historical).unwrap();
+    assert_ne!(serde_json::to_string(&parsed).unwrap(), historical);
+    assert!(parsed.launcher.is_none());
+    store_desired_launcher(&db, "bot", &historical).await;
+    let current = uncontracted_selection("api", 'b', false);
+    assert!(
+        serde_json::from_str::<ComponentRelease>(&current)
+            .unwrap()
+            .launcher
+            .is_none()
+    );
+    store_desired_launcher(&db, "api", &current).await;
+
+    let mut bot = offline_controller("bot", control.clone(), &root);
+    let mut api = offline_controller("api", control.clone(), &root);
+    let (_, warnings) = with_contract_warnings(async {
+        assert!(
+            !bot.launcher(&control.component("bot").await.unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !api.launcher(&control.component("api").await.unwrap())
+                .await
+                .unwrap()
+        );
+    })
+    .await;
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert_idle_without_desired(&control, "bot").await;
+    assert_idle_without_desired(&control, "api").await;
+    let (_, again) = with_contract_warnings(async {
+        assert!(
+            !bot.launcher(&control.component("bot").await.unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !api.launcher(&control.component("api").await.unwrap())
+                .await
+                .unwrap()
+        );
+    })
+    .await;
+    assert!(again.is_empty(), "{again:?}");
+    assert!(!root.join("jmodguard-launcher-next").exists());
+    drop((bot, api, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn stored_launcher_that_is_not_newer_is_still_cleared() {
+    let root = std::env::temp_dir().join(format!(
+        "launcher-not-newer-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let release = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+    assert_eq!(
+        release.launcher.as_ref().unwrap().revision,
+        db::LAUNCHER_REVISION
+    );
+    store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
+    let mut bot = offline_controller("bot", control.clone(), &root);
+    let (kept, warnings) = with_contract_warnings(async {
+        bot.launcher(&control.component("bot").await.unwrap()).await
+    })
+    .await;
+    assert!(!kept.unwrap());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_idle_without_desired(&control, "bot").await;
+    assert!(!root.join("jmodguard-launcher-next").exists());
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn stored_launcher_with_newer_contract_is_still_selected() {
+    let root = std::env::temp_dir().join(format!("launcher-newer-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let mut objects = HashMap::new();
+    let mut release = image(&mut objects, "bot", b"\x7fELFfixture");
+    release.launcher.as_mut().unwrap().revision = db::LAUNCHER_REVISION + 1;
+    store_desired_launcher(&db, "bot", &serde_json::to_string(&release).unwrap()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let mut bot = controller(
+        "bot",
+        root.join("baked-bot"),
+        registry,
+        control.clone(),
+        &root,
+    );
+    let (selected, warnings) = with_contract_warnings(async {
+        bot.launcher(&control.component("bot").await.unwrap()).await
+    })
+    .await;
+    assert!(selected.unwrap());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let desired = control
+        .component("bot")
+        .await
+        .unwrap()
+        .desired_launcher
+        .unwrap();
+    assert_eq!(desired, release);
+    let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+        .await
+        .unwrap();
+    assert!(handoff.ends_with(&format!("{}\n", release.digest)));
+    server.abort();
     drop((bot, control, db));
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
