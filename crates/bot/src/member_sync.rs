@@ -2181,6 +2181,17 @@ mod tests {
         db::guild_data::GuildDataStore,
         db::guild_data::GuildDataScope,
     ) {
+        enrolled_directory_for(10).await
+    }
+
+    async fn enrolled_directory_for(
+        guild_id: i64,
+    ) -> (
+        std::path::PathBuf,
+        Arc<BotState>,
+        db::guild_data::GuildDataStore,
+        db::guild_data::GuildDataScope,
+    ) {
         use crate::{config::BotProcessConfig, db::Db};
         let directory =
             std::env::temp_dir().join(format!("member_sync_idle_{:032x}", rand::random::<u128>()));
@@ -2189,7 +2200,10 @@ mod tests {
         let db_path = directory.join("core.db");
         cfg.db.path = db_path.clone();
         let app = BotState::new(cfg, Db::open(&db_path, 2).unwrap()).unwrap();
-        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let enrollment = db::enroll_guild(&app.db, guild_id, 100)
+            .await
+            .unwrap()
+            .unwrap();
         app.tenant.activate(enrollment.clone()).await.unwrap();
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         (directory, app, store, scope)
@@ -2313,6 +2327,61 @@ mod tests {
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 2).await;
         assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 1);
         assert!(probe.status_reads.load(Ordering::Relaxed) >= 2);
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_pass_issues_no_member_sync_statements() {
+        const GUILD: i64 = 424_243;
+        let (directory, app, store, scope) = enrolled_directory_for(GUILD).await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .initialize_member_directory(scope.clone(), 42, now_ms)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "idle-count".into(), now_ms, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .defer_member_sync(
+                scope.clone(),
+                claim,
+                "retry".into(),
+                now_ms + 45_000,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        db::guild_data::begin_member_sync_statement_count(GUILD);
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(GUILD as u64),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| {
+            probe.status_reads.load(Ordering::Relaxed) >= 1
+                && db::guild_data::member_sync_statement_count(GUILD) > 0
+        })
+        .await;
+        settle_parked(&probe, 1, 1).await;
+        let after_scan = db::guild_data::member_sync_statement_count(GUILD);
+        assert!(after_scan > 0, "the first scan did not count a statement");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle_parked(&probe, 1, 1).await;
+        assert_eq!(
+            db::guild_data::member_sync_statement_count(GUILD),
+            after_scan,
+            "an idle pass queried the database before the saved attempt"
+        );
         worker.abort();
         let _ = worker.await;
         drop((store, app));
