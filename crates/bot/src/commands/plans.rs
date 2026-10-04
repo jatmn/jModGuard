@@ -265,7 +265,7 @@ async fn run_step(
                 env.guild_id.get(),
                 target.get(),
             )
-            .await?;
+            .await;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Ban,
                 env.guild_id.get(),
