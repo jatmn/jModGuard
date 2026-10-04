@@ -16,6 +16,10 @@ struct HranaState {
     expired: HashSet<String>,
     expire_next_cursor: bool,
     expired_requests: usize,
+    fail_next_commit: bool,
+    commit_timeouts: usize,
+    rollback_requests: usize,
+    in_transaction: bool,
 }
 
 struct HranaFixture {
@@ -107,6 +111,18 @@ impl HranaFixture {
     fn expired_requests(&self) -> usize {
         self.state.lock().unwrap().expired_requests
     }
+
+    fn fail_next_commit(&self) {
+        self.state.lock().unwrap().fail_next_commit = true;
+    }
+
+    fn commit_timeouts(&self) -> usize {
+        self.state.lock().unwrap().commit_timeouts
+    }
+
+    fn rollback_requests(&self) -> usize {
+        self.state.lock().unwrap().rollback_requests
+    }
 }
 
 impl Drop for HranaFixture {
@@ -165,8 +181,10 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
                             }
                         }),
                         "get_autocommit" => {
-                            json!({"type": "get_autocommit", "is_autocommit": true})
+                            json!({"type": "get_autocommit", "is_autocommit": !state.in_transaction})
                         }
+                        "batch" => pipeline_batch_response(request, &mut state),
+                        "execute" => pipeline_batch_response(request, &mut state),
                         "close" => {
                             closed = true;
                             json!({"type": "close"})
@@ -203,6 +221,55 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
         }
         other => panic!("unexpected Hrana route: {other}"),
     }
+}
+
+fn statement_sql(request: &Json) -> String {
+    request["batch"]["steps"]
+        .as_array()
+        .and_then(|steps| steps.first())
+        .and_then(|step| step["stmt"]["sql"].as_str())
+        .or_else(|| request["stmt"]["sql"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase()
+}
+
+fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
+    let sql = statement_sql(request);
+    if sql.starts_with("ROLLBACK") {
+        state.rollback_requests += 1;
+        state.in_transaction = false;
+    } else if sql.starts_with("COMMIT") && state.fail_next_commit {
+        state.fail_next_commit = false;
+        state.commit_timeouts += 1;
+        state.in_transaction = false;
+        return json!({
+            "type": "batch",
+            "result": {
+                "step_results": [null],
+                "step_errors": [{
+                    "message": "Transaction timed out",
+                    "code": "TRANSACTION_TIMEOUT"
+                }]
+            }
+        });
+    } else if sql.starts_with("BEGIN") {
+        state.in_transaction = true;
+    } else if sql.starts_with("COMMIT") {
+        state.in_transaction = false;
+    }
+    json!({
+        "type": "batch",
+        "result": {
+            "step_results": [{
+                "cols": [],
+                "rows": [],
+                "affected_row_count": 0,
+                "last_insert_rowid": null
+            }],
+            "step_errors": [null]
+        }
+    })
 }
 
 fn read_one(conn: &mut Connection) -> Result<i64> {
@@ -273,4 +340,34 @@ async fn remote_stream_error_discards_lease_without_replaying_closure() {
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     assert_eq!(db.connections.idle.lock().unwrap().len(), 1);
     assert_eq!(db.permits.available_permits(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_commit_timeout_does_not_roll_back_the_closed_stream() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    fixture.fail_next_commit();
+    let started = std::time::Instant::now();
+    let error = db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_read()?;
+            tx.commit()
+        })
+        .await
+        .expect_err("a timed-out commit must not report success");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "rollback on the closed stream must not wait out the client deadline"
+    );
+    assert!(is_database_commit_indeterminate(&error), "{error:#}");
+    assert!(
+        is_remote_interactive_timeout(&error),
+        "commit timeout must stay an interactive-stream failure: {error:#}"
+    );
+    assert_eq!(fixture.commit_timeouts(), 1);
+    assert_eq!(
+        fixture.rollback_requests(),
+        0,
+        "COMMIT already closed the stream"
+    );
 }

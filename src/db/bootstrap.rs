@@ -712,31 +712,10 @@ fn globals_seed_satisfied_tx(conn: &impl SqlExecutor) -> Result<bool> {
             return Ok(false);
         }
     }
-    let settings: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM guild_settings WHERE guild_id = ?1",
-        params![GLOBAL_SCOPE],
-        |row| Ok(row.get(0)?),
-    )?;
-    let rules: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM rules WHERE guild_id = ?1",
-        params![GLOBAL_SCOPE],
-        |row| Ok(row.get(0)?),
-    )?;
-    let commands: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM commands WHERE guild_id = ?1",
-        params![GLOBAL_SCOPE],
-        |row| Ok(row.get(0)?),
-    )?;
-    let templates: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM templates WHERE guild_id = ?1",
-        params![GLOBAL_SCOPE],
-        |row| Ok(row.get(0)?),
-    )?;
-    if settings < 1
-        || rules < crate::defaults::default_rules().len() as i64
-        || commands < crate::defaults::default_commands().len() as i64
-        || templates < crate::defaults::default_templates().len() as i64
-    {
+    // Counts are not enough. The pre-batch seed ran INSERT OR IGNORE for every
+    // shipped key on each boot, so a deleted default came back and a customized
+    // row did not. An extra custom row must not hide a missing shipped key.
+    if !shipped_global_keys_present(conn)? {
         return Ok(false);
     }
     let stats = crate::defaults::default_commands()
@@ -762,6 +741,60 @@ fn globals_seed_satisfied_tx(conn: &impl SqlExecutor) -> Result<bool> {
         |row| Ok(row.get(0)?),
     )?;
     Ok(legacy_setname == 0)
+}
+
+/// True when every shipped global key is present. Payloads are not compared:
+/// INSERT OR IGNORE restores a missing key and leaves an edited one in place.
+fn shipped_global_keys_present(conn: &impl SqlExecutor) -> Result<bool> {
+    let settings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM guild_settings WHERE guild_id = ?1",
+        params![GLOBAL_SCOPE],
+        |row| Ok(row.get(0)?),
+    )?;
+    if settings < 1 {
+        return Ok(false);
+    }
+    let rules = count_global_keys(conn, "rules", "rule_id", &crate::types::RULE_IDS)?;
+    if rules != crate::types::RULE_IDS.len() as i64 {
+        return Ok(false);
+    }
+    let commands = crate::defaults::default_commands();
+    let command_names: Vec<String> = commands.iter().map(|cmd| cmd.name.to_lowercase()).collect();
+    let command_refs: Vec<&str> = command_names.iter().map(String::as_str).collect();
+    if count_global_keys(conn, "commands", "name", &command_refs)? != command_refs.len() as i64 {
+        return Ok(false);
+    }
+    let templates = crate::defaults::default_templates();
+    let events: Vec<&str> = templates.iter().map(|(event, _)| *event).collect();
+    Ok(count_global_keys(conn, "templates", "event_type", &events)? == events.len() as i64)
+}
+
+fn count_global_keys(
+    conn: &impl SqlExecutor,
+    table: &str,
+    column: &str,
+    keys: &[&str],
+) -> Result<i64> {
+    anyhow::ensure!(
+        matches!(
+            (table, column),
+            ("rules", "rule_id") | ("commands", "name") | ("templates", "event_type")
+        ),
+        "seed presence check uses a fixed table"
+    );
+    anyhow::ensure!(!keys.is_empty(), "shipped key list is empty");
+    let list = keys
+        .iter()
+        .map(|key| sql_text(key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM {table} WHERE guild_id = {GLOBAL_SCOPE} AND {column} IN ({list})"
+        ),
+        (),
+        |row| Ok(row.get(0)?),
+    )
 }
 
 pub(super) fn seed_globals_conn(
