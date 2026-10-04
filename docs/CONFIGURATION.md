@@ -31,6 +31,13 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
 
+Use `info` for production. `JMODGUARD_LOG_LEVEL` overrides `log.level` and
+is the only environment override for tracing; `RUST_LOG` is ignored. The
+configured filter applies to all targets, with no automatic debug override
+for jModGuard. Per-message and per-guild diagnostics require `debug`.
+Enable it only briefly: diagnostic metadata can reveal per-user activity even
+though the per-message line omits author IDs and message text. Restrict log access.
+
 Administrative policy (`[actions]`) is shared by bot/API; scheduling (`[action_worker]`)
 is bot-only. See [all action defaults and environment overrides](BOT-ACTIONS.md#runtime-controls).
 Bot-only `[member_sync]` config sets `page_size = 100` (allowed 1–500),
