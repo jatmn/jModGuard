@@ -182,7 +182,7 @@ test("Administration carries the configured API origin through reads, controls, 
   for (const path of ["/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"]) {
     vm.runInContext(`request(${JSON.stringify(path)}, {})`, remote.context);
   }
-  assert.deepEqual(calls, ["/api/me", "/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"].map((path) => ({
+  assert.deepEqual(calls, ["/api/updates", "/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"].map((path) => ({
     url: `https://api.example.test${path}`, method: "POST", credentials: "include",
   })));
   assert.equal(remote.elements.get("sign-in-link").href,
@@ -193,7 +193,7 @@ test("Administration carries the configured API origin through reads, controls, 
     localCalls.push({ url, credentials: options.credentials });
     return new Promise(() => {});
   });
-  assert.deepEqual(localCalls, [{ url: "/api/me", credentials: "include" }]);
+  assert.deepEqual(localCalls, [{ url: "/api/updates", credentials: "include" }]);
   assert.equal(local.elements.get("sign-in-link").href, "/login?return_to=%2Fadministration%2Findex.html");
   assert.match(fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration/index.html"), "utf8"),
     /id="sign-in-link"/);
@@ -300,7 +300,7 @@ test("application, launcher and WebUI installs show pending and automatically re
     assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.doesNotMatch(view.elements.get("update-status").textContent, /Waiting for the component/);
     assert.equal([...view.timers.values()][0].delay, 30000);
-    assert.equal(calls.filter((call) => call.url === "/api/me").length, 1);
+    assert.equal(calls.filter((call) => call.url === "/api/me").length, 0);
     assert.equal(calls.find((call) => call.url === "/api/updates/install").body.launcher, launcher || undefined);
   }
 });
@@ -623,7 +623,7 @@ test("transient initial access checks retry automatically but confirmed denials 
   for (const failure of ["network", "server"]) {
     let calls = 0;
     const view = await ready(async (url) => {
-      if (url === "/api/me" && ++calls === 1) {
+      if (url === "/api/updates" && ++calls === 1) {
         if (failure === "network") throw new Error("offline");
         return response({ error: "starting" }, 503);
       }
@@ -634,7 +634,7 @@ test("transient initial access checks retry automatically but confirmed denials 
     assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
     assert.equal(updateButton(view, "api").disabled, false);
   }
-  for (const denial of [response({}, 401), response({}, 403), response({ is_bot_owner: false })]) {
+  for (const denial of [response({}, 401), response({}, 403), response({ error: "bot owner required" }, 403)]) {
     let denied = true;
     const view = await ready(async (url) => denied ? denial : response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
     assert.equal(view.timers.size, 0);
@@ -644,6 +644,24 @@ test("transient initial access checks retry automatically but confirmed denials 
     assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
     assert.equal(view.timers.size, 1);
   }
+});
+
+test("Discord rate limits delay the next administration refresh", async () => {
+  const view = await ready(async (url) => {
+    if (url === "/api/updates") {
+      return {
+        status: 429,
+        ok: false,
+        headers: { get: (name) => (name === "retry-after" ? "45" : null) },
+        json: async () => ({ error: "limited", code: "discord_rate_limited" }),
+      };
+    }
+    return response(state([record()]));
+  });
+  assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+  assert.equal(view.elements.get("sign-in").classList.contains("hidden"), true);
+  assert.equal(view.timers.size, 1);
+  assert.equal([...view.timers.values()][0].delay, 45000);
 });
 
 test("refresh retains controls and disclosures while actions use the newest component record", async () => {

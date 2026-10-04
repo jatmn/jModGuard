@@ -204,8 +204,10 @@ operations now use API admission and bot dispatch.
   `jmodguard_session`; lost on API restart).
 - Guild admins need Discord `MANAGE_GUILD`.
 - Global edits (`guild_id=0` or body `scope: "global"`) require `bot.owner_id`.
+  That check uses the session user id and does not fetch the guild list.
 - Guild-scoped authorization always re-fetches Discord guild membership
-  (`authorize_manage_guild`); the short guild-list cache is display-only (`/api/me`).
+  (`authorize_manage_guild`); the short guild-list cache is display-only
+  (`/api/me`) and may serve the last good list while Discord is rate-limiting.
 
 ## Source layout
 

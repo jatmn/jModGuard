@@ -1,7 +1,7 @@
 //! Owner-only physical database usage. Cache lives after authorization and
 //! coalesces concurrent browsers so inspection does not amplify remote reads.
 use super::state::ApiState;
-use super::{is_bot_owner, require_auth, trusted_web_origin};
+use super::{session_owner, trusted_web_origin};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -56,11 +56,12 @@ async fn authorize(
     session: &Session,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let auth = require_auth(app, session)
-        .await
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "sign in required"))?;
-    if !is_bot_owner(app, &auth) {
-        return Err(error(StatusCode::FORBIDDEN, "bot owner required"));
+    match session_owner(app, session).await {
+        Ok(_) => {}
+        Err(failure) if format!("{:#}", failure.0).contains("not authenticated") => {
+            return Err(error(StatusCode::UNAUTHORIZED, "sign in required"));
+        }
+        Err(_) => return Err(error(StatusCode::FORBIDDEN, "bot owner required")),
     }
     if !trusted_web_origin(&app.cfg, headers) {
         return Err(error(StatusCode::FORBIDDEN, "untrusted request origin"));

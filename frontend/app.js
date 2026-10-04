@@ -502,11 +502,11 @@ function apiError(message, status, retryAfterMs) {
   return err;
 }
 
-function parseRetryAfterMs(header) {
+function parseRetryAfterMs(header, capSeconds = 30) {
   if (!header) return 0;
   const seconds = Number(header);
   if (!Number.isFinite(seconds) || seconds < 0) return 0;
-  return Math.min(seconds, 30) * 1000;
+  return Math.min(seconds, capSeconds) * 1000;
 }
 
 function isDiscordRateLimited(err) {
@@ -629,7 +629,7 @@ async function api(path, method = "GET", body = null, signal) {
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
-    if (!res.ok) throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after")));
+    if (!res.ok) throwApiFailure(data, res.status, parseRetryAfterMs(res.headers.get("retry-after"), 900));
     return data;
   } catch (e) {
     if (e && (e.name === "AbortError" || e.name === "TimeoutError")) {
@@ -2191,7 +2191,7 @@ function tabMembers() {
   let listRequest = 0, statusRequest = 0, detailRequest = 0;
   let listAbort = null, statusAbort = null, detailAbort = null;
   let timer = null, countdownTimer = null, debounce = null, disposed = false, after = "", nextAfter = null;
-  let latestStatus = null, latestStatusRevision = -1, statusRetryNeeded = false;
+  let latestStatus = null, latestStatusRevision = -1, statusRetryNeeded = false, lastStatusError = null;
   let latestStatusReceivedAt = 0;
   let pendingSyncAction = null, syncActionOutcome = null;
   let emptyMembersCell = null;
@@ -2212,7 +2212,12 @@ function tabMembers() {
     const active = statusRetryNeeded || pendingSyncAction || (latestStatus && (
       ["queued", "running", "waiting"].includes(latestStatus.status) ||
       ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
-    if (active) timer = setTimeout(loadStatus, 10000);
+    if (!active) return;
+    let delay = 10000;
+    if (isDiscordRateLimited(lastStatusError)) {
+      delay = Math.max(10000, Math.min(lastStatusError.retryAfterMs || 10000, 900000));
+    }
+    timer = setTimeout(loadStatus, delay);
   };
   const asDate = (value) => memberTime(value);
   const renderStatus = (sync) => {
@@ -2361,6 +2366,7 @@ function tabMembers() {
         pendingSyncAction = null;
       }
       statusRetryNeeded = false;
+      lastStatusError = null;
       if (succeededId && pendingSyncAction?.id === succeededId) pendingSyncAction = null;
       latestStatus = sync;
       latestStatusRevision = revision;
@@ -2394,6 +2400,7 @@ function tabMembers() {
     } catch (error) {
       if (!aliveHere() || request !== statusRequest) return;
       statusRetryNeeded = true;
+      lastStatusError = error;
       if (latestStatus) renderStatus(latestStatus);
       else syncCard.replaceChildren();
       syncCard.append(el("p", { class: "err", role: "status", text: latestStatus ? "Could not refresh import status. Showing the last saved status; retrying shortly while visible." : "Could not load import status. Retrying shortly while visible." }));

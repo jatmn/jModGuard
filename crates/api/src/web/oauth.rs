@@ -8,20 +8,29 @@ pub struct OAuthClient {
     pub client_secret: String,
     pub redirect_uri: String,
     pub http: reqwest::Client,
-    /// Token cooldown map. Shared so a dropped request can still store the body wait.
+    /// Route cooldown map. Shared so a dropped request can still store the body wait.
     pub(crate) guild_list: std::sync::Arc<std::sync::Mutex<GuildListGate>>,
-    /// One in-flight guild-list fetch per access token. Unrelated tokens do not share it.
-    pub(crate) guild_flights:
-        tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// One in-flight `/users/@me/guilds` lookup per user. Waiters receive the leader's result.
+    guild_flights: std::sync::Arc<std::sync::Mutex<HashMap<String, GuildFlightSender>>>,
+    /// Core database used to keep Retry-After across process restarts. Empty in tests
+    /// that do not open a database.
+    retry_db: std::sync::Mutex<Option<crate::db::Db>>,
     #[cfg(test)]
     pub guilds_endpoint: Option<String>,
     #[cfg(test)]
     pub token_endpoint: Option<String>,
+    #[cfg(test)]
+    pub me_endpoint: Option<String>,
 }
 
+type GuildFlightSender = tokio::sync::watch::Sender<Option<std::sync::Arc<SharedGuildOutcome>>>;
+
 pub(crate) struct GuildListGate {
-    /// Access token → earliest instant another guild-list request may start.
+    /// Route key → earliest instant another request for that route may start.
     cooldowns: HashMap<String, Cooldown>,
+    /// Durable unix-millis deadlines. `Instant` values do not survive a restart.
+    deadlines_ms: HashMap<String, i64>,
+    generation: u64,
 }
 
 /// A cooldown that cannot be added to `Instant` stays until this process exits,
@@ -38,6 +47,8 @@ impl GuildListGate {
     pub(crate) fn new() -> Self {
         Self {
             cooldowns: HashMap::new(),
+            deadlines_ms: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -67,8 +78,46 @@ impl GuildListGate {
         };
         if replace {
             self.cooldowns.insert(token.to_owned(), next);
+            if super::discord_retry::durable_key(token) {
+                let millis = wall_deadline_ms(retry_after);
+                let previous = self.deadlines_ms.get(token).copied().unwrap_or(0);
+                if millis > previous {
+                    self.deadlines_ms.insert(token.to_owned(), millis);
+                    self.generation = self.generation.saturating_add(1);
+                }
+            }
         }
     }
+
+    fn durable_snapshot(&mut self) -> (u64, std::collections::BTreeMap<String, i64>) {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.deadlines_ms
+            .retain(|key, millis| *millis > now && super::discord_retry::durable_key(key));
+        while self.deadlines_ms.len() > 64 {
+            let Some(soonest) = self
+                .deadlines_ms
+                .iter()
+                .min_by_key(|(_, millis)| *millis)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.deadlines_ms.remove(&soonest);
+        }
+        (
+            self.generation,
+            self.deadlines_ms
+                .iter()
+                .map(|(key, millis)| (key.clone(), *millis))
+                .collect(),
+        )
+    }
+}
+
+fn wall_deadline_ms(retry_after: Duration) -> i64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    let extra = i64::try_from(retry_after.as_millis().min(i64::MAX as u128)).unwrap_or(i64::MAX);
+    now.saturating_add(extra)
 }
 
 pub(crate) fn cooldown_deadline(now: Instant, retry_after: Duration) -> Cooldown {
@@ -81,7 +130,11 @@ pub(crate) fn cooldown_deadline(now: Instant, retry_after: Duration) -> Cooldown
 /// Upstream guild-list failure. Only `Unauthorized` justifies an OAuth refresh.
 #[derive(Debug)]
 pub enum GuildListError {
-    RateLimited { retry_after: Duration },
+    /// `fresh` is the Discord 429 itself. A later call inside that window is not.
+    RateLimited {
+        retry_after: Duration,
+        fresh: bool,
+    },
     Unauthorized,
     Failed(anyhow::Error),
 }
@@ -97,7 +150,7 @@ impl std::fmt::Display for DiscordRateLimit {
         let seconds = retry_after_header_secs(self.retry_after);
         write!(
             f,
-            "Discord is temporarily rate limiting guild checks. Try again in about {seconds}s."
+            "Discord is temporarily rate limiting requests. Try again in about {seconds}s."
         )
     }
 }
@@ -236,6 +289,9 @@ impl OAuthClient {
         value: &str,
         _code_verifier: Option<&str>,
     ) -> Result<TokenResponse> {
+        if let Some(retry_after) = self.route_remaining("token") {
+            return Err(DiscordRateLimit { retry_after }.into());
+        }
         let url = "https://discord.com/api/oauth2/token";
         #[cfg(test)]
         let url = self.token_endpoint.as_deref().unwrap_or(url);
@@ -260,7 +316,15 @@ impl OAuthClient {
             .await
             .context("oauth token request failed")?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
+        self.observe_route("token", status, &headers, &bytes).await;
+        if status.as_u16() == 429 {
+            return Err(DiscordRateLimit {
+                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
+            }
+            .into());
+        }
         if !status.is_success() {
             anyhow::bail!(
                 "discord oauth error {status}: {}",
@@ -270,18 +334,42 @@ impl OAuthClient {
         serde_json::from_slice(&bytes).context("invalid oauth token response")
     }
 
-    pub async fn me(&self, access_token: &str) -> Result<DiscordUser> {
+    pub async fn me(&self, user_id: u64, access_token: &str) -> Result<DiscordUser> {
+        let key = if user_id == 0 {
+            format!("m:login:{:016x}", token_fingerprint(access_token))
+        } else {
+            format!("m:{user_id}")
+        };
+        if let Some(retry_after) = self.route_remaining(&key) {
+            return Err(DiscordRateLimit { retry_after }.into());
+        }
+        let url = "https://discord.com/api/users/@me";
+        #[cfg(test)]
+        let url = self.me_endpoint.as_deref().unwrap_or(url);
         let resp = self
             .http
-            .get("https://discord.com/api/users/@me")
+            .get(url)
             .bearer_auth(access_token)
             .send()
             .await
             .context("discord me request failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("discord me request failed with {}", resp.status());
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .bytes()
+            .await
+            .context("discord me response body failed")?;
+        self.observe_route(&key, status, &headers, &bytes).await;
+        if status.as_u16() == 429 {
+            return Err(DiscordRateLimit {
+                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
+            }
+            .into());
         }
-        resp.json().await.context("invalid discord user response")
+        if !status.is_success() {
+            anyhow::bail!("discord me request failed with {status}");
+        }
+        serde_json::from_slice(&bytes).context("invalid discord user response")
     }
 
     pub async fn my_guilds(
@@ -289,19 +377,43 @@ impl OAuthClient {
         user_id: u64,
         access_token: &str,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
-        let user_key = user_id.to_string();
-        if let Some(retry_after) = self.cooldown_remaining(&user_key) {
-            return Err(GuildListError::RateLimited { retry_after });
+        let user_key = format!("g:{user_id}");
+        if let Some(retry_after) = self.route_remaining(&user_key) {
+            return Err(GuildListError::RateLimited {
+                retry_after,
+                fresh: false,
+            });
         }
-        // Callers for one Discord user share one fetch. Another user's lookup
-        // does not wait on this one, and a new access token does not bypass it.
-        let flight = self.guild_flight(&user_key).await;
-        let _same_user = flight.lock().await;
-        if let Some(retry_after) = self.cooldown_remaining(&user_key) {
-            return Err(GuildListError::RateLimited { retry_after });
+        // One lookup per user. A different user does not wait, and a refreshed
+        // access token does not start a second request for this user.
+        match self.begin_flight(&user_key) {
+            FlightJoin::Follow(receiver) => self.wait_for_flight(receiver).await,
+            FlightJoin::Lead(mut guard) => {
+                if let Some(retry_after) = self.route_remaining(&user_key) {
+                    let error = GuildListError::RateLimited {
+                        retry_after,
+                        fresh: false,
+                    };
+                    guard.finish(&error_outcome(&error));
+                    return Err(error);
+                }
+                let result = self.fetch_guild_pages(&user_key, access_token).await;
+                guard.finish(&shared_outcome(&result));
+                if matches!(result, Err(GuildListError::RateLimited { fresh: true, .. })) {
+                    self.persist_deadlines().await;
+                }
+                result
+            }
         }
+    }
+
+    async fn fetch_guild_pages(
+        &self,
+        user_key: &str,
+        access_token: &str,
+    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
         // Discord paginates at 200 guilds; a single GET silently drops every
-        // server past the first page and deny WebUI manage access for them.
+        // server past the first page and denies WebUI manage access for them.
         const PAGE_LIMIT: usize = 200;
         let endpoint = "https://discord.com/api/users/@me/guilds";
         #[cfg(test)]
@@ -323,47 +435,65 @@ impl OAuthClient {
                 }
             };
             let status = resp.status();
+            let headers = resp.headers().clone();
             if status.as_u16() == 401 {
                 return Err(GuildListError::Unauthorized);
             }
             if status.as_u16() == 429 {
-                let header = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
+                let header = header_retry_after(&headers).map(str::to_owned);
+                let header_global = limit_scope_is_global(&headers);
                 let gate = std::sync::Arc::clone(&self.guild_list);
-                let cooldown_key = user_key.clone();
-                self.hold_for_body(&user_key);
+                let cooldown_key = user_key.to_owned();
+                self.hold_for_body(user_key);
                 let header_for_response = header.clone();
                 let finish = tokio::spawn(async move {
-                    let retry_after = match resp.bytes().await {
-                        Ok(bytes) => discord_retry_after(header.as_deref(), &bytes),
-                        Err(_) if header.is_some() => discord_retry_after(header.as_deref(), b"{}"),
+                    let (retry_after, body_global) = match resp.bytes().await {
+                        Ok(bytes) => (
+                            discord_retry_after(header.as_deref(), &bytes),
+                            body_is_global(&bytes),
+                        ),
+                        Err(_) if header.is_some() => {
+                            (discord_retry_after(header.as_deref(), b"{}"), false)
+                        }
                         Err(_) => {
                             gate.lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .cooldowns
-                                .insert(cooldown_key, Cooldown::RestOfProcess);
+                                .block_until(&cooldown_key, Duration::MAX);
                             return Duration::MAX;
                         }
                     };
-                    gate.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .block_until(&cooldown_key, retry_after);
+                    let mut gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if header_global || body_global {
+                        gate.block_until("global", retry_after);
+                    }
+                    gate.block_until(&cooldown_key, retry_after);
                     retry_after
                 });
                 let retry_after = finish
                     .await
                     .unwrap_or_else(|_| discord_retry_after(header_for_response.as_deref(), b"{}"));
-                return Err(GuildListError::RateLimited { retry_after });
+                return Err(GuildListError::RateLimited {
+                    retry_after,
+                    fresh: true,
+                });
             }
             if !status.is_success() {
                 return Err(GuildListError::Failed(anyhow::anyhow!(
                     "discord guilds request failed with {status}"
                 )));
             }
-            let page: Vec<DiscordGuild> = match resp.json().await {
+            let bytes = match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(GuildListError::Failed(anyhow::anyhow!(
+                        "invalid discord guilds response: {error}"
+                    )));
+                }
+            };
+            if self.note_bucket_reset(user_key, &headers, &bytes) {
+                self.persist_deadlines().await;
+            }
+            let page: Vec<DiscordGuild> = match serde_json::from_slice(&bytes) {
                 Ok(page) => page,
                 Err(error) => {
                     return Err(GuildListError::Failed(anyhow::anyhow!(
@@ -385,11 +515,27 @@ impl OAuthClient {
         Ok(all)
     }
 
-    fn cooldown_remaining(&self, access_token: &str) -> Option<Duration> {
-        self.guild_list
+    fn route_remaining(&self, key: &str) -> Option<Duration> {
+        let mut gate = self
+            .guild_list
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remaining(access_token)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let global = gate.remaining("global");
+        let route = if key == "global" {
+            None
+        } else {
+            gate.remaining(key)
+        };
+        match (global, route) {
+            (Some(global), Some(route)) => Some(global.max(route)),
+            (Some(wait), None) | (None, Some(wait)) => Some(wait),
+            (None, None) => None,
+        }
+    }
+
+    /// True when this user's guild list, or the process-wide Discord limit, is still closed.
+    pub(crate) fn guild_route_limited(&self, user_id: u64) -> bool {
+        self.route_remaining(&format!("g:{user_id}")).is_some()
     }
 
     fn hold_for_body(&self, user_key: &str) {
@@ -406,14 +552,274 @@ impl OAuthClient {
         }
     }
 
-    async fn guild_flight(&self, access_token: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        let mut flights = self.guild_flights.lock().await;
-        flights.retain(|_, flight| std::sync::Arc::strong_count(flight) > 1);
-        flights
-            .entry(access_token.to_owned())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    fn begin_flight(&self, user_key: &str) -> FlightJoin {
+        let mut flights = self
+            .guild_flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = flights.get(user_key) {
+            return FlightJoin::Follow(sender.subscribe());
+        }
+        let (sender, _) = tokio::sync::watch::channel(None);
+        flights.insert(user_key.to_owned(), sender.clone());
+        FlightJoin::Lead(FlightGuard {
+            key: user_key.to_owned(),
+            sender,
+            flights: std::sync::Arc::clone(&self.guild_flights),
+            done: false,
+        })
     }
+
+    async fn wait_for_flight(
+        &self,
+        mut receiver: tokio::sync::watch::Receiver<Option<std::sync::Arc<SharedGuildOutcome>>>,
+    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+        loop {
+            if let Some(outcome) = receiver.borrow().clone() {
+                return outcome_to_result(&outcome);
+            }
+            if receiver.changed().await.is_err() {
+                return Err(GuildListError::Failed(anyhow::anyhow!(
+                    "guild list lookup ended before a result"
+                )));
+            }
+        }
+    }
+
+    async fn observe_route(
+        &self,
+        key: &str,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: &[u8],
+    ) {
+        if status.as_u16() == 429 {
+            let retry_after = discord_retry_after(header_retry_after(headers), body);
+            self.apply_limit(key, retry_after);
+            if limit_scope_is_global(headers) || body_is_global(body) {
+                self.apply_limit("global", retry_after);
+            }
+            self.persist_deadlines().await;
+            return;
+        }
+        if self.note_bucket_reset(key, headers, body) {
+            self.persist_deadlines().await;
+        }
+    }
+
+    fn note_bucket_reset(
+        &self,
+        key: &str,
+        headers: &reqwest::header::HeaderMap,
+        body: &[u8],
+    ) -> bool {
+        let Some(retry_after) = bucket_reset_after(headers) else {
+            return false;
+        };
+        self.apply_limit(key, retry_after);
+        if limit_scope_is_global(headers) || body_is_global(body) {
+            self.apply_limit("global", retry_after);
+        }
+        true
+    }
+
+    fn apply_limit(&self, key: &str, retry_after: Duration) {
+        self.guild_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .block_until(key, retry_after);
+    }
+
+    pub(crate) fn restore_deadlines(&self, deadlines: std::collections::BTreeMap<String, i64>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now = Instant::now();
+        let mut gate = self
+            .guild_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, millis) in deadlines {
+            if millis <= now_ms || !super::discord_retry::durable_key(&key) {
+                continue;
+            }
+            let retry_after =
+                Duration::from_millis(u64::try_from(millis - now_ms).unwrap_or(u64::MAX));
+            gate.cooldowns
+                .insert(key.clone(), cooldown_deadline(now, retry_after));
+            gate.deadlines_ms.insert(key, millis);
+        }
+    }
+
+    pub(crate) fn attach_retry_store(&self, db: crate::db::Db) {
+        *self
+            .retry_db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(db);
+    }
+
+    async fn persist_deadlines(&self) {
+        let Some(db) = self
+            .retry_db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        for _ in 0..4 {
+            let (generation, deadlines) = self
+                .guild_list
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .durable_snapshot();
+            let Ok(json) = serde_json::to_string(&deadlines) else {
+                return;
+            };
+            if json.len() > 8192 {
+                tracing::warn!("discord retry deadline record is too large to store");
+                return;
+            }
+            if let Err(error) = super::discord_retry::store_deadlines(&db, json).await {
+                tracing::warn!("failed to persist discord retry deadline: {error:#}");
+                return;
+            }
+            let current = self
+                .guild_list
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation;
+            if current == generation {
+                return;
+            }
+        }
+    }
+}
+
+enum FlightJoin {
+    Lead(FlightGuard),
+    Follow(tokio::sync::watch::Receiver<Option<std::sync::Arc<SharedGuildOutcome>>>),
+}
+
+struct FlightGuard {
+    key: String,
+    sender: GuildFlightSender,
+    flights: std::sync::Arc<std::sync::Mutex<HashMap<String, GuildFlightSender>>>,
+    done: bool,
+}
+
+impl FlightGuard {
+    fn finish(&mut self, outcome: &SharedGuildOutcome) {
+        let _ = self.sender.send(Some(std::sync::Arc::new(outcome.clone())));
+        self.done = true;
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self
+                .sender
+                .send(Some(std::sync::Arc::new(SharedGuildOutcome::Failed(
+                    "guild list lookup ended before a result".into(),
+                ))));
+        }
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        flights.remove(&self.key);
+    }
+}
+
+#[derive(Clone)]
+enum SharedGuildOutcome {
+    Ok(Vec<DiscordGuild>),
+    Limited { retry_after: Duration, fresh: bool },
+    Unauthorized,
+    Failed(String),
+}
+
+fn shared_outcome(
+    result: &std::result::Result<Vec<DiscordGuild>, GuildListError>,
+) -> SharedGuildOutcome {
+    match result {
+        Ok(guilds) => SharedGuildOutcome::Ok(guilds.clone()),
+        Err(error) => error_outcome(error),
+    }
+}
+
+fn error_outcome(error: &GuildListError) -> SharedGuildOutcome {
+    match error {
+        GuildListError::RateLimited { retry_after, fresh } => SharedGuildOutcome::Limited {
+            retry_after: *retry_after,
+            fresh: *fresh,
+        },
+        GuildListError::Unauthorized => SharedGuildOutcome::Unauthorized,
+        GuildListError::Failed(error) => SharedGuildOutcome::Failed(format!("{error:#}")),
+    }
+}
+
+fn outcome_to_result(
+    outcome: &SharedGuildOutcome,
+) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+    match outcome {
+        SharedGuildOutcome::Ok(guilds) => Ok(guilds.clone()),
+        SharedGuildOutcome::Limited { retry_after, fresh } => Err(GuildListError::RateLimited {
+            retry_after: *retry_after,
+            fresh: *fresh,
+        }),
+        SharedGuildOutcome::Unauthorized => Err(GuildListError::Unauthorized),
+        SharedGuildOutcome::Failed(message) => {
+            Err(GuildListError::Failed(anyhow::anyhow!(message.clone())))
+        }
+    }
+}
+
+fn header_retry_after(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn limit_scope_is_global(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("x-ratelimit-scope")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("global"))
+        || headers
+            .get("x-ratelimit-global")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "true" || value == "1")
+}
+
+fn body_is_global(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("global").and_then(|flag| flag.as_bool()))
+        .unwrap_or(false)
+}
+
+fn bucket_reset_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    if remaining > 0 {
+        return None;
+    }
+    let header = headers
+        .get("x-ratelimit-reset-after")
+        .and_then(|value| value.to_str().ok())?;
+    let wait = discord_retry_after(Some(header), b"{}");
+    Some(wait)
+}
+
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Discord's rate-limit docs: use `Retry-After` or JSON `retry_after` (seconds).
@@ -475,11 +881,16 @@ impl OAuthClient {
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(
                 super::oauth::GuildListGate::new(),
             )),
-            guild_flights: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            guild_flights: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            retry_db: std::sync::Mutex::new(None),
             #[cfg(test)]
             guilds_endpoint: None,
             #[cfg(test)]
             token_endpoint: None,
+            #[cfg(test)]
+            me_endpoint: None,
         })
     }
 }
@@ -578,9 +989,11 @@ mod tests {
             redirect_uri: String::new(),
             http: reqwest::Client::new(),
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
-            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retry_db: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
+            me_endpoint: None,
         });
         let slow_client = std::sync::Arc::clone(&client);
         let slow = tokio::spawn(async move { slow_client.my_guilds(1, "slow").await });
@@ -624,14 +1037,19 @@ mod tests {
             redirect_uri: String::new(),
             http: reqwest::Client::new(),
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
-            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retry_db: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
+            me_endpoint: None,
         };
         let first = client.my_guilds(7, "old-token").await.unwrap_err();
         assert!(matches!(first, GuildListError::RateLimited { .. }));
         let second = client.my_guilds(7, "refreshed-token").await.unwrap_err();
-        assert!(matches!(second, GuildListError::RateLimited { .. }));
+        assert!(matches!(
+            second,
+            GuildListError::RateLimited { fresh: false, .. }
+        ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let other = client.my_guilds(8, "other-user").await.unwrap_err();
         assert!(matches!(other, GuildListError::RateLimited { .. }));
@@ -675,9 +1093,11 @@ mod tests {
                 .build()
                 .unwrap(),
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
-            guild_flights: tokio::sync::Mutex::new(HashMap::new()),
+            guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retry_db: std::sync::Mutex::new(None),
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
+            me_endpoint: None,
         });
         let first_client = std::sync::Arc::clone(&client);
         let first = tokio::spawn(async move { first_client.my_guilds(9, "first").await });
@@ -692,6 +1112,217 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = first.await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn test_oauth(
+        http: reqwest::Client,
+        guilds_endpoint: Option<String>,
+        token_endpoint: Option<String>,
+        me_endpoint: Option<String>,
+    ) -> OAuthClient {
+        OAuthClient {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            http,
+            guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
+            guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retry_db: std::sync::Mutex::new(None),
+            guilds_endpoint,
+            token_endpoint,
+            me_endpoint,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_guild_lookups_share_one_success() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/guilds",
+                axum::routing::get(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        axum::Json(serde_json::json!([{
+                            "id": "1",
+                            "name": "n",
+                            "icon": null,
+                            "owner": false,
+                            "permissions": 32
+                        }]))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = std::sync::Arc::new(test_oauth(
+            reqwest::Client::new(),
+            Some(format!("http://{address}/guilds")),
+            None,
+            None,
+        ));
+        let left = std::sync::Arc::clone(&client);
+        let right = std::sync::Arc::clone(&client);
+        let (first, second) =
+            tokio::join!(async move { left.my_guilds(3, "one").await }, async move {
+                right.my_guilds(3, "one").await
+            },);
+        assert_eq!(first.unwrap().len(), 1);
+        assert_eq!(second.unwrap().len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_rate_limit_is_not_fetched_again() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/me",
+                axum::routing::get(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "8")],
+                            axum::Json(serde_json::json!({"retry_after": 8})),
+                        )
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = test_oauth(
+            reqwest::Client::new(),
+            None,
+            None,
+            Some(format!("http://{address}/me")),
+        );
+        let first = client.me(4, "token").await.unwrap_err();
+        assert!(first.downcast_ref::<DiscordRateLimit>().is_some());
+        let second = client.me(4, "token").await.unwrap_err();
+        assert!(second.downcast_ref::<DiscordRateLimit>().is_some());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_rate_limit_is_not_exchanged_again() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/token",
+                axum::routing::post(move || {
+                    let seen = std::sync::Arc::clone(&seen);
+                    async move {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "6")],
+                            axum::Json(serde_json::json!({"retry_after": 6})),
+                        )
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = test_oauth(
+            reqwest::Client::new(),
+            None,
+            Some(format!("http://{address}/token")),
+            None,
+        );
+        assert!(
+            client
+                .refresh("one")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert!(
+            client
+                .refresh("two")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn global_guild_limit_blocks_identity_lookup() {
+        let guild_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let me_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let guild_seen = std::sync::Arc::clone(&guild_calls);
+        let me_seen = std::sync::Arc::clone(&me_calls);
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/guilds",
+                    axum::routing::get(move || {
+                        let guild_seen = std::sync::Arc::clone(&guild_seen);
+                        async move {
+                            guild_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                [("retry-after", "20"), ("x-ratelimit-scope", "global")],
+                                axum::Json(serde_json::json!({"global": true, "retry_after": 20})),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/me",
+                    axum::routing::get(move || {
+                        let me_seen = std::sync::Arc::clone(&me_seen);
+                        async move {
+                            me_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::Json(serde_json::json!({
+                                "id": "4",
+                                "username": "n",
+                                "global_name": null,
+                                "avatar": null
+                            }))
+                        }
+                    }),
+                );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = test_oauth(
+            reqwest::Client::new(),
+            Some(format!("http://{address}/guilds")),
+            None,
+            Some(format!("http://{address}/me")),
+        );
+        let limited = client.my_guilds(4, "token").await.unwrap_err();
+        assert!(matches!(
+            limited,
+            GuildListError::RateLimited { fresh: true, .. }
+        ));
+        assert!(
+            client
+                .me(4, "token")
+                .await
+                .unwrap_err()
+                .downcast_ref::<DiscordRateLimit>()
+                .is_some()
+        );
+        assert_eq!(guild_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(me_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

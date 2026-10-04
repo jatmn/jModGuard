@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod cases;
+mod discord_retry;
 pub mod members;
 pub mod oauth;
 pub mod preview;
@@ -193,6 +194,35 @@ impl AuthCtx {
     }
 }
 
+/// Session owner check that does not call Discord. Preview sessions never
+/// inherit owner authority. The returned context has no guild membership.
+pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthCtx> {
+    if preview::current().is_some() {
+        return Err(ApiError(anyhow::anyhow!(
+            "global config requires the configured bot owner (bot.owner_id)"
+        )));
+    }
+    let Some(user_id) = session.get::<u64>(SESSION_USER).await.ok().flatten() else {
+        return Err(ApiError(anyhow::anyhow!("not authenticated")));
+    };
+    let owner = app.cfg.bot.owner_id;
+    if owner == 0 || user_id != owner {
+        return Err(ApiError(anyhow::anyhow!(
+            "global config requires the configured bot owner (bot.owner_id)"
+        )));
+    }
+    Ok(AuthCtx {
+        user: DiscordUser {
+            id: user_id.to_string(),
+            username: String::new(),
+            global_name: None,
+            avatar: None,
+        },
+        guilds: Vec::new(),
+        enrollment: None,
+    })
+}
+
 /// True when the session user is the configured bot owner (`bot.owner_id` ≠ 0).
 /// Preview sessions never inherit owner authority.
 pub fn is_bot_owner(app: &ApiState, auth: &AuthCtx) -> bool {
@@ -217,7 +247,8 @@ pub fn require_bot_owner(app: &ApiState, auth: &AuthCtx) -> ApiResult<()> {
 /// How guild membership/permissions may be sourced for this auth call.
 ///
 /// Display (`/api/me`) may use a short in-memory cache to spare Discord rate
-/// limits. Authorization (`guild_scope` for real guilds) must **not** — a
+/// limits, and may keep showing the last good list while that route is cooling
+/// down. Authorization (`guild_scope` for real guilds) must **not** — a
 /// demoted admin must lose WebUI access on the next request, not after a TTL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuildListMode {
@@ -258,11 +289,12 @@ async fn require_auth_with(
     let now = std::time::Instant::now();
     let cached_user = cached_user(app, user_id);
 
-    // Display path only: serve cached guilds while fresh.
+    // Display path only: serve a fresh list, or the last good list while
+    // Discord is still cooling down. Authorization never takes this branch.
     if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
         let user = match cached_user {
             Some(u) => u,
-            None => app.oauth.me(&token).await.map_err(ApiError)?,
+            None => app.oauth.me(user_id, &token).await.map_err(ApiError)?,
         };
         let mut auth = AuthCtx {
             user,
@@ -295,15 +327,27 @@ async fn require_auth_with(
             }
             match app.oauth.my_guilds(user_id, &tok.access_token).await {
                 Ok(g) => (tok.access_token, g),
-                Err(error) => return Err(guild_list_failure(user_id, error)),
+                Err(error) => {
+                    return finish_guild_list(
+                        app,
+                        guild_mode,
+                        user_id,
+                        &tok.access_token,
+                        cached_user,
+                        error,
+                    )
+                    .await;
+                }
             }
         }
-        Err(error) => return Err(guild_list_failure(user_id, error)),
+        Err(error) => {
+            return finish_guild_list(app, guild_mode, user_id, &token, cached_user, error).await;
+        }
     };
 
     let user = match cached_user {
         Some(u) => u,
-        None => app.oauth.me(&access).await.map_err(ApiError)?,
+        None => app.oauth.me(user_id, &access).await.map_err(ApiError)?,
     };
 
     app.guild_cache.insert(user_id, (now, guilds.clone()));
@@ -317,10 +361,73 @@ async fn require_auth_with(
     Ok(auth)
 }
 
+async fn finish_guild_list(
+    app: &ApiState,
+    guild_mode: GuildListMode,
+    user_id: u64,
+    token: &str,
+    cached_user: Option<DiscordUser>,
+    error: oauth::GuildListError,
+) -> ApiResult<AuthCtx> {
+    if matches!(guild_mode, GuildListMode::CachedOk)
+        && let Some(auth) =
+            cached_display_during_limit(app, user_id, token, cached_user, &error).await?
+    {
+        return Ok(auth);
+    }
+    Err(guild_list_failure(user_id, error))
+}
+
+async fn cached_display_during_limit(
+    app: &ApiState,
+    user_id: u64,
+    token: &str,
+    cached_user: Option<DiscordUser>,
+    error: &oauth::GuildListError,
+) -> ApiResult<Option<AuthCtx>> {
+    let oauth::GuildListError::RateLimited { fresh, .. } = error else {
+        return Ok(None);
+    };
+    let Some(guilds) = app
+        .guild_cache
+        .get(&user_id)
+        .map(|entry| entry.value().1.clone())
+    else {
+        return Ok(None);
+    };
+    if *fresh {
+        tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
+    } else {
+        tracing::debug!("webui auth: discord guild-list cooldown still active for user {user_id}");
+    }
+    let fetched_user = cached_user.is_none();
+    let user = match cached_user {
+        Some(user) => user,
+        None => app.oauth.me(user_id, token).await.map_err(ApiError)?,
+    };
+    if fetched_user {
+        app.user_cache
+            .insert(user_id, (std::time::Instant::now(), user.clone()));
+    }
+    let mut auth = AuthCtx {
+        user,
+        guilds,
+        enrollment: None,
+    };
+    preview::apply_overlay(&mut auth)?;
+    Ok(Some(auth))
+}
+
 fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
     match error {
-        oauth::GuildListError::RateLimited { retry_after } => {
-            tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
+        oauth::GuildListError::RateLimited { retry_after, fresh } => {
+            if fresh {
+                tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
+            } else {
+                tracing::debug!(
+                    "webui auth: discord guild-list cooldown still active for user {user_id}"
+                );
+            }
             ApiError(oauth::DiscordRateLimit { retry_after }.into())
         }
         oauth::GuildListError::Unauthorized => {
@@ -356,11 +463,25 @@ fn take_cached_guilds(
     }
     let entry = app.guild_cache.get(&user_id)?;
     let (fetched_at, guilds) = entry.value();
-    if fetched_at.elapsed() < GUILD_DISPLAY_CACHE_TTL {
+    if guild_display_usable(
+        fetched_at.elapsed(),
+        GUILD_DISPLAY_CACHE_TTL,
+        app.oauth.guild_route_limited(user_id),
+    ) {
         Some(guilds.clone())
     } else {
         None
     }
+}
+
+/// A display list is usable while it is younger than the TTL, or while Discord
+/// is still refusing that user's guild list. Authorization must not call this.
+fn guild_display_usable(
+    age: std::time::Duration,
+    ttl: std::time::Duration,
+    rate_limited: bool,
+) -> bool {
+    age < ttl || rate_limited
 }
 
 /// Display listing may use the in-memory guild cache; authorization must not.
@@ -616,7 +737,7 @@ async fn callback_response(
             return finish(error_page(&format!("token exchange failed: {e:#}")));
         }
     };
-    let user = match oauth.me(&tok.access_token).await {
+    let user = match oauth.me(0, &tok.access_token).await {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("oauth callback: me request failed: {e:#}");
@@ -1253,9 +1374,10 @@ pub async fn authorize_ban_members(
 ///
 /// Real guild ids always re-fetch Discord guild permissions (`MustRefresh`) so
 /// a demoted admin cannot keep mutating via a stale display cache. `guild_id=0`
-/// (global) only needs identity + owner check — no guild-list authorization.
+/// (global) checks the session user against `bot.owner_id` and does not fetch
+/// the guild list.
 ///
-/// **Warning:** the `AuthCtx` returned for `guild_id=0` may be display-cached.
+/// **Warning:** the `AuthCtx` returned for `guild_id=0` has no guild membership.
 /// Do **not** call `auth.can_manage(...)` on it. Use [`authorize_manage_guild`]
 /// for any secondary Discord guild check (e.g. copy source).
 pub async fn guild_scope(
@@ -1266,9 +1388,7 @@ pub async fn guild_scope(
     // guild_id 0 is GLOBAL_SCOPE — only the configured bot owner may edit it.
     // Owner identity does not depend on Discord guild membership.
     if guild_id == 0 {
-        let auth = require_auth(app, session).await?;
-        require_bot_owner(app, &auth)?;
-        return Ok(auth);
+        return session_owner(app, session).await;
     }
     authorize_manage_guild(app, session, guild_id).await
 }
@@ -2089,6 +2209,26 @@ mod tests {
     }
 
     #[test]
+    fn display_cache_stays_usable_only_while_fresh_or_rate_limited() {
+        let ttl = std::time::Duration::from_secs(60);
+        assert!(guild_display_usable(
+            std::time::Duration::from_secs(1),
+            ttl,
+            false
+        ));
+        assert!(!guild_display_usable(
+            std::time::Duration::from_secs(120),
+            ttl,
+            false
+        ));
+        assert!(guild_display_usable(
+            std::time::Duration::from_secs(120),
+            ttl,
+            true
+        ));
+    }
+
+    #[test]
     fn guild_list_cache_forbidden_for_authorization() {
         // Root cause of post-demotion WebUI access: authorizing with CachedOk.
         // guild_scope (real guilds) must use MustRefresh → cache never consulted.
@@ -2098,10 +2238,11 @@ mod tests {
 
     #[test]
     fn copy_source_must_not_trust_guild_scope_zero_authctx() {
-        // Regression: guild_scope(0) returns CachedOk AuthCtx. That context can
-        // still list a source guild the owner no longer manages. copy_config
-        // must call authorize_manage_guild(from) — never auth.can_manage(from)
-        // on the destination AuthCtx.
+        // Regression: guild_scope(0) returns an owner identity with no guild
+        // list. A caller that stuffed a stale guild onto that context must not
+        // authorize a copy source from it. copy_config must call
+        // authorize_manage_guild(from) — never auth.can_manage(from) on the
+        // destination AuthCtx.
         let stale = AuthCtx {
             enrollment: None,
             user: crate::web::oauth::DiscordUser {

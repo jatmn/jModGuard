@@ -642,6 +642,85 @@ async fn concurrent_guild_checks_share_one_rate_limit() {
 }
 
 #[tokio::test]
+async fn display_keeps_the_last_guild_list_while_discord_is_rate_limited() {
+    let f = Fixture::new(false).await;
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["guilds"].as_array().unwrap().is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stale_display_fetches_once_then_serves_the_cached_list() {
+    let f = Fixture::new(false).await;
+    let stale = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(120))
+        .expect("display cooldown test needs a monotonic clock older than the cache ttl");
+    f.app
+        .guild_cache
+        .insert(42, (stale, vec![managed_guild(10)]));
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["guilds"][0]["id"], "10");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    let (again, _) = f.request("POST", "/api/me", "").await;
+    assert_eq!(again, StatusCode::OK);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn guild_list_cooldown_survives_a_new_api_process() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.app.guild_cache.clear();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, _) = f.request("POST", "/api/guilds/10/cases/case-1", "{}").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    let endpoint = f.app.oauth.guilds_endpoint.clone().unwrap();
+    let cfg = (*f.app.cfg).clone();
+    let db = db::Db::open(&f.path, 2).unwrap();
+    let mut restarted = ApiState::new(cfg, db).unwrap();
+    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut restarted).unwrap().oauth)
+        .unwrap()
+        .guilds_endpoint = Some(endpoint);
+    let err = restarted
+        .oauth
+        .my_guilds(42, "fixture-token")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        oauth::GuildListError::RateLimited { fresh: false, .. }
+    ));
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn owner_administration_does_not_fetch_guilds_while_rate_limited() {
+    let f = Fixture::new(true).await;
+    f.app.guild_cache.clear();
+    f.app.user_cache.clear();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, body) = f.request("POST", "/api/updates", "").await;
+    assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
+
+    let blocked = Fixture::new(false).await;
+    blocked.app.guild_cache.clear();
+    blocked.app.user_cache.clear();
+    blocked.discord.rate_limited.store(true, Ordering::SeqCst);
+    let (status, _) = blocked.request("POST", "/api/updates", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked.discord.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn expired_guild_token_refreshes_once_and_server_errors_do_not() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
