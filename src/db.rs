@@ -144,7 +144,8 @@ pub fn is_schema_not_ready(err: &anyhow::Error) -> bool {
         .any(|e| e.downcast_ref::<SchemaNotReady>().is_some())
 }
 
-/// True when a remote operation exceeded the fixed request deadline.
+/// True when a remote operation exceeded the fixed request deadline, or the
+/// caller stopped waiting while that operation was still in flight.
 ///
 /// Callers may retry reads. Mutating operations must not be retried blindly:
 /// the server could have committed before its response was lost.
@@ -399,6 +400,22 @@ pub struct Db {
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
+}
+
+struct CallerCancel {
+    watch: Arc<crate::db_compat::AbandonWatch>,
+}
+
+impl CallerCancel {
+    fn arm(watch: Arc<crate::db_compat::AbandonWatch>) -> Self {
+        Self { watch }
+    }
+}
+
+impl Drop for CallerCancel {
+    fn drop(&mut self) {
+        self.watch.signal();
+    }
 }
 
 impl Db {
@@ -870,7 +887,8 @@ impl Db {
     }
 
     /// Runs a blocking compatibility closure on a libSQL connection off the
-    /// application async runtime.
+    /// application async runtime. Dropping this future tells the in-flight
+    /// database call to stop so the blocking task can release the connection.
     pub async fn with_conn<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
@@ -888,10 +906,16 @@ impl Db {
         let required_config_version = Arc::clone(&self.required_config_version);
         let config_write_generation = Arc::clone(&self.config_write_generation);
         let config_floor_lock = Arc::clone(&self.config_floor_lock);
+        let watch = crate::db_compat::AbandonWatch::new();
+        let _caller = CallerCancel::arm(Arc::clone(&watch));
         tokio::task::spawn_blocking(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
             // cannot cancel blocking work, so an aborted request must not let
-            // another operation exceed the configured pool bound.
+            // another operation exceed the configured pool bound. Dropping the
+            // caller signals the in-flight database call so this task can roll
+            // back and return the permit instead of keeping both until the
+            // operation deadline.
+            let _caller = crate::db_compat::enter_caller_abandon(watch);
             let _permit = permit;
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);

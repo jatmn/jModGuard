@@ -10,6 +10,7 @@ use fallible_iterator::FallibleIterator;
 use libsql::params::IntoParams;
 use libsql_sqlite3_parser::ast::{Cmd, PragmaBody, Stmt};
 use libsql_sqlite3_parser::lexer::sql::Parser;
+use std::cell::RefCell;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::Path;
@@ -45,13 +46,24 @@ pub struct DatabaseOperationTimedOut {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error("remote database {operation} ended because the caller stopped waiting")]
+pub struct DatabaseCallerAbandoned {
+    operation: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("remote database commit outcome is indeterminate: {0}")]
 pub struct DatabaseCommitIndeterminate(#[source] anyhow::Error);
 
 pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>().is_some())
+    error.chain().any(|cause| {
+        cause.downcast_ref::<DatabaseOperationTimedOut>().is_some()
+            || cause.downcast_ref::<DatabaseCallerAbandoned>().is_some()
+    })
+}
+
+pub(crate) fn database_caller_abandoned(operation: &'static str) -> anyhow::Error {
+    DatabaseCallerAbandoned { operation }.into()
 }
 
 pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
@@ -62,14 +74,25 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
     })
 }
 
+/// After our own deadline, one attempt to drop a remote writer lock.
+///
+/// Short enough that a hung ROLLBACK cannot hold the API call, and shorter
+/// than the provider's transaction steal so the next writer is not stuck
+/// behind an abandoned `BEGIN IMMEDIATE`.
+pub(crate) const REMOTE_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
+
 /// True when Bunny Database / Turso closed an interactive Hrana transaction.
 ///
 /// This is distinct from the client-side [`DatabaseOperationTimedOut`] deadline.
 /// The provider kills idle or long interactive transactions (often around five
 /// seconds) and the next statement fails at cursor step 0 with
 /// `TRANSACTION_TIMEOUT`. ROLLBACK after that then reports that no transaction
-/// is active.
+/// is active. Our own deadline's text also contains "transaction timed out"
+/// when the operation name ends in "transaction"; that is not a dead stream.
 pub(crate) fn is_remote_interactive_timeout(error: &anyhow::Error) -> bool {
+    if is_database_operation_timeout(error) {
+        return false;
+    }
     error.chain().any(|cause| {
         let message = cause.to_string();
         let lower = message.to_ascii_lowercase();
@@ -137,6 +160,10 @@ pub struct DbRuntime {
     // Shared by all connections for one physical Db pool. A discovered bound
     // violation pauses growth until that runtime is restarted and repaired.
     growth_paused: Arc<AtomicBool>,
+    /// Test-only stand-in for `tokio::time::timeout`. The database runtime is
+    /// multi-thread, and `tokio::time::pause` refuses that flavor.
+    #[cfg(test)]
+    manual_clock: Arc<Mutex<Option<Arc<ManualClock>>>>,
 }
 
 impl DbRuntime {
@@ -153,6 +180,8 @@ impl DbRuntime {
             _thread: Arc::clone(&self._thread),
             operation_timeout,
             growth_paused: Arc::clone(&self.growth_paused),
+            #[cfg(test)]
+            manual_clock: Arc::clone(&self.manual_clock),
         }
     }
 
@@ -194,6 +223,8 @@ impl DbRuntime {
             }),
             operation_timeout,
             growth_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            manual_clock: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -228,22 +259,189 @@ impl DbRuntime {
         T: Send,
         E: Into<anyhow::Error> + Send,
     {
-        match self.operation_timeout {
-            Some(timeout) => {
-                match self.block_on(async move { tokio::time::timeout(timeout, future).await }) {
-                    Ok(result) => result
-                        .map_err(Into::into)
-                        .with_context(|| format!("remote database {operation} failed")),
-                    Err(_) => Err(database_operation_timed_out(operation, timeout)),
+        self.block_on_database_within(operation, self.operation_timeout, future, true)
+    }
+
+    /// Rollback and lock release must finish even after the caller has left.
+    /// They keep their own deadline and ignore the caller-abandon flag.
+    fn block_on_database_cleanup<F, T, E>(&self, operation: &'static str, future: F) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>> + Send,
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        self.block_on_database_within(operation, self.operation_timeout, future, false)
+    }
+
+    fn block_on_database_within<F, T, E>(
+        &self,
+        operation: &'static str,
+        timeout: Option<Duration>,
+        future: F,
+        honor_caller: bool,
+    ) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>> + Send,
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        let watch = if honor_caller {
+            active_caller_abandon()
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
+        self.block_on(async move {
+            let abandoned = async {
+                match watch {
+                    Some(watch) => watch.wait().await,
+                    None => std::future::pending::<()>().await,
                 }
+            };
+            #[cfg(test)]
+            let deadline = async {
+                match timeout {
+                    Some(timeout) => {
+                        if let Some(clock) = clock {
+                            clock.wait(timeout).await;
+                        } else {
+                            tokio::time::sleep(timeout).await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            #[cfg(not(test))]
+            let deadline = async {
+                match timeout {
+                    Some(timeout) => tokio::time::sleep(timeout).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let remote = timeout.is_some();
+            tokio::select! {
+                biased;
+                result = future => {
+                    let result = result.map_err(Into::into);
+                    if remote {
+                        result.with_context(|| format!("remote database {operation} failed"))
+                    } else {
+                        result
+                    }
+                }
+                _ = abandoned => Err(database_caller_abandoned(operation)),
+                _ = deadline, if remote => Err(database_operation_timed_out(
+                    operation,
+                    timeout.unwrap_or(Duration::ZERO),
+                )),
             }
-            None => self.block_on(future).map_err(Into::into),
-        }
+        })
     }
 
     fn is_remote(&self) -> bool {
         self.operation_timeout.is_some()
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_manual_clock(&self, clock: Option<Arc<ManualClock>>) {
+        *self.manual_clock.lock().expect("manual clock lock") = clock;
+    }
+}
+
+/// Virtual deadlines for tests. `tokio::time::pause` only works on a
+/// current-thread runtime; database work runs on a multi-thread runtime.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ManualClock {
+    now_ms: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            now_ms: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.now_ms.fetch_add(millis, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self, timeout: Duration) {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let deadline = self
+            .now_ms
+            .load(Ordering::SeqCst)
+            .saturating_add(timeout_ms);
+        loop {
+            let notified = self.notify.notified();
+            if self.now_ms.load(Ordering::SeqCst) >= deadline {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Set while `Db::with_conn` is still being awaited. Dropping that future
+/// signals the watch so the in-flight database call returns and can release
+/// its connection and any writer lock. Cleanup rollbacks do not honor it.
+pub(crate) struct AbandonWatch {
+    flag: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+thread_local! {
+    static CALLER_ABANDON: RefCell<Option<Arc<AbandonWatch>>> = const { RefCell::new(None) };
+}
+
+impl AbandonWatch {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            flag: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn signal(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct CallerAbandonScope {
+    previous: Option<Arc<AbandonWatch>>,
+}
+
+pub(crate) fn enter_caller_abandon(watch: Arc<AbandonWatch>) -> CallerAbandonScope {
+    let previous = CALLER_ABANDON.with(|slot| slot.borrow_mut().replace(watch));
+    CallerAbandonScope { previous }
+}
+
+impl Drop for CallerAbandonScope {
+    fn drop(&mut self) {
+        CALLER_ABANDON.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn active_caller_abandon() -> Option<Arc<AbandonWatch>> {
+    CALLER_ABANDON.with(|slot| slot.borrow().clone())
 }
 
 pub struct Connection {
@@ -716,6 +914,7 @@ impl Connection {
             capacity_poisoned: AtomicBool::new(false),
             write_prepared: AtomicBool::new(false),
             stream_exhausted: AtomicBool::new(false),
+            client_deadline: AtomicBool::new(false),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
         }
@@ -916,6 +1115,9 @@ pub struct Transaction {
     /// The provider already closed this Hrana stream. Drop must not send
     /// ROLLBACK on it; the connection is tainted and the next open uses a new one.
     stream_exhausted: AtomicBool,
+    /// Our deadline cancelled an in-flight call. The stream may still accept
+    /// ROLLBACK. This is not [`Self::stream_exhausted`].
+    client_deadline: AtomicBool,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
 }
@@ -1053,9 +1255,35 @@ impl Transaction {
     }
 
     fn note_remote_stream_loss(&self, error: &anyhow::Error) {
+        if is_database_operation_timeout(error) {
+            self.client_deadline.store(true, Ordering::Release);
+            return;
+        }
         if is_remote_interactive_timeout(error) {
             self.stream_exhausted.store(true, Ordering::Release);
         }
+    }
+
+    /// One short ROLLBACK after our deadline. libSQL sends stream close with
+    /// a transaction-ending statement, so a live baton is not left behind.
+    /// A provider-closed stream must not call this: that request waits out
+    /// the client deadline and cannot change the outcome.
+    fn release_remote_write_lock(&self) -> Result<()> {
+        self.runtime
+            .block_on_database_within(
+                "release write lock",
+                Some(REMOTE_LOCK_RELEASE_TIMEOUT),
+                self.inner().execute_batch("ROLLBACK"),
+                false,
+            )
+            .map(|_| ())
+    }
+
+    fn remote_write_needs_prompt_release(&self) -> bool {
+        self.runtime.is_remote()
+            && self.allows_write
+            && self.client_deadline.load(Ordering::Acquire)
+            && !self.stream_exhausted.load(Ordering::Acquire)
     }
 
     fn map_stream<T>(&self, result: Result<T>) -> Result<T> {
@@ -1330,12 +1558,17 @@ impl Transaction {
                 // lost. Callers must reconcile every remote commit error as
                 // an indeterminate outcome. An interactive timeout already
                 // closed the stream; ROLLBACK on it waits out the client
-                // deadline and is not cleanup.
+                // deadline and is not cleanup. Our own deadline is different:
+                // the baton may still be live, and the writer lock stays until
+                // the provider steals it unless we roll back promptly.
                 self.note_remote_stream_loss(&commit_error);
                 if self.stream_exhausted.load(Ordering::Acquire) {
                     self.connection_tainted.store(true, Ordering::Release);
+                } else if self.remote_write_needs_prompt_release() {
+                    let _rollback = self.release_remote_write_lock();
+                    self.connection_tainted.store(true, Ordering::Release);
                 } else {
-                    let _rollback = self.runtime.block_on_database(
+                    let _rollback = self.runtime.block_on_database_cleanup(
                         "rollback after failed commit",
                         self.inner().execute_batch("ROLLBACK"),
                     );
@@ -1381,10 +1614,16 @@ impl Transaction {
             drop_transaction_without_runtime(inner);
             return Ok(());
         }
-        let result = self.runtime.block_on_database(
-            "finish read transaction",
-            self.inner().execute_batch("ROLLBACK"),
-        );
+        let result = if self.remote_write_needs_prompt_release() {
+            self.release_remote_write_lock()
+        } else {
+            self.runtime
+                .block_on_database_cleanup(
+                    "finish read transaction",
+                    self.inner().execute_batch("ROLLBACK"),
+                )
+                .map(|_| ())
+        };
         if let Err(error) = &result {
             self.note_remote_stream_loss(error);
         }
@@ -1479,13 +1718,26 @@ impl Drop for Transaction {
             self.connection_tainted.store(true, Ordering::Release);
             return;
         }
+        if self.remote_write_needs_prompt_release() {
+            // Our deadline cancelled the in-flight call. The baton can still
+            // name the server transaction. Release it on a fresh short
+            // deadline, then drop the wrapper where no runtime is current so
+            // libSQL does not spawn a second unbounded rollback.
+            let released = self.release_remote_write_lock();
+            let inner = self.inner.take().expect("transaction already completed");
+            drop_transaction_without_runtime(inner);
+            if released.is_err() {
+                self.connection_tainted.store(true, Ordering::Release);
+            }
+            return;
+        }
         // Use a borrowed SQL rollback instead of libsql::Transaction::rollback,
         // whose consuming future drops the transaction inside Tokio. libsql's
         // Drop callback would then spawn a second, unbounded best-effort
         // rollback. Once this bounded request ends, discard the libsql wrapper
         // where no Tokio runtime is current so that callback cannot enqueue
         // work outside the pool/timeout boundary.
-        let result = self.runtime.block_on_database(
+        let result = self.runtime.block_on_database_cleanup(
             "rollback transaction",
             self.inner().execute_batch("ROLLBACK"),
         );
@@ -2038,5 +2290,25 @@ mod tests {
         assert!(!is_remote_interactive_timeout(&anyhow::anyhow!(
             "database is locked"
         )));
+        let client_deadline =
+            database_operation_timed_out("commit transaction", Duration::from_secs(5));
+        assert!(
+            client_deadline
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("transaction timed out"),
+            "the client deadline text overlaps the provider phrase: {client_deadline}"
+        );
+        assert!(is_database_operation_timeout(&client_deadline));
+        assert!(
+            !is_remote_interactive_timeout(&client_deadline),
+            "our deadline must not be treated as a dead stream"
+        );
+        let abandoned = database_caller_abandoned("commit transaction");
+        assert!(is_database_operation_timeout(&abandoned));
+        assert!(
+            !is_remote_interactive_timeout(&abandoned),
+            "a caller leaving must not be treated as a dead stream"
+        );
     }
 }

@@ -29,6 +29,8 @@ fn api_remote_deadline_stays_inside_the_browser_abort() {
     assert!(API_REMOTE_OPERATION_TIMEOUT < Duration::from_secs(10));
     assert!(API_REMOTE_OPERATION_TIMEOUT.saturating_mul(3) < Duration::from_secs(30));
     assert!(API_REMOTE_OPERATION_TIMEOUT < REMOTE_OPERATION_TIMEOUT);
+    assert!(crate::db_compat::REMOTE_LOCK_RELEASE_TIMEOUT < Duration::from_millis(500));
+    assert!(crate::db_compat::REMOTE_LOCK_RELEASE_TIMEOUT < API_REMOTE_OPERATION_TIMEOUT);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

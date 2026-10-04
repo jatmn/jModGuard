@@ -8,8 +8,8 @@ use serde_json::{Value as Json, json};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
 
-#[derive(Default)]
 struct HranaState {
     next_baton: usize,
     latest_baton: Option<String>,
@@ -22,6 +22,40 @@ struct HranaState {
     in_transaction: bool,
     begin_sql: Vec<String>,
     timeout_next_cursor: bool,
+    hang_next_commit: bool,
+    hang_next_statement: bool,
+    hang_rollback: bool,
+    write_locked: bool,
+    commit_hung: bool,
+    statement_hung: bool,
+    rollback_started: bool,
+    progress: Arc<Notify>,
+}
+
+impl HranaState {
+    fn new() -> Self {
+        Self {
+            next_baton: 0,
+            latest_baton: None,
+            expired: HashSet::new(),
+            expire_next_cursor: false,
+            expired_requests: 0,
+            fail_next_commit: false,
+            commit_timeouts: 0,
+            rollback_requests: 0,
+            in_transaction: false,
+            begin_sql: Vec::new(),
+            timeout_next_cursor: false,
+            hang_next_commit: false,
+            hang_next_statement: false,
+            hang_rollback: false,
+            write_locked: false,
+            commit_hung: false,
+            statement_hung: false,
+            rollback_started: false,
+            progress: Arc::new(Notify::new()),
+        }
+    }
 }
 
 struct HranaFixture {
@@ -34,7 +68,7 @@ impl HranaFixture {
     async fn start() -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let state = Arc::new(Mutex::new(HranaState::default()));
+        let state = Arc::new(Mutex::new(HranaState::new()));
         let service_state = Arc::clone(&state);
         let make_service = make_service_fn(move |_| {
             let state = Arc::clone(&service_state);
@@ -134,6 +168,33 @@ impl HranaFixture {
     fn timeout_next_cursor(&self) {
         self.state.lock().unwrap().timeout_next_cursor = true;
     }
+
+    fn hang_next_commit(&self) {
+        self.state.lock().unwrap().hang_next_commit = true;
+    }
+
+    fn hang_next_statement(&self) {
+        self.state.lock().unwrap().hang_next_statement = true;
+    }
+
+    fn hang_rollback(&self) {
+        self.state.lock().unwrap().hang_rollback = true;
+    }
+
+    fn write_locked(&self) -> bool {
+        self.state.lock().unwrap().write_locked
+    }
+
+    async fn wait_until(&self, flag: impl Fn(&HranaState) -> bool) {
+        loop {
+            let progress = Arc::clone(&self.state.lock().unwrap().progress);
+            let notified = progress.notified();
+            if flag(&self.state.lock().unwrap()) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Drop for HranaFixture {
@@ -151,10 +212,66 @@ fn body(status: StatusCode, value: impl Into<Body>) -> Response<Body> {
         .unwrap()
 }
 
+fn is_transaction_edge(sql: &str) -> bool {
+    sql.starts_with("BEGIN") || sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK")
+}
+
+/// Park this HTTP request forever after publishing the flag the test waits on.
+/// The mutex is released before the park so a later ROLLBACK can still arrive.
+fn park_request(path: &str, input: &Json, state: &Arc<Mutex<HranaState>>) -> bool {
+    let mut guard = state.lock().unwrap();
+    match path {
+        "/v3/pipeline" => {
+            let Some(requests) = input["requests"].as_array() else {
+                return false;
+            };
+            for request in requests {
+                let sql = statement_sql(request);
+                if sql.is_empty() {
+                    continue;
+                }
+                if sql.starts_with("COMMIT") && guard.hang_next_commit {
+                    guard.hang_next_commit = false;
+                    guard.commit_hung = true;
+                    guard.progress.notify_waiters();
+                    return true;
+                }
+                if sql.starts_with("ROLLBACK") && guard.hang_rollback {
+                    guard.rollback_requests += 1;
+                    guard.rollback_started = true;
+                    guard.progress.notify_waiters();
+                    return true;
+                }
+                if guard.hang_next_statement && !is_transaction_edge(&sql) {
+                    guard.hang_next_statement = false;
+                    guard.statement_hung = true;
+                    guard.progress.notify_waiters();
+                    return true;
+                }
+            }
+            false
+        }
+        "/v3/cursor" => {
+            let sql = statement_sql(input);
+            if sql.is_empty() || is_transaction_edge(&sql) || !guard.hang_next_statement {
+                return false;
+            }
+            guard.hang_next_statement = false;
+            guard.statement_hung = true;
+            guard.progress.notify_waiters();
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Response<Body> {
     let path = request.uri().path().to_owned();
     let bytes = hyper::body::to_bytes(request.into_body()).await.unwrap();
     let input: Json = serde_json::from_slice(&bytes).unwrap();
+    if park_request(&path, &input, &state) {
+        std::future::pending::<()>().await;
+    }
     let supplied_baton = input["baton"].as_str();
     let mut state = state.lock().unwrap();
     if supplied_baton.is_some_and(|baton| state.expired.contains(baton)) {
@@ -198,6 +315,8 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
                         "execute" => pipeline_batch_response(request, &mut state),
                         "close" => {
                             closed = true;
+                            state.write_locked = false;
+                            state.in_transaction = false;
                             json!({"type": "close"})
                         }
                         other => panic!("unexpected Hrana pipeline operation: {other}"),
@@ -258,10 +377,13 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
     if sql.starts_with("ROLLBACK") {
         state.rollback_requests += 1;
         state.in_transaction = false;
+        state.write_locked = false;
+        state.progress.notify_waiters();
     } else if sql.starts_with("COMMIT") && state.fail_next_commit {
         state.fail_next_commit = false;
         state.commit_timeouts += 1;
         state.in_transaction = false;
+        state.write_locked = false;
         return json!({
             "type": "batch",
             "result": {
@@ -273,10 +395,26 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
             }
         });
     } else if sql.starts_with("BEGIN") {
+        if sql.contains("IMMEDIATE") && state.write_locked {
+            return json!({
+                "type": "batch",
+                "result": {
+                    "step_results": [null],
+                    "step_errors": [{
+                        "message": "database is locked",
+                        "code": "SQLITE_BUSY"
+                    }]
+                }
+            });
+        }
+        if sql.contains("IMMEDIATE") {
+            state.write_locked = true;
+        }
         state.begin_sql.push(sql);
         state.in_transaction = true;
     } else if sql.starts_with("COMMIT") {
         state.in_transaction = false;
+        state.write_locked = false;
     }
     json!({
         "type": "batch",
@@ -426,4 +564,149 @@ async fn primary_snapshot_skips_rollback_when_the_cursor_stream_is_closed() {
     );
     assert_eq!(db.connections.idle.lock().unwrap().len(), 1);
     assert_eq!(db.permits.available_permits(), 2);
+}
+
+fn install_clock(db: &Db) -> Arc<crate::db_compat::ManualClock> {
+    let clock = crate::db_compat::ManualClock::new();
+    db.runtime.install_manual_clock(Some(Arc::clone(&clock)));
+    clock
+}
+
+fn spawn_write(
+    db: Db,
+    body: impl FnOnce(&mut Connection) -> Result<()> + Send + 'static,
+) -> std::sync::mpsc::Receiver<Result<()>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(db.with_conn_sync(body));
+    });
+    receiver
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_deadline_mid_write_releases_the_lock_for_the_next_writer() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    let clock = install_clock(&db);
+    fixture.hang_next_commit();
+    let first = spawn_write(db.clone(), |conn| {
+        let tx = conn.transaction_primary_read()?;
+        tx.commit()
+    });
+    fixture.wait_until(|state| state.commit_hung).await;
+    clock.advance(Duration::from_secs(3) + Duration::from_millis(1));
+    let error = first
+        .recv_timeout(Duration::from_secs(2))
+        .expect("timed-out commit did not return")
+        .expect_err("a timed-out commit must not report success");
+    assert!(
+        is_database_operation_timeout(&error),
+        "client deadline must stay visible: {error:#}"
+    );
+    assert!(
+        is_database_commit_indeterminate(&error),
+        "lost commit stays indeterminate: {error:#}"
+    );
+    assert!(
+        !is_remote_interactive_timeout(&error),
+        "our deadline is not a dead stream: {error:#}"
+    );
+    assert_eq!(fixture.rollback_requests(), 1);
+    assert!(
+        !fixture.write_locked(),
+        "ROLLBACK must drop the writer lock before the provider steals it"
+    );
+
+    let next = spawn_write(db, |conn| {
+        let tx = conn.transaction_primary_read()?;
+        tx.commit()
+    });
+    next.recv_timeout(Duration::from_secs(2))
+        .expect("next writer stuck behind the abandoned lock")
+        .expect("next writer must commit without waiting out a provider steal");
+    assert!(!fixture.write_locked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hung_rollback_cannot_outlive_the_short_release_deadline() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    let clock = install_clock(&db);
+    fixture.hang_next_statement();
+    fixture.hang_rollback();
+    let call = spawn_write(db, |conn| {
+        let tx = conn.transaction_primary_read()?;
+        tx.execute("SELECT 1", ())?;
+        tx.commit()
+    });
+    fixture.wait_until(|state| state.statement_hung).await;
+    clock.advance(Duration::from_secs(3) + Duration::from_millis(1));
+    fixture.wait_until(|state| state.rollback_started).await;
+    assert!(
+        call.try_recv().is_err(),
+        "the API call must still be inside the short release"
+    );
+    clock.advance(Duration::from_millis(250));
+    assert!(
+        call.try_recv().is_err(),
+        "release must not finish before its own deadline"
+    );
+    clock.advance(Duration::from_millis(100));
+    let error = call
+        .recv_timeout(Duration::from_secs(2))
+        .expect("hung ROLLBACK held the API call open")
+        .expect_err("the statement deadline must still fail the call");
+    assert!(
+        is_database_operation_timeout(&error),
+        "unexpected: {error:#}"
+    );
+    assert!(fixture.rollback_requests() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_write_releases_the_connection_for_the_next_writer() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+    // One permit stays held here, so the next write can proceed only after the
+    // abandoned call returns its connection.
+    let held = Arc::clone(&db.permits).acquire_owned().await.unwrap();
+    fixture.hang_next_commit();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let writer = db.clone();
+    let first = tokio::spawn(async move {
+        let call = writer.with_conn(|conn| {
+            let tx = conn.transaction_primary_read()?;
+            tx.commit()
+        });
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            _ = cancel_rx => {}
+            _ = &mut call => panic!("hung commit returned before the caller stopped waiting"),
+        }
+    });
+    fixture.wait_until(|state| state.commit_hung).await;
+    cancel_tx.send(()).unwrap();
+    first.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        fixture.wait_until(|state| state.rollback_requests >= 1 && !state.write_locked),
+    )
+    .await
+    .expect("abandoned write kept the writer lock");
+
+    let next = db.clone();
+    let next = tokio::spawn(async move {
+        next.with_conn(|conn| {
+            let tx = conn.transaction_primary_read()?;
+            tx.commit()
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), next)
+        .await
+        .expect("next writer did not get a connection")
+        .unwrap()
+        .expect("next writer must commit");
+    drop(held);
 }

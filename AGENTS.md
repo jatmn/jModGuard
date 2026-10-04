@@ -98,7 +98,7 @@ patches verify using a primary read without mutation receipts. Unban/log-channel
 use the queue. Moderation event/ban/statistics GET routes also require loaded page membership
 and captured primary reads; see `docs/MODERATION-READS.md`. Keep the API guard against
 unscoped moderation helpers. These reads create no receipts or version changes. Web, API, and status reads use a
-deferred primary snapshot and do not take the writer lock. Individual configuration GET reads also require page
+deferred primary snapshot and do not take the writer lock. A timed-out API write that may still hold that lock releases it with one short rollback. Do not send that rollback when the provider has already closed the stream. Dropping the database call, including when a caller stops waiting, releases that connection and any writer lock the same way. Individual configuration GET reads also require page
 membership and captured primary snapshots, preserving the config-version read floor. Keep
 guild/global layers together, badword inheritance and guild-only log-channel mappings; explicit
 global context remains owner-only. The WebUI/config-parts bundle verifies membership then
