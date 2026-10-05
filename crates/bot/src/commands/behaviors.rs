@@ -679,16 +679,12 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
-            let s = db::guild_stats(&env.app.db, env.guild_id.get() as i64).await?;
-            let updates = db::component_updates(&env.app.db).await.unwrap_or_default();
-            let response = crate::templates::stats_response_with_updates(
+            let response = stats_response(
+                &env.app.db,
+                env.guild_id.get() as i64,
                 env.app.start.elapsed().as_secs(),
-                s.events,
-                s.warns,
-                s.bans,
-                &updates,
-                chrono::Utc::now().timestamp(),
-            );
+            )
+            .await?;
             Ok(BehaviorOutcome {
                 response: Some(response),
                 vars,
@@ -702,6 +698,22 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+async fn stats_response(db: &db::Db, guild_id: i64, uptime_seconds: u64) -> Result<String> {
+    let s = db::guild_stats(db, guild_id).await?;
+    let updates = db::component_updates(db)
+        .await
+        .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
+        .ok();
+    Ok(crate::templates::stats_response_with_update_availability(
+        uptime_seconds,
+        s.events,
+        s.warns,
+        s.bans,
+        updates.as_deref(),
+        chrono::Utc::now().timestamp(),
+    ))
+}
 
 /// Standard variables available to every command's response template.
 pub fn behaviors_base_vars(env: &CmdEnv<'_>) -> std::collections::BTreeMap<String, String> {
@@ -1184,6 +1196,46 @@ pub fn slash_spec(behavior: &Behavior) -> Vec<OptionSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stats_release_read_failure_is_unavailable() {
+        let path =
+            std::env::temp_dir().join(format!("stats_release_{:032x}.db", rand::random::<u128>()));
+        let db = db::Db::open(&path, 2).unwrap();
+        // An empty successful read still means no known release observations.
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded("DELETE FROM component_updates", 1024 * 1024)?;
+            conn.execute_batch_bounded("INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at) VALUES (10, 42, 99, 'test', '2026-10-05T00:00:00Z')", 1024 * 1024)?;
+            Ok(())
+        }).await.unwrap();
+        let healthy = stats_response(&db, 10, 20).await.unwrap();
+        assert!(healthy.contains("**⚠️ Warns:** `1`"), "{healthy}");
+        for component in ["bot", "api", "webui"] {
+            assert!(
+                healthy.contains(&format!("**{component}:** ❓")),
+                "{healthy}"
+            );
+        }
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded("DROP TABLE component_updates", 1024 * 1024)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let unavailable = stats_response(&db, 10, 20).await.unwrap();
+        assert!(
+            unavailable.contains("**Release status**\nunavailable"),
+            "{unavailable}"
+        );
+        assert!(!unavailable.contains('❓'), "{unavailable}");
+        assert!(unavailable.contains("**⚠️ Warns:** `1`"), "{unavailable}");
+        assert!(
+            unavailable.contains("**⏱️ Uptime:** `20s`"),
+            "{unavailable}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn rule_command_keeps_the_rule_id_for_prefix_and_slash_order() {

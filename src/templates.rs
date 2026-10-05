@@ -74,6 +74,12 @@ pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) 
 
 /// Append cached release observations without making a network request from
 /// a Discord command. Unknown includes stale checks and legacy manual images.
+///
+/// ```
+/// let response: String = jmodguard::templates::stats_response_with_updates(
+///     20, 1, 2, 3, &[], 1_000,
+/// );
+/// ```
 pub fn stats_response_with_updates(
     uptime_seconds: u64,
     records: i64,
@@ -82,6 +88,36 @@ pub fn stats_response_with_updates(
     updates: &[crate::db::ComponentUpdate],
     now: i64,
 ) -> String {
+    stats_response_with_update_availability(
+        uptime_seconds,
+        records,
+        warns,
+        bans,
+        Some(updates),
+        now,
+    )
+}
+
+/// Render release lookup availability alongside moderation stats. None means
+/// the lookup failed; successful reads retain [`stats_response_with_updates`]
+/// semantics, including unknown markers for missing or stale observations.
+pub fn stats_response_with_update_availability(
+    uptime_seconds: u64,
+    records: i64,
+    warns: i64,
+    bans: i64,
+    updates: Option<&[crate::db::ComponentUpdate]>,
+    now: i64,
+) -> String {
+    let Some(updates) = updates else {
+        return render(
+            "{moderation}\n\n**Release status**\nunavailable",
+            &BTreeMap::from([(
+                "moderation".into(),
+                stats_response(uptime_seconds, records, warns, bans),
+            )]),
+        );
+    };
     let mut lines = Vec::new();
     for component in ["bot", "api", "webui"] {
         let Some(item) = updates.iter().find(|item| item.component == component) else {
