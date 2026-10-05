@@ -1239,3 +1239,152 @@ async fn unchanged_snapshot_maintenance_skips_writer_until_heartbeat() {
     assert_eq!(lost, 2);
     assert_eq!(observed, Some(at(120_002)));
 }
+
+#[tokio::test]
+async fn capture_single_and_batch_have_bounded_database_calls() {
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _probe_guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let (_fixture, _registration, store, scope) = ready().await;
+    for count in [1, SNAPSHOT_CAPTURE_BATCH] {
+        let queries = probe.queries();
+        let transactions = probe.transactions();
+        let immediate = probe.immediate();
+        let observations = (0..count)
+            .map(|n| observation((count * 100 + n) as i64, Some("captured"), None, 1))
+            .collect();
+        let outcomes = store
+            .observe_snapshots(scope.clone(), observations)
+            .await
+            .unwrap();
+        assert_eq!(outcomes, vec![SnapshotOutcome::Stored; count]);
+        assert_eq!(
+            probe.immediate() - immediate,
+            0,
+            "capture reads must not reserve the writer lock"
+        );
+        assert_eq!(
+            probe.transactions() - transactions,
+            1,
+            "one data transaction per drain"
+        );
+        assert!(
+            probe.queries() - queries <= 19,
+            "{count} captures used {} calls",
+            probe.queries() - queries
+        );
+        let rows = store
+            .take_snapshots(
+                scope.clone(),
+                20,
+                (0..count).map(|n| (count * 100 + n) as i64).collect(),
+                at(100),
+            )
+            .await
+            .unwrap();
+        assert!(rows.iter().all(|r| {
+            r.as_ref()
+                .is_some_and(|r| r.fields.content.as_deref() == Some("captured"))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn capture_batch_preserves_duplicates_partial_inputs_and_scope() {
+    let (_fixture, _registration, store, scope) = ready().await;
+    let first = observation(950, Some("first quoted'"), None, 1);
+    let mut missing = observation(951, Some("unknown"), None, 1);
+    missing.fields.author_id = None;
+    let rows = vec![
+        first.clone(),
+        observation(950, Some("duplicate"), None, 1),
+        missing,
+    ];
+    assert_eq!(
+        store.observe_snapshots(scope.clone(), rows).await.unwrap(),
+        vec![
+            SnapshotOutcome::Stored,
+            SnapshotOutcome::Duplicate,
+            SnapshotOutcome::Missing
+        ]
+    );
+    let retained = store
+        .take_snapshot(scope.clone(), first.channel_id, first.message_id, at(100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.fields, first.fields);
+    assert_eq!(retained.expires_at_ms, first.created_at_ms + 86_400_000);
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(
+        store
+            .observe_snapshots(scope, vec![observation(952, Some("closed"), None, 1)])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn capture_batch_pressure_split_makes_no_partial_writes() {
+    let (_fixture, _registration, store, scope) = ready().await;
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "UPDATE guild_snapshot_health SET estimated_snapshot_bytes=?1 WHERE singleton=1",
+                params![crate::capacity::SNAPSHOT_BUDGET_BYTES as i64 - 5000],
+                1_000_000,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    let error = store
+        .observe_snapshots(
+            scope.clone(),
+            vec![
+                observation(970, Some("fits"), None, 1),
+                observation(971, Some("does not fit"), None, 1),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SnapshotError>(),
+        Some(SnapshotError::BatchCapacity)
+    ));
+    assert!(
+        store
+            .take_snapshot(scope.clone(), 20, 970, at(100))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let outcomes = vec![
+        store
+            .observe_snapshot(scope.clone(), observation(970, Some("fits"), None, 1))
+            .await
+            .unwrap(),
+        store
+            .observe_snapshot(
+                scope.clone(),
+                observation(971, Some("does not fit"), None, 1),
+            )
+            .await
+            .unwrap(),
+    ];
+    assert_eq!(
+        outcomes,
+        vec![SnapshotOutcome::Stored, SnapshotOutcome::CapacityRefused]
+    );
+    let rows = store
+        .take_snapshots(scope, 20, vec![970, 971], at(100))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].as_ref().unwrap().fields.content.as_deref(),
+        Some("fits")
+    );
+    assert!(rows[1].is_none());
+}

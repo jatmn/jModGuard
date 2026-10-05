@@ -17,8 +17,9 @@ use serenity::model::id::{ChannelId, GuildId, MessageId};
 use tokio::sync::mpsc;
 
 use crate::db::guild_data::{
-    GuildDataScope, GuildDataStore, SnapshotAttachment, SnapshotFields, SnapshotHealthState,
-    SnapshotHealthUpdate, SnapshotObservation, SnapshotOutcome, SnapshotTransition,
+    GuildDataScope, GuildDataStore, SNAPSHOT_CAPTURE_BATCH, SnapshotAttachment, SnapshotError,
+    SnapshotFields, SnapshotHealthState, SnapshotHealthUpdate, SnapshotObservation,
+    SnapshotOutcome, SnapshotTransition,
 };
 use crate::logging::{self, MessageReport};
 use crate::state::BotState;
@@ -960,7 +961,11 @@ fn estimated_bytes(observation: &SnapshotObservation) -> usize {
 async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
     let mut health: HashMap<String, (Instant, SnapshotHealthState, Option<&'static str>)> =
         HashMap::new();
-    while let Some(mut work) = receiver.recv().await {
+    let mut pending = None;
+    while let Some(mut work) = match pending.take() {
+        Some(work) => Some(work),
+        None => receiver.recv().await,
+    } {
         app.snapshots.bytes.fetch_sub(work.bytes, Ordering::AcqRel);
         let store = match app.tenant.store(&work.scope).await {
             Ok(store) => store,
@@ -1048,67 +1053,121 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     continue;
                 }
                 observation.coverage_epoch = work.epoch;
-                match store
-                    .observe_snapshot(work.scope.clone(), observation.clone())
-                    .await
-                {
-                    Ok(SnapshotOutcome::Stored) => {
-                        update_health(
-                            &app,
-                            &store,
-                            &work.scope,
-                            &mut health,
-                            SnapshotHealthState::Active,
-                            None,
-                        )
-                        .await;
+                let mut observations = vec![observation.clone()];
+                for _ in 1..SNAPSHOT_CAPTURE_BATCH {
+                    let Ok(mut next) = receiver.try_recv() else {
+                        break;
+                    };
+                    // Stop at any event/scope boundary. In particular, never
+                    // move a create across a queued edit or deletion.
+                    let same_scope = next.scope.placement() == work.scope.placement()
+                        && next.scope.enrollment() == work.scope.enrollment();
+                    if !same_scope || !matches!(next.body, Body::Create(_)) {
+                        pending = Some(next);
+                        break;
                     }
-                    Ok(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale) => {}
-                    Ok(SnapshotOutcome::CapacityRefused) => {
-                        app.snapshots.gap_scope(&work.scope);
-                        update_health(
-                            &app,
-                            &store,
-                            &work.scope,
-                            &mut health,
-                            SnapshotHealthState::Paused,
-                            Some("capacity"),
-                        )
-                        .await;
-                        if let Err(error) = store
-                            .evict_snapshots(100, chrono::Utc::now().timestamp_millis())
-                            .await
-                        {
-                            tracing::warn!("snapshot pressure eviction unavailable: {error:#}");
-                            app.snapshots
-                                .cleanup_paused
-                                .lock()
-                                .insert(work.scope.placement().store_id().as_str().to_owned());
+                    app.snapshots.bytes.fetch_sub(next.bytes, Ordering::AcqRel);
+                    let Body::Create(next_observation) = &mut next.body else {
+                        unreachable!()
+                    };
+                    let key = (
+                        guild,
+                        next_observation.channel_id as u64,
+                        next_observation.message_id as u64,
+                    );
+                    if app.snapshots.deleted(key) {
+                        app.snapshots.gap_scope(&next.scope);
+                        continue;
+                    }
+                    next_observation.coverage_epoch = next.epoch;
+                    observations.push(next_observation.clone());
+                }
+                let count = observations.len();
+                let outcomes = store
+                    .observe_snapshots(work.scope.clone(), observations.clone())
+                    .await;
+                let split = matches!(
+                    outcomes
+                        .as_ref()
+                        .err()
+                        .and_then(|e| e.downcast_ref::<SnapshotError>()),
+                    Some(SnapshotError::BatchCapacity)
+                );
+                for index in 0..count {
+                    // A split batch made no writes. Preserve the complete
+                    // per-event sequence, including eviction and cleanup pause.
+                    let single;
+                    let outcome = if split {
+                        if app.snapshots.capture_paused(&work.scope) {
+                            app.snapshots.gap_scope(&work.scope);
+                            continue;
+                        }
+                        single = store
+                            .observe_snapshot(work.scope.clone(), observations[index].clone())
+                            .await;
+                        single.as_ref().copied()
+                    } else {
+                        outcomes.as_ref().map(|outcomes| outcomes[index])
+                    };
+                    match outcome {
+                        Ok(SnapshotOutcome::Stored) => {
+                            update_health(
+                                &app,
+                                &store,
+                                &work.scope,
+                                &mut health,
+                                SnapshotHealthState::Active,
+                                None,
+                            )
+                            .await;
+                        }
+                        Ok(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale) => {}
+                        Ok(SnapshotOutcome::CapacityRefused) => {
+                            app.snapshots.gap_scope(&work.scope);
                             update_health(
                                 &app,
                                 &store,
                                 &work.scope,
                                 &mut health,
                                 SnapshotHealthState::Paused,
-                                Some("cleanup_failed"),
+                                Some("capacity"),
+                            )
+                            .await;
+                            if let Err(error) = store
+                                .evict_snapshots(100, chrono::Utc::now().timestamp_millis())
+                                .await
+                            {
+                                tracing::warn!("snapshot pressure eviction unavailable: {error:#}");
+                                app.snapshots
+                                    .cleanup_paused
+                                    .lock()
+                                    .insert(work.scope.placement().store_id().as_str().to_owned());
+                                update_health(
+                                    &app,
+                                    &store,
+                                    &work.scope,
+                                    &mut health,
+                                    SnapshotHealthState::Paused,
+                                    Some("cleanup_failed"),
+                                )
+                                .await;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        Ok(_) => app.snapshots.gap(),
+                        Err(error) => {
+                            tracing::warn!("message snapshot create unavailable: {error:#}");
+                            app.snapshots.gap_scope(&work.scope);
+                            update_health(
+                                &app,
+                                &store,
+                                &work.scope,
+                                &mut health,
+                                SnapshotHealthState::Unavailable,
+                                Some("database"),
                             )
                             .await;
                         }
-                        tokio::task::yield_now().await;
-                    }
-                    Ok(_) => app.snapshots.gap(),
-                    Err(error) => {
-                        tracing::warn!("message snapshot create unavailable: {error:#}");
-                        app.snapshots.gap_scope(&work.scope);
-                        update_health(
-                            &app,
-                            &store,
-                            &work.scope,
-                            &mut health,
-                            SnapshotHealthState::Unavailable,
-                            Some("database"),
-                        )
-                        .await;
                     }
                 }
             }
