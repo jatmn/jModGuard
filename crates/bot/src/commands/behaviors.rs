@@ -705,7 +705,7 @@ async fn stats_response(db: &db::Db, guild_id: i64, uptime_seconds: u64) -> Resu
         .await
         .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
         .ok();
-    Ok(crate::templates::stats_response_with_updates(
+    Ok(crate::templates::stats_response_with_update_availability(
         uptime_seconds,
         s.events,
         s.warns,
