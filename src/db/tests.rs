@@ -3048,108 +3048,30 @@ async fn placed_before_erasure(db: &Db, guild: i64) {
 }
 
 #[test]
-fn compact_duration_commands_upgrade_saved_defaults_once() {
+fn compact_duration_command_defaults_remain_legacy_renderable() {
     let tmp = tmp_db_path("compact_duration_commands");
-    let db = Db::open(&tmp, 2).unwrap();
-    let legacy_commands: Vec<_> = crate::defaults::default_commands()
-        .into_iter()
-        .filter_map(|mut command| {
-            command.response = match command.name.as_str() {
-                "timeout" => "Timed out {target} for {minutes} minutes | {reason}",
-                "slowmode" => "Slowmode set to {seconds}s",
-                _ => return None,
-            }
-            .into();
-            Some(command)
-        })
-        .collect();
-    let saved = legacy_commands.clone();
-    tokio_test_block_on(db.with_conn(move |conn| {
-        conn.execute_reclaim(
-            "DELETE FROM meta WHERE key = 'compact_duration_commands_v1'",
-            (),
-        )?;
-        for command in saved {
-            for guild in [0, 123, 456, 789] {
-                let mut command = command.clone();
-                if guild == 456 {
-                    command.response = "custom {minutes} / {seconds}".into();
-                } else if guild == 789 {
-                    command.permission = "owner".into();
-                }
-                conn.execute_bounded(
-                    "INSERT OR REPLACE INTO commands (guild_id, name, data) VALUES (?1, ?2, ?3)",
-                    params![
-                        guild,
-                        command.name.clone(),
-                        serde_json::to_string(&command)?
-                    ],
-                    64 * 1024 * 1024,
-                )?;
-            }
-        }
-        Ok(())
-    }))
-    .unwrap();
-    let version = tokio_test_block_on(get_config_version(&db)).unwrap();
-    drop(db);
-    let db = Db::open(&tmp, 2).unwrap();
-    assert_eq!(
-        tokio_test_block_on(get_config_version(&db)).unwrap(),
-        version + 1
-    );
+    // Old bots supply only these raw duration variables. Persisted defaults
+    // must remain renderable after fresh bootstrap and after reopening.
     let vars = std::collections::BTreeMap::from([
         ("target".into(), "Member".into()),
         ("reason".into(), "test".into()),
-        ("duration".into(), crate::templates::format_duration(90)),
+        ("minutes".into(), "90".into()),
+        ("seconds".into(), "90".into()),
     ]);
-    for guild in [0, 123, 456, 789] {
-        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
-        for legacy in &legacy_commands {
-            let command = &parts.commands[&legacy.name];
-            if guild == 456 {
-                assert_eq!(command.response, "custom {minutes} / {seconds}");
-            } else if guild == 789 {
-                assert_eq!(command.response, legacy.response);
-                assert_eq!(command.permission, "owner");
-            } else {
-                let expected = if legacy.name == "timeout" {
-                    "Timed out Member for 1m 30s | test"
-                } else {
-                    "Slowmode set to 1m 30s"
-                };
-                assert_eq!(crate::templates::render(&command.response, &vars), expected);
-            }
+    for _ in 0..2 {
+        let db = Db::open(&tmp, 2).unwrap();
+        let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
+        for (name, expected) in [
+            ("timeout", "Timed out Member for 90 minutes | test"),
+            ("slowmode", "Slowmode set to 90s"),
+        ] {
+            assert_eq!(
+                crate::templates::render(&parts.commands[name].response, &vars),
+                expected
+            );
         }
+        drop(db);
     }
-    // A deliberate return to the old wording after upgrading is preserved.
-    tokio_test_block_on(db.with_conn(move |conn| {
-        for command in legacy_commands {
-            conn.execute_bounded(
-                "UPDATE commands SET data = ?1 WHERE guild_id = 0 AND name = ?2",
-                params![serde_json::to_string(&command)?, command.name],
-                64 * 1024 * 1024,
-            )?;
-        }
-        Ok(())
-    }))
-    .unwrap();
-    drop(db);
-    let db = Db::open(&tmp, 2).unwrap();
-    assert_eq!(
-        tokio_test_block_on(get_config_version(&db)).unwrap(),
-        version + 1
-    );
-    let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
-    assert_eq!(
-        parts.commands["timeout"].response,
-        "Timed out {target} for {minutes} minutes | {reason}"
-    );
-    assert_eq!(
-        parts.commands["slowmode"].response,
-        "Slowmode set to {seconds}s"
-    );
-    drop(db);
     cleanup_db(&tmp);
 }
 

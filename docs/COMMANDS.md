@@ -86,11 +86,17 @@ Example: a `!welcome` plan: `reply "Hi {user}, welcome to {guild}!"` →
 Each command's `response` field is a template rendered after success, e.g.
 `Banned {target} | {reason}`. Variables: `{user} {actor} {actor_id} {guild}
 {channel} {target} {target_id} {reason} {minutes} {count} {name} {prefix}
-{seconds} {response}`. Leave it empty and the behavior's built-in reply (if
+{seconds} {duration} {response}`. Leave it empty and the behavior's built-in reply (if
 any) is used. When `!say` posts into the invoking channel the reply is
 suppressed as redundant — the posted text is already visible there — so a
 prefix invocation sends nothing and the deferred slash answer is withdrawn.
 A post into another channel still confirms in the invoking channel.
+
+For timeout and slowmode, `{duration}` is the compact interval (for example
+`1h 30m` or `1m 30s`). `{minutes}` and `{seconds}` retain their raw numeric
+values for custom responses. The bot renders the exact shipped timeout and
+slowmode response wording compactly at reply time; saved definitions remain
+compatible with older bots, and other custom wording is preserved.
 
 ## Alias notes
 
@@ -98,8 +104,9 @@ Prefix aliases match exactly. Slash command names must be
 `[a-z0-9_-]` — the slash sync sanitizes names automatically.
 
 Stats uses bold labels and inline-code values. Uptime, moderation records, warns,
-and bans have a leading emote. Uptime and release ages use compact days, hours,
-minutes, and seconds (`13m 38s`; intermediate zeros stay, as in `1d 0h 0m 38s`),
+and bans have a leading emote. Uptime and release ages use compact months, weeks,
+days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
+`1d 0h 0m 38s`), with fixed 30-day months and 7-day weeks,
 rounded down to whole seconds; a newly started process shows `0s`. Release
 availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source matches
 but the image digest is unverified, ❓ unknown. A component with no cached

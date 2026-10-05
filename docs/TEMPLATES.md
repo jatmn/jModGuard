@@ -111,9 +111,10 @@ units are omitted; intermediate zeros remain (`1d 0h 0m 38s`). Zero is `0s`.
 Missing leave context says `Unavailable`.
 The timeout and slowmode command replies also expose `{duration}`; raw
 `{minutes}` and `{seconds}` remain available for custom command responses.
-On first startup after this upgrade, exact shipped timeout and slowmode command
-definitions are updated in global and guild scopes. Customized commands are
-preserved; use `{duration}` in their response to opt into compact formatting.
+The bot renders the exact shipped timeout and slowmode response wording in
+compact form without rewriting saved command definitions, so older processes
+can still render those defaults during rollout or rollback. Other custom response
+wording is preserved; use `{duration}` to opt into compact formatting.
 The leave template retains the supplied display name, user ID, time in server,
 join date (when known), and departure time; it does not depend on a resolved
 mention after departure.

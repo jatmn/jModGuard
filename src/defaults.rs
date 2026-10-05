@@ -164,7 +164,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         Behavior::Timeout {
             default_minutes: 60,
         },
-        "Timed out {target} for {duration} | {reason}",
+        "Timed out {target} for {minutes} minutes | {reason}",
         "mod_action",
         vec![],
     ));
@@ -232,7 +232,7 @@ pub fn default_commands() -> Vec<CommandDef> {
         "!slowmode <seconds>",
         "mod",
         Behavior::Slowmode { default_seconds: 5 },
-        "Slowmode set to {duration}",
+        "Slowmode set to {seconds}s",
         "mod_action",
         vec![],
     ));
