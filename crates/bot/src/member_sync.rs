@@ -922,6 +922,24 @@ async fn run_loop(
             defer_until = Some(tokio::time::Instant::now() + idle_recheck);
             continue;
         }
+        let cached_guilds = guilds
+            .iter()
+            .map(|guild| guild.get() as i64)
+            .filter(|guild| {
+                matches!(
+                    scope_cache.entries.get(guild),
+                    Some(CachedScope::Ready { .. })
+                )
+            })
+            .collect();
+        let fenced = match db::guild_stores::write_fenced_guilds(&app.db, cached_guilds).await {
+            Ok(fenced) => fenced,
+            Err(error) => {
+                tracing::warn!("member sync fence snapshot unavailable: {error:#}");
+                defer_until = Some(tokio::time::Instant::now() + idle_recheck);
+                continue;
+            }
+        };
         let ready_generation = app.gateway_ready_generation.load(Ordering::Relaxed);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut ready = Vec::new();
@@ -939,21 +957,25 @@ async fn run_loop(
                 .filter(|joined| *joined > 0);
             let (store, scope) = match scope_cache.hit(gid, joined_at) {
                 Some(Some(cached)) => {
-                    // A move can fence a guild after scope was cached without
-                    // changing configuration. Avoid its status/initialization
-                    // reads; mutation paths still enforce the fence atomically.
-                    match db::guild_stores::guild_is_write_fenced(&app.db, gid).await {
-                        Ok(false) => cached,
-                        Ok(true) | Err(_) => continue,
+                    // Skip fences visible to this scan. Core and guild stores
+                    // are separate databases; this is not a cross-store lease.
+                    if fenced.contains(&gid) {
+                        continue;
                     }
+                    cached
                 }
                 Some(None) => continue,
                 None => {
                     probe.scope_lookup();
-                    let Some(enrollment) = db::guild_enrollment(&app.db, gid).await.ok().flatten()
-                    else {
-                        scope_cache.entries.insert(gid, CachedScope::Absent);
-                        continue;
+                    let enrollment = match db::guild_enrollment(&app.db, gid).await {
+                        Ok(Some(enrollment)) => enrollment,
+                        Ok(None) => {
+                            scope_cache.entries.insert(gid, CachedScope::Absent);
+                            continue;
+                        }
+                        // A failed read is not absence. Retry on the next scan
+                        // even when repair confirms an unchanged membership.
+                        Err(_) => continue,
                     };
                     let Ok((store, scope)) = app.tenant.live(enrollment.clone()).await else {
                         continue;
@@ -2517,6 +2539,49 @@ mod tests {
         assert_eq!(report.confirmed, 1);
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
         assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 2);
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_enrollment_read_is_retried_without_scope_invalidation() {
+        let (directory, app, store, _) = enrolled_directory().await;
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) == 1).await;
+        settle_parked(&probe, 1, 0).await;
+        let epoch = app.member_scope_epoch.load(Ordering::SeqCst);
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "ALTER TABLE unavailable_enrollments RENAME TO guild_enrollments",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        app.wake_member_sync();
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 2);
+        assert_eq!(app.member_scope_epoch.load(Ordering::SeqCst), epoch);
         worker.abort();
         let _ = worker.await;
         drop((store, app));

@@ -334,3 +334,74 @@ fn discovery_waits_for_a_real_bot_identity_in_the_gateway_cache() {
     assert_eq!(cache.current_user().id.get(), 1);
     assert!(DiscordMembership::from_cache(&http, &cache).is_none());
 }
+
+#[tokio::test]
+async fn bot_cache_invalidation_tracks_committed_membership_changes() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new();
+    let mut cfg = crate::config::BotProcessConfig::default();
+    cfg.db.path = f.path.clone();
+    let app = crate::state::BotState::new(cfg, f.db.clone()).unwrap();
+    let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+    app.tenant.activate(enrollment).await.unwrap();
+    let epoch = app.member_scope_epoch.load(Ordering::SeqCst);
+    let mut source = Source::new(vec![10]);
+    let mut repair = EnrollmentRepair::new(config(), Instant::now()).unwrap();
+    assert_eq!(
+        repair
+            .step_for_bot(&app, &source)
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed,
+        1
+    );
+    assert_eq!(
+        app.member_scope_epoch.load(Ordering::SeqCst),
+        epoch,
+        "unchanged confirmation must preserve cached scopes"
+    );
+
+    source.fail_page = true;
+    repair.next = Instant::now();
+    assert!(repair.step_for_bot(&app, &source).await.is_err());
+    assert_eq!(app.member_scope_epoch.load(Ordering::SeqCst), epoch);
+    source.fail_page = false;
+    source.joins.clear();
+    repair.next = Instant::now();
+    assert_eq!(
+        repair
+            .step_for_bot(&app, &source)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed,
+        1
+    );
+    assert_eq!(app.member_scope_epoch.load(Ordering::SeqCst), epoch);
+
+    app.db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TRIGGER fail_second_join BEFORE INSERT ON guild_enrollments
+         WHEN NEW.guild_id=30 BEGIN SELECT RAISE(ABORT,'second join failed'); END",
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    repair.next = Instant::now();
+    assert!(
+        repair
+            .step_for_bot(&app, &Source::new(vec![20, 30]))
+            .await
+            .is_err()
+    );
+    assert!(db::guild_enrollment(&app.db, 20).await.unwrap().is_some());
+    assert!(db::guild_enrollment(&app.db, 30).await.unwrap().is_none());
+    assert_eq!(
+        app.member_scope_epoch.load(Ordering::SeqCst),
+        epoch + 1,
+        "a committed prefix must invalidate even when a later join fails"
+    );
+}

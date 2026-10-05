@@ -481,3 +481,44 @@ async fn guild_configuration_writers_fail_inside_the_move_fence_transaction() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn cached_guild_fences_use_one_read_without_reserving_the_writer() {
+    let probe = Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let f = Fixture::new();
+    let destination = StoreId::parse(&format!("{:032x}", 9u128)).unwrap();
+    register_store(&f.db, destination, StorePolicy::Shared)
+        .await
+        .unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+             VALUES(10,?1,'freeze',?1,?1,unixepoch()),(30,?1,'freeze',?1,?1,unixepoch())",
+            params![format!("{:032x}", 9u128)], 65_536)?;
+        Ok(())
+    }).await.unwrap();
+    let before_queries = probe.queries();
+    let before_writers = probe.immediate();
+    let fenced = write_fenced_guilds(&f.db, vec![10, 20]).await.unwrap();
+    assert_eq!(fenced, [10].into_iter().collect());
+    let single_batch_queries = probe.queries() - before_queries;
+    assert!(single_batch_queries > 0);
+    let fenced = write_fenced_guilds(&f.db, (1..=500).collect())
+        .await
+        .unwrap();
+    assert_eq!(fenced, [10, 30].into_iter().collect());
+    assert_eq!(
+        probe.queries() - before_queries,
+        2 * single_batch_queries,
+        "core read count must not grow with the cached guild set"
+    );
+    assert_eq!(probe.immediate(), before_writers);
+    let before = probe.queries();
+    assert!(write_fenced_guilds(&f.db, vec![]).await.unwrap().is_empty());
+    assert_eq!(probe.queries(), before);
+    f.db.with_conn(|conn| conn.execute_batch_bounded("DROP TABLE guild_write_fences", 65_536))
+        .await
+        .unwrap();
+    assert!(write_fenced_guilds(&f.db, vec![10]).await.is_err());
+}

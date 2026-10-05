@@ -101,12 +101,11 @@ impl EnrollmentRepair {
         app: &crate::state::BotState,
         source: &impl MembershipSource,
     ) -> Result<Option<RepairReport>> {
-        let result = self.step(&app.db, &app.tenant, source).await;
-        if match &result {
-            Ok(Some(report)) => report.confirmed > 0 || report.failed > 0,
-            Err(_) => true,
-            _ => false,
-        } {
+        let mut changed = false;
+        let result = self
+            .step_with_changes(&app.db, &app.tenant, source, &mut changed)
+            .await;
+        if changed {
             app.invalidate_member_sync_scope();
         }
         result
@@ -118,10 +117,20 @@ impl EnrollmentRepair {
         tenant: &crate::tenant::TenantRuntime,
         source: &impl MembershipSource,
     ) -> Result<Option<RepairReport>> {
+        self.step_with_changes(db, tenant, source, &mut false).await
+    }
+
+    async fn step_with_changes(
+        &mut self,
+        db: &Db,
+        tenant: &crate::tenant::TenantRuntime,
+        source: &impl MembershipSource,
+        membership_changed: &mut bool,
+    ) -> Result<Option<RepairReport>> {
         if Instant::now() < self.next {
             return Ok(None);
         }
-        match self.page(db, tenant, source).await {
+        match self.page(db, tenant, source, membership_changed).await {
             Ok(report) => Ok(Some(report)),
             Err(error) => {
                 self.next = Instant::now() + Duration::from_secs(u64::from(self.config.retry_secs));
@@ -134,6 +143,7 @@ impl EnrollmentRepair {
         db: &Db,
         tenant: &crate::tenant::TenantRuntime,
         source: &impl MembershipSource,
+        membership_changed: &mut bool,
     ) -> Result<RepairReport> {
         let timeout = Duration::from_secs(u64::from(self.config.request_timeout_secs));
         let mut guilds = tokio::time::timeout(
@@ -170,9 +180,15 @@ impl EnrollmentRepair {
             };
             // This same monotonic transition is used by gateway observations.
             // A late REST result cannot resurrect a retired join or replace a newer one.
-            match db::enroll_guild(db, *guild as i64, joined).await {
-                Ok(Some(enrollment)) => {
-                    if let Err(error) = tenant.activate(enrollment).await {
+            match db::enroll_guild_with_change(db, *guild as i64, joined).await {
+                Ok((Some(enrollment), changed)) => {
+                    let activation = tenant.activate(enrollment).await;
+                    // Record committed changes even if activation or a later
+                    // member fails. Healthy confirmations do not clear the cache.
+                    if changed {
+                        *membership_changed = true;
+                    }
+                    if let Err(error) = activation {
                         tracing::warn!(
                             guild_id = *guild,
                             "guild store activation deferred: {error:#}"
@@ -182,8 +198,15 @@ impl EnrollmentRepair {
                         report.confirmed += 1;
                     }
                 }
-                Ok(None) => report.refused += 1,
-                Err(error) => return Err(error.context("membership repair database unavailable")),
+                Ok((None, _)) => report.refused += 1,
+                Err(error) => {
+                    // A lost COMMIT whose receipt could not be reconciled may
+                    // have changed membership. Ordinary failures did not.
+                    if db::is_database_commit_indeterminate(&error) {
+                        *membership_changed = true;
+                    }
+                    return Err(error.context("membership repair database unavailable"));
+                }
             }
         }
         self.after = if complete {
