@@ -421,3 +421,29 @@ mod member_directory;
 
 #[cfg(unix)]
 mod bunny_transfer;
+
+#[tokio::test]
+async fn identity_verification_uses_one_catalog_read_and_rechecks_schema() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let conn = crate::db_compat::Connection::open(&f.store_path).unwrap();
+    let before = probe.queries();
+    verify_identity(&conn, &reg).unwrap();
+    assert!(
+        probe.queries() - before <= 4,
+        "identity must use one catalog read"
+    );
+    assert_eq!(
+        probe.immediate(),
+        0,
+        "identity reads must not reserve the writer"
+    );
+    conn.execute_batch_bounded("DROP TRIGGER store_identity_no_update", 32_000_000)
+        .unwrap();
+    assert!(verify_identity(&conn, &reg).is_err());
+    drop(store);
+    assert!(GuildDataStore::open(f.options(), reg).is_err());
+}

@@ -94,6 +94,24 @@ impl EnrollmentRepair {
             next: now,
         })
     }
+    /// Repair can enroll a guild without a Gateway event. Wake the importer
+    /// and discard cached absence, including after a partially completed page.
+    pub async fn step_for_bot(
+        &mut self,
+        app: &crate::state::BotState,
+        source: &impl MembershipSource,
+    ) -> Result<Option<RepairReport>> {
+        let result = self.step(&app.db, &app.tenant, source).await;
+        if match &result {
+            Ok(Some(report)) => report.confirmed > 0 || report.failed > 0,
+            Err(_) => true,
+            _ => false,
+        } {
+            app.invalidate_member_sync_scope();
+        }
+        result
+    }
+
     pub async fn step(
         &mut self,
         db: &Db,

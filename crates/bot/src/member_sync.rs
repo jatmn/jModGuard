@@ -938,7 +938,15 @@ async fn run_loop(
                 .and_then(|guild| guild.joined_at.timestamp_nanos_opt())
                 .filter(|joined| *joined > 0);
             let (store, scope) = match scope_cache.hit(gid, joined_at) {
-                Some(Some(cached)) => cached,
+                Some(Some(cached)) => {
+                    // A move can fence a guild after scope was cached without
+                    // changing configuration. Avoid its status/initialization
+                    // reads; mutation paths still enforce the fence atomically.
+                    match db::guild_stores::guild_is_write_fenced(&app.db, gid).await {
+                        Ok(false) => cached,
+                        Ok(true) | Err(_) => continue,
+                    }
+                }
                 Some(None) => continue,
                 None => {
                     probe.scope_lookup();
@@ -2466,6 +2474,106 @@ mod tests {
             tokio::task::yield_now().await;
         };
         assert_ne!(claimed.status, "queued");
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    struct RepairedMembership;
+    #[serenity::async_trait]
+    impl crate::enrollment_repair::MembershipSource for RepairedMembership {
+        async fn guilds_after(&self, _: Option<u64>, _: u32) -> anyhow::Result<Vec<u64>> {
+            Ok(vec![10])
+        }
+        async fn joined_at_ns(&self, _: u64) -> anyhow::Result<i64> {
+            Ok(100)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_repair_wakes_a_cached_absent_guild() {
+        let (directory, app, store, _) = enrolled_directory_for(11).await;
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) == 1).await;
+        settle_parked(&probe, 1, 0).await;
+        let mut repair = crate::enrollment_repair::EnrollmentRepair::new(
+            app.cfg.enrollment.clone(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let report = repair
+            .step_for_bot(&app, &RepairedMembership)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.confirmed, 1);
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
+        assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 2);
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fenced_guild_on_cached_scope_skips_status_then_resumes() {
+        use jmodguard::db::SqlExecutor as _;
+        let (directory, app, store, scope) = enrolled_directory().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .initialize_member_directory(scope.clone(), 42, now)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_member_sync(scope.clone(), 42, "fenced-cache".into(), now, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .defer_member_sync(scope.clone(), claim, "retry".into(), now + 45_000, now)
+            .await
+            .unwrap();
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            probe.clone(),
+        ));
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
+        settle_parked(&probe, 1, 1).await;
+        let store_id = scope.placement().store_id().as_str().to_owned();
+        app.db.with_conn(move |conn| {
+            conn.execute_bounded("INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at) VALUES(10,?1,'freeze',?2,?1,unixepoch())",
+                libsql::params![format!("{:032x}", 9u128), store_id], 64 * 1024 * 1024)?;
+            Ok(())
+        }).await.unwrap();
+        app.wake_member_sync();
+        settle_parked(&probe, 1, 1).await;
+        app.db
+            .with_conn(|conn| {
+                conn.execute_bounded(
+                    "DELETE FROM guild_write_fences WHERE guild_id=10",
+                    (),
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        app.wake_member_sync();
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) == 2).await;
+        assert_eq!(probe.scope_lookups.load(Ordering::Relaxed), 1);
         worker.abort();
         let _ = worker.await;
         drop((store, app));

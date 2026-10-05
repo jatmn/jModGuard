@@ -127,65 +127,125 @@ fn verify_identity_version(
 ) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     anyhow::ensure!(version == wanted, StoreCheckError::Schema);
-    let binding_delete = if wanted >= 8 {
-        "guild_binding_delete"
-    } else {
-        "guild_binding_no_delete"
-    };
-    let tables: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('store_identity','guild_bindings','mutation_receipts')) OR (type='trigger' AND name IN ('store_identity_no_replace','store_identity_no_update','store_identity_no_delete','guild_binding_owner','guild_binding_no_replace','guild_binding_no_update')) OR (type='trigger' AND name=?1)",
-        params![binding_delete],
-        |r| Ok(r.get(0)?),
-    )?;
-    anyhow::ensure!(tables == 10, StoreCheckError::Schema);
+    // Read the catalog once. Verification still shares the caller's data
+    // transaction, so reconnects and schema changes cannot reuse stale authority.
+    let mut statement =
+        conn.prepare("SELECT type,name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'")?;
+    let objects = statement
+        .query_map((), |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)))?
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let has = |kind: &str, name: &str| objects.contains(&(kind.to_owned(), name.to_owned()));
+    let required: &[(i64, &str, &str)] = &[
+        (
+            1,
+            "table",
+            "store_identity guild_bindings mutation_receipts",
+        ),
+        (
+            1,
+            "trigger",
+            "store_identity_no_replace store_identity_no_update store_identity_no_delete guild_binding_owner guild_binding_no_replace guild_binding_no_update",
+        ),
+        (2, "table", "guild_memberships guild_log_channels"),
+        (
+            2,
+            "trigger",
+            "guild_membership_binding guild_membership_no_replace guild_membership_update guild_log_channel_insert guild_log_channel_update",
+        ),
+        (3, "table", "guild_cases"),
+        (
+            3,
+            "trigger",
+            "guild_case_insert guild_case_update guild_case_delete",
+        ),
+        (3, "index", "guild_cases_visible"),
+        (4, "table", "guild_case_history"),
+        (
+            4,
+            "trigger",
+            "guild_case_history_insert guild_case_history_update guild_case_history_delete guild_case_remove_history guild_case_purge_history",
+        ),
+        (5, "table", "guild_case_sources"),
+        (
+            5,
+            "trigger",
+            "guild_case_source_insert guild_case_source_update guild_case_source_delete guild_case_original_source guild_case_purge_sources",
+        ),
+        (6, "table", "guild_case_evidence"),
+        (
+            6,
+            "index",
+            "guild_evidence_parent guild_evidence_work guild_evidence_cancel",
+        ),
+        (
+            6,
+            "trigger",
+            "guild_evidence_insert guild_evidence_update guild_evidence_delete guild_case_cancel_evidence guild_case_purge_evidence",
+        ),
+        (7, "table", "guild_bunny_evidence"),
+        (7, "index", "guild_bunny_resource"),
+        (
+            7,
+            "trigger",
+            "guild_bunny_insert guild_bunny_update guild_bunny_delete guild_bunny_settlement guild_bunny_purge guild_bunny_forget",
+        ),
+        (8, "table", "guild_tenant_settings"),
+        (
+            8,
+            "trigger",
+            "guild_binding_delete guild_tenant_settings_insert guild_tenant_settings_no_replace guild_tenant_settings_update",
+        ),
+        (9, "table", "guild_message_snapshots guild_snapshot_health"),
+        (9, "index", "guild_snapshot_expiry"),
+        (
+            9,
+            "trigger",
+            "guild_snapshot_insert guild_snapshot_update guild_snapshot_account_insert guild_snapshot_account_update guild_snapshot_account_delete guild_membership_delete",
+        ),
+        (
+            10,
+            "table",
+            "guild_member_feature guild_member_seed guild_member_sync guild_member_directory guild_member_stays guild_member_case_index guild_member_pending_bans guild_member_state_observations guild_member_target_checks guild_member_audit_recovery",
+        ),
+        (13, "table", "guild_member_unresolved_audits"),
+        (13, "index", "guild_member_unresolved_audits_user"),
+        (
+            13,
+            "trigger",
+            "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
+        ),
+    ];
+    for (version, kind, names) in required {
+        if wanted >= *version {
+            anyhow::ensure!(
+                names.split_whitespace().all(|name| has(kind, name)),
+                StoreCheckError::Schema
+            );
+        }
+    }
+    anyhow::ensure!(
+        has(
+            "trigger",
+            if wanted >= 8 {
+                "guild_binding_delete"
+            } else {
+                "guild_binding_no_delete"
+            }
+        ),
+        StoreCheckError::Schema
+    );
     if wanted >= 2 {
-        let membership_delete = if wanted >= 8 {
-            "guild_membership_delete"
-        } else {
-            "guild_membership_no_delete"
-        };
-        let objects: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_memberships','guild_log_channels')) OR (type='trigger' AND name IN ('guild_membership_binding','guild_membership_no_replace','guild_membership_update','guild_log_channel_insert','guild_log_channel_update')) OR (type='trigger' AND name=?1)",
-            params![membership_delete],
-            |r| Ok(r.get(0)?),
-        )?;
-        anyhow::ensure!(objects == 8, StoreCheckError::Schema);
-    }
-    if wanted >= 3 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_cases') OR (type='trigger' AND name IN ('guild_case_insert','guild_case_update','guild_case_delete')) OR (type='index' AND name='guild_cases_visible')", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
-    }
-    if wanted >= 4 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_history') OR (type='trigger' AND name IN ('guild_case_history_insert','guild_case_history_update','guild_case_history_delete','guild_case_remove_history','guild_case_purge_history'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 6, StoreCheckError::Schema);
-    }
-    if wanted >= 5 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_sources') OR (type='trigger' AND name IN ('guild_case_source_insert','guild_case_source_update','guild_case_source_delete','guild_case_original_source','guild_case_purge_sources'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 6, StoreCheckError::Schema);
-    }
-    if wanted >= 6 {
-        let objects:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_case_evidence') OR (type='index' AND name IN ('guild_evidence_parent','guild_evidence_work','guild_evidence_cancel')) OR (type='trigger' AND name IN ('guild_evidence_insert','guild_evidence_update','guild_evidence_delete','guild_case_cancel_evidence','guild_case_purge_evidence'))",(),|r|Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 9, StoreCheckError::Schema);
-    }
-    if wanted >= 7 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_bunny_evidence') OR (type='index' AND name='guild_bunny_resource') OR (type='trigger' AND name IN ('guild_bunny_insert','guild_bunny_update','guild_bunny_delete','guild_bunny_settlement','guild_bunny_purge','guild_bunny_forget'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 8, StoreCheckError::Schema);
-    }
-    if wanted >= 8 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_tenant_settings') OR (type='trigger' AND name IN ('guild_binding_delete','guild_tenant_settings_insert','guild_tenant_settings_no_replace','guild_tenant_settings_update'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
-    }
-    if wanted >= 9 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('guild_message_snapshots','guild_snapshot_health')) OR (type='index' AND name='guild_snapshot_expiry') OR (type='trigger' AND name IN ('guild_snapshot_insert','guild_snapshot_update','guild_snapshot_account_insert','guild_snapshot_account_update','guild_snapshot_account_delete','guild_membership_delete'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 9, StoreCheckError::Schema);
-    }
-    if wanted >= 10 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('guild_member_feature','guild_member_seed','guild_member_sync','guild_member_directory','guild_member_stays','guild_member_case_index','guild_member_pending_bans','guild_member_state_observations','guild_member_target_checks','guild_member_audit_recovery')", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 10, StoreCheckError::Schema);
-    }
-    if wanted >= 13 {
-        let objects: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='guild_member_unresolved_audits') OR (type='index' AND name='guild_member_unresolved_audits_user') OR (type='trigger' AND name IN ('guild_member_unresolved_audit_insert','guild_member_unresolved_audit_update','guild_member_unresolved_audit_delete'))", (), |r| Ok(r.get(0)?))?;
-        anyhow::ensure!(objects == 5, StoreCheckError::Schema);
+        anyhow::ensure!(
+            has(
+                "trigger",
+                if wanted >= 8 {
+                    "guild_membership_delete"
+                } else {
+                    "guild_membership_no_delete"
+                }
+            ),
+            StoreCheckError::Schema
+        );
     }
     let identity = conn.query_row("SELECT schema_family,store_id,dedicated_guild_id FROM store_identity WHERE singleton=1", (), |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<Option<i64>>(2)?))).optional()?;
     let Some((family, id, dedicated)) = identity else {

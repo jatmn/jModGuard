@@ -335,19 +335,20 @@ impl SnapshotIngress {
         }
     }
 
-    pub async fn maintain(&self, app: &BotState) {
-        self.maintain_at(app, None).await;
+    pub async fn maintain(&self, app: &BotState) -> std::time::Duration {
+        self.maintain_at(app, None).await
     }
 
-    async fn maintain_at(&self, app: &BotState, now_override: Option<i64>) {
+    async fn maintain_at(&self, app: &BotState, now_override: Option<i64>) -> std::time::Duration {
         let stores = match app.tenant.usage_stores().await {
             Ok(stores) => stores,
             Err(error) => {
                 tracing::warn!("snapshot maintenance catalog unavailable: {error:#}");
                 self.gap();
-                return;
+                return std::time::Duration::from_secs(30);
             }
         };
+        let mut idle = true;
         let mut active = vec![true; stores.len()];
         // One batch per store per round. A known backlog gets prompt follow-up,
         // with a scheduler yield so gateway and scope refresh keep running.
@@ -359,6 +360,7 @@ impl SnapshotIngress {
                 let store_id = entry.registration.id().as_str();
                 let Some(store) = entry.handle.as_ref() else {
                     self.cleanup_paused.lock().insert(store_id.to_owned());
+                    idle = false;
                     active[index] = false;
                     self.gap_store(store_id);
                     continue;
@@ -380,6 +382,7 @@ impl SnapshotIngress {
                     if initialized {
                         self.health_initialized.lock().insert(store_id.to_owned());
                     } else {
+                        idle = false;
                         self.restore_loss(store_id, lost);
                         self.cleanup_paused.lock().insert(store_id.to_owned());
                     }
@@ -389,6 +392,7 @@ impl SnapshotIngress {
                     Err(error) => {
                         tracing::warn!(store_id, "snapshot cleanup unavailable: {error:#}");
                         self.cleanup_paused.lock().insert(store_id.to_owned());
+                        idle = false;
                         active[index] = false;
                         self.gap_store(store_id);
                         self.write_maintenance_pause(store_id, store, "cleanup_failed", now)
@@ -404,6 +408,7 @@ impl SnapshotIngress {
                             "snapshot usage measurement unavailable: {error:#}"
                         );
                         self.cleanup_paused.lock().insert(store_id.to_owned());
+                        idle = false;
                         active[index] = false;
                         self.gap_store(store_id);
                         self.write_maintenance_pause(store_id, store, "measurement_failed", now)
@@ -420,6 +425,7 @@ impl SnapshotIngress {
                                 "snapshot pressure cleanup unavailable: {error:#}"
                             );
                             self.cleanup_paused.lock().insert(store_id.to_owned());
+                            idle = false;
                             active[index] = false;
                             self.gap_store(store_id);
                             self.write_maintenance_pause(store_id, store, "cleanup_failed", now)
@@ -436,6 +442,7 @@ impl SnapshotIngress {
                 {
                     self.cleanup_paused.lock().remove(store_id);
                 }
+                idle &= expired == 0 && evicted == 0;
                 active[index] = expired == 100 || evicted == 100;
                 let verified_content = {
                     let access = self.content_access.lock();
@@ -476,11 +483,13 @@ impl SnapshotIngress {
                     .await
                     .is_err()
                 {
+                    idle = false;
                     self.restore_loss(store_id, lost);
                 }
             }
             tokio::task::yield_now().await;
         }
+        std::time::Duration::from_secs(if idle { 120 } else { 30 })
     }
 
     async fn write_maintenance_pause(
@@ -1611,9 +1620,18 @@ mod tests {
             }
             app.snapshots.scopes.lock().insert(789, scope.clone());
             app.snapshots.content_access.lock().insert(789);
-            app.snapshots
-                .maintain_at(&app, Some(now + 2 * 3_600_000))
-                .await;
+            assert_eq!(
+                app.snapshots
+                    .maintain_at(&app, Some(now + 2 * 3_600_000))
+                    .await,
+                std::time::Duration::from_secs(30)
+            );
+            assert_eq!(
+                app.snapshots
+                    .maintain_at(&app, Some(now + 2 * 3_600_000 + 1))
+                    .await,
+                std::time::Duration::from_secs(120)
+            );
             let usage = store.measure_usage(false).await.unwrap();
             assert_eq!(usage.snapshot_count, Some(0));
             assert_eq!(usage.snapshot_health.unwrap().expired_count, 401);

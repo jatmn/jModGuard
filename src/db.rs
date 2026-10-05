@@ -75,6 +75,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0014_ban_display_identity.sql"),
     include_str!("../migrations/0015_component_updates.sql"),
     include_str!("../migrations/0016_member_sync_pacing.sql"),
+    include_str!("../migrations/0017_hot_query_indexes.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

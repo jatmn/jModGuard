@@ -257,16 +257,25 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
 
 #[tokio::test]
 async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed() {
+    let probe = Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let version = get_config_version(&f.db).await.unwrap();
     f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
+    let before = probe.immediate();
+    guild_stats(&f.db, 10).await.unwrap();
     query_enrolled_events(&f.db, scope.clone(), None, None, 50)
         .await
         .unwrap();
     list_enrolled_bans(&f.db, scope.clone(), 100).await.unwrap();
     enrolled_guild_stats(&f.db, scope.clone()).await.unwrap();
     assert_eq!(get_config_version(&f.db).await.unwrap(), version);
+    assert_eq!(
+        probe.immediate(),
+        before,
+        "bot and dashboard reads must not reserve the writer"
+    );
     f.db.with_conn(|conn| {
         conn.execute_batch_bounded(
             "ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments",

@@ -173,3 +173,12 @@ Local tests cover real report mapping, rendered payload flags/limits, guild rout
 unavailable SQL history tables, overload, timeout/capacity recovery and API/UI removal.
 They use a fake Discord delivery boundary; no live provider behavior or resource cost
 is established.
+
+Snapshot maintenance drains known expiry/pressure backlogs in bounded batches.
+After deleting rows or encountering an error it checks again in 30 seconds; an
+idle pass waits 120 seconds. Unchanged health uses a two-minute heartbeat and
+empty cleanup refreshes its successful-check timestamp at most every five
+minutes. No-op checks use primary read snapshots; actual writes recheck state
+under the writer lock. Health transitions, observations and loss counters are
+still recorded when they change. These intervals stay within the dashboard's
+five-minute health and fifteen-minute cleanup freshness windows.

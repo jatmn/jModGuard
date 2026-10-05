@@ -1,3 +1,17 @@
+const BAN_STATS_SQL: &str = "SELECT COUNT(*) FROM bans WHERE guild_id = ?1";
+const WARN_STATS_SQL: &str = "SELECT COUNT(*) FROM warns WHERE guild_id = ?1";
+const EVENT_STATS_SQL: &str = "SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
+                   event_type IN ('mod_action','timeout_add','timeout_remove',
+                                  'member_ban','member_unban','member_kick')
+                   OR CASE WHEN json_valid(data) THEN
+                     (event_type = 'automod'
+                      AND json_extract(data, '$.action') IN ('warn','timeout','kick','ban')
+                      AND COALESCE(json_extract(data, '$.dry_run'), 0) = 0)
+                     OR (event_type = 'plan_executed' AND json_type(data, '$.moderation') = 'true')
+                   ELSE 0 END
+                 )";
+const BAN_PAGE_SQL: &str = "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name
+             FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2";
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -73,13 +87,12 @@ pub async fn query_events(
     .await
 }
 
-fn query_events_conn(
-    conn: &impl SqlExecutor,
+fn event_query(
     guild_id: i64,
     event_type: Option<&str>,
     user_id: Option<i64>,
     limit: i64,
-) -> Result<Vec<EventRow>> {
+) -> (String, Vec<Value>) {
     let limit = limit.clamp(1, 200);
     let mut sql = String::from(
         "SELECT id, guild_id, event_type, user_id, actor_id, data, created_at
@@ -96,6 +109,18 @@ fn query_events_conn(
     }
     sql.push_str(" ORDER BY id DESC LIMIT ?");
     args.push(limit.into());
+
+    (sql, args)
+}
+
+fn query_events_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    event_type: Option<&str>,
+    user_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    let (sql, args) = event_query(guild_id, event_type, user_id, limit);
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(args), |r| {
@@ -274,10 +299,7 @@ pub async fn list_bans(db: &Db, guild_id: i64, limit: i64) -> Result<Vec<BanRow>
 
 fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<Vec<BanRow>> {
     let limit = limit.clamp(1, 200);
-    let mut stmt = conn.prepare(
-        "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name
-             FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare(BAN_PAGE_SQL)?;
     let rows = stmt.query_map(params![guild_id, limit], |r| {
         Ok(BanRow {
             id: r.get(0)?,
@@ -320,18 +342,9 @@ pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
 fn guild_stats_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Stats> {
     let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
     Ok(Stats {
-        events: one("SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
-                   event_type IN ('mod_action','timeout_add','timeout_remove',
-                                  'member_ban','member_unban','member_kick')
-                   OR CASE WHEN json_valid(data) THEN
-                     (event_type = 'automod'
-                      AND json_extract(data, '$.action') IN ('warn','timeout','kick','ban')
-                      AND COALESCE(json_extract(data, '$.dry_run'), 0) = 0)
-                     OR (event_type = 'plan_executed' AND json_type(data, '$.moderation') = 'true')
-                   ELSE 0 END
-                 )")?,
-        warns: one("SELECT COUNT(*) FROM warns WHERE guild_id = ?1")?,
-        bans: one("SELECT COUNT(*) FROM bans WHERE guild_id = ?1")?,
+        events: one(EVENT_STATS_SQL)?,
+        warns: one(WARN_STATS_SQL)?,
+        bans: one(BAN_STATS_SQL)?,
     })
 }
 
@@ -608,4 +621,38 @@ pub async fn clear_enrolled_warns(
         Ok(count)
     })
     .await
+}
+
+#[cfg(test)]
+mod query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn status_dashboard_and_pages_use_bounded_index_searches() {
+        let path =
+            std::env::temp_dir().join(format!("hot_plans_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn_sync(|conn| {
+            // Both !stats/!status and WebUI stats call guild_stats_conn.
+            for sql in [EVENT_STATS_SQL, WARN_STATS_SQL, BAN_STATS_SQL] {
+                crate::db::tests::assert_index_plan(conn, sql, params![42], false);
+            }
+            for event_type in [None, Some("automod")] {
+                for user_id in [None, Some(99)] {
+                    let (sql, args) = event_query(42, event_type, user_id, 50);
+                    crate::db::tests::assert_index_plan(
+                        conn,
+                        &sql,
+                        params_from_iter(args),
+                        user_id.is_none(),
+                    );
+                }
+            }
+            crate::db::tests::assert_index_plan(conn, BAN_PAGE_SQL, params![42, 50], true);
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 }

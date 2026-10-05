@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0016. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0017. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -118,7 +118,7 @@ settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
 store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0016. Each opener refuses the other family. No records are moved by startup.
+migration 0017. Each opener refuses the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
 stays, case projection, sync state and immutable initial-seed completion.
@@ -141,3 +141,8 @@ Guild migration 0009 starts with no retained message payloads. It adds snapshot
 expiry/identity constraints and bounded store-health metadata. Deploy matching
 bot/API builds; old guild-store binaries reject version9. Rollback requires a
 matching pre-upgrade backup and binaries. See [application database budgets](DATABASE-CAPACITY.md).
+
+Core migration 0017 adds ordered guild event/ban page indexes and a state/expiry
+index for the bot-action poll. Upgrade the bot and API together through the
+existing paired schema protocol; their exact core runtime schema is now 17.
+The guild schema remains 14: its member-cleanup index already exists.
