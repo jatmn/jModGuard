@@ -51,7 +51,10 @@ class Element {
 
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
 
-function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible" } = {}) {
+// Keep page time and response timestamps on the same deterministic clock.
+const NOW_SECONDS = 1800000000;
+
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000 } = {}) {
   const elements = new Map();
   const document = {
     visibilityState: visibility,
@@ -76,7 +79,7 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     fetch: fetchImpl,
     setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
     clearTimeout(id) { timers.delete(id); },
-    Date,
+    Date: { now },
   });
   vm.runInContext(source, context);
   return { context, elements, timers };
@@ -101,10 +104,10 @@ function record(component = "api") {
     component, channel: "latest", cadence: "off",
     candidate: { component, channel: "latest", source_sha: "b".repeat(40),
       digest: "sha256:" + "b".repeat(64), release_id: "v1", published_at: "2026-09-23T00:00:00Z" },
-    installed: null, checked_at: Math.floor(Date.now() / 1000), check_error: null,
-    observed_at: Math.floor(Date.now() / 1000), state: "running", last_error: null,
+    installed: null, checked_at: NOW_SECONDS, check_error: null,
+    observed_at: NOW_SECONDS, state: "running", last_error: null,
     observed: { source_sha: sha, base_image_sha: sha, executable_sha256: "c".repeat(64),
-      started_at: Math.floor(Date.now() / 1000), self_update_enabled: true },
+      started_at: NOW_SECONDS, self_update_enabled: true },
   };
 }
 
@@ -141,7 +144,7 @@ test("owner update controls require a current installable candidate", () => {
   assert.equal(updateButton(view, "api").disabled, true);
 
   api.channel = "latest";
-  api.checked_at = Math.floor(Date.now() / 1000) - 7201;
+  api.checked_at = NOW_SECONDS - 7201;
   render(view, api);
   assert.equal(updateButton(view, "api").disabled, true);
 
@@ -246,8 +249,8 @@ function state(items) {
     apply_enabled: true, unattended_enabled: true, webui_storage_configured: true };
 }
 
-async function ready(fetchImpl) {
-  const view = page(fetchImpl);
+async function ready(fetchImpl, options) {
+  const view = page(fetchImpl, options);
   await vm.runInContext("refresh()", view.context);
   return view;
 }
@@ -543,9 +546,8 @@ test("a queued older digest can still be superseded by the owner", () => {
 
 
 test("uptime uses compact day/hour/minute/second units without leading zero units", () => {
-  const view = page();
-  const now = 1800000000;
-  vm.runInContext(`Date = { now: () => ${now} * 1000 };`, view.context);
+  const now = NOW_SECONDS;
+  const view = page(undefined, { now: () => now * 1000 });
   for (const [seconds, expected] of [[0, "0s"], [38, "38s"], [818, "13m 38s"],
     [3608, "1h 0m 8s"]]) {
     assert.equal(vm.runInContext(`uptime(${now - seconds})`, view.context), expected);
@@ -647,6 +649,7 @@ test("transient initial access checks retry automatically but confirmed denials 
 });
 
 test("Discord rate limits delay the next administration refresh", async () => {
+  let now = NOW_SECONDS * 1000;
   const view = await ready(async (url) => {
     if (url === "/api/updates") {
       return {
@@ -657,11 +660,14 @@ test("Discord rate limits delay the next administration refresh", async () => {
       };
     }
     return response(state([record()]));
-  });
+  }, { now: () => now });
   assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
   assert.equal(view.elements.get("sign-in").classList.contains("hidden"), true);
   assert.equal(view.timers.size, 1);
   assert.equal([...view.timers.values()][0].delay, 45000);
+  now += 1;
+  vm.runInContext("scheduleRefresh()", view.context);
+  assert.equal([...view.timers.values()][0].delay, 44999);
 });
 
 test("refresh retains controls and disclosures while actions use the newest component record", async () => {
@@ -722,8 +728,8 @@ test("Database Usage shows independent physical databases and unknown allocation
   const view = page(async (url) => {
     calls.push(url);
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    return { status: 200, ok: true, json: async () => ({ generated_at: Math.floor(Date.now() / 1000), databases: [
-      { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: Math.floor(Date.now() / 1000) },
+    return { status: 200, ok: true, json: async () => ({ generated_at: NOW_SECONDS, databases: [
+      { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: NOW_SECONDS },
         percent_of_limit: 75, headroom_bytes: 250000000, status: "pressure" },
       { id: "a".repeat(32), kind: "guild", policy: { kind: "shared" }, usage: null,
         percent_of_limit: null, headroom_bytes: null, status: "unavailable" },
@@ -742,13 +748,16 @@ test("Database Usage shows independent physical databases and unknown allocation
 test("Database Usage does not paint cards if the tab hides during the fetch", async () => {
   let release;
   const usage = new Promise((resolve) => { release = resolve; });
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
   const view = page(async (url) => {
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    markStarted();
     await usage;
     return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1 }, percent_of_limit: 0, status: "normal" }], generated_at: 1 }) };
   });
   const pending = vm.runInContext('selectView("usage")', view.context);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await started;
   view.context.document.visibilityState = "hidden";
   release();
   await pending;
@@ -781,15 +790,18 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
   const calls = [];
   let release;
   const usage = new Promise((resolve) => { release = resolve; });
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
   const view = page(async (url) => {
     calls.push(url);
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    markStarted();
     await usage;
     return { status: 200, ok: true, json: async () => ({ databases: [], generated_at: 1 }) };
   });
   const first = vm.runInContext('selectView("usage")', view.context);
   const second = vm.runInContext('refreshUsage()', view.context);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await started;
   assert.equal(calls.filter((url) => url === "/api/database-usage").length, 1);
   release();
   await Promise.all([first, second]);
