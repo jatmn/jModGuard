@@ -376,11 +376,14 @@ impl DbRuntime {
                 }
             };
             #[cfg(test)]
+            let manual_deadline =
+                timeout.and_then(|timeout| clock.as_ref().map(|clock| clock.wait(timeout)));
+            #[cfg(test)]
             let deadline = async {
                 match timeout {
                     Some(timeout) => {
-                        if let Some(clock) = clock {
-                            clock.wait(timeout).await;
+                        if let Some(deadline) = manual_deadline {
+                            deadline.await;
                         } else {
                             tokio::time::sleep(timeout).await;
                         }
@@ -453,9 +456,11 @@ impl DbRuntime {
                 }
             };
             #[cfg(test)]
+            let manual_deadline = clock.as_ref().map(|clock| clock.wait(operation_timeout));
+            #[cfg(test)]
             let deadline = async {
-                if let Some(clock) = &clock {
-                    clock.wait(operation_timeout).await;
+                if let Some(deadline) = manual_deadline {
+                    deadline.await;
                 } else {
                     tokio::time::sleep(operation_timeout).await;
                 }
@@ -476,9 +481,12 @@ impl DbRuntime {
             open_releases.fetch_add(1, Ordering::Release);
             #[cfg(test)]
             let opened = {
+                let manual_deadline = clock
+                    .as_ref()
+                    .map(|clock| clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT));
                 let wait = async {
-                    if let Some(clock) = &clock {
-                        clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                    if let Some(deadline) = manual_deadline {
+                        deadline.await;
                     } else {
                         tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT).await;
                     }
@@ -498,9 +506,12 @@ impl DbRuntime {
             if let Some(Ok(tx)) = opened {
                 #[cfg(test)]
                 let rolled_back = {
+                    let manual_deadline = clock
+                        .as_ref()
+                        .map(|clock| clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT));
                     let wait = async {
-                        if let Some(clock) = &clock {
-                            clock.wait(REMOTE_LOCK_RELEASE_TIMEOUT).await;
+                        if let Some(deadline) = manual_deadline {
+                            deadline.await;
                         } else {
                             tokio::time::sleep(REMOTE_LOCK_RELEASE_TIMEOUT).await;
                         }
@@ -606,18 +617,22 @@ impl ManualClock {
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self, timeout: Duration) {
+    // Capture the deadline before polling the operation: its HTTP request can
+    // wake the test and advance this clock before the timer is first polled.
+    fn wait(&self, timeout: Duration) -> impl Future<Output = ()> + '_ {
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         let deadline = self
             .now_ms
             .load(Ordering::SeqCst)
             .saturating_add(timeout_ms);
-        loop {
-            let notified = self.notify.notified();
-            if self.now_ms.load(Ordering::SeqCst) >= deadline {
-                return;
+        async move {
+            loop {
+                let notified = self.notify.notified();
+                if self.now_ms.load(Ordering::SeqCst) >= deadline {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
         }
     }
 }
@@ -2150,6 +2165,31 @@ impl SqlExecutor for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_deadline_starts_before_the_operation_is_polled() {
+        let timeout = Duration::from_millis(300);
+        let runtime = DbRuntime::with_operation_timeout(Some(timeout)).unwrap();
+        let clock = ManualClock::new();
+        runtime.install_manual_clock(Some(Arc::clone(&clock)));
+        let mut first_poll = true;
+        let operation = std::future::poll_fn(|cx| {
+            if first_poll {
+                first_poll = false;
+                // Reproduce the test thread advancing time after HTTP work
+                // starts but before the select polls its deadline branch.
+                clock.advance(timeout);
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok::<_, anyhow::Error>(()))
+            }
+        });
+        let error = runtime
+            .block_on_database("delayed operation", operation)
+            .expect_err("the deadline must expire on the first poll");
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+    }
 
     #[test]
     fn read_classifier_refuses_explained_side_effects() {
