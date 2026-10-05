@@ -269,6 +269,15 @@ accounts cap Deploy UI at a higher minimum), create the app with
 is not a website. Platform health checks (Monitoring → HTTP GET `/health`
 on port `8080`) stay inside Bunny; they are not a public URL.
 
+**Warning:** The bot's `/ready` endpoint must never be configured as a Bunny
+or other platform readiness check. `/ready` returns 200 only after the bot
+holds the active-bot lease and is connected to Discord. During a rolling
+update the old bot still holds the lease until it is stopped, so a readiness
+check on `/ready` stalls the new bot until Bunny's timeout and then rolls the
+update back. Bot platform checks are liveness on `/health` only. Do not set a
+readiness check on the bot. The API may safely use `/ready` for readiness
+because it does not wait on a lease.
+
 ```dotenv
 JMODGUARD_DISCORD_TOKEN=SECRET
 JMODGUARD_OWNER_ID=123456789012345678
@@ -314,11 +323,11 @@ the Bunny API returns every env var — never paste those responses.
 The Bunny API image does not embed or serve the UI at `/`; a default
 local API build (`embed-ui`) may serve `/`. Do not treat `/` on
 the container or its endpoint hostname as a ready check. Platform and
-Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. `/ready` is
-readiness: `503` until startup finishes, then `200`, and it does not
-query the database. Pointing a platform check at `/ready` is a later
-deploy. Until axum takes over (database open, API state primary-version
-prime, router build), `/health` returns `200` and `/ready` stays `503`.
+Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. The API may
+use `/ready` for readiness (`503` until startup finishes, then `200`).
+That check does not query the database. Until axum takes over (database
+open, API state primary-version prime, router build), `/health` returns
+`200` and `/ready` stays `503`.
 `/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
@@ -452,8 +461,7 @@ self-host.
    if you added one — not a leftover `*.b-cdn.net` host after owned-host
    cutover). The admin UI loads from Storage. Login with Discord. OAuth
    returns to that origin. Probe `/health` (200 `ok`) for liveness.
-   `/ready` is readiness and is not a platform check yet. Do not use `/`
-   on the API origin as a ready check.
+   Do not use `/` on the API origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure an `automod` log channel, enable a dry-run rule and check its Discord
