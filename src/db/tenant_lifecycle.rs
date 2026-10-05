@@ -215,6 +215,21 @@ pub async fn evidence_storage_id(db: &Db, configured: &str) -> Result<String> {
         return Ok(configured.to_owned());
     }
     db.with_conn(|conn| {
+        {
+            let tx = conn.transaction_primary_snapshot()?;
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key='evidence_storage_id'",
+                    (),
+                    |r| Ok(r.get::<String>(0)?),
+                )
+                .optional()?
+            {
+                tx.finish_read()?;
+                return Ok(existing);
+            }
+            tx.finish_read()?;
+        }
         let mut tx = conn.transaction_primary_read()?;
         if let Some(existing) = tx
             .query_row(

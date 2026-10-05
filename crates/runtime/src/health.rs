@@ -57,8 +57,14 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 /// a slow probe must not stall the next one, and excess sockets stay in the
 /// listen backlog instead of being accepted and dropped.
 pub async fn serve_listener(listener: TcpListener) -> Result<()> {
+    serve_listener_as(listener, "process").await
+}
+
+/// Same listener as [`serve_listener`], with the process role in the log line
+/// so a launcher bind and the later bot bind are not the same sentence.
+pub async fn serve_listener_as(listener: TcpListener, role: &'static str) -> Result<()> {
     tracing::info!(
-        "health listener on http://{}/health",
+        "health listener ({role}) on http://{}/health",
         listener.local_addr()?
     );
     serve_while(&listener, std::future::pending::<Result<()>>()).await
@@ -119,15 +125,26 @@ pub async fn answer_connection(mut stream: TcpStream) -> Result<()> {
         .and_then(Result::ok)
         .unwrap_or(0);
     let probe = parse_probe(&buf[..n]);
-    let response = probe_response(probe);
+    let response = probe_response(probe, crate::process_ready());
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
 }
 
-fn probe_response(probe: Probe) -> String {
+fn probe_response(probe: Probe, ready: bool) -> String {
     let (status, content_type, extra, body) = if probe.liveness {
         ("200 OK", "text/plain; charset=utf-8", "", LIVENESS_BODY)
+    } else if probe.readiness {
+        if ready {
+            ("200 OK", "text/plain; charset=utf-8", "", "ready")
+        } else {
+            (
+                "503 Service Unavailable",
+                "text/plain; charset=utf-8",
+                "retry-after: 1\r\n",
+                "not ready",
+            )
+        }
     } else if probe.json_error {
         (
             "503 Service Unavailable",
@@ -153,6 +170,7 @@ fn probe_response(probe: Probe) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     liveness: bool,
+    readiness: bool,
     /// `/api` and non-GET/HEAD methods: machine clients (SPA `fetch`).
     json_error: bool,
     head: bool,
@@ -167,9 +185,11 @@ fn parse_probe(buf: &[u8]) -> Probe {
     let path = request_target_path(target);
     let head = method == "HEAD";
     let get_or_head = matches!(method, "GET" | "HEAD");
+    let readiness = get_or_head && is_readiness_path(path);
     Probe {
         liveness: get_or_head && is_liveness_path(path),
-        json_error: is_api_path(path) || !get_or_head,
+        readiness,
+        json_error: !readiness && (is_api_path(path) || !get_or_head),
         head,
     }
 }
@@ -192,6 +212,10 @@ fn request_target_path(target: &str) -> &str {
 
 fn is_liveness_path(path: &str) -> bool {
     path == "/health" || path == "/health/"
+}
+
+fn is_readiness_path(path: &str) -> bool {
+    path == "/ready" || path == "/ready/"
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -252,6 +276,7 @@ mod tests {
             parse_probe(b"GET /health HTTP/1.1"),
             Probe {
                 liveness: true,
+                readiness: false,
                 json_error: false,
                 head: false
             }
@@ -260,6 +285,7 @@ mod tests {
             parse_probe(b"HEAD /health HTTP/1.1"),
             Probe {
                 liveness: true,
+                readiness: false,
                 json_error: false,
                 head: true
             }
@@ -268,6 +294,7 @@ mod tests {
             parse_probe(b"GET http://127.0.0.1:8080/health HTTP/1.1"),
             Probe {
                 liveness: true,
+                readiness: false,
                 json_error: false,
                 head: false
             }
@@ -276,6 +303,7 @@ mod tests {
             parse_probe(b"GET / HTTP/1.1"),
             Probe {
                 liveness: false,
+                readiness: false,
                 json_error: false,
                 head: false
             }
@@ -284,6 +312,7 @@ mod tests {
             parse_probe(b"POST /api/me HTTP/1.1"),
             Probe {
                 liveness: false,
+                readiness: false,
                 json_error: true,
                 head: false
             }
@@ -292,6 +321,7 @@ mod tests {
             parse_probe(b"GET /api/me HTTP/1.1"),
             Probe {
                 liveness: false,
+                readiness: false,
                 json_error: true,
                 head: false
             }
@@ -300,6 +330,7 @@ mod tests {
             parse_probe(b"GET /login HTTP/1.1"),
             Probe {
                 liveness: false,
+                readiness: false,
                 json_error: false,
                 head: false
             }
@@ -308,6 +339,7 @@ mod tests {
             parse_probe(b"POST /health HTTP/1.1"),
             Probe {
                 liveness: false,
+                readiness: false,
                 json_error: true,
                 head: false
             }
@@ -520,5 +552,54 @@ mod tests {
             assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         };
         super::serve_while(&listener, work).await;
+    }
+
+    fn ready_flag() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn health_stays_ok_while_readiness_is_down() {
+        let _flag = ready_flag().lock().await;
+        crate::set_process_ready(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let live = exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(live.starts_with("HTTP/1.1 200 OK"), "unexpected: {live}");
+            assert!(live.contains("\r\n\r\nok"), "unexpected: {live}");
+            let ready = exchange(addr, b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(
+                ready.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "unexpected: {ready}"
+            );
+            assert!(ready.contains("\r\n\r\nnot ready"), "unexpected: {ready}");
+        };
+        super::serve_while(&listener, work).await;
+        crate::set_process_ready(false);
+    }
+
+    #[tokio::test]
+    async fn ready_becomes_ok_when_startup_finishes() {
+        let _flag = ready_flag().lock().await;
+        crate::set_process_ready(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let work = async {
+            let before = exchange(addr, b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(
+                before.starts_with("HTTP/1.1 503 Service Unavailable"),
+                "unexpected: {before}"
+            );
+            crate::set_process_ready(true);
+            let after = exchange(addr, b"GET /ready/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(after.starts_with("HTTP/1.1 200 OK"), "unexpected: {after}");
+            assert!(after.contains("\r\n\r\nready"), "unexpected: {after}");
+            let live = exchange(addr, b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            assert!(live.starts_with("HTTP/1.1 200 OK"), "unexpected: {live}");
+        };
+        super::serve_while(&listener, work).await;
+        crate::set_process_ready(false);
     }
 }

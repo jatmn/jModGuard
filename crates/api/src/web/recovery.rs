@@ -201,13 +201,14 @@ async fn maintenance_callback(
 /// Bound and healthy during control-store startup, without constructing ApiState
 /// or running core/guild application migrations. Only the update routes exist.
 pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
+    crate::set_shutdown_context("temporary maintenance API; the application has not started");
     let listener = crate::health::bind(&cfg.web.bind).await?;
     let opts = cfg.db_open_options();
     let control = crate::health::serve_while(&listener, async {
         loop {
             let opts = opts.clone();
             match tokio::task::spawn_blocking(move || UpdateControl::open(&opts)).await? {
-                Ok(Some(control)) => break Ok::<_, anyhow::Error>(control),
+                Ok(Some(control)) => break Ok::<_, anyhow::Error>(Some(control)),
                 result => tracing::warn!(
                     "maintenance update control is not ready: {}",
                     match result {
@@ -218,12 +219,21 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
                 ),
             }
             tokio::select! {
-                _ = crate::shutdown_signal() => anyhow::bail!("maintenance stopped"),
+                _ = crate::shutdown_signal() => {
+                    tracing::info!(
+                        "temporary maintenance API stopped; the application has not started"
+                    );
+                    return Ok(None);
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
             }
         }
     })
     .await?;
+    let Some(control) = control else {
+        crate::log_shutdown_finished("temporary maintenance API");
+        return Ok(());
+    };
     let oauth = Arc::new(oauth::OAuthClient::from_config(&cfg)?);
     let state = Arc::new(RecoveryState {
         cfg: Arc::new(cfg),
@@ -235,7 +245,12 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(crate::shutdown_signal())
         .await?;
+    crate::log_shutdown_finished("temporary maintenance API");
     Ok(())
+}
+
+async fn maintenance_ready() -> (StatusCode, &'static str) {
+    (StatusCode::SERVICE_UNAVAILABLE, "not ready")
 }
 
 fn maintenance_router(state: Arc<RecoveryState>, store: MemoryStore) -> Router {
@@ -251,6 +266,8 @@ fn maintenance_router(state: Arc<RecoveryState>, store: MemoryStore) -> Router {
         )
         .route("/health", get(health))
         .route("/health/", get(health))
+        .route("/ready", get(maintenance_ready))
+        .route("/ready/", get(maintenance_ready))
         .layer(
             SessionManagerLayer::new(store)
                 .with_name(SESSION_COOKIE_NAME)

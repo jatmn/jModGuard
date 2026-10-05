@@ -362,6 +362,7 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
+    pub activation: Arc<crate::activation::Activation>,
     pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<BotProcessConfig>,
     pub configs: ConfigCache,
@@ -440,6 +441,7 @@ impl BotState {
         db.require_config_version(primed.config);
         Ok(Arc::new(Self {
             db,
+            activation: crate::activation::Activation::new(),
             tenant,
             cfg: Arc::new(cfg),
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),

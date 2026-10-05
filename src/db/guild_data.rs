@@ -204,6 +204,23 @@ fn initialize_store(
     expected: &StoreRegistration,
     create: bool,
 ) -> Result<()> {
+    {
+        let tx = conn.transaction_primary_snapshot()?;
+        let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+        let objects: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+            (),
+            |r| Ok(r.get(0)?),
+        )?;
+        let needs_write =
+            create && ((1..VERSION).contains(&version) || (version == 0 && objects == 0));
+        if !needs_write {
+            verify_identity(&tx, expected)?;
+            tx.finish_read()?;
+            return Ok(());
+        }
+        tx.finish_read()?;
+    }
     let mut tx = conn.transaction_primary_read()?;
     let version: i64 = tx.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
     let objects: i64 = tx.query_row(

@@ -1,9 +1,11 @@
 //! Discord gateway, moderation and bot-owned action execution.
 pub use jmodguard::{
-    bot_actions, config, db, defaults, health, ids, init_tracing, normalize, shutdown_signal,
-    templates, tenant, types,
+    bot_actions, config, db, defaults, health, ids, init_tracing, log_shutdown_finished, normalize,
+    process_ready, set_process_ready, set_shutdown_context, shutdown_signal, templates, tenant,
+    types,
 };
 pub mod action_worker;
+pub mod activation;
 pub mod automod;
 pub mod cases;
 pub mod commands;

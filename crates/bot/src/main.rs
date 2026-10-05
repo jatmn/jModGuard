@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
     }
 
     init_tracing(&cfg.log, "bot");
+    jmodguard::set_shutdown_context("bot");
 
     // Liveness must accept before database retry. Platform probes hit this
     // port while `open_with_until_ready` waits on a waking database or a
@@ -107,7 +108,7 @@ async fn main() -> Result<()> {
     if !offline_cache && let Some(bind) = cfg.health_bind() {
         let listener = jmodguard_bot::health::bind(&bind).await?;
         tokio::spawn(async move {
-            if let Err(error) = jmodguard_bot::health::serve_listener(listener).await {
+            if let Err(error) = jmodguard_bot::health::serve_listener_as(listener, "bot").await {
                 tracing::error!("health listener exited: {error:#}");
             }
         });
@@ -132,6 +133,7 @@ async fn main() -> Result<()> {
         })?,
         _ = shutdown_signal() => {
             tracing::info!("shutdown during database open");
+            jmodguard::log_shutdown_finished("bot");
             tracing::info!("bot process stopped");
             return Ok(());
         }
@@ -146,6 +148,22 @@ async fn main() -> Result<()> {
     );
 
     let app = BotState::new(cfg.clone(), db)?;
+    let activation = Arc::clone(&app.activation);
+    match jmodguard_bot::activation::wait_for_writer_lock(&app.db, &activation).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!("bot stopped before it held the active-bot lease");
+            jmodguard::log_shutdown_finished("bot");
+            tracing::info!("bot process stopped");
+            return Ok(());
+        }
+        Err(error) => return Err(error.context("active-bot lease")),
+    }
+    if !activation.allows_discord_connect() {
+        anyhow::bail!("active-bot lease was not held");
+    }
+    let _renewal =
+        jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
 
     // --- Discord client (needed for slash re-sync after config polls) --------
     let intents = GatewayIntents::GUILDS
@@ -457,6 +475,12 @@ async fn main() -> Result<()> {
 
     if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
         tracing::info!("shutdown before gateway identify");
+        activation.begin_shutdown();
+        jmodguard::set_process_ready(false);
+        if let Err(error) = db::release_active_bot(&app.db, activation.instance()).await {
+            tracing::warn!("active-bot lease release failed: {error:#}");
+        }
+        jmodguard::log_shutdown_finished("bot");
         tracing::info!("bot process stopped");
         return Ok(());
     }
@@ -466,8 +490,12 @@ async fn main() -> Result<()> {
     let shutdown_app = Arc::clone(&app);
     let shutdown_http = Arc::clone(&http);
     let shutdown_cache = Arc::clone(&cache);
+    let shutdown_activation = Arc::clone(&activation);
+    let shutdown_db = app.db.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
+        shutdown_activation.begin_shutdown();
+        jmodguard::set_process_ready(false);
         shutdown_app.stop_startup_notice_task().await;
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
@@ -475,12 +503,18 @@ async fn main() -> Result<()> {
         let sent =
             logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
         tracing::info!(sent, attempted, "shutdown notice phase complete");
+        if let Err(error) =
+            db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
+        {
+            tracing::warn!("active-bot lease release failed: {error:#}");
+        }
         tracing::info!("stopping Discord shards");
         shard_manager.shutdown_all().await;
     });
     if let Err(error) = client.start().await {
         anyhow::bail!("discord client error: {error:#}");
     }
+    jmodguard::log_shutdown_finished("bot");
     tracing::info!("bot process stopped");
     Ok(())
 }

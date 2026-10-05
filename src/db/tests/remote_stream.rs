@@ -30,6 +30,7 @@ struct HranaState {
     skip_immediate_lock: bool,
     hang_rollback: bool,
     write_locked: bool,
+    closes: usize,
     commit_hung: bool,
     statement_hung: bool,
     begin_hung: bool,
@@ -59,6 +60,7 @@ impl HranaState {
             skip_immediate_lock: false,
             hang_rollback: false,
             write_locked: false,
+            closes: 0,
             commit_hung: false,
             statement_hung: false,
             begin_hung: false,
@@ -203,6 +205,10 @@ impl HranaFixture {
 
     fn write_locked(&self) -> bool {
         self.state.lock().unwrap().write_locked
+    }
+
+    fn closes(&self) -> usize {
+        self.state.lock().unwrap().closes
     }
 
     async fn wait_until(&self, flag: impl Fn(&HranaState) -> bool) {
@@ -370,6 +376,7 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
                         "execute" => pipeline_batch_response(request, &mut state),
                         "close" => {
                             closed = true;
+                            state.closes += 1;
                             state.write_locked = false;
                             state.in_transaction = false;
                             json!({"type": "close"})
@@ -827,4 +834,33 @@ async fn timed_out_begin_releases_the_lock_for_the_next_writer() {
         .expect("next writer must commit");
     assert!(!fixture.write_locked());
     drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_connection_close_lets_the_next_writer_take_the_lock() {
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_secs(3))).unwrap();
+    let database = runtime
+        .block_on_database(
+            "connect",
+            libsql::Builder::new_remote(format!("http://{}", fixture.address), "test".into())
+                .connector(crate::remote_https::https_connector())
+                .build(),
+        )
+        .unwrap();
+    let database = Arc::new(database);
+    let connection = Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap();
+    {
+        let tx = connection.transaction_primary_read().unwrap();
+        tx.commit().unwrap();
+    }
+    runtime.close_connection(connection);
+    assert!(
+        fixture.closes() >= 1,
+        "startup close must be sent on the database runtime"
+    );
+    let next = Connection::from_database(database, runtime).unwrap();
+    let tx = next.transaction_primary_read().unwrap();
+    tx.commit().unwrap();
+    assert!(!fixture.write_locked());
 }

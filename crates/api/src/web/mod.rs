@@ -915,6 +915,14 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn ready() -> impl IntoResponse {
+    if crate::process_ready() {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
 #[cfg(feature = "embed-ui")]
 async fn app_js() -> impl IntoResponse {
     static_handler(
@@ -1236,6 +1244,8 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         Router::new()
             .route("/health", get(health))
             .route("/health/", get(health))
+            .route("/ready", get(ready))
+            .route("/ready/", get(ready))
             .merge(sessioned),
     )
     .with_state(app.clone())

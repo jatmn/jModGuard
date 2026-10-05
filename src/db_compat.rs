@@ -152,6 +152,67 @@ impl Drop for RuntimeThread {
     }
 }
 
+/// Counts write transactions and database calls for the startup that installed it.
+///
+/// Only connections created while this probe is current increment it, so
+/// parallel tests do not share a counter.
+#[derive(Debug, Default)]
+pub struct StartupProbe {
+    immediate: AtomicU64,
+    queries: AtomicU64,
+}
+
+impl StartupProbe {
+    pub fn immediate(&self) -> u64 {
+        self.immediate.load(Ordering::Relaxed)
+    }
+
+    pub fn queries(&self) -> u64 {
+        self.queries.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_immediate(&self) {
+        self.immediate.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_query(&self) {
+        self.queries.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    static STARTUP_PROBE: RefCell<Option<Arc<StartupProbe>>> = const { RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn install_startup_probe(probe: Option<Arc<StartupProbe>>) -> Option<Arc<StartupProbe>> {
+    STARTUP_PROBE.with(|slot| slot.replace(probe))
+}
+
+#[doc(hidden)]
+pub fn current_startup_probe() -> Option<Arc<StartupProbe>> {
+    STARTUP_PROBE.with(|slot| slot.borrow().clone())
+}
+
+/// Restores the previous probe when dropped. Forward this into a worker
+/// thread before that thread opens a database runtime.
+pub struct StartupProbeGuard {
+    previous: Option<Arc<StartupProbe>>,
+}
+
+impl Drop for StartupProbeGuard {
+    fn drop(&mut self) {
+        install_startup_probe(self.previous.take());
+    }
+}
+
+#[doc(hidden)]
+pub fn enter_startup_probe(probe: Option<Arc<StartupProbe>>) -> StartupProbeGuard {
+    StartupProbeGuard {
+        previous: install_startup_probe(probe),
+    }
+}
+
 #[derive(Clone)]
 pub struct DbRuntime {
     handle: tokio::runtime::Handle,
@@ -160,6 +221,7 @@ pub struct DbRuntime {
     // Shared by all connections for one physical Db pool. A discovered bound
     // violation pauses growth until that runtime is restarted and repaired.
     growth_paused: Arc<AtomicBool>,
+    startup_probe: Option<Arc<StartupProbe>>,
     /// Test-only stand-in for `tokio::time::timeout`. The database runtime is
     /// multi-thread, and `tokio::time::pause` refuses that flavor.
     #[cfg(test)]
@@ -185,6 +247,7 @@ impl DbRuntime {
             _thread: Arc::clone(&self._thread),
             operation_timeout,
             growth_paused: Arc::clone(&self.growth_paused),
+            startup_probe: self.startup_probe.clone(),
             #[cfg(test)]
             manual_clock: Arc::clone(&self.manual_clock),
             #[cfg(test)]
@@ -230,6 +293,7 @@ impl DbRuntime {
             }),
             operation_timeout,
             growth_paused: Arc::new(AtomicBool::new(false)),
+            startup_probe: current_startup_probe(),
             #[cfg(test)]
             manual_clock: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -294,6 +358,9 @@ impl DbRuntime {
         T: Send,
         E: Into<anyhow::Error> + Send,
     {
+        if let Some(probe) = &self.startup_probe {
+            probe.record_query();
+        }
         let watch = if honor_caller {
             active_caller_abandon()
         } else {
@@ -480,6 +547,28 @@ impl DbRuntime {
         self.handle.spawn(async move {
             drop(value);
         });
+    }
+
+    /// Close a startup connection on this runtime and wait until that drop
+    /// returns. libsql sends a stream close only when a tokio runtime is
+    /// current; dropping the connection on the plain open thread never sends it.
+    pub(crate) fn close_connection(&self, connection: Connection) {
+        if self.is_remote() {
+            self.block_on(async move {
+                drop(connection);
+            });
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || drop(connection))
+                    .join()
+                    .expect("database connection close panicked")
+            });
+        } else {
+            drop(connection);
+        }
     }
 
     #[cfg(test)]
@@ -984,7 +1073,13 @@ impl Connection {
         behavior: libsql::TransactionBehavior,
     ) -> Result<libsql::Transaction> {
         let runtime = self.runtime.clone();
-        runtime.complete_or_release_open(operation, self.inner.transaction_with_behavior(behavior))
+        let immediate = matches!(behavior, libsql::TransactionBehavior::Immediate);
+        let inner = runtime
+            .complete_or_release_open(operation, self.inner.transaction_with_behavior(behavior))?;
+        if immediate && let Some(probe) = &self.runtime.startup_probe {
+            probe.record_immediate();
+        }
+        Ok(inner)
     }
 
     pub fn transaction_immediate(&self) -> Result<Transaction> {

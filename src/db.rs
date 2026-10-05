@@ -19,6 +19,11 @@ use crate::db_compat::{
     Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out,
     params_from_iter,
 };
+#[doc(hidden)]
+pub use crate::db_compat::{
+    StartupProbe, StartupProbeGuard, current_startup_probe, enter_startup_probe,
+    install_startup_probe,
+};
 // SQL operations/parameters for connections supplied by Db::with_conn.
 pub use crate::db_compat::{SqlExecutor, params};
 use crate::types::{
@@ -346,20 +351,24 @@ pub struct StartupOpenBudget {
 /// gets a real wall-clock budget. The old `(180, 2s)` pair looked like 180
 /// tries and was actually `180 * 2s` of clock, so a multi-minute attempt exited
 /// after a handful of tries.
-pub fn startup_open_retry(opts: &DbOpenOptions) -> StartupOpenBudget {
-    if opts.url.trim().is_empty() {
-        StartupOpenBudget {
-            budget: Duration::from_secs(30),
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(1),
-        }
-    } else {
+pub fn startup_retry_budget(remote: bool) -> StartupOpenBudget {
+    if remote {
         StartupOpenBudget {
             budget: Duration::from_secs(30 * 60),
             initial_backoff: Duration::from_secs(2),
             max_backoff: Duration::from_secs(30),
         }
+    } else {
+        StartupOpenBudget {
+            budget: Duration::from_secs(30),
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(1),
+        }
     }
+}
+
+pub fn startup_open_retry(opts: &DbOpenOptions) -> StartupOpenBudget {
+    startup_retry_budget(!opts.url.trim().is_empty())
 }
 
 /// Backoff after `failed_attempts` failures. The first failure waits
@@ -539,6 +548,19 @@ fn drop_connection_without_runtime(connection: Connection) {
     crate::db_compat::drop_pooled_connection(connection);
 }
 
+struct CloseBootstrap {
+    connection: Option<Connection>,
+    runtime: DbRuntime,
+}
+
+impl Drop for CloseBootstrap {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            self.runtime.close_connection(connection);
+        }
+    }
+}
+
 impl Db {
     /// Local helper used by tests and callers that always migrate.
     pub fn open(path: &Path, pool_size: u32) -> Result<Self> {
@@ -604,11 +626,9 @@ impl Db {
                     // One primary-routed snapshot is the API readiness barrier.
                     // Replica reads can otherwise see an old completed marker
                     // while a new bot bootstrap is in progress on the primary.
+                    // This snapshot does not take the writer lock. A read-only
+                    // token fails on the first real WebUI write instead of here.
                     let _ = read_bootstrap_defaults_primary(bootstrap)?;
-                    // Bunny issues read-only tokens alongside full-access. The API
-                    // only SELECTs during open, so a read-only token would pass
-                    // bootstrap and fail later on the first WebUI write.
-                    ensure_api_writes_allowed(bootstrap)?;
                 }
                 Ok(())
             },
@@ -641,6 +661,7 @@ impl Db {
         if !remote && !opts.token.trim().is_empty() {
             anyhow::bail!("db.url / JMODGUARD_DB_URL is required when db.token is set");
         }
+        let open_started = Instant::now();
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
@@ -655,12 +676,24 @@ impl Db {
             runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?
         };
         let database = Arc::new(database);
+        let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // Migrate / schema-check on a dedicated connection first, so no other
-        // connections are racing the DDL at startup.
+        // connections are racing the DDL at startup. The connection is closed
+        // on the database runtime, including the error path.
         {
-            let mut bootstrap = Connection::from_database(Arc::clone(&database), runtime.clone())
-                .context("failed to connect to database")?;
+            let mut held = CloseBootstrap {
+                connection: Some(
+                    Connection::from_database(Arc::clone(&database), runtime.clone())
+                        .context("failed to connect to database")?,
+                ),
+                runtime: runtime.clone(),
+            };
+            let bootstrap = held
+                .connection
+                .as_mut()
+                .expect("bootstrap connection is installed");
+            let step_started = Instant::now();
             if !remote {
                 bootstrap.execute_batch(
                     "PRAGMA busy_timeout=5000;
@@ -671,7 +704,14 @@ impl Db {
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
-            initialize(&mut bootstrap)?;
+            initialize(bootstrap)?;
+            let step_ms = u64::try_from(step_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::info!(
+                migrate = opts.migrate,
+                open_ms,
+                step_ms,
+                "database startup step finished"
+            );
 
             let pool_size = opts.pool_size.max(2) as usize;
             // The API does not migrate. Its pooled work is interactive and must
@@ -700,7 +740,7 @@ impl Db {
             // `open_with_until_ready` (remote first-boot) would otherwise
             // clear this marker after a later pool-connect failure, while an
             // API that already passed the gate is serving.
-            ready(&bootstrap)?;
+            ready(bootstrap)?;
 
             Ok(Self {
                 path: opts.path.clone(),
@@ -826,7 +866,17 @@ impl Db {
             }
             attempt += 1;
             match Self::open_with_on_worker(opts.clone()).await {
-                Ok(db) => return Ok(db),
+                Ok(db) => {
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    tracing::info!(
+                        attempt,
+                        retried = attempt > 1,
+                        elapsed_ms,
+                        "database open finished"
+                    );
+                    return Ok(db);
+                }
                 Err(err) => {
                     let Some(kind) = startup_retry_kind(&err, remote) else {
                         return Err(err);
@@ -863,12 +913,14 @@ impl Db {
     }
 
     async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {
+        let probe = current_startup_probe();
         let (send, receive) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("jmodguard-db-open".into())
             .spawn(move || {
                 // The receiver can be dropped on shutdown. The worker still
                 // finishes the synchronous open; process exit reaps it.
+                let _probe = enter_startup_probe(probe);
                 let _ = send.send(Self::open_with(opts));
             })
             .context("failed to start database-open worker")?;
