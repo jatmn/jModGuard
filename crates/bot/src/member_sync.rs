@@ -1807,7 +1807,7 @@ mod tests {
         );
         let content = messages[0]["content"].as_str().unwrap();
         assert!(content.contains("saved-user"));
-        assert!(content.contains("|1 hour|"));
+        assert!(content.contains("|1h|"));
         assert!(
             content.contains(
                 &chrono::DateTime::<chrono::Utc>::from_timestamp_millis(removed_at)

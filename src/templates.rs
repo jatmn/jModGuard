@@ -2,37 +2,14 @@
 
 use std::collections::BTreeMap;
 
-/// Human-readable elapsed time: fixed 30-day months, then weeks down to seconds.
-pub fn format_duration(mut seconds: u64) -> String {
-    let mut parts = Vec::new();
-    for (unit, size) in [
-        ("month", 30 * 86400),
-        ("week", 7 * 86400),
-        ("day", 86400),
-        ("hour", 3600),
-        ("minute", 60),
-        ("second", 1),
-    ] {
-        let count = seconds / size;
-        seconds %= size;
-        if count > 0 {
-            let plural = if count == 1 { "" } else { "s" };
-            parts.push(format!("{count} {unit}{plural}"));
-        }
-    }
-    if parts.is_empty() {
-        "0 seconds".into()
-    } else {
-        parts.join(", ")
-    }
-}
-
-/// Stats-command elapsed time: days, hours, minutes, and seconds.
-/// Leading zero units are omitted. Zeros between the first and last nonzero
-/// unit stay, so one day and 38 seconds is `1d 0h 0m 38s`.
-pub fn format_compact_duration(seconds: u64) -> String {
+/// Compact Discord elapsed time, using fixed 30-day months and 7-day weeks.
+/// Leading/trailing zero units are omitted; intermediate zeros stay, so one
+/// day and 38 seconds is `1d 0h 0m 38s`. `mo` distinguishes months from minutes.
+pub fn format_duration(seconds: u64) -> String {
     let parts = [
-        (seconds / 86_400, "d"),
+        (seconds / 2_592_000, "mo"),
+        ((seconds % 2_592_000) / 604_800, "w"),
+        ((seconds % 2_592_000) % 604_800 / 86_400, "d"),
         ((seconds % 86_400) / 3_600, "h"),
         ((seconds % 3_600) / 60, "m"),
         (seconds % 60, "s"),
@@ -49,6 +26,11 @@ pub fn format_compact_duration(seconds: u64) -> String {
         .map(|(count, unit)| format!("{count}{unit}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Compatibility entry point for Stats; all Discord durations share one format.
+pub fn format_compact_duration(seconds: u64) -> String {
+    format_duration(seconds)
 }
 
 fn release_status_icon(availability: &str) -> &'static str {
@@ -325,41 +307,28 @@ mod presentation_tests {
     use super::*;
 
     #[test]
-    fn readable_elapsed_time_boundaries() {
-        for (seconds, expected) in [
-            (0, "0 seconds"),
-            (1, "1 second"),
-            (59, "59 seconds"),
-            (60, "1 minute"),
-            (61, "1 minute, 1 second"),
-            (3600, "1 hour"),
-            (86400, "1 day"),
-            (604800, "1 week"),
-            (2591999, "4 weeks, 1 day, 23 hours, 59 minutes, 59 seconds"),
-            (2592000, "1 month"),
-            (
-                6062706,
-                "2 months, 1 week, 3 days, 4 hours, 5 minutes, 6 seconds",
-            ),
-        ] {
-            assert_eq!(format_duration(seconds), expected, "{seconds}");
-        }
-    }
-
-    #[test]
-    fn compact_stats_duration_keeps_intermediate_zeros() {
+    fn compact_duration_boundaries_and_intermediate_zeros() {
         for (seconds, expected) in [
             (0, "0s"),
             (1, "1s"),
+            (59, "59s"),
             (60, "1m"),
+            (61, "1m 1s"),
+            (216, "3m 36s"),
             (818, "13m 38s"),
             (3600, "1h"),
             (86400, "1d"),
             (86438, "1d 0h 0m 38s"),
+            (259200, "3d"),
+            (604800, "1w"),
+            (2591999, "4w 1d 23h 59m 59s"),
+            (2592000, "1mo"),
+            (5184001, "2mo 0w 0d 0h 0m 1s"),
+            (6062706, "2mo 1w 3d 4h 5m 6s"),
         ] {
+            assert_eq!(format_duration(seconds), expected, "{seconds}");
             assert_eq!(format_compact_duration(seconds), expected, "{seconds}");
         }
-        assert_eq!(format_duration(60), "1 minute");
     }
 
     #[test]

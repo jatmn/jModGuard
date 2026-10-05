@@ -993,7 +993,7 @@ impl LogDelivery for Sink {
 }
 
 #[tokio::test]
-async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
+async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "system", 456)
         .await
@@ -1003,7 +1003,7 @@ async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
     assert_eq!(
         content,
         format!(
-            "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+            "Bot shutting down (v{}). Uptime: 1h 1m 1s",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -1035,7 +1035,7 @@ async fn graceful_shutdown_notice_uses_system_route_and_readable_uptime() {
     let rendered = messages[0].1["content"].as_str().unwrap();
     assert!(rendered.starts_with("**:gear: System notice**\n\n**Time:** `"));
     assert!(rendered.ends_with(&format!(
-        "Bot shutting down (v{}). Uptime: 1 hour, 1 minute, 1 second",
+        "Bot shutting down (v{}). Uptime: 1h 1m 1s",
         env!("CARGO_PKG_VERSION")
     )));
 }
@@ -1071,7 +1071,7 @@ async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
             .as_str()
             .unwrap()
             .contains(&format!(
-                "Bot shutting down (v{}). Uptime: 1 minute, 1 second",
+                "Bot shutting down (v{}). Uptime: 1m 1s",
                 env!("CARGO_PKG_VERSION")
             ))
     );
@@ -1617,10 +1617,10 @@ fn leave_uses_supplied_join_time_and_explicit_missing_context() {
     let joined =
         serenity::model::Timestamp::from_unix_timestamp(observed.timestamp() - 90_060).unwrap();
     let vars = member_join_vars(Some(joined), observed);
-    assert_eq!(vars["duration"], "1 day, 1 hour, 1 minute");
+    assert_eq!(vars["duration"], "1d 1h 1m");
     assert_eq!(vars["joined"], joined.to_string());
     let text = templates::render(default_template("member_leave"), &vars);
-    assert!(!text.contains("{duration}"));
+    assert!(text.contains("**Time in server:** `1d 1h 1m`"));
     assert_eq!(member_join_vars(None, observed)["duration"], "Unavailable");
     assert_eq!(member_join_vars(None, observed)["joined"], "Unavailable");
 }
@@ -1653,12 +1653,12 @@ fn deferred_verified_leave_uses_captured_stay_and_original_event_time() {
     let vars = verified_member_departure_vars(&departure, Some(&profile)).unwrap();
     assert_eq!(vars["user"], "Saved nickname");
     assert_eq!(vars["username"], "saved_user");
-    assert_eq!(vars["duration"], "1 hour");
+    assert_eq!(vars["duration"], "1h");
     assert_eq!(vars["joined"], "2026-09-21T14:13:20+00:00");
     assert_eq!(vars["time"], "2026-09-21T15:13:20+00:00");
     let fallback = verified_member_departure_vars(&departure, None).unwrap();
     assert_eq!(fallback["user"], departure.user_id.to_string());
-    assert_eq!(fallback["duration"], "1 hour");
+    assert_eq!(fallback["duration"], "1h");
 }
 
 #[test]

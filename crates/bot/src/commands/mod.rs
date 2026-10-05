@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::state::{BotState, CachedGuildConfig};
 use crate::templates;
-use crate::types::CommandDef;
+use crate::types::{Behavior, CommandDef};
 use crate::{db, logging};
 
 use std::collections::HashMap as StdHashMap;
@@ -710,7 +710,19 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
             "response".into(),
             outcome.response.clone().unwrap_or_default(),
         );
-        templates::render(&cmd.response, &vars)
+        // Keep stored defaults readable by older bots during a rollout or
+        // rollback. Only the current process substitutes compact presentation;
+        // other custom response text and raw numeric variables stay unchanged.
+        let response = match (&cmd.behavior, cmd.response.as_str()) {
+            (Behavior::Timeout { .. }, "Timed out {target} for {minutes} minutes | {reason}") => {
+                "Timed out {target} for {duration} | {reason}"
+            }
+            (Behavior::Slowmode { .. }, "Slowmode set to {seconds}s") => {
+                "Slowmode set to {duration}"
+            }
+            _ => &cmd.response,
+        };
+        templates::render(response, &vars)
     } else if let Some(r) = &outcome.response {
         r.clone()
     } else {
@@ -912,6 +924,64 @@ mod tests {
             response: response.map(str::to_string),
             vars: BTreeMap::new(),
             suppress_response,
+        }
+    }
+
+    #[test]
+    fn compact_duration_responses_preserve_stored_and_custom_templates() {
+        for (name, stored, seconds, compact, legacy) in [
+            (
+                "timeout",
+                "Timed out {target} for {minutes} minutes | {reason}",
+                5400,
+                "Timed out Member for 1h 30m | test",
+                "Timed out Member for 90 minutes | test",
+            ),
+            (
+                "slowmode",
+                "Slowmode set to {seconds}s",
+                90,
+                "Slowmode set to 1m 30s",
+                "Slowmode set to 90s",
+            ),
+        ] {
+            let mut command = crate::defaults::default_commands()
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap();
+            command.response = stored.into();
+            // Formatting follows behavior, even if the command is renamed or
+            // its permissions change; those settings remain untouched.
+            command.name = "renamed".into();
+            command.permission = "owner".into();
+            let mut result = outcome(None, false);
+            result.vars = BTreeMap::from([
+                ("target".into(), "Member".into()),
+                ("reason".into(), "test".into()),
+                ("minutes".into(), "90".into()),
+                ("seconds".into(), "90".into()),
+                ("duration".into(), templates::format_duration(seconds)),
+            ]);
+            assert_eq!(
+                prefix_response_text(&command, &result).as_deref(),
+                Some(compact)
+            );
+            // Slash replies call the same renderer directly.
+            assert_eq!(render_outcome(&command, &result), compact);
+            assert_eq!(command.response, stored);
+            assert_eq!(command.permission, "owner");
+            let mut old_vars = result.vars.clone();
+            old_vars.remove("duration");
+            assert_eq!(templates::render(&command.response, &old_vars), legacy);
+
+            command.response = "Custom {minutes}m / {seconds}s / {duration}".into();
+            assert_eq!(
+                render_outcome(&command, &result),
+                format!("Custom 90m / 90s / {}", templates::format_duration(seconds))
+            );
+            command.response = stored.into();
+            command.behavior = Behavior::Say;
+            assert_eq!(render_outcome(&command, &result), legacy);
         }
     }
 

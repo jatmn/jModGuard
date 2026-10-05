@@ -3048,6 +3048,34 @@ async fn placed_before_erasure(db: &Db, guild: i64) {
 }
 
 #[test]
+fn compact_duration_command_defaults_remain_legacy_renderable() {
+    let tmp = tmp_db_path("compact_duration_commands");
+    // Old bots supply only these raw duration variables. Persisted defaults
+    // must remain renderable after fresh bootstrap and after reopening.
+    let vars = std::collections::BTreeMap::from([
+        ("target".into(), "Member".into()),
+        ("reason".into(), "test".into()),
+        ("minutes".into(), "90".into()),
+        ("seconds".into(), "90".into()),
+    ]);
+    for _ in 0..2 {
+        let db = Db::open(&tmp, 2).unwrap();
+        let parts = tokio_test_block_on(load_config_parts(&db, 0)).unwrap();
+        for (name, expected) in [
+            ("timeout", "Timed out Member for 90 minutes | test"),
+            ("slowmode", "Slowmode set to 90s"),
+        ] {
+            assert_eq!(
+                crate::templates::render(&parts.commands[name].response, &vars),
+                expected
+            );
+        }
+        drop(db);
+    }
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn readable_defaults_upgrade_preserves_customizations_and_runs_once() {
     let tmp = tmp_db_path("readable_defaults");
     let db = Db::open(&tmp, 2).unwrap();
