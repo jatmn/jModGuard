@@ -12,7 +12,11 @@ pub mod defaults;
 #[cfg(unix)]
 pub mod evidence_transfer;
 pub use jmodguard_runtime::health;
+pub use jmodguard_runtime::log_shutdown_finished;
 pub use jmodguard_runtime::mark_child_ready;
+pub use jmodguard_runtime::process_ready;
+pub use jmodguard_runtime::set_process_ready;
+pub use jmodguard_runtime::set_shutdown_context;
 pub mod ids;
 pub mod image_spam;
 pub mod normalize;

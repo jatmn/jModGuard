@@ -314,9 +314,12 @@ the Bunny API returns every env var — never paste those responses.
 The Bunny API image does not embed or serve the UI at `/`; a default
 local API build (`embed-ui`) may serve `/`. Do not treat `/` on
 the container or its endpoint hostname as a ready check. Platform and
-Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. Until axum
-takes over (database open, API state primary-version prime, router
-build), only `/health` returns `200`. `/api` returns `503` with JSON
+Pull Zone liveness is `GET`/`HEAD /health` on port `8080`. `/ready` is
+readiness: `503` until startup finishes, then `200`, and it does not
+query the database. Pointing a platform check at `/ready` is a later
+deploy. Until axum takes over (database open, API state primary-version
+prime, router build), `/health` returns `200` and `/ready` stays `503`.
+`/api` returns `503` with JSON
 `{"error":"not ready"}` and `Retry-After`; `/login` and `/oauth/callback`
 return HTML `503` that refreshes the same URL (so an in-flight Discord
 redirect is not replaced by a JSON error page). The admin page retries
@@ -448,8 +451,9 @@ self-host.
    (the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain
    if you added one — not a leftover `*.b-cdn.net` host after owned-host
    cutover). The admin UI loads from Storage. Login with Discord. OAuth
-   returns to that origin. Probe `/health` (200 `ok`); do not use `/` on
-   the Bunny API origin as a ready check.
+   returns to that origin. Probe `/health` (200 `ok`) for liveness.
+   `/ready` is readiness and is not a platform check yet. Do not use `/`
+   on the API origin as a ready check.
 5. Change a harmless guild prefix. Confirm the bot picks it up, then
    restore it.
 6. Configure an `automod` log channel, enable a dry-run rule and check its Discord

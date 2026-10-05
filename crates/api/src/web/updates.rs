@@ -311,12 +311,48 @@ async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow:
     Ok(())
 }
 
+/// Read-only release poll. A changed candidate is logged and not recorded.
+/// Discovery is injected so tests do not call the registry.
+pub async fn poll_releases(
+    app: &Arc<ApiState>,
+    mut discover: impl AsyncFnMut(&str, &str) -> anyhow::Result<String>,
+) {
+    for component in ["bot", "api", "webui"] {
+        let state = match db::component_update(&app.db, component).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(component, "release read failed: {error:#}");
+                continue;
+            }
+        };
+        match discover(component, &state.channel).await {
+            Ok(digest) => {
+                let unchanged = state
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.digest == digest);
+                if unchanged {
+                    tracing::info!(component, "release candidate unchanged");
+                } else {
+                    tracing::info!(
+                        component,
+                        "release candidate changed; automatic poll does not record it"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(component, "release discovery failed: {error:#}"),
+        }
+    }
+}
+
 /// API process timer is independent of browser sessions and auto-apply policy.
 pub async fn poll_all(app: &Arc<ApiState>) {
+    poll_releases(app, async |component, channel| {
+        let registry = Registry::ghcr()?;
+        Ok(registry.discover(component, channel).await?.digest)
+    })
+    .await;
     for component in ["bot", "api", "webui"] {
-        if let Err(error) = check_one(app, component).await {
-            tracing::warn!(component, "release discovery failed: {error:#}");
-        }
         if enabled("JMODGUARD_UNATTENDED_UPDATES")
             && enabled("JMODGUARD_UPDATE_APPLY_ENABLED")
             && let Err(error) = automatic_install(app, component).await

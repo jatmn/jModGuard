@@ -241,18 +241,22 @@ impl Supervisor {
             && let Some(bind) = &self.health_bind
         {
             let listener = jmodguard::health::bind(bind).await?;
-            self.health = Some(tokio::spawn(jmodguard::health::serve_listener(listener)));
+            self.health = Some(tokio::spawn(jmodguard::health::serve_listener_as(
+                listener, "launcher",
+            )));
         }
         Ok(())
     }
 
     async fn end_idle(&mut self) -> Result<()> {
         if let Some(mut child) = self.maintenance.take() {
+            tracing::info!("stopping temporary maintenance API before the application starts");
             stop(&mut child).await?;
         }
         if let Some(task) = self.health.take() {
             task.abort();
             let _ = task.await;
+            tracing::info!("launcher released health listener");
         }
         Ok(())
     }
@@ -273,6 +277,9 @@ impl Supervisor {
         sha: &str,
         release: Option<ComponentRelease>,
     ) -> Result<()> {
+        if self.running.is_some() {
+            anyhow::bail!("application process is already running");
+        }
         if let Some(release) = &release {
             release.supports_launcher(self.launcher_revision)?;
         }
@@ -968,10 +975,12 @@ async fn main() -> Result<()> {
     let (opts, health_bind) = if role == "bot" {
         let cfg = BotProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
+        jmodguard::set_shutdown_context("launcher");
         (cfg.db_open_options(), cfg.health_bind())
     } else {
         let cfg = ApiProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
+        jmodguard::set_shutdown_context("launcher");
         (cfg.db_open_options(), None)
     };
     let baked = binary_path(&role);
@@ -984,8 +993,9 @@ async fn main() -> Result<()> {
         None
     };
     let mut boot_health = if let Some(bind) = &health_bind {
-        Some(tokio::spawn(jmodguard::health::serve_listener(
+        Some(tokio::spawn(jmodguard::health::serve_listener_as(
             jmodguard::health::bind(bind).await?,
+            "launcher",
         )))
     } else {
         None
@@ -996,8 +1006,9 @@ async fn main() -> Result<()> {
         {
             initial = None;
             if let Some(bind) = &health_bind {
-                boot_health = Some(tokio::spawn(jmodguard::health::serve_listener(
+                boot_health = Some(tokio::spawn(jmodguard::health::serve_listener_as(
                     jmodguard::health::bind(bind).await?,
+                    "launcher",
                 )));
             }
         }
@@ -1008,6 +1019,7 @@ async fn main() -> Result<()> {
                 if let Some(task) = boot_health.take() {
                     task.abort();
                     let _ = task.await;
+                    tracing::info!("launcher released health listener");
                 }
                 initial = Some(launch(&baked, &base_sha, None).await?);
             }
@@ -1019,8 +1031,18 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = jmodguard::shutdown_signal() => {
                 if let Some(child) = initial.as_mut() { stop(child).await?; }
-                if let Some(child) = maintenance.as_mut() { stop(child).await?; }
-                if let Some(task) = boot_health { task.abort(); let _ = task.await; }
+                if let Some(child) = maintenance.as_mut() {
+                    tracing::info!(
+                        "stopping temporary maintenance API before the application starts"
+                    );
+                    stop(child).await?;
+                }
+                if let Some(task) = boot_health {
+                    task.abort();
+                    let _ = task.await;
+                    tracing::info!("launcher released health listener");
+                }
+                jmodguard::log_shutdown_finished("launcher");
                 return Ok(());
             },
             _ = tokio::time::sleep(POLL) => {},
@@ -1090,6 +1112,7 @@ async fn main() -> Result<()> {
     }
     supervisor.stop_application().await?;
     supervisor.end_idle().await?;
+    jmodguard::log_shutdown_finished("launcher");
     Ok(())
 }
 

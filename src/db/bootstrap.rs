@@ -194,7 +194,7 @@ pub(super) fn bootstrap_at_capacity(conn: &Connection) -> Result<bool> {
 }
 
 pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<GuildSettings> {
-    let tx = conn.transaction_primary_read()?;
+    let tx = conn.transaction_primary_snapshot()?;
     ensure_schema_current(&tx)?;
     ensure_bootstrap_complete(&tx)?;
     let defaults = read_terminal_defaults_meta(&tx)?.ok_or_else(|| {
@@ -380,6 +380,11 @@ pub fn get_slash_registry_version_sync(db: &Db) -> Result<u64> {
 /// Primary-routed startup baseline. A replica can expose schema metadata before
 /// the atomically seeded command registry has converged.
 pub fn get_primary_versions_sync(db: &Db) -> Result<VersionState> {
+    if let Some(path) = db.sqlite_path()
+        && take_starting_state_failure(path)
+    {
+        anyhow::bail!("database is locked");
+    }
     db.with_conn_sync(|conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let state = get_version_state_conn(&tx)?;
@@ -393,6 +398,113 @@ pub fn get_primary_versions_sync(db: &Db) -> Result<VersionState> {
 /// Stored in `meta` so bot and API share one source of truth when the global
 /// settings override is empty. Process-local config alone caused split-brain
 /// whenever the two processes loaded different config values.
+static STARTING_STATE_FAILURES: std::sync::Mutex<Vec<(std::path::PathBuf, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fail the next `times` starting-state reads for this database path only.
+/// The error is the local startup lock text, so the production retry treats it
+/// as retryable. Other databases in the same process are unaffected.
+#[doc(hidden)]
+pub fn test_fail_starting_state_read(path: &std::path::Path, times: u32) {
+    STARTING_STATE_FAILURES
+        .lock()
+        .expect("starting-state failure lock")
+        .push((path.to_path_buf(), times));
+}
+
+fn take_starting_state_failure(path: &std::path::Path) -> bool {
+    let mut pending = STARTING_STATE_FAILURES
+        .lock()
+        .expect("starting-state failure lock");
+    let Some(index) = pending.iter().position(|(candidate, _)| candidate == path) else {
+        return false;
+    };
+    if pending[index].1 <= 1 {
+        pending.remove(index);
+    } else {
+        pending[index].1 -= 1;
+    }
+    true
+}
+
+const ACTIVE_BOT_LEASE: &str = "active_bot_lease";
+const ACTIVE_BOT_LEASE_TTL_MS: i64 = 20_000;
+
+fn valid_bot_instance(instance: &str) -> bool {
+    instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn lease_blocks(current: Option<&str>, instance: &str, now_ms: i64) -> bool {
+    let Some(value) = current else {
+        return false;
+    };
+    let Some((owner, expires)) = value.rsplit_once(' ') else {
+        return false;
+    };
+    let Ok(expires) = expires.parse::<i64>() else {
+        return false;
+    };
+    owner != instance && expires > now_ms
+}
+
+/// Take or renew the active-bot lease under the writer lock.
+///
+/// `refuse` is checked after the lock is held. When it is set, this does not
+/// write, so a shutdown that already started cannot reclaim the lease.
+pub async fn claim_active_bot(
+    db: &Db,
+    instance: &str,
+    now_ms: i64,
+    refuse: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<bool> {
+    anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
+    let instance = instance.to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        if refuse.load(std::sync::atomic::Ordering::Acquire) {
+            tx.finish_read()?;
+            return Ok(false);
+        }
+        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+        if lease_blocks(current.as_deref(), &instance, now_ms) {
+            tx.finish_read()?;
+            return Ok(false);
+        }
+        let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+        tx.ensure_mutation_receipt()?;
+        write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
+        tx.commit()?;
+        Ok(true)
+    })
+    .await
+}
+
+/// Drop the lease only when this instance still owns the row.
+pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
+    anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
+    let instance = instance.to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_read()?;
+        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+        let owned = current
+            .as_deref()
+            .is_some_and(|value| value.starts_with(&format!("{instance} ")));
+        if !owned {
+            tx.finish_read()?;
+            return Ok(());
+        }
+        tx.ensure_mutation_receipt()?;
+        tx.execute_rows(
+            "DELETE FROM meta WHERE key = ?1",
+            params![ACTIVE_BOT_LEASE],
+            1,
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 pub(super) const META_TERMINAL_DEFAULTS: &str = "settings_terminal_defaults";
 /// Written only after a bot has completed the entire bootstrap sequence.
 /// The API must not treat schema version alone as a readiness signal.
@@ -502,8 +614,9 @@ pub(super) fn migrate_open_needs_api_fence(conn: &Connection) -> Result<bool> {
     }
 }
 
-/// Prove the API token can mutate. Read-only Bunny tokens otherwise survive
-/// schema-open and fail on the first WebUI `PUT`.
+/// Prove a token can mutate. Startup no longer calls this; the first WebUI
+/// write fails closed. The query-only regression still uses it.
+#[cfg(test)]
 pub(super) fn ensure_api_writes_allowed(conn: &Connection) -> Result<()> {
     let tx = conn
         .transaction_primary_read()

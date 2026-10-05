@@ -12,8 +12,49 @@ pub fn mark_child_ready() -> std::io::Result<()> {
     Ok(())
 }
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use tokio::sync::watch;
+
+static PROCESS_READY: AtomicBool = AtomicBool::new(false);
+
+/// In-memory readiness. Liveness does not read this, and readiness does not
+/// touch a database.
+pub fn set_process_ready(ready: bool) {
+    PROCESS_READY.store(ready, Ordering::Release);
+}
+
+pub fn process_ready() -> bool {
+    PROCESS_READY.load(Ordering::Acquire)
+}
+
+static SHUTDOWN_CONTEXT: Mutex<&'static str> = Mutex::new("process");
+static SIGNAL_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Names the process in the stop-signal line. Set this before waiting.
+pub fn set_shutdown_context(context: &'static str) {
+    if let Ok(mut slot) = SHUTDOWN_CONTEXT.lock() {
+        *slot = context;
+    }
+}
+
+fn shutdown_context() -> &'static str {
+    SHUTDOWN_CONTEXT
+        .lock()
+        .map(|slot| *slot)
+        .unwrap_or("process")
+}
+
+/// Logs elapsed time since the stop signal. Does nothing when no signal arrived.
+pub fn log_shutdown_finished(work: &str) {
+    let started = SIGNAL_AT.lock().ok().and_then(|slot| *slot);
+    let Some(started) = started else {
+        return;
+    };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(elapsed_ms, "{work} shutdown finished");
+}
 
 /// Process-wide shutdown latch. One OS signal unblocks every waiter
 /// (database retry, health, axum, Discord shards) instead of being
@@ -32,7 +73,10 @@ fn arm_shutdown_listener() {
         let tx = shutdown_tx().clone();
         tokio::spawn(async move {
             wait_for_os_shutdown().await;
-            tracing::info!("shutdown signal received");
+            tracing::info!("stop signal arrived ({})", shutdown_context());
+            if let Ok(mut slot) = SIGNAL_AT.lock() {
+                *slot = Some(Instant::now());
+            }
             let _ = tx.send(true);
         });
     });

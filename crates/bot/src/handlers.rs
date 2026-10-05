@@ -130,11 +130,20 @@ fn warn_empty_content_once() {
 #[async_trait]
 impl EventHandler for Handler {
     async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         self.app.snapshots.install_collector(&self.app, &_ctx);
         self.app.snapshots.gap();
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
+        self.app.activation.note_discord_connected();
+        self.app.activation.publish_process_ready();
+        if !self.app.activation.allows_started_notice() {
+            tracing::info!("discord connected before this bot was ready; not posting started");
+            return;
+        }
         self.app.note_shard_ready(ctx.shard_id.0);
         self.app.snapshots.install_collector(&self.app, &ctx);
         self.app.snapshots.gap();
@@ -221,6 +230,9 @@ impl EventHandler for Handler {
     }
 
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         self.app.member_joins.clear_guild(guild.id.get());
         let app = Arc::clone(self.app());
         let gid = guild.id;
@@ -257,6 +269,9 @@ impl EventHandler for Handler {
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         self.app.invalidate_member_sync_scope();
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
@@ -291,6 +306,9 @@ impl EventHandler for Handler {
     }
 
     async fn guild_member_addition(&self, ctx: Context, new_member: Member) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let app = Arc::clone(self.app());
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
@@ -321,6 +339,9 @@ impl EventHandler for Handler {
         user: User,
         member_data: Option<Member>,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         self.app
             .image_spam
             .invalidate_author(guild_id.get(), user.id.get());
@@ -360,6 +381,9 @@ impl EventHandler for Handler {
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
             guild_id.get(),
@@ -493,6 +517,9 @@ impl EventHandler for Handler {
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
             guild_id.get(),
@@ -562,6 +589,9 @@ impl EventHandler for Handler {
         entry: serenity::model::guild::audit_log::AuditLogEntry,
         guild_id: GuildId,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let Some(action) = audit_case_action(entry.action) else {
             return;
         };
@@ -618,6 +648,9 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
@@ -753,6 +786,9 @@ impl EventHandler for Handler {
         _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
@@ -842,6 +878,9 @@ impl EventHandler for Handler {
         deleted_message_id: MessageId,
         guild_id: Option<GuildId>,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let Some(guild_id) = guild_id else { return };
         let hooked = self.app.snapshots.collector_active(&ctx);
         if !hooked {
@@ -869,6 +908,9 @@ impl EventHandler for Handler {
         multiple_deleted_messages_ids: Vec<MessageId>,
         guild_id: Option<GuildId>,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let Some(guild_id) = guild_id else { return };
         let hooked = self.app.snapshots.collector_active(&ctx);
         if !hooked {
@@ -903,6 +945,9 @@ impl EventHandler for Handler {
         new_if_available: Option<Member>,
         event: GuildMemberUpdateEvent,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         self.app
             .image_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
@@ -958,6 +1003,9 @@ impl EventHandler for Handler {
         ctx: Context,
         interaction: serenity::model::prelude::Interaction,
     ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
         let app = Arc::clone(self.app());
         commands::handle_interaction(&app, &ctx, interaction).await;
     }

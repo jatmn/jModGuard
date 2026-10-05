@@ -199,6 +199,15 @@ pub async fn register_store(
         "invalid dedicated guild id"
     );
     db.with_conn(move |conn| {
+        {
+            let tx = conn.transaction_primary_snapshot()?;
+            if let Some(existing) = registration_conn(&tx, &id)? {
+                anyhow::ensure!(existing.policy == policy, CatalogConflict::Registration);
+                tx.finish_read()?;
+                return Ok(existing);
+            }
+            tx.finish_read()?;
+        }
         let mut tx = conn.transaction_primary_read()?;
         if let Some(existing) = registration_conn(&tx, &id)? {
             anyhow::ensure!(existing.policy == policy, CatalogConflict::Registration);

@@ -2,7 +2,6 @@
 
 use anyhow::{Context as _, Result};
 use jmodguard_api::config::ApiProcessConfig;
-use jmodguard_api::web::state::ApiState;
 use jmodguard_api::{health, init_tracing, shutdown_signal, web};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +24,7 @@ async fn main() -> Result<()> {
     }
 
     init_tracing(&cfg.log, "api");
+    jmodguard::set_shutdown_context("api");
     if std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1") {
         return web::recovery::serve(cfg).await;
     }
@@ -74,18 +74,15 @@ async fn main() -> Result<()> {
                         )
                     })?;
                 tracing::info!("database ready (migrate=false) at {db_label}");
-                // `ApiState::new` and `web::router` are synchronous. Run both
-                // off the task that drives `serve_while` or `/health` stalls
-                // for the same remote round-trip / router build this listener
-                // exists to cover.
-                let app = tokio::task::spawn_blocking(move || ApiState::new(cfg_for_state, db))
-                    .await
-                    .context("app state worker stopped before returning")??;
+                // The starting-state read uses the database-open retry budget.
+                // Router build stays off this task so `/health` keeps answering.
+                let app = jmodguard_api::startup::build_state(cfg_for_state, db).await?;
                 let router_app = Arc::clone(&app);
                 let web_app = tokio::task::spawn_blocking(move || web::router(router_app))
                     .await
                     .context("router worker stopped before returning")?;
                 jmodguard::mark_child_ready().context("failed to signal API readiness")?;
+                jmodguard::set_process_ready(true);
                 // Runtime work starts only after the serving artifact exists.
                 // Starting the poller before `web::router` succeeded would leave
                 // a background task on a process that then failed to listen.
@@ -119,6 +116,7 @@ async fn main() -> Result<()> {
             } => result,
             _ = shutdown_signal() => {
                 tracing::info!("shutdown during API startup");
+                jmodguard::log_shutdown_finished("api");
                 Ok(None)
             }
         }
@@ -135,6 +133,7 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("web server error")?;
+    jmodguard::log_shutdown_finished("api");
     tracing::info!("API process stopped");
     Ok(())
 }
