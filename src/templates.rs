@@ -73,15 +73,25 @@ pub fn stats_response(uptime_seconds: u64, records: i64, warns: i64, bans: i64) 
 }
 
 /// Append cached release observations without making a network request from
-/// a Discord command. Unknown includes stale checks and legacy manual images.
+/// a Discord command. None means the lookup failed; an empty successful lookup,
+/// stale checks and legacy manual images remain unknown.
 pub fn stats_response_with_updates(
     uptime_seconds: u64,
     records: i64,
     warns: i64,
     bans: i64,
-    updates: &[crate::db::ComponentUpdate],
+    updates: Option<&[crate::db::ComponentUpdate]>,
     now: i64,
 ) -> String {
+    let Some(updates) = updates else {
+        return render(
+            "{moderation}\n\n**Release status**\nunavailable",
+            &BTreeMap::from([(
+                "moderation".into(),
+                stats_response(uptime_seconds, records, warns, bans),
+            )]),
+        );
+    };
     let mut lines = Vec::new();
     for component in ["bot", "api", "webui"] {
         let Some(item) = updates.iter().find(|item| item.component == component) else {
@@ -403,12 +413,12 @@ mod presentation_tests {
             state: "running".into(),
             last_error: None,
         };
-        let fresh = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let fresh = stats_response_with_updates(20, 1, 2, 3, Some(&[row.clone()]), 1100);
         assert!(fresh.contains(&format!("`{}`", "a".repeat(40))));
         assert!(fresh.contains("⬆️"));
         assert!(!fresh.contains("update available"));
         row.channel = "nightly".into();
-        let wrong_channel = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let wrong_channel = stats_response_with_updates(20, 1, 2, 3, Some(&[row.clone()]), 1100);
         assert!(!wrong_channel.contains("update available"));
         let wrong_api = wrong_channel
             .lines()
@@ -420,7 +430,7 @@ mod presentation_tests {
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
-        let baked_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let baked_current = stats_response_with_updates(20, 1, 2, 3, Some(&[row.clone()]), 1100);
         let api_line = baked_current
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -428,11 +438,12 @@ mod presentation_tests {
         assert!(api_line.ends_with("⚠️"), "{api_line}");
         assert!(!baked_current.contains("no source update"));
         row.channel = "nightly".into();
-        let wrong_channel_current = stats_response_with_updates(20, 1, 2, 3, &[row.clone()], 1100);
+        let wrong_channel_current =
+            stats_response_with_updates(20, 1, 2, 3, Some(&[row.clone()]), 1100);
         assert!(!wrong_channel_current.contains("no source update"));
         row.channel = "stable".into();
         row.observed_at = Some(1);
-        let stale = stats_response_with_updates(20, 1, 2, 3, &[row], 9000);
+        let stale = stats_response_with_updates(20, 1, 2, 3, Some(&[row]), 9000);
         assert!(!stale.contains(&"a".repeat(40)));
         let stale_api = stale
             .lines()
@@ -444,7 +455,7 @@ mod presentation_tests {
 
     #[test]
     fn missing_release_rows_use_the_unknown_icon() {
-        let out = stats_response_with_updates(0, 0, 0, 0, &[], 1_000);
+        let out = stats_response_with_updates(0, 0, 0, 0, Some(&[]), 1_000);
         for component in ["bot", "api", "webui"] {
             assert!(
                 out.contains(&format!("**{component}:** ❓")),
