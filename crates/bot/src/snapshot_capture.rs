@@ -958,6 +958,45 @@ fn estimated_bytes(observation: &SnapshotObservation) -> usize {
         }))
 }
 
+fn capture_enabled(config: &crate::state::CachedGuildConfig) -> bool {
+    ["message_edit", "message_delete", "message_bulk_delete"]
+        .iter()
+        .any(|event| config.log_channels.contains_key(*event))
+}
+
+// Admission stays next to the write for both a drain and each pressure-split
+// item. A previous work item's configuration never authorizes these creates.
+async fn observe_configured_creates(
+    app: &BotState,
+    store: &GuildDataStore,
+    scope: &GuildDataScope,
+    observations: Vec<SnapshotObservation>,
+) -> anyhow::Result<Vec<Option<SnapshotOutcome>>> {
+    let mut outcomes = vec![None; observations.len()];
+    let mut admitted = Vec::with_capacity(observations.len());
+    let mut indices = Vec::with_capacity(observations.len());
+    for (index, observation) in observations.into_iter().enumerate() {
+        match app.configs.get(&app.db, scope.guild_id() as u64).await {
+            Ok(config) if capture_enabled(&config) => {
+                indices.push(index);
+                admitted.push(observation);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!("message snapshot config unavailable: {error:#}");
+                app.snapshots.gap_scope(scope);
+            }
+        }
+    }
+    if !admitted.is_empty() {
+        let stored = store.observe_snapshots(scope.clone(), admitted).await?;
+        for (index, outcome) in indices.into_iter().zip(stored) {
+            outcomes[index] = Some(outcome);
+        }
+    }
+    Ok(outcomes)
+}
+
 async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
     let mut health: HashMap<String, (Instant, SnapshotHealthState, Option<&'static str>)> =
         HashMap::new();
@@ -1029,11 +1068,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 (None, true)
             }
         };
-        let configured = config.as_ref().is_some_and(|cfg| {
-            ["message_edit", "message_delete", "message_bulk_delete"]
-                .iter()
-                .any(|event| cfg.log_channels.contains_key(*event))
-        });
+        let configured = config.as_ref().is_some_and(|cfg| capture_enabled(cfg));
         match &mut work.body {
             Body::Create(observation) => {
                 if !configured {
@@ -1083,9 +1118,9 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     observations.push(next_observation.clone());
                 }
                 let count = observations.len();
-                let outcomes = store
-                    .observe_snapshots(work.scope.clone(), observations.clone())
-                    .await;
+                let outcomes =
+                    observe_configured_creates(&app, &store, &work.scope, observations.clone())
+                        .await;
                 let split = matches!(
                     outcomes
                         .as_ref()
@@ -1102,15 +1137,19 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             app.snapshots.gap_scope(&work.scope);
                             continue;
                         }
-                        single = store
-                            .observe_snapshot(work.scope.clone(), observations[index].clone())
-                            .await;
-                        single.as_ref().copied()
+                        single = observe_configured_creates(
+                            &app,
+                            &store,
+                            &work.scope,
+                            vec![observations[index].clone()],
+                        )
+                        .await;
+                        single.as_ref().map(|outcomes| outcomes[0])
                     } else {
                         outcomes.as_ref().map(|outcomes| outcomes[index])
                     };
                     match outcome {
-                        Ok(SnapshotOutcome::Stored) => {
+                        Ok(Some(SnapshotOutcome::Stored)) => {
                             update_health(
                                 &app,
                                 &store,
@@ -1121,8 +1160,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             )
                             .await;
                         }
-                        Ok(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale) => {}
-                        Ok(SnapshotOutcome::CapacityRefused) => {
+                        Ok(Some(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale)) => {}
+                        Ok(Some(SnapshotOutcome::CapacityRefused)) => {
                             app.snapshots.gap_scope(&work.scope);
                             update_health(
                                 &app,
@@ -1154,7 +1193,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             }
                             tokio::task::yield_now().await;
                         }
-                        Ok(_) => app.snapshots.gap(),
+                        Ok(None) => {}
+                        Ok(Some(_)) => app.snapshots.gap(),
                         Err(error) => {
                             tracing::warn!("message snapshot create unavailable: {error:#}");
                             app.snapshots.gap_scope(&work.scope);
@@ -1508,6 +1548,104 @@ fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_writes_recheck_configuration_for_batches_and_split_items() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_config_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 2;
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms: None,
+            coverage_epoch: 1,
+            fields: SnapshotFields {
+                content: Some("captured".into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        // Reproduce an eligible first work item followed by a configuration
+        // change before its drain reaches the production write helper.
+        let first_config = app.configs.get(&app.db, 789).await.unwrap();
+        assert!(capture_enabled(&first_config));
+        let initial =
+            observe_configured_creates(&app, &store, &scope, vec![observation(1), observation(2)])
+                .await
+                .unwrap();
+        assert_eq!(initial, vec![Some(SnapshotOutcome::Stored); 2]);
+        crate::db::delete_log_channel(&app.db, 789, "message_delete")
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        assert!(capture_enabled(&first_config), "the old admission is stale");
+        for ids in [vec![3, 4], vec![5]] {
+            let expected = vec![None; ids.len()];
+            let outcomes = observe_configured_creates(
+                &app,
+                &store,
+                &scope,
+                ids.into_iter().map(observation).collect(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcomes, expected);
+        }
+        crate::db::upsert_log_channel(&app.db, 789, "message_edit", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        assert_eq!(
+            observe_configured_creates(&app, &store, &scope, vec![observation(6)])
+                .await
+                .unwrap(),
+            vec![Some(SnapshotOutcome::Stored)]
+        );
+        // Both the batch and one-at-a-time pressure path must leave no payload
+        // behind when disabled. Re-enabling still permits new observations.
+        let retained = store
+            .take_snapshots(scope, 456, vec![1, 2, 3, 4, 5, 6], now + 1)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = retained
+            .into_iter()
+            .flatten()
+            .map(|row| row.message_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 6]);
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[test]
     fn observed_empty_differs_from_missing_and_utf8_clip_is_safe() {

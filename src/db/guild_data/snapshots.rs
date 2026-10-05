@@ -1002,3 +1002,78 @@ fn admit_snapshot(
         wrote_health,
     })
 }
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capture_automatically_retries_busy_and_rereads_committed_health() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_retry_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let registration = StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared);
+        let store = GuildDataStore::initialize(
+            GuildStoreOptions {
+                path: path.clone(),
+                url: String::new(),
+                token: String::new(),
+                pool_size: 1,
+            },
+            registration,
+        )
+        .unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let writer_path = path.clone();
+        let result = store
+            .capture(move |conn, immediate| {
+                let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(immediate, attempt == 1);
+                let mut tx = capture_transaction(conn, immediate)?;
+                let lost: i64 = tx.query_row(
+                    "SELECT lost_count FROM guild_snapshot_health WHERE singleton=1",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                if attempt == 0 {
+                    // Commit on a genuinely independent connection after the
+                    // deferred read. Its promotion must fail with SQLITE_BUSY.
+                    let writer = Connection::open(&writer_path)?;
+                    writer.execute_bounded(
+                        "UPDATE guild_snapshot_health SET lost_count=1 WHERE singleton=1",
+                        (),
+                        1_000_000,
+                    )?;
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_bounded(
+                    "UPDATE guild_snapshot_health SET lost_count=?1 WHERE singleton=1",
+                    params![lost + 10],
+                    1_000_000,
+                )?;
+                tx.commit()?;
+                Ok(lost)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(result, 1, "retry must read the competing commit");
+        assert_eq!(
+            store
+                .measure_usage(false)
+                .await
+                .unwrap()
+                .snapshot_health
+                .unwrap()
+                .lost_count,
+            11,
+            "retry must durably apply to fresh state, not overwrite with stale state"
+        );
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+}
