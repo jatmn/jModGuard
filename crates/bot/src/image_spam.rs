@@ -1384,8 +1384,8 @@ async fn run_job(
                     excerpts,
                     attachments,
                     reason: format!(
-                        "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
-                        policy.min_attachments, policy.min_channels, policy.window_secs
+                        "Verified identical image bytes: at least {} common distinct images across {} channels in {}",
+                        policy.min_attachments, policy.min_channels, crate::templates::format_duration(policy.window_secs)
                     ),
                 },
             )
@@ -1417,8 +1417,10 @@ fn report_vars(
     let (reason, content) = match report {
         Report::Verified(image_match) => (
             format!(
-                "Verified identical image bytes: at least {} common distinct images across {} channels in {} seconds",
-                policy.min_attachments, policy.min_channels, policy.window_secs
+                "Verified identical image bytes: at least {} common distinct images across {} channels in {}",
+                policy.min_attachments,
+                policy.min_channels,
+                crate::templates::format_duration(policy.window_secs)
             ),
             image_match
                 .messages

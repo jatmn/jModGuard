@@ -796,8 +796,10 @@ fn consider(
                     excerpts,
                     attachments: Vec::new(),
                     reason: format!(
-                        "Exact trimmed text across {} channels in {} seconds (minimum {} scalars)",
-                        policy.min_channels, policy.window_secs, policy.min_length
+                        "Exact trimmed text across {} channels in {} (minimum {} scalars)",
+                        policy.min_channels,
+                        crate::templates::format_duration(policy.window_secs),
+                        policy.min_length
                     ),
                 },
             )

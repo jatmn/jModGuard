@@ -757,11 +757,12 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
-const SEED_META_MARKERS: [&str; 4] = [
+const SEED_META_MARKERS: [&str; 5] = [
     "readable_log_defaults_v1",
     "attachment_delete_template_v1",
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
+    "compact_duration_commands_v1",
 ];
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
@@ -1070,6 +1071,26 @@ fn seed_globals_sql(
             sql_text(crate::defaults::PRE_BULK_STATUS_TEMPLATE)
         ));
         markers.push("retained_bulk_status_template_v1");
+    }
+    if meta_string_conn(conn, "compact_duration_commands_v1")?.is_none() {
+        for command in crate::defaults::default_commands() {
+            let old_response = match command.name.as_str() {
+                "timeout" => "Timed out {target} for {minutes} minutes | {reason}",
+                "slowmode" => "Slowmode set to {seconds}s",
+                _ => continue,
+            };
+            let mut legacy = command.clone();
+            legacy.response = old_response.into();
+            // Exact shipped payloads only, in global and guild scopes. Preserve
+            // all customized commands, including permissions and wording.
+            commands.push_str(&format!(
+                "UPDATE commands SET data = {} WHERE name = {} AND data = {};\n",
+                sql_text(&serde_json::to_string(&command)?),
+                sql_text(&command.name),
+                sql_text(&serde_json::to_string(&legacy)?)
+            ));
+        }
+        markers.push("compact_duration_commands_v1");
     }
     for mut cmd in crate::defaults::default_commands() {
         if cmd.name == "stats" && status_taken {

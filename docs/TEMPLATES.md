@@ -28,9 +28,9 @@ preview) or via `!template`.
 | `{coverage}` | last-observed continuity or a gap / unavailable reason for edit and single-delete reports |
 | `{retained}` / `{unavailable}` / `{filtered}` / `{details}` | bulk-delete counts, excluded authors and transcript availability |
 | `{count}` | bulk delete count / purge count / warn count |
-| `{duration}` | timeout length / time in server |
+| `{duration}` | compact timeout length / slowmode interval / time in server |
 | `{account_created}` | account creation timestamp |
-| `{account_age}` | readable account age |
+| `{account_age}` | compact account age |
 | `{joined}` | supplied/cached join timestamp in join/leave reports (readable UTC date), or unavailable |
 | `{time}` | event timestamp (readable UTC date and time, including seconds) |
 | `{command}` | command name (command log events) |
@@ -52,7 +52,7 @@ Unknown variables are left untouched so template mistakes are visible.
 - **timeout_add** / **timeout_remove** — timer events
 - **plan_executed** — custom command runs
 - **system** — general notices, including one start notice per process and a
-  graceful-shutdown notice with readable uptime
+  graceful-shutdown notice with compact uptime
 
 ## Log channel routing
 
@@ -104,8 +104,16 @@ Discord's supplied edit timestamp. Events without a supplied timestamp use repor
 time. Date formatting also applies to the standard `{time}`, `{account_created}`
 and `{joined}` variables in custom templates; other content is not rewritten.
 
-Durations list nonzero months, weeks, days, hours, minutes and seconds, using
-30-day months and 7-day weeks. Missing leave context says `Unavailable`.
+Durations use the same compact format as Stats: `3m 36s`, or
+`2mo 1w 3d 4h 5m 6s` for longer spans. Units are `mo`, `w`, `d`, `h`, `m`,
+and `s`, using fixed 30-day months and 7-day weeks. Leading and trailing zero
+units are omitted; intermediate zeros remain (`1d 0h 0m 38s`). Zero is `0s`.
+Missing leave context says `Unavailable`.
+The timeout and slowmode command replies also expose `{duration}`; raw
+`{minutes}` and `{seconds}` remain available for custom command responses.
+On first startup after this upgrade, exact shipped timeout and slowmode command
+definitions are updated in global and guild scopes. Customized commands are
+preserved; use `{duration}` in their response to opt into compact formatting.
 The leave template retains the supplied display name, user ID, time in server,
 join date (when known), and departure time; it does not depend on a resolved
 mention after departure.

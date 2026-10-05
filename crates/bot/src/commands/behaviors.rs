@@ -265,19 +265,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             )
             .await;
             discord?;
+            vars.insert(
+                "duration".into(),
+                crate::templates::format_duration(minutes.saturating_mul(60)),
+            );
             if minutes == 0 {
                 let mut v = vars.clone();
                 v.insert("target_id".into(), target.to_string());
-                v.insert("duration".into(), "0".into());
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_remove", v).await;
             } else {
                 let mut v = vars.clone();
                 v.insert("target_id".into(), target.to_string());
-                v.insert(
-                    "duration".into(),
-                    crate::templates::format_duration(minutes.saturating_mul(60)),
-                );
                 v.insert("reason".into(), reason.clone());
                 logging::emit(env.app, env.ctx, env.guild_id, "timeout_add", v).await;
             }
@@ -515,13 +514,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 )
                 .await?;
             vars.insert("seconds".into(), seconds.to_string());
+            let duration = crate::templates::format_duration(seconds);
+            vars.insert("duration".into(), duration.clone());
             log_mod(
                 env,
                 enrollment.clone(),
                 "slowmode",
                 env.actor,
                 "channel",
-                &format!("{seconds}s"),
+                &duration,
             )
             .await;
             Ok(BehaviorOutcome {
@@ -665,10 +666,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::About => {
             let response = format!(
-                "**{}** — a data-driven Discord moderation bot.\nVersion {}\nUptime: {:?}\nConfig via WebUI, `!help` for commands.",
+                "**{}** — a data-driven Discord moderation bot.\nVersion {}\nUptime: {}\nConfig via WebUI, `!help` for commands.",
                 env.ctx.cache.current_user().name.clone(),
                 env!("CARGO_PKG_VERSION"),
-                env.app.start.elapsed()
+                crate::templates::format_duration(env.app.start.elapsed().as_secs())
             );
             Ok(BehaviorOutcome {
                 response: Some(response),
