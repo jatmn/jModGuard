@@ -30,13 +30,10 @@ pub use jmodguard_runtime::shutdown_signal;
 /// `process` selects a per-binary log file stem (`jmodguard-bot` / `jmodguard-api`)
 /// so dual-process deploys do not contend on one shared appender.
 pub fn init_tracing(cfg: &LogConfig, process: &str) {
-    let level = cfg.level.clone();
     let dir = cfg.directory.clone();
-    // Our crate logs per-message diagnostics at debug; everything else at the
-    // configured level. This keeps the log file useful without drowning in
-    // serenity internals.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("{level},jmodguard=debug")));
+    // The loader already applies JMODGUARD_LOG_LEVEL over log.level. Do not
+    // override that configuration with RUST_LOG or crate-specific directives.
+    let filter = tracing_subscriber::EnvFilter::new(&cfg.level);
 
     let fmt = tracing_subscriber::fmt()
         .with_env_filter(filter)

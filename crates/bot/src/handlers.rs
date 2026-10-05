@@ -30,6 +30,17 @@ impl Handler {
     }
 }
 
+fn log_message_diagnostic(msg: &Message, guild_id: GuildId) {
+    tracing::debug!(
+        "message {} in guild {} channel {}: {} bytes, {} attachments",
+        msg.id,
+        guild_id,
+        msg.channel_id,
+        msg.content.len(),
+        msg.attachments.len()
+    );
+}
+
 fn user_display(member: &Member) -> String {
     member.display_name().to_string()
 }
@@ -643,15 +654,7 @@ impl EventHandler for Handler {
         if msg.content.is_empty() {
             warn_empty_content_once();
         }
-        tracing::debug!(
-            "message {} from {} in guild {} channel {}: {} bytes, {} attachments",
-            msg.id,
-            msg.author.id,
-            guild_id,
-            msg.channel_id,
-            msg.content.len(),
-            msg.attachments.len()
-        );
+        log_message_diagnostic(&msg, guild_id);
 
         app.automod.maybe_prune();
 
@@ -962,13 +965,72 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn message_diagnostics_respect_configured_level() {
+        const CHILD_LEVEL: &str = "JMODGUARD_TEST_MESSAGE_LOG_LEVEL";
+        if let Ok(level) = std::env::var(CHILD_LEVEL) {
+            let mut cfg = crate::config::LogConfig::default();
+            if level != "default" {
+                cfg.level = level;
+            }
+            cfg.directory = Default::default();
+            crate::init_tracing(&cfg, "bot");
+            let mut msg = Message::default();
+            msg.id = MessageId::new(111111111111111111);
+            msg.channel_id = ChannelId::new(222222222222222222);
+            msg.author.id = serenity::model::id::UserId::new(333333333333333333);
+            msg.content = "private message text".into();
+            log_message_diagnostic(&msg, GuildId::new(444444444444444444));
+            tracing::info!("startup log probe");
+            tracing::error!("error log probe");
+            return;
+        }
+
+        // Each subprocess has its own global subscriber and environment. Exercise
+        // the production initializer and the diagnostic used by the handler.
+        for (level, rust_log, diagnostic, info) in [
+            ("default", None, false, true),
+            ("info", None, false, true),
+            ("info", Some("jmodguard=debug"), false, true),
+            ("warn", Some("debug"), false, false),
+            ("debug", Some("off"), true, true),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "handlers::tests::message_diagnostics_respect_configured_level",
+                    "--nocapture",
+                ])
+                .env(CHILD_LEVEL, level)
+                .env_remove("RUST_LOG");
+            if let Some(rust_log) = rust_log {
+                command.env("RUST_LOG", rust_log);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let logs = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                logs.contains("message 111111111111111111"),
+                diagnostic,
+                "level={level}, RUST_LOG={rust_log:?}: {logs}"
+            );
+            assert_eq!(logs.contains("startup log probe"), info, "{logs}");
+            assert!(logs.contains("error log probe"), "{logs}");
+            assert!(!logs.contains("333333333333333333"), "{logs}");
+            assert!(!logs.contains("private message text"), "{logs}");
+        }
+    }
+
     use super::{
-        audit_case_action, departure_joined_at_ms, record_unresolved_gateway_observation,
-        select_update_authors,
+        audit_case_action, departure_joined_at_ms, log_message_diagnostic,
+        record_unresolved_gateway_observation, select_update_authors,
     };
     use crate::{db::Db, logging, state::BotState};
+    use serenity::model::channel::Message;
     use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
+    use serenity::model::id::{ChannelId, GuildId, MessageId};
 
     #[test]
     fn unsuppressed_gateway_actions_survive_equal_saved_state() {

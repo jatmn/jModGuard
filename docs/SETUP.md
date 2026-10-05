@@ -301,7 +301,10 @@ once the bot has started once. No events afterwards means nothing tracked
 happened yet (member joins/leaves, message edits/deletes, automod hits, mod
 actions are what populate it).
 
-**Diagnostics in the log:** with the default `log.level = "info"`, the bot
-logs every command invocation, unknown-prefix attempts, empty-content
-warnings, and per-message debug lines (`jmodguard=debug` is always enabled
-for its own crate). Set `log.level = "debug"` for full tracing.
+**Diagnostics in the log:** keep the default `log.level = "info"` for
+production. `JMODGUARD_LOG_LEVEL` overrides that setting; `RUST_LOG` is ignored.
+At `info`, per-message and per-guild debug diagnostics are suppressed, while
+startup, command and warning/error logs remain available. Enable `debug` only
+briefly for troubleshooting: message/guild/channel metadata and other diagnostics
+can reveal per-user activity even though the per-message line omits author IDs
+and message text. Restrict access to logs. See [logging configuration](CONFIGURATION.md).
