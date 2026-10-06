@@ -1201,8 +1201,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 );
                 // A shared store error is one call, not one outcome per index.
                 // `observe_configured_creates` already recorded its loss.
-                if !split && outcomes.is_err() {
-                    let error = outcomes.unwrap_err();
+                if !split && let Err(error) = &outcomes {
                     tracing::warn!("message snapshot create unavailable: {error:#}");
                     update_health(
                         &app,
