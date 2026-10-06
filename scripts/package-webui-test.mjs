@@ -54,3 +54,27 @@ test("WebUI package has immutable references and both entry pages", () => {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+// Inspect emitted contributions, not just named imports in the source adapter.
+test("WebUI excludes unrelated Headless component code", () => {
+  const { js } = JSON.parse(fs.readFileSync(path.join(repo, "dist/webui-metafile.json"), "utf8"));
+  const components = new Set();
+  for (const output of Object.values(js.outputs)) {
+    for (const [input, { bytesInOutput }] of Object.entries(output.inputs)) {
+      const match = input.match(/@headlessui\/react\/dist\/components\/([^/]+)\//);
+      if (match && bytesInOutput > 0) components.add(match[1]);
+    }
+  }
+  // Description, label and portal support the retained accessible Combobox.
+  assert.deepEqual([...components].sort(), ["combobox", "description", "label", "portal"]);
+});
+
+test("WebUI CSS retains used widgets and excludes unused component families", () => {
+  const css = fs.readFileSync(path.join(repo, "dist/frontend/style.css"), "utf8");
+  for (const name of ["alert", "badge", "btn", "card", "checkbox", "hero", "input", "menu", "modal", "navbar", "select", "stat", "table", "textarea"]) {
+    assert.ok(new RegExp("\\." + name + "(?=[^a-zA-Z0-9_-])").test(css), "missing " + name);
+  }
+  for (const name of ["carousel", "chat", "countdown", "dock", "drawer", "rating", "timeline"]) {
+    assert.ok(!new RegExp("\\." + name + "(?=[^a-zA-Z0-9_-])").test(css), "unused " + name);
+  }
+});

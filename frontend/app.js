@@ -1,4 +1,4 @@
-/* jModGuard WebUI — vanilla JS single-page app; daisyUI/Headless load at runtime */
+/* jModGuard WebUI — vanilla JS single-page app; daisyUI/Headless included at build time */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);

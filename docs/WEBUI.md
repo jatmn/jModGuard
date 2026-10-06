@@ -46,11 +46,30 @@ The five generated files are:
 Buildkite also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
 
-React, ReactDOM, Headless UI and daisyUI are declared with exact versions in
-`tools/webui/package.json` and pinned transitively by its lockfile. esbuild
-includes only the requested exports and their dependencies in `app.js`; daisyUI
-and the app's theme CSS share `style.css`. No third-party source or generated
-bundle is committed. Browsers fetch no external module server or stylesheet.
+The dependency audit keeps the libraries that supply existing behavior:
+
+| Dependency | Used for | Build decision |
+|---|---|---|
+| React and ReactDOM | Rendering searchable selects only | Retained; required by Headless UI |
+| Headless UI | Combobox search, keyboard navigation, focus and selection | Include its Combobox entry, excluding unrelated Dialog, Menu, Tabs, Listbox and other components |
+| Floating UI | Combobox popup anchoring | Retained internal dependency |
+| React Aria and its support packages | Combobox focus/hover handling | Retained internal dependencies |
+| TanStack Virtual | Headless UI's optional virtual mode | App does not enable it, but the Combobox module imports it; retained to avoid patching the library |
+| daisyUI | Component styles on both pages | Include the 14 used component families, base styles, light/dark themes, color properties and radius utilities |
+| esbuild and es-module-lexer | Build and import regression checks | Build/test only; never loaded by the browser |
+
+Exact versions are declared in `tools/webui/package.json` and pinned transitively
+by its lockfile. `tools/webui/style.css` lists the used CSS chunks; update it when
+adding a component family. These include alert, badge, button, card, checkbox,
+hero, input, menu, modal, navbar, select, stat, table and textarea.
+The build resolves the Combobox file inside the pinned Headless package because
+its public barrel retains unused component initializers. A dependency upgrade
+must preserve that path or update the build and pass the component exclusion
+check. No third-party source is patched or copied into Git.
+`dist/webui-metafile.json` records every build input/import and emitted-byte
+contribution for auditing; it is not published. Generated JS/CSS and library
+licenses share the existing assets. Browsers fetch no external module server
+or stylesheet, and no generated bundle is committed.
 The old `JMODGUARD_ESM_BASE` and `JMODGUARD_DAISYUI_HREF` overrides are retired.
 If widget mounting fails, native selects remain usable.
 Pale blue light and navy dark colors stay the existing theme tokens.
