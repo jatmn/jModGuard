@@ -296,7 +296,9 @@ async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<Bot
 }
 
 fn claim_next_sql() -> String {
-    format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
+    // Expiry searches use bot_actions_expiry; selecting one oldest job must
+    // walk pending order so LIMIT can stop without sorting all live jobs.
+    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
                       AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
                       ORDER BY created_at,id LIMIT 1")
 }
@@ -666,7 +668,7 @@ mod query_plan_tests {
         let db = Db::open(&path, 2).unwrap();
         db.with_conn_sync(|conn| {
             crate::db::tests::assert_index_plan(conn, &poll_due_sql(), params![123], false);
-            crate::db::tests::assert_index_plan(conn, &claim_next_sql(), params![123], false);
+            crate::db::tests::assert_index_plan(conn, &claim_next_sql(), params![123], true);
             let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT id FROM bot_actions WHERE state IN ('pending','claimed','running') AND expires_at<=?1 LIMIT 64")?;
             let plan = stmt.query_map(params![123], |r| Ok(r.get::<String>(3)?))?.collect::<Result<Vec<_>>>()?;
             assert!(plan.iter().any(|line| line.contains("state=? AND expires_at<?")), "expiry must use a range search: {plan:?}");

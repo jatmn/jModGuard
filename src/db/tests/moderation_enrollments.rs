@@ -95,7 +95,7 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
         &f.db,
         20,
         "member_ban",
-        Some(204),
+        Some(5),
         None,
         &serde_json::json!({"foreign":"secret"}),
     )
@@ -130,11 +130,30 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
             serde_json::to_value(list_bans(&f.db, 10, limit).await.unwrap()).unwrap()
         );
     }
-    let rows = query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(5), 50)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].user_id, Some(5));
+    // Sparse and absent users must retain their filters with or without a type.
+    // The matching row is near the start of the guild history; another guild
+    // has a newer row for the same user.
+    for event_type in [None, Some("member_ban")] {
+        for (user, count) in [(5, 1), (999, 0)] {
+            let rows = query_enrolled_events(&f.db, scope.clone(), event_type, Some(user), 50)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), count);
+            assert!(
+                rows.iter()
+                    .all(|row| row.guild_id == 10 && row.user_id == Some(user))
+            );
+            assert_eq!(
+                serde_json::to_value(&rows).unwrap(),
+                serde_json::to_value(
+                    query_events(&f.db, 10, event_type, Some(user), 50)
+                        .await
+                        .unwrap()
+                )
+                .unwrap()
+            );
+        }
+    }
     assert!(
         query_enrolled_events(&f.db, scope.clone(), Some("member_kick"), None, 50)
             .await

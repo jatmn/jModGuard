@@ -33,8 +33,10 @@ primary, and it does not take the writer lock, so a bot write is not queued behi
 read and a held writer does not stall the read. No recovery receipt, configuration version
 change, new table, dependency, cache, connection pool or polling task is added. Event/ban
 results retain their 1–200 row clamp, ordering and filters. Statistics retain existing
-definitions, with all three counts in one snapshot. Counts use guild-scoped index searches, and ordered event/ban pages use guild/ID
-indexes (guild/type/ID for filtered events). Counting work still grows with the
+definitions, with all three counts in one snapshot. Counts use guild-scoped index searches,
+and ordered event/ban pages use guild/ID indexes (guild/type/ID for type-only event
+filters). Event queries with a user filter use the existing user index for both
+user-only and type-plus-user lookups, retaining guild and type checks. Counting work still grows with the
 guild’s retained records; this change does not establish large-database performance or
 distributed read scaling.
 

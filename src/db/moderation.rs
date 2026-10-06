@@ -96,8 +96,14 @@ fn event_query(
     let limit = limit.clamp(1, 200);
     let mut sql = String::from(
         "SELECT id, guild_id, event_type, user_id, actor_id, data, created_at
-         FROM events WHERE guild_id = ?1",
+         FROM events",
     );
+    // Keep sparse/absent-user lookups selective instead of walking the guild's
+    // ordered history and applying user_id as a residual filter.
+    if user_id.is_some() {
+        sql.push_str(" INDEXED BY idx_events_user");
+    }
+    sql.push_str(" WHERE guild_id = ?1");
     let mut args: Vec<Value> = vec![guild_id.into()];
     if let Some(et) = &event_type {
         sql.push_str(" AND event_type = ?");
@@ -646,6 +652,19 @@ mod query_plan_tests {
                         params_from_iter(args),
                         user_id.is_none(),
                     );
+                    if user_id.is_some() {
+                        let (_, args) = event_query(42, event_type, user_id, 50);
+                        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        let plan = stmt
+                            .query_map(params_from_iter(args), |r| Ok(r.get::<String>(3)?))?
+                            .collect::<Result<Vec<_>>>()?;
+                        assert!(
+                            plan.iter()
+                                .any(|line| line.contains("SEARCH events")
+                                    && line.contains("user_id=?")),
+                            "user filter must constrain the index search: {plan:?}"
+                        );
+                    }
                 }
             }
             crate::db::tests::assert_index_plan(conn, BAN_PAGE_SQL, params![42, 50], true);
