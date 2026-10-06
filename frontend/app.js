@@ -1,11 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  Combobox,
-  ComboboxInput,
-  ComboboxButton,
-  ComboboxOptions,
-  ComboboxOption,
   Dialog,
   DialogPanel,
   Field,
@@ -50,90 +45,7 @@ function Textarea(props) {
 }
 function Select({ className = "", children, ...props }) {
   const working = useContext(BusyContext);
-  return className.split(/\s+/).includes("searchable")
-    ? h(SearchSelect, { ...props, disabled: working || props.disabled, className }, children)
-    : h(HeadlessSelect, { ...props, disabled: working || props.disabled, className }, children);
-}
-function SearchSelect({ children, defaultValue, value, onChange, className, ref, ...props }) {
-  const localRef = useRef(null);
-  const controlRef = ref || localRef;
-  const options = React.Children.toArray(children).map((child) => ({
-    value: String(child.props.value),
-    label: child.props.children,
-  }));
-  const [selection, setSelection] = useState(defaultValue ?? options[0]?.value ?? "");
-  const [query, setQuery] = useState("");
-  const selectedValue = value ?? selection;
-  const selected = options.find((item) => item.value === selectedValue) || null;
-  const filtered = options.filter((item) =>
-    `${item.label} ${item.value}`.toLowerCase().includes(query.trim().toLowerCase()),
-  );
-  return h(
-    "div",
-    { className: "search-select" },
-    h(
-      "select",
-      {
-        ...props,
-        id: undefined,
-        ref: controlRef,
-        onInput: (event) => setSelection(event.currentTarget.value),
-        className: "search-select-native",
-        tabIndex: -1,
-        "aria-hidden": true,
-        value: selectedValue,
-        onChange,
-        readOnly: true,
-      },
-      children,
-    ),
-    h(
-      Combobox,
-      {
-        value: selected,
-        by: "value",
-        disabled: props.disabled,
-        onClose: () => setQuery(""),
-        onChange: (item) => {
-          if (!item) return;
-          setSelection(item.value);
-          // The native form value participates in the dashboard's save/draft rules.
-          if (controlRef.current) {
-            controlRef.current.value = item.value;
-            controlRef.current.dispatchEvent(new Event("input", { bubbles: true }));
-          }
-          onChange?.({ target: { value: item.value }, currentTarget: controlRef.current });
-        },
-      },
-      h(
-        "div",
-        {
-          className: `select select-bordered w-full search-select-control${className.includes("select-sm") ? " select-sm" : ""}`,
-        },
-        h(ComboboxInput, {
-          id: props.id,
-          className: "search-select-input",
-          "aria-label": props["aria-label"] || "Search options",
-          displayValue: (item) => item?.label || "",
-          onChange: (event) => setQuery(event.target.value),
-        }),
-        h(ComboboxButton, { className: "search-select-button", "aria-label": "Show options" }, "▾"),
-      ),
-      h(
-        ComboboxOptions,
-        { className: "search-select-options menu bg-base-100 rounded-box shadow-lg", anchor: "bottom start" },
-        filtered.length
-          ? filtered.map((item) =>
-              h(
-                ComboboxOption,
-                { key: item.value, value: item, className: "search-select-option" },
-                item.label,
-              ),
-            )
-          : h("div", { className: "search-select-empty" }, "No matches"),
-      ),
-    ),
-  );
+  return h(HeadlessSelect, { ...props, disabled: working || props.disabled, className }, children);
 }
 function Appearance({ preference, setPreference }) {
   useEffect(() => {
@@ -288,7 +200,7 @@ function App() {
                 {
                   id: "guild-select",
                   "aria-label": "YOUR SERVER",
-                  className: "searchable select select-bordered select-sm w-full",
+                  className: "select select-bordered select-sm w-full",
                   value: state.guildId || "",
                   onChange: async (event) => {
                     if (!canLeave()) return;
@@ -484,7 +396,6 @@ function Notification() {
 function trackDraft(event) {
   if (
     event.target.matches("input, textarea, select") &&
-    !event.target.classList.contains("search-select-input") &&
     !["events", "members", "bans"].includes(state.tab)
   )
     markDirty();
@@ -699,7 +610,6 @@ function markDirty() {
 function currentDraftInputs() {
   return [...($("#content")?.querySelectorAll("input, select, textarea") || [])].filter(
     (input) =>
-      !input.classList.contains("search-select-input") &&
       input._initialValue !== undefined &&
       input.value !== input._initialValue,
   );
@@ -4370,7 +4280,7 @@ function tabSettings() {
     Select,
     {
       ref: srcSelRef,
-      className: "searchable" + " select select-bordered",
+      className: "select select-bordered",
       onChange: (event) =>
         handleEvent(
           event.currentTarget,
@@ -4766,7 +4676,7 @@ function RuleAction({ action, index, remove }) {
         h(
           Select,
           {
-            className: "searchable select select-bordered",
+            className: "select select-bordered",
             defaultValue: action.action,
             onChange: (event) => {
               action.action = event.target.value;
@@ -4837,7 +4747,7 @@ function CommandStep({ step, placeholder, onChange, remove }) {
       h(
         Select,
         {
-          className: "searchable select select-bordered",
+          className: "select select-bordered",
           value: step.type,
           "aria-label": "Step action",
           onChange: (event) => {
@@ -4966,7 +4876,8 @@ function tabEvents() {
       h(
         Select,
         {
-          className: "searchable select select-bordered",
+          className: "select select-bordered",
+          "aria-label": "Event type",
           value: type,
           onChange: (event) => {
             setType(event.target.value);

@@ -13,7 +13,7 @@ const bootDom = new JSDOM('<html><body></body></html>', {pretendToBeVisual: true
 activate(bootDom.window);
 const { createRoot: reactRoot } = await import('../tools/webui/node_modules/react-dom/client.js');
 const { flushSync } = await import('../tools/webui/node_modules/react-dom/index.js');
-const { Combobox, ComboboxInput, ComboboxButton, ComboboxOptions, ComboboxOption, Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea } = await import('../tools/webui/components.js');
+const { Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea } = await import('../tools/webui/components.js');
 import { afterEach, after } from 'node:test';
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nrender\(\);\ninit\(\);\n/, '\n');
@@ -80,7 +80,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     React, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot,
-    Combobox, ComboboxInput, ComboboxButton, ComboboxOptions, ComboboxOption, Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
+    Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
@@ -2492,7 +2492,6 @@ test('React WebUI retains the framework imports, styling and pale-blue tokens', 
   assert.doesNotMatch(html, /https?:\/\//);
   assert.doesNotMatch(js, /esm\.sh|cdn\.jsdelivr\.net|JMODGUARD_ESM_BASE|JMODGUARD_DAISYUI_HREF/);
   assert.match(js, /from "react"/);
-  assert.match(js, /anchor:\s*"bottom start"/);
   assert.match(css, /--bg:\s*#f0f7ff/);
   assert.match(css, /--accent:\s*#2266c2/);
   assert.match(css, /\[data-theme="dark"\][\s\S]*--bg:\s*#0d1727/);
@@ -2507,13 +2506,11 @@ test('React WebUI retains the framework imports, styling and pale-blue tokens', 
   assert.doesNotMatch(css, /\.hero\s*\{[^}]*background:/);
   assert.doesNotMatch(css, /\.stat-grid/);
   assert.doesNotMatch(css, /\.btn\.primary/);
-  assert.match(css, /\.search-select-options\s*\{[^}]*z-index:\s*1100/);
   assert.match(css, /--color-base-100:\s*var\(--panel\)/);
   assert.match(js, /hero-content/);
   assert.match(js, /stat-title/);
   assert.match(js, /btn-primary/);
   assert.match(js, /dashboard-hero/);
-  assert.match(js, /search-select-control/);
   assert.doesNotMatch(js, /btn-neutral/);
   assert.match(js, /className: "stats /);
   assert.match(js, /btn btn-primary/);
@@ -2556,7 +2553,8 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
     if (options.method === 'PUT') submitted = JSON.parse(options.body);
     return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
   });
-  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'ban', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
+  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
+  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
   for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Delete history (days)', '2'], ['Reason template', 'Updated reason']]) {
     const wrapper = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(label));
     assert.ok(wrapper, label);
@@ -2567,27 +2565,47 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
   }
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click', {});
   assert.equal(submitted.data.actions[0].at, 3);
+  assert.equal(submitted.data.actions[0].action, 'ban');
   assert.equal(submitted.data.actions[0].duration_minutes, 15);
   assert.equal(submitted.data.actions[0].delete_days, 2);
   assert.equal(submitted.data.actions[0].reason, 'Updated reason');
 });
 
 async function chooseOption(select, label) {
-  const document = select.ownerDocument;
-  await fire(select.closest('.search-select').querySelector('[aria-label="Show options"]'), 'click');
-  const option = Array.from(document.querySelectorAll('[role="option"]')).find(node => node.textContent === label);
+  const option = Array.from(select.options).find(node => node.textContent === label);
   assert.ok(option, label);
-  flushSync(() => option.dispatchEvent(new document.defaultView.MouseEvent('mousedown', {bubbles: true, button: 0, cancelable: true})));
-  await settle();
+  select.value = option.value;
+  await fire(select, 'input');
+  await fire(select, 'change');
 }
 
 test('changing only a rule action through Headless UI marks unsaved edits', async () => {
   const h = harness();
   const modal = await h.app.editRule({name: 'Mentions', rule_id: 'mention_spam', effective: {enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}});
   assert.equal(h.app.isDirty(), false);
-  await chooseOption(modal.querySelector('.search-select-native'), 'ban');
-  assert.equal(modal.querySelector('.search-select-native').value, 'ban');
+  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
+  assert.equal(modal.querySelector('.escalation-step select').value, 'ban');
   assert.equal(h.app.isDirty(), true);
+});
+
+test('native server selection restores the selected server and draft when navigation is cancelled', async () => {
+  const calls = [];
+  const h = harness(async url => { calls.push(url); return response({}); }, new Map(), new Map(), () => false);
+  h.app.state.config = { templates: [{event: 'member_join', effective: 'Welcome'}] };
+  h.app.navigate('templates');
+  await settle();
+  const draft = h.document.querySelector('.template-card textarea');
+  draft.value = 'Unsaved template';
+  await fire(draft, 'input');
+  const select = h.document.querySelector('#guild-select');
+  assert.equal(select.localName, 'select');
+  const originalGuild = h.app.state.guildId;
+  await chooseOption(select, 'Second');
+  assert.equal(select.value, originalGuild);
+  assert.equal(h.app.state.guildId, originalGuild);
+  assert.equal(draft.value, 'Unsaved template');
+  assert.equal(h.app.isDirty(), true);
+  assert.deepEqual(calls, []);
 });
 
 
@@ -2718,7 +2736,7 @@ test('field labels exclude control values and command steps have individual iden
   }
   const modal = await h.app.editCommand(null);
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === '+ add step'), 'click');
-  const inputs = [...modal.querySelectorAll('.step-card input')];
+  const inputs = [...modal.querySelectorAll('.step-card input, .step-card select')];
   assert.equal(inputs.length, 4);
   assert.equal(new Set(inputs.map(input => input.id)).size, inputs.length);
   for (const input of inputs) assert.match(input.getAttribute('aria-label'), /^Step (action|value)$/);

@@ -51,10 +51,10 @@ The dependency audit keeps the libraries that supply existing behavior:
 | Dependency | Used for | Build decision |
 |---|---|---|
 | React and ReactDOM | Rendering and component lifecycle on the moderation and Administration pages | Retained; replace manual DOM construction, reconciliation and event wiring |
-| Headless UI | Searchable selects, editor dialogs, focus/dismissal and form label associations | Include Combobox, Dialog, Field, Label, Input, Select and Textarea plus their internal helpers; exclude unrelated Menu, Tabs, Listbox and other components |
-| Floating UI | Combobox popup anchoring | Retained internal dependency |
+| Headless UI | Native selects, editor dialogs, focus/dismissal and form label associations | Include Dialog, Field, Label, Input, Select and Textarea plus their internal helpers; exclude Combobox, Menu, Tabs, Listbox and other components |
+| Floating UI | Upstream Headless popup dependency | Excluded from browser assets; retained only in the installation lockfile |
 | React Aria and its support packages | Headless control focus/hover handling | Retained internal dependencies |
-| TanStack Virtual | Headless UI's optional virtual mode | App does not enable it, but the Combobox module imports it; retained to avoid patching the library |
+| TanStack Virtual | Upstream Headless Combobox virtualization dependency | Excluded from browser assets; retained only in the installation lockfile |
 | daisyUI | Component styles on both pages | Include the 14 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
 | esbuild, es-module-lexer and jsdom | Build, import checks and real React/DOM regression tests | Build/test only; never loaded by the browser |
 
@@ -79,10 +79,14 @@ Both pages use React throughout; there is no parallel vanilla renderer. Native
 form values participate in the existing application-specific draft and save
 rules. API permissions, membership fencing, queued receipts and moderation
 policy remain application logic. Headless UI owns dialog focus restoration,
-Escape/outside dismissal, searchable selection and field label associations.
+Escape/outside dismissal and field label associations. Selects use native browser
+menus and keyboard selection, styled by daisyUI; inline text filtering is removed.
+Headless Listbox is another installed option, but its custom popup retains the
+Floating UI stack. React Aria offers lower-level selection hooks that need custom
+rendering and state integration. Reusing Headless Select avoids both additions.
 Pale blue light and navy dark colors stay the existing theme tokens.
-Buttons, cards, hero, stats, badges, tables, inputs, and the searchable
-select use daisyUI (and Headless Combobox) component classes mapped onto
+Buttons, cards, hero, stats, badges, tables, inputs, and selects
+use daisyUI component classes mapped onto
 those tokens. First-party CSS is the workspace shell and theme, not a
 restyle of daisyUI widgets back into the previous custom controls.
 

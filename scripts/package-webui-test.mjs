@@ -56,17 +56,18 @@ test("WebUI package has immutable references and both entry pages", () => {
 });
 
 // Inspect emitted contributions, not just named imports in the source adapter.
-test("WebUI excludes unrelated Headless component code", () => {
+test("WebUI excludes unused Headless components and popup dependency families", () => {
   const { js } = JSON.parse(fs.readFileSync(path.join(repo, "dist/webui-metafile.json"), "utf8"));
   const components = new Set();
   for (const output of Object.values(js.outputs)) {
     for (const [input, { bytesInOutput }] of Object.entries(output.inputs)) {
+      if (bytesInOutput > 0) assert.doesNotMatch(input, /node_modules\/(?:@tanstack|@floating-ui)\//);
       const match = input.match(/@headlessui\/react\/dist\/components\/([^/]+)\//);
       if (match && bytesInOutput > 0) components.add(match[1]);
     }
   }
   // These are the controls used by the React UI plus their accessibility/lifecycle helpers.
-  assert.deepEqual([...components].sort(), ["combobox", "description", "dialog", "field", "focus-trap", "input", "label", "portal", "select", "textarea", "transition"]);
+  assert.deepEqual([...components].sort(), ["description", "dialog", "field", "focus-trap", "input", "label", "portal", "select", "textarea", "transition"]);
 });
 
 test("WebUI CSS retains used widgets and excludes unused component families", () => {
