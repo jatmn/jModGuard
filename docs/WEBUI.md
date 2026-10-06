@@ -55,13 +55,17 @@ The dependency audit keeps the libraries that supply existing behavior:
 | Floating UI | Combobox popup anchoring | Retained internal dependency |
 | React Aria and its support packages | Headless control focus/hover handling | Retained internal dependencies |
 | TanStack Virtual | Headless UI's optional virtual mode | App does not enable it, but the Combobox module imports it; retained to avoid patching the library |
-| daisyUI | Component styles on both pages | Include the 14 used component families, base styles, light/dark themes, color properties and radius utilities |
+| daisyUI | Component styles on both pages | Include the 14 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
 | esbuild, es-module-lexer and jsdom | Build, import checks and real React/DOM regression tests | Build/test only; never loaded by the browser |
 
 Exact versions are declared in `tools/webui/package.json` and pinned transitively
 by its lockfile. `tools/webui/style.css` lists the used CSS chunks; update it when
 adding a component family. These include alert, badge, button, card, checkbox,
 hero, input, menu, modal, navbar, select, stat, table and textarea.
+The four used theme utilities (`bg-base-100`, `bg-base-200`, `text-warning`,
+`rounded-box`) live with the existing token mappings in `frontend/style.css`.
+This avoids loading all color/opacity and directional/responsive radius variants
+without adding a CSS pruning tool or replacing framework widgets.
 `tools/webui/components.js` selects component entries inside the pinned Headless
 package because its public barrel retains unused component initializers. A
 dependency upgrade must preserve those paths or update the adapter and pass the

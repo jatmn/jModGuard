@@ -77,4 +77,13 @@ test("WebUI CSS retains used widgets and excludes unused component families", ()
   for (const name of ["carousel", "chat", "countdown", "dock", "drawer", "rating", "timeline"]) {
     assert.ok(!new RegExp("\\." + name + "(?=[^a-zA-Z0-9_-])").test(css), "unused " + name);
   }
+  for (const name of ["bg-base-100", "bg-base-200", "text-warning", "rounded-box"]) {
+    assert.ok(css.includes("." + name + "{"), "missing theme utility " + name);
+  }
+  // Optional utility sheets contain hundreds of unused colors/opacity/radius variants.
+  const { css: metadata } = JSON.parse(fs.readFileSync(path.join(repo, "dist/webui-metafile.json"), "utf8"));
+  assert.ok(!Object.keys(metadata.inputs).some((name) => /daisyui\/(colors\/|utilities\/radius\.css)/.test(name)));
+  for (const name of ["bg-base-300", "text-secondary", "rounded-t-box", "rounded-selector"]) {
+    assert.ok(!css.includes("." + name), "unused theme utility " + name);
+  }
 });
