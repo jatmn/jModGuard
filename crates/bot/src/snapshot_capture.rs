@@ -965,8 +965,8 @@ fn capture_enabled(config: &crate::state::CachedGuildConfig) -> bool {
 }
 
 // Admission stays next to the write for both a drain and each pressure-split
-// item. Recheck cleanup pause after the configuration await as well; neither
-// admission check on an earlier work item authorizes these creates.
+// item. Recheck cleanup pause and deletion identity after the configuration
+// await: a deletion can arrive while a preceding split item finishes eviction.
 async fn observe_configured_creates(
     app: &BotState,
     store: &GuildDataStore,
@@ -979,7 +979,12 @@ async fn observe_configured_creates(
     for (index, observation) in observations.into_iter().enumerate() {
         match app.configs.get(&app.db, scope.guild_id() as u64).await {
             Ok(config) if capture_enabled(&config) => {
-                if app.snapshots.capture_paused(scope) {
+                let key = (
+                    scope.guild_id() as u64,
+                    observation.channel_id as u64,
+                    observation.message_id as u64,
+                );
+                if app.snapshots.capture_paused(scope) || app.snapshots.deleted(key) {
                     app.snapshots.gap_scope(scope);
                     continue;
                 }
@@ -1553,6 +1558,165 @@ fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pressure_split_rechecks_deletions_before_each_admission() {
+        use std::future::Future;
+
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_deleted_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms: None,
+            coverage_epoch: 1,
+            fields: SnapshotFields {
+                content: Some("captured".into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        store
+            .observe_snapshot(scope.clone(), observation(100))
+            .await
+            .unwrap();
+        let raw = libsql::Builder::new_local(format!("{}.guild.db", path.display()))
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.execute(
+            "UPDATE guild_snapshot_health SET estimated_snapshot_bytes=?1 WHERE singleton=1",
+            libsql::params![jmodguard::capacity::SNAPSHOT_BUDGET_BYTES as i64 - 2000],
+        )
+        .await
+        .unwrap();
+        // All creates pass the drain's deletion check before the batch refuses.
+        for id in 1..=4 {
+            assert!(!app.snapshots.deleted((789, 456, id)));
+        }
+        let error =
+            observe_configured_creates(&app, &store, &scope, (1..=4).map(observation).collect())
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SnapshotError>(),
+            Some(SnapshotError::BatchCapacity)
+        ));
+        assert_eq!(
+            observe_configured_creates(&app, &store, &scope, vec![observation(1)])
+                .await
+                .unwrap(),
+            vec![Some(SnapshotOutcome::CapacityRefused)]
+        );
+        // Drive the real deletion owner while the preceding split item has yet
+        // to finish eviction. There is no queued deletion to remove a late row.
+        app.snapshots
+            .unhooked_delete(GuildId::new(789), ChannelId::new(456), &[MessageId::new(2)]);
+        assert_eq!(store.evict_snapshots(100, now).await.unwrap(), 1);
+        let store_id = scope.placement().store_id().as_str();
+        app.snapshots.take_loss(store_id);
+        for id in [2, 3] {
+            // For item 3 the deletion arrives during its own config reload.
+            let outcomes = if id == 3 {
+                app.invalidate_configs();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let occupied_db = app.db.clone();
+                let occupied = tokio::spawn(async move {
+                    occupied_db
+                        .with_conn(move |_| {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                });
+                entered_rx.await.unwrap();
+                let mut write = Box::pin(observe_configured_creates(
+                    &app,
+                    &store,
+                    &scope,
+                    vec![observation(id)],
+                ));
+                std::future::poll_fn(|cx| match write.as_mut().poll(cx) {
+                    std::task::Poll::Pending => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(_) => panic!("configuration reload did not wait"),
+                })
+                .await;
+                app.snapshots.unhooked_delete(
+                    GuildId::new(789),
+                    ChannelId::new(456),
+                    &[MessageId::new(id as u64)],
+                );
+                release_tx.send(()).unwrap();
+                occupied.await.unwrap();
+                write.await.unwrap()
+            } else {
+                observe_configured_creates(&app, &store, &scope, vec![observation(id)])
+                    .await
+                    .unwrap()
+            };
+            let retained = store
+                .take_snapshot(scope.clone(), 456, id, now + 1)
+                .await
+                .unwrap();
+            assert!(
+                retained.is_none(),
+                "deleted message {id} persisted: {outcomes:?}"
+            );
+            assert_eq!(outcomes, vec![None]);
+        }
+        assert_eq!(app.snapshots.take_loss(store_id), 2);
+        // An undeleted retry still writes and retains the original payload.
+        assert_eq!(
+            observe_configured_creates(&app, &store, &scope, vec![observation(4)])
+                .await
+                .unwrap(),
+            vec![Some(SnapshotOutcome::Stored)]
+        );
+        let retained = store
+            .take_snapshot(scope, 456, 4, now + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.fields.content.as_deref(), Some("captured"));
+        drop(conn);
+        drop(raw);
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[tokio::test]
     async fn capture_rechecks_cleanup_pause_after_configuration_reload() {
