@@ -1,49 +1,32 @@
-/* Owner-only Administration page. The API enforces ownership and Origin for
- * every mutation; hidden controls do not provide authorization. */
-const cards = document.getElementById("update-cards");
-const statusNode = document.getElementById("update-status");
-const updateView = document.getElementById("updates");
-const signIn = document.getElementById("sign-in");
-const usageView = document.getElementById("database-usage");
-const usageCards = document.getElementById("usage-cards");
-const usageStatus = document.getElementById("usage-status");
+/* Owner Administration. React owns rendering; the API remains authoritative. */
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+
+const h = React.createElement;
+const root = createRoot(document.getElementById("content"));
 let activeView = "updates";
 let snapshot = null;
+let usageSnapshot = null;
+let usageStale = false;
+let usageRevision = 0;
+let usageMessage = "Waiting to load usage…";
+let status = { message: "Checking your access and release state…", tone: "neutral" };
+let refreshing = null;
 let usageRefreshPromise = null;
 const detailRequests = new Map();
-let refreshing = null;
 let busy = false;
 let stale = true;
 let authorized = false;
 let accessDenied = false;
+let needsSignIn = false;
 let rateLimitUntil = 0;
 let refreshTimer;
 let actionMessage = "";
-const componentViews = new Map();
-let browserView;
-const refreshButton = document.getElementById("refresh-status");
+let policyRevision = 0;
 
-function initTheme() {
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  const select = document.getElementById("appearance");
-  let preference = "system";
-  try { preference = window.localStorage.getItem("jmodguard.theme") || "system"; } catch (_) { /* Storage is optional. */ }
-  if (!["light", "dark", "system"].includes(preference)) preference = "system";
-  const apply = () => {
-    const dark = preference === "dark" || (preference === "system" && media.matches);
-    document.documentElement.dataset.theme = dark ? "dark" : "light";
-    document.querySelector('meta[name="theme-color"]').content = dark ? "#101e33" : "#e0eeff";
-    select.value = preference;
-  };
-  select.addEventListener("change", () => {
-    preference = select.value;
-    try { window.localStorage.setItem("jmodguard.theme", preference); } catch (_) { /* Storage is optional. */ }
-    apply();
-  });
-  media.addEventListener("change", apply);
-  apply();
-}
-
+function render() { root.render(h(Administration)); }
+function notice(message, tone = "neutral") { status = { message, tone }; render(); }
+function restorePolicySelections() { policyRevision++; }
 function applicationPending(record) {
   // A launcher failure changes the shared state but leaves a service request active.
   // Failed WebUI publications intentionally retain desired for recovery, not retry.
@@ -54,11 +37,6 @@ function applicationPending(record) {
 function pending(record) {
   return applicationPending(record) || Boolean(record.desired_launcher &&
     record.desired_launcher.digest !== record.installed_launcher?.digest);
-}
-
-function notice(message, tone = "neutral") {
-  statusNode.textContent = message;
-  statusNode.className = `administration-notice administration-${tone}`;
 }
 
 function nextRefreshDelay(normal) {
@@ -87,18 +65,6 @@ function apiBase() {
   return (window.JMODGUARD_API_BASE || "").replace(/\/$/, "");
 }
 
-const base = apiBase();
-document.getElementById("sign-in-link").href = base
-  ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}`
-  : "/login?return_to=%2Fadministration%2Findex.html";
-
-function node(tag, text, className) {
-  const element = document.createElement(tag);
-  if (text != null) element.textContent = text;
-  if (className) element.className = className;
-  return element;
-}
-
 async function request(path, body) {
   const response = await fetch(apiBase() + path, {
     method: body === undefined ? "GET" : "POST",
@@ -117,9 +83,8 @@ async function request(path, body) {
     accessDenied = true;
     stale = true;
     clearTimeout(refreshTimer);
-    signIn.classList.remove("hidden");
-    updateView.classList.add("hidden");
-    usageView.classList.add("hidden");
+    needsSignIn = true;
+    render();
     throw new Error("Sign in again to manage updates.");
   }
   if (response.status === 403) {
@@ -127,8 +92,7 @@ async function request(path, body) {
     accessDenied = true;
     stale = true;
     clearTimeout(refreshTimer);
-    updateView.classList.add("hidden");
-    usageView.classList.add("hidden");
+    render();
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
   rateLimitUntil = 0;
@@ -155,18 +119,9 @@ function uptime(timestamp) {
     days || hours || minutes ? `${minutes}m` : "", `${seconds}s`].filter(Boolean).join(" ");
 }
 
-function line(parent, label, value) {
-  const item = node("p", null, "administration-detail");
-  const strong = node("strong", `${label}: `);
-  item.append(strong, node("span", String(value)));
-  parent.append(item);
-}
-
-function restorePolicySelections() {
-  for (const view of componentViews.values()) {
-    view.channelValue = undefined;
-    view.cadenceValue = undefined;
-  }
+function line(items, label, value) {
+  items.push(h("p", { key: label, className: "administration-detail" },
+    h("strong", null, label + ": "), h("span", null, String(value))));
 }
 
 async function mutate(record, label, callback) {
@@ -211,227 +166,135 @@ async function mutate(record, label, callback) {
   }
 }
 
-function action(label, callback, view) {
-  const button = node("button", label, "btn btn-sm");
-  button.type = "button";
-  button.addEventListener("click", () => {
-    // Read the record when the request is built, after mutate finishes any in-flight refresh.
-    return mutate(view.record, label, () => callback(view.record));
-  });
-  return button;
-}
-
-// Keep controls mounted during status reads so native selects and keyboard focus survive.
-function createComponentView(record) {
-  const view = { record };
-  view.card = node("section", null, "card bg-base-100 administration-card");
-  const content = node("div", null, "card-body");
-  view.heading = node("div", null, "administration-card-heading");
-  view.info = node("div", null, "administration-info");
-  const details = node("details", null, "administration-technical");
-  details.append(node("summary", "Version & technical details"));
-  view.technical = node("div");
-  details.append(view.technical);
-  view.help = node("p", null, "muted administration-help");
-  const row = node("div", null, "card-actions administration-actions");
-  view.check = action("Check now", (item) => request("/api/updates/check", { component: item.component }), view);
-  view.install = action(record.component === "webui" ? "Update WebUI" : "Update",
-    (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }), view);
-  row.append(view.check, view.install);
-  if (record.component !== "webui") {
-    view.launcher = action("Update launcher", (item) => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }), view);
-    const advanced = node("details", null, "administration-technical");
-    advanced.append(node("summary", "Advanced launcher controls"),
-      node("p", "The launcher starts and recovers this service. Normal Update includes any required launcher update first. Use this control only for an optional launcher update; it restarts the service."), view.launcher);
-    row.append(advanced);
-  }
-  view.policy = node("fieldset", null, "administration-policy");
-  view.policy.append(node("legend", "Release policy"));
-  view.channel = node("select", null, "select select-bordered select-sm");
-  view.channel.setAttribute("aria-label", `${record.component} release channel`);
-  for (const value of ["latest", "stable", "nightly"]) {
-    const option = node("option", value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases");
-    option.value = value;
-    view.channel.append(option);
-  }
-  view.channel.addEventListener("change", () => {
-    const value = view.channel.value;
-    return mutate(view.record, "Save release channel", () => {
-      const item = view.record;
-      return request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence });
-    });
-  });
-  const channelLabel = node("label", "Release channel", "field");
-  channelLabel.append(view.channel);
-  view.cadence = node("select", null, "select select-bordered select-sm");
-  view.cadence.setAttribute("aria-label", `${record.component} automatic installation cadence`);
-  for (const value of ["off", "daily", "weekly", "monthly"]) {
-    const option = node("option", value === "off" ? "Automatic install off" : value);
-    option.value = value;
-    view.cadence.append(option);
-  }
-  view.cadence.addEventListener("change", () => {
-    const value = view.cadence.value;
-    return mutate(view.record, "Save automatic installation", () => {
-      const item = view.record;
-      return request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value });
-    });
-  });
-  const cadenceLabel = node("label", "Automatic installation", "field");
-  cadenceLabel.append(view.cadence);
-  view.policy.append(channelLabel, cadenceLabel);
-  content.append(view.heading, view.info, details, view.help, row, view.policy);
-  view.card.append(content);
-  cards.append(view.card);
-  return view;
+function action(label, component, callback, props = {}) {
+  return h("button", { type: "button", className: "btn btn-sm", ...props,
+    onClick: () => mutate(snapshot.components.find(item => item.component === component), label,
+      () => callback(snapshot.components.find(item => item.component === component))) }, label);
 }
 
 function badge(text, tone, icon) {
-  const item = node("span", null, `badge administration-badge administration-${tone}`);
-  const symbol = node("span", icon);
-  symbol.setAttribute("aria-hidden", "true");
-  item.append(symbol, node("span", text));
-  return item;
+  return h("span", { className: `badge administration-badge administration-${tone}` },
+    h("span", { "aria-hidden": "true" }, icon), h("span", null, text));
 }
 
 function releaseText(release) {
   return release ? `${release.release_id} · ${release.source_sha} · ${release.published_at}` : "No checked candidate";
 }
 
-function render() {
-  refreshButton.disabled = busy;
-  if (!snapshot) return;
-  const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
-  const installedWeb = snapshot.components.find((item) => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
-  if (!browserView) {
-    const browser = document.getElementById("browser-version");
-    const details = node("details");
-    details.append(node("summary", "Browser version"));
-    const technical = node("div");
-    details.append(technical);
-    const warning = badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻");
-    const reload = node("button", "Reload page", "btn btn-sm");
-    reload.type = "button";
-    reload.addEventListener("click", () => window.location.reload());
-    browser.append(details, warning, reload);
-    browserView = { technical, warning, reload };
+function ComponentCard({ record, revision }) {
+  const [channel, setChannel] = useState(record.channel);
+  const [cadence, setCadence] = useState(record.cadence);
+  useEffect(() => { setChannel(record.channel); setCadence(record.cadence); }, [record.channel, record.cadence, revision]);
+  const content = [], details = [], heading = [];
+  const fresh = record.observed_at && Date.now() / 1000 - record.observed_at < 7200 && record.state !== "drift";
+  const observed = fresh ? record.observed : null;
+  line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? snapshot.base_image_sha : "unknown"));
+  line(details, record.component === "webui" ? "Storage-observed SHA" : "Running executable SHA", observed?.source_sha || "unknown");
+  line(details, "Verified running file SHA-256", observed?.executable_sha256 || "unknown");
+  line(content, "Uptime", uptime(observed?.started_at));
+  line(details, "Managed release installed", age(record.installed_at));
+  const checked = record.checked_at && Date.now() / 1000 - record.checked_at < 7200 && !record.check_error;
+  const candidateCurrent = checked && record.candidate?.channel === record.channel;
+  const webuiRepacked = record.component === "webui" && [record.installed, record.previous, record.desired].some((release) => release?.source_sha === record.candidate?.source_sha && release.digest !== record.candidate?.digest);
+  const releaseLabel = record.candidate?.release_id || "No checked candidate";
+  line(content, "Available release", candidateCurrent ? (/^[a-f0-9]{40}$/.test(releaseLabel) ? releaseLabel.slice(0, 12) : releaseLabel) : "Check now to confirm this channel");
+  line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
+  if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
+  const compatibility = snapshot.compatibility?.[record.component];
+  const launcher = snapshot.launchers?.[record.component];
+  if (record.component !== "webui") {
+    line(content, "Launcher requirement", candidateCurrent ? launcher?.reason || "Check with a launcher-aware API to determine this release's requirement." : "Check now to determine the release requirement.");
+    if (launcher?.running != null) line(details, "Launcher capability", `${launcher.running} running; ${launcher.minimum} required; ${launcher.available} included in release`);
   }
-  browserView.technical.replaceChildren();
-  line(browserView.technical, "Loaded WebUI SHA", loaded);
-  line(browserView.technical, "Storage-observed SHA", installedWeb);
-  const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;
-  browserView.warning.hidden = !differentWeb;
-  browserView.reload.hidden = !differentWeb;
-  browserView.reload.disabled = busy;
-  document.getElementById("automatic-state").textContent = snapshot.unattended_enabled
-    ? "Automatic installation policies are available."
-    : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work.";
-  for (const record of snapshot.components) {
-    let view = componentViews.get(record.component);
-    if (!view) {
-      view = createComponentView(record);
-      componentViews.set(record.component, view);
-    }
-    view.record = record;
-    const content = view.info;
-    const details = view.technical;
-    const heading = view.heading;
-    content.replaceChildren();
-    details.replaceChildren();
-    heading.replaceChildren();
-    const identity = node("div");
-    identity.append(node("h2", record.component.toUpperCase(), "card-title"));
-    identity.append(node("p", {api: "Dashboard service", bot: "Discord moderation", webui: "Browser workspace"}[record.component], "muted"));
-    heading.append(identity);
-    const fresh = record.observed_at && Date.now() / 1000 - record.observed_at < 7200 && record.state !== "drift";
-    const observed = fresh ? record.observed : null;
-    line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? snapshot.base_image_sha : "unknown"));
-    line(details, record.component === "webui" ? "Storage-observed SHA" : "Running executable SHA", observed?.source_sha || "unknown");
-    line(details, "Verified running file SHA-256", observed?.executable_sha256 || "unknown");
-    line(content, "Uptime", uptime(observed?.started_at));
-    line(details, "Managed release installed", age(record.installed_at));
-    const checked = record.checked_at && Date.now() / 1000 - record.checked_at < 7200 && !record.check_error;
-    const candidateCurrent = checked && record.candidate?.channel === record.channel;
-    const webuiRepacked = record.component === "webui" && [record.installed, record.previous, record.desired].some((release) => release?.source_sha === record.candidate?.source_sha && release.digest !== record.candidate?.digest);
-    const releaseLabel = record.candidate?.release_id || "No checked candidate";
-    line(content, "Available release", candidateCurrent ? (/^[a-f0-9]{40}$/.test(releaseLabel) ? releaseLabel.slice(0, 12) : releaseLabel) : "Check now to confirm this channel");
-    line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
-    if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
-    const compatibility = snapshot.compatibility?.[record.component];
-    const launcher = snapshot.launchers?.[record.component];
-    if (record.component !== "webui") {
-      line(content, "Launcher requirement", candidateCurrent ? launcher?.reason || "Check with a launcher-aware API to determine this release's requirement." : "Check now to determine the release requirement.");
-      if (launcher?.running != null) line(details, "Launcher capability", `${launcher.running} running; ${launcher.minimum} required; ${launcher.available} included in release`);
-    }
-    if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
-      const target = record.candidate;
-      const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
-        target.upgrade?.guild_schema !== observed.guild_schema);
-      if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
-      if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
-      const pair = node("a", "Update bot and API together / recovery");
-      pair.href = `${apiBase()}/api/service-upgrade/recovery`;
-      content.append(pair);
-    }
+  if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
+    const target = record.candidate;
+    const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
+    target.upgrade?.guild_schema !== observed.guild_schema);
+    if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
+    if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
+    content.push(h("a", { key: "paired-upgrade", href: `${apiBase()}/api/service-upgrade/recovery` }, "Update bot and API together / recovery"));
+  }
 
-    if (candidateCurrent) line(content, "Compatibility", compatibility?.installable ? "Ready for this deployment" : compatibility?.reason || "Unable to verify");
-    line(content, "Last check", record.checked_at ? age(record.checked_at) : "never");
-    const bakedSourceCurrent = record.component !== "webui" && !record.installed && observed &&
-      observed.source_sha === observed.base_image_sha && observed.source_sha === record.candidate?.source_sha;
-    let availability = "unknown";
-    if (candidateCurrent && observed && !webuiRepacked) {
-      if (record.installed?.digest === record.candidate?.digest && observed.source_sha === record.candidate?.source_sha) {
-        availability = "up to date";
-      } else if (bakedSourceCurrent) {
-        availability = "no source update (image digest unverified)";
-      } else if (record.candidate && observed.source_sha !== record.candidate.source_sha) {
-        availability = "update available";
-      }
-    }
-    const inProgress = pending(record);
-    const problem = record.check_error || record.last_error || record.state === "failed" || record.state === "drift";
-    heading.append(badge(stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
-      stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
-      stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
-    line(content, "Availability", availability);
-    if (record.desired_launcher && record.desired_launcher.digest !== record.installed_launcher?.digest) {
-      line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
-    }
-    line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
-    line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
-    line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
-    const pairActive = snapshot.service_upgrade && !["complete", "aborted"].includes(snapshot.service_upgrade.phase);
-    const canApply = !pairActive && snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
-    const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
-    const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
-    view.check.disabled = busy || stale;
-    view.install.hidden = !record.candidate;
-    view.install.disabled = busy || stale || !canApply || applicationCurrent || candidatePending;
-    if (view.launcher) {
-      view.launcher.hidden = !record.candidate;
-      view.launcher.disabled = busy || stale || pairActive || !snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest;
-    }
-    view.help.textContent = !snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
-      : record.component === "webui" ? !snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
-      : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";
-    view.help.hidden = !view.help.textContent;
-    view.policy.disabled = busy || stale;
-    // Do not reset an in-progress native selection on an unchanged server value.
-    if (view.channelValue !== record.channel) view.channel.value = record.channel;
-    if (view.cadenceValue !== record.cadence) view.cadence.value = record.cadence;
-    view.channelValue = record.channel;
-    view.cadenceValue = record.cadence;
-    for (const option of view.cadence.children) {
-      option.disabled = option.value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest");
+  if (candidateCurrent) line(content, "Compatibility", compatibility?.installable ? "Ready for this deployment" : compatibility?.reason || "Unable to verify");
+  line(content, "Last check", record.checked_at ? age(record.checked_at) : "never");
+  const bakedSourceCurrent = record.component !== "webui" && !record.installed && observed &&
+    observed.source_sha === observed.base_image_sha && observed.source_sha === record.candidate?.source_sha;
+  let availability = "unknown";
+  if (candidateCurrent && observed && !webuiRepacked) {
+    if (record.installed?.digest === record.candidate?.digest && observed.source_sha === record.candidate?.source_sha) {
+    availability = "up to date";
+    } else if (bakedSourceCurrent) {
+    availability = "no source update (image digest unverified)";
+    } else if (record.candidate && observed.source_sha !== record.candidate.source_sha) {
+    availability = "update available";
     }
   }
+  const inProgress = pending(record);
+  const problem = record.check_error || record.last_error || record.state === "failed" || record.state === "drift";
+  heading.push(badge(stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
+    stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
+    stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
+  line(content, "Availability", availability);
+  if (record.desired_launcher && record.desired_launcher.digest !== record.installed_launcher?.digest) {
+    line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
+  }
+  line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
+  line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
+  line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
+  const pairActive = snapshot.service_upgrade && !["complete", "aborted"].includes(snapshot.service_upgrade.phase);
+  const canApply = !pairActive && snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
+  const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
+  const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
+  const help = !snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
+    : record.component === "webui" ? !snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
+    : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";
+  return h("section", { className: "card bg-base-100 administration-card" },
+    h("div", { className: "card-body" },
+      h("div", { className: "administration-card-heading" },
+        h("div", null, h("h2", { className: "card-title" }, record.component.toUpperCase()),
+          h("p", { className: "muted" }, { api: "Dashboard service", bot: "Discord moderation", webui: "Browser workspace" }[record.component])), ...heading),
+      h("div", { className: "administration-info" }, content),
+      h("details", { className: "administration-technical" }, h("summary", null, "Version & technical details"), h("div", null, details)),
+      h("p", { className: "muted administration-help", hidden: !help }, help),
+      h("div", { className: "card-actions administration-actions" },
+        action("Check now", record.component, item => request("/api/updates/check", { component: item.component }), { disabled: busy || stale }),
+        action(record.component === "webui" ? "Update WebUI" : "Update", record.component,
+          item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }),
+          { hidden: !record.candidate, disabled: busy || stale || !canApply || applicationCurrent || candidatePending }),
+        record.component !== "webui" && h("details", { className: "administration-technical" },
+          h("summary", null, "Advanced launcher controls"),
+          h("p", null, "The launcher starts and recovers this service. Normal Update includes any required launcher update first. Use this control only for an optional launcher update. It restarts the service."),
+          action("Update launcher", record.component,
+            item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }),
+            { hidden: !record.candidate, disabled: busy || stale || pairActive || !snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
+      h("fieldset", { className: "administration-policy", disabled: busy || stale },
+        h("legend", null, "Release policy"),
+        h("label", { className: "field" }, "Release channel",
+          h("select", { className: "select select-bordered select-sm", "aria-label": `${record.component} release channel`, value: channel,
+            onChange: event => {
+              const value = event.target.value; setChannel(value);
+              return mutate(record, "Save release channel", () => {
+                const item = snapshot.components.find(item => item.component === record.component);
+                return request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence });
+              });
+            } }, ...["latest", "stable", "nightly"].map(value => h("option", { key: value, value }, value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases")))),
+        h("label", { className: "field" }, "Automatic installation",
+          h("select", { className: "select select-bordered select-sm", "aria-label": `${record.component} automatic installation cadence`, value: cadence,
+            onChange: event => {
+              const value = event.target.value; setCadence(value);
+              return mutate(record, "Save automatic installation", () => {
+                const item = snapshot.components.find(item => item.component === record.component);
+                return request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value });
+              });
+            } }, ...["off", "daily", "weekly", "monthly"].map(value => h("option", { key: value, value,
+              disabled: value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest") }, value === "off" ? "Automatic install off" : value)))))));
 }
 
 function refresh() {
   if (activeView !== "updates" || document.visibilityState === "hidden") return;
   if (refreshing) return refreshing;
   clearTimeout(refreshTimer);
-  refreshButton.disabled = busy;
+  render();
   refreshing = (async () => {
     try {
       snapshot = await request("/api/updates", {});
@@ -440,8 +303,7 @@ function refresh() {
       accessDenied = false;
       if (!busy) actionMessage = "";
       stale = false;
-      signIn.classList.add("hidden");
-      updateView.classList.remove("hidden");
+      needsSignIn = false;
       notice(actionMessage || "Status refreshed. Release availability reflects the last successful release check.");
       render();
     } catch (error) {
@@ -450,7 +312,7 @@ function refresh() {
       render();
     } finally {
       refreshing = null;
-      refreshButton.disabled = busy;
+      render();
       if (!busy) scheduleRefresh();
     }
   })();
@@ -476,12 +338,14 @@ function usageState(value) {
     stale: "Stale measurement", unavailable: "Measurement unavailable"})[value] || "Unknown";
 }
 
-function renderUsage(database) {
-  const card = node("section", null, "card bg-base-100 shadow-xl");
-  const content = node("div", null, "card-body");
+function UsageCard({ database: initial, stale, revision }) {
+  const [detail, setDetail] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const database = detail?.source === initial ? detail.database : initial;
+  const oldSample = stale && detail?.revision !== revision;
+  const content = [];
   const title = database.kind === "core" ? "Core database" :
     database.policy?.kind === "dedicated" ? `Guild database · ${database.policy.guild_id}` : "Shared guild database";
-  content.append(node("h3", title, "card-title"));
   line(content, "Database ID", database.id);
   line(content, "Role", database.role || "unknown");
   line(content, "Availability", database.availability || "unknown");
@@ -545,46 +409,40 @@ function renderUsage(database) {
   if (!usage || usage.breakdown_quality === "unavailable" && usage.snapshot_count == null) {
     line(content, "Breakdown", "unavailable");
   }
-  const details = node("button", "Show current breakdown", "btn btn-sm");
-  details.type = "button";
-  details.addEventListener("click", async () => {
-    details.disabled = true;
-    try {
-      let pending = detailRequests.get(database.id);
-      if (!pending) {
-        pending = request(`/api/database-usage/${encodeURIComponent(database.id)}`, {});
-        detailRequests.set(database.id, pending);
-        pending.finally(() => detailRequests.delete(database.id)).catch(() => {});
-      }
-      const updated = await pending;
-      card.replaceWith(renderUsage(updated));
-    } catch (error) { usageStatus.textContent = error.message; }
-    finally { details.disabled = false; }
-  });
-  content.append(details);
-  card.append(content);
-  return card;
+  return h("section", { className: "card bg-base-100 shadow-xl", "data-usage-stale": oldSample ? "1" : undefined },
+    oldSample && h("p", { className: "text-warning" }, "Stale: the latest usage refresh failed. These figures are not a current capacity sample."),
+    h("div", { className: "card-body" }, h("h3", { className: "card-title" }, title), content,
+      h("button", { type: "button", className: "btn btn-sm", disabled: loading, onClick: async () => {
+        setLoading(true);
+        try {
+          let pending = detailRequests.get(database.id);
+          if (!pending) {
+            pending = request(`/api/database-usage/${encodeURIComponent(database.id)}`, {});
+            detailRequests.set(database.id, pending);
+            pending.finally(() => detailRequests.delete(database.id)).catch(() => {});
+          }
+          const updated = await pending;
+          if (revision === usageRevision && activeView === "usage" && authorized) setDetail({ database: updated, revision, source: initial });
+        } catch (error) {
+          if (revision === usageRevision && activeView === "usage" && authorized) { usageMessage = error.message; render(); }
+        }
+        finally { setLoading(false); }
+      } }, "Show current breakdown")));
 }
 
 async function doRefreshUsage() {
   if (activeView !== "usage" || document.visibilityState === "hidden") return;
   try {
-    const snapshot = await request("/api/database-usage", {});
+    const next = await request("/api/database-usage", {});
     if (activeView !== "usage" || document.visibilityState === "hidden") return;
-    signIn.classList.add("hidden");
-    usageView.classList.remove("hidden");
-    usageCards.replaceChildren(...snapshot.databases.map(renderUsage));
-    usageStatus.textContent = `Usage response ${age(snapshot.generated_at)}. Catalog ${snapshot.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.`;
-  } catch (error) {
-    usageStatus.textContent = error.message;
-    for (const card of usageCards.children) {
-      if (card.dataset.usageStale === "1") continue;
-      card.dataset.usageStale = "1";
-      const note = node("p", "Stale: the latest usage refresh failed. These figures are not a current capacity sample.", "text-warning");
-      card.prepend(note);
-    }
-  }
-  finally { scheduleRefresh(); }
+    needsSignIn = false;
+    authorized = true;
+    accessDenied = false;
+    usageSnapshot = next;
+    usageStale = false;
+    usageMessage = `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.`;
+  } catch (error) { usageMessage = error.message; usageStale = true; }
+  finally { usageRevision++; render(); scheduleRefresh(); }
 }
 
 function refreshUsage() {
@@ -597,27 +455,68 @@ function refreshUsage() {
 function selectView(view) {
   activeView = view;
   clearTimeout(refreshTimer);
-  if (view === "usage") usageCards.replaceChildren();
-  document.getElementById("admin-title").textContent = view === "usage" ? "Database Usage" : "Updates";
-  document.getElementById("show-updates").setAttribute("aria-current", view === "updates" ? "page" : "false");
-  document.getElementById("show-database-usage").setAttribute("aria-current", view === "usage" ? "page" : "false");
-  updateView.classList.toggle("hidden", view !== "updates");
-  usageView.classList.toggle("hidden", view !== "usage");
+  if (view === "usage") usageSnapshot = null;
+  render();
   return view === "usage" ? refreshUsage() : refresh();
 }
 
-refreshButton.addEventListener("click", () => {
-  if (busy) return;
-  actionMessage = "";
-  return refresh();
-});
-document.getElementById("show-updates").addEventListener("click", () => selectView("updates"));
-document.getElementById("show-database-usage").addEventListener("click", () => selectView("usage"));
-document.getElementById("refresh-usage").addEventListener("click", () => refreshUsage());
-document.addEventListener?.("visibilitychange", () => {
-  if (document.visibilityState !== "hidden") {
-    if (activeView === "usage") refreshUsage(); else refresh();
-  }
-});
-initTheme();
+function Appearance() {
+  const [preference, setPreference] = useState(() => {
+    try { return window.localStorage.getItem("jmodguard.theme") || "system"; } catch (_) { return "system"; }
+  });
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      const dark = preference === "dark" || (preference !== "light" && media.matches);
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+      document.querySelector('meta[name="theme-color"]').content = dark ? "#101e33" : "#e0eeff";
+    };
+    apply(); media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [preference]);
+  return h("label", { className: "theme-picker" }, "Appearance ",
+    h("select", { id: "appearance", className: "select select-bordered select-sm", "aria-label": "Appearance", value: preference,
+      onChange: event => { const value = event.target.value; setPreference(value); try { window.localStorage.setItem("jmodguard.theme", value); } catch (_) {} } },
+      ...["system", "light", "dark"].map(value => h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)))));
+}
+
+function Administration() {
+  useEffect(() => {
+    const visible = () => { if (document.visibilityState !== "hidden") { if (activeView === "usage") refreshUsage(); else refresh(); } };
+    document.addEventListener("visibilitychange", visible);
+    return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
+  }, []);
+  const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
+  const installedWeb = snapshot?.components.find(item => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
+  const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;
+  const details = [];
+  line(details, "Loaded WebUI SHA", loaded); line(details, "Storage-observed SHA", installedWeb);
+  const base = apiBase();
+  const login = base ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}` : "/login?return_to=%2Fadministration%2Findex.html";
+  return h(React.Fragment, null,
+    h("header", { className: "administration-header" },
+      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, activeView === "usage" ? "Database Usage" : "Updates")),
+      h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: busy,
+        onClick: () => { if (!busy) { actionMessage = ""; return refresh(); } } }, "↻ Refresh status"), h(Appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
+    h("p", { id: "update-status", className: `administration-notice administration-${status.tone}`, role: "status", "aria-live": "polite" }, status.message),
+    h("div", { id: "sign-in", className: needsSignIn ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
+    h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
+      h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
+      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage")),
+    h("div", { id: "updates", className: authorized && !accessDenied && activeView === "updates" ? "" : "hidden" },
+      h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
+      h("p", { id: "automatic-state", className: "muted" }, snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
+      h("div", { id: "browser-version", className: "administration-browser" }, snapshot && h(React.Fragment, null,
+        h("details", null, h("summary", null, "Browser version"), h("div", null, details)),
+        differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"),
+        differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: busy, onClick: () => window.location.reload() }, "Reload page"))),
+      h("div", { id: "update-cards", className: "administration-grid" }, snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: policyRevision })))),
+    h("section", { id: "database-usage", className: authorized && !accessDenied && activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
+      h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
+      h("p", { id: "usage-status", className: "administration-notice", role: "status" }, usageMessage),
+      h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
+      h("div", { id: "usage-cards", className: "administration-grid" }, usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: usageStale, revision: usageRevision })))));
+}
+
+render();
 refresh();

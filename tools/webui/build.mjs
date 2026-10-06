@@ -10,13 +10,9 @@ fs.mkdirSync(path.join(output, "administration"), { recursive: true });
 const bundle = buildSync({
   absWorkingDir: root,
   metafile: true,
-  // The package barrel retains unrelated component initializers. Resolve the
-  // pinned package's Combobox entry; a layout change must fail the build.
-  alias: {
-    "@headlessui/react": fileURLToPath(new URL("./components/combobox/combobox.js", import.meta.resolve("@headlessui/react"))),
-  },
-  entryPoints: [path.join(source, "app.js")],
-  outfile: path.join(output, "app.js"),
+  entryPoints: [path.join(source, "app.js"), path.join(source, "administration.js")],
+  outdir: output,
+  nodePaths: [path.join(import.meta.dirname, "node_modules")],
   bundle: true,
   minify: true,
   platform: "browser",
@@ -31,16 +27,18 @@ function licenseText(directory) {
   if (!name) throw new Error("Missing dependency license: " + directory);
   return fs.readFileSync(path.join(directory, name), "utf8").replaceAll("*/", "* /");
 }
-const packages = new Set();
-for (const name of Object.keys(bundle.metafile.inputs)) {
-  if (!name.includes("node_modules/")) continue;
-  let directory = path.dirname(path.join(root, name));
-  while (!fs.existsSync(path.join(directory, "package.json"))) directory = path.dirname(directory);
-  packages.add(directory);
+for (const [file, emitted] of Object.entries(bundle.metafile.outputs)) {
+  const packages = new Set();
+  for (const [name, contribution] of Object.entries(emitted.inputs)) {
+    if (!name.includes("node_modules/") || !contribution.bytesInOutput) continue;
+    let directory = path.dirname(path.join(root, name));
+    while (!fs.existsSync(path.join(directory, "package.json"))) directory = path.dirname(directory);
+    packages.add(directory);
+  }
+  const notices = [...packages].sort().map((directory) =>
+    "/*! " + path.relative(root, directory) + "\n" + licenseText(directory) + "\n*/").join("\n");
+  fs.appendFileSync(path.join(root, file), "\n" + notices + "\n");
 }
-const notices = [...packages].sort().map((directory) =>
-  "/*! " + path.relative(root, directory) + "\n" + licenseText(directory) + "\n*/").join("\n");
-fs.appendFileSync(path.join(output, "app.js"), "\n" + notices + "\n");
 const daisyui = fileURLToPath(import.meta.resolve("daisyui/daisyui.css"));
 const css = buildSync({
   absWorkingDir: root,
@@ -55,6 +53,6 @@ const css = buildSync({
 // Build-only audit evidence: never included in the five published assets.
 fs.writeFileSync(path.join(root, "dist/webui-metafile.json"),
   JSON.stringify({ js: bundle.metafile, css: css.metafile }, null, 2) + "\n");
-for (const name of ["index.html", "administration/index.html", "administration.js"]) {
+for (const name of ["index.html", "administration/index.html"]) {
   fs.copyFileSync(path.join(source, name), path.join(output, name));
 }

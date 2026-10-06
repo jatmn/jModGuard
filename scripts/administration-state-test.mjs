@@ -5,84 +5,60 @@ import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 
-class Element {
-  constructor(tag = "div") {
-    this.tag = tag;
-    this.textContent = "";
-    this.disabled = false;
-    this.listeners = {};
-    const classes = new Set();
-    this.classList = {
-      add(name) { classes.add(name); },
-      remove(name) { classes.delete(name); },
-      contains(name) { return classes.has(name); },
-      toggle(name, forced) {
-        if (forced === undefined) forced = !classes.has(name);
-        if (forced) classes.add(name); else classes.delete(name);
-        return forced;
-      },
-    };
-    const childNodes = [];
-    this.children = new Proxy(childNodes, {
-      get(target, prop) {
-        if (prop === "unshift") return undefined;
-        const value = target[prop];
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    this._childNodes = childNodes;
-    const dataset = {};
-    Object.defineProperty(this, "dataset", {
-      get: () => dataset,
-      set() {
-        throw new TypeError("Cannot set property dataset which has only a getter");
-      },
-      enumerable: true,
-      configurable: true,
-    });
-  }
-  append(...children) { this._childNodes.push(...children); }
-  prepend(...children) { this._childNodes.unshift(...children); }
-  replaceChildren(...children) { this._childNodes.length = 0; this._childNodes.push(...children); }
-  replaceWith(next) { this.replacedWith = next; }
-  addEventListener(name, callback) { this.listeners[name] = callback; }
-  setAttribute(name, value) { this.attributes = { ...(this.attributes || {}), [name]: value }; }
-}
+import { JSDOM } from "../tools/webui/node_modules/jsdom/lib/api.js";
+import React, { useEffect, useState } from "../tools/webui/node_modules/react/index.js";
+import { createRoot as reactRoot } from "../tools/webui/node_modules/react-dom/client.js";
+import { flushSync } from "../tools/webui/node_modules/react-dom/index.js";
+import { afterEach } from "node:test";
 
-const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8");
-
-// Keep page time and response timestamps on the same deterministic clock.
+const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8")
+  .replace(/^import .*;$/gm, "");
 const NOW_SECONDS = 1800000000;
+const pages = [];
+afterEach(() => {
+  for (const { dom, roots } of pages.splice(0)) {
+    globalThis.window = dom.window; globalThis.document = dom.window.document;
+    for (const root of roots) flushSync(() => root.unmount());
+    dom.window.close();
+  }
+});
 
 function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000 } = {}) {
-  const elements = new Map();
-  const document = {
-    visibilityState: visibility,
-    documentElement: { dataset: {} },
-    querySelector: () => ({}),
-    addEventListener() {},
-    createElement: (tag) => new Element(tag),
-    getElementById(id) {
-      if (!elements.has(id)) {
-        const element = new Element();
-        if (["sign-in", "updates", "database-usage"].includes(id)) element.classList.add("hidden");
-        elements.set(id, element);
-      }
-      return elements.get(id);
-    },
-  };
+  const dom = new JSDOM('<!doctype html><html><head><meta name="theme-color"></head><body><main id="content"></main></body></html>', { url: origin });
+  const { window } = dom, { document } = window;
+  Object.defineProperty(document, "visibilityState", { value: visibility, writable: true });
+  Object.defineProperty(window, "localStorage", { get() { throw new Error("storage disabled"); } });
+  window.JMODGUARD_WEBUI_SHA = "a".repeat(40);
+  window.JMODGUARD_API_BASE = apiBase;
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  const roots = [];
   const timers = new Map();
   let nextTimer = 0;
   const context = vm.createContext({
-    document,
-    window: { JMODGUARD_WEBUI_SHA: "a".repeat(40), JMODGUARD_API_BASE: apiBase, location: { origin }, matchMedia: () => ({ matches: false, addEventListener() {} }) },
+    document, window, React, useEffect, useState,
+    createRoot(container) {
+      globalThis.window = window; globalThis.document = document;
+      const root = reactRoot(container); roots.push(root);
+      return { render(element) {
+        globalThis.window = window; globalThis.document = document;
+        flushSync(() => root.render(element));
+      } };
+    },
     fetch: fetchImpl,
     setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
     clearTimeout(id) { timers.delete(id); },
     Date: { now },
   });
+  pages.push({ dom, roots });
   vm.runInContext(source, context);
-  return { context, elements, timers };
+  return { context, elements: { get: id => document.getElementById(id) }, timers };
+}
+
+function fire(element, type) {
+  globalThis.window = element.ownerDocument.defaultView;
+  globalThis.document = element.ownerDocument;
+  flushSync(() => element.dispatchEvent(new window.Event(type, { bubbles: true })));
+  return new Promise(resolve => setImmediate(resolve));
 }
 
 function find(element, predicate) {
@@ -95,7 +71,7 @@ function find(element, predicate) {
 }
 
 function textOf(element) {
-  return element.textContent + element.children.map(textOf).join("");
+  return element.textContent;
 }
 
 function record(component = "api") {
@@ -113,10 +89,10 @@ function record(component = "api") {
 
 function updateButton(pageState, component, launcher = false) {
   const cards = pageState.elements.get("update-cards");
-  const card = cards.children.find((item) =>
-    find(item, (child) => child.tag === "h2")?.textContent === component.toUpperCase());
+  const card = Array.from(cards.children).find((item) =>
+    find(item, (child) => child.localName === "h2")?.textContent === component.toUpperCase());
   assert.ok(card);
-  return find(card, (item) => item.tag === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update"));
+  return find(card, (item) => item.localName === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update"));
 }
 
 function render(pageState, item) {
@@ -197,9 +173,8 @@ test("Administration carries the configured API origin through reads, controls, 
     return new Promise(() => {});
   });
   assert.deepEqual(localCalls, [{ url: "/api/updates", credentials: "include" }]);
-  assert.equal(local.elements.get("sign-in-link").href, "/login?return_to=%2Fadministration%2Findex.html");
-  assert.match(fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration/index.html"), "utf8"),
-    /id="sign-in-link"/);
+  assert.equal(local.elements.get("sign-in-link").href, "https://ui.example.test/login?return_to=%2Fadministration%2Findex.html");
+  assert.ok(local.elements.get("sign-in-link"));
 });
 
 test("owner availability distinguishes baked source parity from channel mismatch", () => {
@@ -209,7 +184,7 @@ test("owner availability distinguishes baked source parity from channel mismatch
   render(view, api);
   const availability = () => {
     const card = view.elements.get("update-cards").children[0];
-    return textOf(find(card, (element) => element.tag === "p" && textOf(element).startsWith("Availability:")));
+    return textOf(find(card, (element) => element.localName === "p" && textOf(element).startsWith("Availability:")));
   };
   assert.match(availability(), /no source update \(image digest unverified\)/);
   api.channel = "nightly";
@@ -267,8 +242,8 @@ test("check applies its returned snapshot and reports failures without leaving e
     if (unavailable) throw new Error("offline");
     return response(state([api]));
   });
-  const check = find(view.elements.get("update-cards"), (item) => item.tag === "button" && item.textContent === "Check now");
-  await check.listeners.click();
+  const check = find(view.elements.get("update-cards"), (item) => item.localName === "button" && item.textContent === "Check now");
+  await fire(check, "click");
   assert.match(textOf(view.elements.get("update-cards")), /no source update/);
   unavailable = true;
   await vm.runInContext("refresh()", view.context);
@@ -293,7 +268,7 @@ test("application, launcher and WebUI installs show pending and automatically re
       }
       return response(state([item]));
     });
-    await updateButton(view, component, launcher).listeners.click();
+    await fire(updateButton(view, component, launcher), "click");
     assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.equal(updateButton(view, component, launcher).disabled, true);
     assert.equal([...view.timers.values()][0].delay, 2000);
@@ -334,7 +309,7 @@ test("queued acknowledgement uses the immediate status snapshot for api, bot, We
         }
         return response(state([item]));
       });
-      await updateButton(view, component, launcher).listeners.click();
+      await fire(updateButton(view, component, launcher), "click");
       const banner = view.elements.get("update-status").textContent;
       const card = textOf(view.elements.get("update-cards"));
       assert.match(banner, /update request accepted/);
@@ -359,7 +334,7 @@ test("a failed status read after a queued acknowledgement keeps the status error
     if (installed) throw new Error("status offline");
     return response(state([item]));
   });
-  await updateButton(view, "webui").listeners.click();
+  await fire(updateButton(view, "webui"), "click");
   const banner = view.elements.get("update-status").textContent;
   assert.match(banner, /status offline/);
   assert.doesNotMatch(banner, /Waiting for the component/);
@@ -383,7 +358,7 @@ test("overlapping refreshes share one read and mutations wait for that read", as
   const first = vm.runInContext("refresh()", view.context);
   const second = vm.runInContext("refresh()", view.context);
   assert.equal(first, second);
-  const action = updateButton(view, "api").listeners.click();
+  const action = fire(updateButton(view, "api"), "click");
   assert.equal(installs, 0);
   releaseRead(response(state([item])));
   await action;
@@ -426,11 +401,11 @@ test("a policy save keeps the sibling field from the refresh it waits for", asyn
     if (block) { block = false; return new Promise((resolve) => { releaseRead = resolve; }); }
     return response(state([item]));
   });
-  const [channel, cadence] = findAll(view.elements.get("update-cards"), (element) => element.tag === "select");
+  const [channel, cadence] = findAll(view.elements.get("update-cards"), (element) => element.localName === "select");
   block = true;
   const reading = vm.runInContext("refresh()", view.context);
   channel.value = "nightly";
-  const savingChannel = channel.listeners.change();
+  const savingChannel = fire(channel, "change");
   item.cadence = "weekly";
   releaseRead(response(state([item])));
   await Promise.all([reading, savingChannel]);
@@ -439,7 +414,7 @@ test("a policy save keeps the sibling field from the refresh it waits for", asyn
   block = true;
   const readingAgain = vm.runInContext("refresh()", view.context);
   cadence.value = "monthly";
-  const savingCadence = cadence.listeners.change();
+  const savingCadence = fire(cadence, "change");
   item.channel = "stable";
   releaseRead(response(state([item])));
   await Promise.all([readingAgain, savingCadence]);
@@ -462,7 +437,7 @@ test("an install uses the candidate from the refresh it waits for", async () => 
   });
   block = true;
   const reading = vm.runInContext("refresh()", view.context);
-  const saving = updateButton(view, "api").listeners.click();
+  const saving = fire(updateButton(view, "api"), "click");
   item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) } };
   releaseRead(response(state([item])));
   await Promise.all([reading, saving]);
@@ -482,9 +457,9 @@ test("policy changes use authoritative responses and latest switches automatic i
     }
     return response(state([item]));
   });
-  const channel = find(view.elements.get("update-cards"), (element) => element.tag === "select");
+  const channel = find(view.elements.get("update-cards"), (element) => element.localName === "select");
   channel.value = "latest";
-  await channel.listeners.change();
+  await fire(channel, "change");
   assert.deepEqual(saved, { component: "bot", channel: "latest", cadence: "off" });
 });
 
@@ -492,7 +467,7 @@ test("pending installs surface terminal failures and leave Check now available f
   const item = record("webui");
   item.state = "queued";
   const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([item])));
-  const check = find(view.elements.get("update-cards"), (element) => element.tag === "button" && element.textContent === "Check now");
+  const check = find(view.elements.get("update-cards"), (element) => element.localName === "button" && element.textContent === "Check now");
   assert.equal(check.disabled, false);
   item.state = "failed";
   item.last_error = "Storage installation interrupted";
@@ -509,10 +484,10 @@ test("a failed policy save restores the server's channel and displays the error"
     if (url === "/api/updates/policy") return response({ error: "policy rejected" }, 400);
     return response(state([item]));
   });
-  const select = find(view.elements.get("update-cards"), (element) => element.tag === "select");
+  const select = find(view.elements.get("update-cards"), (element) => element.localName === "select");
   select.value = "nightly";
-  await select.listeners.change();
-  assert.equal(find(view.elements.get("update-cards"), (element) => element.tag === "select").value, "latest");
+  await fire(select, "change");
+  assert.equal(find(view.elements.get("update-cards"), (element) => element.localName === "select").value, "latest");
   assert.match(view.elements.get("update-status").textContent, /policy rejected/);
 });
 
@@ -520,10 +495,10 @@ test("appearance changes even when browser storage is unavailable", () => {
   const view = page();
   const select = view.elements.get("appearance");
   select.value = "dark";
-  select.listeners.change();
+  fire(select, "change");
   assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "dark");
   select.value = "light";
-  select.listeners.change();
+  fire(select, "change");
   assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "light");
 });
 
@@ -612,7 +587,7 @@ test("failed WebUI publication remains terminal even with a retained desired dig
 
 test("Browser version remains expanded or collapsed across status refreshes", async () => {
   const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
-  const details = () => find(view.elements.get("browser-version"), (element) => element.tag === "details");
+  const details = () => find(view.elements.get("browser-version"), (element) => element.localName === "details");
   details().open = true;
   await vm.runInContext("refresh()", view.context);
   assert.equal(details().open, true);
@@ -642,7 +617,7 @@ test("transient initial access checks retry automatically but confirmed denials 
     assert.equal(view.timers.size, 0);
     assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
     denied = false;
-    await view.elements.get("refresh-status").listeners.click();
+    await fire(view.elements.get("refresh-status"), "click");
     assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
     assert.equal(view.timers.size, 1);
   }
@@ -684,17 +659,18 @@ test("refresh retains controls and disclosures while actions use the newest comp
     });
     const card = view.elements.get("update-cards");
     const install = updateButton(view, component);
-    const select = find(card, (el) => el.tag === "select");
-    const summary = find(card, (el) => el.tag === "summary");
-    const browserSummary = find(view.elements.get("browser-version"), (el) => el.tag === "summary");
-    item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) }, state: "queued", desired: { ...item.candidate } };
+    const select = find(card, (el) => el.localName === "select");
+    const summary = find(card, (el) => el.localName === "summary");
+    const browserSummary = find(view.elements.get("browser-version"), (el) => el.localName === "summary");
+    item = { ...item, candidate: { ...item.candidate, source_sha: "f".repeat(40), digest: "sha256:" + "f".repeat(64) }, state: "queued", desired: { ...item.candidate } };
     await [...view.timers.values()][0].callback();
     assert.equal(updateButton(view, component), install);
-    assert.equal(find(card, (el) => el.tag === "select"), select);
-    assert.equal(find(card, (el) => el.tag === "summary"), summary);
-    assert.equal(find(view.elements.get("browser-version"), (el) => el.tag === "summary"), browserSummary);
+    assert.equal(find(card, (el) => el.localName === "select"), select);
+    assert.equal(find(card, (el) => el.localName === "summary"), summary);
+    assert.equal(find(view.elements.get("browser-version"), (el) => el.localName === "summary"), browserSummary);
     assert.match(textOf(card), /Update pending/);
-    await install.listeners.click();
+    assert.equal(install.disabled, false);
+    await fire(install, "click");
     assert.equal(submitted.digest, item.candidate.digest);
     assert.equal(submitted.component, component);
   }
@@ -712,9 +688,9 @@ test("a policy edit abandoned after a failed prior read restores the recorded se
   });
   block = true;
   const reading = vm.runInContext("refresh()", view.context);
-  const select = find(view.elements.get("update-cards"), (el) => el.tag === "select");
+  const select = find(view.elements.get("update-cards"), (el) => el.localName === "select");
   select.value = "stable";
-  const saving = select.listeners.change();
+  const saving = fire(select, "change");
   failRead(new Error("offline"));
   await Promise.all([reading, saving]);
   assert.equal(writes, 0);
@@ -727,6 +703,7 @@ test("Database Usage shows independent physical databases and unknown allocation
   const calls = [];
   const view = page(async (url) => {
     calls.push(url);
+    if (url === "/api/updates") return response(state([]));
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
     return { status: 200, ok: true, json: async () => ({ generated_at: NOW_SECONDS, databases: [
       { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: NOW_SECONDS },
@@ -751,6 +728,7 @@ test("Database Usage does not paint cards if the tab hides during the fetch", as
   let markStarted;
   const started = new Promise((resolve) => { markStarted = resolve; });
   const view = page(async (url) => {
+    if (url === "/api/updates") return response(state([]));
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
     markStarted();
     await usage;
@@ -767,6 +745,7 @@ test("Database Usage does not paint cards if the tab hides during the fetch", as
 test("Database Usage marks retained cards stale when refresh fails", async () => {
   let fail = false;
   const view = page(async (url) => {
+    if (url === "/api/updates") return response(state([]));
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
     if (fail) throw new Error("usage unavailable");
     return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 }, percent_of_limit: 0.1, status: "normal" }], generated_at: 1 }) };
@@ -794,6 +773,7 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
   const started = new Promise((resolve) => { markStarted = resolve; });
   const view = page(async (url) => {
     calls.push(url);
+    if (url === "/api/updates") return response(state([]));
     if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
     markStarted();
     await usage;
@@ -809,7 +789,7 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
 
 test("Database Usage renders disjoint physical groups and unknown guard status", () => {
   const view = page();
-  const card = vm.runInContext(`renderUsage(${JSON.stringify({
+  vm.runInContext(`authorized = true; activeView = "usage"; usageSnapshot = { databases: [${JSON.stringify({
     id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
     policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
     usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,
@@ -818,8 +798,8 @@ test("Database Usage renders disjoint physical groups and unknown guard status",
         index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } },
     capture: { status: "unknown", configured_retention_hours: 24 },
     application_admission: { bot_cross_process_guard: "unknown" },
-  })})`, view.context);
-  const content = textOf(card);
+  })}] }; render();`, view.context);
+  const content = textOf(view.elements.get("usage-cards"));
   for (const label of ["Snapshot table", "Moderation and evidence tables", "Configuration tables",
     "Operational tables", "Indexes", "Reusable pages", "System / unattributed",
     "Bot growth guard: unknown", "External evidence file bytes: unavailable"]) {
@@ -838,7 +818,7 @@ test("schema upgrades expose the paired action and active pairs block independen
   vm.runInContext(`snapshot.coordinated_upgrade_path = "/api/service-upgrade/recovery";
     snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; render();`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
-  const link = find(view.elements.get("update-cards"), item => item.tag === "a" && item.textContent.includes("together"));
+  const link = find(view.elements.get("update-cards"), item => item.localName === "a" && item.textContent.includes("together"));
   assert.ok(link?.href.endsWith("/api/service-upgrade/recovery"));
   assert.ok(find(view.elements.get("update-cards"), item => item.textContent.includes("both services will briefly stop")));
   vm.runInContext(`snapshot.compatibility.api.installable = true;
@@ -854,17 +834,82 @@ test("normal update explains a required launcher step and separates optional lau
     reason: "Update will install the required launcher first, then the application." } }; render();`, view.context);
   const card = view.elements.get("update-cards");
   assert.match(textOf(card), /required launcher first/);
-  assert.ok(find(card, (node) => node.tag === "button" && node.textContent === "Update"));
-  const advanced = find(card, (node) => node.tag === "details" && textOf(node).includes("Advanced launcher controls"));
+  assert.ok(find(card, (node) => node.localName === "button" && node.textContent === "Update"));
+  const advanced = find(card, (node) => node.localName === "details" && textOf(node).includes("Advanced launcher controls"));
   assert.ok(advanced);
-  assert.equal(find(advanced, (node) => node.tag === "button").disabled, true);
+  assert.equal(find(advanced, (node) => node.localName === "button").disabled, true);
   vm.runInContext(`snapshot.launchers.api = { state: "satisfied", installable: false,
     reason: "Current launcher supports this application; no launcher update is required." }; render();`, view.context);
   assert.match(textOf(card), /no launcher update is required/);
-  assert.equal(find(advanced, (node) => node.tag === "button").disabled, true);
+  assert.equal(find(advanced, (node) => node.localName === "button").disabled, true);
   vm.runInContext(`snapshot.compatibility.api.installable = false;
     snapshot.launchers.api = { state: "optional", installable: true,
     reason: "Current launcher supports this application. A newer launcher is optional." }; render();`, view.context);
-  assert.equal(find(advanced, (node) => node.tag === "button").disabled, false,
+  assert.equal(find(advanced, (node) => node.localName === "button").disabled, false,
     "launcher-only admission is independent of the bundled application's schema");
+});
+
+
+test("late detail response must not replace a newer aggregate usage sample", async () => {
+  let resolveDetail;
+  let allocated = 1000000;
+  const database = () => ({ id: "core", kind: "core", usage: { allocated_bytes: allocated } });
+  const view = await ready(async url => {
+    if (url === "/api/updates") return response(state([]));
+    if (url === "/api/database-usage/core") return new Promise(resolve => { resolveDetail = resolve; });
+    return response({ databases: [database()], generated_at: NOW_SECONDS });
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
+  await fire(detail, "click");
+  allocated = 2000000;
+  await vm.runInContext('refreshUsage()', view.context);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
+  allocated = 1000000;
+  resolveDetail(response(database()));
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
+});
+
+test("successful details refresh clears stale flag for its own card", async () => {
+  let fail = false;
+  const database = () => ({ id: "core", kind: "core", usage: { allocated_bytes: 2000000 } });
+  const view = await ready(async url => {
+    if (url === "/api/updates") return response(state([]));
+    if (url === "/api/database-usage/core") return response(database());
+    if (fail) throw new Error("offline");
+    return response({ databases: [database()], generated_at: NOW_SECONDS });
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  fail = true;
+  await vm.runInContext('refreshUsage()', view.context);
+  assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
+  const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
+  await fire(detail, "click");
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.notEqual(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
+});
+
+
+test("failed aggregate retains the last successful detail with a stale warning", async () => {
+  let fail = false;
+  const view = await ready(async url => {
+    if (url === "/api/updates") return response(state([]));
+    if (url === "/api/database-usage/core") return response({ id: "core", kind: "core", usage: { allocated_bytes: 2000000 } });
+    if (fail) throw new Error("offline");
+    return response({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 } }], generated_at: NOW_SECONDS });
+  });
+  await vm.runInContext('selectView("usage")', view.context);
+  await fire(find(view.elements.get("usage-cards"), el => el.localName === "button"), "click");
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
+  fail = true;
+  await vm.runInContext('refreshUsage()', view.context);
+  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
+  assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
 });

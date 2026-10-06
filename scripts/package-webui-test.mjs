@@ -65,8 +65,8 @@ test("WebUI excludes unrelated Headless component code", () => {
       if (match && bytesInOutput > 0) components.add(match[1]);
     }
   }
-  // Description, label and portal support the retained accessible Combobox.
-  assert.deepEqual([...components].sort(), ["combobox", "description", "label", "portal"]);
+  // These are the controls used by the React UI plus their accessibility/lifecycle helpers.
+  assert.deepEqual([...components].sort(), ["combobox", "description", "dialog", "field", "focus-trap", "input", "label", "portal", "select", "textarea", "transition"]);
 });
 
 test("WebUI CSS retains used widgets and excludes unused component families", () => {

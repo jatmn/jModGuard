@@ -14,7 +14,7 @@ export default defineConfig([
         extends: [js.configs.recommended],
         languageOptions: {
             ecmaVersion: 2022,
-            sourceType: "script",
+            sourceType: "module",
             globals: {
                 ...globals.browser,
             },
