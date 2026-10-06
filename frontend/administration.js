@@ -173,7 +173,7 @@ function action(label, component, callback, props = {}) {
 }
 
 function badge(text, tone, icon) {
-  return h("span", { className: `badge administration-badge administration-${tone}` },
+  return h("span", { className: `badge badge-soft administration-badge badge-${{ good: "success", warn: "warning", bad: "error", neutral: "neutral" }[tone]}` },
     h("span", { "aria-hidden": "true" }, icon), h("span", null, text));
 }
 

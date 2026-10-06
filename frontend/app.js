@@ -1662,14 +1662,14 @@ function ruleCard(r) {
             h(
               "span",
               {
-                className: `badge status-tag ${{ off: "badge-error", dry: "badge-warning", on: "badge-success" }[badge]}`,
+                className: `badge badge-soft badge-sm ${{ off: "badge-error", dry: "badge-warning", on: "badge-success" }[badge]}`,
               },
               label,
             ),
             r.guild_override
-              ? h("span", { className: "badge status-tag badge-secondary override-tag" }, "server override")
+              ? h("span", { className: "badge badge-soft badge-sm badge-neutral override-tag" }, "server override")
               : null,
-            r.global ? h("span", { className: "badge status-tag badge-info scope-tag" }, "global") : null,
+            r.global ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global") : null,
           ),
         ),
         h(
@@ -2293,12 +2293,12 @@ function tabBadwords() {
                           ? h(
                               "span",
                               {
-                                className: "badge status-tag badge-error",
+                                className: "badge badge-soft badge-sm badge-error",
                                 title: w.error || "failed compile limits",
                               },
                               "not enforced",
                             )
-                          : h("span", { className: "badge status-tag badge-success" }, "active"),
+                          : h("span", { className: "badge badge-soft badge-sm badge-success" }, "active"),
                       ),
                       h(
                         "td",
@@ -2397,12 +2397,12 @@ function tabCommands() {
                     c.guild_override
                       ? h(
                           "span",
-                          { className: "badge status-tag badge-secondary override-tag" },
+                          { className: "badge badge-soft badge-sm badge-neutral override-tag" },
                           "server override",
                         )
                       : null,
                     c.scope === "global"
-                      ? h("span", { className: "badge status-tag badge-info scope-tag" }, "global")
+                      ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global")
                       : null,
                   ),
                 ),
@@ -2415,7 +2415,7 @@ function tabCommands() {
                 {},
                 h(
                   "span",
-                  { className: `badge status-tag ${d.enabled ? "badge-success" : "badge-error"}` },
+                  { className: `badge badge-soft badge-sm ${d.enabled ? "badge-success" : "badge-error"}` },
                   d.enabled ? "enabled" : "disabled",
                 ),
               ),
@@ -2952,7 +2952,7 @@ function LogChannelCard({ lc }) {
         lc.pending_action
           ? h(
               "span",
-              { className: "badge status-tag badge-warning" },
+              { className: "badge badge-soft badge-sm badge-warning" },
               ["pending", "claimed", "running"].includes(lc.pending_action.state)
                 ? "queued"
                 : lc.pending_action.state,

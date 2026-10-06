@@ -8,9 +8,9 @@
   --side-panel: #edf5ff; --side-border: #b5cde9; --side-hover: #cddfff;
   --selected: #bdd9ff; --selected-text: #173f72;
   --hero: #dcecff; --hero-border: #b7d3f4; --hero-text: #3b5e86;
-  --good: #236a48; --good-bg: #e7f5ed; --good-border: #b9dcc8;
-  --warn: #845600; --warn-bg: #fff5db; --warn-border: #e7d49e;
-  --bad: #ad344a; --bad-bg: #fff0f3; --bad-border: #e7bdc8;
+  --good: #236a48;
+  --warn: #845600;
+  --bad: #ad344a;
   --toast: #193957; --toast-text: #f3f8ff; --overlay: #102a4db3;
   --welcome-glow: #c0dcff;
   font-family: Inter, "Segoe UI", system-ui, sans-serif;
@@ -25,9 +25,9 @@
   --side-panel: #172a44; --side-border: #385579; --side-hover: #233c5d;
   --selected: #284f7d; --selected-text: #dcecff;
   --hero: #1a3455; --hero-border: #315680; --hero-text: #b2cbea;
-  --good: #91d8b0; --good-bg: #18392e; --good-border: #32614e;
-  --warn: #f2ce80; --warn-bg: #3a301c; --warn-border: #6e5830;
-  --bad: #ffa4b5; --bad-bg: #3d2533; --bad-border: #704154;
+  --good: #91d8b0;
+  --warn: #f2ce80;
+  --bad: #ffa4b5;
   --toast: #254363; --toast-text: #eef6ff; --overlay: #040b18cc;
   --welcome-glow: #244a76;
 }
@@ -198,12 +198,6 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .field > label > input, .field > label > select, .field > label > textarea { font-weight: 400; }
 .field-help { margin: 0 0 14px; font-size: .8125rem; color: var(--muted); }
 .tag-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.status-tag { height: auto; min-height: 24px; padding: 3px 9px; font-size: .75rem; line-height: 1.4; font-weight: 600; white-space: normal; background: var(--panel2); border: 1px solid var(--shell-border); color: var(--muted); }
-.status-tag.badge-success { background: var(--good-bg); color: var(--good); border-color: var(--good-border); }
-.status-tag.badge-warning { background: var(--warn-bg); color: var(--warn); border-color: var(--warn-border); }
-.status-tag.badge-error { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-border); }
-.status-tag.scope-tag { background: var(--hero); color: var(--accent); border-color: var(--hero-border); }
-.status-tag.override-tag { background: var(--selected); color: var(--selected-text); border-color: var(--side-border); }
 .rule-heading { display: flex; flex-direction: column; gap: 10px; }
 
 .dashboard-hero { background: var(--hero); border: 1px solid var(--hero-border); border-radius: var(--radius-box); }
@@ -308,10 +302,6 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .administration-card-heading h2 { font-size: 20px; margin: 0 0 4px; }
 .administration-card-heading p, .administration-help { font-size: 12px; }
 .administration-badge { height: auto; min-height: 28px; padding: 5px 9px; white-space: normal; text-align: start; gap: 6px; font-size: 12px; }
-.administration-good { color: var(--good); background: var(--good-bg); border-color: var(--good-border); }
-.administration-warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-border); }
-.administration-bad { color: var(--bad); background: var(--bad-bg); border-color: var(--bad-border); }
-.administration-neutral { color: var(--muted); background: var(--panel2); border-color: var(--shell-border); }
 .administration-notice { padding: 14px 18px; border: 1px solid var(--shell-border); border-radius: 10px; margin: 0; overflow-wrap: anywhere; }
 .administration-detail { display: flex; flex-direction: column; gap: 4px; margin: 0; min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
 .administration-detail strong { color: var(--muted); font-size: 11px; font-weight: 650; }
