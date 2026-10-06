@@ -1700,8 +1700,8 @@ test('global rule partial success with failed reconciliation stays unavailable t
   assert.match(h.nodes.get('#toast').textContent, /cleanup unavailable/);
   assert.match(h.nodes.get('#toast').textContent, /Retry/);
   assert.equal(h.app.isBusy(), false);
-  h.app.navigate('rules');
-  assert.match(textOf(h.content), /Configuration unavailable/);
+  assert.equal(h.modal.isConnected, false);
+  assertAccessible(findNode(h.content, n => n.textContent === 'Retry'));
   h.failures.refresh = false;
   const retry = findNode(h.content, (n) => n.textContent === 'Retry');
   await fire(retry, 'click', {});
@@ -1717,6 +1717,8 @@ test('a refused rule PUT retains the checkbox draft and never deletes an overrid
   await fire(h.save, 'click', {});
   assert.deepEqual(h.calls.map((c) => c.method), ['PUT']);
   assert.equal(h.modal.isConnected, true);
+  assert.match(h.nodes.get('#toast').textContent, /write refused/);
+  assertAccessible(h.nodes.get('#toast'));
   assert.equal(h.app.state.config.rules[0].effective.enabled, true);
   assert.equal(h.app.isBusy(), false);
   h.failures.put = false;
@@ -2558,9 +2560,10 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
   for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Delete history (days)', '2'], ['Reason template', 'Updated reason']]) {
     const wrapper = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(label));
     assert.ok(wrapper, label);
-    const input = findNode(wrapper, n => n.localName === 'input');
+    const input = wrapper.control;
+    assert.equal(input?.localName, 'input');
     input.value = value;
-    fire(input, 'change');
+    await fire(input, 'change');
   }
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click', {});
   assert.equal(submitted.data.actions[0].at, 3);
@@ -2605,4 +2608,133 @@ test('failed copy-source load reports the error and leaves copy unavailable', as
   await fire(copy, 'click', {});
   assert.equal(writes, 0);
   assert.match(nodes.get('#toast').textContent, /Select a source server/);
+});
+
+function assertAccessible(node) {
+  assert.ok(node, 'feedback/recovery control exists');
+  for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+    assert.notEqual(ancestor.getAttribute('aria-hidden'), 'true');
+    assert.notEqual(ancestor.inert, true);
+  }
+}
+
+test('command plan validation retains editable drafts and accessible errors on blur and Save', async () => {
+  const writes = [];
+  let refuse = true;
+  const h = harness(async (_url, options) => {
+    const body = JSON.parse(options.body);
+    writes.push(body);
+    if (refuse) throw new Error('command write refused');
+    return response({ config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } });
+  });
+  h.app.state.config = { commands: [] };
+  h.app.state.tab = 'commands';
+  const modal = await h.app.editCommand(null);
+  const json = modal.querySelector('textarea.mono');
+  const save = findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+  for (const value of ['{broken', 'null', '[]', '{"steps":{}}', ...[null, 1, 'bad', true, []].map(step => JSON.stringify({steps: [step]}))]) {
+    json.value = value;
+    await fire(json, 'input');
+    await fire(json, 'focusout');
+    assert.equal(modal.isConnected, true, value);
+    assert.equal(json.value, value);
+    assert.match(h.nodes.get('#toast').textContent, /Invalid behavior JSON/);
+    assertAccessible(h.nodes.get('#toast'));
+    await fire(save, 'click');
+    assert.equal(modal.isConnected, true);
+    assert.equal(writes.length, 0);
+    assertAccessible(h.nodes.get('#toast'));
+  }
+  const name = modal.querySelector('input[placeholder="command name"]');
+  name.value = 'hello';
+  await fire(name, 'input');
+  json.value = '{"steps":[{"type":"reply","template":"Hello"}]}';
+  await fire(json, 'input');
+  await fire(json, 'focusout');
+  await fire(save, 'click');
+  assert.equal(modal.isConnected, true);
+  assert.equal(name.value, 'hello');
+  assert.match(h.nodes.get('#toast').textContent, /command write refused/);
+  assertAccessible(h.nodes.get('#toast'));
+  refuse = false;
+  await fire(save, 'click');
+  assert.equal(modal.isConnected, false);
+  assert.deepEqual(writes.at(-1).data.behavior.params.steps, [{type: 'reply', template: 'Hello'}]);
+});
+
+test('acknowledged command deletion exposes Retry when the config refresh fails', async () => {
+  const calls = [];
+  const h = harness(async (url, options) => {
+    calls.push({url, method: options.method});
+    if (options.method === 'DELETE') return response({ok: true});
+    throw new Error('refresh unavailable');
+  });
+  h.app.state.config = { commands: [] };
+  h.app.state.tab = 'commands';
+  const modal = await h.app.editCommand({name: 'hello', scope: 'guild', effective: {name: 'hello', behavior: {kind: 'plan', params: {steps: []}}}});
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Delete'), 'click');
+  assert.deepEqual(calls.map(call => call.method), ['DELETE', 'POST']);
+  assert.equal(h.app.state.config, null);
+  assert.equal(modal.isConnected, false);
+  assertAccessible(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Retry'));
+});
+
+test('read views retain request deadlines and cancel obsolete reads without rendering errors', async () => {
+  for (const tab of ['dashboard', 'events', 'bans', 'actions']) {
+    const signals = [];
+    const h = harness((_url, options) => new Promise((_resolve, reject) => {
+      signals.push(options.signal);
+      options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name: 'AbortError'})), {once: true});
+    }));
+    h.app.state.config = {enrollment_id: 'membership', settings: {}, rules: [], commands: [], badwords: [], log_channels: [], templates: [], event_types: []};
+    h.app.navigate(tab);
+    await settle();
+    const deadline = [...h.timers.values()].find(timer => timer.delay === 30000);
+    assert.ok(deadline, tab + ' must bound loading');
+    await deadline.fn();
+    assert.equal(signals[0].aborted, true);
+    assert.match(textOf(h.nodes.get('#content')), tab === 'dashboard' ? /Unavailable/ : /Request timed out/);
+    assert.equal([...h.timers.values()].some(timer => timer.delay === 30000), false);
+    h.app.navigate(tab);
+    await settle();
+    const pending = signals.at(-1);
+    h.app.navigate('templates');
+    await settle();
+    assert.equal(pending.aborted, true);
+    assert.equal([...h.timers.values()].some(timer => timer.delay === 30000), false);
+    assert.doesNotMatch(textOf(h.nodes.get('#content')), /Request timed out|Failed to fetch/);
+  }
+});
+
+test('field labels exclude control values and command steps have individual identities', async () => {
+  const h = harness();
+  h.app.state.config = {templates: [{event: 'member_join', effective: 'Welcome {user}'}]};
+  h.app.navigate('templates');
+  await settle();
+  for (const label of h.nodes.get('#content').querySelectorAll('.field > label')) {
+    assert.ok(['Message template', 'Save to'].includes(label.textContent));
+    assert.ok(label.control);
+    assert.equal(label.control.getAttribute('aria-labelledby'), label.id);
+  }
+  const modal = await h.app.editCommand(null);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === '+ add step'), 'click');
+  const inputs = [...modal.querySelectorAll('.step-card input')];
+  assert.equal(inputs.length, 4);
+  assert.equal(new Set(inputs.map(input => input.id)).size, inputs.length);
+  for (const input of inputs) assert.match(input.getAttribute('aria-label'), /^Step (action|value)$/);
+});
+
+test('appearance retains the session choice across startup and workspace when storage is blocked', async () => {
+  const blocked = {get() { throw new Error('blocked'); }, set() { throw new Error('blocked'); }};
+  const h = harness(undefined, blocked);
+  const picker = h.document.querySelector('.theme-select');
+  picker.value = 'dark';
+  await fire(picker, 'change');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
+  h.app.state.config = {templates: []};
+  h.app.navigate('templates');
+  await settle();
+  assert.equal(picker.isConnected, false);
+  assert.equal(h.document.querySelector('.theme-select').value, 'dark');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });

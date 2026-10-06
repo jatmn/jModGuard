@@ -125,7 +125,7 @@ body { background: var(--bg); color: var(--text); }
 .action-row > .select, .action-row > select { flex: 0 1 110px; }
 .action-row > .input, .action-row > input[type=text] { flex: 1 1 180px; }
 .field { margin-bottom: 18px; min-width: 0; }
-.field > label { display: block; font-size: 12px; font-weight: 650; color: var(--text); margin-bottom: 7px; }
+.field > label, .field > legend { display: block; font-size: 12px; font-weight: 650; color: var(--text); margin-bottom: 7px; }
 .field > .input, .field > .select, .field > .textarea, .field > input:not([type=checkbox]), .field > select, .field > textarea { width: 100%; }
 
 .search-select { position: relative; flex: 1 1 180px; min-width: min(180px, 100%); }
@@ -150,6 +150,7 @@ body { background: var(--bg); color: var(--text); }
 .ok { color: var(--good); }
 .err, .error { color: var(--bad); }
 pre.code { background: var(--panel2); border: 1px solid var(--shell-border); border-radius: 8px; padding: 16px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.plan-steps { border: 0; padding: 0; }
 .step-card { border: 1px solid var(--shell-border); border-radius: 8px; padding: 14px; margin-bottom: 10px; background: var(--panel2); }
 .step-actions { display: flex; gap: 8px; margin-top: 10px; }
 .empty-state { text-align: center; }
@@ -277,10 +278,10 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .template-preview .code { min-height: 14rem; margin: 0; line-height: 1.65; }
 .editor-footer { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 16px; padding-top: 18px; border-top: 1px solid var(--shell-border); }
 .editor-footer .field { flex: 0 1 250px; margin: 0; }
-.editor-footer .field label { margin: 0; }
+.editor-footer .field label { margin: 0 0 8px; }
 .routing-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; align-items: end; gap: 16px; }
 .routing-fields .field { margin: 0; }
-.routing-fields .field label { margin: 0; }
+.routing-fields .field label { margin: 0 0 8px; }
 .routing-actions { padding-bottom: 4px; }
 .log-ignore-section { border-top: 1px solid var(--shell-border); padding-top: 20px; }
 .log-ignore-section h4 { font-size: .875rem; font-weight: 700; margin-bottom: 6px; }

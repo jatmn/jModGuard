@@ -135,14 +135,7 @@ function SearchSelect({ children, defaultValue, value, onChange, className, ref,
     ),
   );
 }
-function Appearance() {
-  const [preference, setPreference] = useState(() => {
-    let value;
-    try {
-      value = window.localStorage.getItem("jmodguard.theme");
-    } catch (_) {}
-    return ["system", "light", "dark"].includes(value) ? value : "system";
-  });
+function Appearance({ preference, setPreference }) {
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => {
@@ -232,6 +225,14 @@ function OwnerTools() {
   );
 }
 function App() {
+  const [preference, setPreference] = useState(() => {
+    let value;
+    try {
+      value = window.localStorage.getItem("jmodguard.theme");
+    } catch (_) {}
+    return ["system", "light", "dark"].includes(value) ? value : "system";
+  });
+
   useEffect(() => {
     const beforeUnload = (event) => {
       if (dirty || busy) {
@@ -340,7 +341,7 @@ function App() {
             h(
               "div",
               { className: "sidebar-footer" },
-              h(Appearance),
+              h(Appearance, { preference, setPreference }),
               h(
                 "div",
                 { className: "sidebar-user" },
@@ -397,7 +398,7 @@ function App() {
       : h(
           "div",
           { id: view, className: "welcome-view" },
-          h(Appearance),
+          h(Appearance, { preference, setPreference }),
           h(
             "div",
             { className: "login-card card bg-base-100 shadow-xl" },
@@ -450,17 +451,7 @@ function App() {
             ),
           ),
         ),
-    h(
-      "div",
-      {
-        id: "toast",
-        role: "status",
-        "aria-live": "polite",
-        "aria-atomic": true,
-        className: notification ? `show ${notification.kind}` : "",
-      },
-      notification?.message,
-    ),
+    (!editor || view !== "main-view") && h(Notification),
     view === "main-view" &&
       h(
         Dialog,
@@ -473,7 +464,21 @@ function App() {
           "aria-label": "Configuration editor",
         },
         editor,
+        h(Notification),
       ),
+  );
+}
+function Notification() {
+  return h(
+    "div",
+    {
+      id: "toast",
+      role: "status",
+      "aria-live": "polite",
+      "aria-atomic": true,
+      className: notification ? `show ${notification.kind}` : "",
+    },
+    notification?.message,
   );
 }
 function trackDraft(event) {
@@ -1396,6 +1401,7 @@ async function loadConfig() {
     if (request !== configRequest || guildId !== state.guildId) return;
     if (isUnauthenticated(e)) return;
     state.config = null;
+    editor = null;
     state.error = e.message || String(e);
     toast("Could not refresh configuration: " + state.error, "error");
   } finally {
@@ -1527,7 +1533,7 @@ function emptyPanel(title, body, action, attrs) {
 
 function field(label, control) {
   control = React.cloneElement(control, { "aria-label": label });
-  return h(Field, { className: "field" }, h(Label, {}, label, control));
+  return h(Field, { className: "field" }, h(Label, {}, label), control);
 }
 
 function eventHeading(event) {
@@ -2516,6 +2522,18 @@ function tabCommands() {
   );
 }
 
+function parsePlanParams(value) {
+  const params = JSON.parse(value || "{}");
+  if (!params || typeof params !== "object" || Array.isArray(params))
+    throw new Error("plan parameters must be an object");
+  if (params.steps !== undefined && !Array.isArray(params.steps))
+    throw new Error("plan steps must be an array");
+  params.steps = params.steps || [];
+  if (params.steps.some((step) => !step || typeof step !== "object" || Array.isArray(step)))
+    throw new Error("each plan step must be an object");
+  return params;
+}
+
 function CommandEditor({ record: c }) {
   const isNew = c === null;
   const [data] = useState(() =>
@@ -2636,13 +2654,7 @@ function CommandEditor({ record: c }) {
     onBlur: () => {
       if (!isPlan) return;
       try {
-        const params = JSON.parse(behaviorJson || "{}");
-        if (!params || typeof params !== "object" || Array.isArray(params))
-          throw new Error("plan parameters must be an object");
-        if (params.steps !== undefined && !Array.isArray(params.steps))
-          throw new Error("plan steps must be an array");
-        params.steps = params.steps || [];
-        data.behavior.params = params;
+        data.behavior.params = parsePlanParams(behaviorJson);
         renderSteps();
       } catch (error) {
         toast("Invalid behavior JSON: " + error.message, "error");
@@ -2700,9 +2712,9 @@ function CommandEditor({ record: c }) {
     h(Field, { className: "field" }, h(Label, {}, "Usage"), usageIn),
     isPlan
       ? h(
-          Field,
-          { className: "field" },
-          h(Label, {}, "Action plan steps"),
+          "fieldset",
+          { className: "field plan-steps" },
+          h("legend", {}, "Action plan steps"),
           stepsBox,
           h(
             ActionButton,
@@ -2755,11 +2767,10 @@ function CommandEditor({ record: c }) {
           className: "btn btn-primary",
           onClick: async () => {
             try {
-              const raw = JSON.parse(behaviorAreaRef.current.value || "{}");
               if (isPlan) {
-                data.behavior.params.steps = raw.steps || data.behavior.params.steps;
+                data.behavior.params = parsePlanParams(behaviorAreaRef.current.value);
               } else {
-                data.behavior = raw;
+                data.behavior = JSON.parse(behaviorAreaRef.current.value || "{}");
               }
             } catch (e) {
               toast("Invalid behavior JSON: " + e.message, "error");
@@ -4828,6 +4839,7 @@ function CommandStep({ step, placeholder, onChange, remove }) {
         {
           className: "searchable select select-bordered",
           value: step.type,
+          "aria-label": "Step action",
           onChange: (event) => {
             const type = event.target.value,
               updated = { type };
@@ -4866,6 +4878,7 @@ function CommandStep({ step, placeholder, onChange, remove }) {
       ),
       h(Input, {
         ref: input,
+        "aria-label": "Step value",
         className: "input input-bordered",
         type: "text",
         defaultValue:
@@ -4888,16 +4901,26 @@ function useApiRead(path) {
   useEffect(() => {
     const controller = new AbortController();
     let current = true;
+    const timeout = setTimeout(() => controller.abort(), 30000);
     setResult({ loading: true, data: null, error: null });
     apiRead(path, controller.signal)
       .then((data) => {
         if (current) setResult({ loading: false, data, error: null });
       })
       .catch((error) => {
-        if (current) setResult({ loading: false, data: null, error });
-      });
+        if (current)
+          setResult({
+            loading: false,
+            data: null,
+            error: controller.signal.aborted
+              ? apiError("Request timed out. Refresh to verify saved state before trying again.")
+              : error,
+          });
+      })
+      .finally(() => clearTimeout(timeout));
     return () => {
       current = false;
+      clearTimeout(timeout);
       controller.abort();
     };
   }, [path, revision]);
