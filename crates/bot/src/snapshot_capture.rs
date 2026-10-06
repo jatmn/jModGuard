@@ -965,7 +965,8 @@ fn capture_enabled(config: &crate::state::CachedGuildConfig) -> bool {
 }
 
 // Admission stays next to the write for both a drain and each pressure-split
-// item. A previous work item's configuration never authorizes these creates.
+// item. Recheck cleanup pause after the configuration await as well; neither
+// admission check on an earlier work item authorizes these creates.
 async fn observe_configured_creates(
     app: &BotState,
     store: &GuildDataStore,
@@ -978,6 +979,10 @@ async fn observe_configured_creates(
     for (index, observation) in observations.into_iter().enumerate() {
         match app.configs.get(&app.db, scope.guild_id() as u64).await {
             Ok(config) if capture_enabled(&config) => {
+                if app.snapshots.capture_paused(scope) {
+                    app.snapshots.gap_scope(scope);
+                    continue;
+                }
                 indices.push(index);
                 admitted.push(observation);
             }
@@ -1548,6 +1553,128 @@ fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_rechecks_cleanup_pause_after_configuration_reload() {
+        use std::future::Future;
+
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_pause_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms: None,
+            coverage_epoch: 1,
+            fields: SnapshotFields {
+                content: Some("captured".into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        // Exercise both a drained batch and the single-item pressure fallback.
+        for ids in [vec![1, 2], vec![3]] {
+            let config = app.configs.get(&app.db, 789).await.unwrap();
+            assert!(capture_enabled(&config));
+            assert!(!app.snapshots.capture_paused(&scope));
+            app.invalidate_configs();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied_db = app.db.clone();
+            let occupied = tokio::spawn(async move {
+                occupied_db
+                    .with_conn(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            entered_rx.await.unwrap();
+            let observations: Vec<_> = ids.iter().copied().map(observation).collect();
+            let mut writes = Box::pin(observe_configured_creates(
+                &app,
+                &store,
+                &scope,
+                observations.clone(),
+            ));
+            std::future::poll_fn(|cx| match writes.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(_) => panic!("configuration reload did not wait"),
+            })
+            .await;
+            release_tx.send(()).unwrap();
+            occupied.await.unwrap();
+            // Before resuming admission, use the real maintenance failure path.
+            // An invalid cleanup time is rejected by the store, as in the
+            // maintenance recovery test below; no pause flag is set by the test.
+            app.snapshots.maintain_at(&app, Some(-1)).await;
+            assert!(app.snapshots.capture_paused(&scope));
+            let store_id = scope.placement().store_id().as_str();
+            app.snapshots.take_loss(store_id);
+            let outcomes = writes.await.unwrap();
+            let retained = store
+                .take_snapshots(scope.clone(), 456, ids.clone(), now + 1)
+                .await
+                .unwrap();
+            assert!(
+                retained.iter().all(Option::is_none),
+                "capture persisted after cleanup paused: {outcomes:?}"
+            );
+            assert_eq!(outcomes, vec![None; ids.len()]);
+            assert_eq!(app.snapshots.take_loss(store_id), ids.len() as u64);
+
+            app.snapshots.maintain_at(&app, Some(now)).await;
+            assert!(!app.snapshots.capture_paused(&scope));
+            assert_eq!(
+                observe_configured_creates(&app, &store, &scope, observations)
+                    .await
+                    .unwrap(),
+                vec![Some(SnapshotOutcome::Stored); ids.len()]
+            );
+            let retained = store
+                .take_snapshots(scope.clone(), 456, ids.clone(), now + 1)
+                .await
+                .unwrap();
+            for (row, id) in retained.into_iter().zip(ids) {
+                let row = row.unwrap();
+                assert_eq!(row.message_id, id);
+                assert_eq!(row.fields.content.as_deref(), Some("captured"));
+            }
+        }
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[tokio::test]
     async fn capture_writes_recheck_configuration_for_batches_and_split_items() {
