@@ -159,10 +159,15 @@ impl Drop for RuntimeThread {
 #[derive(Debug, Default)]
 pub struct StartupProbe {
     immediate: AtomicU64,
+    transactions: AtomicU64,
     queries: AtomicU64,
 }
 
 impl StartupProbe {
+    pub fn transactions(&self) -> u64 {
+        self.transactions.load(Ordering::Relaxed)
+    }
+
     pub fn immediate(&self) -> u64 {
         self.immediate.load(Ordering::Relaxed)
     }
@@ -1091,8 +1096,11 @@ impl Connection {
         let immediate = matches!(behavior, libsql::TransactionBehavior::Immediate);
         let inner = runtime
             .complete_or_release_open(operation, self.inner.transaction_with_behavior(behavior))?;
-        if immediate && let Some(probe) = &self.runtime.startup_probe {
-            probe.record_immediate();
+        if let Some(probe) = &self.runtime.startup_probe {
+            probe.transactions.fetch_add(1, Ordering::Relaxed);
+            if immediate {
+                probe.record_immediate();
+            }
         }
         Ok(inner)
     }
@@ -1122,6 +1130,17 @@ impl Connection {
             libsql::TransactionBehavior::Deferred,
         )?;
         Ok(self.wrap_transaction(inner, None, false))
+    }
+
+    /// Snapshot capture reads before acquiring the writer lock. A concurrent
+    /// writer can invalidate promotion; the capture owner must restart the
+    /// entire operation on a proven busy error, never reuse the read results.
+    pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
+        let inner = self.open_remote_transaction(
+            "begin capture transaction",
+            libsql::TransactionBehavior::Deferred,
+        )?;
+        Ok(self.wrap_transaction(inner, None, true))
     }
 
     /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
@@ -2525,6 +2544,66 @@ mod tests {
 
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn capture_reads_allow_writers_and_stale_promotion_cannot_overwrite_them() {
+        let path = std::env::temp_dir().join(format!(
+            "capture_upgrade_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        reader
+            .execute_batch_bounded(
+                "CREATE TABLE counter(value INTEGER); INSERT INTO counter VALUES(1)",
+                1_000_000,
+            )
+            .unwrap();
+        let writer = Connection::open(&path).unwrap();
+        let mut capture = reader.transaction_capture().unwrap();
+        let before: i64 = capture
+            .query_row("SELECT value FROM counter", (), |r| Ok(r.get(0)?))
+            .unwrap();
+        assert_eq!(before, 1);
+        // Another writer completes while the capture read transaction is open.
+        writer
+            .execute_bounded("UPDATE counter SET value=2", (), 1_000_000)
+            .unwrap();
+        capture.ensure_mutation_receipt().unwrap();
+        let error = capture
+            .execute_bounded(
+                "UPDATE counter SET value=?1",
+                params![before + 10],
+                1_000_000,
+            )
+            .unwrap_err();
+        assert!(error.chain().any(|e| matches!(e.downcast_ref::<libsql::Error>(), Some(libsql::Error::SqliteFailure(code, _)) if code & 0xff == 5)), "{error:#}");
+        drop(capture);
+        let retry = reader.transaction_immediate().unwrap();
+        let fresh: i64 = retry
+            .query_row("SELECT value FROM counter", (), |r| Ok(r.get(0)?))
+            .unwrap();
+        assert_eq!(fresh, 2);
+        retry
+            .execute_bounded(
+                "UPDATE counter SET value=?1",
+                params![fresh + 10],
+                1_000_000,
+            )
+            .unwrap();
+        retry.commit().unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM counter", (), |r| Ok(r.get::<i64>(0)?))
+                .unwrap(),
+            12
+        );
+        drop(reader);
+        drop(writer);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

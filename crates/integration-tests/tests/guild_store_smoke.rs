@@ -16,6 +16,7 @@ async fn retained_messages_survive_remote_reopen(
     store: &GuildDataStore,
     reopened: &GuildDataStore,
     scope: &GuildDataScope,
+    probe: &jmodguard::db::StartupProbe,
 ) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,13 +86,30 @@ async fn retained_messages_survive_remote_reopen(
     // not evidence about the production Bunny endpoint.
     let started = std::time::Instant::now();
     let before = store.measure_usage(false).await.unwrap().allocated_bytes;
-    for id in 2000..2100 {
+    let ids: Vec<_> = (2000..2100).collect();
+    for chunk in ids.chunks(SNAPSHOT_CAPTURE_BATCH) {
+        let calls = probe.queries();
+        let transactions = probe.transactions();
+        let immediate = probe.immediate();
         assert_eq!(
             store
-                .observe_snapshot(scope.clone(), observation(id, "x".repeat(4096)))
+                .observe_snapshots(
+                    scope.clone(),
+                    chunk
+                        .iter()
+                        .map(|id| observation(*id, "x".repeat(4096)))
+                        .collect()
+                )
                 .await
                 .unwrap(),
-            SnapshotOutcome::Stored
+            vec![SnapshotOutcome::Stored; chunk.len()]
+        );
+        assert_eq!(probe.transactions() - transactions, 1);
+        assert_eq!(probe.immediate() - immediate, 0);
+        assert!(
+            probe.queries() - calls <= 24,
+            "remote batch used {} calls",
+            probe.queries() - calls
         );
     }
     let allocated = store.measure_usage(false).await.unwrap().allocated_bytes;
@@ -139,7 +157,11 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
         .unwrap();
     assert!(GuildDataStore::open(remote_options(), registration.clone()).is_err());
     test_drop_next_commit_response();
-    let store = GuildDataStore::initialize(remote_options(), registration.clone()).unwrap();
+    let probe = std::sync::Arc::new(jmodguard::db::StartupProbe::default());
+    let store = {
+        let _guard = jmodguard::db::enter_startup_probe(Some(probe.clone()));
+        GuildDataStore::initialize(remote_options(), registration.clone()).unwrap()
+    };
     assert!(store.verify_placement(placement.clone()).await.is_err());
     test_drop_next_commit_response();
     store
@@ -219,7 +241,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .is_err()
     );
-    retained_messages_survive_remote_reopen(&store, &reopened, &scoped).await;
+    retained_messages_survive_remote_reopen(&store, &reopened, &scoped, &probe).await;
     let case_id = CaseId::new();
     let limits = CaseLimits::default();
     let facts = CaseData {

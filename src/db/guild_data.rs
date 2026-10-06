@@ -125,15 +125,14 @@ fn verify_identity_version(
     expected: &StoreRegistration,
     wanted: i64,
 ) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+    // Inspect version and catalog in one request while preserving the base's
+    // required-object checks inside the caller's data transaction.
+    let (version, objects): (i64, String) = conn.query_row(
+        "SELECT (SELECT user_version FROM pragma_user_version), json_group_array(json_array(type,name)) FROM sqlite_master",
+        (), |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     anyhow::ensure!(version == wanted, StoreCheckError::Schema);
-    // Read the catalog once. Verification still shares the caller's data
-    // transaction, so reconnects and schema changes cannot reuse stale authority.
-    let mut statement =
-        conn.prepare("SELECT type,name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'")?;
-    let objects = statement
-        .query_map((), |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)))?
-        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let objects: std::collections::HashSet<(String, String)> = serde_json::from_str(&objects)?;
     let has = |kind: &str, name: &str| objects.contains(&(kind.to_owned(), name.to_owned()));
     let required: &[(i64, &str, &str)] = &[
         (

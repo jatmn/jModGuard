@@ -11,6 +11,8 @@ const MAX_ATTACHMENTS: usize = 16 * 1024;
 const MAX_ATTACHMENT_INPUT: usize = 128;
 const MAX_PAYLOAD: usize = 64 * 1024;
 const MAX_BULK: usize = 100;
+/// Bound worker drains and conservative capacity reservations.
+pub const SNAPSHOT_CAPTURE_BATCH: usize = 8;
 const ROW_RESERVE: u64 = 4096;
 
 /// Maximum encoded row plus possible B-tree splits in the table, its two
@@ -103,6 +105,8 @@ pub enum SnapshotError {
     Invalid,
     #[error("snapshot batch exceeds 100 IDs")]
     BatchLimit,
+    #[error("snapshot batch needs individual admission and pressure handling")]
+    BatchCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,20 +310,67 @@ fn merged(
     (fields, content_supplied, attachments_supplied)
 }
 
-fn insert(
-    tx: &impl SqlExecutor,
+const INSERT_SNAPSHOT: &str = "INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,author_id,author_name,content,content_truncated,content_original_bytes,attachments,attachments_truncated,attachments_omitted,content_supplied,attachments_supplied,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,encoded_bytes,reservation_bytes)";
+
+fn insert_values(
     scope: &GuildDataScope,
     row: &MessageSnapshot,
     bytes: usize,
-) -> Result<()> {
+    reserve: u64,
+) -> Result<Vec<Value>> {
     let attachments = row
         .fields
         .attachments
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    Ok(params![
+        scope.guild_id(),
+        scope.enrollment.id.as_str(),
+        row.channel_id,
+        row.message_id,
+        row.fields.author_id,
+        row.fields.author_name.as_deref(),
+        row.fields.content.as_deref(),
+        row.fields.content_truncated,
+        row.fields.content_original_bytes,
+        attachments.as_deref(),
+        row.fields.attachments_truncated,
+        row.fields.attachments_omitted,
+        row.content_supplied,
+        row.attachments_supplied,
+        row.created_at_ms,
+        row.first_observed_at_ms,
+        row.last_observed_at_ms,
+        row.edit_at_ms,
+        row.expires_at_ms,
+        row.generation,
+        row.coverage_epoch as i64,
+        row.continuous,
+        bytes as i64,
+        reserve as i64
+    ]
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn insert(
+    tx: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    row: &MessageSnapshot,
+    bytes: usize,
+) -> Result<()> {
     let reserve = growth_reserve(tx)?;
-    tx.execute_bounded("INSERT INTO guild_message_snapshots(guild_id,enrollment_id,channel_id,message_id,author_id,author_name,content,content_truncated,content_original_bytes,attachments,attachments_truncated,attachments_omitted,content_supplied,attachments_supplied,created_at_ms,first_observed_at_ms,last_observed_at_ms,edit_at_ms,expires_at_ms,generation,coverage_epoch,continuous,encoded_bytes,reservation_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)", params![scope.guild_id(),scope.enrollment.id.as_str(),row.channel_id,row.message_id,row.fields.author_id,row.fields.author_name.as_deref(),row.fields.content.as_deref(),row.fields.content_truncated,row.fields.content_original_bytes,attachments.as_deref(),row.fields.attachments_truncated,row.fields.attachments_omitted,row.content_supplied,row.attachments_supplied,row.created_at_ms,row.first_observed_at_ms,row.last_observed_at_ms,row.edit_at_ms,row.expires_at_ms,row.generation,row.coverage_epoch as i64,row.continuous,bytes as i64,reserve as i64], reserve)?;
+    let values = insert_values(scope, row, bytes, reserve)?;
+    let placeholders = (1..=values.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    tx.execute_bounded(
+        &format!("{INSERT_SNAPSHOT} VALUES({placeholders})"),
+        params_from_iter(values),
+        reserve,
+    )?;
     Ok(())
 }
 
@@ -340,7 +391,51 @@ fn update(
     Ok(())
 }
 
+fn capture_busy(error: &anyhow::Error) -> bool {
+    if crate::db_compat::is_database_commit_indeterminate(error) {
+        return false;
+    }
+    error.chain().any(|cause| {
+        match cause.downcast_ref::<libsql::Error>() {
+            Some(
+                libsql::Error::SqliteFailure(code, _)
+                | libsql::Error::RemoteSqliteFailure(code, _, _),
+            ) => code & 0xff == 5,
+            // Hrana exposes the remote SQLite code in its structured error's
+            // display. Do not classify timeouts/connection loss as contention.
+            Some(libsql::Error::Hrana(_)) => cause.to_string().contains("SQLITE_BUSY"),
+            _ => false,
+        }
+    })
+}
+
+fn capture_transaction(conn: &Connection, immediate: bool) -> Result<Transaction> {
+    if immediate {
+        conn.transaction_primary_read()
+    } else {
+        conn.transaction_capture()
+    }
+}
+
 impl GuildDataStore {
+    async fn capture<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&mut Connection, bool) -> Result<T> + Send + Sync + 'static,
+    {
+        let operation = std::sync::Arc::new(operation);
+        let first = operation.clone();
+        match self.db.with_conn(move |conn| first(conn, false)).await {
+            Err(error) if capture_busy(&error) => {
+                // The failed transaction was rolled back before with_conn
+                // returned. Re-read everything under the existing writer path
+                // once, instead of repeatedly trying to promote stale reads.
+                self.db.with_conn(move |conn| operation(conn, true)).await
+            }
+            result => result,
+        }
+    }
+
     pub async fn update_snapshot_health(&self, update: SnapshotHealthUpdate) -> Result<()> {
         anyhow::ensure!(
             update.epoch <= i64::MAX as u64 && update.now_ms > 0,
@@ -392,67 +487,119 @@ impl GuildDataStore {
     pub async fn observe_snapshot(
         &self,
         scope: GuildDataScope,
-        mut observation: SnapshotObservation,
+        observation: SnapshotObservation,
     ) -> Result<SnapshotOutcome> {
+        Ok(self
+            .observe_snapshots(scope, vec![observation])
+            .await?
+            .remove(0))
+    }
+
+    /// Consecutive creates for one captured scope, in input order. Edits and
+    /// deletes are worker barriers, so a drain cannot reorder message history.
+    /// BatchCapacity leaves all rows unchanged: handle each create and its
+    /// pressure eviction before admitting the next, just as for single events.
+    pub async fn observe_snapshots(
+        &self,
+        scope: GuildDataScope,
+        observations: Vec<SnapshotObservation>,
+    ) -> Result<Vec<SnapshotOutcome>> {
+        anyhow::ensure!(
+            observations.len() <= SNAPSHOT_CAPTURE_BATCH,
+            SnapshotError::BatchLimit
+        );
         self.check_target(&scope.placement)?;
+        let mut prepared = Vec::with_capacity(observations.len());
+        for mut observation in observations {
+            let expires = validate(&observation)?;
+            let bytes = bound_fields(&mut observation.fields)?;
+            prepared.push((observation, expires, bytes));
+        }
+        self.observe_snapshot_batch(scope, prepared)
+            .await?
+            .ok_or_else(|| SnapshotError::BatchCapacity.into())
+    }
+
+    async fn observe_snapshot_batch(
+        &self,
+        scope: GuildDataScope,
+        batch: Vec<(SnapshotObservation, i64, usize)>,
+    ) -> Result<Option<Vec<SnapshotOutcome>>> {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
-        let expires = validate(&observation)?;
-        let bytes = bound_fields(&mut observation.fields)?;
         let expected = self.expected.clone();
-        self.db
-            .with_conn(move |conn| {
-                let mut tx = conn.transaction_primary_read()?;
-                verify_scope(&tx, &expected, &scope, true)?;
-                if observation.fields.author_id.is_none() {
-                    tx.finish_read()?;
-                    return Ok(SnapshotOutcome::Missing);
-                }
-                if observation.observed_at_ms >= expires || write_time_ms()? >= expires {
-                    tx.finish_read()?;
-                    return Ok(SnapshotOutcome::Expired);
-                }
-                if load(&tx, &scope, observation.channel_id, observation.message_id)?.is_some() {
-                    tx.finish_read()?;
-                    return Ok(SnapshotOutcome::Duplicate);
-                }
-                let reserve = growth_reserve(&tx)?;
-                let admission = admit_snapshot(
-                    &mut tx,
-                    bytes as u64,
-                    0,
-                    reserve,
-                    observation.observed_at_ms,
-                )?;
-                if !admission.allowed {
-                    if admission.wrote_health {
-                        tx.commit()?;
-                    } else {
-                        tx.finish_read()?;
-                    }
-                    return Ok(SnapshotOutcome::CapacityRefused);
-                }
-                tx.ensure_mutation_receipt()?;
-                let row = MessageSnapshot {
-                    guild_id: scope.guild_id(),
-                    channel_id: observation.channel_id,
-                    message_id: observation.message_id,
-                    fields: observation.fields,
-                    created_at_ms: observation.created_at_ms,
-                    first_observed_at_ms: observation.observed_at_ms,
-                    last_observed_at_ms: observation.observed_at_ms,
-                    edit_at_ms: None,
-                    expires_at_ms: expires,
-                    generation: 1,
-                    coverage_epoch: observation.coverage_epoch,
-                    continuous: true,
-                    content_supplied: false,
-                    attachments_supplied: false,
+        let batch_scope = scope.clone();
+        self.capture(move |conn, immediate| {
+            let scope = &batch_scope;
+            let mut tx = capture_transaction(conn, immediate)?;
+            verify_scope(&tx, &expected, scope, true)?;
+            let mut outcomes = vec![SnapshotOutcome::Stored; batch.len()];
+            let mut seen = HashSet::new();
+            if !batch.is_empty() {
+                let keys = serde_json::to_string(&batch.iter().map(|(o,_,_)| [o.channel_id,o.message_id]).collect::<Vec<_>>())?;
+                let mut stmt = tx.prepare("SELECT channel_id,message_id FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 AND (channel_id,message_id) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?3))")?;
+                for row in stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),keys], |r| Ok((r.get::<i64>(0)?,r.get::<i64>(1)?)))? { seen.insert(row?); }
+            }
+            let now = write_time_ms()?;
+            let reserve = growth_reserve(&tx)?;
+            let mut values = Vec::new();
+            let mut placeholders = Vec::new();
+            let mut bytes_total = 0;
+            let mut observed_at = 0;
+            for (i, (observation, expires, bytes)) in batch.iter().enumerate() {
+                outcomes[i] = if observation.fields.author_id.is_none() {
+                    SnapshotOutcome::Missing
+                } else if observation.observed_at_ms >= *expires || now >= *expires {
+                    SnapshotOutcome::Expired
+                } else if !seen.insert((observation.channel_id, observation.message_id)) {
+                    SnapshotOutcome::Duplicate
+                } else {
+                    let row = MessageSnapshot {
+                        guild_id: scope.guild_id(), channel_id: observation.channel_id,
+                        message_id: observation.message_id, fields: observation.fields.clone(),
+                        created_at_ms: observation.created_at_ms,
+                        first_observed_at_ms: observation.observed_at_ms,
+                        last_observed_at_ms: observation.observed_at_ms, edit_at_ms: None,
+                        expires_at_ms: *expires, generation: 1, coverage_epoch: observation.coverage_epoch,
+                        continuous: true, content_supplied: false, attachments_supplied: false,
+                    };
+                    let row_values = insert_values(scope, &row, *bytes, reserve)?;
+                    let first = values.len()+1;
+                    placeholders.push(format!("({})", (first..first+row_values.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(",")));
+                    values.extend(row_values);
+                    bytes_total += *bytes as u64;
+                    observed_at = observed_at.max(observation.observed_at_ms);
+                    SnapshotOutcome::Stored
                 };
-                insert(&tx, &scope, &row, bytes)?;
-                tx.commit()?;
-                Ok(SnapshotOutcome::Stored)
-            })
-            .await
+            }
+            if placeholders.is_empty() { tx.finish_read()?; return Ok(Some(outcomes)); }
+            let count = placeholders.len() as u64;
+            // Aggregate worst-case reservations can exceed the global budget
+            // even when individual rows fit (notably with 64 KiB pages).
+            // Split before mutation; never turn batching into lost captures.
+            if count > 1 && crate::capacity::allocated_bytes(&tx)?
+                .saturating_add(reserve.saturating_mul(count + 1))
+                .saturating_add(8 * 1024 * 1024) > crate::capacity::GROWTH_STOP_BYTES {
+                tx.finish_read()?;
+                return Ok(None);
+            }
+
+            let admission = admit_snapshot(&mut tx, bytes_total, 0, reserve * count, observed_at, count)?;
+            if !admission.allowed {
+                if batch.len() > 1 {
+                    // A conservative aggregate reservation must not refuse rows
+                    // that fit when admitted individually. Roll back health too.
+                    tx.finish_read()?;
+                    return Ok(None);
+                }
+                if admission.wrote_health { tx.commit()?; } else { tx.finish_read()?; }
+                for outcome in &mut outcomes { if *outcome == SnapshotOutcome::Stored { *outcome = SnapshotOutcome::CapacityRefused; } }
+                return Ok(Some(outcomes));
+            }
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(&format!("{INSERT_SNAPSHOT} VALUES {}", placeholders.join(",")), params_from_iter(values), reserve * count)?;
+            tx.commit()?;
+            Ok(Some(outcomes))
+        }).await
     }
 
     /// Reads and writes one accepted edit in one primary transaction. Equal-version
@@ -489,8 +636,9 @@ impl GuildDataStore {
         let edit = observation.edit_at_ms.ok_or(SnapshotError::Invalid)?;
         let incoming_bytes = bound_fields(&mut observation.fields)?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+        self.capture(move |conn, immediate| {
+            let observation = observation.clone();
+            let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, &scope, true)?;
             if observation.observed_at_ms >= expires || write_time_ms()? >= expires { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None }); }
             let old = load(&tx, &scope, observation.channel_id, observation.message_id)?;
@@ -516,7 +664,7 @@ impl GuildDataStore {
             if !changed { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Duplicate, before: None, after: old }); }
             let old_bytes = if old.is_some() { tx.query_row("SELECT encoded_bytes FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 AND channel_id=?3 AND message_id=?4", params![scope.guild_id(),scope.enrollment.id.as_str(),observation.channel_id,observation.message_id], |r| Ok(r.get::<i64>(0)?))? as u64 } else { 0 };
             let reserve = growth_reserve(&tx)?;
-            let admission = admit_snapshot(&mut tx, bytes as u64, old_bytes, reserve, observation.observed_at_ms)?;
+            let admission = admit_snapshot(&mut tx, bytes as u64, old_bytes, reserve, observation.observed_at_ms, u64::from(old.is_none()))?;
             if !admission.allowed {
                 if admission.wrote_health { tx.commit()?; } else { tx.finish_read()?; }
                 return Ok(SnapshotTransition { outcome: SnapshotOutcome::CapacityRefused, before: None, after: old });
@@ -586,8 +734,9 @@ impl GuildDataStore {
             SnapshotError::BatchLimit
         );
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+        self.capture(move |conn, immediate| {
+            let ids = ids.clone();
+            let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, &scope, true)?;
             if ids.is_empty() { tx.finish_read()?; return Ok(Vec::new()); }
             let mut unique = ids.clone();
@@ -728,12 +877,45 @@ fn admit_snapshot(
     old_bytes: u64,
     reserve: u64,
     now_ms: i64,
+    new_rows: u64,
 ) -> Result<SnapshotAdmission> {
     let allocated = crate::capacity::allocated_bytes(tx)?;
     let (logical, mut sample, mut sampled_at, mut debt, paused):
         (i64, Option<i64>, Option<i64>, i64, bool) = tx.query_row(
         "SELECT estimated_snapshot_bytes,physical_sample_bytes,physical_sample_at_ms,physical_debt_bytes,capacity_paused FROM guild_snapshot_health WHERE singleton=1",
         (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    // Insert accounting adds the one-time row reserve. An update already
+    // carries that reserve and only changes encoded bytes.
+    let row_reserve = ROW_RESERVE.saturating_mul(new_rows);
+    let estimated = (logical.max(0) as u64)
+        .saturating_add(incoming_bytes.saturating_sub(old_bytes))
+        .saturating_add(row_reserve);
+    let sampled_recently = sampled_at.is_some_and(|at| now_ms.saturating_sub(at) < 300_000);
+    let sample_upper = sample
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(allocated)
+        .saturating_add(debt.max(0) as u64)
+        .saturating_add(reserve);
+    // Refresh the detailed allocation at most once per five minutes in the
+    // ordinary path. When accumulated conservative debt nears 400 MB, allow
+    // one early refresh per 30 seconds; between refreshes refuse safely.
+    let budget_near = sample_upper > crate::capacity::SNAPSHOT_BUDGET_BYTES;
+    let refresh = sample.is_none()
+        || !sampled_recently
+        || (budget_near && sampled_at.is_none_or(|at| now_ms.saturating_sub(at) >= 30_000));
+    let attributed = if refresh
+        && allocated < crate::capacity::SNAPSHOT_PAUSE_BYTES
+        && (!paused || allocated < crate::capacity::PRESSURE_BYTES)
+        && estimated <= crate::capacity::SNAPSHOT_BUDGET_BYTES
+    {
+        let attributed: Option<i64> = tx.query_row(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name IN ('guild_message_snapshots','guild_snapshot_expiry','guild_snapshot_health') OR name GLOB 'sqlite_autoindex_guild_message_snapshots_*'",
+            (), |r| Ok(r.get(0)?),
+        ).unwrap_or(None);
+        attributed
+    } else {
+        None
+    };
     let mut wrote_health = false;
     // The high-water pause is durable and shared by all bot processes. Once
     // reached, capture waits until a fresh primary sample drops below 700 MB.
@@ -767,36 +949,13 @@ fn admit_snapshot(
         )?;
         wrote_health = true;
     }
-    // Insert accounting adds the one-time row reserve. An update already
-    // carries that reserve and only changes encoded bytes.
-    let row_reserve = if old_bytes == 0 { ROW_RESERVE } else { 0 };
-    let estimated = (logical.max(0) as u64)
-        .saturating_add(incoming_bytes.saturating_sub(old_bytes))
-        .saturating_add(row_reserve);
     if estimated > crate::capacity::SNAPSHOT_BUDGET_BYTES {
         return Ok(SnapshotAdmission {
             allowed: false,
             wrote_health,
         });
     }
-    let sampled_recently = sampled_at.is_some_and(|at| now_ms.saturating_sub(at) < 300_000);
-    let sample_upper = sample
-        .and_then(|n| u64::try_from(n).ok())
-        .unwrap_or(allocated)
-        .saturating_add(debt.max(0) as u64)
-        .saturating_add(reserve);
-    // Refresh the detailed allocation at most once per five minutes in the
-    // ordinary path. When accumulated conservative debt nears 400 MB, allow
-    // one early refresh per 30 seconds; between refreshes refuse safely.
-    let budget_near = sample_upper > crate::capacity::SNAPSHOT_BUDGET_BYTES;
-    let refresh = sample.is_none()
-        || !sampled_recently
-        || (budget_near && sampled_at.is_none_or(|at| now_ms.saturating_sub(at) >= 30_000));
     if refresh {
-        let attributed: Option<i64> = tx.query_row(
-            "SELECT SUM(pgsize) FROM dbstat WHERE name IN ('guild_message_snapshots','guild_snapshot_expiry','guild_snapshot_health') OR name GLOB 'sqlite_autoindex_guild_message_snapshots_*'",
-            (), |r| Ok(r.get(0)?),
-        ).unwrap_or(None);
         let measured = attributed
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(allocated);
@@ -815,7 +974,11 @@ fn admit_snapshot(
     // whole-file sample bounds them even if conservative per-write debt has
     // greatly exceeded actual allocation. The pending write is covered by
     // the same full B-tree/trigger reservation on either side of the minimum.
-    let fresh_allocated = crate::capacity::allocated_bytes(tx)?;
+    let fresh_allocated = if wrote_health {
+        crate::capacity::allocated_bytes(tx)?
+    } else {
+        allocated
+    };
     if fresh_allocated >= crate::capacity::SNAPSHOT_PAUSE_BYTES {
         tx.ensure_mutation_receipt()?;
         tx.execute_bounded(
@@ -838,4 +1001,79 @@ fn admit_snapshot(
         allowed: physical_upper <= crate::capacity::SNAPSHOT_BUDGET_BYTES,
         wrote_health,
     })
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capture_automatically_retries_busy_and_rereads_committed_health() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_retry_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let registration = StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared);
+        let store = GuildDataStore::initialize(
+            GuildStoreOptions {
+                path: path.clone(),
+                url: String::new(),
+                token: String::new(),
+                pool_size: 1,
+            },
+            registration,
+        )
+        .unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let writer_path = path.clone();
+        let result = store
+            .capture(move |conn, immediate| {
+                let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(immediate, attempt == 1);
+                let mut tx = capture_transaction(conn, immediate)?;
+                let lost: i64 = tx.query_row(
+                    "SELECT lost_count FROM guild_snapshot_health WHERE singleton=1",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )?;
+                if attempt == 0 {
+                    // Commit on a genuinely independent connection after the
+                    // deferred read. Its promotion must fail with SQLITE_BUSY.
+                    let writer = Connection::open(&writer_path)?;
+                    writer.execute_bounded(
+                        "UPDATE guild_snapshot_health SET lost_count=1 WHERE singleton=1",
+                        (),
+                        1_000_000,
+                    )?;
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_bounded(
+                    "UPDATE guild_snapshot_health SET lost_count=?1 WHERE singleton=1",
+                    params![lost + 10],
+                    1_000_000,
+                )?;
+                tx.commit()?;
+                Ok(lost)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(result, 1, "retry must read the competing commit");
+        assert_eq!(
+            store
+                .measure_usage(false)
+                .await
+                .unwrap()
+                .snapshot_health
+                .unwrap()
+                .lost_count,
+            11,
+            "retry must durably apply to fresh state, not overwrite with stale state"
+        );
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
