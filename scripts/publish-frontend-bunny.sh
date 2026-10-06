@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upload frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
+# Upload built dist/frontend/ to a Bunny Storage Zone and purge the configured production Pull Zone.
 #
 # Public installs can upload the same files from this repository
 # or the WebUI image. Keep Storage passwords out of git.
@@ -14,9 +14,9 @@ endpoint="${BUNNY_STORAGE_ENDPOINT:-storage.bunnycdn.com}"
 endpoint="${endpoint#https://}"
 endpoint="${endpoint%/}"
 
-root="${JMODGUARD_FRONTEND_ROOT:-$(cd "$(dirname "$0")/.." && pwd)/frontend}"
+root="${JMODGUARD_FRONTEND_ROOT:-$(cd "$(dirname "$0")/.." && pwd)/dist/frontend}"
 if [[ ! -f "$root/index.html" || ! -f "$root/app.js" || ! -f "$root/style.css" ]]; then
-  echo "frontend/ is missing index.html, app.js, or style.css under $root" >&2
+  echo "Build the WebUI first (npm ci --ignore-scripts --prefix tools/webui && npm run build --prefix tools/webui); dist/frontend/ is missing index.html, app.js, or style.css under $root" >&2
   exit 1
 fi
 

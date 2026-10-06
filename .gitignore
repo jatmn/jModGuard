@@ -6,3 +6,4 @@ logs/
 /config.toml
 jmodguard.secret
 node_modules/
+/dist/

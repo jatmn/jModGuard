@@ -53,7 +53,9 @@ git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
 # Independent bot package (no dashboard stack).
 cargo build --locked --release -p jmodguard-bot
-# API with the default embedded frontend.
+# API with the default embedded frontend (Node.js 22.13+).
+npm ci --ignore-scripts --prefix tools/webui
+npm run build --prefix tools/webui
 cargo build --locked --release -p jmodguard-api
 cp config.example.toml config.toml     # add your token + OAuth ids
 ./target/release/jmodguard-bot         # Discord gateway (migrates DB)
@@ -143,7 +145,7 @@ crates/api/src/            HTTP/OAuth API and dashboard state
 crates/api/tests/          actual API startup regression
 crates/integration-tests/  shared-DB, cross-service and optional remote-libSQL regressions
 crates/runtime/            shared process health/shutdown utilities
-frontend/                  static dashboard (Bunny Storage/CDN or local API embed; daisyUI/Headless at runtime)
+frontend/                  static dashboard (Bunny Storage/CDN or local API embed; daisyUI/Headless bundled at build time)
 migrations/                jmodguard-core-1, steps 0001–0009
 Dockerfile.bot / Dockerfile.api
 ```

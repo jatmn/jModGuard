@@ -230,6 +230,14 @@ run_cargo() {
   return 1
 }
 
+# Rust's default embed-ui and the publication tests consume the same built assets.
+if should_run api || should_run integration || should_run dylint || should_run frontend || should_run publish-tests; then
+  bash scripts/require-host-eslint-node.sh
+  npm ci --ignore-scripts --prefix tools/webui
+  npm audit --prefix tools/webui --audit-level=high
+  npm run build --prefix tools/webui
+fi
+
 if run_cargo; then
   echo 'ci-preflight: cargo update --workspace --locked'
   cargo update --workspace --locked

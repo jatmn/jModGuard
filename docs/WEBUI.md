@@ -1,7 +1,7 @@
 # WebUI
 
 The WebUI is a single-page admin app. On a laptop it is served by
-**`jmodguard-api`** (feature `embed-ui`). On Bunny it is files in `frontend/`
+**`jmodguard-api`** (feature `embed-ui`). On Bunny it is built files from `dist/frontend/`
 on Storage/CDN; the API container stays private and only answers `/api`,
 login, and OAuth. The pages never open SQL from the browser. They call the
 API; the API (and the bot) open the database. If the CDN page loads while
@@ -20,31 +20,40 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 
 ## Getting and hosting the files
 
-The website has five first-party files in the `frontend/` folder:
+Build the five website files from source before hosting or compiling the API's
+default `embed-ui` feature (Node.js as supported by `tools/webui/package.json`):
+
+```bash
+npm ci --ignore-scripts --prefix tools/webui
+npm run build --prefix tools/webui
+```
+
+Rebuild after editing `frontend/` or `tools/webui/`. Output is in
+`dist/frontend/`, ignored by Git. Buildkite runs these steps before checks and
+release packaging. The bot and API `--no-default-features` builds need no WebUI build.
+Do not upload the unbuilt `frontend/` sources.
+
+The five generated files are:
 
 | File | What it is |
 |---|---|
-| `frontend/index.html` | the page |
-| `frontend/app.js` | the app |
-| `frontend/style.css` | the look |
-| `frontend/administration/index.html` | owner Administration and Updates page |
-| `frontend/administration.js` | update controls and version display |
+| `dist/frontend/index.html` | the page |
+| `dist/frontend/app.js` | the app |
+| `dist/frontend/style.css` | the look |
+| `dist/frontend/administration/index.html` | owner Administration and Updates page |
+| `dist/frontend/administration.js` | update controls and version display |
 
 Buildkite also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
 
-The browser also loads **daisyUI CSS** and **Headless UI** (with React) at
-runtime from a CDN so searchable selects work. Those libraries are **not** in
-git and are **not** extra Bunny Storage files. Defaults are jsDelivr
-(`daisyui@5.7.43/daisyui.css`) and esm.sh (`react@19.3.0`,
-`@headlessui/react@2.2.10`). Set `window.JMODGUARD_DAISYUI_HREF` and
-`window.JMODGUARD_ESM_BASE` before `app.js` (the same pattern as
-`window.JMODGUARD_API_BASE`) to a Bunny pull zone or other host that caches
-those same URLs. `app.js` applies the CSS href to the daisyUI `<link>` when it
-loads, so an override placed with the API base still replaces the default
-stylesheet. Putting the CSS override above that `<link>` in `index.html`
-avoids a second fetch. If that runtime load fails, native `<select>` controls stay
-usable. Pale blue light and navy dark colors stay the existing theme tokens.
+React, ReactDOM, Headless UI and daisyUI are declared with exact versions in
+`tools/webui/package.json` and pinned transitively by its lockfile. esbuild
+includes only the requested exports and their dependencies in `app.js`; daisyUI
+and the app's theme CSS share `style.css`. No third-party source or generated
+bundle is committed. Browsers fetch no external module server or stylesheet.
+The old `JMODGUARD_ESM_BASE` and `JMODGUARD_DAISYUI_HREF` overrides are retired.
+If widget mounting fails, native selects remain usable.
+Pale blue light and navy dark colors stay the existing theme tokens.
 Buttons, cards, hero, stats, badges, tables, inputs, and the searchable
 select use daisyUI (and Headless Combobox) component classes mapped onto
 those tokens. First-party CSS is the workspace shell and theme, not a
@@ -54,14 +63,14 @@ Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.
 
 **Self-host (one machine, [SETUP.md](SETUP.md)).** You do not copy these
-files anywhere. A normal `jmodguard-api` build already includes them and
+files anywhere. After the frontend build above, a normal `jmodguard-api` build includes them and
 serves them at `http://localhost:8080`.
 
 **Bunny (first-class cloud path, [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md)).**
 
 1. Create a Bunny **Storage Zone**. The create form requires a primary
    region and at least one replication region; do not skip replication.
-2. Put the five first-party files at their paths in that zone so the root has
+2. Put the five generated files at their paths in that zone so the root has
    `/index.html` (or `/`), `/app.js`, `/style.css`, and `/administration.js`,
    with `/administration/index.html` in its subdirectory.
 3. Create a **Pull Zone** whose origin is that Storage Zone. The public
@@ -83,13 +92,11 @@ For an initial manual install, upload all five files in the Bunny dashboard (**B
 `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STORAGE_ENDPOINT`,
 `BUNNY_PULL_ZONE_ID`, and `BUNNY_API_KEY` in the environment (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) for meanings. Optional `JMODGUARD_FRONTEND_ROOT`
- selects a non-default `frontend/` directory. A private ops repo is **not required** to install.
+ selects a non-default built frontend directory. A private ops repo is **not required** to install.
 
-**Another host or CDN.** Copy the five first-party files to the site root
+**Another host or CDN.** Copy the five generated files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
-files can be newer). The page still fetches daisyUI and Headless UI from the
-runtime CDN unless you override `window.JMODGUARD_DAISYUI_HREF` and
-`window.JMODGUARD_ESM_BASE` before `app.js` loads. If the API is on a **different** hostname than the pages,
+files can be newer). If the API is on a **different** hostname than the pages,
 set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads
 in `index.html`, and set the same value before `administration.js` loads
 in `administration/index.html`. Each HTML page needs its own setting;

@@ -237,36 +237,6 @@ function apiBase() {
   return ((typeof window !== "undefined" && window.JMODGUARD_API_BASE) || "").replace(/\/$/, "");
 }
 
-/** Runtime CDN pins. daisyUI / Headless / React are not stored in this repository. */
-const VENDOR = {
-  daisyuiCss: "https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css",
-  esm: "https://esm.sh",
-  react: "19.3.0",
-  headless: "2.2.10",
-};
-
-function vendorCssHref() {
-  const href = typeof window !== "undefined" ? window.JMODGUARD_DAISYUI_HREF : "";
-  return String(href || VENDOR.daisyuiCss);
-}
-
-function applyVendorCss() {
-  if (typeof document === "undefined" || typeof document.getElementById !== "function") return;
-  const link = document.getElementById("jmodguard-daisyui");
-  if (!link) return;
-  const href = vendorCssHref();
-  if (!href) return;
-  const current = typeof link.getAttribute === "function" ? link.getAttribute("href") : link.href;
-  if (current === href) return;
-  if (typeof link.setAttribute === "function") link.setAttribute("href", href);
-  else link.href = href;
-}
-
-function vendorEsmBase() {
-  const base = typeof window !== "undefined" ? window.JMODGUARD_ESM_BASE : "";
-  return String(base || VENDOR.esm).replace(/\/$/, "");
-}
-
 function vendorWidgetsEnabled() {
   try {
     if (typeof window === "undefined" || window.JMODGUARD_VENDOR === "off") return false;
@@ -291,33 +261,10 @@ function shouldEnhanceSelect(select) {
 
 let vendorRuntimePromise = null;
 
-function vendorModule(mod, names) {
-  if (!mod) return null;
-  const usable = (value) => typeof value === "function" || (value && typeof value === "object");
-  const has = (obj) => obj && names.every((name) => usable(obj[name]));
-  if (has(mod)) return mod;
-  if (has(mod.default)) return Object.assign({}, mod, mod.default);
-  return null;
-}
-
 function loadSearchSelectRuntime() {
+  // The production build folds this module and its dependencies into app.js.
   if (!vendorRuntimePromise) {
-    const esm = vendorEsmBase();
-    const reactV = VENDOR.react;
-    const headlessV = VENDOR.headless;
-    vendorRuntimePromise = Promise.all([
-      import(`${esm}/react@${reactV}`),
-      import(`${esm}/react-dom@${reactV}/client?deps=react@${reactV}`),
-      import(`${esm}/@headlessui/react@${headlessV}?deps=react@${reactV},react-dom@${reactV}`),
-    ]).then(([reactMod, reactDomMod, headlessMod]) => {
-      const React = vendorModule(reactMod, ["createElement", "useState"]);
-      const ReactDOM = vendorModule(reactDomMod, ["createRoot"]);
-      const Headless = vendorModule(headlessMod, ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"]);
-      if (!React || !ReactDOM || !Headless) {
-        throw new Error("vendor runtime missing Combobox exports");
-      }
-      return { React, ReactDOM, Headless };
-    });
+    vendorRuntimePromise = import("../tools/webui/search-select.js");
   }
   return vendorRuntimePromise;
 }
@@ -2936,7 +2883,6 @@ function initTheme() {
 
 function bootUi() {
   capturePreviewToken();
-  applyVendorCss();
   initTheme();
   bindTabButtons();
   $("#content").addEventListener("input", (event) => {
@@ -2972,7 +2918,6 @@ function bootUi() {
   init().catch((e) => { toast("Init failed: " + e.message, "error"); });
 }
 
-if (typeof document !== "undefined") applyVendorCss();
 if (typeof document !== "undefined" && document.getElementById?.("app")) {
   bootUi();
 }

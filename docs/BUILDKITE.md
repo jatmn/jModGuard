@@ -81,7 +81,10 @@ these ignored tests at an existing installation or share one database between th
 Selected checks must pass before preparation and publication. A docs-only
 diff runs the contract checks (whitespace, public-install acceptance, and
 the Dependabot copy contract) and does not run Rust, frontend, image,
-bootstrap, or remote-database jobs. A `frontend/` diff runs the frontend Node checks and the API group, because the default API `embed-ui` build embeds those files. `Dockerfile.webui`
+bootstrap, or remote-database jobs. A `frontend/` diff runs the frontend Node checks and the API group, because the default API `embed-ui` build embeds the generated assets.
+Changes under `tools/webui/` also select frontend, API and publication checks.
+Those checks build `dist/frontend/` with `npm ci --ignore-scripts --prefix tools/webui`
+and `npm run build --prefix tools/webui`; high/critical npm audit findings fail the gate. `Dockerfile.webui`
 also runs the publisher contract tests. An `crates/api` diff runs the API test, Clippy,
 build, service-boundary, and dual-process checks. A `crates/runtime` diff also runs the core
 and integration groups so direct and workspace consumers of `jmodguard-runtime`

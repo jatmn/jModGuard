@@ -108,7 +108,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: { randomUUID },
   });
-  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, VENDOR, vendorCssHref, vendorEsmBase, vendorWidgetsEnabled, shouldEnhanceSelect, vendorModule, applyVendorCss})`, context);
+  const app = vm.runInContext(`${source}\n({state, el, uiClass, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, bindOwnerTools, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, vendorWidgetsEnabled, shouldEnhanceSelect})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -2496,45 +2496,14 @@ test('vendor widgets stay off in the vm harness so tests do not fetch CDN module
   assert.equal(app.shouldEnhanceSelect({ tag: 'select', id: '', className: '', classList: { contains: () => false }, options: { length: 20 } }), false);
 });
 
-test('Guild WebUI pulls daisyUI and Headless from pinned CDNs and keeps pale-blue tokens', () => {
+test('Guild WebUI uses a build-time search-select module and keeps pale-blue tokens', () => {
+  const { app } = harness();
   const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
   const js = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
-  const { app } = harness();
-  assert.match(html, /cdn\.jsdelivr\.net\/npm\/daisyui@5\.7\.43\/daisyui\.css/);
-  assert.match(html, /link\.id = "jmodguard-daisyui"/);
-  assert.match(html, /link\.href = window\.JMODGUARD_DAISYUI_HREF/);
-  assert.doesNotMatch(html, /<link[^>]*id="jmodguard-daisyui"/);
-  assert.ok(html.indexOf('jmodguard-daisyui') < html.indexOf('href="/style.css"'));
-  assert.equal(app.VENDOR.daisyuiCss, 'https://cdn.jsdelivr.net/npm/daisyui@5.7.43/daisyui.css');
-  assert.equal(app.VENDOR.esm, 'https://esm.sh');
-  assert.equal(app.VENDOR.react, '19.3.0');
-  assert.equal(app.VENDOR.headless, '2.2.10');
-  assert.equal(app.vendorCssHref(), app.VENDOR.daisyuiCss);
-  assert.equal(app.vendorEsmBase(), 'https://esm.sh');
-  const names = ["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"];
-  const incomplete = { Combobox() {} };
-  assert.equal(app.vendorModule(incomplete, names), null);
-  const complete = { Combobox() {}, ComboboxInput() {}, ComboboxOptions() {}, ComboboxOption() {} };
-  assert.equal(app.vendorModule(complete, names), complete);
-  const asObjects = { Combobox: { $$typeof: 1 }, ComboboxInput: { $$typeof: 1 }, ComboboxOptions: { $$typeof: 1 }, ComboboxOption: { $$typeof: 1 } };
-  assert.equal(app.vendorModule(asObjects, names), asObjects);
-  const fromDefault = { Combobox() {}, ComboboxInput: undefined, default: complete };
-  const merged = app.vendorModule(fromDefault, names);
-  assert.equal(typeof merged.Combobox, "function");
-  assert.equal(typeof merged.ComboboxInput, "function");
-  assert.equal(typeof merged.ComboboxOptions, "function");
-  assert.equal(typeof merged.ComboboxOption, "function");
-  const { app: cssApp, window: cssWindow, nodes: cssNodes } = harness();
-  cssWindow.JMODGUARD_DAISYUI_HREF = "https://cdn.example.test/daisyui.css";
-  assert.equal(cssApp.vendorCssHref(), "https://cdn.example.test/daisyui.css");
-  cssApp.applyVendorCss();
-  assert.equal(cssNodes.get("#jmodguard-daisyui").getAttribute("href"), "https://cdn.example.test/daisyui.css");
-  assert.match(js, /function applyVendorCss/);
-  assert.match(js, /vendorModule\(headlessMod, \["Combobox", "ComboboxInput", "ComboboxOptions", "ComboboxOption"\]\)/);
-  assert.match(js, /@headlessui\/react@/);
-  assert.match(js, /esm\.sh/);
-  assert.doesNotMatch(js, /node_modules/);
+  assert.doesNotMatch(html, /https?:\/\//);
+  assert.doesNotMatch(js, /esm\.sh|cdn\.jsdelivr\.net|JMODGUARD_ESM_BASE|JMODGUARD_DAISYUI_HREF/);
+  assert.match(js, /import\("\.\.\/tools\/webui\/search-select\.js"\)/);
   assert.match(js, /function loadSearchSelectRuntime/);
   assert.match(js, /function restoreNativeSelect/);
   assert.match(js, /searchSelectId/);

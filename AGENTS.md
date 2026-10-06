@@ -203,6 +203,11 @@ libSQL, not RDS. See `docs/INSTALL.md`.
 
 ## Commands
 
+Before a local default-feature API build, run `npm ci --ignore-scripts --prefix tools/webui`
+and `npm run build --prefix tools/webui`. Rebuild after frontend/build-input changes.
+Generated assets and third-party source must not be committed. Local preflight
+and publication build these assets automatically.
+
 Local Linux preflight is `bash scripts/ci-preflight.sh` with no `--only`.
 Buildkite runs the same gates in selected groups; see `docs/BUILDKITE.md`.
 Do not add GitHub Actions CI workflows. Allowed workflow files are the
@@ -358,7 +363,7 @@ authorize live provider calls or require a Codex skill to contribute.
   DELETE-then-filter. Empty source clears destination (intentional).
   `compile_user_regex` is the single gate for add / copy / cache load / tester.
 - Select service packages explicitly: `-p jmodguard-bot` or `-p jmodguard-api`.
-  API default `embed-ui` includes the root `frontend/` for local use; API
+  API default `embed-ui` includes built `dist/frontend/` for local use; API
   `--no-default-features` builds JSON/OAuth for Bunny. There is no root `web` feature.
   Keep embedding paths relative to the new API source. Bot never needs dashboard features.
   Bare Cargo commands select all workspace packages; production builds must use `-p`.
@@ -497,8 +502,8 @@ crates/api/src/web/oauth.rs        dashboard OAuth client and identity models
 crates/bot/src/automod.rs          rule engine + action executor
 crates/bot/src/handlers.rs         gateway events
 crates/bot/src/commands/           engine, behaviors, plans
-crates/api/src/web/                axum API + OAuth (API embed-ui serves root frontend/ locally)
-frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless from runtime CDN, not git)
+crates/api/src/web/                axum API + OAuth (API embed-ui serves built dist/frontend/ locally)
+frontend/               admin SPA (Bunny Storage/CDN from public artifacts; local: embedded in API; daisyUI/Headless bundled at build time, not git)
 migrations/             0001_init through 0017_hot_query_indexes
 Dockerfile.bot / Dockerfile.api
 docs/                   SETUP, INSTALL, DEPLOY-BUNNY, DEPLOY-AWS, COST, UPGRADE, ARCHITECTURE, …

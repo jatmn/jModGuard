@@ -19,15 +19,15 @@ Use a source commit or verified image digest:
 
 - Source: `https://github.com/jatmn/jModGuard`
 - Images: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui`
-- WebUI files: `frontend/index.html`, `frontend/app.js`, `frontend/style.css`,
-  `frontend/administration/index.html`, `frontend/administration.js`
+- WebUI files: `dist/frontend/index.html`, `dist/frontend/app.js`, `dist/frontend/style.css`,
+  `dist/frontend/administration/index.html`, `dist/frontend/administration.js`
 
 Buildkite publishes changed images on main. Manual commit-SHA builds publish all
 eligible components; WebUI is skipped for source revisions predating that package.
 Stable tags and scheduled Nightlies use the image channels in [RELEASES.md](RELEASES.md).
 Buildkite does not upload WebUI files to Bunny Storage. Publish from source or the
-WebUI image using the [WebUI guide](WEBUI.md). The browser also fetches daisyUI CSS
-and Headless UI from a CDN; these are not extra repository files.
+WebUI image using the [WebUI guide](WEBUI.md). Build the source assets with the locked npm dependencies first; daisyUI and
+Headless UI are bundled into the existing CSS/JS files, with no runtime CDN dependency.
 
 ## Setup
 

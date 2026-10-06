@@ -36,6 +36,8 @@ expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
 expect "contracts" config.example.toml
 expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
+expect "contracts frontend api publish-tests supply-chain" tools/webui/package-lock.json
+expect "contracts frontend api publish-tests supply-chain" tools/webui/build.mjs
 expect "contracts frontend" tools/eslint/package.json
 expect "contracts frontend" tools/eslint-web-selftest.sh
 expect "contracts fmt dylint api boundaries integration supply-chain" crates/api/src/lib.rs
