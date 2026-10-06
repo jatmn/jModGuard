@@ -320,7 +320,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch_bounded("DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
+        conn.execute_batch_bounded("DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
         conn.pragma_update(None, "user_version", 2)?;
         migrate_conn(conn)?;
 
@@ -3339,4 +3339,36 @@ fn readable_stats_upgrade_does_not_claim_an_existing_status_alias() {
     assert!(parts.commands["custom"].matches("status"));
     drop(db);
     cleanup_db(&tmp);
+}
+
+/// Explain the production SQL, rejecting unbounded table/index scans. A scalar
+/// EXISTS can include a single constant row; that is not a data-table scan.
+pub(super) fn assert_index_plan(
+    conn: &impl SqlExecutor,
+    sql: &str,
+    args: impl libsql::params::IntoParams + Send,
+    ordered: bool,
+) {
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let plan = statement
+        .query_map(args, |row| Ok(row.get::<String>(3)?))
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("SEARCH ")),
+        "no index search: {plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|line| line.starts_with("SCAN ") && line != "SCAN CONSTANT ROW"),
+        "full scan: {plan:?}"
+    );
+    if ordered {
+        assert!(
+            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "page requires sorting: {plan:?}"
+        );
+    }
 }

@@ -147,6 +147,49 @@ async fn admission_deduplicates_scopes_and_bounds_pending_work() {
 }
 
 #[tokio::test]
+async fn claims_keep_oldest_order_with_a_live_pending_backlog() {
+    let f = Fixture::new().await;
+    // Insert newer work first, across guilds within the default per-guild limit.
+    for guild in [20, 21, 22] {
+        for user in 1..=32 {
+            f.enqueue(guild, &format!("backlog_{user}"), unban(user))
+                .await;
+        }
+    }
+    let mut oldest = Vec::new();
+    for user in [90, 91] {
+        oldest.push(
+            enqueue_bot_action(
+                &f.db,
+                10,
+                42,
+                &format!("999_oldest_{user}"),
+                unban(user),
+                999,
+                Limits::default(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    oldest.sort_by(|a, b| a.id.cmp(&b.id));
+    for expected in oldest {
+        let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+        assert_eq!(claimed.id, expected.id);
+        assert_eq!(claimed.state, "claimed");
+        assert_eq!(f.state(&expected).await, "claimed");
+    }
+    assert_eq!(
+        claim_bot_action(&f.db, 1001)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        1000
+    );
+}
+
+#[tokio::test]
 async fn claims_are_exclusive_and_execution_is_consumed_once() {
     let f = Fixture::new().await;
     let pending = f.enqueue(10, "claim", unban(99)).await;

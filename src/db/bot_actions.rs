@@ -295,6 +295,23 @@ async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<Bot
     .await
 }
 
+fn claim_next_sql() -> String {
+    // Expiry searches use bot_actions_expiry; selecting one oldest job must
+    // walk pending order so LIMIT can stop without sorting all live jobs.
+    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
+                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
+                      ORDER BY created_at,id LIMIT 1")
+}
+
+fn poll_due_sql() -> String {
+    // Separate the two searches so expiry uses (state,expires_at) and pending
+    // admission keeps its own indexed branch. Both retain active membership.
+    format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
+                AND state IN ('pending','claimed','running') AND expires_at<=?1)
+            OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending'
+                AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))")
+}
+
 /// Claim one job. Expired running work is never claimed again, even after restart.
 pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
@@ -303,13 +320,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         // Housekeeping (expiry/uncertain) is independent of write fences. Claim
         // selection still excludes fenced guilds in the UPDATE/SELECT below.
         let due: i64 = conn.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND (
-             (state IN ('pending','claimed','running') AND expires_at<=?1)
-             OR (state='pending'
-                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))
-            ))"
-            ),
+            &poll_due_sql(),
             params![now],
             |r| Ok(r.get(0)?),
         )?;
@@ -330,9 +341,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
             params![now],
         )?;
         let job = tx.query_row(
-            &format!("SELECT {COLS} FROM bot_actions WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
-                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
-                      ORDER BY created_at,id LIMIT 1"),
+            &claim_next_sql(),
             params![now],
             row_action,
         )
@@ -647,4 +656,25 @@ pub async fn bot_action_dispatch(db: &Db, job: &BotAction) -> Result<BotActionDi
 /// Compatibility boolean for callers that do not need the refusal reason.
 pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
     Ok(bot_action_dispatch(db, job).await? == BotActionDispatch::Ready)
+}
+
+#[cfg(test)]
+mod query_plan_tests {
+    use super::*;
+    #[test]
+    fn action_poll_and_claim_use_index_searches() {
+        let path =
+            std::env::temp_dir().join(format!("action_plans_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn_sync(|conn| {
+            crate::db::tests::assert_index_plan(conn, &poll_due_sql(), params![123], false);
+            crate::db::tests::assert_index_plan(conn, &claim_next_sql(), params![123], true);
+            let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT id FROM bot_actions WHERE state IN ('pending','claimed','running') AND expires_at<=?1 LIMIT 64")?;
+            let plan = stmt.query_map(params![123], |r| Ok(r.get::<String>(3)?))?.collect::<Result<Vec<_>>>()?;
+            assert!(plan.iter().any(|line| line.contains("state=? AND expires_at<?")), "expiry must use a range search: {plan:?}");
+            Ok(())
+        }).unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 }

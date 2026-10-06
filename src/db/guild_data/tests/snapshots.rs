@@ -1173,3 +1173,69 @@ async fn closed_scope_erasure_deletes_snapshots_in_batches() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn unchanged_snapshot_maintenance_skips_writer_until_heartbeat() {
+    let (fixture, registration, _store, _scope) = ready().await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+    let store = GuildDataStore::open(fixture.options(), registration).unwrap();
+    let update = SnapshotHealthUpdate {
+        epoch: 7,
+        state: SnapshotHealthState::Active,
+        reason: None,
+        observed_at_ms: None,
+        lost_delta: 0,
+        now_ms: at(0),
+    };
+    store.update_snapshot_health(update.clone()).await.unwrap();
+    store.expire_snapshots(100, at(0)).await.unwrap();
+    let writes = probe.immediate();
+    for offset in [30_000, 60_000] {
+        store
+            .update_snapshot_health(SnapshotHealthUpdate {
+                now_ms: at(offset),
+                ..update.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.expire_snapshots(100, at(offset)).await.unwrap(), 0);
+    }
+    assert_eq!(
+        probe.immediate(),
+        writes,
+        "unchanged maintenance must not reserve the writer"
+    );
+    store
+        .update_snapshot_health(SnapshotHealthUpdate {
+            now_ms: at(120_000),
+            ..update.clone()
+        })
+        .await
+        .unwrap();
+    assert!(
+        probe.immediate() > writes,
+        "keep the dashboard heartbeat fresh"
+    );
+    store
+        .update_snapshot_health(SnapshotHealthUpdate {
+            now_ms: at(120_001),
+            lost_delta: 2,
+            ..update.clone()
+        })
+        .await
+        .unwrap();
+    store
+        .update_snapshot_health(SnapshotHealthUpdate {
+            now_ms: at(120_002),
+            observed_at_ms: Some(at(120_002)),
+            ..update
+        })
+        .await
+        .unwrap();
+    let (lost, observed): (i64, Option<i64>) = store.db.with_conn_sync(|conn| conn.query_row(
+        "SELECT lost_count,last_observed_at_ms FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?))
+    )).unwrap();
+    assert_eq!(lost, 2);
+    assert_eq!(observed, Some(at(120_002)));
+}

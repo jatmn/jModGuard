@@ -5802,3 +5802,27 @@ async fn member_page_statements_scale_by_batch_not_by_member() {
         assert_eq!(last.revision, 1);
     }
 }
+
+#[tokio::test]
+async fn cleanup_candidate_plan_uses_the_existing_scoped_index() {
+    let (_fixture, store, scope) = ready().await;
+    store
+        .db
+        .with_conn(move |conn| {
+            crate::db::tests::assert_index_plan(
+                conn,
+                super::super::member_directory::MEMBER_CLEANUP_CANDIDATE_SQL,
+                params![
+                    scope.guild_id(),
+                    scope.enrollment.id.as_str(),
+                    1_000_000,
+                    1,
+                    0
+                ],
+                false,
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}

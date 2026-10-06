@@ -95,7 +95,7 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
         &f.db,
         20,
         "member_ban",
-        Some(204),
+        Some(5),
         None,
         &serde_json::json!({"foreign":"secret"}),
     )
@@ -130,11 +130,30 @@ async fn moderation_scopes_preserve_filter_order_limits_wire_data_and_guild_isol
             serde_json::to_value(list_bans(&f.db, 10, limit).await.unwrap()).unwrap()
         );
     }
-    let rows = query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(5), 50)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].user_id, Some(5));
+    // Sparse and absent users must retain their filters with or without a type.
+    // The matching row is near the start of the guild history; another guild
+    // has a newer row for the same user.
+    for event_type in [None, Some("member_ban")] {
+        for (user, count) in [(5, 1), (999, 0)] {
+            let rows = query_enrolled_events(&f.db, scope.clone(), event_type, Some(user), 50)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), count);
+            assert!(
+                rows.iter()
+                    .all(|row| row.guild_id == 10 && row.user_id == Some(user))
+            );
+            assert_eq!(
+                serde_json::to_value(&rows).unwrap(),
+                serde_json::to_value(
+                    query_events(&f.db, 10, event_type, Some(user), 50)
+                        .await
+                        .unwrap()
+                )
+                .unwrap()
+            );
+        }
+    }
     assert!(
         query_enrolled_events(&f.db, scope.clone(), Some("member_kick"), None, 50)
             .await
@@ -257,16 +276,25 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
 
 #[tokio::test]
 async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed() {
+    let probe = Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let version = get_config_version(&f.db).await.unwrap();
     f.db.with_conn(|conn| conn.execute_batch_bounded("CREATE TRIGGER reject_read_receipt BEFORE INSERT ON mutation_receipts BEGIN SELECT RAISE(ABORT,'read wrote receipt'); END", 64 * 1024 * 1024)).await.unwrap();
+    let before = probe.immediate();
+    guild_stats(&f.db, 10).await.unwrap();
     query_enrolled_events(&f.db, scope.clone(), None, None, 50)
         .await
         .unwrap();
     list_enrolled_bans(&f.db, scope.clone(), 100).await.unwrap();
     enrolled_guild_stats(&f.db, scope.clone()).await.unwrap();
     assert_eq!(get_config_version(&f.db).await.unwrap(), version);
+    assert_eq!(
+        probe.immediate(),
+        before,
+        "bot and dashboard reads must not reserve the writer"
+    );
     f.db.with_conn(|conn| {
         conn.execute_batch_bounded(
             "ALTER TABLE guild_enrollments RENAME TO unavailable_enrollments",

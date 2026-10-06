@@ -67,7 +67,7 @@ Environment-only (not in `config.toml`):
 
 This release requires the [fresh database baseline](DATABASE-BASELINE.md). Configuration
 is managed via the WebUI or bot commands; the schema lives in
-`migrations/` (`0001_init.sql` through `0016_member_sync_pacing.sql`) and is applied by
+`migrations/` (`0001_init.sql` through `0017_hot_query_indexes.sql`) and is applied by
 `jmodguard-bot` on startup (API opens with `migrate=false` and waits ~30s
 locally, or about six minutes on a remote database, for the bot to finish
 bootstrap or for a transient connect/lock to clear, then serves HTTP; it

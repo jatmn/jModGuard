@@ -187,11 +187,9 @@ impl EventHandler for Handler {
             });
             let maintenance_app = Arc::clone(&app);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
-                    maintenance_app.snapshots.maintain(&maintenance_app).await;
+                    let delay = maintenance_app.snapshots.maintain(&maintenance_app).await;
+                    tokio::time::sleep(delay).await;
                 }
             });
             let startup = async move {

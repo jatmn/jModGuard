@@ -1,4 +1,6 @@
 //! Scoped, persistent member observations and one-time initial import metadata.
+pub(super) const MEMBER_CLEANUP_CANDIDATE_SQL: &str = "SELECT d.user_id,d.revision,d.cleanup_member_checked_at_ms,d.departed_at_ms FROM guild_member_directory d WHERE d.guild_id=?1 AND d.enrollment_id=?2 AND d.is_current=0 AND d.is_banned=0 AND d.ever_banned=0 AND d.cleanup_after_ms<=?3 AND (?4=1 OR coalesce(d.cleanup_member_checked_at_ms,-1)<max(coalesce(?5,0),coalesce(d.departed_at_ms,0))) AND NOT EXISTS(SELECT 1 FROM guild_member_pending_bans p WHERE p.guild_id=d.guild_id AND p.enrollment_id=d.enrollment_id AND p.user_id=d.user_id) AND NOT EXISTS(SELECT 1 FROM guild_member_target_checks t WHERE t.guild_id=d.guild_id AND t.enrollment_id=d.enrollment_id AND t.user_id=d.user_id) ORDER BY d.cleanup_after_ms,d.user_id LIMIT 1";
+
 use super::tenant_logs::verify_scope;
 use super::*;
 use crate::db::write_budget::MemberSqlWrites;
@@ -2328,7 +2330,7 @@ impl GuildDataStore {
             if audit_gap_recovery_pending(&tx,&scope)? {tx.finish_read()?;return Ok(None)}
             // During initial history import, already checked candidates wait
             // without hiding the next unverified departure in the queue.
-            let row=tx.query_row("SELECT d.user_id,d.revision,d.cleanup_member_checked_at_ms,d.departed_at_ms FROM guild_member_directory d WHERE d.guild_id=?1 AND d.enrollment_id=?2 AND d.is_current=0 AND d.is_banned=0 AND d.ever_banned=0 AND d.cleanup_after_ms<=?3 AND (?4=1 OR coalesce(d.cleanup_member_checked_at_ms,-1)<max(coalesce(?5,0),coalesce(d.departed_at_ms,0))) AND NOT EXISTS(SELECT 1 FROM guild_member_pending_bans p WHERE p.guild_id=d.guild_id AND p.enrollment_id=d.enrollment_id AND p.user_id=d.user_id) AND NOT EXISTS(SELECT 1 FROM guild_member_target_checks t WHERE t.guild_id=d.guild_id AND t.enrollment_id=d.enrollment_id AND t.user_id=d.user_id) ORDER BY d.cleanup_after_ms,d.user_id LIMIT 1",params![scope.guild_id(),scope.enrollment.id.as_str(),now_ms,history_ready,gap_at],|r|Ok((r.get::<i64>(0)?,r.get::<i64>(1)?,r.get::<Option<i64>>(2)?,r.get::<Option<i64>>(3)?))).optional()?;
+            let row=tx.query_row(MEMBER_CLEANUP_CANDIDATE_SQL,params![scope.guild_id(),scope.enrollment.id.as_str(),now_ms,history_ready,gap_at],|r|Ok((r.get::<i64>(0)?,r.get::<i64>(1)?,r.get::<Option<i64>>(2)?,r.get::<Option<i64>>(3)?))).optional()?;
             if let Some((user_id,revision,checked_at,departed_at))=row {
                 let check_since=if !history_ready{Some(gap_at.unwrap_or(0).max(departed_at.unwrap_or(0)))}else{gap_at};
                 if check_since.is_some_and(|boundary|checked_at.is_none_or(|checked|checked<boundary)) {

@@ -1,6 +1,7 @@
 //! Nonsecret directory catalog foundation. Not live routing or user authorization.
 //! Initial placement is one-shot.
 use super::*;
+use std::collections::HashSet;
 
 /// Opaque installation-assigned identity, never a database URL, token or provider ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +132,30 @@ pub async fn guild_is_write_fenced(db: &Db, guild: i64) -> Result<bool> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let fenced = guild_write_fenced(&tx, guild)?;
+        tx.finish_read()?;
+        Ok(fenced)
+    })
+    .await
+}
+
+/// Snapshot fences for a worker's cached guild set in one primary read. This
+/// controls scheduling, not authorization of later guild-store operations.
+pub async fn write_fenced_guilds(db: &Db, guilds: Vec<i64>) -> Result<HashSet<i64>> {
+    anyhow::ensure!(guilds.iter().all(|guild| *guild > 0), "invalid guild id");
+    if guilds.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let guilds = serde_json::to_string(&guilds)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let mut stmt = tx.prepare(
+            "SELECT value FROM json_each(?1) AS guild
+             WHERE EXISTS(SELECT 1 FROM guild_write_fences WHERE guild_id=guild.value)",
+        )?;
+        let fenced = stmt
+            .query_map(params![guilds], |row| Ok(row.get(0)?))?
+            .collect::<std::result::Result<HashSet<i64>, _>>()?;
+        drop(stmt);
         tx.finish_read()?;
         Ok(fenced)
     })

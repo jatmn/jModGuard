@@ -80,7 +80,7 @@ source association remains unresolved; a later exact source link consumes the st
 action without creating a duplicate case. Version14 lets case-retention updates
 preserve in-flight member import pages. There are no core
 configuration/default/enrollment tables or general event archives. Core bootstrap
-never applies this schema; the existing core version is 16.
+never applies this schema; the existing core version is 17.
 
 | Operation | Contract |
 |---|---|

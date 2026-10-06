@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
                 };
                 let result = tokio::select! {
                     _ = shutdown_signal() => break,
-                    result = repair.step(&app.db, &app.tenant, &source) => result,
+                    result = repair.step_for_bot(&app, &source) => result,
                 };
                 match result {
                     Ok(Some(report)) if report.failed > 0 => tracing::warn!(

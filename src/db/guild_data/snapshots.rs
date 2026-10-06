@@ -367,16 +367,25 @@ impl GuildDataStore {
         );
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            // Inspect on a primary read first. If a write is needed, re-check
+            // identity and health after taking the writer lock.
+            for writable in [false, true] {
+            let mut tx = if writable { conn.transaction_primary_read()? } else { conn.transaction_primary_snapshot()? };
             verify_identity(&tx, &expected)?;
-            let (old_epoch, old_state, old_reason, old_updated): (i64,String,Option<String>,Option<i64>) = tx.query_row("SELECT epoch,state,reason,updated_at_ms FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-            if old_epoch == update.epoch as i64 && old_state == update.state.as_str() && old_reason.as_deref() == update.reason && update.lost_delta == 0 && old_updated.is_some_and(|at| update.now_ms.saturating_sub(at) < 30_000) {
+            let (old_epoch, old_state, old_reason, old_updated, old_observed): (i64,String,Option<String>,Option<i64>,Option<i64>) = tx.query_row("SELECT epoch,state,reason,updated_at_ms,last_observed_at_ms FROM guild_snapshot_health WHERE singleton=1", (), |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+            if old_epoch == update.epoch as i64 && old_state == update.state.as_str() && old_reason.as_deref() == update.reason && update.lost_delta == 0 && update.observed_at_ms.is_none_or(|at| Some(at) == old_observed) && old_updated.is_some_and(|at| update.now_ms >= at && update.now_ms - at < 120_000) {
                 tx.finish_read()?;
                 return Ok(());
             }
+            if !writable {
+                tx.finish_read()?;
+                continue;
+            }
             tx.ensure_mutation_receipt()?;
             tx.execute_bounded("UPDATE guild_snapshot_health SET epoch=?1,state=?2,reason=?3,last_observed_at_ms=COALESCE(?4,last_observed_at_ms),lost_count=CASE WHEN epoch=?1 THEN lost_count+?5 ELSE ?5 END,expired_count=CASE WHEN epoch=?1 THEN expired_count ELSE 0 END,evicted_count=CASE WHEN epoch=?1 THEN evicted_count ELSE 0 END,counters_reset_at_ms=CASE WHEN epoch=?1 THEN counters_reset_at_ms ELSE ?6 END,updated_at_ms=?6 WHERE singleton=1",params![update.epoch as i64,update.state.as_str(),update.reason,update.observed_at_ms,update.lost_delta.min(i64::MAX as u64) as i64,update.now_ms], growth_reserve(&tx)?)?;
-            tx.commit()
+            return tx.commit();
+            }
+            unreachable!("write pass returns")
         }).await
     }
     /// Creates a latest snapshot once. A delayed create cannot overwrite a newer edit.
@@ -651,7 +660,8 @@ impl GuildDataStore {
         );
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
-            let mut tx = conn.transaction_primary_read()?;
+            for writable in [false, true] {
+            let mut tx = if writable { conn.transaction_primary_read()? } else { conn.transaction_primary_snapshot()? };
             verify_identity(&tx, &expected)?;
             let (subquery, args): (&str, Vec<Value>) = if expired_only {
                 ("SELECT guild_id,enrollment_id,channel_id,message_id FROM guild_message_snapshots WHERE expires_at_ms<=?1 ORDER BY expires_at_ms LIMIT ?2",
@@ -667,9 +677,13 @@ impl GuildDataStore {
                     "SELECT last_cleanup_at_ms FROM guild_snapshot_health WHERE singleton=1",
                     (), |r| Ok(r.get(0)?),
                 )?;
-                if last.is_some_and(|at| now_ms.saturating_sub(at) < 30_000) {
+                if last.is_some_and(|at| now_ms >= at && now_ms - at < 300_000) {
                     tx.finish_read()?;
                 } else {
+                    if !writable {
+                        tx.finish_read()?;
+                        continue;
+                    }
                     tx.prepare_reclaim()?;
                     tx.execute_reclaim_metadata_bounded(
                         "UPDATE guild_snapshot_health SET last_cleanup_at_ms=?1,updated_at_ms=?1 WHERE singleton=1",
@@ -678,6 +692,10 @@ impl GuildDataStore {
                     tx.commit()?;
                 }
                 return Ok(0);
+            }
+            if !writable {
+                tx.finish_read()?;
+                continue;
             }
             tx.prepare_reclaim()?;
             let delete_sql = format!("DELETE FROM guild_message_snapshots WHERE (guild_id,enrollment_id,channel_id,message_id) IN ({subquery})");
@@ -692,7 +710,9 @@ impl GuildDataStore {
                 metadata_sql, params![now_ms, count], growth_reserve(&tx)?,
             )?;
             tx.commit()?;
-            Ok(count as usize)
+            return Ok(count as usize);
+            }
+            unreachable!("write pass returns")
         }).await
     }
 }

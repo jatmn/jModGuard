@@ -27,6 +27,16 @@ pub async fn enroll_guild(
     guild: i64,
     joined_at_ns: i64,
 ) -> Result<Option<GuildEnrollment>> {
+    Ok(enroll_guild_with_change(db, guild, joined_at_ns).await?.0)
+}
+
+/// Return whether the observation committed a new enrollment identity. Matching
+/// confirmations (including nickname resumption) do not change membership.
+pub async fn enroll_guild_with_change(
+    db: &Db,
+    guild: i64,
+    joined_at_ns: i64,
+) -> Result<(Option<GuildEnrollment>, bool)> {
     observe_membership(db, guild, joined_at_ns, true).await
 }
 
@@ -42,7 +52,7 @@ async fn observe_membership(
     guild: i64,
     joined_at_ns: i64,
     present: bool,
-) -> Result<Option<GuildEnrollment>> {
+) -> Result<(Option<GuildEnrollment>, bool)> {
     anyhow::ensure!(
         guild > 0 && joined_at_ns > 0,
         "invalid guild membership observation"
@@ -59,7 +69,7 @@ async fn observe_membership(
         if let Some((id, joined, active)) = &current {
             if *joined > joined_at_ns || (*joined == joined_at_ns && !active) {
                 tx.finish_read()?;
-                return Ok(None);
+                return Ok((None, false));
             }
             if *joined == joined_at_ns && present {
                 // Healthy observations are write-free; only a dormant request bound
@@ -83,11 +93,11 @@ async fn observe_membership(
                 } else {
                     tx.finish_read()?;
                 }
-                return Ok(Some(GuildEnrollment {
+                return Ok((Some(GuildEnrollment {
                     guild_id: guild,
                     id: id.clone(),
                     joined_at_ns,
-                }));
+                }), false));
             }
         }
         // The primary snapshot already holds the write lock: enabling recovery
@@ -142,11 +152,11 @@ async fn observe_membership(
             }
         }
         tx.commit()?;
-        Ok(present.then_some(GuildEnrollment {
+        Ok((present.then_some(GuildEnrollment {
             guild_id: guild,
             id,
             joined_at_ns,
-        }))
+        }), true))
     })
     .await
 }
