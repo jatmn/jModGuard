@@ -472,7 +472,7 @@ function App() {
           className: "modal modal-open modal-overlay",
           "aria-label": "Configuration editor",
         },
-        editor && h(DialogPanel, { as: "div", className: "contents", onInput: trackDraft }, editor),
+        editor,
       ),
   );
 }
@@ -1943,8 +1943,8 @@ function RuleEditor({ record: r }) {
   );
 
   const box = h(
-    "div",
-    { className: "modal-box rule-editor" },
+    DialogPanel,
+    { className: "modal-box rule-editor", onInput: trackDraft },
     h(
       "div",
       { className: "editor-heading" },
@@ -2686,8 +2686,8 @@ function CommandEditor({ record: c }) {
   );
   void stepsRevision;
   return h(
-    "div",
-    { className: "modal-box" },
+    DialogPanel,
+    { className: "modal-box", onInput: trackDraft },
     h("h3", { className: "card-title" }, isNew ? "New custom command" : `Edit command: ${c.name}`),
     h(
       "div",

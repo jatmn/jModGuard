@@ -1618,6 +1618,9 @@ for (const kind of ['rule', 'command']) {
       if (kind === 'rule') await app.editRule({ name: 'Flood', rule_id: 'flood', effective: { params: {}, actions: [{ at: 1, action: 'warn' }] } });
       else await app.editCommand(null);
       assert.equal(app.isDirty(), false, 'opening the editor does not modify it');
+      const panel = elements.find(n => n.classList.contains('modal-box'));
+      assert.equal(panel?.matches('.modal-open > .modal-box'), true,
+        'daisyUI only reveals editor panels that are direct children of the open modal');
       const button = action === 'add'
         ? elements.find(n => n.localName === 'button' && (n.textContent === '+ add step' || n.textContent === '+ add action'))
         : elements.find(n => n.localName === 'button' && (n.getAttribute('aria-label') === 'Remove action 1' || n.textContent === '✕' || Array.from(n.children).some(c => c.textContent === '✕')));

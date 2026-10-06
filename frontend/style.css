@@ -203,7 +203,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 #content .card-body { gap: 1rem; }
 #content .input, #content .select, #content .textarea { background-color: var(--input); border-color: var(--input-border); }
 #content .search-select-input { background: transparent; }
-.field > label > input, .field > label > select, .field > label > textarea, .field > label > .search-select { display: block; width: 100%; margin-top: 8px; }
+.field > label > input, .field > label > select, .field > label > textarea, .field > label > .search-select { width: 100%; margin-top: 8px; }
+.field > label > input, .field > label > textarea, .field > label > .search-select { display: block; }
 .field > label > input, .field > label > select, .field > label > textarea, .field > label > .search-select { font-weight: 400; }
 .field-help { margin: 0 0 14px; font-size: .8125rem; color: var(--muted); }
 .tag-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
