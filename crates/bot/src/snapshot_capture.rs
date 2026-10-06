@@ -566,7 +566,24 @@ impl SnapshotIngress {
     }
 
     fn gap_scope(&self, scope: &GuildDataScope) {
-        self.gap_store(scope.placement().store_id().as_str());
+        self.gap_scope_messages(scope, 1);
+    }
+
+    /// One coverage discontinuity for a failed shared write, with `messages`
+    /// added to the store's pending loss. A single message stays on `gap_scope`.
+    fn gap_scope_messages(&self, scope: &GuildDataScope, messages: u64) {
+        if messages == 0 {
+            return;
+        }
+        if messages == 1 {
+            self.gap_store(scope.placement().store_id().as_str());
+            return;
+        }
+        self.gap();
+        let key = scope.placement().store_id().as_str().to_owned();
+        let mut pending = self.lost_pending.lock();
+        let count = pending.entry(key).or_default();
+        *count = count.saturating_add(messages);
     }
 
     fn gap_store(&self, store_id: &str) {
@@ -998,11 +1015,55 @@ async fn observe_configured_creates(
             }
         }
     }
-    if !admitted.is_empty() {
-        let stored = store.observe_snapshots(scope.clone(), admitted).await?;
-        for (index, outcome) in indices.into_iter().zip(stored) {
-            outcomes[index] = Some(outcome);
+    if admitted.is_empty() {
+        return Ok(outcomes);
+    }
+    // Configuration loads are the awaits in this function. Yield once so a
+    // cleanup pause or deletion that arrived during those loads is visible,
+    // then re-check every row that is about to share one write.
+    tokio::task::yield_now().await;
+    if app.snapshots.capture_paused(scope) {
+        for _ in &admitted {
+            app.snapshots.gap_scope(scope);
         }
+        return Ok(outcomes);
+    }
+    let mut ready = Vec::with_capacity(admitted.len());
+    let mut ready_indices = Vec::with_capacity(admitted.len());
+    for (index, observation) in indices.into_iter().zip(admitted) {
+        let key = (
+            scope.guild_id() as u64,
+            observation.channel_id as u64,
+            observation.message_id as u64,
+        );
+        if app.snapshots.deleted(key) {
+            app.snapshots.gap_scope(scope);
+            continue;
+        }
+        ready_indices.push(index);
+        ready.push(observation);
+    }
+    if ready.is_empty() {
+        return Ok(outcomes);
+    }
+    let stored = match store.observe_snapshots(scope.clone(), ready).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            // Capacity splits roll back and are retried one row at a time.
+            // Any other failure is one store call: one discontinuity, and one
+            // lost message per row that call was responsible for.
+            if !matches!(
+                error.downcast_ref::<SnapshotError>(),
+                Some(SnapshotError::BatchCapacity)
+            ) {
+                app.snapshots
+                    .gap_scope_messages(scope, ready_indices.len() as u64);
+            }
+            return Err(error);
+        }
+    };
+    for (index, outcome) in ready_indices.into_iter().zip(stored) {
+        outcomes[index] = Some(outcome);
     }
     Ok(outcomes)
 }
@@ -1138,85 +1199,101 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         .and_then(|e| e.downcast_ref::<SnapshotError>()),
                     Some(SnapshotError::BatchCapacity)
                 );
-                for index in 0..count {
-                    // A split batch made no writes. Preserve the complete
-                    // per-event sequence, including eviction and cleanup pause.
-                    let single;
-                    let outcome = if split {
-                        if app.snapshots.capture_paused(&work.scope) {
-                            app.snapshots.gap_scope(&work.scope);
-                            continue;
-                        }
-                        single = observe_configured_creates(
-                            &app,
-                            &store,
-                            &work.scope,
-                            vec![observations[index].clone()],
-                        )
-                        .await;
-                        single.as_ref().map(|outcomes| outcomes[0])
-                    } else {
-                        outcomes.as_ref().map(|outcomes| outcomes[index])
-                    };
-                    match outcome {
-                        Ok(Some(SnapshotOutcome::Stored)) => {
-                            update_health(
+                // A shared store error is one call, not one outcome per index.
+                // `observe_configured_creates` already recorded its loss.
+                if !split && outcomes.is_err() {
+                    let error = outcomes.unwrap_err();
+                    tracing::warn!("message snapshot create unavailable: {error:#}");
+                    update_health(
+                        &app,
+                        &store,
+                        &work.scope,
+                        &mut health,
+                        SnapshotHealthState::Unavailable,
+                        Some("database"),
+                    )
+                    .await;
+                } else {
+                    for index in 0..count {
+                        // A split batch made no writes. Preserve the complete
+                        // per-event sequence, including eviction and cleanup pause.
+                        let single;
+                        let outcome = if split {
+                            if app.snapshots.capture_paused(&work.scope) {
+                                app.snapshots.gap_scope(&work.scope);
+                                continue;
+                            }
+                            single = observe_configured_creates(
                                 &app,
                                 &store,
                                 &work.scope,
-                                &mut health,
-                                SnapshotHealthState::Active,
-                                None,
+                                vec![observations[index].clone()],
                             )
                             .await;
-                        }
-                        Ok(Some(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale)) => {}
-                        Ok(Some(SnapshotOutcome::CapacityRefused)) => {
-                            app.snapshots.gap_scope(&work.scope);
-                            update_health(
-                                &app,
-                                &store,
-                                &work.scope,
-                                &mut health,
-                                SnapshotHealthState::Paused,
-                                Some("capacity"),
-                            )
-                            .await;
-                            if let Err(error) = store
-                                .evict_snapshots(100, chrono::Utc::now().timestamp_millis())
-                                .await
-                            {
-                                tracing::warn!("snapshot pressure eviction unavailable: {error:#}");
-                                app.snapshots
-                                    .cleanup_paused
-                                    .lock()
-                                    .insert(work.scope.placement().store_id().as_str().to_owned());
+                            single.as_ref().map(|outcomes| outcomes[0])
+                        } else {
+                            outcomes.as_ref().map(|outcomes| outcomes[index])
+                        };
+                        match outcome {
+                            Ok(Some(SnapshotOutcome::Stored)) => {
+                                update_health(
+                                    &app,
+                                    &store,
+                                    &work.scope,
+                                    &mut health,
+                                    SnapshotHealthState::Active,
+                                    None,
+                                )
+                                .await;
+                            }
+                            Ok(Some(SnapshotOutcome::Duplicate | SnapshotOutcome::Stale)) => {}
+                            Ok(Some(SnapshotOutcome::CapacityRefused)) => {
+                                app.snapshots.gap_scope(&work.scope);
                                 update_health(
                                     &app,
                                     &store,
                                     &work.scope,
                                     &mut health,
                                     SnapshotHealthState::Paused,
-                                    Some("cleanup_failed"),
+                                    Some("capacity"),
+                                )
+                                .await;
+                                if let Err(error) = store
+                                    .evict_snapshots(100, chrono::Utc::now().timestamp_millis())
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "snapshot pressure eviction unavailable: {error:#}"
+                                    );
+                                    app.snapshots.cleanup_paused.lock().insert(
+                                        work.scope.placement().store_id().as_str().to_owned(),
+                                    );
+                                    update_health(
+                                        &app,
+                                        &store,
+                                        &work.scope,
+                                        &mut health,
+                                        SnapshotHealthState::Paused,
+                                        Some("cleanup_failed"),
+                                    )
+                                    .await;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            Ok(None) => {}
+                            Ok(Some(_)) => app.snapshots.gap(),
+                            Err(error) => {
+                                tracing::warn!("message snapshot create unavailable: {error:#}");
+                                update_health(
+                                    &app,
+                                    &store,
+                                    &work.scope,
+                                    &mut health,
+                                    SnapshotHealthState::Unavailable,
+                                    Some("database"),
                                 )
                                 .await;
                             }
-                            tokio::task::yield_now().await;
-                        }
-                        Ok(None) => {}
-                        Ok(Some(_)) => app.snapshots.gap(),
-                        Err(error) => {
-                            tracing::warn!("message snapshot create unavailable: {error:#}");
-                            app.snapshots.gap_scope(&work.scope);
-                            update_health(
-                                &app,
-                                &store,
-                                &work.scope,
-                                &mut health,
-                                SnapshotHealthState::Unavailable,
-                                Some("database"),
-                            )
-                            .await;
                         }
                     }
                 }
@@ -1924,6 +2001,156 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2, 6]);
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_store_failure_is_one_gap_for_every_admitted_row() {
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_batch_err_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms: None,
+            coverage_epoch: 1,
+            fields: SnapshotFields {
+                content: Some("captured".into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        store.close_membership(scope.clone()).await.unwrap();
+        let before = app.snapshots.epoch.load(Ordering::Relaxed);
+        let error =
+            observe_configured_creates(&app, &store, &scope, vec![observation(1), observation(2)])
+                .await
+                .unwrap_err();
+        assert!(
+            !matches!(
+                error.downcast_ref::<SnapshotError>(),
+                Some(SnapshotError::BatchCapacity)
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            app.snapshots.epoch.load(Ordering::Relaxed),
+            before + 1,
+            "one failed batch write is one coverage gap"
+        );
+        let store_id = scope.placement().store_id().as_str();
+        assert_eq!(app.snapshots.take_loss(store_id), 2);
+        drop(store);
+        drop(app);
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".guild.db",
+            ".guild.db-wal",
+            ".guild.db-shm",
+        ] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_write_rechecks_deletion_after_admission() {
+        use std::future::Future;
+
+        let path = std::env::temp_dir().join(format!(
+            "snapshot_capture_batch_tombstone_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = path.clone();
+        cfg.db.pool_size = 1;
+        let db = crate::db::Db::open(&path, 1).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        assert!(capture_enabled(
+            &app.configs.get(&app.db, 789).await.unwrap()
+        ));
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms: None,
+            coverage_epoch: 1,
+            fields: SnapshotFields {
+                content: Some("captured".into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        let mut write = Box::pin(observe_configured_creates(
+            &app,
+            &store,
+            &scope,
+            vec![observation(1), observation(2)],
+        ));
+        std::future::poll_fn(|cx| match write.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => panic!("batch admission did not yield before the write"),
+        })
+        .await;
+        app.snapshots
+            .unhooked_delete(GuildId::new(789), ChannelId::new(456), &[MessageId::new(1)]);
+        let outcomes = write.await.unwrap();
+        assert_eq!(outcomes, vec![None, Some(SnapshotOutcome::Stored)]);
+        let retained = store
+            .take_snapshots(scope, 456, vec![1, 2], now + 1)
+            .await
+            .unwrap();
+        assert!(
+            retained[0].is_none(),
+            "deleted row was stored: {retained:?}"
+        );
+        assert_eq!(
+            retained[1].as_ref().unwrap().fields.content.as_deref(),
+            Some("captured")
+        );
         drop(store);
         drop(app);
         for suffix in [
