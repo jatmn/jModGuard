@@ -66,7 +66,7 @@ function Appearance({ preference, setPreference }) {
     h(
       "select",
       {
-        className: "theme-select select select-bordered select-sm",
+        className: "theme-select select select-sm",
         "aria-label": "Appearance",
         value: preference,
         onChange: (event) => {
@@ -129,7 +129,7 @@ function OwnerTools() {
     ),
     h(
       Select,
-      { ref: profile, className: "select select-bordered", "aria-label": "Preview profile" },
+      { ref: profile, className: "select", "aria-label": "Preview profile" },
       ...["administrator", "moderator", "member"].map((value) =>
         h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)),
       ),
@@ -200,7 +200,7 @@ function App() {
                 {
                   id: "guild-select",
                   "aria-label": "YOUR SERVER",
-                  className: "select select-bordered select-sm w-full",
+                  className: "select select-sm w-full",
                   value: state.guildId || "",
                   onChange: async (event) => {
                     if (!canLeave()) return;
@@ -313,7 +313,7 @@ function App() {
           h(Appearance, { preference, setPreference }),
           h(
             "div",
-            { className: "login-card card bg-base-100 shadow-xl" },
+            { className: "login-card card bg-base-100" },
             h(
               "div",
               { className: "card-body items-center text-center" },
@@ -388,9 +388,12 @@ function Notification() {
       role: "status",
       "aria-live": "polite",
       "aria-atomic": true,
-      className: notification ? `show ${notification.kind}` : "",
+      className: `toast toast-end toast-bottom ${notification?.kind || ""}`,
+      hidden: !notification,
     },
-    notification?.message,
+    notification && h("div", {
+      className: `alert alert-soft ${notification.kind === "error" ? "alert-error" : notification.kind === "success" ? "alert-success" : ""}`,
+    }, notification.message),
   );
 }
 function trackDraft(event) {
@@ -1443,7 +1446,7 @@ function emptyPanel(title, body, action, attrs) {
 
 function field(label, control) {
   control = React.cloneElement(control, { "aria-label": label });
-  return h(Field, { className: "field" }, h(Label, {}, label), control);
+  return h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, label), control);
 }
 
 function eventHeading(event) {
@@ -1460,7 +1463,7 @@ function eventHeading(event) {
 }
 
 function statsRow(...items) {
-  return h("div", { className: "stats bg-base-100 shadow w-full" }, ...items);
+  return h("div", { className: "stats bg-base-100 w-full" }, ...items);
 }
 
 function tabDashboard() {
@@ -1524,7 +1527,7 @@ function tabDashboard() {
     ),
     h(
       "section",
-      { className: "card bg-base-100 card-border shadow-sm getting-started" },
+      { className: "card bg-base-100 card-border getting-started" },
       h(
         "div",
         { className: "card-body" },
@@ -1540,7 +1543,7 @@ function tabDashboard() {
           ].map(([number, title, description, tab]) =>
             h(
               ActionButton,
-              { className: "setup-link", onClick: () => navigate(tab) },
+              { className: "btn setup-link", onClick: () => navigate(tab) },
               h("span", { className: "setup-number" }, number),
               h("span", {}, h("strong", {}, title), h("span", {}, description)),
               h("span", { "aria-hidden": "true" }, "→"),
@@ -1645,7 +1648,7 @@ function ruleCard(r) {
           : "enabled";
   return h(
     "div",
-    { className: "card bg-base-100 card-border shadow-sm" },
+    { className: "card bg-base-100 card-border" },
     h(
       "div",
       { className: "card-body" },
@@ -1770,7 +1773,7 @@ function RuleEditor({ record: r }) {
     min: 2,
     max: 10,
     defaultValue: rule.params?.min_channels ?? 3,
-    className: "input input-bordered",
+    className: "input",
   });
   const imageCountRef = useRef(null);
   const imageCount = h(Input, {
@@ -1779,7 +1782,7 @@ function RuleEditor({ record: r }) {
     min: 1,
     max: 10,
     defaultValue: rule.params?.min_attachments ?? 2,
-    className: "input input-bordered",
+    className: "input",
   });
   const imageWindowRef = useRef(null);
   const imageWindow = h(Input, {
@@ -1788,7 +1791,7 @@ function RuleEditor({ record: r }) {
     min: 1,
     max: 600,
     defaultValue: rule.params?.window_secs ?? 60,
-    className: "input input-bordered",
+    className: "input",
   });
   const textLengthRef = useRef(null);
   const textLength = h(Input, {
@@ -1797,7 +1800,7 @@ function RuleEditor({ record: r }) {
     min: 1,
     max: 2000,
     defaultValue: rule.params?.min_length ?? 20,
-    className: "input input-bordered",
+    className: "input",
   });
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const dryRunRef = useRef(null);
@@ -1811,7 +1814,7 @@ function RuleEditor({ record: r }) {
   const paramsTextRef = useRef(null);
   const paramsText = h(Textarea, {
     ref: paramsTextRef,
-    className: "mono" + " textarea textarea-bordered",
+    className: "mono" + " textarea",
     rows: 7,
     spellCheck: false,
     defaultValue: JSON.stringify(rule.params ?? {}, null, 2),
@@ -1822,21 +1825,21 @@ function RuleEditor({ record: r }) {
     ref: whitelistTextRef,
     type: "text",
     defaultValue: (rule.whitelist_roles || []).join(","),
-    className: "input input-bordered",
+    className: "input",
   });
   const channelsTextRef = useRef(null);
   const channelsText = h(Input, {
     ref: channelsTextRef,
     type: "text",
     defaultValue: (rule.whitelist_channels || []).join(","),
-    className: "input input-bordered",
+    className: "input",
   });
   const usersTextRef = useRef(null);
   const usersText = h(Input, {
     ref: usersTextRef,
     type: "text",
     defaultValue: (rule.whitelist_users || []).join(","),
-    className: "input input-bordered",
+    className: "input",
   });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
@@ -1899,27 +1902,27 @@ function RuleEditor({ record: r }) {
               ? "Exact text after trimming ends only. No case folding. Empty text never matches. Default minimum length is 20 Unicode scalars."
               : "Exact common image bytes across channels. Extra images are allowed. Creates and relevant attachment edits participate. Work limits can reduce coverage.",
           ),
-          h(Field, { className: "field" }, h(Label, {}, "Distinct channels"), imageChannels),
+          h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Distinct channels"), imageChannels),
           image
-            ? h(Field, { className: "field" }, h(Label, {}, "Common distinct images per message"), imageCount)
+            ? h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Common distinct images per message"), imageCount)
             : null,
           textRule
             ? h(
                 Field,
-                { className: "field" },
-                h(Label, {}, "Minimum length (Unicode scalars after trim)"),
+                { className: "fieldset field" },
+                h(Label, { className: "fieldset-legend" }, "Minimum length (Unicode scalars after trim)"),
                 textLength,
               )
             : null,
-          h(Field, { className: "field" }, h(Label, {}, "Window (seconds)"), imageWindow),
+          h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Window (seconds)"), imageWindow),
         )
-      : h(Field, { className: "field" }, h(Label, {}, "Parameters (JSON)"), paramsText),
+      : h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Parameters (JSON)"), paramsText),
     spam
       ? null
       : h(
           Field,
-          { className: "field" },
-          h(Label, {}, "Action escalation"),
+          { className: "fieldset field" },
+          h(Label, { className: "fieldset-legend" }, "Action escalation"),
           h(
             "p",
             { className: "field-help" },
@@ -1948,14 +1951,14 @@ function RuleEditor({ record: r }) {
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "field" }, h(Label, {}, "Whitelist roles (ids, comma)"), whitelistText),
-      h(Field, { className: "field" }, h(Label, {}, "Whitelist channels (ids)"), channelsText),
-      h(Field, { className: "field" }, h(Label, {}, "Whitelist users (ids)"), usersText),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist roles (ids, comma)"), whitelistText),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist channels (ids)"), channelsText),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist users (ids)"), usersText),
     ),
     h(
       "div",
       { className: "modal-action" },
-      h(Field, { className: "field" }, h(Label, {}, "Applies to"), scopeSel),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Applies to"), scopeSel),
       h(
         ActionButton,
         {
@@ -2127,7 +2130,7 @@ function tabBadwords() {
     type: "text",
     placeholder: "regex pattern, e.g. (scam|pump and dump)",
     style: { flex: "2" },
-    className: "input input-bordered",
+    className: "input",
   });
   const noteRef = useRef(null);
   const note = h(Input, {
@@ -2135,7 +2138,7 @@ function tabBadwords() {
     type: "text",
     placeholder: "note (optional)",
     style: { flex: "1" },
-    className: "input input-bordered",
+    className: "input",
   });
   const scopeRef = useRef(null);
   const scope = scopeSelect(scopeRef, "This server", "Global");
@@ -2145,7 +2148,7 @@ function tabBadwords() {
     type: "text",
     placeholder: "sample text to test, e.g. 5c@m 🅿🆁🅾🅼🅾",
     style: { flex: "2" },
-    className: "input input-bordered",
+    className: "input",
   });
   const [result, setResult] = useState("");
 
@@ -2164,7 +2167,7 @@ function tabBadwords() {
     ),
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -2202,7 +2205,7 @@ function tabBadwords() {
     ),
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -2215,7 +2218,7 @@ function tabBadwords() {
             id: "test-pattern",
             placeholder: "regex",
             style: { flex: "1" },
-            className: "input input-bordered",
+            className: "input",
           }),
           sample,
           h(
@@ -2242,7 +2245,7 @@ function tabBadwords() {
     ),
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -2472,7 +2475,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: data.name,
     placeholder: "command name",
-    className: "input input-bordered",
+    className: "input",
   });
   const descInRef = useRef(null);
   const descIn = h(Input, {
@@ -2480,7 +2483,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: data.description,
     placeholder: "description",
-    className: "input input-bordered",
+    className: "input",
   });
   const usageInRef = useRef(null);
   const usageIn = h(Input, {
@@ -2488,7 +2491,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: data.usage,
     placeholder: "usage",
-    className: "input input-bordered",
+    className: "input",
   });
   const aliasesInRef = useRef(null);
   const aliasesIn = h(Input, {
@@ -2496,19 +2499,19 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: (data.aliases || []).join(","),
     placeholder: "aliases, comma separated",
-    className: "input input-bordered",
+    className: "input",
   });
   const respInRef = useRef(null);
   const respIn = h(Textarea, {
     ref: respInRef,
     defaultValue: data.response || "",
     placeholder: "response template, e.g. Banned {target} | {reason}",
-    className: "textarea textarea-bordered",
+    className: "textarea",
   });
   const permInRef = useRef(null);
   const permIn = h(
     Select,
-    { ref: permInRef, defaultValue: data.permission, className: "select select-bordered" },
+    { ref: permInRef, defaultValue: data.permission, className: "select" },
     ["everyone", "mod", "admin", "owner"].map((p) => h("option", { value: p }, p)),
   );
   const cdInRef = useRef(null);
@@ -2517,7 +2520,7 @@ function CommandEditor({ record: c }) {
     type: "number",
     min: 0,
     defaultValue: data.cooldown_secs || 0,
-    className: "input input-bordered",
+    className: "input",
   });
   const roleInRef = useRef(null);
   const roleIn = h(Input, {
@@ -2525,7 +2528,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: (data.roles || []).join(","),
     placeholder: "role ids",
-    className: "input input-bordered",
+    className: "input",
   });
   const chanInRef = useRef(null);
   const chanIn = h(Input, {
@@ -2533,7 +2536,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: (data.channels || []).join(","),
     placeholder: "channel ids",
-    className: "input input-bordered",
+    className: "input",
   });
   const logInRef = useRef(null);
   const logIn = h(Input, {
@@ -2541,7 +2544,7 @@ function CommandEditor({ record: c }) {
     type: "text",
     defaultValue: data.log_event || "",
     placeholder: "mod_action",
-    className: "input input-bordered",
+    className: "input",
   });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
@@ -2557,7 +2560,7 @@ function CommandEditor({ record: c }) {
   const behaviorAreaRef = useRef(null);
   const behaviorArea = h(Textarea, {
     ref: behaviorAreaRef,
-    className: "mono textarea textarea-bordered",
+    className: "mono textarea",
     style: { minHeight: "70px" },
     value: behaviorJson,
     onChange: (event) => setBehaviorJson(event.target.value),
@@ -2614,17 +2617,17 @@ function CommandEditor({ record: c }) {
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "field" }, h(Label, {}, "Name"), nameIn),
-      h(Field, { className: "field" }, h(Label, {}, "Aliases"), aliasesIn),
-      h(Field, { className: "field" }, h(Label, {}, "Permission"), permIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Name"), nameIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Aliases"), aliasesIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Permission"), permIn),
     ),
-    h(Field, { className: "field" }, h(Label, {}, "Description"), descIn),
-    h(Field, { className: "field" }, h(Label, {}, "Usage"), usageIn),
+    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Description"), descIn),
+    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Usage"), usageIn),
     isPlan
       ? h(
           "fieldset",
-          { className: "field plan-steps" },
-          h("legend", {}, "Action plan steps"),
+          { className: "fieldset field plan-steps" },
+          h("legend", { className: "fieldset-legend" }, "Action plan steps"),
           stepsBox,
           h(
             ActionButton,
@@ -2641,25 +2644,25 @@ function CommandEditor({ record: c }) {
           ),
         )
       : null,
-    h(Field, { className: "field" }, h(Label, {}, "Behavior (advanced JSON)"), behaviorArea),
+    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Behavior (advanced JSON)"), behaviorArea),
     h(
       Field,
-      { className: "field" },
-      h(Label, {}, "Response template (in-chat reply; {target} {reason} {response} …)"),
+      { className: "fieldset field" },
+      h(Label, { className: "fieldset-legend" }, "Response template (in-chat reply; {target} {reason} {response} …)"),
       respIn,
     ),
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "field" }, h(Label, {}, "Cooldown (secs)"), cdIn),
-      h(Field, { className: "field" }, h(Label, {}, "Role restriction (ids)"), roleIn),
-      h(Field, { className: "field" }, h(Label, {}, "Channel restriction (ids)"), chanIn),
-      h(Field, { className: "field" }, h(Label, {}, "Log event"), logIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Cooldown (secs)"), cdIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Role restriction (ids)"), roleIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Channel restriction (ids)"), chanIn),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Log event"), logIn),
     ),
     h(
       "div",
       { className: "modal-action" },
-      h(Field, { className: "field" }, h(Label, {}, "Applies to"), scopeSel),
+      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Applies to"), scopeSel),
       h(
         "label",
         { className: "checkbox-label" },
@@ -2799,7 +2802,7 @@ function TemplateCard({ record: t }) {
   const textRef = useRef(null);
   const text = h(Textarea, {
     ref: textRef,
-    className: "mono template-input" + " textarea textarea-bordered",
+    className: "mono template-input" + " textarea",
     rows: 8,
     spellCheck: false,
     defaultValue: t.effective,
@@ -2822,7 +2825,7 @@ function TemplateCard({ record: t }) {
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global");
   return h(
     "div",
-    { className: "card bg-base-100 card-border shadow-sm template-card" },
+    { className: "card bg-base-100 card-border template-card" },
     h(
       "div",
       { className: "card-body" },
@@ -2919,14 +2922,14 @@ function LogChannelCard({ lc }) {
     type: "text",
     defaultValue: lc.effective && String(lc.effective) !== "0" ? String(lc.effective) : "",
     placeholder: "channel id",
-    className: "input input-bordered",
+    className: "input",
   });
   const ignoredUsersRef = useRef(null);
   const ignoredUsers = h(Textarea, {
     ref: ignoredUsersRef,
     placeholder: "One Discord user or bot ID per line",
     rows: 2,
-    className: "textarea textarea-bordered",
+    className: "textarea",
     defaultValue: (lc.ignore?.users || []).join("\n"),
   });
   const ignoredChannelsRef = useRef(null);
@@ -2934,14 +2937,14 @@ function LogChannelCard({ lc }) {
     ref: ignoredChannelsRef,
     placeholder: "One source channel ID per line",
     rows: 2,
-    className: "textarea textarea-bordered",
+    className: "textarea",
     defaultValue: (lc.ignore?.channels || []).join("\n"),
   });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", false);
   return h(
     "div",
-    { className: "card bg-base-100 card-border shadow-sm log-channel-card" },
+    { className: "card bg-base-100 card-border log-channel-card" },
     h(
       "div",
       { className: "card-body" },
@@ -3102,7 +3105,7 @@ function tabMembers() {
     type: "search",
     placeholder: "User ID, mention, display name or username",
     "aria-label": "Search members",
-    className: "input input-bordered",
+    className: "input",
   });
   const statusFilterRef = useRef(null);
   const statusFilter = h(
@@ -3111,7 +3114,7 @@ function tabMembers() {
       ref: statusFilterRef,
       onChange: () => handlers.current.loadChangedFilters?.(),
       "aria-label": "Member status",
-      className: "select select-bordered",
+      className: "select",
     },
     ...[
       ["current", "Current members"],
@@ -3127,7 +3130,7 @@ function tabMembers() {
     onBlur: () => handlers.current.loadChangedFilters?.(),
     type: "date",
     "aria-label": "Joined from date, UTC",
-    className: "input input-bordered",
+    className: "input",
   });
   const joinedToRef = useRef(null);
   const joinedTo = h(Input, {
@@ -3136,7 +3139,7 @@ function tabMembers() {
     onBlur: () => handlers.current.loadChangedFilters?.(),
     type: "date",
     "aria-label": "Joined through date, UTC",
-    className: "input input-bordered",
+    className: "input",
   });
   const sortRef = useRef(null);
   const sort = h(
@@ -3145,7 +3148,7 @@ function tabMembers() {
       ref: sortRef,
       onChange: () => handlers.current.loadChangedFilters?.(),
       "aria-label": "Join date order",
-      className: "select select-bordered",
+      className: "select",
     },
     h("option", { value: "joined_newest" }, "Newest join first"),
     h("option", { value: "joined_oldest" }, "Oldest join first"),
@@ -3900,12 +3903,12 @@ function tabMembers() {
     ),
     h(
       "section",
-      { className: "card bg-base-100 card-border shadow-sm", "aria-label": "Member import status" },
+      { className: "card bg-base-100 card-border", "aria-label": "Member import status" },
       ...syncParts,
     ),
     h(
       "section",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -3930,7 +3933,7 @@ function tabMembers() {
     ),
     h(
       "section",
-      { className: "card bg-base-100 card-border shadow-sm", "aria-label": "Member history" },
+      { className: "card bg-base-100 card-border", "aria-label": "Member history" },
       ...detailParts,
     ),
   );
@@ -3983,7 +3986,7 @@ function tabCases() {
           ref: noteRef,
           rows: "3",
           placeholder: "Add a note. This does not change Discord.",
-          className: "textarea textarea-bordered",
+          className: "textarea",
         });
         setDetailParts([
           h("h3", { className: "card-title" }, "Case " + id),
@@ -4020,8 +4023,8 @@ function tabCases() {
           ),
           h(
             Field,
-            { className: "field" },
-            h(Label, {}, "Note"),
+            { className: "fieldset field" },
+            h(Label, { className: "fieldset-legend" }, "Note"),
             note,
             h(
               ActionButton,
@@ -4250,7 +4253,7 @@ function tabCases() {
     h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "When"] }, rows),
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm", style: { marginTop: "16px" } },
+      { className: "card bg-base-100 card-border", style: { marginTop: "16px" } },
       ...detailParts,
     ),
   );
@@ -4264,14 +4267,14 @@ function tabSettings() {
     ref: prefixRef,
     type: "text",
     defaultValue: cfg.settings.prefix,
-    className: "input input-bordered",
+    className: "input",
   });
   const botNameRef = useRef(null);
   const botName = h(Input, {
     ref: botNameRef,
     type: "text",
     defaultValue: cfg.settings.bot_name,
-    className: "input input-bordered",
+    className: "input",
   });
 
   const sourceEnrollment = useRef(null);
@@ -4280,7 +4283,7 @@ function tabSettings() {
     Select,
     {
       ref: srcSelRef,
-      className: "select select-bordered",
+      className: "select",
       onChange: (event) =>
         handleEvent(
           event.currentTarget,
@@ -4302,7 +4305,7 @@ function tabSettings() {
   const sectionSelRef = useRef(null);
   const sectionSel = h(
     Select,
-    { ref: sectionSelRef, className: "select select-bordered" },
+    { ref: sectionSelRef, className: "select" },
     ["all", "rules", "badwords", "commands", "templates", "settings"].map((s) =>
       h("option", { value: s }, s === "all" ? "everything" : s),
     ),
@@ -4312,7 +4315,7 @@ function tabSettings() {
     ref: globalPrefixRef,
     type: "text",
     defaultValue: cfg.global_settings.prefix,
-    className: "input input-bordered",
+    className: "input",
   });
 
   /** Clear one override field via API null (inherit parent). */
@@ -4327,8 +4330,8 @@ function tabSettings() {
     const hasOv = ov[overrideKey] != null;
     return h(
       Field,
-      { className: "field" },
-      h(Label, {}, labelText),
+      { className: "fieldset field" },
+      h(Label, { className: "fieldset-legend" }, labelText),
       input,
       hint ? h("p", { className: "muted", style: { margin: "4px 0 0", fontSize: "12px" } }, hint) : null,
       hasOv && allowInheritance
@@ -4350,7 +4353,7 @@ function tabSettings() {
   const cards = [
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4457,7 +4460,7 @@ function tabSettings() {
     ref: roleInputRef,
     type: "text",
     placeholder: "role id, <@&id> mention, comma-separated",
-    className: "input input-bordered",
+    className: "input",
   });
   const roleRevision = useRef("");
   const roleWriteGeneration = useRef(0);
@@ -4487,7 +4490,7 @@ function tabSettings() {
   cards.push(
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4497,7 +4500,7 @@ function tabSettings() {
           { className: "muted" },
           "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action.",
         ),
-        h(Field, { className: "field" }, h(Label, {}, "Delegated case-removal role IDs"), roleInput),
+        h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Delegated case-removal role IDs"), roleInput),
         h(
           "div",
           { className: "card-actions" },
@@ -4529,7 +4532,7 @@ function tabSettings() {
     cards.push(
       h(
         "div",
-        { className: "card bg-base-100 card-border shadow-sm" },
+        { className: "card bg-base-100 card-border" },
         h(
           "div",
           { className: "card-body" },
@@ -4542,7 +4545,7 @@ function tabSettings() {
           h(
             "div",
             { className: "row form-actions" },
-            h(Field, { className: "field" }, h(Label, {}, "Global prefix"), globalPrefix),
+            h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Global prefix"), globalPrefix),
             h(
               ActionButton,
               {
@@ -4570,7 +4573,7 @@ function tabSettings() {
   cards.push(
     h(
       "div",
-      { className: "card bg-base-100 card-border shadow-sm" },
+      { className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4637,7 +4640,7 @@ function scopeSelect(
 ) {
   return h(
     Select,
-    { ref, className: "select select-bordered" },
+    { ref, className: "select" },
     h("option", { value: "guild" }, guildLabel),
     allowGlobal && isBotOwner() && h("option", { value: "global" }, globalLabel),
   );
@@ -4662,7 +4665,7 @@ function RuleAction({ action, index, remove }) {
       field(
         "Strike count",
         h(Input, {
-          className: "input input-bordered",
+          className: "input",
           type: "number",
           min: 1,
           defaultValue: action.at,
@@ -4676,7 +4679,7 @@ function RuleAction({ action, index, remove }) {
         h(
           Select,
           {
-            className: "select select-bordered",
+            className: "select",
             defaultValue: action.action,
             onChange: (event) => {
               action.action = event.target.value;
@@ -4690,7 +4693,7 @@ function RuleAction({ action, index, remove }) {
       field(
         "Timeout (minutes)",
         h(Input, {
-          className: "input input-bordered",
+          className: "input",
           type: "number",
           min: 0,
           defaultValue: action.duration_minutes ?? 0,
@@ -4703,7 +4706,7 @@ function RuleAction({ action, index, remove }) {
       field(
         "Delete history (days)",
         h(Input, {
-          className: "input input-bordered",
+          className: "input",
           type: "number",
           min: 0,
           max: 7,
@@ -4718,7 +4721,7 @@ function RuleAction({ action, index, remove }) {
     field(
       "Reason template",
       h(Input, {
-        className: "input input-bordered",
+        className: "input",
         type: "text",
         defaultValue: action.reason || "",
         placeholder: "reason template",
@@ -4740,14 +4743,14 @@ function CommandStep({ step, placeholder, onChange, remove }) {
   const input = useRef(null);
   return h(
     "div",
-    { className: "step-card" },
+    { className: "card card-border step-card" },
     h(
       "div",
       { className: "row control-row" },
       h(
         Select,
         {
-          className: "select select-bordered",
+          className: "select",
           value: step.type,
           "aria-label": "Step action",
           onChange: (event) => {
@@ -4789,7 +4792,7 @@ function CommandStep({ step, placeholder, onChange, remove }) {
       h(Input, {
         ref: input,
         "aria-label": "Step value",
-        className: "input input-bordered",
+        className: "input",
         type: "text",
         defaultValue:
           step.template ?? step.role_id ?? step.minutes ?? step.delete_days ?? step.emoji ?? step.secs ?? "",
@@ -4876,7 +4879,7 @@ function tabEvents() {
       h(
         Select,
         {
-          className: "select select-bordered",
+          className: "select",
           "aria-label": "Event type",
           value: type,
           onChange: (event) => {
@@ -4890,7 +4893,7 @@ function tabEvents() {
       h(Input, {
         ref: input,
         type: "text",
-        className: "input input-bordered",
+        className: "input",
         placeholder: "user id",
         onKeyDown: (event) => {
           if (event.key === "Enter") refresh();

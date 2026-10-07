@@ -55,13 +55,13 @@ The dependency audit keeps the libraries that supply existing behavior:
 | Floating UI | Upstream Headless popup dependency | Excluded from browser assets; retained only in the installation lockfile |
 | React Aria and its support packages | Headless control focus/hover handling | Retained internal dependencies |
 | TanStack Virtual | Upstream Headless Combobox virtualization dependency | Excluded from browser assets; retained only in the installation lockfile |
-| daisyUI | Component styles on both pages | Include the 14 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
+| daisyUI | Component styles on both pages | Include the 16 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
 | esbuild, es-module-lexer and jsdom | Build, import checks and real React/DOM regression tests | Build/test only; never loaded by the browser |
 
 Exact versions are declared in `tools/webui/package.json` and pinned transitively
 by its lockfile. `tools/webui/style.css` lists the used CSS chunks; update it when
 adding a component family. These include alert, badge, button, card, checkbox,
-hero, input, menu, modal, navbar, select, stat, table and textarea.
+fieldset, hero, input, menu, modal, navbar, select, stat, table, textarea and toast.
 The four used theme utilities (`bg-base-100`, `bg-base-200`, `text-warning`,
 `rounded-box`) live with the existing token mappings in `frontend/style.css`.
 This avoids loading all color/opacity and directional/responsive radius variants
@@ -84,6 +84,15 @@ menus and keyboard selection, styled by daisyUI; inline text filtering is remove
 Headless Listbox is another installed option, but its custom popup retains the
 Floating UI stack. React Aria offers lower-level selection hooks that need custom
 rendering and state integration. Reusing Headless Select avoids both additions.
+TanStack and Floating UI are required, non-optional dependencies of the pinned
+Headless UI package. Removing their lock entries or installed directories is not
+a supported removal: the next `npm ci` must install that declared graph. Their
+absence from browser output is checked by the packaged dependency tests.
+
+Status messages use daisyUI alert variants; toast positioning and field labels
+use the toast and fieldset sheets. Setup actions and command-step panels reuse
+button/card foundations, with only the existing palette and geometry adjustments.
+Obsolete `*-bordered` and unavailable shadow utility classes are omitted.
 Pale blue light and navy dark colors stay the existing theme tokens.
 Buttons, cards, hero, stats, badges, tables, inputs, and selects
 use daisyUI component classes mapped onto

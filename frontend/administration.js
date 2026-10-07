@@ -267,10 +267,10 @@ function ComponentCard({ record, revision }) {
           action("Update launcher", record.component,
             item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }),
             { hidden: !record.candidate, disabled: busy || stale || pairActive || !snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
-      h("fieldset", { className: "administration-policy", disabled: busy || stale },
-        h("legend", null, "Release policy"),
-        h("label", { className: "field" }, "Release channel",
-          h("select", { className: "select select-bordered select-sm", "aria-label": `${record.component} release channel`, value: channel,
+      h("fieldset", { className: "fieldset administration-policy", disabled: busy || stale },
+        h("legend", { className: "fieldset-legend" }, "Release policy"),
+        h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Release channel"),
+          h("select", { className: "select select-sm", "aria-label": `${record.component} release channel`, value: channel,
             onChange: event => {
               const value = event.target.value; setChannel(value);
               return mutate(record, "Save release channel", () => {
@@ -278,8 +278,8 @@ function ComponentCard({ record, revision }) {
                 return request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence });
               });
             } }, ...["latest", "stable", "nightly"].map(value => h("option", { key: value, value }, value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases")))),
-        h("label", { className: "field" }, "Automatic installation",
-          h("select", { className: "select select-bordered select-sm", "aria-label": `${record.component} automatic installation cadence`, value: cadence,
+        h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Automatic installation"),
+          h("select", { className: "select select-sm", "aria-label": `${record.component} automatic installation cadence`, value: cadence,
             onChange: event => {
               const value = event.target.value; setCadence(value);
               return mutate(record, "Save automatic installation", () => {
@@ -409,7 +409,7 @@ function UsageCard({ database: initial, stale, revision }) {
   if (!usage || usage.breakdown_quality === "unavailable" && usage.snapshot_count == null) {
     line(content, "Breakdown", "unavailable");
   }
-  return h("section", { className: "card bg-base-100 shadow-xl", "data-usage-stale": oldSample ? "1" : undefined },
+  return h("section", { className: "card bg-base-100", "data-usage-stale": oldSample ? "1" : undefined },
     oldSample && h("p", { className: "text-warning" }, "Stale: the latest usage refresh failed. These figures are not a current capacity sample."),
     h("div", { className: "card-body" }, h("h3", { className: "card-title" }, title), content,
       h("button", { type: "button", className: "btn btn-sm", disabled: loading, onClick: async () => {
@@ -475,7 +475,7 @@ function Appearance() {
     return () => media.removeEventListener("change", apply);
   }, [preference]);
   return h("label", { className: "theme-picker" }, "Appearance ",
-    h("select", { id: "appearance", className: "select select-bordered select-sm", "aria-label": "Appearance", value: preference,
+    h("select", { id: "appearance", className: "select select-sm", "aria-label": "Appearance", value: preference,
       onChange: event => { const value = event.target.value; setPreference(value); try { window.localStorage.setItem("jmodguard.theme", value); } catch (_) {} } },
       ...["system", "light", "dark"].map(value => h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)))));
 }
@@ -498,7 +498,7 @@ function Administration() {
       h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, activeView === "usage" ? "Database Usage" : "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: busy,
         onClick: () => { if (!busy) { actionMessage = ""; return refresh(); } } }, "↻ Refresh status"), h(Appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
-    h("p", { id: "update-status", className: `administration-notice administration-${status.tone}`, role: "status", "aria-live": "polite" }, status.message),
+    h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[status.tone]}`, role: "status", "aria-live": "polite" }, status.message),
     h("div", { id: "sign-in", className: needsSignIn ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
       h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
@@ -513,7 +513,7 @@ function Administration() {
       h("div", { id: "update-cards", className: "administration-grid" }, snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: policyRevision })))),
     h("section", { id: "database-usage", className: authorized && !accessDenied && activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
       h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
-      h("p", { id: "usage-status", className: "administration-notice", role: "status" }, usageMessage),
+      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${usageStale ? "alert-warning" : ""}`, role: "status" }, usageMessage),
       h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
       h("div", { id: "usage-cards", className: "administration-grid" }, usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: usageStale, revision: usageRevision })))));
 }
