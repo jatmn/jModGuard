@@ -112,7 +112,6 @@ body { background: var(--bg); color: var(--text); }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 18px; }
 .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
 .row > * { min-width: 0; }
-.row > label:not(.checkbox-label) { color: var(--muted); }
 .title-row { justify-content: space-between; }
 .title-row > h2 { margin-bottom: 0; }
 .form-row { align-items: flex-start; margin-bottom: 18px; }

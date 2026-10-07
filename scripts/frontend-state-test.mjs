@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
-import React, { useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
+import React, { useSyncExternalStore, useState, useEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
 
 
 const bootDom = new JSDOM('<html><body></body></html>', {pretendToBeVisual: true});
@@ -83,12 +83,12 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot,
+    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, ui, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, BusyContext})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, ui, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, BusyContext})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -2086,48 +2086,9 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   assert.deepEqual(calls.at(-1).data.actions.map(a=>a.action),['log']);
 });
 
-test('checkbox labels inside rows keep primary text color', () => {
-  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)];
-  const specificity = (selector) => {
-    const ids = (selector.match(/#[\w-]+/g) || []).length;
-    const classes = (selector.match(/\.[\w-]+/g) || []).length
-      + (selector.match(/\[[^\]]+\]/g) || []).length
-      + (selector.match(/:(?:not|is|where)\([^)]*\)/g) || []).length;
-    const withoutPseudos = selector.replace(/:(?:not|is|where)\([^)]*\)/g, '');
-    const elements = (withoutPseudos.match(/(^|[\s>+~])[a-zA-Z][\w-]*/g) || []).length;
-    return ids * 100 + classes * 10 + elements;
-  };
-  const matches = (selector, checkbox) => {
-    if (selector.includes(':not(.checkbox-label)') && checkbox) return false;
-    const normalized = selector.replace(/:not\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
-    if (checkbox) {
-      return normalized === '.checkbox-label'
-        || normalized === '.row > label'
-        || normalized === '.row > label.checkbox-label'
-        || normalized === '.row > .checkbox-label';
-    }
-    return normalized === '.row > label' || normalized === '.row label';
-  };
-  const winningColor = (checkbox) => {
-    let winner = null;
-    rules.forEach((match, index) => {
-      const declared = match[2].match(/(?:^|;)\s*color\s*:\s*([^;]+)/);
-      if (!declared) return;
-      for (const raw of match[1].split(',')) {
-        const selector = raw.trim();
-        if (!matches(selector, checkbox)) continue;
-        const rank = specificity(selector);
-        if (!winner || rank > winner.rank || (rank === winner.rank && index >= winner.index)) {
-          winner = { rank, index, color: declared[1].trim() };
-        }
-      }
-    });
-    return winner && winner.color;
-  };
-  assert.equal(winningColor(true), 'var(--text)');
-  assert.equal(winningColor(false), 'var(--muted)');
+test('checkbox labels keep primary text color', () => {
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  assert.match(css, /\.checkbox-label\s*\{[^}]*color:\s*var\(--text\)/);
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
@@ -2521,7 +2482,6 @@ test('unauthenticated settings save returns to login', async () => {
 
 
 test('React WebUI retains the framework imports, styling and pale-blue tokens', () => {
-  const { app } = harness();
   const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
   const js = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');

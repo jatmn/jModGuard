@@ -1593,23 +1593,6 @@ function spamRule(id) {
   return id === "attachment_flood" || id === "repeat_text";
 }
 
-function imageTestConfigured(rule) {
-  return (
-    spamConfigured(
-      "attachment_flood",
-      Object.assign({}, rule, {
-        dry_run: true,
-        params: Object.assign({ mode: "exact_image_test" }, rule.params || {}),
-        actions: [{ action: "log" }],
-      }),
-    ) ||
-    ((rule.params || {}).mode === "exact_image_test" &&
-      rule.dry_run === true &&
-      (rule.actions || []).every((a) => a.action === "log") &&
-      spamThresholds(rule.params, "attachment_flood"))
-  );
-}
-
 function spamConfigured(id, rule) {
   const p = rule.params || {};
   if (id === "attachment_flood") {

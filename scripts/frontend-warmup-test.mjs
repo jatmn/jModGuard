@@ -14,26 +14,9 @@ const src = appSource.slice(appSource.indexOf("let state ="))
   .replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, "\n");
 
 function loadFrontend(fetchImpl, clock, timers) {
-  const document = {
-    getElementById() {
-      return null;
-    },
-    querySelector() {
-      return {
-        classList: { toggle() {} },
-        textContent: "",
-        className: "",
-        addEventListener() {},
-      };
-    },
-    querySelectorAll() {
-      return [];
-    },
-  };
   const now = clock || { ms: 0 };
   const context = vm.createContext({
     fetch: fetchImpl, showView() {}, setStartupStatus() {}, showPreviewUnavailable() {},
-    document,
     window: { JMODGUARD_API_BASE: "" },
     Date: { now: () => now.ms },
     Number,

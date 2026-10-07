@@ -21,11 +21,9 @@ export default defineConfig([
         },
         rules: {
             // catch (_) {} and unused parameters are intentional on existing pages.
-            // imageTestConfigured is destructured out in scripts/frontend-state-test.mjs.
             "no-unused-vars": ["error", {
                 args: "none",
                 caughtErrors: "none",
-                varsIgnorePattern: "^imageTestConfigured$",
             }],
             "no-empty": ["error", { allowEmptyCatch: true }],
             "preserve-caught-error": "off",
