@@ -6,11 +6,15 @@ import test from "node:test";
 import vm from "node:vm";
 
 import { JSDOM } from "../tools/webui/node_modules/jsdom/lib/api.js";
-import React, { useEffect, useState } from "../tools/webui/node_modules/react/index.js";
+import React, { useSyncExternalStore, useEffect, useState } from "../tools/webui/node_modules/react/index.js";
 import { createRoot as reactRoot } from "../tools/webui/node_modules/react-dom/client.js";
 import { flushSync } from "../tools/webui/node_modules/react-dom/index.js";
 import { afterEach } from "node:test";
 
+const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
+const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replaceAll('export function', 'function');
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8")
   .replace(/^import .*;$/gm, "");
 const NOW_SECONDS = 1800000000;
@@ -35,7 +39,7 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
   const timers = new Map();
   let nextTimer = 0;
   const context = vm.createContext({
-    document, window, React, useEffect, useState,
+    document, window, React, useSyncExternalStore, useEffect, useState,
     createRoot(container) {
       globalThis.window = window; globalThis.document = document;
       const root = reactRoot(container); roots.push(root);
@@ -50,8 +54,14 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     Date: { now },
   });
   pages.push({ dom, roots });
-  vm.runInContext(source, context);
+  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + source, context);
   return { context, elements: { get: id => document.getElementById(id) }, timers };
+}
+
+function run(script, context) {
+  let result;
+  flushSync(() => { result = vm.runInContext(script, context); });
+  return result;
 }
 
 function fire(element, type) {
@@ -101,7 +111,7 @@ function render(pageState, item) {
     components: [item], compatibility: { [item.component]: { installable: true } },
     apply_enabled: true, unattended_enabled: false, webui_storage_configured: true,
   };
-  vm.runInContext("snapshot = " + JSON.stringify(snapshot) + "; stale = false; authorized = true; render();", pageState.context);
+  run("ui.set({ snapshot: " + JSON.stringify(snapshot) + ", stale: false, authorized: true });", pageState.context);
 }
 
 test("owner update controls require a current installable candidate", () => {
@@ -145,7 +155,7 @@ test("signed-out Administration offers Discord sign-in on the existing API respo
   const view = page(async () => ({
     status: 400, ok: false, json: async () => ({ error: "not authenticated" }),
   }));
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(view.elements.get("sign-in").classList.contains("hidden"), false);
   assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
   assert.match(view.elements.get("update-status").textContent, /Sign in again/);
@@ -159,7 +169,7 @@ test("Administration carries the configured API origin through reads, controls, 
   };
   const remote = page(fetchImpl, { apiBase: "https://api.example.test/" });
   for (const path of ["/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"]) {
-    vm.runInContext(`request(${JSON.stringify(path)}, {})`, remote.context);
+    run(`request(${JSON.stringify(path)}, {})`, remote.context);
   }
   assert.deepEqual(calls, ["/api/updates", "/api/updates", "/api/updates/check", "/api/updates/install", "/api/updates/policy"].map((path) => ({
     url: `https://api.example.test${path}`, method: "POST", credentials: "include",
@@ -226,7 +236,7 @@ function state(items) {
 
 async function ready(fetchImpl, options) {
   const view = page(fetchImpl, options);
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   return view;
 }
 
@@ -246,11 +256,11 @@ test("check applies its returned snapshot and reports failures without leaving e
   await fire(check, "click");
   assert.match(textOf(view.elements.get("update-cards")), /no source update/);
   unavailable = true;
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   assert.match(view.elements.get("update-status").textContent, /offline/);
   unavailable = false;
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(updateButton(view, "api").disabled, false);
 });
 
@@ -355,8 +365,8 @@ test("overlapping refreshes share one read and mutations wait for that read", as
     return response(state([item]));
   });
   block = true;
-  const first = vm.runInContext("refresh()", view.context);
-  const second = vm.runInContext("refresh()", view.context);
+  const first = run("refresh()", view.context);
+  const second = run("refresh()", view.context);
   assert.equal(first, second);
   const action = fire(updateButton(view, "api"), "click");
   assert.equal(installs, 0);
@@ -373,7 +383,7 @@ test("authorization loss hides the controls and stops automatic polling", async 
     return lost ? response({ error: "bot owner required" }, 403) : response(state([record()]));
   });
   lost = true;
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
   assert.equal(view.timers.size, 0);
 });
@@ -403,7 +413,7 @@ test("a policy save keeps the sibling field from the refresh it waits for", asyn
   });
   const [channel, cadence] = findAll(view.elements.get("update-cards"), (element) => element.localName === "select");
   block = true;
-  const reading = vm.runInContext("refresh()", view.context);
+  const reading = run("refresh()", view.context);
   channel.value = "nightly";
   const savingChannel = fire(channel, "change");
   item.cadence = "weekly";
@@ -412,7 +422,7 @@ test("a policy save keeps the sibling field from the refresh it waits for", asyn
   assert.deepEqual(saved, { component: "bot", channel: "nightly", cadence: "weekly" });
 
   block = true;
-  const readingAgain = vm.runInContext("refresh()", view.context);
+  const readingAgain = run("refresh()", view.context);
   cadence.value = "monthly";
   const savingCadence = fire(cadence, "change");
   item.channel = "stable";
@@ -436,7 +446,7 @@ test("an install uses the candidate from the refresh it waits for", async () => 
     return response(state([item]));
   });
   block = true;
-  const reading = vm.runInContext("refresh()", view.context);
+  const reading = run("refresh()", view.context);
   const saving = fire(updateButton(view, "api"), "click");
   item = { ...item, candidate: { ...item.candidate, digest: "sha256:" + "f".repeat(64) } };
   releaseRead(response(state([item])));
@@ -493,13 +503,13 @@ test("a failed policy save restores the server's channel and displays the error"
 
 test("appearance changes even when browser storage is unavailable", () => {
   const view = page();
-  const select = view.elements.get("appearance");
+  const select = run(`document.querySelector('select[aria-label="Appearance"]')`, view.context);
   select.value = "dark";
   fire(select, "change");
-  assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "dark");
+  assert.equal(run("document.documentElement.dataset.theme", view.context), "dark");
   select.value = "light";
   fire(select, "change");
-  assert.equal(vm.runInContext("document.documentElement.dataset.theme", view.context), "light");
+  assert.equal(run("document.documentElement.dataset.theme", view.context), "light");
 });
 
 
@@ -525,10 +535,10 @@ test("uptime uses compact day/hour/minute/second units without leading zero unit
   const view = page(undefined, { now: () => now * 1000 });
   for (const [seconds, expected] of [[0, "0s"], [38, "38s"], [818, "13m 38s"],
     [3608, "1h 0m 8s"]]) {
-    assert.equal(vm.runInContext(`uptime(${now - seconds})`, view.context), expected);
+    assert.equal(run(`uptime(${now - seconds})`, view.context), expected);
   }
-  assert.equal(vm.runInContext(`uptime(${now - 94418})`, view.context), "1d 2h 13m 38s");
-  assert.equal(vm.runInContext("uptime(null)", view.context), "unknown");
+  assert.equal(run(`uptime(${now - 94418})`, view.context), "1d 2h 13m 38s");
+  assert.equal(run("uptime(null)", view.context), "unknown");
 });
 
 
@@ -542,7 +552,7 @@ test("service application and launcher requests reconcile independently after a 
     item.desired_launcher = null;
     item.state = "failed";
     item.last_error = "launcher update: download failed";
-    await vm.runInContext("refresh()", view.context);
+    await run("refresh()", view.context);
     assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.match(textOf(view.elements.get("update-cards")), /launcher update: download failed/);
     assert.equal([...view.timers.values()][0].delay, 2000);
@@ -550,12 +560,12 @@ test("service application and launcher requests reconcile independently after a 
     assert.equal(updateButton(view, component, true).disabled, false);
     // Owner can supersede a still-active application request with a different digest.
     item.candidate = { ...item.candidate, digest: "sha256:" + "e".repeat(64) };
-    await vm.runInContext("refresh()", view.context);
+    await run("refresh()", view.context);
     assert.equal(updateButton(view, component).disabled, false);
     item.installed = { ...item.desired };
     item.state = "running";
     item.last_error = null;
-    await vm.runInContext("refresh()", view.context);
+    await run("refresh()", view.context);
     assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.equal([...view.timers.values()][0].delay, 30000);
     // The inverse outcome keeps a launcher pending after application failure.
@@ -563,12 +573,12 @@ test("service application and launcher requests reconcile independently after a 
     item.desired_launcher = { ...item.candidate };
     item.state = "failed";
     item.last_error = "application download failed";
-    await vm.runInContext("refresh()", view.context);
+    await run("refresh()", view.context);
     assert.match(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.match(textOf(view.elements.get("update-cards")), /application download failed/);
     assert.equal([...view.timers.values()][0].delay, 2000);
     item.installed_launcher = { ...item.desired_launcher };
-    await vm.runInContext("refresh()", view.context);
+    await run("refresh()", view.context);
     assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Update pending/);
     assert.equal([...view.timers.values()][0].delay, 30000);
   }
@@ -589,10 +599,10 @@ test("Browser version remains expanded or collapsed across status refreshes", as
   const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
   const details = () => find(view.elements.get("browser-version"), (element) => element.localName === "details");
   details().open = true;
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(details().open, true);
   details().open = false;
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(details().open, false);
 });
 
@@ -641,7 +651,7 @@ test("Discord rate limits delay the next administration refresh", async () => {
   assert.equal(view.timers.size, 1);
   assert.equal([...view.timers.values()][0].delay, 45000);
   now += 1;
-  vm.runInContext("scheduleRefresh()", view.context);
+  run("scheduleRefresh()", view.context);
   assert.equal([...view.timers.values()][0].delay, 44999);
 });
 
@@ -687,7 +697,7 @@ test("a policy edit abandoned after a failed prior read restores the recorded se
     return response(state([record()]));
   });
   block = true;
-  const reading = vm.runInContext("refresh()", view.context);
+  const reading = run("refresh()", view.context);
   const select = find(view.elements.get("update-cards"), (el) => el.localName === "select");
   select.value = "stable";
   const saving = fire(select, "change");
@@ -695,7 +705,7 @@ test("a policy edit abandoned after a failed prior read restores the recorded se
   await Promise.all([reading, saving]);
   assert.equal(writes, 0);
   assert.equal(select.value, "latest");
-  await vm.runInContext("refresh()", view.context);
+  await run("refresh()", view.context);
   assert.equal(select.value, "latest");
 });
 
@@ -712,7 +722,7 @@ test("Database Usage shows independent physical databases and unknown allocation
         percent_of_limit: null, headroom_bytes: null, status: "unavailable" },
     ] }) };
   });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   const text = textOf(view.elements.get("usage-cards"));
   assert.match(text, /750\.00 MB/);
   assert.match(text, /75\.00% of 1,000 MB/);
@@ -734,7 +744,7 @@ test("Database Usage does not paint cards if the tab hides during the fetch", as
     await usage;
     return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1 }, percent_of_limit: 0, status: "normal" }], generated_at: 1 }) };
   });
-  const pending = vm.runInContext('selectView("usage")', view.context);
+  const pending = run('selectView("usage")', view.context);
   await started;
   view.context.document.visibilityState = "hidden";
   release();
@@ -750,9 +760,9 @@ test("Database Usage marks retained cards stale when refresh fails", async () =>
     if (fail) throw new Error("usage unavailable");
     return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 }, percent_of_limit: 0.1, status: "normal" }], generated_at: 1 }) };
   });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   fail = true;
-  await vm.runInContext('refreshUsage()', view.context);
+  await run('refreshUsage()', view.context);
   const text = textOf(view.elements.get("usage-cards"));
   assert.match(text, /Stale: the latest usage refresh failed/);
   assert.match(view.elements.get("usage-status").textContent, /usage unavailable/);
@@ -761,7 +771,7 @@ test("Database Usage marks retained cards stale when refresh fails", async () =>
 test("Administration usage polling does not fetch while the tab is hidden", async () => {
   const calls = [];
   const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   assert.deepEqual(calls, []);
 });
 
@@ -779,8 +789,8 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
     await usage;
     return { status: 200, ok: true, json: async () => ({ databases: [], generated_at: 1 }) };
   });
-  const first = vm.runInContext('selectView("usage")', view.context);
-  const second = vm.runInContext('refreshUsage()', view.context);
+  const first = run('selectView("usage")', view.context);
+  const second = run('refreshUsage()', view.context);
   await started;
   assert.equal(calls.filter((url) => url === "/api/database-usage").length, 1);
   release();
@@ -789,7 +799,7 @@ test("Database Usage coalesces overlapping visible refreshes", async () => {
 
 test("Database Usage renders disjoint physical groups and unknown guard status", () => {
   const view = page();
-  vm.runInContext(`authorized = true; activeView = "usage"; usageSnapshot = { databases: [${JSON.stringify({
+  run(`ui.set({ authorized: true, activeView: "usage", usageSnapshot: { databases: [${JSON.stringify({
     id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
     policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
     usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,
@@ -798,7 +808,7 @@ test("Database Usage renders disjoint physical groups and unknown guard status",
         index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } },
     capture: { status: "unknown", configured_retention_hours: 24 },
     application_admission: { bot_cross_process_guard: "unknown" },
-  })}] }; render();`, view.context);
+  })}] } });`, view.context);
   const content = textOf(view.elements.get("usage-cards"));
   for (const label of ["Snapshot table", "Moderation and evidence tables", "Configuration tables",
     "Operational tables", "Indexes", "Reusable pages", "System / unattributed",
@@ -815,14 +825,14 @@ test("schema upgrades expose the paired action and active pairs block independen
   api.candidate.result_schema = 17;
   api.candidate.upgrade = { guild_schema: 15 };
   render(view, api);
-  vm.runInContext(`snapshot.coordinated_upgrade_path = "/api/service-upgrade/recovery";
-    snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; render();`, view.context);
+  run(`ui.getSnapshot().snapshot.coordinated_upgrade_path = "/api/service-upgrade/recovery";
+    ui.getSnapshot().snapshot.compatibility.api = { installable: false, reason: "schema changes require pairing" }; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   const link = find(view.elements.get("update-cards"), item => item.localName === "a" && item.textContent.includes("together"));
   assert.ok(link?.href.endsWith("/api/service-upgrade/recovery"));
   assert.ok(find(view.elements.get("update-cards"), item => item.textContent.includes("both services will briefly stop")));
-  vm.runInContext(`snapshot.compatibility.api.installable = true;
-    snapshot.service_upgrade = { phase: "preparing", error: null }; render();`, view.context);
+  run(`ui.getSnapshot().snapshot.compatibility.api.installable = true;
+    ui.getSnapshot().snapshot.service_upgrade = { phase: "preparing", error: null }; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.equal(updateButton(view, "api").disabled, true);
   assert.equal(updateButton(view, "api", true).disabled, true);
 });
@@ -830,21 +840,21 @@ test("schema upgrades expose the paired action and active pairs block independen
 test("normal update explains a required launcher step and separates optional launcher updates", () => {
   const view = page();
   render(view, record());
-  vm.runInContext(`snapshot.launchers = { api: { state: "required_first", installable: false,
-    reason: "Update will install the required launcher first, then the application." } }; render();`, view.context);
+  run(`ui.getSnapshot().snapshot.launchers = { api: { state: "required_first", installable: false,
+    reason: "Update will install the required launcher first, then the application." } }; ui.set({ ...ui.getSnapshot() });`, view.context);
   const card = view.elements.get("update-cards");
   assert.match(textOf(card), /required launcher first/);
   assert.ok(find(card, (node) => node.localName === "button" && node.textContent === "Update"));
   const advanced = find(card, (node) => node.localName === "details" && textOf(node).includes("Advanced launcher controls"));
   assert.ok(advanced);
   assert.equal(find(advanced, (node) => node.localName === "button").disabled, true);
-  vm.runInContext(`snapshot.launchers.api = { state: "satisfied", installable: false,
-    reason: "Current launcher supports this application; no launcher update is required." }; render();`, view.context);
+  run(`ui.getSnapshot().snapshot.launchers.api = { state: "satisfied", installable: false,
+    reason: "Current launcher supports this application; no launcher update is required." }; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.match(textOf(card), /no launcher update is required/);
   assert.equal(find(advanced, (node) => node.localName === "button").disabled, true);
-  vm.runInContext(`snapshot.compatibility.api.installable = false;
-    snapshot.launchers.api = { state: "optional", installable: true,
-    reason: "Current launcher supports this application. A newer launcher is optional." }; render();`, view.context);
+  run(`ui.getSnapshot().snapshot.compatibility.api.installable = false;
+    ui.getSnapshot().snapshot.launchers.api = { state: "optional", installable: true,
+    reason: "Current launcher supports this application. A newer launcher is optional." }; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.equal(find(advanced, (node) => node.localName === "button").disabled, false,
     "launcher-only admission is independent of the bundled application's schema");
 });
@@ -859,11 +869,11 @@ test("late detail response must not replace a newer aggregate usage sample", asy
     if (url === "/api/database-usage/core") return new Promise(resolve => { resolveDetail = resolve; });
     return response({ databases: [database()], generated_at: NOW_SECONDS });
   });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
   await fire(detail, "click");
   allocated = 2000000;
-  await vm.runInContext('refreshUsage()', view.context);
+  await run('refreshUsage()', view.context);
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
@@ -883,9 +893,9 @@ test("successful details refresh clears stale flag for its own card", async () =
     if (fail) throw new Error("offline");
     return response({ databases: [database()], generated_at: NOW_SECONDS });
   });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   fail = true;
-  await vm.runInContext('refreshUsage()', view.context);
+  await run('refreshUsage()', view.context);
   assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
   const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
   await fire(detail, "click");
@@ -903,13 +913,13 @@ test("failed aggregate retains the last successful detail with a stale warning",
     if (fail) throw new Error("offline");
     return response({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 } }], generated_at: NOW_SECONDS });
   });
-  await vm.runInContext('selectView("usage")', view.context);
+  await run('selectView("usage")', view.context);
   await fire(find(view.elements.get("usage-cards"), el => el.localName === "button"), "click");
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
   fail = true;
-  await vm.runInContext('refreshUsage()', view.context);
+  await run('refreshUsage()', view.context);
   assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
   assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
 });

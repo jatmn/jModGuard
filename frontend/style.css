@@ -230,7 +230,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .rule-editor > .checkbox-group { padding: 16px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel2); gap: 24px; }
 .rule-editor > .field, .rule-editor > .form-row { margin-block: 24px; }
 .rule-editor .textarea { min-height: 10rem; line-height: 1.65; }
-.escalation-step { padding: 18px; margin: 12px 0; border: 1px solid var(--shell-border); border-radius: 10px; background: var(--panel2); }
+.escalation-step { --radius-box: 10px; padding: 18px; margin: 12px 0; border-color: var(--shell-border); background: var(--panel2); }
 .escalation-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
 .escalation-step .field { margin-bottom: 0; }
 .escalation-step > .field { margin-top: 16px; }

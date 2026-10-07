@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
-import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
+import React, { useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
 
 
 const bootDom = new JSDOM('<html><body></body></html>', {pretendToBeVisual: true});
@@ -15,8 +15,12 @@ const { createRoot: reactRoot } = await import('../tools/webui/node_modules/reac
 const { flushSync } = await import('../tools/webui/node_modules/react-dom/index.js');
 const { Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea } = await import('../tools/webui/components.js');
 import { afterEach, after } from 'node:test';
+const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
+const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replaceAll('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
-  .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nrender\(\);\ninit\(\);\n/, '\n');
+  .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
 after(() => bootDom.window.close());
 function activate(window) {
@@ -79,12 +83,12 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    React, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot,
+    React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${source}\n({state, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, restoreDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => dirty, resetDirty: () => { dirty = false; }, isBusy: () => busy, OwnerTools, BusyContext})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, apiRead, init, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, actionReconcileDelays, tabActions, tabBans, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, reloadAfter, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, imageTestConfigured, spamConfigured, editRule, editCommand, currentDrafts, captureDrafts, retainDrafts, ui, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, isPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => ui.getSnapshot().dirty, resetDirty: () => { ui.set({ dirty: false }); }, isBusy: () => ui.getSnapshot().busy, OwnerTools, BusyContext})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -102,21 +106,22 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   app.bindOwnerTools = () => mount(app.OwnerTools);
   for (const name of ['renderTab', 'navigate']) {
     const fn = app[name]; app[name] = (...args) => {
-      fixtureContent.remove(); vm.runInContext('view = "main-view";', context);
-      fn(...args);
+      fixtureContent.remove();
+      flushSync(() => { vm.runInContext('ui.set({ view: "main-view" });', context); fn(...args); });
       return document.querySelector('.modal-overlay');
     };
   }
   for (const name of ['editRule', 'editCommand']) {
     const fn = app[name]; app[name] = async (...args) => {
-      fixtureContent.remove(); vm.runInContext('view = "main-view";', context); fn(...args); await settle();
+      fixtureContent.remove();
+      flushSync(() => { vm.runInContext('ui.set({ view: "main-view" });', context); fn(...args); }); await settle();
       return document.querySelector('.modal-overlay');
     };
   }
   const nodes = { get: selector => document.querySelector(selector) };
   const collect = () => Array.from(document.querySelectorAll('#content *, .modal-overlay *, #owner-tools *, .test-panel *'));
   const elements = { find: predicate => collect().find(predicate), filter: predicate => collect().filter(predicate), some: predicate => collect().some(predicate), [Symbol.iterator]: function* () { yield* collect(); } };
-  vm.runInContext('render(); committedRevision = contentRevision;', context);
+  vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
   return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
 }
@@ -1104,13 +1109,14 @@ test('async actions block duplicate submissions and release after errors', async
   let reject;
   let calls = 0;
   const run = () => { calls++; return new Promise((_, fail) => { reject = fail; }); };
-  const pending = app.handleEvent({}, run, {});
+  const pending = app.handleEvent(run, {});
   assert.equal(app.isBusy(), true);
-  await app.handleEvent({}, run, {});
+  await app.handleEvent(run, {});
   assert.equal(calls, 1);
   reject(new Error('save refused'));
   await pending;
   assert.equal(app.isBusy(), false);
+  await settle();
   assert.equal(nodes.get('#toast').textContent, 'save refused');
 });
 
@@ -1179,15 +1185,16 @@ test('case-delete-role saves advance their revision token', async () => {
 
   const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
   const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
-  assert.equal(h.app.currentDrafts().length, 0, 'server-loaded roles must become the saved baseline');
+  assert.equal(Object.keys(h.app.currentDrafts()).length, 0, 'server-loaded roles must become the saved baseline');
   roleInput.value = '1, 2';
-  h.app.markDirty();
+  await fire(roleInput, 'input');
   await fire(saveRoles, 'click', {});
   assert.equal(h.app.isDirty(), false, 'an acknowledged role save must not remain unsaved');
   const prefix = h.elements.find(n => n.localName === 'input' && n.value === '!');
   prefix.value = '?';
-  h.app.markDirty();
+  await fire(prefix, 'input');
   roleInput.value = '2';
+  await fire(roleInput, 'input');
   await fire(saveRoles, 'click', {});
   assert.equal(h.app.isDirty(), true, 'an unrelated settings draft must remain dirty');
 
@@ -1333,9 +1340,10 @@ test('terminal log receipt repaints while retaining an unrelated row draft', asy
   h.app.renderTab();
   const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
   inputs[1].value = '555';
-  h.app.markDirty();
+  await fire(inputs[1], 'input');
 
   await h.app.reconcileQueuedLogChannel(pending);
+  await settle();
 
   const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
   assert.equal(renderedInputs[1].value, '555');
@@ -1545,6 +1553,7 @@ test('late case-delete-role load cannot overwrite an acknowledged save', async (
   const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
   const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
   roleInput.value = '2';
+  await fire(roleInput, 'input');
   await fire(saveRoles, 'click', {});
 
   resolveInitialRoles(response({ roles: ['1'], revision: 'revision-1' }));
@@ -1572,43 +1581,62 @@ test('settings do not expose historical chat-retention controls', () => {
   assert.ok(!elements.some(n => /retention|keep forever/i.test(n.textContent || '')));
 });
 
-test('partial settings actions preserve dirty sibling fields in the same card', () => {
+test('partial settings actions preserve dirty sibling fields in the same card', async () => {
   const h = settingsHarness();
-  const [prefix, nickname] = h.inputs;
-  prefix._initialValue = '!'; prefix.dataset.inputKey = '0'; prefix.value = '?';
-  nickname._initialValue = 'Guard'; nickname.dataset.inputKey = '1'; nickname.value = 'Draft nickname';
-  assert.deepEqual(JSON.parse(JSON.stringify(h.app.captureDrafts(h.save, [{current: prefix}]))), [{ key: '1', value: 'Draft nickname' }]);
-  assert.equal(h.app.captureDrafts(h.save, []).length, 2);
-  assert.equal(h.app.captureDrafts(h.save).length, 0);
+  h.app.renderTab();
+  const prefix = h.document.querySelector('input');
+  const nickname = h.document.querySelectorAll('input')[1];
+  prefix.value = '?'; await fire(prefix, 'input');
+  nickname.value = 'Draft nickname'; await fire(nickname, 'input');
+  const inherit = h.elements.find(n => n.localName === 'button' && n.textContent === 'Use global');
+  await fire(inherit, 'click');
+  assert.equal(h.document.querySelectorAll('input')[1].value, 'Draft nickname');
+  assert.equal(h.document.querySelector('input').value, '/');
+  assert.equal(h.app.isDirty(), true);
 });
 
-test('unrelated drafts survive the unavailable screen and restore after Retry', () => {
-  const { app, nodes } = harness();
-  const input = { value: 'Saved text', dataset: { inputKey: '0' } };
-  app.state.config = null;
-  app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Unsaved text' }]);
-  assert.equal(app.isDirty(), true);
-  app.restoreDrafts(); // Loading/error screen still has no input.
-  app.state.config = {};
-  nodes.get('#content').querySelector = () => input;
-  app.restoreDrafts();
-  assert.equal(input.value, 'Unsaved text');
-  assert.equal(app.isDirty(), true);
+function templateDraftHarness() {
+  let fail = true;
+  let membership = 'original';
+  const config = () => ({ enrollment_id: membership, templates: [
+    { event: 'join', name: 'Join', effective: 'Saved join', global: 'Saved join' },
+    { event: 'leave', name: 'Leave', effective: 'Saved leave', global: 'Saved leave' },
+  ] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config') && fail) throw new Error('offline');
+    if (url.endsWith('/config')) return response(config());
+    if (options.method === 'PUT') return response({});
+    return response({});
+  });
+  h.app.state.config = config(); h.app.state.tab = 'templates'; h.app.renderTab();
+  return { ...h, recover(next = 'original') { fail = false; membership = next; } };
+}
+
+test('unrelated drafts survive the unavailable screen and restore after Retry', async () => {
+  const h = templateDraftHarness();
+  const fields = h.document.querySelectorAll('textarea');
+  fields[1].value = 'Unsaved leave'; await fire(fields[1], 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.match(h.document.querySelector('#content').textContent, /Configuration unavailable/);
+  assert.equal(h.app.isDirty(), true);
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+  assert.match(h.document.querySelector('#content').textContent, /Configuration unavailable/);
+  h.recover();
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Unsaved leave');
+  assert.equal(h.app.isDirty(), true);
 });
 
-test('confirmed navigation clears pending drafts and prevents later replay', () => {
-  const { app, nodes } = harness();
-  const originalTab = app.state.tab;
-  app.state.config = null;
-  app.retainDrafts(app.state.guildId, originalTab, [{ key: '0', value: 'Old draft' }]);
-  app.navigate('settings');
-  app.state.tab = originalTab;
-  app.state.config = {};
-  const input = { value: 'Server value' };
-  nodes.get('#content').querySelector = () => input;
-  app.restoreDrafts();
-  assert.equal(input.value, 'Server value');
-  assert.equal(app.isDirty(), false);
+test('confirmed navigation clears pending drafts and prevents later replay', async () => {
+  const h = templateDraftHarness();
+  const draft = h.document.querySelectorAll('textarea')[1];
+  draft.value = 'Unsaved leave'; await fire(draft, 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  h.app.navigate('templates');
+  h.recover(); await h.app.loadConfig();
+  h.app.navigate('templates');
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Saved leave');
+  assert.equal(h.app.isDirty(), false);
 });
 
 for (const kind of ['rule', 'command']) {
@@ -1799,33 +1827,30 @@ test('configuration mutations retain the loaded membership without refreshing or
   }
 });
 
-test('drafts survive retries only within the captured bot membership', () => {
+test('drafts survive retries only within the captured bot membership', async () => {
   for (const next of ['original', 'replacement']) {
-    const { app, nodes } = harness();
-    const input = { value: 'Saved value' };
-    app.state.config = null;
-    app.retainDrafts(app.state.guildId, app.state.tab, [{ key: '0', value: 'Old draft' }], 'original');
-    app.state.config = { enrollment_id: next };
-    nodes.get('#content').querySelector = () => input;
-    app.restoreDrafts();
-    assert.equal(input.value, next === 'original' ? 'Old draft' : 'Saved value');
-    assert.equal(app.isDirty(), next === 'original');
+    const h = templateDraftHarness();
+    const draft = h.document.querySelectorAll('textarea')[1];
+    draft.value = 'Old draft'; await fire(draft, 'input');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+    h.recover(next);
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Retry'), 'click');
+    assert.equal(h.document.querySelectorAll('textarea')[1].value, next === 'original' ? 'Old draft' : 'Saved leave');
+    assert.equal(h.app.isDirty(), next === 'original');
   }
 });
 
 test('an async action cannot restore drafts into a replacement membership', async () => {
-  const { app, nodes } = harness();
-  app.state.config = { enrollment_id: 'original' };
-  const input = nodes.get('#content').ownerDocument.createElement('input');
-  input.value = 'Old draft'; input._initialValue = 'Saved'; input.dataset.inputKey = '0';
-  nodes.get('#content').querySelectorAll = () => [input];
-  nodes.get('#content').querySelector = () => input;
-  await app.handleEvent({ closest: () => ({ contains: () => false }), isConnected: false }, async () => {
-    app.state.config = { enrollment_id: 'replacement' };
-    input.value = 'New membership value';
+  const h = templateDraftHarness();
+  const input = h.document.querySelectorAll('textarea')[1];
+  input.value = 'Old draft'; await fire(input, 'input');
+  await h.app.handleEvent(async () => {
+    h.app.state.config = { ...h.app.state.config, enrollment_id: 'replacement' };
+    h.app.renderTab();
   }, {});
-  assert.equal(input.value, 'New membership value');
-  assert.equal(app.isDirty(), false);
+  await settle();
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Saved leave');
+  assert.equal(h.app.isDirty(), false);
 });
 
 test('copy captures source membership on selection and sends both page scopes', async () => {
@@ -1838,17 +1863,28 @@ test('copy captures source membership on selection and sends both page scopes', 
   });
   app.state.config = cfg;
   app.state.tab = 'settings';
-  app.tabSettings();
+  app.renderTab();
   const source = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.textContent === 'Select a source server'));
-  const copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
+  let copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
   source.value = app.state.guilds[1].id;
   await fire(copy, 'click', {});
   assert.equal(calls.filter((c) => c.url.endsWith('/copy')).length, 0, 'copy waits for an explicitly loaded source');
   await chooseOption(source, 'Second');
   assert.equal(calls.filter((c) => c.url.includes(app.state.guilds[1].id)).length, 1);
+  const section = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.value === 'all'));
+  section.value = 'settings'; await fire(section, 'change');
+  const prefix = elements.find(n => n.localName === 'input' && n.value === '!');
+  prefix.value = '?'; await fire(prefix, 'input');
+  await fire(elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  const restoredSource = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.textContent === 'Select a source server'));
+  const restoredSection = elements.find(n => n.localName === 'select' && Array.from(n.options).some(option => option.value === 'all'));
+  assert.equal(restoredSource.value, app.state.guilds[1].id);
+  assert.equal(restoredSection.value, 'settings', 'unrelated save must not broaden the selected copy scope');
+  copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
   await fire(copy, 'click', {});
   const sent = calls.find(c => c.opts.method === 'POST' && c.url.endsWith('/copy'));
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
+  assert.deepEqual(JSON.parse(sent.opts.body).sections, ['settings']);
   assert.equal(sent.opts.headers['x-jmodguard-enrollment'], 'destination');
   assert.equal(calls.filter(c => c.url.includes('987654321098765433')).length, 1, 'copy must not refresh the selected source token');
 });
@@ -2531,6 +2567,7 @@ test('unauthenticated log-channel mutation returns to login', async () => {
   }));
   const err = Object.assign(new Error('not authenticated'), { status: 400 });
   assert.equal(h.app.handleAuthLoss(err), true);
+  await settle();
   assert.equal(h.nodes.get('#login-view').classList.contains('hidden'), false);
 });
 
@@ -2745,7 +2782,7 @@ test('field labels exclude control values and command steps have individual iden
 test('appearance retains the session choice across startup and workspace when storage is blocked', async () => {
   const blocked = {get() { throw new Error('blocked'); }, set() { throw new Error('blocked'); }};
   const h = harness(undefined, blocked);
-  const picker = h.document.querySelector('.theme-select');
+  const picker = h.document.querySelector('select[aria-label="Appearance"]');
   picker.value = 'dark';
   await fire(picker, 'change');
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
@@ -2753,6 +2790,6 @@ test('appearance retains the session choice across startup and workspace when st
   h.app.navigate('templates');
   await settle();
   assert.equal(picker.isConnected, false);
-  assert.equal(h.document.querySelector('.theme-select').value, 'dark');
+  assert.equal(h.document.querySelector('select[aria-label="Appearance"]').value, 'dark');
   assert.equal(h.document.documentElement.dataset.theme, 'dark');
 });

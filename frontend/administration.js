@@ -1,32 +1,37 @@
+import { createState, useStore } from "./state.js";
+import { Appearance, useAppearance } from "./appearance.js";
 /* Owner Administration. React owns rendering; the API remains authoritative. */
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 const h = React.createElement;
+const ui = createState({
+  activeView: "updates",
+  snapshot: null,
+  usageSnapshot: null,
+  usageStale: false,
+  usageRevision: 0,
+  usageMessage: "Waiting to load usage…",
+  status: { message: "Checking your access and release state…", tone: "neutral" },
+  busy: false,
+  stale: true,
+  authorized: false,
+  accessDenied: false,
+  needsSignIn: false,
+  actionMessage: "",
+  policyRevision: 0
+});
 const root = createRoot(document.getElementById("content"));
-let activeView = "updates";
-let snapshot = null;
-let usageSnapshot = null;
-let usageStale = false;
-let usageRevision = 0;
-let usageMessage = "Waiting to load usage…";
-let status = { message: "Checking your access and release state…", tone: "neutral" };
+
 let refreshing = null;
 let usageRefreshPromise = null;
 const detailRequests = new Map();
-let busy = false;
-let stale = true;
-let authorized = false;
-let accessDenied = false;
-let needsSignIn = false;
+
 let rateLimitUntil = 0;
 let refreshTimer;
-let actionMessage = "";
-let policyRevision = 0;
 
-function render() { root.render(h(Administration)); }
-function notice(message, tone = "neutral") { status = { message, tone }; render(); }
-function restorePolicySelections() { policyRevision++; }
+function notice(message, tone = "neutral") { ui.set({ status: { message, tone } }); }
+function restorePolicySelections() { ui.set({ policyRevision: ui.getSnapshot().policyRevision + 1 }); }
 function applicationPending(record) {
   // A launcher failure changes the shared state but leaves a service request active.
   // Failed WebUI publications intentionally retain desired for recovery, not retry.
@@ -45,12 +50,12 @@ function nextRefreshDelay(normal) {
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  if (accessDenied || document.visibilityState === "hidden") return;
-  if (activeView === "usage") {
+  if (ui.getSnapshot().accessDenied || document.visibilityState === "hidden") return;
+  if (ui.getSnapshot().activeView === "usage") {
     refreshTimer = setTimeout(() => refreshUsage(), nextRefreshDelay(60000));
     return;
   }
-  refreshTimer = setTimeout(() => refresh(), nextRefreshDelay(snapshot?.components.some(pending) ? 2000 : 30000));
+  refreshTimer = setTimeout(() => refresh(), nextRefreshDelay(ui.getSnapshot().snapshot?.components.some(pending) ? 2000 : 30000));
 }
 
 function retryWaitMs(response) {
@@ -79,20 +84,15 @@ async function request(path, body) {
   }
   if (response.status === 401 || (path === "/api/me" && response.status === 400) ||
       (response.status === 400 && ["not authenticated", "session expired"].includes(value.error))) {
-    authorized = false;
-    accessDenied = true;
-    stale = true;
+    ui.set({ authorized: false, accessDenied: true, stale: true });
     clearTimeout(refreshTimer);
-    needsSignIn = true;
-    render();
+    ui.set({ needsSignIn: true });
+
     throw new Error("Sign in again to manage updates.");
   }
   if (response.status === 403) {
-    authorized = false;
-    accessDenied = true;
-    stale = true;
+    ui.set({ authorized: false, accessDenied: true, stale: true });
     clearTimeout(refreshTimer);
-    render();
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
   rateLimitUntil = 0;
@@ -125,51 +125,50 @@ function line(items, label, value) {
 }
 
 async function mutate(record, label, callback) {
-  if (busy || stale || !authorized) return;
-  busy = true;
+  if (ui.getSnapshot().busy || ui.getSnapshot().stale || !ui.getSnapshot().authorized) return;
+  ui.set({ busy: true });
   clearTimeout(refreshTimer);
   // Finish any older read before submitting; it must never overwrite the result.
   if (refreshing) await refreshing;
-  if (!authorized || stale) { busy = false; restorePolicySelections(); render(); scheduleRefresh(); return; }
-  actionMessage = `${record.component.toUpperCase()}: ${label}…`;
-  notice(actionMessage);
-  render();
+  if (!ui.getSnapshot().authorized || ui.getSnapshot().stale) { ui.set({ busy: false }); restorePolicySelections(); scheduleRefresh(); return; }
+  ui.set({ actionMessage: `${record.component.toUpperCase()}: ${label}…` });
+  notice(ui.getSnapshot().actionMessage);
+
   try {
     const result = await callback();
     if (result.components) {
-      snapshot = result;
-      stale = false;
+      ui.set({ snapshot: result, stale: false });
     } else {
       await refresh();
     }
     // The queued acknowledgement is not progress. Say we are waiting only when
     // the snapshot just read still has that component's work pending.
-    const current = snapshot?.components?.find((item) => item.component === record.component);
+    const current = ui.getSnapshot().snapshot?.components?.find((item) => item.component === record.component);
     const name = record.component.toUpperCase();
-    actionMessage = result.queued
+    ui.set({ actionMessage: result.queued
       ? current && pending(current)
         ? `${name}: update request accepted. Waiting for the component to report its result.`
         : `${name}: update request accepted.`
-      : `${name}: ${label} completed.`;
-    if (!stale) notice(actionMessage, "good");
+      : `${name}: ${label} completed.` });
+    if (!ui.getSnapshot().stale) notice(ui.getSnapshot().actionMessage, "good");
   } catch (error) {
     const message = `${record.component.toUpperCase()}: ${error.message}`;
     // A failed check may have persisted an error; show that state too.
-    if (authorized) await refresh();
-    actionMessage = message;
+    if (ui.getSnapshot().authorized) await refresh();
+    ui.set({ actionMessage: message });
     notice(message, "bad");
   } finally {
-    busy = false;
+    ui.set({ busy: false });
     restorePolicySelections();
-    render();
+
     scheduleRefresh();
   }
 }
 
 function action(label, component, callback, props = {}) {
   return h("button", { type: "button", className: "btn btn-sm", ...props,
-    onClick: () => mutate(snapshot.components.find(item => item.component === component), label,
-      () => callback(snapshot.components.find(item => item.component === component))) }, label);
+    onClick: () => mutate(ui.getSnapshot().snapshot.components.find(item => item.component === component), label,
+      () => callback(ui.getSnapshot().snapshot.components.find(item => item.component === component))) }, label);
 }
 
 function badge(text, tone, icon) {
@@ -188,7 +187,7 @@ function ComponentCard({ record, revision }) {
   const content = [], details = [], heading = [];
   const fresh = record.observed_at && Date.now() / 1000 - record.observed_at < 7200 && record.state !== "drift";
   const observed = fresh ? record.observed : null;
-  line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? snapshot.base_image_sha : "unknown"));
+  line(details, "Base image build SHA", observed?.base_image_sha || (record.component === "api" ? ui.getSnapshot().snapshot.base_image_sha : "unknown"));
   line(details, record.component === "webui" ? "Storage-observed SHA" : "Running executable SHA", observed?.source_sha || "unknown");
   line(details, "Verified running file SHA-256", observed?.executable_sha256 || "unknown");
   line(content, "Uptime", uptime(observed?.started_at));
@@ -200,18 +199,18 @@ function ComponentCard({ record, revision }) {
   line(content, "Available release", candidateCurrent ? (/^[a-f0-9]{40}$/.test(releaseLabel) ? releaseLabel.slice(0, 12) : releaseLabel) : "Check now to confirm this channel");
   line(details, "Available release", candidateCurrent ? releaseText(record.candidate) : "No current candidate");
   if (webuiRepacked) line(content, "Release warning", "This WebUI source SHA has a different image digest; file bytes may differ, so publish a new source commit");
-  const compatibility = snapshot.compatibility?.[record.component];
-  const launcher = snapshot.launchers?.[record.component];
+  const compatibility = ui.getSnapshot().snapshot.compatibility?.[record.component];
+  const launcher = ui.getSnapshot().snapshot.launchers?.[record.component];
   if (record.component !== "webui") {
     line(content, "Launcher requirement", candidateCurrent ? launcher?.reason || "Check with a launcher-aware API to determine this release's requirement." : "Check now to determine the release requirement.");
     if (launcher?.running != null) line(details, "Launcher capability", `${launcher.running} running; ${launcher.minimum} required; ${launcher.available} included in release`);
   }
-  if (record.component !== "webui" && snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
+  if (record.component !== "webui" && ui.getSnapshot().snapshot.coordinated_upgrade_path === "/api/service-upgrade/recovery") {
     const target = record.candidate;
     const changesSchema = target && observed && (target.result_schema !== observed.max_schema ||
     target.upgrade?.guild_schema !== observed.guild_schema);
     if (changesSchema) line(content, "Required action", "This release changes the database. Update bot and API together; both services will briefly stop.");
-    if (snapshot.service_upgrade) line(content, "Paired upgrade", snapshot.service_upgrade.error || snapshot.service_upgrade.phase);
+    if (ui.getSnapshot().snapshot.service_upgrade) line(content, "Paired upgrade", ui.getSnapshot().snapshot.service_upgrade.error || ui.getSnapshot().snapshot.service_upgrade.phase);
     content.push(h("a", { key: "paired-upgrade", href: `${apiBase()}/api/service-upgrade/recovery` }, "Update bot and API together / recovery"));
   }
 
@@ -231,9 +230,9 @@ function ComponentCard({ record, revision }) {
   }
   const inProgress = pending(record);
   const problem = record.check_error || record.last_error || record.state === "failed" || record.state === "drift";
-  heading.push(badge(stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
-    stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
-    stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
+  heading.push(badge(ui.getSnapshot().stale ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
+    ui.getSnapshot().stale || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
+    ui.getSnapshot().stale || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
   line(content, "Availability", availability);
   if (record.desired_launcher && record.desired_launcher.digest !== record.installed_launcher?.digest) {
     line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
@@ -241,12 +240,12 @@ function ComponentCard({ record, revision }) {
   line(content, "Update state", record.check_error ? `Check failed: ${record.check_error}` : record.last_error ? record.state === "drift" ? `Storage drift: ${record.last_error}` : `Install failed: ${record.last_error}` : record.state);
   line(details, "Launcher release", record.installed_launcher ? releaseText(record.installed_launcher) : "baked into base image");
   line(details, "Launcher SHA-256", record.launcher_sha256 || "unknown");
-  const pairActive = snapshot.service_upgrade && !["complete", "aborted"].includes(snapshot.service_upgrade.phase);
-  const canApply = !pairActive && snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
+  const pairActive = ui.getSnapshot().snapshot.service_upgrade && !["complete", "aborted"].includes(ui.getSnapshot().snapshot.service_upgrade.phase);
+  const canApply = !pairActive && ui.getSnapshot().snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? ui.getSnapshot().snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
   const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
   const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
-  const help = !snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
-    : record.component === "webui" ? !snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
+  const help = !ui.getSnapshot().snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
+    : record.component === "webui" ? !ui.getSnapshot().snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
     : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";
   return h("section", { className: "card bg-base-100 administration-card" },
     h("div", { className: "card-body" },
@@ -257,24 +256,24 @@ function ComponentCard({ record, revision }) {
       h("details", { className: "administration-technical" }, h("summary", null, "Version & technical details"), h("div", null, details)),
       h("p", { className: "muted administration-help", hidden: !help }, help),
       h("div", { className: "card-actions administration-actions" },
-        action("Check now", record.component, item => request("/api/updates/check", { component: item.component }), { disabled: busy || stale }),
+        action("Check now", record.component, item => request("/api/updates/check", { component: item.component }), { disabled: ui.getSnapshot().busy || ui.getSnapshot().stale }),
         action(record.component === "webui" ? "Update WebUI" : "Update", record.component,
           item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest }),
-          { hidden: !record.candidate, disabled: busy || stale || !canApply || applicationCurrent || candidatePending }),
+          { hidden: !record.candidate, disabled: ui.getSnapshot().busy || ui.getSnapshot().stale || !canApply || applicationCurrent || candidatePending }),
         record.component !== "webui" && h("details", { className: "administration-technical" },
           h("summary", null, "Advanced launcher controls"),
           h("p", null, "The launcher starts and recovers this service. Normal Update includes any required launcher update first. Use this control only for an optional launcher update. It restarts the service."),
           action("Update launcher", record.component,
             item => request("/api/updates/install", { component: item.component, digest: item.candidate.digest, launcher: true }),
-            { hidden: !record.candidate, disabled: busy || stale || pairActive || !snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
-      h("fieldset", { className: "fieldset administration-policy", disabled: busy || stale },
+            { hidden: !record.candidate, disabled: ui.getSnapshot().busy || ui.getSnapshot().stale || pairActive || !ui.getSnapshot().snapshot.apply_enabled || !candidateCurrent || !launcher?.installable || record.desired_launcher?.digest === record.candidate?.digest || record.installed_launcher?.digest === record.candidate?.digest }))),
+      h("fieldset", { className: "fieldset administration-policy", disabled: ui.getSnapshot().busy || ui.getSnapshot().stale },
         h("legend", { className: "fieldset-legend" }, "Release policy"),
         h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Release channel"),
           h("select", { className: "select select-sm", "aria-label": `${record.component} release channel`, value: channel,
             onChange: event => {
               const value = event.target.value; setChannel(value);
               return mutate(record, "Save release channel", () => {
-                const item = snapshot.components.find(item => item.component === record.component);
+                const item = ui.getSnapshot().snapshot.components.find(item => item.component === record.component);
                 return request("/api/updates/policy", { component: item.component, channel: value, cadence: value === "latest" ? "off" : item.cadence });
               });
             } }, ...["latest", "stable", "nightly"].map(value => h("option", { key: value, value }, value === "latest" ? "Latest published build" : value === "stable" ? "Stable releases" : "Nightly releases")))),
@@ -283,42 +282,37 @@ function ComponentCard({ record, revision }) {
             onChange: event => {
               const value = event.target.value; setCadence(value);
               return mutate(record, "Save automatic installation", () => {
-                const item = snapshot.components.find(item => item.component === record.component);
+                const item = ui.getSnapshot().snapshot.components.find(item => item.component === record.component);
                 return request("/api/updates/policy", { component: item.component, channel: item.channel, cadence: value });
               });
             } }, ...["off", "daily", "weekly", "monthly"].map(value => h("option", { key: value, value,
-              disabled: value !== "off" && (!snapshot.unattended_enabled || record.channel === "latest") }, value === "off" ? "Automatic install off" : value)))))));
+              disabled: value !== "off" && (!ui.getSnapshot().snapshot.unattended_enabled || record.channel === "latest") }, value === "off" ? "Automatic install off" : value)))))));
 }
 
 function refresh() {
-  if (activeView !== "updates" || document.visibilityState === "hidden") return;
+  if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
   if (refreshing) return refreshing;
   clearTimeout(refreshTimer);
-  render();
+
   refreshing = (async () => {
     try {
-      snapshot = await request("/api/updates", {});
-      if (activeView !== "updates" || document.visibilityState === "hidden") return;
-      authorized = true;
-      accessDenied = false;
-      if (!busy) actionMessage = "";
-      stale = false;
-      needsSignIn = false;
-      notice(actionMessage || "Status refreshed. Release availability reflects the last successful release check.");
-      render();
+      ui.set({ snapshot: await request("/api/updates", {}) });
+      if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
+      ui.set({ authorized: true, accessDenied: false });
+      if (!ui.getSnapshot().busy) ui.set({ actionMessage: "" });
+      ui.set({ stale: false, needsSignIn: false });
+      notice(ui.getSnapshot().actionMessage || "Status refreshed. Release availability reflects the last successful release check.");
     } catch (error) {
-      stale = true;
+      ui.set({ stale: true });
       notice(`Status could not be refreshed: ${error.message}`, "bad");
-      render();
     } finally {
       refreshing = null;
-      render();
-      if (!busy) scheduleRefresh();
+
+      if (!ui.getSnapshot().busy) scheduleRefresh();
     }
   })();
   return refreshing;
 }
-
 
 function decimalMB(value) {
   return value == null ? "unavailable" : `${(value / 1000000).toFixed(2)} MB`;
@@ -422,27 +416,22 @@ function UsageCard({ database: initial, stale, revision }) {
             pending.finally(() => detailRequests.delete(database.id)).catch(() => {});
           }
           const updated = await pending;
-          if (revision === usageRevision && activeView === "usage" && authorized) setDetail({ database: updated, revision, source: initial });
+          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && ui.getSnapshot().authorized) setDetail({ database: updated, revision, source: initial });
         } catch (error) {
-          if (revision === usageRevision && activeView === "usage" && authorized) { usageMessage = error.message; render(); }
+          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && ui.getSnapshot().authorized) { ui.set({ usageMessage: error.message }); }
         }
         finally { setLoading(false); }
       } }, "Show current breakdown")));
 }
 
 async function doRefreshUsage() {
-  if (activeView !== "usage" || document.visibilityState === "hidden") return;
+  if (ui.getSnapshot().activeView !== "usage" || document.visibilityState === "hidden") return;
   try {
     const next = await request("/api/database-usage", {});
-    if (activeView !== "usage" || document.visibilityState === "hidden") return;
-    needsSignIn = false;
-    authorized = true;
-    accessDenied = false;
-    usageSnapshot = next;
-    usageStale = false;
-    usageMessage = `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.`;
-  } catch (error) { usageMessage = error.message; usageStale = true; }
-  finally { usageRevision++; render(); scheduleRefresh(); }
+    if (ui.getSnapshot().activeView !== "usage" || document.visibilityState === "hidden") return;
+    ui.set({ needsSignIn: false, authorized: true, accessDenied: false, usageSnapshot: next, usageStale: false, usageMessage: `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.` });
+  } catch (error) { ui.set({ usageMessage: error.message }); ui.set({ usageStale: true }); }
+  finally { ui.set({ usageRevision: ui.getSnapshot().usageRevision + 1 }); scheduleRefresh(); }
 }
 
 function refreshUsage() {
@@ -453,41 +442,23 @@ function refreshUsage() {
 }
 
 function selectView(view) {
-  activeView = view;
+  ui.set({ activeView: view });
   clearTimeout(refreshTimer);
-  if (view === "usage") usageSnapshot = null;
-  render();
+  if (view === "usage") ui.set({ usageSnapshot: null });
+
   return view === "usage" ? refreshUsage() : refresh();
 }
 
-function Appearance() {
-  const [preference, setPreference] = useState(() => {
-    try { return window.localStorage.getItem("jmodguard.theme") || "system"; } catch (_) { return "system"; }
-  });
-  useEffect(() => {
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => {
-      const dark = preference === "dark" || (preference !== "light" && media.matches);
-      document.documentElement.dataset.theme = dark ? "dark" : "light";
-      document.querySelector('meta[name="theme-color"]').content = dark ? "#101e33" : "#e0eeff";
-    };
-    apply(); media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
-  }, [preference]);
-  return h("label", { className: "theme-picker" }, "Appearance ",
-    h("select", { id: "appearance", className: "select select-sm", "aria-label": "Appearance", value: preference,
-      onChange: event => { const value = event.target.value; setPreference(value); try { window.localStorage.setItem("jmodguard.theme", value); } catch (_) {} } },
-      ...["system", "light", "dark"].map(value => h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)))));
-}
-
 function Administration() {
+  const appearance = useAppearance();
+  const display = useStore(ui);
   useEffect(() => {
-    const visible = () => { if (document.visibilityState !== "hidden") { if (activeView === "usage") refreshUsage(); else refresh(); } };
+    const visible = () => { if (document.visibilityState !== "hidden") { if (ui.getSnapshot().activeView === "usage") refreshUsage(); else refresh(); } };
     document.addEventListener("visibilitychange", visible);
     return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
   }, []);
   const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
-  const installedWeb = snapshot?.components.find(item => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
+  const installedWeb = display.snapshot?.components.find(item => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
   const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;
   const details = [];
   line(details, "Loaded WebUI SHA", loaded); line(details, "Storage-observed SHA", installedWeb);
@@ -495,28 +466,28 @@ function Administration() {
   const login = base ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}` : "/login?return_to=%2Fadministration%2Findex.html";
   return h(React.Fragment, null,
     h("header", { className: "administration-header" },
-      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, activeView === "usage" ? "Database Usage" : "Updates")),
-      h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: busy,
-        onClick: () => { if (!busy) { actionMessage = ""; return refresh(); } } }, "↻ Refresh status"), h(Appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
-    h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[status.tone]}`, role: "status", "aria-live": "polite" }, status.message),
-    h("div", { id: "sign-in", className: needsSignIn ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
+      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : "Updates")),
+      h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: display.busy,
+        onClick: () => { if (!ui.getSnapshot().busy) { ui.set({ actionMessage: "" }); return refresh(); } } }, "↻ Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
+    h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
+    h("div", { id: "sign-in", className: display.needsSignIn ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
-      h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
-      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage")),
-    h("div", { id: "updates", className: authorized && !accessDenied && activeView === "updates" ? "" : "hidden" },
+      h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
+      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage")),
+    h("div", { id: "updates", className: display.authorized && !display.accessDenied && display.activeView === "updates" ? "" : "hidden" },
       h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
-      h("p", { id: "automatic-state", className: "muted" }, snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
-      h("div", { id: "browser-version", className: "administration-browser" }, snapshot && h(React.Fragment, null,
+      h("p", { id: "automatic-state", className: "muted" }, display.snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
+      h("div", { id: "browser-version", className: "administration-browser" }, display.snapshot && h(React.Fragment, null,
         h("details", null, h("summary", null, "Browser version"), h("div", null, details)),
         differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"),
-        differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: busy, onClick: () => window.location.reload() }, "Reload page"))),
-      h("div", { id: "update-cards", className: "administration-grid" }, snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: policyRevision })))),
-    h("section", { id: "database-usage", className: authorized && !accessDenied && activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
+        differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: display.busy, onClick: () => window.location.reload() }, "Reload page"))),
+      h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision })))),
+    h("section", { id: "database-usage", className: display.authorized && !display.accessDenied && display.activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
       h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
-      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${usageStale ? "alert-warning" : ""}`, role: "status" }, usageMessage),
+      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${display.usageStale ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),
       h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
-      h("div", { id: "usage-cards", className: "administration-grid" }, usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: usageStale, revision: usageRevision })))));
+      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: ui.getSnapshot().usageStale, revision: ui.getSnapshot().usageRevision })))));
 }
 
-render();
+root.render(h(Administration));
 refresh();

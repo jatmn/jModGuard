@@ -75,9 +75,15 @@ contribution for auditing; it is not published. Generated JS/CSS and library
 licenses share the existing assets. Browsers fetch no external module server
 or stylesheet, and no generated bundle is committed.
 The old `JMODGUARD_ESM_BASE` and `JMODGUARD_DAISYUI_HREF` overrides are retired.
-Both pages use React throughout; there is no parallel vanilla renderer. Native
-form values participate in the existing application-specific draft and save
-rules. API permissions, membership fencing, queued receipts and moderation
+Both pages use React throughout; there is no parallel vanilla renderer. React's `useSyncExternalStore` subscribes the two roots to immutable UI
+status snapshots from the existing API controllers. Each root mounts once;
+controllers update state instead of calling `root.render` after each change.
+Synchronous controller guards still prevent duplicate submissions between awaits.
+Configuration drafts use controlled React inputs keyed by record and field,
+with React context identifying each save group. Partial saves retain sibling
+edits without scanning DOM inputs, assigning positional IDs or replaying events.
+Retry retains the captured guild, tab and membership; navigation discards drafts.
+The shared appearance hook retains the session preference even without storage. API permissions, membership fencing, queued receipts and moderation
 policy remain application logic. Headless UI owns dialog focus restoration,
 Escape/outside dismissal and field label associations. Selects use native browser
 menus and keyboard selection, styled by daisyUI; inline text filtering is removed.
@@ -91,7 +97,7 @@ absence from browser output is checked by the packaged dependency tests.
 
 Status messages use daisyUI alert variants; toast positioning and field labels
 use the toast and fieldset sheets. Setup actions and command-step panels reuse
-button/card foundations, with only the existing palette and geometry adjustments.
+button/card foundations (including rule escalation panels), with only the existing palette and geometry adjustments.
 Obsolete `*-bordered` and unavailable shadow utility classes are omitted.
 Pale blue light and navy dark colors stay the existing theme tokens.
 Buttons, cards, hero, stats, badges, tables, inputs, and selects

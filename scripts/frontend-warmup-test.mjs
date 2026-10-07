@@ -11,7 +11,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // behavior is covered separately with real React/DOM and browser checks.
 const appSource = fs.readFileSync(path.join(root, "frontend/app.js"), "utf8");
 const src = appSource.slice(appSource.indexOf("let state ="))
-  .replace(/\ncapturePreviewToken\(\);\nrender\(\);\ninit\(\);\n/, "\n");
+  .replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, "\n");
 
 function loadFrontend(fetchImpl, clock, timers) {
   const document = {

@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
+import { createState, useStore } from "./state.js";
+import { Appearance, useAppearance } from "./appearance.js";
+import React, { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Dialog,
@@ -11,77 +13,61 @@ import {
 } from "../tools/webui/components.js";
 
 const h = React.createElement;
-const $ = (selector) => document.querySelector(selector);
 const BusyContext = createContext(false);
+const ui = createState({
+  view: "startup-view",
+  startupStatus: "Waiting for the API to finish starting…",
+  previewUnavailable: false,
+  contentRevision: 0,
+  editor: null,
+  notification: null,
+  busy: false,
+  dirty: false,
+  copySource: null,
+  drafts: {},
+  pendingDrafts: null
+});
 const root = createRoot(document.getElementById("app"));
-let view = "startup-view",
-  startupStatus = "Waiting for the API to finish starting…",
-  previewUnavailable = false;
-let committedRevision = -1;
-let contentRevision = 0,
-  editor = null,
-  notification = null,
-  toastTimer;
-function render() {
-  root.render(h(App));
-}
+
+let toastTimer;
 
 // The shared busy policy belongs to the application; React owns the controls.
-function ActionButton({ onClick, savedInputs, disabled, ...props }) {
+const DraftGroup = createContext(null);
+function DraftCard({ group, children, ...props }) {
+  return h(DraftGroup.Provider, { value: group }, h("div", props, children));
+}
+function ActionButton({ onClick, savedFields, disabled, ...props }) {
   const working = useContext(BusyContext);
+  const group = useContext(DraftGroup);
   return h("button", {
     ...props,
     disabled: working || disabled,
-    onClick: onClick && ((event) => handleEvent(event.currentTarget, onClick, event, savedInputs)),
+    onClick: onClick && ((event) => handleEvent(onClick, event, savedFields, group)),
   });
 }
-function Input(props) {
+function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
+  const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
-  return h(HeadlessInput, { ...props, disabled: working || props.disabled });
+  const { drafts } = useStore(ui);
+  if (!draftKey) return { ...props, defaultValue, onChange, disabled: working || props.disabled };
+  const baseline = String(defaultValue ?? "");
+  return {
+    ...props,
+    value: drafts[draftKey]?.value ?? baseline,
+    disabled: working || props.disabled,
+    onChange: event => {
+      const value = event.target.value;
+      const next = { ...ui.getSnapshot().drafts };
+      if (value === baseline) delete next[draftKey];
+      else next[draftKey] = { value, group };
+      ui.set({ drafts: next, dirty: Object.keys(next).length > 0 });
+      onChange?.(event);
+    },
+  };
 }
-function Textarea(props) {
-  const working = useContext(BusyContext);
-  return h(HeadlessTextarea, { ...props, disabled: working || props.disabled });
-}
-function Select({ className = "", children, ...props }) {
-  const working = useContext(BusyContext);
-  return h(HeadlessSelect, { ...props, disabled: working || props.disabled, className }, children);
-}
-function Appearance({ preference, setPreference }) {
-  useEffect(() => {
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => {
-      const theme = preference === "system" ? (media.matches ? "dark" : "light") : preference;
-      document.documentElement.dataset.theme = theme;
-      document.querySelector('meta[name="theme-color"]').content = theme === "dark" ? "#101e33" : "#e0eeff";
-    };
-    apply();
-    media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
-  }, [preference]);
-  return h(
-    "label",
-    { className: "theme-picker" },
-    "Appearance ",
-    h(
-      "select",
-      {
-        className: "theme-select select select-sm",
-        "aria-label": "Appearance",
-        value: preference,
-        onChange: (event) => {
-          setPreference(event.target.value);
-          try {
-            window.localStorage.setItem("jmodguard.theme", event.target.value);
-          } catch (_) {}
-        },
-      },
-      ...["system", "light", "dark"].map((value) =>
-        h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)),
-      ),
-    ),
-  );
-}
+function Input(props) { return h(HeadlessInput, useDraftControl(props)); }
+function Textarea(props) { return h(HeadlessTextarea, useDraftControl(props)); }
+function Select(props) { return h(HeadlessSelect, useDraftControl(props)); }
 function OwnerTools() {
   const profile = useRef(null);
   if (isPreview())
@@ -137,17 +123,12 @@ function OwnerTools() {
   );
 }
 function App() {
-  const [preference, setPreference] = useState(() => {
-    let value;
-    try {
-      value = window.localStorage.getItem("jmodguard.theme");
-    } catch (_) {}
-    return ["system", "light", "dark"].includes(value) ? value : "system";
-  });
+  const appearance = useAppearance();
+  const display = useStore(ui);
 
   useEffect(() => {
     const beforeUnload = (event) => {
-      if (dirty || busy) {
+      if (ui.getSnapshot().dirty || ui.getSnapshot().busy) {
         event.preventDefault();
         event.returnValue = "";
       }
@@ -171,14 +152,14 @@ function App() {
   ];
   return h(
     BusyContext.Provider,
-    { value: busy },
+    { value: display.busy },
     isPreview() &&
       h(
         "div",
         { id: "preview-banner", className: "preview-banner alert alert-warning", role: "status" },
         "Preview — changes disabled",
       ),
-    view === "main-view"
+    display.view === "main-view"
       ? h(
           "div",
           { id: "main-view" },
@@ -204,11 +185,11 @@ function App() {
                   value: state.guildId || "",
                   onChange: async (event) => {
                     if (!canLeave()) return;
-                    pendingDrafts = null;
+                    ui.set({ pendingDrafts: null, drafts: {}, copySource: null });
                     pendingCase = null;
                     state.guildId = event.target.value;
                     state.config = null;
-                    dirty = false;
+                    ui.set({ dirty: false });
                     persistWorkspace();
                     if (await loadConfig()) renderTab();
                   },
@@ -253,7 +234,7 @@ function App() {
             h(
               "div",
               { className: "sidebar-footer" },
-              h(Appearance, { preference, setPreference }),
+              h(Appearance, appearance),
               h(
                 "div",
                 { className: "sidebar-user" },
@@ -287,17 +268,17 @@ function App() {
                 { id: "workspace-status" },
                 isPreview()
                   ? "Preview — changes disabled"
-                  : busy
+                  : display.busy
                     ? "Working…"
-                    : dirty
+                    : display.dirty
                       ? "Unsaved changes"
                       : "Changes saved with each action",
               ),
             ),
             h(
               "main",
-              { id: "content", tabIndex: -1, onInput: trackDraft },
-              h(Content, { key: contentRevision }),
+              { id: "content", tabIndex: -1, onChange: trackDraft },
+              h(Content, { key: display.contentRevision }),
             ),
             h(
               "footer",
@@ -309,21 +290,21 @@ function App() {
         )
       : h(
           "div",
-          { id: view, className: "welcome-view" },
-          h(Appearance, { preference, setPreference }),
+          { id: display.view, className: "welcome-view" },
+          h(Appearance, appearance),
           h(
             "div",
             { className: "login-card card bg-base-100" },
             h(
               "div",
-              { className: "card-body items-center text-center" },
+              { className: "card-body" },
               h("span", { className: "brand-mark", "aria-hidden": true }, "jG"),
               h(
                 "p",
                 { className: "eyebrow" },
-                view === "login-view" ? "JMODGUARD / MODERATION WORKSPACE" : "YOUR COMMUNITY, IN GOOD HANDS",
+                display.view === "login-view" ? "JMODGUARD / MODERATION WORKSPACE" : "YOUR COMMUNITY, IN GOOD HANDS",
               ),
-              view === "login-view"
+              display.view === "login-view"
                 ? h(
                     React.Fragment,
                     null,
@@ -347,8 +328,8 @@ function App() {
                     React.Fragment,
                     null,
                     h("h1", null, "Getting things ready."),
-                    h("p", { id: "startup-status", role: "status" }, startupStatus),
-                    previewUnavailable &&
+                    h("p", { id: "startup-status", role: "status" }, display.startupStatus),
+                    display.previewUnavailable &&
                       h(
                         "a",
                         {
@@ -363,19 +344,19 @@ function App() {
             ),
           ),
         ),
-    (!editor || view !== "main-view") && h(Notification),
-    view === "main-view" &&
+    (!display.editor || display.view !== "main-view") && h(Notification),
+    display.view === "main-view" &&
       h(
         Dialog,
         {
-          open: !!editor,
+          open: !!display.editor,
           onClose: () => {
             if (canLeave()) closeOverlay();
           },
           className: "modal modal-open modal-overlay",
           "aria-label": "Configuration editor",
         },
-        editor,
+        display.editor,
         h(Notification),
       ),
   );
@@ -388,12 +369,12 @@ function Notification() {
       role: "status",
       "aria-live": "polite",
       "aria-atomic": true,
-      className: `toast toast-end toast-bottom ${notification?.kind || ""}`,
-      hidden: !notification,
+      className: `toast toast-end toast-bottom ${ui.getSnapshot().notification?.kind || ""}`,
+      hidden: !ui.getSnapshot().notification,
     },
-    notification && h("div", {
-      className: `alert alert-soft ${notification.kind === "error" ? "alert-error" : notification.kind === "success" ? "alert-success" : ""}`,
-    }, notification.message),
+    ui.getSnapshot().notification && h("div", {
+      className: `alert alert-soft ${ui.getSnapshot().notification.kind === "error" ? "alert-error" : ui.getSnapshot().notification.kind === "success" ? "alert-success" : ""}`,
+    }, ui.getSnapshot().notification.message),
   );
 }
 function trackDraft(event) {
@@ -404,15 +385,6 @@ function trackDraft(event) {
     markDirty();
 }
 function Content() {
-  useLayoutEffect(() => {
-    committedRevision = contentRevision;
-    const content = $("#content");
-    content.querySelectorAll("input, select, textarea").forEach((input, i) => {
-      input.dataset.inputKey = String(i);
-      input._initialValue = input.value;
-    });
-    restoreDrafts();
-  }, []);
   const components = {
     dashboard: tabDashboard,
     rules: tabRules,
@@ -452,56 +424,48 @@ function Content() {
   return h(components[state.tab] || tabDashboard);
 }
 function renderTab() {
-  dirty = false;
-  contentRevision++;
-  render();
+  const pending = ui.getSnapshot().pendingDrafts;
+  const matching = pending && pending.guildId === state.guildId && pending.tab === state.tab &&
+    (!state.config || pending.enrollmentId === state.config.enrollment_id);
+  const drafts = matching ? pending.drafts : {};
+  ui.set({
+    contentRevision: ui.getSnapshot().contentRevision + 1,
+    drafts,
+    dirty: Object.keys(drafts).length > 0,
+    pendingDrafts: matching && !state.config ? pending : null,
+  });
 }
-function updateWorkspaceStatus() {
-  render();
-}
+
 function setBusy(value) {
-  busy = value;
-  render();
+  ui.set({ busy: value });
 }
 function showView(id) {
-  view = id;
-  render();
+  ui.set({ view: id });
 }
 function setStartupStatus(text) {
-  startupStatus = text;
-  render();
+  ui.set({ startupStatus: text });
 }
 function showPreviewUnavailable() {
-  view = "startup-view";
-  previewUnavailable = true;
-  startupStatus =
-    "This preview is no longer signed in. Return to the owner dashboard and launch a new preview.";
-  render();
+  ui.set({ view: "startup-view", previewUnavailable: true, startupStatus: "This preview is no longer signed in. Return to the owner dashboard and launch a new preview." });
 }
 function toast(message, kind = "info") {
-  notification = { message, kind };
+  ui.set({ notification: { message, kind } });
   clearTimeout(toastTimer);
   toastTimer = setTimeout(
     () => {
-      notification = null;
-      render();
+      ui.set({ notification: null });
     },
     kind === "error" ? 5000 : 2600,
   );
-  render();
 }
 function closeOverlay() {
-  editor = null;
-  dirty = false;
-  render();
+  ui.set({ editor: null, dirty: false });
 }
 function editRule(record) {
-  editor = h(RuleEditor, { record });
-  render();
+  ui.set({ editor: h(RuleEditor, { record }) });
 }
 function editCommand(record) {
-  editor = h(CommandEditor, { record });
-  render();
+  ui.set({ editor: h(CommandEditor, { record }) });
 }
 async function init() {
   try {
@@ -520,7 +484,7 @@ async function init() {
 }
 async function logout() {
   if (!canLeave()) return;
-  dirty = false;
+  ui.set({ dirty: false });
   if (isPreview()) {
     try {
       await api("/api/preview", "DELETE");
@@ -550,12 +514,6 @@ let state = {
 };
 
 let configRequest = 0;
-
-let busy = false;
-
-let dirty = false;
-
-let pendingDrafts = null;
 
 const pendingLogChannelActions = new Map();
 
@@ -602,89 +560,51 @@ function persistWorkspace() {
 }
 
 function canLeave() {
-  return !busy && (!dirty || confirm("Discard unsaved changes?"));
+  return !ui.getSnapshot().busy && (!ui.getSnapshot().dirty || confirm("Discard unsaved changes?"));
 }
 
 function markDirty() {
-  dirty = true;
-  updateWorkspaceStatus();
-}
-
-function currentDraftInputs() {
-  return [...($("#content")?.querySelectorAll("input, select, textarea") || [])].filter(
-    (input) =>
-      input._initialValue !== undefined &&
-      input.value !== input._initialValue,
-  );
+  ui.set({ dirty: true });
 }
 
 function currentDrafts() {
-  return currentDraftInputs().map((input) => ({ key: input.dataset.inputKey, value: input.value }));
+  return ui.getSnapshot().drafts;
 }
 
-function captureDrafts(node, savedInputs) {
-  const form = node.closest?.(".card, .modal-box");
-  if (!form) return [];
-  return currentDraftInputs()
-    .filter(
-      (input) => !(savedInputs ? savedInputs.some((ref) => ref.current === input) : form.contains(input)),
-    )
-    .map((input) => ({ key: input.dataset.inputKey, value: input.value }));
+function captureDrafts(savedFields, group) {
+  return Object.fromEntries(Object.entries(currentDrafts()).filter(([key, draft]) =>
+    savedFields ? !savedFields.includes(key) : !group || draft.group !== group));
 }
 
-function retainDrafts(guildId, tab, drafts, enrollmentId = state.config?.enrollment_id) {
-  if (!drafts.length || guildId !== state.guildId || tab !== state.tab) return;
-  pendingDrafts = { guildId, tab, drafts, enrollmentId };
-  restoreDrafts();
+function retainDrafts(guildId, tab, drafts, enrollmentId) {
+  if (guildId !== state.guildId || tab !== state.tab) return;
+  if (state.config && enrollmentId !== state.config.enrollment_id) return;
+  ui.set({ drafts, dirty: Object.keys(drafts).length > 0,
+    pendingDrafts: state.config ? null : { guildId, tab, drafts, enrollmentId } });
 }
 
-function restoreDrafts() {
-  if (committedRevision !== contentRevision) return;
-  if (!pendingDrafts || pendingDrafts.guildId !== state.guildId || pendingDrafts.tab !== state.tab) return;
-  if (state.config && pendingDrafts.enrollmentId !== state.config.enrollment_id) {
-    pendingDrafts = null;
-    dirty = false;
-    updateWorkspaceStatus();
-    return;
-  }
-  markDirty();
-  // The unavailable/loading screen has no inputs. Keep the draft until Retry succeeds.
-  if (!state.config) return;
-  for (const draft of pendingDrafts.drafts) {
-    const input = $("#content").querySelector(`[data-input-key="${draft.key}"]`);
-    if (input) {
-      input.value = draft.value;
-      input.dispatchEvent?.(new Event("input", { bubbles: true }));
-    }
-  }
-  pendingDrafts = null;
-}
-
-async function handleEvent(node, handler, event, savedInputs) {
-  if (busy) return;
-  const guildId = state.guildId,
-    tab = state.tab,
-    enrollmentId = state.config?.enrollment_id,
-    revision = contentRevision;
-  const drafts = captureDrafts(node, savedInputs);
+async function handleEvent(handler, event, savedFields, group) {
+  if (ui.getSnapshot().busy) return;
+  const guildId = state.guildId, tab = state.tab, enrollmentId = state.config?.enrollment_id ?? ui.getSnapshot().pendingDrafts?.enrollmentId;
+  const revision = ui.getSnapshot().contentRevision;
+  const drafts = captureDrafts(savedFields, group);
   try {
     const result = handler(event);
     if (result && typeof result.then === "function") {
       setBusy(true);
       await result;
-      if (revision !== contentRevision || !node.isConnected) retainDrafts(guildId, tab, drafts, enrollmentId);
+      if (revision !== ui.getSnapshot().contentRevision) retainDrafts(guildId, tab, drafts, enrollmentId);
     }
   } catch (e) {
     reportApiError(e);
   } finally {
-    if (busy) setBusy(false);
+    if (ui.getSnapshot().busy) setBusy(false);
   }
 }
 
 function navigate(tab) {
   if (!canLeave()) return false;
-  view = "main-view";
-  pendingDrafts = null;
+  ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, copySource: null });
   state.tab = tabs.includes(tab) ? tab : "dashboard";
   persistWorkspace();
   renderTab();
@@ -1067,15 +987,9 @@ function overlayPendingLogChannels(config, guildId) {
 
 function renderLogChannelsPreservingDrafts() {
   if (state.tab !== "logchannels") return;
-  const drafts = committedRevision === contentRevision ? currentDrafts() : [];
-  if (drafts.length) {
-    pendingDrafts = {
-      guildId: state.guildId,
-      tab: state.tab,
-      drafts,
-      enrollmentId: state.config?.enrollment_id,
-    };
-  }
+  ui.set({ pendingDrafts: {
+    guildId: state.guildId, tab: state.tab, drafts: currentDrafts(), enrollmentId: state.config?.enrollment_id,
+  } });
   renderTab();
 }
 
@@ -1296,8 +1210,7 @@ async function loadConfig() {
     const config = await apiRead(`/api/guilds/${guildId}/config`);
     if (request !== configRequest || guildId !== state.guildId) return;
     if (state.config && state.config.enrollment_id !== config.enrollment_id) {
-      pendingDrafts = null;
-      dirty = false;
+      ui.set({ pendingDrafts: null, drafts: {}, copySource: null, dirty: false });
       for (const [key, entry] of pendingLogChannelActions) {
         if (entry.job.guild_id === guildId && entry.job.enrollment_id !== config.enrollment_id) {
           clearPendingLogChannelEntry(key);
@@ -1314,7 +1227,7 @@ async function loadConfig() {
     if (request !== configRequest || guildId !== state.guildId) return;
     if (isUnauthenticated(e)) return;
     state.config = null;
-    editor = null;
+    ui.set({ editor: null });
     state.error = e.message || String(e);
     toast("Could not refresh configuration: " + state.error, "error");
   } finally {
@@ -1438,7 +1351,7 @@ function emptyPanel(title, body, action, attrs) {
     { className: "hero bg-base-200 rounded-box", ...(attrs || {}) },
     h(
       "div",
-      { className: "hero-content text-center" },
+      { className: "hero-content" },
       h("div", { className: "hero-copy" }, h("h2", {}, title), h("p", {}, body), action || null),
     ),
   );
@@ -2124,9 +2037,11 @@ function applyPlanStepInput(step, type, raw) {
 
 function tabBadwords() {
   const words = state.config.badwords;
+  const testPatternRef = useRef(null);
   const patternRef = useRef(null);
   const pattern = h(Input, {
     ref: patternRef,
+    draftKey: "badwords:pattern",
     type: "text",
     placeholder: "regex pattern, e.g. (scam|pump and dump)",
     style: { flex: "2" },
@@ -2135,16 +2050,18 @@ function tabBadwords() {
   const noteRef = useRef(null);
   const note = h(Input, {
     ref: noteRef,
+    draftKey: "badwords:note",
     type: "text",
     placeholder: "note (optional)",
     style: { flex: "1" },
     className: "input",
   });
   const scopeRef = useRef(null);
-  const scope = scopeSelect(scopeRef, "This server", "Global");
+  const scope = scopeSelect(scopeRef, "This server", "Global", true, "badwords:scope");
   const sampleRef = useRef(null);
   const sample = h(Input, {
     ref: sampleRef,
+    draftKey: "badwords:sample",
     type: "text",
     placeholder: "sample text to test, e.g. 5c@m 🅿🆁🅾🅼🅾",
     style: { flex: "2" },
@@ -2166,8 +2083,8 @@ function tabBadwords() {
           : "Global patterns (shown below) are enforced for all servers; only the bot owner can edit them."),
     ),
     h(
-      "div",
-      { className: "card bg-base-100 card-border" },
+      DraftCard,
+      { group: "badwords", className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -2190,8 +2107,6 @@ function tabBadwords() {
                       pattern: patternRef.current.value.trim(),
                       note: noteRef.current.value || null,
                     });
-                    patternRef.current.value = "";
-                    noteRef.current.value = "";
                     return res;
                   },
                   () => toast("Badword added", "success"),
@@ -2204,8 +2119,8 @@ function tabBadwords() {
       ),
     ),
     h(
-      "div",
-      { className: "card bg-base-100 card-border" },
+      DraftCard,
+      { group: "badwords-test", className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -2216,6 +2131,8 @@ function tabBadwords() {
           h(Input, {
             type: "text",
             id: "test-pattern",
+            ref: testPatternRef,
+            draftKey: "badwords:test-pattern",
             placeholder: "regex",
             style: { flex: "1" },
             className: "input",
@@ -2226,7 +2143,7 @@ function tabBadwords() {
             {
               className: "btn",
               onClick: async () => {
-                const p = $("#test-pattern").value;
+                const p = testPatternRef.current.value;
                 if (!p || !sampleRef.current.value) return toast("Enter pattern and sample", "error");
                 const res = await api(`/api/guilds/${state.guildId}/testregex`, "POST", {
                   pattern: p,
@@ -2802,13 +2719,13 @@ function TemplateCard({ record: t }) {
   const textRef = useRef(null);
   const text = h(Textarea, {
     ref: textRef,
+    draftKey: `template:${t.event}:text`,
     className: "mono template-input" + " textarea",
     rows: 8,
     spellCheck: false,
     defaultValue: t.effective,
-    onInput: (event) => setPreview(event.target.value),
   });
-  const [preview, setPreview] = useState(() =>
+  const preview = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? (
     t.effective
       .replaceAll("{user}", "Alice")
       .replaceAll("{mention}", "@alice")
@@ -2819,13 +2736,13 @@ function TemplateCard({ record: t }) {
       .replaceAll("{action}", "ban")
       .replaceAll("{content}", "FREE NITRO http://scam.link")
       .replaceAll("{count}", "3")
-      .replaceAll("{time}", new Date().toISOString()),
+      .replaceAll("{time}", new Date().toISOString())
   );
   const scopeSelRef = useRef(null);
-  const scopeSel = scopeSelect(scopeSelRef, "This server", "Global");
+  const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
   return h(
-    "div",
-    { className: "card bg-base-100 card-border template-card" },
+    DraftCard,
+    { group: `template:${t.event}`, className: "card bg-base-100 card-border template-card" },
     h(
       "div",
       { className: "card-body" },
@@ -2919,6 +2836,7 @@ function LogChannelCard({ lc }) {
   const inputRef = useRef(null);
   const input = h(Input, {
     ref: inputRef,
+    draftKey: `log:${lc.event}:channel`,
     type: "text",
     defaultValue: lc.effective && String(lc.effective) !== "0" ? String(lc.effective) : "",
     placeholder: "channel id",
@@ -2927,6 +2845,7 @@ function LogChannelCard({ lc }) {
   const ignoredUsersRef = useRef(null);
   const ignoredUsers = h(Textarea, {
     ref: ignoredUsersRef,
+    draftKey: `log:${lc.event}:users`,
     placeholder: "One Discord user or bot ID per line",
     rows: 2,
     className: "textarea",
@@ -2935,6 +2854,7 @@ function LogChannelCard({ lc }) {
   const ignoredChannelsRef = useRef(null);
   const ignoredChannels = h(Textarea, {
     ref: ignoredChannelsRef,
+    draftKey: `log:${lc.event}:channels`,
     placeholder: "One source channel ID per line",
     rows: 2,
     className: "textarea",
@@ -2943,8 +2863,8 @@ function LogChannelCard({ lc }) {
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", false);
   return h(
-    "div",
-    { className: "card bg-base-100 card-border log-channel-card" },
+    DraftCard,
+    { group: `log:${lc.event}`, className: "card bg-base-100 card-border log-channel-card" },
     h(
       "div",
       { className: "card-body" },
@@ -2974,7 +2894,7 @@ function LogChannelCard({ lc }) {
             ActionButton,
             {
               className: "btn btn-sm btn-primary",
-              savedInputs: [inputRef],
+              savedFields: [`log:${lc.event}:channel`],
               onClick: async () => {
                 const v = parseSnowflake(inputRef.current.value);
                 if (!v) return toast("Enter a Discord channel ID, <#id> mention, or channel URL", "error");
@@ -2995,7 +2915,7 @@ function LogChannelCard({ lc }) {
             ActionButton,
             {
               className: "btn btn-sm",
-              savedInputs: [inputRef],
+              savedFields: [`log:${lc.event}:channel`],
               onClick: async () => {
                 const job = await submitBotAction(
                   `/api/guilds/${guildId}/logchannels/${lc.event}`,
@@ -3034,7 +2954,7 @@ function LogChannelCard({ lc }) {
           ActionButton,
           {
             className: "btn btn-sm",
-            savedInputs: [ignoredUsersRef, ignoredChannelsRef],
+            savedFields: [`log:${lc.event}:users`, `log:${lc.event}:channels`],
             onClick: async () => {
               const users = ignoredUsersRef.current.value
                 .split(/\r?\n|,/)
@@ -4043,8 +3963,7 @@ function tabCases() {
                     noteIntent = null;
                     toast("Note added", "success");
                     await openCase(id);
-                    dirty = false;
-                    updateWorkspaceStatus();
+                    ui.set({ dirty: false });
                   } finally {
                     notePending = false;
                   }
@@ -4265,6 +4184,7 @@ function tabSettings() {
   const prefixRef = useRef(null);
   const prefix = h(Input, {
     ref: prefixRef,
+    draftKey: "settings:prefix",
     type: "text",
     defaultValue: cfg.settings.prefix,
     className: "input",
@@ -4272,28 +4192,29 @@ function tabSettings() {
   const botNameRef = useRef(null);
   const botName = h(Input, {
     ref: botNameRef,
+    draftKey: "settings:bot_name",
     type: "text",
     defaultValue: cfg.settings.bot_name,
     className: "input",
   });
 
-  const sourceEnrollment = useRef(null);
   const srcSelRef = useRef(null);
   const srcSel = h(
     Select,
     {
       ref: srcSelRef,
+      draftKey: "copy:source",
+      defaultValue: "",
       className: "select",
       onChange: (event) =>
         handleEvent(
-          event.currentTarget,
           async () => {
-            sourceEnrollment.current = null;
+            ui.set({ copySource: null });
             const guildId = srcSelRef.current.value;
             if (!guildId) return;
             const source = await apiRead(`/api/guilds/${guildId}/config`);
             if (srcSelRef.current?.value === guildId && source.enrollment_id) {
-              sourceEnrollment.current = { guildId, id: source.enrollment_id };
+              ui.set({ copySource: { guildId, id: source.enrollment_id } });
             }
           },
           event,
@@ -4305,7 +4226,7 @@ function tabSettings() {
   const sectionSelRef = useRef(null);
   const sectionSel = h(
     Select,
-    { ref: sectionSelRef, className: "select" },
+    { ref: sectionSelRef, className: "select", draftKey: "copy:section", defaultValue: "all" },
     ["all", "rules", "badwords", "commands", "templates", "settings"].map((s) =>
       h("option", { value: s }, s === "all" ? "everything" : s),
     ),
@@ -4313,6 +4234,7 @@ function tabSettings() {
   const globalPrefixRef = useRef(null);
   const globalPrefix = h(Input, {
     ref: globalPrefixRef,
+    draftKey: "global:prefix",
     type: "text",
     defaultValue: cfg.global_settings.prefix,
     className: "input",
@@ -4340,7 +4262,7 @@ function tabSettings() {
             {
               className: "btn btn-sm",
               type: "button",
-              savedInputs: [input.props.ref],
+              savedFields: [input.props.draftKey],
               style: { marginTop: "6px" },
               onClick: () => inheritField(overrideKey),
             },
@@ -4352,8 +4274,8 @@ function tabSettings() {
 
   const cards = [
     h(
-      "div",
-      { className: "card bg-base-100 card-border" },
+      DraftCard,
+      { group: "settings", className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4434,7 +4356,7 @@ function tabSettings() {
             ActionButton,
             {
               className: "btn",
-              savedInputs: [],
+              savedFields: [],
               onClick: async () => {
                 await reloadAfter(
                   () => api(`/api/guilds/${state.guildId}/settings`, "PUT", { sync_nickname: true }),
@@ -4455,9 +4377,12 @@ function tabSettings() {
     ),
   ];
 
+  const [roleBaseline, setRoleBaseline] = useState("");
   const roleInputRef = useRef(null);
   const roleInput = h(Input, {
     ref: roleInputRef,
+    draftKey: "settings:roles",
+    defaultValue: roleBaseline,
     type: "text",
     placeholder: "role id, <@&id> mention, comma-separated",
     className: "input",
@@ -4471,13 +4396,7 @@ function tabSettings() {
       .then((roles) => {
         if (!active || initialRoleGeneration !== roleWriteGeneration.current) return;
         const loadedValue = (roles.roles || []).join(", ");
-        if (
-          roleInputRef.current._initialValue === undefined ||
-          roleInputRef.current.value === roleInputRef.current._initialValue
-        ) {
-          roleInputRef.current.value = loadedValue;
-        }
-        roleInputRef.current._initialValue = loadedValue;
+        setRoleBaseline(loadedValue);
         roleRevision.current = roles.revision || "";
       })
       .catch((e) => {
@@ -4489,8 +4408,8 @@ function tabSettings() {
   }, []);
   cards.push(
     h(
-      "div",
-      { className: "card bg-base-100 card-border" },
+      DraftCard,
+      { group: "roles", className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4515,9 +4434,11 @@ function tabSettings() {
                 });
                 roleWriteGeneration.current++;
                 roleRevision.current = saved.revision;
-                roleInputRef.current._initialValue = roleInputRef.current.value;
-                dirty = currentDraftInputs().length > 0;
-                updateWorkspaceStatus();
+                setRoleBaseline(roleInputRef.current.value);
+                const drafts = { ...currentDrafts() };
+                delete drafts["settings:roles"];
+                ui.set({ drafts, dirty: Object.keys(drafts).length > 0 });
+
                 toast("Case-removal roles saved", "success");
               },
             },
@@ -4531,8 +4452,8 @@ function tabSettings() {
   if (isBotOwner()) {
     cards.push(
       h(
-        "div",
-        { className: "card bg-base-100 card-border" },
+        DraftCard,
+        { group: "global", className: "card bg-base-100 card-border" },
         h(
           "div",
           { className: "card-body" },
@@ -4572,8 +4493,8 @@ function tabSettings() {
 
   cards.push(
     h(
-      "div",
-      { className: "card bg-base-100 card-border" },
+      DraftCard,
+      { group: "copy", className: "card bg-base-100 card-border" },
       h(
         "div",
         { className: "card-body" },
@@ -4593,7 +4514,7 @@ function tabSettings() {
             {
               className: "btn btn-primary",
               onClick: async () => {
-                if (!sourceEnrollment.current || sourceEnrollment.current.guildId !== srcSelRef.current.value)
+                if (!ui.getSnapshot().copySource || ui.getSnapshot().copySource.guildId !== srcSelRef.current.value)
                   return toast("Select a source server to load its current configuration", "error");
                 if (
                   !confirm(
@@ -4605,7 +4526,7 @@ function tabSettings() {
                   () =>
                     api(`/api/guilds/${state.guildId}/copy`, "POST", {
                       from_guild_id: String(srcSelRef.current.value),
-                      from_enrollment_id: sourceEnrollment.current.id,
+                      from_enrollment_id: ui.getSnapshot().copySource.id,
                       sections: [sectionSelRef.current.value],
                     }),
                   (res) => {
@@ -4637,10 +4558,11 @@ function scopeSelect(
   guildLabel = "This server only",
   globalLabel = "Global (all servers)",
   allowGlobal = true,
+  draftKey,
 ) {
   return h(
     Select,
-    { ref, className: "select" },
+    { ref, className: "select", draftKey, defaultValue: "guild" },
     h("option", { value: "guild" }, guildLabel),
     allowGlobal && isBotOwner() && h("option", { value: "global" }, globalLabel),
   );
@@ -4648,7 +4570,7 @@ function scopeSelect(
 function RuleAction({ action, index, remove }) {
   return h(
     "div",
-    { className: "escalation-step" },
+    { className: "card card-border escalation-step" },
     h(
       "div",
       { className: "row title-row" },
@@ -5093,5 +5015,5 @@ function tabActions() {
 }
 
 capturePreviewToken();
-render();
+root.render(h(App));
 init();
