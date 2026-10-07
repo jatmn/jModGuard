@@ -1357,9 +1357,8 @@ function emptyPanel(title, body, action, attrs) {
   );
 }
 
-function field(label, control) {
-  control = React.cloneElement(control, { "aria-label": label });
-  return h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, label), control);
+function field(label, ...children) {
+  return h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, label), ...children);
 }
 
 function eventHeading(event) {
@@ -1388,20 +1387,6 @@ function tabDashboard() {
   const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
   const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
   const result = useApiRead(`/api/guilds/${guildId}/stats`);
-  const moderation = [
-    ["events", "Moderation records"],
-    ["warns", "Warns"],
-    ["bans", "Bans"],
-    ["cases", "Cases"],
-  ].map(([key, label]) => ({
-    key,
-    value: h(
-      "div",
-      { className: "stat-value" },
-      result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]),
-    ),
-    label,
-  }));
   return h(
     "div",
     { className: "contents" },
@@ -1489,8 +1474,13 @@ function tabDashboard() {
       { className: "dashboard-section" },
       h("h3", { className: "card-title" }, "Moderation activity"),
       statsRow(
-        ...moderation.map(({ value, label }) =>
-          h("div", { className: "stat" }, h("div", { className: "stat-title" }, label), value),
+        ...[
+          ["events", "Moderation records"],
+          ["warns", "Warns"],
+          ["bans", "Bans"],
+          ["cases", "Cases"],
+        ].map(([key, label]) =>
+          stat(label, result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key])),
         ),
       ),
       h(
@@ -1727,7 +1717,7 @@ function RuleEditor({ record: r }) {
   const paramsTextRef = useRef(null);
   const paramsText = h(Textarea, {
     ref: paramsTextRef,
-    className: "mono" + " textarea",
+    className: "mono textarea",
     rows: 7,
     spellCheck: false,
     defaultValue: JSON.stringify(rule.params ?? {}, null, 2),
@@ -1815,27 +1805,20 @@ function RuleEditor({ record: r }) {
               ? "Exact text after trimming ends only. No case folding. Empty text never matches. Default minimum length is 20 Unicode scalars."
               : "Exact common image bytes across channels. Extra images are allowed. Creates and relevant attachment edits participate. Work limits can reduce coverage.",
           ),
-          h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Distinct channels"), imageChannels),
+          field("Distinct channels", imageChannels),
           image
-            ? h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Common distinct images per message"), imageCount)
+            ? field("Common distinct images per message", imageCount)
             : null,
           textRule
-            ? h(
-                Field,
-                { className: "fieldset field" },
-                h(Label, { className: "fieldset-legend" }, "Minimum length (Unicode scalars after trim)"),
-                textLength,
-              )
+            ? field("Minimum length (Unicode scalars after trim)", textLength)
             : null,
-          h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Window (seconds)"), imageWindow),
+          field("Window (seconds)", imageWindow),
         )
-      : h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Parameters (JSON)"), paramsText),
+      : field("Parameters (JSON)", paramsText),
     spam
       ? null
-      : h(
-          Field,
-          { className: "fieldset field" },
-          h(Label, { className: "fieldset-legend" }, "Action escalation"),
+      : field(
+          "Action escalation",
           h(
             "p",
             { className: "field-help" },
@@ -1864,14 +1847,14 @@ function RuleEditor({ record: r }) {
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist roles (ids, comma)"), whitelistText),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist channels (ids)"), channelsText),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Whitelist users (ids)"), usersText),
+      field("Whitelist roles (ids, comma)", whitelistText),
+      field("Whitelist channels (ids)", channelsText),
+      field("Whitelist users (ids)", usersText),
     ),
     h(
       "div",
       { className: "modal-action" },
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Applies to"), scopeSel),
+      field("Applies to", scopeSel),
       h(
         ActionButton,
         {
@@ -2101,14 +2084,11 @@ function tabBadwords() {
               onClick: async () => {
                 if (!patternRef.current.value.trim()) return toast("Enter a pattern", "error");
                 await reloadAfter(
-                  async () => {
-                    const res = await api(`/api/guilds/${state.guildId}/badwords`, "POST", {
-                      scope: scopeRef.current.value,
-                      pattern: patternRef.current.value.trim(),
-                      note: noteRef.current.value || null,
-                    });
-                    return res;
-                  },
+                  () => api(`/api/guilds/${state.guildId}/badwords`, "POST", {
+                    scope: scopeRef.current.value,
+                    pattern: patternRef.current.value.trim(),
+                    note: noteRef.current.value || null,
+                  }),
                   () => toast("Badword added", "success"),
                 );
               },
@@ -2170,79 +2150,53 @@ function tabBadwords() {
         words.length === 0
           ? h("p", { className: "muted" }, "No patterns yet.")
           : h(
-              "div",
-              {
-                className: "table-scroll rounded-box bg-base-100",
-                tabIndex: 0,
-                role: "region",
-                "aria-label": "Scrollable data table",
-              },
-              h(
-                "table",
-                { className: "table table-zebra" },
-                h(
-                  "thead",
-                  {},
+              DataTable,
+              { headings: ["Scope", "Pattern", "Note", "Status", ""] },
+              words.map((w) => {
+                const isGlobal = String(w.guild_id) === "0";
+                const canDelete = !isGlobal || isBotOwner();
+                const invalid = w.valid === false;
+                return h(
+                  "tr",
+                  { key: w.id },
+                  h("td", {}, isGlobal ? "global" : "server"),
+                  h("td", { className: "mono" }, w.pattern),
+                  h("td", { className: "muted" }, w.note || ""),
                   h(
-                    "tr",
+                    "td",
                     {},
-                    h("th", {}, "Scope"),
-                    h("th", {}, "Pattern"),
-                    h("th", {}, "Note"),
-                    h("th", {}, "Status"),
-                    h("th", {}),
+                    invalid
+                      ? h(
+                          "span",
+                          {
+                            className: "badge badge-soft badge-sm badge-error",
+                            title: w.error || "failed compile limits",
+                          },
+                          "not enforced",
+                        )
+                      : h("span", { className: "badge badge-soft badge-sm badge-success" }, "active"),
                   ),
-                ),
-                h(
-                  "tbody",
-                  {},
-                  ...words.map((w) => {
-                    const isGlobal = String(w.guild_id) === "0";
-                    const canDelete = !isGlobal || isBotOwner();
-                    const invalid = w.valid === false;
-                    return h(
-                      "tr",
-                      {},
-                      h("td", {}, isGlobal ? "global" : "server"),
-                      h("td", { className: "mono" }, w.pattern),
-                      h("td", { className: "muted" }, w.note || ""),
-                      h(
-                        "td",
-                        {},
-                        invalid
-                          ? h(
-                              "span",
-                              {
-                                className: "badge badge-soft badge-sm badge-error",
-                                title: w.error || "failed compile limits",
-                              },
-                              "not enforced",
-                            )
-                          : h("span", { className: "badge badge-soft badge-sm badge-success" }, "active"),
-                      ),
-                      h(
-                        "td",
-                        {},
-                        canDelete
-                          ? h(
-                              ActionButton,
-                              {
-                                className: "btn btn-sm btn-error",
-                                onClick: async () => {
-                                  await reloadAfter(
-                                    () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
-                                    () => toast("Removed", "success"),
-                                  );
-                                },
-                              },
-                              "✕",
-                            )
-                          : h("span", { className: "muted" }, "owner only"),
-                      ),
-                    );
-                  }),
-                ),
-              ),
+                  h(
+                    "td",
+                    {},
+                    canDelete
+                      ? h(
+                          ActionButton,
+                          {
+                            className: "btn btn-sm btn-error",
+                            onClick: async () => {
+                              await reloadAfter(
+                                () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
+                                () => toast("Removed", "success"),
+                              );
+                            },
+                          },
+                          "✕",
+                        )
+                      : h("span", { className: "muted" }, "owner only"),
+                  ),
+                );
+              }),
             ),
       ),
     ),
@@ -2272,82 +2226,55 @@ function tabCommands() {
         "Enabled commands are synced to Discord as slash commands.",
     ),
     h(
-      "div",
-      {
-        className: "table-scroll rounded-box bg-base-100",
-        tabIndex: 0,
-        role: "region",
-        "aria-label": "Scrollable data table",
-      },
-      h(
-        "table",
-        { className: "commands-table" + " table" },
-        h(
-          "thead",
-          {},
+      DataTable,
+      { headings: ["Command", "Category", "Description", "Permission", "State", ""], className: "commands-table table" },
+      cmds.map((c) => {
+        const d = c.effective;
+        return h(
+          "tr",
+          { key: c.name },
           h(
-            "tr",
+            "td",
             {},
-            h("th", {}, "Command"),
-            h("th", {}, "Category"),
-            h("th", {}, "Description"),
-            h("th", {}, "Permission"),
-            h("th", {}, "State"),
-            h("th", {}),
+            h(
+              "div",
+              { className: "command-identity" },
+              h("strong", { className: "mono" }, d.name),
+              h(
+                "div",
+                { className: "tag-group" },
+                c.guild_override
+                  ? h(
+                      "span",
+                      { className: "badge badge-soft badge-sm badge-neutral override-tag" },
+                      "server override",
+                    )
+                  : null,
+                c.scope === "global"
+                  ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global")
+                  : null,
+              ),
+            ),
           ),
-        ),
-        h(
-          "tbody",
-          {},
-          ...cmds.map((c) => {
-            const d = c.effective;
-            return h(
-              "tr",
-              {},
-              h(
-                "td",
-                {},
-                h(
-                  "div",
-                  { className: "command-identity" },
-                  h("strong", { className: "mono" }, d.name),
-                  h(
-                    "div",
-                    { className: "tag-group" },
-                    c.guild_override
-                      ? h(
-                          "span",
-                          { className: "badge badge-soft badge-sm badge-neutral override-tag" },
-                          "server override",
-                        )
-                      : null,
-                    c.scope === "global"
-                      ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global")
-                      : null,
-                  ),
-                ),
-              ),
-              h("td", {}, d.category),
-              h("td", { className: "muted command-description" }, d.description),
-              h("td", {}, d.permission),
-              h(
-                "td",
-                {},
-                h(
-                  "span",
-                  { className: `badge badge-soft badge-sm ${d.enabled ? "badge-success" : "badge-error"}` },
-                  d.enabled ? "enabled" : "disabled",
-                ),
-              ),
-              h(
-                "td",
-                {},
-                h(ActionButton, { className: "btn btn-sm", onClick: () => editCommand(c) }, "Edit"),
-              ),
-            );
-          }),
-        ),
-      ),
+          h("td", {}, d.category),
+          h("td", { className: "muted command-description" }, d.description),
+          h("td", {}, d.permission),
+          h(
+            "td",
+            {},
+            h(
+              "span",
+              { className: `badge badge-soft badge-sm ${d.enabled ? "badge-success" : "badge-error"}` },
+              d.enabled ? "enabled" : "disabled",
+            ),
+          ),
+          h(
+            "td",
+            {},
+            h(ActionButton, { className: "btn btn-sm", onClick: () => editCommand(c) }, "Edit"),
+          ),
+        );
+      }),
     ),
   );
 }
@@ -2469,7 +2396,7 @@ function CommandEditor({ record: c }) {
   const [behaviorJson, setBehaviorJson] = useState(() =>
     JSON.stringify(isPlan ? data.behavior.params || {} : data.behavior || {}, null, 2),
   );
-  const [stepsRevision, setStepsRevision] = useState(0);
+  const [, setStepsRevision] = useState(0);
   const renderSteps = () => setStepsRevision((value) => value + 1);
   const syncPlanJson = () => {
     if (isPlan) setBehaviorJson(JSON.stringify(data.behavior.params || {}, null, 2));
@@ -2526,7 +2453,6 @@ function CommandEditor({ record: c }) {
         }),
       ),
   );
-  void stepsRevision;
   return h(
     DialogPanel,
     { className: "modal-box", onInput: trackDraft },
@@ -2534,12 +2460,12 @@ function CommandEditor({ record: c }) {
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Name"), nameIn),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Aliases"), aliasesIn),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Permission"), permIn),
+      field("Name", nameIn),
+      field("Aliases", aliasesIn),
+      field("Permission", permIn),
     ),
-    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Description"), descIn),
-    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Usage"), usageIn),
+    field("Description", descIn),
+    field("Usage", usageIn),
     isPlan
       ? h(
           "fieldset",
@@ -2561,25 +2487,20 @@ function CommandEditor({ record: c }) {
           ),
         )
       : null,
-    h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Behavior (advanced JSON)"), behaviorArea),
-    h(
-      Field,
-      { className: "fieldset field" },
-      h(Label, { className: "fieldset-legend" }, "Response template (in-chat reply; {target} {reason} {response} …)"),
-      respIn,
-    ),
+    field("Behavior (advanced JSON)", behaviorArea),
+    field("Response template (in-chat reply; {target} {reason} {response} …)", respIn),
     h(
       "div",
       { className: "row form-row" },
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Cooldown (secs)"), cdIn),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Role restriction (ids)"), roleIn),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Channel restriction (ids)"), chanIn),
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Log event"), logIn),
+      field("Cooldown (secs)", cdIn),
+      field("Role restriction (ids)", roleIn),
+      field("Channel restriction (ids)", chanIn),
+      field("Log event", logIn),
     ),
     h(
       "div",
       { className: "modal-action" },
-      h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Applies to"), scopeSel),
+      field("Applies to", scopeSel),
       h(
         "label",
         { className: "checkbox-label" },
@@ -2720,7 +2641,7 @@ function TemplateCard({ record: t }) {
   const text = h(Textarea, {
     ref: textRef,
     draftKey: `template:${t.event}:text`,
-    className: "mono template-input" + " textarea",
+    className: "mono template-input textarea",
     rows: 8,
     spellCheck: false,
     defaultValue: t.effective,
@@ -3941,10 +3862,8 @@ function tabCases() {
           ...(history.history || []).map((entry) =>
             h("p", { className: "muted" }, JSON.stringify(entry.entry.body)),
           ),
-          h(
-            Field,
-            { className: "fieldset field" },
-            h(Label, { className: "fieldset-legend" }, "Note"),
+          field(
+            "Note",
             note,
             h(
               ActionButton,
@@ -4250,10 +4169,8 @@ function tabSettings() {
 
   function settingsField(labelText, input, overrideKey, hint, allowInheritance = true) {
     const hasOv = ov[overrideKey] != null;
-    return h(
-      Field,
-      { className: "fieldset field" },
-      h(Label, { className: "fieldset-legend" }, labelText),
+    return field(
+      labelText,
       input,
       hint ? h("p", { className: "muted", style: { margin: "4px 0 0", fontSize: "12px" } }, hint) : null,
       hasOv && allowInheritance
@@ -4419,7 +4336,7 @@ function tabSettings() {
           { className: "muted" },
           "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action.",
         ),
-        h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Delegated case-removal role IDs"), roleInput),
+        field("Delegated case-removal role IDs", roleInput),
         h(
           "div",
           { className: "card-actions" },
@@ -4466,7 +4383,7 @@ function tabSettings() {
           h(
             "div",
             { className: "row form-actions" },
-            h(Field, { className: "fieldset field" }, h(Label, { className: "fieldset-legend" }, "Global prefix"), globalPrefix),
+            field("Global prefix", globalPrefix),
             h(
               ActionButton,
               {
@@ -4761,7 +4678,7 @@ function useApiRead(path) {
   }, [path, revision]);
   return { ...result, refresh: () => setRevision((value) => value + 1) };
 }
-function DataTable({ headings, children }) {
+function DataTable({ headings, children, className = "table table-zebra" }) {
   return h(
     "div",
     {
@@ -4772,7 +4689,7 @@ function DataTable({ headings, children }) {
     },
     h(
       "table",
-      { className: "table table-zebra" },
+      { className },
       h("thead", null, h("tr", null, ...headings.map((text) => h("th", { key: text }, text)))),
       h("tbody", null, ...React.Children.toArray(children)),
     ),
