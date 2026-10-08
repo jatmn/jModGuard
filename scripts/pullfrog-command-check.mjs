@@ -5,7 +5,7 @@ const OWNER_ID = 12479882;
 const REPOSITORY = 'jatmn/jModGuard';
 // Matches the pinned action in .github/workflows/pullfrog.yml. Pullfrog's
 // structured prompt is version-specific; verify its schema when updating both.
-export const PULLFROG_VERSION = '0.1.82';
+export const PULLFROG_VERSION = '0.1.97';
 // Action inputs become individual environment strings. Stay comfortably below
 // Linux's per-string exec limit, including JSON escaping and multibyte text.
 const MAX_PAYLOAD_BYTES = 64 * 1024;
@@ -40,9 +40,10 @@ export function ownerCommandPayload(eventName, actor, event, eventPath) {
     triggerer: actor,
     prompt: `The repository owner issued this command in ${REPOSITORY}:\n${event.comment.body}\n\n` +
       `Read the linked issue or pull request and current repository state before acting. ` +
-      `The command is at ${url}. Post your result in that thread.`,
+      `Follow AGENTS.md and CONTRIBUTING.md. The command is at ${url}. Post your result in that thread.`,
     event: {
       trigger: 'issue_comment_created',
+      authorPermission: 'admin',
       comment_type: 'issue',
       comment_id: commentId,
       issue_number: issueNumber,
@@ -60,12 +61,14 @@ export function ownerCommandPayload(eventName, actor, event, eventPath) {
     payload.prompt = `The repository owner issued a command in ${REPOSITORY}. ` +
       `Before acting, read the full comment.body string from the GitHub event snapshot at ${JSON.stringify(eventPath)}. ` +
       `That string is the owner's complete instruction; the other JSON fields are event metadata. ` +
-      `Follow that instruction, read the current linked issue or PR, and post your result at ${url}.`;
+      `Follow AGENTS.md and CONTRIBUTING.md, read the current linked issue or PR, and post your result at ${url}.`;
   }
   return payload;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  if (process.env.GITHUB_RUN_ATTEMPT !== '1' ||
+      process.env.GITHUB_TRIGGERING_ACTOR !== 'jatmn') process.exit(0);
   const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
   const payload = ownerCommandPayload(process.env.GITHUB_EVENT_NAME, process.env.GITHUB_ACTOR, event, process.env.GITHUB_EVENT_PATH);
   if (payload) {

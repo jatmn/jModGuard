@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -59,6 +59,10 @@ test('rejects passive mentions and empty commands', () => {
     '@pullfrog <!-- Please review this -->',
     '@pullfrog `Please review this`',
     '@pullfrog \u200B',
+    '@pullfrog \u115F',
+    '@pullfrog \u1160',
+    '@pullfrog \u3164',
+    '@pullfrog \uFFA0',
     '@pullfrog',
     '@pullfrog   ',
     '@pullfrogger review this',
@@ -86,6 +90,7 @@ test('supplies native PR check context and preserves issue-only commands', () =>
   assert.equal(pr.version, PULLFROG_VERSION);
   assert.equal(pr.triggerer, 'jatmn');
   assert.equal(pr.event.trigger, 'issue_comment_created');
+  assert.equal(pr.event.authorPermission, 'admin');
   assert.equal(pr.event.comment_type, 'issue');
   assert.equal(pr.event.comment_id, 5816388832);
   // reportStatusChecks in the pinned action returns early without these fields.
@@ -126,7 +131,8 @@ test('CLI serializes arbitrary owner text without injecting workflow outputs', (
     }));
     const result = spawnSync(process.execPath, [fileURLToPath(new URL('./pullfrog-command-check.mjs', import.meta.url))], {
       env: { ...process.env, GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath,
-        GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: 'jatmn' },
+        GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: 'jatmn',
+        GITHUB_TRIGGERING_ACTOR: 'jatmn', GITHUB_RUN_ATTEMPT: '1' },
       encoding: 'utf8',
     });
     assert.equal(result.status, 0, result.stderr);
@@ -155,7 +161,8 @@ test('large PR and issue commands use the original snapshot and fit action input
         writeFileSync(outputPath, '');
         const build = spawnSync(process.execPath, [fileURLToPath(new URL('./pullfrog-command-check.mjs', import.meta.url))], {
           env: { ...process.env, GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath,
-            GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: 'jatmn' },
+            GITHUB_EVENT_NAME: 'issue_comment', GITHUB_ACTOR: 'jatmn',
+            GITHUB_TRIGGERING_ACTOR: 'jatmn', GITHUB_RUN_ATTEMPT: '1' },
           encoding: 'utf8',
         });
         assert.equal(build.status, 0, build.stderr);
@@ -189,21 +196,64 @@ test('large PR and issue commands use the original snapshot and fit action input
 test('workflow uses the verified payload, matching pinned action, and owner-only trigger', () => {
   const workflow = readFileSync(new URL('../.github/workflows/pullfrog.yml', import.meta.url), 'utf8');
   assert.ok(workflow.includes('prompt: ${{ steps.authorize.outputs.payload }}'));
-  assert.ok(workflow.includes(`uses: pullfrog/pullfrog@ce127b38d7f0c6c5e2c40ccd290adc4c5652357f # v${PULLFROG_VERSION}`));
+  assert.ok(workflow.includes(`uses: pullfrog/pullfrog@5fe4547eb8efd88bdbf9dbc68a38cc3cd0ae7685 # v${PULLFROG_VERSION}`));
   assert.match(workflow, /status_checks: enabled/);
   assert.match(workflow, /github\.run_attempt == 1/);
   assert.match(workflow, /if: steps\.authorize\.outputs\.authorized == 'true'/);
   assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.doesNotMatch(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /OPENCODE_API_KEY: \$\{\{ secrets\.OPENCODE_API_KEY \}\}/);
-  assert.match(workflow, /PULLFROG_MODEL: \$\{\{ secrets\.PULLFROG_MODEL \}\}/);
-  assert.doesNotMatch(workflow, /^\s*model:/m);
-  const docs = readFileSync(new URL('../docs/PULLFROG.md', import.meta.url), 'utf8');
-  assert.match(docs, /`PULLFROG_MODEL`: the full model id OpenCode Go serves, `opencode-go\/<id>`/);
-  assert.match(docs, /non-empty `PULLFROG_MODEL`, after trimming whitespace, before any console/);
-  assert.match(docs, /a console pick does not replace this\s+secret/);
-  assert.match(docs, /If the secret is missing\s+or only whitespace, the action ignores it/);
-  assert.match(docs, /if none is set Pullfrog auto-selects/);
-  assert.doesNotMatch(docs, /Choose an \*\*OpenCode Go\*\* model in the repo's Agent settings/);
-  assert.doesNotMatch(docs, /falls back to the console model/);
+  assert.match(workflow, /model: openai\/gpt-sol/);
+  assert.match(workflow, /github\.triggering_actor == 'jatmn'/);
+  assert.doesNotMatch(workflow, /\$\{\{\s*secrets\.|OPENCODE_API_KEY|PULLFROG_MODEL/);
+});
+
+function run(event, overrides = {}) {
+  const directory = mkdtempSync(join(tmpdir(), 'pullfrog-test-'));
+  try {
+    const eventPath = join(directory, 'event.json');
+    const outputPath = join(directory, 'output');
+    writeFileSync(eventPath, JSON.stringify(event));
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./pullfrog-command-check.mjs', import.meta.url))], {
+      encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'issue_comment',
+        GITHUB_ACTOR: 'jatmn', GITHUB_TRIGGERING_ACTOR: 'jatmn', GITHUB_RUN_ATTEMPT: '1',
+        GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath, ...overrides },
+    });
+    return { ...result, output: existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : '', eventPath };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('invisible Unicode instructions cannot authorize issue or PR commands', () => {
+  for (const issue of [ownerComment.issue, { number: 98 }]) {
+    const visible = run({ ...ownerComment, issue });
+    assert.equal(visible.status, 0, visible.stderr);
+    assert.ok(visible.output.split('\n').includes('authorized=true'));
+    for (const filler of ['\u115F', '\u1160', '\u3164', '\uFFA0']) {
+      const result = run({ ...ownerComment, issue,
+        comment: { ...ownerComment.comment, body: `@pullfrog ${filler}` } });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.output, '', `invisible instruction U+${filler.codePointAt(0).toString(16)}`);
+    }
+  }
+});
+
+test('other actors, reruns and unrelated events cannot authorize the agent', () => {
+  for (const overrides of [
+    { GITHUB_ACTOR: 'contributor' }, { GITHUB_TRIGGERING_ACTOR: 'contributor' },
+    { GITHUB_RUN_ATTEMPT: '2' }, { GITHUB_EVENT_NAME: 'workflow_dispatch' },
+    { GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'pull_request_review_comment' },
+  ]) {
+    const result = run(ownerComment, overrides);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.output, '');
+  }
+  for (const overrides of [
+    { action: 'edited' }, { sender: { id: 999 } }, { repository: { full_name: 'someone/else' } },
+    { comment: { ...ownerComment.comment, user: { id: 999 } } },
+  ]) {
+    const result = run({ ...ownerComment, ...overrides });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.output, '');
+  }
 });

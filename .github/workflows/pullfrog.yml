@@ -1,7 +1,7 @@
 name: Pullfrog owner command
 
-# Pullfrog is deliberately separate from Buildkite CI. A new comment from the
-# repository owner is the only event that can reach the agent step.
+# Only a new owner command can run the agent. Dashboard dispatch, automatic
+# reviews, pushes, edited comments and schedules are deliberately absent.
 on:
   issue_comment:
     types: [created]
@@ -14,37 +14,32 @@ jobs:
     if: >-
       github.run_attempt == 1 &&
       github.actor == 'jatmn' &&
+      github.triggering_actor == 'jatmn' &&
       github.event.comment.user.id == 12479882 &&
       contains(github.event.comment.body, '@pullfrog')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
     permissions:
       id-token: write
       contents: read
     steps:
       - name: Checkout trusted default branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-
       - name: Verify owner command
         id: authorize
         run: node scripts/pullfrog-command-check.mjs
-
       - name: Run Pullfrog
         if: steps.authorize.outputs.authorized == 'true'
-        # Keep this pin and PULLFROG_VERSION in the command helper in sync.
-        uses: pullfrog/pullfrog@ce127b38d7f0c6c5e2c40ccd290adc4c5652357f # v0.1.82
+        # Keep this bootstrap and PULLFROG_VERSION in the helper in sync.
+        uses: pullfrog/pullfrog@5fe4547eb8efd88bdbf9dbc68a38cc3cd0ae7685 # v0.1.97
         with:
           prompt: ${{ steps.authorize.outputs.payload }}
-          # v0.1.82 supports this override for both native PR checks. The
-          # structured event above supplies their PR identity without dispatch.
+          model: openai/gpt-sol
           status_checks: enabled
           push: restricted
           shell: restricted
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          # Pinned v0.1.82 resolveModel reads this before the console model.
-          # A non-curated opencode-go/<id> passes through; the dashboard picker
-          # does not. See docs/PULLFROG.md.
-          PULLFROG_MODEL: ${{ secrets.PULLFROG_MODEL }}
+        # ChatGPT subscription credentials come from Pullfrog's encrypted store.
+        # No provider API keys are passed from GitHub secrets.
