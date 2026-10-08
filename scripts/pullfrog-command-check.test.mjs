@@ -59,6 +59,10 @@ test('rejects passive mentions and empty commands', () => {
     '@pullfrog <!-- Please review this -->',
     '@pullfrog `Please review this`',
     '@pullfrog \u200B',
+    '@pullfrog \u115F',
+    '@pullfrog \u1160',
+    '@pullfrog \u3164',
+    '@pullfrog \uFFA0',
     '@pullfrog',
     '@pullfrog   ',
     '@pullfrogger review this',
@@ -219,6 +223,20 @@ function run(event, overrides = {}) {
     rmSync(directory, { recursive: true, force: true });
   }
 }
+
+test('invisible Unicode instructions cannot authorize issue or PR commands', () => {
+  for (const issue of [ownerComment.issue, { number: 98 }]) {
+    const visible = run({ ...ownerComment, issue });
+    assert.equal(visible.status, 0, visible.stderr);
+    assert.ok(visible.output.split('\n').includes('authorized=true'));
+    for (const filler of ['\u115F', '\u1160', '\u3164', '\uFFA0']) {
+      const result = run({ ...ownerComment, issue,
+        comment: { ...ownerComment.comment, body: `@pullfrog ${filler}` } });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.output, '', `invisible instruction U+${filler.codePointAt(0).toString(16)}`);
+    }
+  }
+});
 
 test('other actors, reruns and unrelated events cannot authorize the agent', () => {
   for (const overrides of [

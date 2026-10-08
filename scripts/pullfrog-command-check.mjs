@@ -20,7 +20,7 @@ export function isOwnerCommand(eventName, actor, event) {
   const firstLine = body.split(/\r?\n/, 1)[0];
   const command = /^ {0,3}@pullfrog[ \t]+([^\r\n]+)$/i.exec(firstLine);
   if (command === null) return false;
-  const instruction = command[1].trimStart();
+  const instruction = command[1].replace(/\p{Default_Ignorable_Code_Point}/gu, '').trimStart();
   return /^[\p{L}\p{N}]/u.test(instruction);
 }
 
