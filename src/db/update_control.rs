@@ -4,6 +4,8 @@ use super::*;
 use serde::{Deserialize, Serialize};
 
 pub const UPDATE_CONTROL_PROTOCOL: u32 = 3;
+pub const PAIRED_UPGRADES_DISABLED: &str =
+    "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
 pub const LAUNCHER_REVISION: u32 = 2;
@@ -34,6 +36,32 @@ fn warn_api_launcher_cannot_record_upgrade() {
     );
 }
 
+fn warn_api_launcher_observation_not_forwarded() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!("API launcher has no control link; component observations are not recorded");
+}
+
+fn forward_status(reply: &ControlReply) -> &'static str {
+    match reply {
+        ControlReply::Failed { message } if message == crate::control::NOT_THE_WRITER => {
+            "not the writer"
+        }
+        ControlReply::Failed { message } if message == crate::control::RECOVERY_IN_PROGRESS => {
+            "recovery in progress"
+        }
+        ControlReply::Failed { .. } => "failed",
+        ControlReply::Waiting => "waiting",
+        ControlReply::Busy => "busy",
+        ControlReply::StillWaiting => "still waiting",
+        ControlReply::Saved { .. } => "saved",
+        ControlReply::Unchanged { .. } => "unchanged",
+    }
+}
+
 fn require_progress(current: bool) -> Result<()> {
     if !current {
         return Err(UpgradeProgressChanged.into());
@@ -46,6 +74,7 @@ fn require_progress(current: bool) -> Result<()> {
 #[derive(Clone)]
 pub struct UpdateControl {
     db: Db,
+    writer: Option<crate::control::WriterLink>,
 }
 
 /// Immutable application compatibility of this container's baked image. A
@@ -261,11 +290,19 @@ impl UpdateControl {
             },
             |_| Ok(()),
         )?;
-        Ok((!empty.get()).then_some(Self { db }))
+        Ok((!empty.get()).then_some(Self { db, writer: None }))
     }
 
     pub fn from_application(db: &Db) -> Self {
-        Self { db: db.clone() }
+        Self {
+            db: db.clone(),
+            writer: None,
+        }
+    }
+
+    pub fn with_writer_link(mut self, link: crate::control::WriterLink) -> Self {
+        self.writer = Some(link);
+        self
     }
 
     /// Bot-launcher fence. The API launcher never calls this and never writes.
@@ -474,7 +511,14 @@ impl UpdateControl {
         now: i64,
     ) -> Result<()> {
         if !self.writes_locally() {
-            return Ok(());
+            return self
+                .forward_process(ControlOp::RecordComponentRunning {
+                    component: role.to_owned(),
+                    release,
+                    observation,
+                    now,
+                })
+                .await;
         }
         record_component_running(&self.db, role, release, observation, now).await
     }
@@ -486,9 +530,38 @@ impl UpdateControl {
         now: i64,
     ) -> Result<()> {
         if !self.writes_locally() {
-            return Ok(());
+            return self
+                .forward_process(ControlOp::RecordBakedComponentRunning {
+                    component: role.to_owned(),
+                    observation,
+                    now,
+                })
+                .await;
         }
         record_baked_component_running(&self.db, role, observation, now).await
+    }
+
+    /// A missing link is logged once. A refused or unreachable writer is logged
+    /// and still returns `Ok` so the launcher heartbeat can try again.
+    async fn forward_process(&self, op: ControlOp) -> Result<()> {
+        let Some(link) = &self.writer else {
+            warn_api_launcher_observation_not_forwarded();
+            return Ok(());
+        };
+        match link.submit(op, 0).await {
+            Ok(ControlReply::Saved { .. } | ControlReply::Unchanged { .. }) => Ok(()),
+            Ok(reply) => {
+                tracing::warn!(
+                    "API launcher observation was not recorded: {}",
+                    forward_status(&reply)
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!("API launcher observation was not recorded: {error:#}");
+                Ok(())
+            }
+        }
     }
 
     pub async fn failed(&self, role: &str, release: &ComponentRelease, error: &str) -> Result<()> {
@@ -668,9 +741,23 @@ impl UpdateControl {
         record_launcher_failure(&self.db, role, digest, error).await
     }
 
+    /// Paired upgrades stay refused until signed, launcher-routed upgrades land.
+    pub async fn request_upgrade(
+        &self,
+        bot_digest: &str,
+        api_digest: &str,
+        recover: bool,
+        now: i64,
+    ) -> Result<ServiceUpgrade> {
+        let _ = (bot_digest, api_digest, recover, now);
+        anyhow::bail!("{PAIRED_UPGRADES_DISABLED}");
+    }
+
     /// Pin both checked targets atomically before either service is interrupted.
     /// Recovery is an explicit owner action and may only move forwards.
-    pub async fn request_upgrade(
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn queue_paired_upgrade_for_tests(
         &self,
         bot_digest: &str,
         api_digest: &str,
@@ -1052,7 +1139,7 @@ mod tests {
         }
         async fn queue(&self, recover: bool, now: i64) -> Result<ServiceUpgrade> {
             self.control
-                .request_upgrade(
+                .queue_paired_upgrade_for_tests(
                     &format!("sha256:{}", "a".repeat(64)),
                     &format!("sha256:{}", "b".repeat(64)),
                     recover,
@@ -1659,6 +1746,63 @@ mod tests {
                 .launcher_revision,
             22
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_upgrade_request_is_refused_until_issue_188() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let bot = format!("sha256:{}", "a".repeat(64));
+        let api = format!("sha256:{}", "b".repeat(64));
+        for recover in [false, true] {
+            let error = f
+                .control
+                .request_upgrade(&bot, &api, recover, 100)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), PAIRED_UPGRADES_DISABLED);
+            let applied = crate::db::apply_control(
+                &f.control.db,
+                None,
+                crate::db::ControlOp::RequestUpgrade {
+                    bot_digest: bot.clone(),
+                    api_digest: api.clone(),
+                    recover,
+                    now: 100,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(applied.to_string(), PAIRED_UPGRADES_DISABLED);
+            assert_eq!(
+                crate::control::public_error(&applied),
+                PAIRED_UPGRADES_DISABLED
+            );
+        }
+        assert!(f.control.upgrade().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatible_single_container_install_still_queues() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let reply = crate::db::apply_control(
+            &f.control.db,
+            None,
+            crate::db::ControlOp::RequestComponentInstall {
+                component: "bot".into(),
+                digest: digest.clone(),
+                now: 100,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
+        let row = f.control.component("bot").await.unwrap();
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.desired.unwrap().digest, digest);
+        assert!(f.control.upgrade().await.unwrap().is_none());
     }
 
     /// Bot-launcher writes land with no `active_bot_lease` (the bot process is

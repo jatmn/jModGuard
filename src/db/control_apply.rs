@@ -148,6 +148,13 @@ pub enum ControlOp {
         observation: ComponentObservation,
         now: i64,
     },
+    RecordBakedComponentRunning {
+        component: String,
+        observation: ComponentObservation,
+        now: i64,
+    },
+    /// Read a stored result. This never starts an apply.
+    LookupResult,
     RecordComponentFailure {
         component: String,
         failed: ComponentRelease,
@@ -289,6 +296,8 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::ReleaseUpdateLease { .. }
         | ControlOp::RecordUpdateCheck { .. }
         | ControlOp::RecordComponentRunning { .. }
+        | ControlOp::RecordBakedComponentRunning { .. }
+        | ControlOp::LookupResult
         | ControlOp::RecordComponentFailure { .. }
         | ControlOp::RecordWebuiDrift { .. }
         | ControlOp::RecordWebuiInstalledVerified { .. }
@@ -620,6 +629,17 @@ async fn apply_control_inner(
             record_component_running(db, &component, release, observation, now).await?;
             saved_null()
         }
+        ControlOp::RecordBakedComponentRunning {
+            component,
+            observation,
+            now,
+        } => {
+            record_baked_component_running(db, &component, observation, now).await?;
+            saved_null()
+        }
+        ControlOp::LookupResult => Ok(ControlReply::Failed {
+            message: crate::control::OUTCOME_UNKNOWN.into(),
+        }),
         ControlOp::RecordComponentFailure {
             component,
             failed,

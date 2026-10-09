@@ -29,6 +29,30 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn api_writer_link(target: &str, secret: &str) -> Option<jmodguard::control::WriterLink> {
+    if target.is_empty() {
+        tracing::warn!(
+            "API launcher control target is unset; component observations will not be recorded"
+        );
+        return None;
+    }
+    match jmodguard::control::try_writer_link(target, secret) {
+        Ok(Some(link)) => Some(link),
+        Ok(None) => {
+            tracing::warn!(
+                "API launcher control secret is missing or too short; component observations will not be recorded"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                "API launcher control link is unusable; component observations will not be recorded: {error:#}"
+            );
+            None
+        }
+    }
+}
+
 fn spawn_launcher_fence_renewal(control: UpdateControl) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -988,6 +1012,7 @@ async fn establish_launcher(
 async fn main() -> Result<()> {
     let role = role()?;
     let base_sha = std::env::var("JMODGUARD_BASE_SHA").unwrap_or_else(|_| "unknown".into());
+    let mut api_control: Option<(String, String)> = None;
     let (opts, health_bind) = if role == "bot" {
         let cfg = BotProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
@@ -997,6 +1022,10 @@ async fn main() -> Result<()> {
         let cfg = ApiProcessConfig::load()?;
         jmodguard::init_tracing(&cfg.log, "launcher");
         jmodguard::set_shutdown_context("launcher");
+        api_control = Some((
+            cfg.bot.control_target.clone(),
+            cfg.bot.control_secret.as_str().to_owned(),
+        ));
         (cfg.db_open_options(), None)
     };
     let baked = binary_path(&role);
@@ -1065,6 +1094,14 @@ async fn main() -> Result<()> {
             },
             _ = tokio::time::sleep(POLL) => {},
         }
+    };
+    let control = if let Some((target, secret)) = api_control.as_ref() {
+        match api_writer_link(target, secret) {
+            Some(link) => control.with_writer_link(link),
+            None => control,
+        }
+    } else {
+        control
     };
     let instance = format!("{:032x}", rand::random::<u128>());
     let fence_renewal = if role == "bot" {

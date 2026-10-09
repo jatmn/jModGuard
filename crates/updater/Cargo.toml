@@ -23,6 +23,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 axum = "0.8"
+jmodguard = { path = "../..", features = ["test-support"] }
 
 [[bin]]
 name = "jmodguard-launcher"

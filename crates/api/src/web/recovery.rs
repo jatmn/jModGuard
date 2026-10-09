@@ -41,8 +41,11 @@ async fn control_value<T: serde::de::DeserializeOwned>(
         }
         crate::db::ControlReply::Failed { message } => anyhow::bail!(message),
         crate::db::ControlReply::Waiting => anyhow::bail!(jmodguard::control::NOT_THE_WRITER),
-        crate::db::ControlReply::Busy | crate::db::ControlReply::StillWaiting => {
+        crate::db::ControlReply::Busy => {
             anyhow::bail!(jmodguard::control::CONTROL_LINK_UNAVAILABLE)
+        }
+        crate::db::ControlReply::StillWaiting => {
+            anyhow::bail!(jmodguard::control::OUTCOME_UNKNOWN)
         }
     };
     Ok(serde_json::from_value(body)?)
@@ -508,17 +511,26 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                response.status(),
-                if confirmed {
-                    StatusCode::OK
-                } else {
-                    StatusCode::CONFLICT
-                }
-            );
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            if confirmed {
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains(db::PAIRED_UPGRADES_DISABLED), "{text}");
+            }
         }
-        assert!(control.upgrade().await.unwrap().is_some());
-        let upgrade_id = control.upgrade().await.unwrap().unwrap().id;
+        assert!(control.upgrade().await.unwrap().is_none());
+        let upgrade_id = control
+            .queue_paired_upgrade_for_tests(
+                &format!("sha256:{}", "a".repeat(64)),
+                &format!("sha256:{}", "b".repeat(64)),
+                false,
+                now,
+            )
+            .await
+            .unwrap()
+            .id;
         db.with_conn(|conn| {
             let raw: String = conn.query_row(
                 "SELECT value FROM meta WHERE key='component_upgrade_v1'",

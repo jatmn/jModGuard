@@ -348,3 +348,144 @@ async fn check_without_a_control_target_is_control_link_unavailable() {
     drop(app);
     cleanup(&path);
 }
+
+fn add_badword(enrollment: &db::GuildEnrollment, pattern: &str) -> db::ControlOp {
+    let scope = db::ScopeWire {
+        global: false,
+        guild_id: enrollment.guild_id,
+        enrollment_id: enrollment.id.clone(),
+        joined_at_ns: enrollment.joined_at_ns,
+    };
+    db::ControlOp::AddBadword {
+        request: scope.clone(),
+        target: scope,
+        pattern: pattern.into(),
+        note: None,
+    }
+}
+
+async fn linked_writer(
+    label: &str,
+) -> (
+    Arc<jmodguard_bot::state::BotState>,
+    Arc<ApiState>,
+    PathBuf,
+    db::GuildEnrollment,
+) {
+    let path = temp_db(label);
+    let bot_db = Db::open(&path, 2).unwrap();
+    let mut bot_cfg = BotProcessConfig::default();
+    bot_cfg.db.path = path.clone();
+    bot_cfg.bot.control_bind = "127.0.0.1:0".into();
+    bot_cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    let _tenant = TenantRuntime::open(
+        &bot_db,
+        &bot_cfg.db,
+        &bot_cfg.guild_stores,
+        &bot_cfg.evidence,
+    )
+    .unwrap();
+    let enrollment = db::enroll_guild(&bot_db, 55_555, 1).await.unwrap().unwrap();
+    let bot = jmodguard_bot::state::BotState::new(bot_cfg, bot_db).unwrap();
+    bot.activation.mark_lock_held(true);
+    assert!(
+        db::claim_active_bot(
+            &bot.db,
+            bot.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    bot.install_control_actor_lookup(|actor, _| {
+        (actor == 7).then_some(db::CachedGuildActor {
+            guild_owner_id: 0,
+            permissions: 1 << 5,
+        })
+    });
+    let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
+        .unwrap()
+        .expect("control listener");
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    cfg.bot.control_secret = ControlSecret::new("x".repeat(32));
+    cfg.bot.control_target = bound.to_string();
+    let db = Db::open_with(cfg.db_open_options()).unwrap();
+    let app = ApiState::new(cfg, db).unwrap();
+    (bot, app, path, enrollment)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_moderation_saves_one_badword_when_released_before_expiry() {
+    let (bot, app, path, enrollment) = linked_writer("hold-save").await;
+    let hold = bot.activation.hold_rule();
+    let app_task = Arc::clone(&app);
+    let op = add_badword(&enrollment, "once");
+    let pending = tokio::spawn(async move { app_task.commit_json_actor(7, op).await });
+    let admitted = std::time::Instant::now();
+    while bot.activation.in_flight() < 2 {
+        assert!(
+            admitted.elapsed() < std::time::Duration::from_secs(3),
+            "the control job was not admitted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    drop(hold);
+    let saved = pending.await.unwrap().unwrap();
+    assert!(!saved.0);
+    assert_eq!(
+        db::list_badwords(&bot.db, enrollment.guild_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_moderation_past_expiry_returns_request_expired_and_a_fresh_submit_applies_once() {
+    let (bot, app, path, enrollment) = linked_writer("hold-expire").await;
+    let hold = bot.activation.hold_rule();
+    let app_task = Arc::clone(&app);
+    let op = add_badword(&enrollment, "late");
+    let pending = tokio::spawn(async move { app_task.commit_json_actor(7, op).await });
+    let admitted = std::time::Instant::now();
+    while bot.activation.in_flight() < 2 {
+        assert!(
+            admitted.elapsed() < std::time::Duration::from_secs(3),
+            "the control job was not admitted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+    drop(hold);
+    let error = pending.await.unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "request expired");
+    assert!(
+        db::list_badwords(&bot.db, enrollment.guild_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let saved = app
+        .commit_json_actor(7, add_badword(&enrollment, "late"))
+        .await
+        .unwrap();
+    assert!(!saved.0);
+    assert_eq!(
+        db::list_badwords(&bot.db, enrollment.guild_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}

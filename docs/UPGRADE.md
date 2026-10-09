@@ -89,6 +89,8 @@ Env overrides (`JMODGUARD_*`) still win over the file.
 
 With the launcher-aware coordinated-update baseline installed, supported in-container upgrades
 use **Administration → Updates → Update bot and API together / recovery**.
+Paired bot and API upgrades are refused until signed, launcher-routed upgrades land (issue 188).
+Single-container installs still work. Schema changes ship in new images.
 That flow enforces the stop/migrate/start ordering below and persists restart
 recovery. See [Bunny updates](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
 Normal Update installs a required launcher before its application; the update page

@@ -28,6 +28,7 @@ enum ReplyState {
 
 struct StoredReply {
     at: Instant,
+    actor_user_id: i64,
     state: ReplyState,
 }
 
@@ -63,11 +64,19 @@ fn evict_results(guard: &mut HashMap<String, StoredReply>, now: Instant) {
 fn evict_and_insert(
     guard: &mut HashMap<String, StoredReply>,
     request_id: String,
+    actor_user_id: i64,
     state: ReplyState,
 ) {
     let now = Instant::now();
     evict_results(guard, now);
-    guard.insert(request_id, StoredReply { at: now, state });
+    guard.insert(
+        request_id,
+        StoredReply {
+            at: now,
+            actor_user_id,
+            state,
+        },
+    );
     evict_results(guard, now);
 }
 
@@ -89,11 +98,43 @@ fn remember(results: &Results, request_id: &str, reply: &ControlReply) {
         guard.remove(request_id);
         return;
     }
+    let actor_user_id = guard
+        .get(request_id)
+        .map(|entry| entry.actor_user_id)
+        .unwrap_or(0);
     evict_and_insert(
         &mut guard,
         request_id.to_owned(),
+        actor_user_id,
         ReplyState::Ready(reply.clone()),
     );
+}
+
+fn lookup_reply(
+    results: &Results,
+    request_id: &str,
+    actor_user_id: i64,
+    expires_ms: i64,
+) -> ControlReply {
+    let guard = results
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.get(request_id)
+        && entry.actor_user_id == actor_user_id
+    {
+        return match &entry.state {
+            ReplyState::Ready(done) => done.clone(),
+            ReplyState::Pending => ControlReply::StillWaiting,
+        };
+    }
+    drop(guard);
+    if control::now_ms() > expires_ms {
+        ControlReply::Failed {
+            message: control::OUTCOME_UNKNOWN.into(),
+        }
+    } else {
+        ControlReply::StillWaiting
+    }
 }
 
 fn forget(results: &Results, request_id: &str) {
@@ -251,15 +292,6 @@ fn handle(
         Ok(body) => body,
         Err(_) => return,
     };
-    if activation.recovery_in_progress() {
-        let _ = reply(
-            stream,
-            &ControlReply::Failed {
-                message: control::RECOVERY_IN_PROGRESS.into(),
-            },
-        );
-        return;
-    }
     let (op, actor_user_id, expires_ms, request_id) = match control::open_frame(key, &body, nonces)
     {
         Ok(opened) => opened,
@@ -273,18 +305,36 @@ fn handle(
             return;
         }
     };
+    if matches!(op, db::ControlOp::LookupResult) {
+        let done = lookup_reply(results, &request_id, actor_user_id, expires_ms);
+        let _ = reply(stream, &done);
+        return;
+    }
+    if activation.recovery_in_progress() {
+        let _ = reply(
+            stream,
+            &ControlReply::Failed {
+                message: control::RECOVERY_IN_PROGRESS.into(),
+            },
+        );
+        return;
+    }
     enum Replay {
         Ready(ControlReply),
         Pending,
+        Foreign,
         New,
     }
     {
         let mut guard = results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cached = match guard.get(&request_id).map(|entry| &entry.state) {
-            Some(ReplyState::Ready(done)) => Replay::Ready(done.clone()),
-            Some(ReplyState::Pending) => Replay::Pending,
+        let cached = match guard.get(&request_id) {
+            Some(entry) if entry.actor_user_id == actor_user_id => match &entry.state {
+                ReplyState::Ready(done) => Replay::Ready(done.clone()),
+                ReplyState::Pending => Replay::Pending,
+            },
+            Some(_) => Replay::Foreign,
             None => Replay::New,
         };
         match cached {
@@ -298,7 +348,22 @@ fn handle(
                 let _ = reply(stream, &ControlReply::StillWaiting);
                 return;
             }
-            Replay::New => evict_and_insert(&mut guard, request_id.clone(), ReplyState::Pending),
+            Replay::Foreign => {
+                drop(guard);
+                let _ = reply(
+                    stream,
+                    &ControlReply::Failed {
+                        message: control::OUTCOME_UNKNOWN.into(),
+                    },
+                );
+                return;
+            }
+            Replay::New => evict_and_insert(
+                &mut guard,
+                request_id.clone(),
+                actor_user_id,
+                ReplyState::Pending,
+            ),
         }
     }
     let Some(_hold) = activation.hold_control() else {
@@ -380,6 +445,7 @@ mod tests {
                     at: now
                         .checked_sub(result_ttl() + Duration::from_secs(1))
                         .unwrap_or(now),
+                    actor_user_id: 1,
                     state: ReplyState::Ready(ControlReply::Saved {
                         body: serde_json::Value::Null,
                     }),
@@ -389,6 +455,7 @@ mod tests {
                 "pending".into(),
                 StoredReply {
                     at: now,
+                    actor_user_id: 1,
                     state: ReplyState::Pending,
                 },
             );
@@ -423,6 +490,7 @@ mod tests {
                 format!("pending-{index}"),
                 StoredReply {
                     at: now,
+                    actor_user_id: 1,
                     state: ReplyState::Pending,
                 },
             );
@@ -431,12 +499,14 @@ mod tests {
             "oldest-ready".into(),
             StoredReply {
                 at: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
+                actor_user_id: 1,
                 state: ReplyState::Ready(ControlReply::Waiting),
             },
         );
         evict_and_insert(
             &mut guard,
             "newest-ready".into(),
+            1,
             ReplyState::Ready(ControlReply::Busy),
         );
         assert_eq!(guard.len(), RESULT_CAP);
@@ -1038,9 +1108,14 @@ mod tests {
         let bot = BotState::new(cfg, database).unwrap();
         crate::recovery::arm_pending_pause();
         assert!(
-            crate::activation::claim_writer_lease(&"x".repeat(32), &bot.db, &bot.activation)
-                .await
-                .unwrap()
+            crate::activation::claim_writer_lease(
+                &"x".repeat(32),
+                &bot.db,
+                &bot.activation,
+                Some(&bot.tenant),
+            )
+            .await
+            .unwrap()
         );
         let started = std::time::Instant::now();
         while !crate::recovery::pending_pause_entered() {
@@ -1074,6 +1149,126 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        drop(bot);
+        cleanup(&path);
+    }
+
+    fn badword(enrollment: &db::GuildEnrollment, pattern: &str) -> db::ControlOp {
+        let scope = scope(enrollment);
+        db::ControlOp::AddBadword {
+            request: scope.clone(),
+            target: scope,
+            pattern: pattern.into(),
+            note: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lookup_never_applies_and_returns_only_the_same_actors_result() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let hold = bot.activation.hold_rule();
+        let unknown = control::random_request_id().unwrap();
+        let frame = control::seal_with_request(
+            &key(),
+            &db::ControlOp::LookupResult,
+            7,
+            control::now_ms().saturating_add(control::CONTROL_REQUEST_LIFETIME_MS),
+            &unknown,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let reply = submit(bound, frame);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a lookup must not wait behind moderation"
+        );
+        assert!(matches!(reply, ControlReply::StillWaiting), "{reply:?}");
+        assert!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(hold);
+
+        let request_id = control::random_request_id().unwrap();
+        let saved = submit(
+            bound,
+            control::seal_with_request(
+                &key(),
+                &badword(&enrollment, "once"),
+                7,
+                control::now_ms().saturating_add(control::CONTROL_REQUEST_LIFETIME_MS),
+                &request_id,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(saved, ControlReply::Saved { .. }), "{saved:?}");
+        let same = submit(
+            bound,
+            control::seal_with_request(
+                &key(),
+                &db::ControlOp::LookupResult,
+                7,
+                control::now_ms().saturating_add(control::CONTROL_REQUEST_LIFETIME_MS),
+                &request_id,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(same, ControlReply::Saved { .. }), "{same:?}");
+        let other = submit(
+            bound,
+            control::seal_with_request(
+                &key(),
+                &db::ControlOp::LookupResult,
+                8,
+                control::now_ms().saturating_add(control::CONTROL_REQUEST_LIFETIME_MS),
+                &request_id,
+            )
+            .unwrap(),
+        );
+        assert!(
+            matches!(other, ControlReply::StillWaiting),
+            "another actor must not read the stored result: {other:?}"
+        );
+        assert_eq!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_lookup_after_expiry_is_outcome_unknown() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        allow_actor(&bot);
+        bot.activation.set_recovery_in_progress(true);
+        bot.activation.note_lease_lost();
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let frame = control::seal_with_request(
+            &key(),
+            &db::ControlOp::LookupResult,
+            7,
+            control::now_ms().saturating_sub(1_000),
+            &control::random_request_id().unwrap(),
+        )
+        .unwrap();
+        let reply = submit(bound, frame);
+        assert_eq!(failure_message(&reply), control::OUTCOME_UNKNOWN);
+        assert!(
+            db::list_badwords(&bot.db, enrollment.guild_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         drop(bot);
         cleanup(&path);
     }

@@ -159,7 +159,9 @@ impl ApiState {
             db::ControlReply::Unchanged { body } => Ok((true, body)),
             db::ControlReply::Waiting => anyhow::bail!("waiting"),
             db::ControlReply::Busy => anyhow::bail!("busy"),
-            db::ControlReply::StillWaiting => anyhow::bail!("still_waiting"),
+            db::ControlReply::StillWaiting => {
+                anyhow::bail!("{}", jmodguard::control::OUTCOME_UNKNOWN)
+            }
             db::ControlReply::Failed { message } => anyhow::bail!(message),
         }
     }

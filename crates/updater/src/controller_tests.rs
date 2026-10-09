@@ -321,7 +321,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
             .is_err()
     );
     let operation = control
-        .request_upgrade(&bot_release.digest, &api_release.digest, false, now())
+        .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, false, now())
         .await
         .unwrap();
     // Simulate an older capable controller executing the real prerequisite path.
@@ -505,7 +505,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
         assert!(control.abort_upgrade(&failed.id).await.is_err());
         tokio::fs::remove_file(root.join(failure)).await.unwrap();
         control
-            .request_upgrade(&bot_release.digest, &api_release.digest, true, now())
+            .queue_paired_upgrade_for_tests(&bot_release.digest, &api_release.digest, true, now())
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -921,7 +921,7 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
             .unwrap();
     }
     let op = control
-        .request_upgrade(&target.digest, &api.digest, false, now())
+        .queue_paired_upgrade_for_tests(&target.digest, &api.digest, false, now())
         .await
         .unwrap();
     restart(&mut bot).await; // application stopped for the launcher handoff
@@ -1039,7 +1039,7 @@ async fn completed_coordinated_upgrade(root: &Path) -> (Db, UpdateControl, Compo
             .unwrap();
     }
     let op = control
-        .request_upgrade(&bot.digest, &api.digest, false, stamp)
+        .queue_paired_upgrade_for_tests(&bot.digest, &api.digest, false, stamp)
         .await
         .unwrap();
     let seen = control.component("bot").await.unwrap().observed.unwrap();

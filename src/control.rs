@@ -21,7 +21,13 @@ const BODY_LIMIT: usize = 256 * 1024;
 const MAC_HEX: usize = 64;
 const MIN_SECRET_LEN: usize = 32;
 pub const MAX_AGE_MS: i64 = 60_000;
+/// One dashboard attempt. Every frame of that attempt uses this same expiry.
+pub const CONTROL_REQUEST_LIFETIME_MS: i64 = 15_000;
+const OUTCOME_GRACE_MS: i64 = 4_000;
+const LOOKUP_POLL: Duration = Duration::from_millis(250);
+const _: () = assert!(CONTROL_REQUEST_LIFETIME_MS <= MAX_AGE_MS);
 const SKEW_MS: i64 = 5_000;
+const _: () = assert!(OUTCOME_GRACE_MS < SKEW_MS);
 const SEEN_LIMIT: usize = 4096;
 const REQUEST_ID_HEX: usize = 64;
 
@@ -31,6 +37,8 @@ pub const CONTROL_LINK_UNAVAILABLE: &str = "control link unavailable";
 pub const NOT_THE_WRITER: &str = "not the writer";
 /// Exact status while the bot is still applying maintenance recovery.
 pub const RECOVERY_IN_PROGRESS: &str = "recovery in progress";
+/// The attempt's expiry passed without a stored outcome. Reload before retrying.
+pub const OUTCOME_UNKNOWN: &str = "outcome unknown; reload before retrying";
 
 #[derive(Debug)]
 pub struct WriterLinkNotReady;
@@ -81,7 +89,7 @@ impl WriterLink {
         self.submit_request(op, actor_user_id, request_id).await
     }
 
-    /// One dashboard attempt keeps `request_id` for its retry. A later attempt
+    /// One dashboard attempt keeps `request_id` and one expiry. A later attempt
     /// calls [`Self::submit`] and gets a new id.
     pub async fn submit_request(
         &self,
@@ -89,24 +97,53 @@ impl WriterLink {
         actor_user_id: i64,
         request_id: String,
     ) -> Result<ControlReply> {
+        let expires_ms = now_ms().saturating_add(CONTROL_REQUEST_LIFETIME_MS);
         let addr = self.addr;
         let key = self.key.clone();
-        let op_retry = op.clone();
-        let id_retry = request_id.clone();
-        let key_retry = key.clone();
+        let id = request_id.clone();
         let first = tokio::task::spawn_blocking(move || {
-            submit_blocking(addr, &key, &op, actor_user_id, &request_id)
+            submit_blocking(addr, &key, &op, actor_user_id, expires_ms, &id)
         })
         .await
         .context("write failed")??;
         if !matches!(first, ControlReply::StillWaiting) {
             return Ok(first);
         }
-        tokio::task::spawn_blocking(move || {
-            submit_blocking(addr, &key_retry, &op_retry, actor_user_id, &id_retry)
-        })
-        .await
-        .context("write failed")?
+        let grace_deadline = expires_ms.saturating_add(OUTCOME_GRACE_MS);
+        loop {
+            if now_ms() > grace_deadline {
+                return Ok(outcome_unknown());
+            }
+            tokio::time::sleep(LOOKUP_POLL).await;
+            if now_ms() > grace_deadline {
+                return Ok(outcome_unknown());
+            }
+            let addr = self.addr;
+            let key = self.key.clone();
+            let id = request_id.clone();
+            let looked_up = tokio::task::spawn_blocking(move || {
+                submit_blocking(
+                    addr,
+                    &key,
+                    &ControlOp::LookupResult,
+                    actor_user_id,
+                    expires_ms,
+                    &id,
+                )
+            })
+            .await;
+            match looked_up {
+                Ok(Ok(ControlReply::StillWaiting)) => {}
+                Ok(Ok(done)) => return Ok(done),
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+    }
+}
+
+fn outcome_unknown() -> ControlReply {
+    ControlReply::Failed {
+        message: OUTCOME_UNKNOWN.to_owned(),
     }
 }
 
@@ -205,6 +242,7 @@ fn submit_blocking(
     key: &[u8],
     op: &ControlOp,
     actor_user_id: i64,
+    expires_ms: i64,
     request_id: &str,
 ) -> Result<ControlReply> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
@@ -215,13 +253,7 @@ fn submit_blocking(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| anyhow::anyhow!("write failed"))?;
-    let frame = seal_with_request(
-        key,
-        op,
-        actor_user_id,
-        now_ms().saturating_add(MAX_AGE_MS),
-        request_id,
-    )?;
+    let frame = seal_with_request(key, op, actor_user_id, expires_ms, request_id)?;
     stream
         .write_all(&frame)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
