@@ -307,23 +307,52 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
     }
 }
 
-/// Every scope a copy must authorize. Other operations keep a single need.
+/// Every scope a request must authorize. Copy keeps source and destination.
+/// Other request-plus-target configuration ops keep the request guild and the
+/// target, without repeating the same need.
 pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
     match op {
         ControlOp::CopyGuildConfig {
             source,
             destination,
             ..
-        } => {
-            let source_need = scope_actor_need(source);
-            let destination_need = scope_actor_need(destination);
-            if source_need == destination_need {
-                vec![destination_need]
-            } else {
-                vec![source_need, destination_need]
-            }
+        } => pair_needs(scope_actor_need(source), scope_actor_need(destination)),
+        ControlOp::UpsertRule {
+            request, target, ..
         }
+        | ControlOp::DeleteRule {
+            request, target, ..
+        }
+        | ControlOp::AddBadword {
+            request, target, ..
+        }
+        | ControlOp::DeleteBadword {
+            request, target, ..
+        }
+        | ControlOp::UpsertCommand {
+            request, target, ..
+        }
+        | ControlOp::DeleteCommand {
+            request, target, ..
+        }
+        | ControlOp::UpsertTemplate {
+            request, target, ..
+        }
+        | ControlOp::DeleteTemplate {
+            request, target, ..
+        }
+        | ControlOp::PutLogFilter {
+            request, target, ..
+        } => pair_needs(scope_actor_need(request), scope_actor_need(target)),
         other => vec![control_actor_need(other)],
+    }
+}
+
+fn pair_needs(first: ControlActorNeed, second: ControlActorNeed) -> Vec<ControlActorNeed> {
+    if first == second {
+        vec![first]
+    } else {
+        vec![first, second]
     }
 }
 

@@ -471,6 +471,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_upsert_does_not_apply_when_the_request_guild_permission_is_revoked() {
+        let path =
+            std::env::temp_dir().join(format!("control_actor_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let mut cfg = BotProcessConfig::default();
+        cfg.bot.control_bind = "127.0.0.1:0".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
+        cfg.bot.owner_id = 7;
+        let bot = BotState::new(cfg, database).unwrap();
+        bot.activation.mark_lock_held(true);
+        assert!(
+            db::claim_active_bot(
+                &bot.db,
+                bot.activation.instance(),
+                control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, None);
+        bot.install_discord_cache(cache);
+        let source_allowed = Arc::new(AtomicBool::new(true));
+        let allowed = Arc::clone(&source_allowed);
+        bot.install_member_lookup(move |guild, _| {
+            let permitted = guild != 10 || allowed.load(Ordering::SeqCst);
+            async move { ControlMemberFetch::Found(Box::new(actor_member(guild, permitted))) }
+        });
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let hold = bot.activation.hold_rule();
+        let op = db::ControlOp::UpsertRule {
+            request: scope(&enrollment),
+            target: db::ScopeWire {
+                global: true,
+                guild_id: 0,
+                enrollment_id: String::new(),
+                joined_at_ns: 0,
+            },
+            id: "spam".into(),
+            rule: crate::types::RuleDef {
+                name: "spam".into(),
+                description: String::new(),
+                enabled: true,
+                dry_run: false,
+                params: serde_json::Value::Null,
+                actions: Vec::new(),
+                whitelist_roles: Vec::new(),
+                whitelist_channels: Vec::new(),
+                whitelist_users: Vec::new(),
+            },
+        };
+        let frame = seal(&op, 7);
+        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        source_allowed.store(false, Ordering::SeqCst);
+        drop(hold);
+        let reply = pending.await.unwrap();
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert!(db::get_rule(&bot.db, 0, "spam").await.unwrap().is_none());
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
     async fn queued_control_expires_before_apply() {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();

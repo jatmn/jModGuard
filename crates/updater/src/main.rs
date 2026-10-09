@@ -1049,9 +1049,14 @@ async fn main() -> Result<()> {
         }
     };
     let handoff_digest = std::env::var("JMODGUARD_LAUNCHER_RELEASE").ok();
+    let baked_controller = handoff_digest.is_none();
     let baked_compatibility = control
-        .baked_compatibility(&role, &base_sha, handoff_digest.is_none())
+        .baked_compatibility(&role, &base_sha, baked_controller)
         .await?;
+    // The API process is read-only, so the baked bot controller stores both rows.
+    if role == "bot" && baked_controller {
+        control.baked_compatibility("api", &base_sha, true).await?;
+    }
     let hash = sha256_hex(&tokio::fs::read(std::env::current_exe()?).await?);
     // Capability is published only after the pinned release is verified.
     // A rejected handoff must not leave Administration treating this binary as active.

@@ -39,7 +39,13 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     write_probe_marker(&dir, "bot-migrate", if migrate { "true" } else { "false" })?;
     let db = open_database(&cfg).await?;
     let app = BotState::new(cfg, db)?;
-    if !crate::activation::wait_for_writer_lock(&app.db, &app.activation).await? {
+    if !crate::activation::claim_writer_lease(
+        app.cfg.bot.control_secret.as_str(),
+        &app.db,
+        &app.activation,
+    )
+    .await?
+    {
         bail!("bot probe stopped before it held the writer lease");
     }
     let _renewal = crate::activation::spawn_renewal(app.db.clone(), Arc::clone(&app.activation));

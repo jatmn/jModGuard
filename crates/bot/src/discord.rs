@@ -8,6 +8,38 @@ use serenity::model::id::ChannelId;
 /// cannot stall durable work for every guild indefinitely.
 pub const DISCORD_REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Outcome of a Discord call raced against writer cutoff.
+pub(crate) enum DiscordCall<T> {
+    Finished(T),
+    Cancelled,
+}
+
+/// Cancel the Discord future if cutoff wins. The waiter is registered inside
+/// `until_cutoff` before the flag is observed, so a cutoff between the flag
+/// read and the wait is not missed. Dropping `call` is the cancellation.
+pub(crate) async fn race_discord_call<F>(
+    activation: &crate::activation::Activation,
+    call: F,
+) -> DiscordCall<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(call);
+    tokio::select! {
+        biased;
+        _ = activation.until_cutoff() => DiscordCall::Cancelled,
+        value = &mut call => DiscordCall::Finished(value),
+    }
+}
+
+/// A non-4xx error so [`crate::cases::classify_discord`] reports [`crate::db::guild_data::CaseOutcome::Uncertain`].
+pub(crate) fn cutoff_discord_error() -> serenity::Error {
+    serenity::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "cutoff",
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicknameFailureClass {
     Transient,

@@ -365,17 +365,20 @@ async fn enforce(
         }
         let outcome = match tokio::time::timeout(
             Duration::from_secs(10),
-            http.delete_message(
-                ChannelId::new(*channel),
-                MessageId::new(*message),
-                Some("spam match"),
+            crate::discord::race_discord_call(
+                &app.activation,
+                http.delete_message(
+                    ChannelId::new(*channel),
+                    MessageId::new(*message),
+                    Some("spam match"),
+                ),
             ),
         )
         .await
         {
-            Ok(Ok(())) => CaseOutcome::Succeeded,
-            Ok(Err(error)) => delete_outcome(&error),
-            Err(_) => CaseOutcome::Uncertain,
+            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => CaseOutcome::Succeeded,
+            Ok(crate::discord::DiscordCall::Finished(Err(error))) => delete_outcome(&error),
+            Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
         };
         app.spam_gate.finish_delete(
             found.guild,
@@ -450,56 +453,71 @@ async fn enforce(
                         );
                         let discord = tokio::time::timeout(
                             Duration::from_secs(10),
-                            GuildId::new(found.guild).ban_with_reason(
-                                http,
-                                UserId::new(found.author),
-                                0,
-                                &found.reason,
+                            crate::discord::race_discord_call(
+                                &app.activation,
+                                GuildId::new(found.guild).ban_with_reason(
+                                    http,
+                                    UserId::new(found.author),
+                                    0,
+                                    &found.reason,
+                                ),
                             ),
                         )
                         .await;
-                        let outcome = match discord {
-                            Ok(Ok(())) => CaseOutcome::Succeeded,
-                            Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
-                            Err(_) => CaseOutcome::Uncertain,
-                        };
-                        app.spam_gate.finish_ban(
-                            found.guild,
-                            found.author,
-                            now,
-                            matches!(outcome, CaseOutcome::Succeeded),
-                        );
-                        if release_gateway_ban_suppression(&outcome) {
-                            app.release_gateway_case_suppression(suppression);
-                        }
-                        if app.activation.may_record() {
-                            if matches!(outcome, CaseOutcome::Succeeded) {
-                                let _ = crate::db::record_enrolled_ban_if_absent(
-                                    &app.db,
+                        if matches!(discord, Ok(crate::discord::DiscordCall::Cancelled)) {
+                            app.spam_gate
+                                .finish_ban(found.guild, found.author, now, false);
+                            pending_ban.finish(app, CaseOutcome::Uncertain).await;
+                        } else {
+                            let outcome = match discord {
+                                Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+                                    CaseOutcome::Succeeded
+                                }
+                                Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                                    crate::cases::classify_discord(Some(&error))
+                                }
+                                Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+                                    CaseOutcome::Uncertain
+                                }
+                            };
+                            app.spam_gate.finish_ban(
+                                found.guild,
+                                found.author,
+                                now,
+                                matches!(outcome, CaseOutcome::Succeeded),
+                            );
+                            if release_gateway_ban_suppression(&outcome) {
+                                app.release_gateway_case_suppression(suppression);
+                            }
+                            if app.activation.may_record() {
+                                if matches!(outcome, CaseOutcome::Succeeded) {
+                                    let _ = crate::db::record_enrolled_ban_if_absent(
+                                        &app.db,
+                                        Some(enrollment.clone()),
+                                        found.author as i64,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        &format!("[automod:{rule}] {}", found.reason),
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                ban_outcome = Some(outcome.clone());
+                                ban_case = crate::cases::record_application(
+                                    app,
                                     Some(enrollment.clone()),
-                                    found.author as i64,
+                                    CaseAction::Ban,
+                                    outcome.clone(),
+                                    found.author,
                                     None,
-                                    None,
-                                    None,
-                                    None,
-                                    &format!("[automod:{rule}] {}", found.reason),
-                                    None,
+                                    Some(found.reason.clone()),
+                                    evidence(found.excerpts.clone()),
                                 )
                                 .await;
+                                pending_ban.finish(app, outcome).await;
                             }
-                            ban_outcome = Some(outcome.clone());
-                            ban_case = crate::cases::record_application(
-                                app,
-                                Some(enrollment.clone()),
-                                CaseAction::Ban,
-                                outcome.clone(),
-                                found.author,
-                                None,
-                                Some(found.reason.clone()),
-                                evidence(found.excerpts.clone()),
-                            )
-                            .await;
-                            pending_ban.finish(app, outcome).await;
                         }
                     }
                 }

@@ -563,12 +563,10 @@ impl BotState {
     ) -> Result<(), &'static str> {
         if self.control_actor_lookup.lock().is_some() {
             let cached = self.cached_control_actor(actor_user_id, op);
-            return db::decide_control_actor(
-                db::control_actor_need(op),
-                actor_user_id,
-                self.cfg.bot.owner_id,
-                cached,
-            );
+            for need in db::control_actor_needs(op) {
+                db::decide_control_actor(need, actor_user_id, self.cfg.bot.owner_id, cached)?;
+            }
+            return Ok(());
         }
         for need in db::control_actor_needs(op) {
             self.authorize_control_need(need, actor_user_id).await?;

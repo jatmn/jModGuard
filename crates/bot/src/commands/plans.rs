@@ -190,7 +190,14 @@ async fn run_guarded_case_step(
     discord: impl std::future::Future<Output = serenity::Result<()>>,
 ) -> Result<()> {
     require_plan_writer(&app.activation).await?;
-    let result = discord.await;
+    let result = match crate::discord::race_discord_call(&app.activation, discord).await {
+        crate::discord::DiscordCall::Cancelled => {
+            let cancelled = Err(crate::discord::cutoff_discord_error());
+            record_step_outcome(app, actor, enrollment, action, target, &cancelled).await;
+            anyhow::bail!("writer lease is not held");
+        }
+        crate::discord::DiscordCall::Finished(result) => result,
+    };
     require_plan_writer(&app.activation).await?;
     record_step_outcome(app, actor, enrollment, action, target, &result).await;
     result.map_err(|error| anyhow!("{error}"))
@@ -215,13 +222,25 @@ async fn run_step(
             let text = crate::templates::render(template, vars);
             let user_id = target.unwrap_or(env.actor);
             require_plan_writer(&env.app.activation).await?;
-            let channel = env
-                .ctx
-                .http
-                .create_private_channel(&serde_json::json!({"recipient_id": user_id.get()}))
-                .await?;
+            let channel = match crate::discord::race_discord_call(
+                &env.app.activation,
+                env.ctx
+                    .http
+                    .create_private_channel(&serde_json::json!({"recipient_id": user_id.get()})),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(channel) => channel?,
+            };
             require_plan_writer(&env.app.activation).await?;
-            let _ = channel.say(&env.ctx.http, &text).await;
+            let _ = crate::discord::race_discord_call(
+                &env.app.activation,
+                channel.say(&env.ctx.http, &text),
+            )
+            .await;
         }
         PlanStep::Log { event, template } => {
             let text = crate::templates::render(template, vars);
@@ -234,17 +253,33 @@ async fn run_step(
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
             refuse_fenced_discord_mutation(env).await?;
             require_plan_writer(&env.app.activation).await?;
-            member
-                .add_role(&env.ctx.http, RoleId::new(*role_id))
-                .await?;
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                member.add_role(&env.ctx.http, RoleId::new(*role_id)),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(result) => result?,
+            }
         }
         PlanStep::RemoveRole { role_id } => {
             let member = target_member(env, target.unwrap_or(env.actor)).await?;
             refuse_fenced_discord_mutation(env).await?;
             require_plan_writer(&env.app.activation).await?;
-            member
-                .remove_role(&env.ctx.http, RoleId::new(*role_id))
-                .await?;
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                member.remove_role(&env.ctx.http, RoleId::new(*role_id)),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                }
+                crate::discord::DiscordCall::Finished(result) => result?,
+            }
         }
         PlanStep::Timeout { minutes } => {
             let target = target.expect("target-required plan steps are validated before execution");
@@ -328,10 +363,25 @@ async fn run_step(
                         env.guild_id.get(),
                         target.get(),
                     );
-                    let result = env
-                        .guild_id
-                        .ban_with_reason(&env.ctx.http, target, *delete_days, "custom command")
-                        .await;
+                    let result = match crate::discord::race_discord_call(
+                        &env.app.activation,
+                        env.guild_id.ban_with_reason(
+                            &env.ctx.http,
+                            target,
+                            *delete_days,
+                            "custom command",
+                        ),
+                    )
+                    .await
+                    {
+                        crate::discord::DiscordCall::Cancelled => {
+                            pending_ban
+                                .finish(env.app, crate::db::guild_data::CaseOutcome::Uncertain)
+                                .await;
+                            anyhow::bail!("ban outcome is uncertain; verify it in Discord");
+                        }
+                        crate::discord::DiscordCall::Finished(result) => result,
+                    };
                     if matches!(
                         crate::cases::classify_discord(result.as_ref().err()),
                         crate::db::guild_data::CaseOutcome::Failed
@@ -378,21 +428,25 @@ async fn run_step(
         PlanStep::DeleteCommandMessage => {
             if let Some(id) = env.source_message {
                 require_plan_writer(&env.app.activation).await?;
-                let _ = env.channel_id.delete_message(&env.ctx.http, id).await;
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.channel_id.delete_message(&env.ctx.http, id),
+                )
+                .await;
             }
         }
         PlanStep::React { emoji } => {
             if let Some(id) = env.source_message {
                 require_plan_writer(&env.app.activation).await?;
-                let _ = env
-                    .ctx
-                    .http
-                    .create_reaction(
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.ctx.http.create_reaction(
                         env.channel_id,
                         id,
                         &serenity::model::channel::ReactionType::Unicode(emoji.clone()),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
             }
         }
         PlanStep::Wait { secs } => {

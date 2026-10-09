@@ -500,10 +500,11 @@ pub async fn add_enrolled_warn(
 
 /// Insert an active ban row for this dispatch.
 ///
-/// The same reason, moderator, and `created_at` returns `None` and writes nothing.
-/// Any other active row for the guild and user is marked inactive in the same transaction,
-/// then the new row is inserted and its id is returned. An ended row does not block the insert.
-/// `Some` means a row was inserted.
+/// The same guild, user, reason, and moderator, while a row is still active, returns
+/// `None` and writes nothing even when `occurred_at` is `None`. `created_at` stays the
+/// timestamp of the insert and is not the dispatch identity. A different reason replaces
+/// the stale active row. An ended row does not block the insert. `Some` means a row was
+/// inserted and the caller may publish. `None` means do not publish.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_enrolled_ban_if_absent(
     db: &Db,
@@ -533,9 +534,9 @@ pub async fn record_enrolled_ban_if_absent(
             .query_row(
                 "SELECT id FROM bans
                  WHERE guild_id=?1 AND user_id=?2 AND active=1
-                   AND reason IS ?3 AND created_at=?4 AND moderator_id IS ?5
+                   AND reason IS ?3 AND moderator_id IS ?4
                  ORDER BY id DESC LIMIT 1",
-                params![guild_id, user_id, reason.clone(), now.clone(), moderator_id],
+                params![guild_id, user_id, reason.clone(), moderator_id],
                 |row| Ok(row.get(0)?),
             )
             .optional()?;

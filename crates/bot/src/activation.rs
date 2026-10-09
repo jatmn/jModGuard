@@ -21,6 +21,7 @@ pub struct Activation {
     discord_connected: AtomicBool,
     shutting_down: Arc<AtomicBool>,
     cut_off: AtomicBool,
+    cutoff_wait: tokio::sync::Notify,
     in_flight: std::sync::atomic::AtomicUsize,
     moderation_depth: std::sync::atomic::AtomicUsize,
 }
@@ -63,6 +64,7 @@ impl Activation {
             discord_connected: AtomicBool::new(false),
             shutting_down: Arc::new(AtomicBool::new(false)),
             cut_off: AtomicBool::new(false),
+            cutoff_wait: tokio::sync::Notify::new(),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             moderation_depth: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -126,6 +128,20 @@ impl Activation {
 
     pub fn cut_off(&self) {
         self.cut_off.store(true, Ordering::Release);
+        self.cutoff_wait.notify_waiters();
+    }
+
+    /// Resolves when [`Self::cut_off`] has run. The waiter is registered before
+    /// the flag is read again, and the flag stays set for a waiter that arrives
+    /// after cutoff.
+    pub async fn until_cutoff(&self) {
+        let notified = self.cutoff_wait.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.cut_off.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     pub fn note_discord_connected(&self) {
@@ -264,6 +280,33 @@ pub async fn finish_in_flight(activation: &Activation) {
     }
 }
 
+/// Reject a missing control secret before the lease is claimed.
+pub async fn claim_writer_lease(
+    secret: &str,
+    db: &Db,
+    activation: &Arc<Activation>,
+) -> anyhow::Result<bool> {
+    jmodguard::control::load_writer_key(secret).map_err(|error| anyhow::anyhow!("{error}"))?;
+    wait_for_writer_lock(db, activation).await
+}
+
+/// Drain in-flight work, run shutdown notices while recording is still allowed,
+/// then cut off. Notices stay inside [`HANDOFF_DEADLINE`].
+pub async fn drain_for_shutdown_notices(
+    activation: &Activation,
+    notices: impl std::future::Future<Output = ()> + Send,
+) {
+    let deadline = Instant::now() + HANDOFF_DEADLINE;
+    while activation.in_flight() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if activation.may_record() && !remaining.is_zero() {
+        let _ = tokio::time::timeout(remaining, notices).await;
+    }
+    activation.cut_off();
+}
+
 fn fresh_instance() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let tick = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
@@ -372,6 +415,35 @@ mod tests {
         assert!(!challenger.may_record());
         assert!(challenger.hold_control().is_none());
         assert_eq!(challenger.in_flight(), 0);
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_control_secret_does_not_claim_the_lease() {
+        let (path, db) = temp_db("secret");
+        let activation = Activation::new();
+        let error = claim_writer_lease("short", &db, &activation)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("JMODGUARD_CONTROL_SECRET"),
+            "missing secret must fail closed: {text}"
+        );
+        assert!(!activation.may_record());
+        assert!(!activation.lock_held.load(Ordering::Acquire));
+        let rows = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key='active_bot_lease'",
+                    (),
+                    |row| Ok(row.get::<i64>(0)?),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a rejected secret must not write the lease");
         drop(db);
         cleanup(&path);
     }

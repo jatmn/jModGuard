@@ -520,6 +520,62 @@ async fn guild_mutation_commit_rechecks_the_core_lease() {
     store.verify_placement(empty).await.unwrap();
 }
 
+#[tokio::test]
+async fn guild_commit_does_not_land_when_the_lease_moves_before_the_final_reread() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let placement = f.placement(&reg, 21).await;
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    let catalog = f.catalog.clone();
+    f.catalog.arm_before_final_lease_reread(move || {
+        catalog
+            .with_conn_sync(|conn| {
+                conn.set_expected_lease_owner(None);
+                let mut tx = conn.transaction_primary_read()?;
+                tx.ensure_mutation_receipt()?;
+                let moved = format!(
+                    "{} {}",
+                    "cd".repeat(16),
+                    crate::control::now_ms().saturating_add(60_000)
+                );
+                tx.execute_bounded(
+                    "INSERT INTO meta (key, value) VALUES ('active_bot_lease', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![moved],
+                    4096,
+                )?;
+                tx.commit()
+            })
+            .unwrap();
+    });
+    let error = store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert!(matches!(
+        store
+            .verify_placement(placement)
+            .await
+            .unwrap_err()
+            .downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Unbound)
+    ));
+}
+
 fn lease_rejected(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause

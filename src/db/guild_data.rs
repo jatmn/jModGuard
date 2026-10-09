@@ -469,8 +469,8 @@ impl GuildDataStore {
     pub fn with_core_write_fence(self, core: Db) -> Self {
         let probe_core = core.clone();
         self.db
-            .install_commit_lease_probe(std::sync::Arc::new(move || {
-                Self::confirm_core_writer_lease(&probe_core)
+            .install_commit_lease_probe(std::sync::Arc::new(move |commit| {
+                Self::confirm_core_writer_lease(&probe_core, commit)
             }));
         Self {
             core: Some(core),
@@ -478,24 +478,51 @@ impl GuildDataStore {
         }
     }
 
-    /// Re-read the captured enrollment on the core primary while a guild
-    /// transaction is already open. Missing core (unit stores) skips the check.
-    fn confirm_core_writer_lease(core: &Db) -> Result<()> {
+    /// Re-read the core lease in the same critical section as the guild `COMMIT`.
+    /// An empty owner slot does not query. The final re-read holds the core
+    /// writer lock until the guild commit returns.
+    fn confirm_core_writer_lease(core: &Db, commit: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         let Some(expected) = core.leased_owner() else {
-            return Ok(());
+            return commit();
         };
+        Self::read_core_lease(core, &expected)?;
+        #[cfg(test)]
+        if let Some(hook) = core.take_before_final_lease_reread() {
+            hook();
+        }
+        core.with_conn_sync(|conn| {
+            let tx = conn.transaction_primary_read()?;
+            let value = Self::lease_row(&tx)?;
+            if let Err(error) =
+                crate::db_compat::reject_active_bot_lease(value.as_deref(), &expected)
+            {
+                let _ = tx.finish_read();
+                return Err(error);
+            }
+            let committed = commit();
+            match (committed, tx.finish_read()) {
+                (Err(error), _) => Err(error),
+                (Ok(()), finished) => finished,
+            }
+        })
+    }
+
+    fn read_core_lease(core: &Db, expected: &str) -> Result<()> {
         core.with_conn_sync(|conn| {
             let tx = conn.transaction_primary_snapshot()?;
-            let value: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM meta WHERE key='active_bot_lease'",
-                    (),
-                    |row| Ok(row.get(0)?),
-                )
-                .optional()?;
+            let value = Self::lease_row(&tx)?;
             tx.finish_read()?;
-            crate::db_compat::reject_active_bot_lease(value.as_deref(), &expected)
+            crate::db_compat::reject_active_bot_lease(value.as_deref(), expected)
         })
+    }
+
+    fn lease_row(tx: &crate::db_compat::Transaction) -> Result<Option<String>> {
+        tx.query_row(
+            "SELECT value FROM meta WHERE key='active_bot_lease'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+        .optional()
     }
 
     pub(super) fn confirm_captured_enrollment(

@@ -418,6 +418,46 @@ async fn stale_active_ban_is_replaced_and_the_same_dispatch_is_not_inserted_twic
 }
 
 #[tokio::test]
+async fn same_dispatch_without_occurred_at_inserts_once() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let first = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "handoff",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(first.is_some());
+    let second = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "handoff",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second, None);
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, first.unwrap());
+    assert_eq!(active[0].reason.as_deref(), Some("handoff"));
+    assert_eq!(active[0].moderator_id, Some(9));
+}
+
+#[tokio::test]
 async fn ended_ban_does_not_block_a_new_insert() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();

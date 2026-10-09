@@ -151,7 +151,13 @@ async fn main() -> Result<()> {
 
     let app = BotState::new(cfg.clone(), db)?;
     let activation = Arc::clone(&app.activation);
-    match jmodguard_bot::activation::wait_for_writer_lock(&app.db, &activation).await {
+    match jmodguard_bot::activation::claim_writer_lease(
+        app.cfg.bot.control_secret.as_str(),
+        &app.db,
+        &activation,
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             tracing::info!("bot stopped before it held the active-bot lease");
@@ -159,14 +165,16 @@ async fn main() -> Result<()> {
             tracing::info!("bot process stopped");
             return Ok(());
         }
-        Err(error) => return Err(error.context("active-bot lease")),
+        Err(error) => return Err(error),
     }
     if !activation.allows_discord_connect() {
         anyhow::bail!("active-bot lease was not held");
     }
     let _renewal =
         jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
-    jmodguard_bot::control_server::spawn(Arc::clone(&app))?;
+    if jmodguard_bot::control_server::spawn(Arc::clone(&app))?.is_none() {
+        anyhow::bail!("{}", jmodguard::control::ControlSecretError);
+    }
 
     // --- Discord client (needed for slash re-sync after config polls) --------
     // Guild voice states is not a privileged intent. Voice join, leave, and
@@ -313,6 +321,7 @@ async fn main() -> Result<()> {
                         let discord = jmodguard_bot::action_worker::LiveDiscord {
                             http: &http,
                             bot_user_id: membership.bot_user_id,
+                            activation: &app.activation,
                         };
                         tokio::select! {
                             _ = shutdown_signal() => break,
@@ -527,20 +536,22 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
         jmodguard::set_process_ready(false);
-        jmodguard_bot::activation::finish_in_flight(&shutdown_activation).await;
-        shutdown_activation.cut_off();
+        let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
+        let guild_ids = shutdown_cache.guilds();
+        let attempted = guild_ids.len();
+        jmodguard_bot::activation::drain_for_shutdown_notices(&shutdown_activation, async move {
+            shutdown_app.stop_startup_notice_task().await;
+            let sent =
+                logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content)
+                    .await;
+            tracing::info!(sent, attempted, "shutdown notice phase complete");
+        })
+        .await;
         if let Err(error) =
             db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
         {
             tracing::warn!("active-bot lease release failed: {error:#}");
         }
-        shutdown_app.stop_startup_notice_task().await;
-        let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
-        let guild_ids = shutdown_cache.guilds();
-        let attempted = guild_ids.len();
-        let sent =
-            logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
-        tracing::info!(sent, attempted, "shutdown notice phase complete");
         tracing::info!("stopping Discord shards");
         shard_manager.shutdown_all().await;
     });

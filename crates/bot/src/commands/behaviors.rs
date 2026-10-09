@@ -83,13 +83,29 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         env.guild_id.get(),
                         target.get(),
                     );
-                    let discord = if let Some(m) = member {
-                        m.ban_with_reason(&env.ctx.http, *delete_days, &reason)
-                            .await
+                    let raced = if let Some(m) = member {
+                        crate::discord::race_discord_call(
+                            &env.app.activation,
+                            m.ban_with_reason(&env.ctx.http, *delete_days, &reason),
+                        )
+                        .await
                     } else {
-                        env.guild_id
-                            .ban_with_reason(&env.ctx.http, target, *delete_days, &reason)
-                            .await
+                        crate::discord::race_discord_call(
+                            &env.app.activation,
+                            env.guild_id.ban_with_reason(
+                                &env.ctx.http,
+                                target,
+                                *delete_days,
+                                &reason,
+                            ),
+                        )
+                        .await
+                    };
+                    let crate::discord::DiscordCall::Finished(discord) = raced else {
+                        pending_ban
+                            .finish(env.app, crate::db::guild_data::CaseOutcome::Uncertain)
+                            .await;
+                        return Err(anyhow!("ban outcome is uncertain; verify it in Discord"));
                     };
                     let outcome = crate::cases::classify_discord(discord.as_ref().err());
                     if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
@@ -166,11 +182,28 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 env.guild_id.get(),
                 target.get(),
             );
-            let discord = env
-                .ctx
-                .http
-                .remove_ban(env.guild_id, target, Some(&reason))
-                .await;
+            let discord = match crate::discord::race_discord_call(
+                &env.app.activation,
+                env.ctx.http.remove_ban(env.guild_id, target, Some(&reason)),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    crate::cases::record_application(
+                        env.app,
+                        enrollment.clone(),
+                        crate::db::guild_data::CaseAction::Unban,
+                        crate::db::guild_data::CaseOutcome::Uncertain,
+                        target.get(),
+                        Some(env.actor.get()),
+                        Some(reason.clone()),
+                        crate::db::guild_data::CaseEvidence::Unavailable,
+                    )
+                    .await;
+                    return Err(anyhow!("ban outcome is uncertain; verify it in Discord"));
+                }
+                crate::discord::DiscordCall::Finished(result) => result,
+            };
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
                 env.app.release_gateway_case_suppression(suppression);
@@ -228,9 +261,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
-            let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
+            let discord = match crate::discord::race_discord_call(
+                &env.app.activation,
+                member.kick_with_reason(&env.ctx.http, &reason),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    Err(crate::discord::cutoff_discord_error())
+                }
+                crate::discord::DiscordCall::Finished(result) => result,
+            };
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
-            lease_held(env)?;
             crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
@@ -242,6 +284,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::db::guild_data::CaseEvidence::Unavailable,
             )
             .await;
+            lease_held(env)?;
             discord?;
             log_mod(
                 env,
@@ -294,15 +337,26 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             };
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
-            let discord = if let Some(until) = until {
-                member
-                    .disable_communication_until_datetime(&env.ctx.http, until)
-                    .await
+            let raced = if let Some(until) = until {
+                crate::discord::race_discord_call(
+                    &env.app.activation,
+                    member.disable_communication_until_datetime(&env.ctx.http, until),
+                )
+                .await
             } else {
-                member.enable_communication(&env.ctx.http).await
+                crate::discord::race_discord_call(
+                    &env.app.activation,
+                    member.enable_communication(&env.ctx.http),
+                )
+                .await
+            };
+            let discord = match raced {
+                crate::discord::DiscordCall::Cancelled => {
+                    Err(crate::discord::cutoff_discord_error())
+                }
+                crate::discord::DiscordCall::Finished(result) => result,
             };
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
-            lease_held(env)?;
             crate::cases::record(
                 env.app,
                 enrollment.clone(),
@@ -319,6 +373,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::cases::application_source(),
             )
             .await;
+            lease_held(env)?;
             discord?;
             vars.insert(
                 "duration".into(),
@@ -528,9 +583,17 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 lease_held(env)?;
             }
             if n > 1 {
-                let _ = env.channel_id.delete_messages(&env.ctx.http, &ids).await;
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.channel_id.delete_messages(&env.ctx.http, &ids),
+                )
+                .await;
             } else if n == 1 {
-                let _ = env.channel_id.delete_message(&env.ctx.http, ids[0]).await;
+                let _ = crate::discord::race_discord_call(
+                    &env.app.activation,
+                    env.channel_id.delete_message(&env.ctx.http, ids[0]),
+                )
+                .await;
             }
             log_mod(
                 env,
@@ -551,7 +614,19 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Say => {
             let (target, text) = say_target_and_text(&env.args, env.channel_id)?;
             lease_held(env)?;
-            target.say(&env.ctx.http, &text).await?;
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                target.say(&env.ctx.http, &text),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("writer lease is not held");
+                }
+                crate::discord::DiscordCall::Finished(result) => {
+                    result?;
+                }
+            }
             vars.insert("channel".into(), format!("<#{}>", target));
             Ok(BehaviorOutcome {
                 response: None,
@@ -569,12 +644,22 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .unwrap_or(*default_seconds);
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
-            env.channel_id
-                .edit(
+            match crate::discord::race_discord_call(
+                &env.app.activation,
+                env.channel_id.edit(
                     &env.ctx.http,
                     EditChannel::new().rate_limit_per_user(seconds as u16),
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                crate::discord::DiscordCall::Cancelled => {
+                    anyhow::bail!("writer lease is not held");
+                }
+                crate::discord::DiscordCall::Finished(result) => {
+                    result?;
+                }
+            }
             vars.insert("seconds".into(), seconds.to_string());
             let duration = crate::templates::format_duration(seconds);
             vars.insert("duration".into(), duration.clone());

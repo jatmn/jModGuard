@@ -27,6 +27,8 @@ pub struct ApiState {
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
     config_observation: tokio::sync::Mutex<(u64, String)>,
+    /// Replaces the in-memory session store for one `web::router` build.
+    session_store: std::sync::Mutex<Option<tower_sessions::MemoryStore>>,
 }
 
 impl ApiState {
@@ -79,7 +81,23 @@ impl ApiState {
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
             config_observation: tokio::sync::Mutex::new((primed.config, primed.config_revision)),
+            session_store: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Use this store for the next `web::router` build. Production leaves it empty.
+    pub fn install_session_store(&self, store: tower_sessions::MemoryStore) {
+        *self
+            .session_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+    }
+
+    pub(crate) fn take_session_store(&self) -> Option<tower_sessions::MemoryStore> {
+        self.session_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// API requests load config from the DB directly; no compiled bot cache is

@@ -145,6 +145,8 @@ impl HranaFixture {
             config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
             settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             lease_owner,
+            #[cfg(test)]
+            before_final_lease_reread: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }

@@ -50,6 +50,21 @@ impl BakedCompatibility {
     }
 }
 
+fn read_baked_compatibility(
+    conn: &impl SqlExecutor,
+    key: &str,
+    base_sha: &str,
+) -> Result<BakedCompatibility> {
+    let raw = meta_string_conn(conn, key)?
+        .context("baked compatibility missing; restart the container's baked controller")?;
+    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
+    anyhow::ensure!(
+        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
+        "baked compatibility does not match this base image"
+    );
+    Ok(baked)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeCompatibility {
     pub control_protocol: u32,
@@ -387,6 +402,9 @@ impl UpdateControl {
     }
 
     pub async fn failed(&self, role: &str, release: &ComponentRelease, error: &str) -> Result<()> {
+        if self.db.is_read_only() {
+            anyhow::bail!("read-only database cannot record a component failure");
+        }
         record_component_failure(&self.db, role, release, error).await
     }
 
@@ -403,6 +421,8 @@ impl UpdateControl {
     }
 
     /// Only the baked controller can establish the baked application's schema.
+    /// A read-only process returns the compiled value or verifies it with a
+    /// snapshot. The bot launcher is the process that persists it.
     pub async fn baked_compatibility(
         &self,
         role: &str,
@@ -412,6 +432,20 @@ impl UpdateControl {
         anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
         let key = format!("component_baked_compatibility_{role}_v1");
         let base_sha = base_sha.to_owned();
+        if self.db.is_read_only() {
+            if baked_controller {
+                return Ok(BakedCompatibility::compiled(&base_sha));
+            }
+            return self
+                .db
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let baked = read_baked_compatibility(&tx, &key, &base_sha)?;
+                    tx.finish_read()?;
+                    Ok(baked)
+                })
+                .await;
+        }
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_immediate()?;
@@ -420,15 +454,7 @@ impl UpdateControl {
                     write_meta_string_conn(&tx, &key, &serde_json::to_string(&baked)?)?;
                     baked
                 } else {
-                    let raw = meta_string_conn(&tx, &key)?.context(
-                        "baked compatibility missing; restart the container's baked controller",
-                    )?;
-                    let baked: BakedCompatibility = serde_json::from_str(&raw)?;
-                    anyhow::ensure!(
-                        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
-                        "baked compatibility does not match this base image"
-                    );
-                    baked
+                    read_baked_compatibility(&tx, &key, &base_sha)?
                 };
                 tx.commit()?;
                 Ok(result)
@@ -439,6 +465,9 @@ impl UpdateControl {
     /// Refresh actual controller capability without an application heartbeat.
     pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
         anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
+        if self.db.is_read_only() {
+            return Ok(());
+        }
         let role = role.to_owned();
         self.db
             .with_conn(move |conn| {
@@ -520,14 +549,23 @@ impl UpdateControl {
         hash: &str,
         now: i64,
     ) -> Result<()> {
+        if self.db.is_read_only() {
+            return Ok(());
+        }
         record_launcher_running(&self.db, role, release, hash, now).await
     }
 
     pub async fn baked_launcher(&self, role: &str, hash: &str, now: i64) -> Result<()> {
+        if self.db.is_read_only() {
+            return Ok(());
+        }
         record_baked_launcher(&self.db, role, hash, now).await
     }
 
     pub async fn launcher_failed(&self, role: &str, digest: &str, error: &str) -> Result<()> {
+        if self.db.is_read_only() {
+            anyhow::bail!("read-only database cannot record a launcher failure");
+        }
         record_launcher_failure(&self.db, role, digest, error).await
     }
 
@@ -786,6 +824,9 @@ impl UpdateControl {
     }
 
     pub async fn upgrade_error(&self, id: &str, error: &str) -> Result<()> {
+        if self.db.is_read_only() {
+            anyhow::bail!("read-only database cannot record an upgrade error");
+        }
         let (id, error) = (id.to_owned(), error.chars().take(300).collect::<String>());
         self.db
             .with_conn(move |conn| {

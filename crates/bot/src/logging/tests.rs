@@ -1062,6 +1062,54 @@ async fn graceful_shutdown_notice_uses_system_route_and_compact_uptime() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_emits_notices_before_cutoff() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    let sink = Arc::new(Sink::default());
+    let app = Arc::clone(&f.app);
+    let delivery = Arc::clone(&sink);
+    assert!(f.app.activation.may_record());
+    crate::activation::drain_for_shutdown_notices(&f.app.activation, async move {
+        assert!(app.activation.may_record());
+        let sent = emit_shutdown_notices_to(
+            &app,
+            delivery,
+            vec![GuildId::new(789)],
+            shutdown_notice_content(1),
+            SHUTDOWN_NOTICE_PHASE,
+        )
+        .await;
+        assert_eq!(sent, 1);
+    })
+    .await;
+    assert!(!f.app.activation.may_record());
+    assert_eq!(sink.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lease_loss_cutoff_emits_no_shutdown_notices() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "system", 456)
+        .await
+        .unwrap();
+    f.app.activation.note_lease_lost();
+    let sink = Arc::new(Sink::default());
+    let sent = emit_shutdown_notices_to(
+        &f.app,
+        sink.clone(),
+        vec![GuildId::new(789)],
+        shutdown_notice_content(1),
+        SHUTDOWN_NOTICE_PHASE,
+    )
+    .await;
+    assert_eq!(sent, 0);
+    assert!(sink.messages.lock().unwrap().is_empty());
+    assert!(!f.app.activation.may_record());
+}
+
+#[tokio::test]
 async fn shutdown_notice_waits_for_busy_log_delivery_capacity() {
     use std::future::Future;
 

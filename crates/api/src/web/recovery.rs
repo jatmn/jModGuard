@@ -3,6 +3,7 @@
 use super::*;
 use crate::config::ApiProcessConfig;
 use crate::db::UpdateControl;
+use anyhow::Context as _;
 use axum::extract::State;
 use axum::response::Html;
 use serde::Deserialize;
@@ -13,12 +14,21 @@ pub struct RecoveryState {
     pub oauth: Arc<oauth::OAuthClient>,
     pub control: UpdateControl,
     pub apply_enabled: bool,
+    /// Normal router only. Maintenance `serve` stays on the local writable control.
+    pub api: Option<Arc<super::state::ApiState>>,
 }
 
-async fn recovery_value<T>(
+async fn control_value<T: serde::de::DeserializeOwned>(
+    state: &RecoveryState,
     local: impl std::future::Future<Output = anyhow::Result<T>>,
+    op: crate::db::ControlOp,
 ) -> anyhow::Result<T> {
-    local.await
+    if state.control.writes_locally() {
+        return local.await;
+    }
+    let api = state.api.as_ref().context("waiting")?;
+    let (_, body) = api.commit_json(op).await?;
+    Ok(serde_json::from_value(body)?)
 }
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -102,14 +112,18 @@ async fn check(
     let now = chrono::Utc::now().timestamp();
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
-    let owner = recovery_value(state.control.acquire_pair_check(now))
-        .await
-        .map_err(|e| {
-            problem(
-                StatusCode::CONFLICT,
-                format!("matching pair unavailable: {e:#}"),
-            )
-        })?;
+    let owner = control_value(
+        &state,
+        state.control.acquire_pair_check(now),
+        crate::db::ControlOp::AcquirePairCheck { now },
+    )
+    .await
+    .map_err(|e| {
+        problem(
+            StatusCode::CONFLICT,
+            format!("matching pair unavailable: {e:#}"),
+        )
+    })?;
     let result = async {
         let registry = jmodguard_updater::oci::Registry::ghcr()?;
         let bot = registry.discover("bot", &input.channel).await?;
@@ -119,16 +133,32 @@ async fn check(
         // Both images must resolve before either channel or candidate changes.
         // One transaction commits the pair; a missing counterpart or a failed
         // second write leaves the previous selection in place.
-        recovery_value(
+        control_value(
+            &state,
             state
                 .control
-                .record_pair_check(&owner, &input.channel, bot, api, now),
+                .record_pair_check(&owner, &input.channel, bot.clone(), api.clone(), now),
+            crate::db::ControlOp::RecordPairCheck {
+                owner: owner.clone(),
+                channel: input.channel.clone(),
+                bot,
+                api,
+                now,
+            },
         )
         .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = recovery_value(state.control.release_pair_check(&owner)).await {
+    if let Err(error) = control_value(
+        &state,
+        state.control.release_pair_check(&owner),
+        crate::db::ControlOp::ReleasePairCheck {
+            owner: owner.clone(),
+        },
+    )
+    .await
+    {
         tracing::warn!("paired check lease release failed: {error:#}");
     }
     result.map_err(|e| {
@@ -162,12 +192,18 @@ async fn apply(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    let operation = recovery_value(state.control.request_upgrade(
-        &input.bot_digest,
-        &input.api_digest,
-        input.recover,
-        now,
-    ))
+    let operation = control_value(
+        &state,
+        state
+            .control
+            .request_upgrade(&input.bot_digest, &input.api_digest, input.recover, now),
+        crate::db::ControlOp::RequestUpgrade {
+            bot_digest: input.bot_digest.clone(),
+            api_digest: input.api_digest.clone(),
+            recover: input.recover,
+            now,
+        },
+    )
     .await
     .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(Json(json!({"operation":operation})))
@@ -184,9 +220,15 @@ async fn cancel(
     Json(input): Json<Cancel>,
 ) -> Reply {
     mutation(&state, &session, &headers).await?;
-    recovery_value(state.control.abort_upgrade(&input.id))
-        .await
-        .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
+    control_value(
+        &state,
+        state.control.abort_upgrade(&input.id),
+        crate::db::ControlOp::AbortUpgrade {
+            id: input.id.clone(),
+        },
+    )
+    .await
+    .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
     status(State(state), session).await
 }
 
@@ -248,6 +290,7 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
         oauth,
         control,
         apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+        api: None,
     });
     let app = maintenance_router(state, MemoryStore::default());
     axum::serve(listener, app)
@@ -384,6 +427,7 @@ mod tests {
             cfg: Arc::new(cfg),
             control: control.clone(),
             apply_enabled: true,
+            api: None,
         });
         let store = MemoryStore::default();
         let owner_cookie = cookie(&store, 123).await;

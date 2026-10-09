@@ -83,14 +83,96 @@ pub async fn reconcile_nickname_job(
         return;
     };
     let guild = serenity::model::id::GuildId::new(guild_id_u64);
+    let http_for_read = Arc::clone(&http);
+    apply_nickname_edit(
+        &app,
+        &job,
+        || async move {
+            guild
+                .member(&http_for_read, me)
+                .await
+                .map(|member| member.nick)
+                .map_err(anyhow::Error::from)
+        },
+        || {
+            let nickname = job.nickname.clone();
+            async move {
+                guild
+                    .edit_member(&http, me, EditMember::new().nickname(nickname))
+                    .await
+                    .map(|_| ())
+            }
+        },
+    )
+    .await;
+}
+
+/// Apply one nickname edit. A previous attempt cancelled inside Discord is
+/// `outcome_unknown`: confirm the name before sending `edit_member` again.
+async fn apply_nickname_edit<R, E, RF, EF>(
+    app: &Arc<BotState>,
+    job: &db::NicknameReconcileJob,
+    read_nickname: RF,
+    edit_member: EF,
+) where
+    RF: FnOnce() -> R,
+    R: std::future::Future<Output = Result<Option<String>>>,
+    EF: FnOnce() -> E,
+    E: std::future::Future<Output = serenity::Result<()>>,
+{
     if !app.activation.may_record() {
         return;
     }
+    if nickname_outcome_unknown(&app.db, job.guild_id).await {
+        let current =
+            tokio::time::timeout(crate::discord::DISCORD_REST_TIMEOUT, read_nickname()).await;
+        match current {
+            Ok(Ok(nick)) if nick.as_deref().unwrap_or("") == job.nickname => {
+                if !app.activation.may_record() {
+                    return;
+                }
+                if let Err(error) = db::acknowledge_nickname_reconcile(&app.db, job).await {
+                    tracing::warn!(
+                        guild_id = job.guild_id,
+                        "failed to acknowledge nickname reconciliation: {error:#}"
+                    );
+                }
+                return;
+            }
+            Ok(Ok(_)) => {}
+            _ => return,
+        }
+        if !app.activation.may_record() {
+            return;
+        }
+    }
     let edit = tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
-        guild.edit_member(&http, me, EditMember::new().nickname(job.nickname.clone())),
+        crate::discord::race_discord_call(&app.activation, edit_member()),
     )
     .await;
+    let edit = match edit {
+        Ok(crate::discord::DiscordCall::Cancelled) => {
+            let now = chrono::Utc::now().timestamp();
+            if let Err(error) = db::schedule_nickname_reconcile_retry(
+                &app.db,
+                job,
+                now,
+                "outcome_unknown",
+                "Discord nickname outcome is unknown",
+            )
+            .await
+            {
+                tracing::error!(
+                    guild_id = job.guild_id,
+                    "failed to persist nickname reconciliation outcome: {error:#}"
+                );
+            }
+            return;
+        }
+        Ok(crate::discord::DiscordCall::Finished(result)) => Ok(result),
+        Err(elapsed) => Err(elapsed),
+    };
     match edit {
         Err(_) => {
             if !app.activation.may_record() {
@@ -99,7 +181,7 @@ pub async fn reconcile_nickname_job(
             let now = chrono::Utc::now().timestamp();
             let message = "Discord nickname request timed out";
             if let Err(error) =
-                db::schedule_nickname_reconcile_retry(&app.db, &job, now, "timeout", message).await
+                db::schedule_nickname_reconcile_retry(&app.db, job, now, "timeout", message).await
             {
                 tracing::error!(
                     guild_id = job.guild_id,
@@ -111,7 +193,7 @@ pub async fn reconcile_nickname_job(
             if !app.activation.may_record() {
                 return;
             }
-            if let Err(error) = db::acknowledge_nickname_reconcile(&app.db, &job).await {
+            if let Err(error) = db::acknowledge_nickname_reconcile(&app.db, job).await {
                 tracing::warn!(
                     guild_id = job.guild_id,
                     "failed to acknowledge nickname reconciliation: {error:#}"
@@ -128,7 +210,7 @@ pub async fn reconcile_nickname_job(
             let message = error.to_string();
             let result = match class {
                 NicknameFailureClass::Transient => {
-                    db::schedule_nickname_reconcile_retry(&app.db, &job, now, &code, &message)
+                    db::schedule_nickname_reconcile_retry(&app.db, job, now, &code, &message)
                         .await
                         .map(|exhausted| {
                             if exhausted {
@@ -147,7 +229,7 @@ pub async fn reconcile_nickname_job(
                         })
                 }
                 NicknameFailureClass::Dormant => {
-                    db::finish_nickname_reconcile(&app.db, &job, "dormant", &code, &message, now)
+                    db::finish_nickname_reconcile(&app.db, job, "dormant", &code, &message, now)
                         .await
                         .map(|()| {
                             tracing::warn!(
@@ -157,7 +239,7 @@ pub async fn reconcile_nickname_job(
                         })
                 }
                 NicknameFailureClass::Terminal => {
-                    db::finish_nickname_reconcile(&app.db, &job, "terminal", &code, &message, now)
+                    db::finish_nickname_reconcile(&app.db, job, "terminal", &code, &message, now)
                         .await
                         .map(|()| {
                             tracing::error!(
@@ -175,6 +257,13 @@ pub async fn reconcile_nickname_job(
             }
         }
     }
+}
+
+async fn nickname_outcome_unknown(db: &db::Db, guild_id: i64) -> bool {
+    matches!(
+        db::nickname_reconcile_status(db, guild_id).await,
+        Ok(Some(status)) if status.last_error_code.as_deref() == Some("outcome_unknown")
+    )
 }
 
 #[cfg(test)]

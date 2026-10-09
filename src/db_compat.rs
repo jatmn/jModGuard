@@ -736,7 +736,10 @@ pub(crate) fn reject_active_bot_lease(value: Option<&str>, expected: &str) -> Re
     Ok(())
 }
 
-pub(crate) type CommitLeaseProbe = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
+/// Guild commits pass the remainder of `COMMIT` so the core re-read can hold
+/// its writer lock until that continuation returns.
+pub(crate) type CommitLeaseProbe =
+    std::sync::Arc<dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync>;
 
 impl std::fmt::Display for ActiveBotLeaseRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1866,10 +1869,16 @@ impl Transaction {
             self.reject_unless_active_lease(expected)?;
         }
         if let Some(probe) = self.commit_lease_probe.clone() {
-            probe()?;
+            return probe(&mut || self.commit_after_lease_probe());
         }
+        self.commit_after_lease_probe()
+    }
+
+    /// Capacity check and `COMMIT`. A guild lease probe calls this while it
+    /// still holds the core writer lock.
+    fn commit_after_lease_probe(&mut self) -> Result<()> {
         if self.capacity_dirty.load(Ordering::Acquire) {
-            let actual = crate::capacity::sample(&self)?;
+            let actual = crate::capacity::sample(&*self)?;
             let expected = self
                 .capacity_reservation
                 .lock()

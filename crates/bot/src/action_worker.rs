@@ -55,6 +55,7 @@ pub trait DiscordActions: Send + Sync {
 pub struct LiveDiscord<'a> {
     pub http: &'a serenity::http::Http,
     pub bot_user_id: UserId,
+    pub activation: &'a crate::activation::Activation,
 }
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
@@ -101,20 +102,24 @@ impl DiscordActions for LiveDiscord<'_> {
         )
     }
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome {
-        match self
-            .http
-            .remove_ban(
+        match crate::discord::race_discord_call(
+            self.activation,
+            self.http.remove_ban(
                 GuildId::new(guild as u64),
                 UserId::new(user as u64),
                 Some(reason),
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(()) => Outcome::succeeded("unbanned"),
-            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r))) => {
-                classify_unban_response(r.status_code.as_u16(), r.error.code)
+            crate::discord::DiscordCall::Cancelled => Outcome::uncertain("discord_outcome_unknown"),
+            crate::discord::DiscordCall::Finished(Ok(())) => Outcome::succeeded("unbanned"),
+            crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(r),
+            ))) => classify_unban_response(r.status_code.as_u16(), r.error.code),
+            crate::discord::DiscordCall::Finished(Err(_)) => {
+                Outcome::uncertain("discord_outcome_unknown")
             }
-            Err(_) => Outcome::uncertain("discord_outcome_unknown"),
         }
     }
 }

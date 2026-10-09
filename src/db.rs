@@ -403,6 +403,11 @@ pub struct DbOpenOptions {
     pub retention_days: u32,
 }
 
+#[cfg(test)]
+type BeforeFinalLeaseHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+type BeforeFinalLeaseReread = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
+
 #[derive(Clone)]
 pub struct Db {
     path: PathBuf,
@@ -422,6 +427,10 @@ pub struct Db {
     /// Empty means commits are not fenced. Claiming the writer lease arms this
     /// and leaves it armed. Control apply restores the previous value.
     lease_owner: Arc<Mutex<Option<String>>>,
+    /// Moves the core lease after the early guild-commit probe and before the
+    /// final re-read that shares the core writer lock with `COMMIT`.
+    #[cfg(test)]
+    before_final_lease_reread: BeforeFinalLeaseReread,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -501,6 +510,22 @@ impl Db {
             .commit_lease_probe
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_before_final_lease_reread(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_final_lease_reread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_before_final_lease_reread(&self) -> Option<BeforeFinalLeaseHook> {
+        self.before_final_lease_reread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -866,6 +891,8 @@ impl Db {
                 config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
                 settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
                 lease_owner,
+                #[cfg(test)]
+                before_final_lease_reread: Arc::new(Mutex::new(None)),
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })
