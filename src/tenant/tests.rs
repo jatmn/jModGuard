@@ -1851,7 +1851,12 @@ async fn case_control_rejects_replaced_enrollment() {
     let f = Fixture::new();
     let first = enroll(&f, 10, 100).await;
     let op = db::ControlOp::CleanupEvidence {
-        scope: db::ConfigurationScope::Guild(first.clone()).to_wire(),
+        scope: db::ScopeWire {
+            global: false,
+            guild_id: first.guild_id,
+            enrollment_id: first.id.clone(),
+            joined_at_ns: first.joined_at_ns,
+        },
     };
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     f.tenant.schedule_erasure(first).await.unwrap();
