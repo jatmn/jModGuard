@@ -147,12 +147,16 @@ async fn apply_nickname_edit<R, E, RF, EF>(
         }
     }
     let now = chrono::Utc::now().timestamp();
-    if let Err(error) = db::mark_nickname_outcome_unknown(&app.db, job, now).await {
-        tracing::error!(
-            guild_id = job.guild_id,
-            "failed to persist nickname reconciliation outcome: {error:#}"
-        );
-        return;
+    match db::mark_nickname_outcome_unknown(&app.db, job, now).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::error!(
+                guild_id = job.guild_id,
+                "failed to persist nickname reconciliation outcome: {error:#}"
+            );
+            return;
+        }
     }
     if !app.activation.may_record() {
         return;

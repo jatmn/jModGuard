@@ -196,17 +196,18 @@ fn nickname_retry_delay_secs(job: &NicknameReconcileJob) -> i64 {
 
 /// Record that a nickname edit is about to leave this process. Does not change
 /// `attempt_count`, so a later acknowledgement of the same job still matches.
+/// `Ok(true)` is this exact job. `Ok(false)` means a newer save replaced it.
 pub async fn mark_nickname_outcome_unknown(
     db: &Db,
     job: &NicknameReconcileJob,
     now: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let job = job.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         if !nickname_job_matches_conn(&tx, &job)? {
             tx.finish_read()?;
-            return Ok(());
+            return Ok(false);
         }
         tx.execute_rows(
             "UPDATE nickname_reconcile SET
@@ -225,7 +226,7 @@ pub async fn mark_nickname_outcome_unknown(
             1,
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     })
     .await
 }
