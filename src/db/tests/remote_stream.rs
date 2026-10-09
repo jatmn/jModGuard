@@ -120,6 +120,7 @@ impl HranaFixture {
         let connections = (0..2)
             .map(|_| Connection::from_database(Arc::clone(&database), runtime.clone()).unwrap())
             .collect();
+        let lease_owner = Arc::new(Mutex::new(None));
         Db {
             path: PathBuf::new(),
             remote: true,
@@ -134,6 +135,7 @@ impl HranaFixture {
                 remote: true,
                 read_only: false,
                 busy_timeout_ms: 5_000,
+                lease_owner: Arc::clone(&lease_owner),
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),
@@ -141,6 +143,7 @@ impl HranaFixture {
             config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
             settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lease_owner,
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }
