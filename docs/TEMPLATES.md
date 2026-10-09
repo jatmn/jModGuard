@@ -38,7 +38,7 @@ preview) or via `!template`.
 
 Unknown variables are left untouched so template mistakes are visible.
 
-Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{role_name}`, `{detail}`, `{before_global}`, `{after_global}`, `{thread}`, `{thread_id}`, `{thread_name}`, `{archived}`, `{locked}`, `{auto_archive}`, and `{invitable}` when that event has them. They do not supply message text.
+Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{role_name}`, `{detail}`, `{before_global}`, `{after_global}`, `{thread}`, `{thread_id}`, `{thread_name}`, `{notice}`, `{archived}`, `{locked}`, `{auto_archive}`, and `{invitable}` when that event has them. They do not supply message text.
 
 ## Default templates (all editable)
 
@@ -59,7 +59,7 @@ Activity reports also supply `{added}`, `{removed}`, `{role}`, `{role_id}`, `{ro
 - **role_change** — role created, updated, or deleted. Detail names the change, including colour, emoji, and icon, without permission bits or image hashes
 - **voice_join** / **voice_leave** / **voice_move** — voice channel only. Mute and deaf changes are not reports. A move ignore matches either channel
 - **nickname_change** / **username_change** — guild nickname, or username and display name. No message text
-- **thread_create** / **thread_update** / **thread_delete** — thread name, parent, and owner when known. Updates also include archive, lock, auto-archive, and whether others can be invited. The starter message is not included
+- **thread_create** / **thread_update** / **thread_delete** — thread name, parent, and owner when known. thread_create says created only when the thread snowflake is within 60 seconds of the report; otherwise the same line says joined/visible because this gateway event also fires when the bot is added to an existing private thread. Updates also include archive, lock, auto-archive, and whether others can be invited. The starter message is not included
 
 These activity events follow the same opt-in rule: no log channel means no post.
 Their default wording lives in the bot until an operator saves a template. They

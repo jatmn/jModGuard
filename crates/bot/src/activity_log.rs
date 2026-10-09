@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serenity::model::channel::{ChannelType, GuildChannel, PartialGuildChannel};
 use serenity::model::guild::{Member, Role};
+use serenity::model::id::ChannelId;
+use serenity::model::misc::ImageHash;
 use serenity::model::permissions::Permissions;
 use serenity::model::voice::VoiceState;
 
@@ -70,7 +72,7 @@ pub(crate) struct RoleView {
     pub mentionable: bool,
     pub position: u16,
     pub unicode_emoji: Option<String>,
-    pub has_icon: bool,
+    pub icon: Option<ImageHash>,
 }
 
 impl RoleView {
@@ -87,7 +89,7 @@ impl RoleView {
             mentionable: role.mentionable,
             position: role.position,
             unicode_emoji: role.unicode_emoji.clone(),
-            has_icon: role.icon.is_some(),
+            icon: role.icon,
         }
     }
 
@@ -104,7 +106,7 @@ impl RoleView {
             mentionable: false,
             position: 0,
             unicode_emoji: None,
-            has_icon: false,
+            icon: None,
         }
     }
 }
@@ -275,7 +277,31 @@ pub(crate) fn role_change_report(
 }
 
 pub(crate) fn thread_created(thread: &ThreadView) -> Option<ActivityReport> {
-    thread_report("thread_create", thread, None)
+    thread_created_at(thread, chrono::Utc::now())
+}
+
+pub(crate) fn thread_created_at(
+    thread: &ThreadView,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ActivityReport> {
+    let mut report = thread_report("thread_create", thread, None)?;
+    let notice = if thread_snowflake_is_new(thread.id, now) {
+        "created"
+    } else {
+        "joined/visible"
+    };
+    report.vars.insert("notice".into(), notice.into());
+    Some(report)
+}
+
+// Serenity 0.12.5 drops newly_created; the snowflake window is the creation signal.
+#[allow(clippy::manual_abs_diff)] // unsigned_abs does not panic when the difference is i64::MIN.
+fn thread_snowflake_is_new(id: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if id == 0 {
+        return false;
+    }
+    let created = ChannelId::new(id).created_at().unix_timestamp();
+    (now.timestamp() - created).unsigned_abs() <= 60
 }
 
 pub(crate) fn thread_deleted(thread: &ThreadView) -> Option<ActivityReport> {
@@ -408,7 +434,7 @@ fn role_changes(old: &RoleView, new: &RoleView) -> String {
     if old.unicode_emoji != new.unicode_emoji {
         parts.push("emoji changed".into());
     }
-    if old.has_icon != new.has_icon {
+    if old.icon != new.icon {
         parts.push("icon changed".into());
     }
     if parts.is_empty() {
@@ -508,8 +534,12 @@ mod tests {
     use crate::types::ACTIVITY_LOG_EVENTS;
     use serenity::async_trait;
     use serenity::builder::CreateMessage;
-    use serenity::model::id::{ChannelId, GuildId};
+    use serenity::model::id::{ChannelId, GuildId, RoleId};
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
+
+    const ROLE_ICON_A: &str = "f1eff024d9c85339c877985229ed8fec";
+    const ROLE_ICON_B: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
     fn member(
         id: u64,
@@ -554,8 +584,41 @@ mod tests {
             mentionable: false,
             position,
             unicode_emoji: None,
-            has_icon: false,
+            icon: None,
         }
+    }
+
+    fn snowflake_thread(unix_secs: i64) -> ThreadView {
+        let millis = unix_secs * 1000;
+        let discord_millis = millis - 1_420_070_400_000;
+        let id = (discord_millis as u64) << 22;
+        ThreadView {
+            id,
+            ..thread("topic title", false)
+        }
+    }
+
+    fn thread_create_wording(report: &ActivityReport) -> String {
+        let template = crate::defaults::activity_log_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "thread_create")
+            .unwrap()
+            .1;
+        templates::render_bounded(template, &report.vars, 2000)
+    }
+
+    fn image_hash(hex: &str) -> ImageHash {
+        ImageHash::from_str(hex).unwrap()
+    }
+
+    fn projected_role(name: &str, position: u16, icon: Option<ImageHash>) -> RoleView {
+        let mut role = Role::default();
+        role.id = RoleId::new(55);
+        role.guild_id = GuildId::new(789);
+        role.name = name.into();
+        role.position = position;
+        role.icon = icon;
+        RoleView::from_role(&role)
     }
 
     #[test]
@@ -680,12 +743,13 @@ mod tests {
         assert!(!updated.vars["detail"].contains("permissions"));
         let mut emoji = created.clone();
         emoji.unicode_emoji = Some("star".into());
-        emoji.has_icon = true;
+        emoji.icon = Some(image_hash(ROLE_ICON_A));
         let appearance =
             role_change_report(RoleAction::Updated, Some(&created), Some(&emoji)).unwrap();
         assert!(appearance.vars["detail"].contains("emoji changed"));
         assert!(appearance.vars["detail"].contains("icon changed"));
         assert!(!appearance.vars["detail"].contains("star"));
+        assert!(!appearance.vars["detail"].contains(ROLE_ICON_A));
 
         let open = thread("topic title", false);
         assert!(thread_updated(Some(&open), &open).is_none());
@@ -715,6 +779,64 @@ mod tests {
         .unwrap();
         assert_eq!(deleted.vars["thread_name"], "unavailable");
         assert_eq!(deleted.vars["mention"], "unavailable");
+    }
+
+    #[test]
+    fn thread_create_notice_follows_the_snowflake_window() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let recent = thread_created_at(&snowflake_thread(now.timestamp()), now).unwrap();
+        assert_eq!(recent.event, "thread_create");
+        assert_eq!(recent.vars["notice"], "created");
+        let recent_text = thread_create_wording(&recent);
+        assert!(recent_text.contains("Thread created"));
+        assert!(!recent_text.contains("joined/visible"));
+        assert!(!recent.vars.contains_key("content"));
+
+        let earlier = thread_created_at(&snowflake_thread(now.timestamp() - 3_600), now).unwrap();
+        assert_eq!(earlier.event, "thread_create");
+        assert_eq!(earlier.vars["notice"], "joined/visible");
+        let earlier_text = thread_create_wording(&earlier);
+        assert!(earlier_text.contains("Thread joined/visible"));
+        assert!(!earlier_text.contains("Thread created"));
+        assert!(!earlier.vars.contains_key("content"));
+
+        let boundary = thread_created_at(&snowflake_thread(now.timestamp() - 60), now).unwrap();
+        assert_eq!(boundary.vars["notice"], "created");
+        let outside = thread_created_at(&snowflake_thread(now.timestamp() - 61), now).unwrap();
+        assert_eq!(outside.event, "thread_create");
+        assert_eq!(outside.vars["notice"], "joined/visible");
+
+        let sampled = sample("thread_create");
+        assert!(sampled.vars.contains_key("notice"));
+        assert!(!thread_create_wording(&sampled).contains("{notice}"));
+    }
+
+    #[test]
+    fn role_icon_changes_compare_the_image_hash() {
+        let hash_a = image_hash(ROLE_ICON_A);
+        let hash_b = image_hash(ROLE_ICON_B);
+        let none = projected_role("Mods", 1, None);
+        let icon_a = projected_role("Mods", 1, Some(hash_a));
+        let icon_b = projected_role("Mods", 1, Some(hash_b));
+        let icon_a_again = projected_role("Mods", 1, Some(hash_a));
+
+        let added = role_change_report(RoleAction::Updated, Some(&none), Some(&icon_a)).unwrap();
+        assert!(added.vars["detail"].contains("icon changed"));
+        assert!(!added.vars["detail"].contains(ROLE_ICON_A));
+
+        let removed = role_change_report(RoleAction::Updated, Some(&icon_a), Some(&none)).unwrap();
+        assert!(removed.vars["detail"].contains("icon changed"));
+        assert!(!removed.vars["detail"].contains(ROLE_ICON_A));
+
+        let replaced =
+            role_change_report(RoleAction::Updated, Some(&icon_a), Some(&icon_b)).unwrap();
+        assert!(replaced.vars["detail"].contains("icon changed"));
+        assert!(!replaced.vars["detail"].contains(ROLE_ICON_A));
+        assert!(!replaced.vars["detail"].contains(ROLE_ICON_B));
+
+        assert!(
+            role_change_report(RoleAction::Updated, Some(&icon_a), Some(&icon_a_again)).is_none()
+        );
     }
 
     fn sample(event: &str) -> ActivityReport {

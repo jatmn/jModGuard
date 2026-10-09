@@ -99,8 +99,11 @@ Joining, leaving and talking still do not maintain a general activity archive.
   the previous member. Voice join, leave, and move need the Guild Voice States
   gateway intent, which is not a privileged intent. Nickname, username, and member
   role logs use the existing Server Members intent. Thread logs use the existing
-  Guilds intent. A voice move ignore matches either the channel left or the channel
-  joined. These names are not guild-store log-channel types.
+  Guilds intent. thread_create says created only when the thread snowflake is
+  within 60 seconds of the report; otherwise the same line says joined/visible
+  because this gateway event also fires when the bot is added to an existing
+  private thread. A voice move ignore matches either the channel left or the
+  channel joined. These names are not guild-store log-channel types.
 - Startup, routine command-plan execution and test/log-only automod reports use Discord
   channels, without a generic SQL event copy. Delete-only automod reports are transient.
   Plans containing timeout/kick/ban steps retain their existing SQL execution summary;

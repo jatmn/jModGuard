@@ -503,7 +503,7 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "thread_create",
-            "**:thread: Thread created**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Owner:** {mention}\n**Time:** `{time}`",
+            "**:thread: Thread {notice}**\n\n**Thread:** {thread} (`{thread_id}`)\n**Name:** {thread_name}\n**Parent:** {channel}\n**Owner:** {mention}\n**Time:** `{time}`",
         ),
         (
             "thread_update",
