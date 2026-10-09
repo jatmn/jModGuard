@@ -1177,13 +1177,10 @@ pub(crate) fn bound_automod_content_var(
                 } else {
                     clip(&hashes, budget)
                 }
-            } else if tail.encode_utf16().count()
-                <= budget.saturating_sub(hash_units + sep_units)
-            {
+            } else if tail.encode_utf16().count() <= budget.saturating_sub(hash_units + sep_units) {
                 format!("{hashes}{sep}{tail}")
             } else {
-                let tail_budget = budget
-                    .saturating_sub(hash_units + sep_units + marker_units);
+                let tail_budget = budget.saturating_sub(hash_units + sep_units + marker_units);
                 format!("{hashes}{sep}{}{marker}", clip(&tail, tail_budget))
             }
         }
@@ -1194,10 +1191,7 @@ pub(crate) fn bound_automod_content_var(
                 let marker = " [display clipped]";
                 format!(
                     "{}{}",
-                    clip(
-                        &tail,
-                        budget.saturating_sub(marker.encode_utf16().count())
-                    ),
+                    clip(&tail, budget.saturating_sub(marker.encode_utf16().count())),
                     marker
                 )
             }

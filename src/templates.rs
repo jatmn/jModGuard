@@ -286,7 +286,9 @@ pub fn substitution_budget(
 ) -> usize {
     let mut without = vars.clone();
     without.insert(key.to_string(), String::new());
-    let used = render_bounded(template, &without, max_units).encode_utf16().count();
+    let used = render_bounded(template, &without, max_units)
+        .encode_utf16()
+        .count();
     max_units.saturating_sub(used)
 }
 
