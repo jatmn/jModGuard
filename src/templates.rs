@@ -211,6 +211,94 @@ pub fn stats_response_with_update_availability(
     )
 }
 
+const CONTAINER_USE_TEMPLATE: &str = "\
+**Container use**\n\
+**Bot CPU:** `{bot_cpu}`\n\
+**Bot memory (real program use):** `{bot_memory}`\n\
+**API CPU:** `{api_cpu}`\n\
+**API memory (real program use):** `{api_memory}`";
+
+/// Append this process's container sample to a stats reply.
+///
+/// `api` stays `None` until a private reading can be supplied. Those rows
+/// then render as `unavailable`, not zero. The bot sample is a cache copy;
+/// this function does not read cgroup files or wait for a CPU sample.
+pub fn stats_with_container_use(
+    moderation: String,
+    bot: &crate::cgroup::ContainerSample,
+    api: Option<&crate::cgroup::ContainerSample>,
+) -> String {
+    render(
+        "{moderation}\n\n{containers}",
+        &BTreeMap::from([
+            ("moderation".into(), moderation),
+            ("containers".into(), container_use_section(bot, api)),
+        ]),
+    )
+}
+
+fn container_use_section(
+    bot: &crate::cgroup::ContainerSample,
+    api: Option<&crate::cgroup::ContainerSample>,
+) -> String {
+    let unavailable = crate::cgroup::ContainerSample::unavailable();
+    let api = api.unwrap_or(&unavailable);
+    render(
+        CONTAINER_USE_TEMPLATE,
+        &BTreeMap::from([
+            ("bot_cpu".into(), cpu_value(bot)),
+            ("bot_memory".into(), memory_value(bot)),
+            ("api_cpu".into(), cpu_value(api)),
+            ("api_memory".into(), memory_value(api)),
+        ]),
+    )
+}
+
+fn cpu_value(sample: &crate::cgroup::ContainerSample) -> String {
+    sample
+        .cpu_tenths
+        .map(format_cpu_tenths)
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn memory_value(sample: &crate::cgroup::ContainerSample) -> String {
+    let Some(memory) = sample.memory else {
+        return "unavailable".to_string();
+    };
+    let used = format_bytes(memory.program_bytes);
+    match memory.limit {
+        crate::cgroup::MemoryLimit::Unlimited => format!("{used} / no limit"),
+        crate::cgroup::MemoryLimit::Bytes(limit) => format!("{used} / {}", format_bytes(limit)),
+    }
+}
+
+fn format_cpu_tenths(tenths: u32) -> String {
+    format!("{}.{}%", tenths / 10, tenths % 10)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes < KIB {
+        return format!("{bytes} B");
+    }
+    let (unit, suffix) = if bytes < MIB {
+        (KIB, "KiB")
+    } else if bytes < GIB {
+        (MIB, "MiB")
+    } else {
+        (GIB, "GiB")
+    };
+    let mut whole = bytes / unit;
+    let mut frac = ((bytes % unit) * 10 + unit / 2) / unit;
+    if frac >= 10 {
+        whole += 1;
+        frac = 0;
+    }
+    format!("{whole}.{frac} {suffix}")
+}
+
 /// Renders a template, replacing `{variable}` tokens with values from `vars`.
 /// Unknown tokens are left untouched so template mistakes are visible.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
@@ -503,6 +591,99 @@ mod presentation_tests {
             );
         }
         assert!(!out.contains("**bot:** unknown"));
+    }
+
+    #[test]
+    fn status_does_not_wait_for_a_cpu_sample() {
+        let started = std::time::Instant::now();
+        let text = stats_with_container_use(
+            "**📊 Stats (this server)**".into(),
+            &crate::cgroup::ContainerSample::unavailable(),
+            None,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**Bot memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**API memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        assert!(!text.contains("0.0%"), "{text}");
+        assert!(!text.contains("0 B"), "{text}");
+    }
+
+    #[test]
+    fn container_use_shows_program_memory_and_leaves_the_api_unavailable() {
+        let bot = crate::cgroup::ContainerSample {
+            memory: Some(crate::cgroup::MemoryUse {
+                program_bytes: 900,
+                limit: crate::cgroup::MemoryLimit::Unlimited,
+            }),
+            cpu_tenths: Some(250),
+        };
+        let text = stats_with_container_use("stats".into(), &bot, None);
+        assert!(text.contains("**Bot CPU:** `25.0%`"), "{text}");
+        assert!(
+            text.contains("**Bot memory (real program use):** `900 B / no limit`"),
+            "{text}"
+        );
+        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**API memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn container_memory_limit_renders_without_a_cpu_sample() {
+        let bot = crate::cgroup::ContainerSample {
+            memory: Some(crate::cgroup::MemoryUse {
+                program_bytes: 4096,
+                limit: crate::cgroup::MemoryLimit::Bytes(8192),
+            }),
+            cpu_tenths: None,
+        };
+        let text = stats_with_container_use("stats".into(), &bot, None);
+        assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**Bot memory (real program use):** `4.0 KiB / 8.0 KiB`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unreadable_cgroup_layout_renders_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "jmg-status-cgroup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meminfo"), "MemTotal: 1\n").unwrap();
+        std::fs::write(dir.join("stat"), "cpu 1 2 3\n").unwrap();
+        let reading = crate::cgroup::read_cgroup(Some(&dir), Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(reading.memory.is_none());
+        assert!(reading.cpu.is_none());
+        let sample = crate::cgroup::ContainerSample {
+            memory: reading.memory,
+            cpu_tenths: None,
+        };
+        let text = stats_with_container_use("stats".into(), &sample, None);
+        assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**Bot memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        assert!(!text.contains("0.0%"), "{text}");
+        assert!(!text.contains("0 B"), "{text}");
     }
 
     #[test]

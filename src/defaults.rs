@@ -344,7 +344,7 @@ pub fn default_commands() -> Vec<CommandDef> {
     out.push(cmd(
         "stats",
         "Utility",
-        "This server's retained moderation counts and deployed component versions.",
+        "This server's moderation counts, release state, and container CPU and memory.",
         "!stats",
         "admin",
         Behavior::Stats,
