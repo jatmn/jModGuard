@@ -330,6 +330,12 @@ async fn run_step(
                 }
                 crate::member_directory::BanContinuation::AlreadyFinished => {}
                 crate::member_directory::BanContinuation::RecordOnly => {
+                    crate::cases::settle_present_application_ban(
+                        env.app,
+                        enrollment.clone(),
+                        target.get(),
+                    )
+                    .await;
                     if env.app.activation.may_record() {
                         db::record_enrolled_ban_if_absent(
                             &env.app.db,
@@ -359,6 +365,16 @@ async fn run_step(
                     if !env.app.activation.may_record() {
                         anyhow::bail!("writer lease is not held");
                     }
+                    let attempted = crate::cases::begin_application_attempt(
+                        env.app,
+                        enrollment.clone(),
+                        crate::db::guild_data::CaseAction::Ban,
+                        target.get(),
+                        Some(env.actor.get()),
+                        Some("custom command".into()),
+                        crate::db::guild_data::CaseEvidence::Unavailable,
+                    )
+                    .await;
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -392,15 +408,15 @@ async fn run_step(
                     if !env.app.activation.may_record() {
                         anyhow::bail!("writer lease is not held");
                     }
-                    record_step_outcome(
-                        env.app,
-                        env.actor,
-                        enrollment.clone(),
-                        crate::db::guild_data::CaseAction::Ban,
-                        target,
-                        &result,
-                    )
-                    .await;
+                    if let Some(case_id) = attempted {
+                        crate::cases::settle_application_attempt(
+                            env.app,
+                            enrollment.clone(),
+                            case_id,
+                            crate::cases::classify_discord(result.as_ref().err()),
+                        )
+                        .await;
+                    }
                     pending_ban
                         .finish(
                             env.app,

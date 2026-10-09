@@ -406,7 +406,6 @@ async fn enforce(
         .await;
     }
     let mut ban_outcome = None;
-    let mut ban_case = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
@@ -420,23 +419,14 @@ async fn enforce(
             crate::member_directory::BanContinuation::Stop
             | crate::member_directory::BanContinuation::AlreadyFinished => {}
             crate::member_directory::BanContinuation::RecordOnly => {
-                if app.activation.may_record()
-                    && crate::db::record_enrolled_ban_if_absent(
-                        &app.db,
-                        Some(enrollment.clone()),
-                        found.author as i64,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &format!("[automod:{rule}] {}", found.reason),
-                        None,
-                        crate::db::BanRecord::Retry,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some()
+                if continue_present_spam_ban(
+                    app,
+                    enrollment.clone(),
+                    found.author,
+                    rule,
+                    &found.reason,
+                )
+                .await
                 {
                     ban_outcome = Some(CaseOutcome::Succeeded);
                 }
@@ -447,6 +437,27 @@ async fn enforce(
                         crate::member_directory::begin_ban_attempt(app, found.guild, found.author)
                             .await;
                     if app.activation.may_record() {
+                        let attempted = crate::cases::begin_application_attempt(
+                            app,
+                            Some(enrollment.clone()),
+                            CaseAction::Ban,
+                            found.author,
+                            None,
+                            Some(found.reason.clone()),
+                            evidence(found.excerpts.clone()),
+                        )
+                        .await;
+                        if found.kind == Kind::Image
+                            && let Some(case_id) = attempted.clone()
+                        {
+                            capture_attachments(
+                                app,
+                                enrollment.clone(),
+                                case_id,
+                                &found.attachments,
+                            )
+                            .await;
+                        }
                         let suppression = app.suppress_next_gateway_case(
                             crate::state::GatewayCaseAction::Ban,
                             found.guild,
@@ -507,17 +518,15 @@ async fn enforce(
                                     .await;
                                 }
                                 ban_outcome = Some(outcome.clone());
-                                ban_case = crate::cases::record_application(
-                                    app,
-                                    Some(enrollment.clone()),
-                                    CaseAction::Ban,
-                                    outcome.clone(),
-                                    found.author,
-                                    None,
-                                    Some(found.reason.clone()),
-                                    evidence(found.excerpts.clone()),
-                                )
-                                .await;
+                                if let Some(case_id) = attempted.clone() {
+                                    crate::cases::settle_application_attempt(
+                                        app,
+                                        Some(enrollment.clone()),
+                                        case_id,
+                                        outcome.clone(),
+                                    )
+                                    .await;
+                                }
                                 pending_ban.finish(app, outcome).await;
                             }
                         }
@@ -525,11 +534,6 @@ async fn enforce(
                 }
             }
         }
-    }
-    if found.kind == Kind::Image
-        && let Some(case_id) = ban_case
-    {
-        capture_attachments(app, enrollment, case_id, &found.attachments).await;
     }
     let action = match ban_outcome {
         None => "delete remaining; ban already applied this window".into(),
@@ -560,6 +564,33 @@ async fn enforce(
     ]);
     crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
     ReportDisposition::Consumed
+}
+
+pub(crate) async fn continue_present_spam_ban(
+    app: &BotState,
+    enrollment: crate::db::GuildEnrollment,
+    author: u64,
+    rule: &str,
+    reason: &str,
+) -> bool {
+    crate::cases::settle_present_application_ban(app, Some(enrollment.clone()), author).await;
+    app.activation.may_record()
+        && crate::db::record_enrolled_ban_if_absent(
+            &app.db,
+            Some(enrollment),
+            author as i64,
+            None,
+            None,
+            None,
+            None,
+            &format!("[automod:{rule}] {reason}"),
+            None,
+            crate::db::BanRecord::Retry,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn eligible(rule: &crate::types::RuleDef, author: u64, channel: u64, roles: &[u64]) -> bool {

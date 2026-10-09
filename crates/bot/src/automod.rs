@@ -562,6 +562,12 @@ pub async fn execute_pending(
                     publish_report = false;
                 }
                 crate::member_directory::BanContinuation::RecordOnly => {
+                    crate::cases::settle_present_application_ban(
+                        app,
+                        enrollment.clone(),
+                        target.id.get(),
+                    )
+                    .await;
                     publish_report = app.activation.may_record()
                         && db::record_enrolled_ban_if_absent(
                             &app.db,
@@ -593,6 +599,21 @@ pub async fn execute_pending(
                         if !app.activation.may_record() {
                             publish_report = false;
                         } else {
+                            let attempted = crate::cases::begin_application_attempt(
+                                app,
+                                enrollment.clone(),
+                                crate::db::guild_data::CaseAction::Ban,
+                                target.id.get(),
+                                None,
+                                Some(reason.clone()),
+                                crate::cases::text_excerpt(
+                                    msg_channel.unwrap_or(0),
+                                    msg_id.unwrap_or(0),
+                                    target.id.get(),
+                                    pending.evidence["content"].as_str().unwrap_or(""),
+                                ),
+                            )
+                            .await;
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
                                 guild_id.get(),
@@ -646,22 +667,15 @@ pub async fn execute_pending(
                                         .is_some();
                                     }
                                     if app.activation.may_record() {
-                                        crate::cases::record_application(
-                                            app,
-                                            enrollment.clone(),
-                                            crate::db::guild_data::CaseAction::Ban,
-                                            outcome.clone(),
-                                            target.id.get(),
-                                            None,
-                                            Some(reason.clone()),
-                                            crate::cases::text_excerpt(
-                                                msg_channel.unwrap_or(0),
-                                                msg_id.unwrap_or(0),
-                                                target.id.get(),
-                                                pending.evidence["content"].as_str().unwrap_or(""),
-                                            ),
-                                        )
-                                        .await;
+                                        if let Some(case_id) = attempted.clone() {
+                                            crate::cases::settle_application_attempt(
+                                                app,
+                                                enrollment.clone(),
+                                                case_id,
+                                                outcome.clone(),
+                                            )
+                                            .await;
+                                        }
                                         pending_ban.finish(app, outcome).await;
                                     }
                                 }

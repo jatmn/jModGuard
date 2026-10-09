@@ -51,13 +51,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 }
                 crate::member_directory::BanContinuation::AlreadyFinished => {}
                 crate::member_directory::BanContinuation::RecordOnly => {
-                    if record_ban_once(
-                        env,
+                    if continue_present_command_ban(
+                        env.app,
                         enrollment.clone(),
-                        target,
-                        &target_user,
+                        target.get() as i64,
+                        target_user.known_name.as_deref(),
+                        target_user.global_name.as_deref(),
+                        env.actor.get() as i64,
+                        &env.actor_member.user.name,
                         &reason,
-                        db::BanRecord::Retry,
                     )
                     .await?
                     {
@@ -85,6 +87,16 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     if !env.app.activation.may_record() {
                         return Err(anyhow!("writer lease is not held"));
                     }
+                    let attempted = crate::cases::begin_application_attempt(
+                        env.app,
+                        enrollment.clone(),
+                        crate::db::guild_data::CaseAction::Ban,
+                        target.get(),
+                        Some(env.actor.get()),
+                        Some(reason.clone()),
+                        crate::db::guild_data::CaseEvidence::Unavailable,
+                    )
+                    .await;
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -121,17 +133,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     if !env.app.activation.may_record() {
                         return Err(anyhow!("writer lease is not held"));
                     }
-                    crate::cases::record_application(
-                        env.app,
-                        enrollment.clone(),
-                        crate::db::guild_data::CaseAction::Ban,
-                        outcome.clone(),
-                        target.get(),
-                        Some(env.actor.get()),
-                        Some(reason.clone()),
-                        crate::db::guild_data::CaseEvidence::Unavailable,
-                    )
-                    .await;
+                    if let Some(case_id) = attempted {
+                        crate::cases::settle_application_attempt(
+                            env.app,
+                            enrollment.clone(),
+                            case_id,
+                            outcome.clone(),
+                        )
+                        .await;
+                    }
                     pending_ban.finish(env.app, outcome.clone()).await;
                     match outcome {
                         crate::db::guild_data::CaseOutcome::Succeeded => {
@@ -919,6 +929,38 @@ async fn target_and_reason(
         args.rest()
     };
     Ok((target, reason))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn continue_present_command_ban(
+    app: &crate::state::BotState,
+    enrollment: Option<db::GuildEnrollment>,
+    target: i64,
+    known_name: Option<&str>,
+    global_name: Option<&str>,
+    actor: i64,
+    actor_name: &str,
+    reason: &str,
+) -> Result<bool> {
+    let subject = u64::try_from(target).unwrap_or(0);
+    crate::cases::settle_present_application_ban(app, enrollment.clone(), subject).await;
+    if !app.activation.may_record() {
+        return Ok(false);
+    }
+    Ok(db::record_enrolled_ban_if_absent(
+        &app.db,
+        enrollment,
+        target,
+        known_name,
+        global_name,
+        Some(actor),
+        Some(actor_name),
+        reason,
+        None,
+        db::BanRecord::Retry,
+    )
+    .await?
+    .is_some())
 }
 
 async fn record_ban_once(
