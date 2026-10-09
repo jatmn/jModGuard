@@ -164,6 +164,9 @@ fn controller(
         prepared: None,
         standby: None,
         rollback: None,
+        pending_failure: None,
+        receipt_attempt: 0,
+        receipt_not_before: None,
         reported: false,
         last_observed: None,
     }
@@ -177,6 +180,9 @@ async fn restart(service: &mut Supervisor) {
     service.instance = format!("{:032x}", rand::random::<u128>());
     service.standby = None;
     service.rollback = None;
+    service.pending_failure = None;
+    service.receipt_attempt = 0;
+    service.receipt_not_before = None;
 }
 
 #[tokio::test]
@@ -690,7 +696,10 @@ async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_do
     // A newer baked controller can already satisfy an earlier queued launcher
     // request. Settle that request without claiming the requested bytes ran.
     let state = control.component("bot").await.unwrap();
-    assert!(!bot.launcher(&state).await.unwrap());
+    assert!(matches!(
+        bot.launcher(&state).await.unwrap(),
+        ControlStep::Proceed
+    ));
     assert!(
         control
             .component("bot")
@@ -702,7 +711,10 @@ async fn independent_update_requires_launcher_before_spawn_and_retains_app_on_do
     // A different build with a newer optional launcher must not cause a handoff.
     let mut optional = release.clone();
     optional.launcher.as_mut().unwrap().revision += 1;
-    assert!(!bot.required_launcher(&optional, None).await.unwrap());
+    assert!(matches!(
+        bot.required_launcher(&optional, None).await.unwrap(),
+        ControlStep::Proceed
+    ));
     let advice =
         jmodguard_updater::launcher_status(&control.component("bot").await.unwrap(), now());
     assert_eq!(advice["state"], "satisfied");
@@ -1349,32 +1361,36 @@ async fn stored_launcher_without_contract_is_cleared_once() {
     let mut bot = offline_controller("bot", control.clone(), &root);
     let mut api = offline_controller("api", control.clone(), &root);
     let (_, warnings) = with_contract_warnings(async {
-        assert!(
-            !bot.launcher(&control.component("bot").await.unwrap())
+        assert!(matches!(
+            bot.launcher(&control.component("bot").await.unwrap())
                 .await
-                .unwrap()
-        );
-        assert!(
-            !api.launcher(&control.component("api").await.unwrap())
+                .unwrap(),
+            ControlStep::Proceed
+        ));
+        assert!(matches!(
+            api.launcher(&control.component("api").await.unwrap())
                 .await
-                .unwrap()
-        );
+                .unwrap(),
+            ControlStep::Proceed
+        ));
     })
     .await;
     assert_eq!(warnings.len(), 2, "{warnings:?}");
     assert_idle_without_desired(&control, "bot").await;
     assert_idle_without_desired(&control, "api").await;
     let (_, again) = with_contract_warnings(async {
-        assert!(
-            !bot.launcher(&control.component("bot").await.unwrap())
+        assert!(matches!(
+            bot.launcher(&control.component("bot").await.unwrap())
                 .await
-                .unwrap()
-        );
-        assert!(
-            !api.launcher(&control.component("api").await.unwrap())
+                .unwrap(),
+            ControlStep::Proceed
+        ));
+        assert!(matches!(
+            api.launcher(&control.component("api").await.unwrap())
                 .await
-                .unwrap()
-        );
+                .unwrap(),
+            ControlStep::Proceed
+        ));
     })
     .await;
     assert!(again.is_empty(), "{again:?}");
@@ -1402,7 +1418,7 @@ async fn stored_launcher_that_is_not_newer_is_still_cleared() {
         bot.launcher(&control.component("bot").await.unwrap()).await
     })
     .await;
-    assert!(!kept.unwrap());
+    assert!(matches!(kept.unwrap(), ControlStep::Proceed));
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_idle_without_desired(&control, "bot").await;
     assert!(!root.join("jmodguard-launcher-next").exists());
@@ -1442,7 +1458,7 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
         bot.launcher(&control.component("bot").await.unwrap()).await
     })
     .await;
-    assert!(selected.unwrap());
+    assert!(matches!(selected.unwrap(), ControlStep::Reexec));
     assert!(warnings.is_empty(), "{warnings:?}");
     let desired = control
         .component("bot")
@@ -1457,5 +1473,97 @@ async fn stored_launcher_with_newer_contract_is_still_selected() {
     assert!(handoff.ends_with(&format!("{}\n", release.digest)));
     server.abort();
     drop((bot, control, db));
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
+async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
+    use std::os::unix::fs::PermissionsExt;
+    let root =
+        std::env::temp_dir().join(format!("readonly-receipt-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("core.db");
+    let db = Db::open(&path, 2).unwrap();
+    let candidate = release_at("api", 'a', db::CORE_SCHEMA_VERSION + 5);
+    let stamp = now();
+    db::record_update_check(&db, "api", "latest", Some(candidate.clone()), None, stamp)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "api", &candidate.digest, stamp)
+        .await
+        .unwrap();
+    drop(db);
+    let opts = DbOpenOptions {
+        read_only: true,
+        path: path.clone(),
+        url: String::new(),
+        token: String::new(),
+        pool_size: 2,
+        migrate: false,
+        default_prefix: "!".into(),
+        retention_days: 1,
+    };
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    assert!(!control.writes_locally());
+    let script = root.join("sleep-child");
+    tokio::fs::write(&script, "#!/bin/sh\nsleep 60\n")
+        .await
+        .unwrap();
+    tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        root.join("baked-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    let child = launch(&script, &"b".repeat(40), None).await.unwrap();
+    tokio::fs::write(&child.ready_file, "ready").await.unwrap();
+    service.running = Some(child);
+    service.reported = true;
+    assert!(!service.tick().await.unwrap());
+    let pending = service.pending_failure.as_ref().unwrap();
+    assert_eq!(
+        pending.component.as_ref().unwrap().0.digest,
+        candidate.digest
+    );
+    assert!(
+        !service.staging.exists()
+            || std::fs::read_dir(&service.staging)
+                .unwrap()
+                .next()
+                .is_none()
+    );
+    assert!(!service.tick().await.unwrap());
+    assert!(service.pending_failure.is_some());
+    drop(service);
+
+    let mut objects = HashMap::new();
+    let mut required = image(&mut objects, "api", b"\x7fELF\x02\x01\x01\x00required");
+    required.launcher = Some(db::LauncherCompatibility {
+        revision: db::LAUNCHER_REVISION + 1,
+        min_revision: db::LAUNCHER_REVISION + 1,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let control = UpdateControl::open(&opts).unwrap().unwrap();
+    let mut service = controller("api", root.join("baked-api"), registry, control, &root);
+    let step = service.required_launcher(&required, None).await.unwrap();
+    assert!(matches!(step, ControlStep::Defer));
+    assert!(!root.join("jmodguard-launcher-next").exists());
+    server.abort();
+    drop(service);
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }

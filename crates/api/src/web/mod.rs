@@ -1672,17 +1672,20 @@ mod tests {
             upgrade: None,
         };
         let before = control.component("api").await.unwrap();
-        control.observe_launcher("api", 1).await.unwrap();
-        control.baked_launcher("api", "hash", 1).await.unwrap();
-        control
-            .launcher_running("api", &release, "hash", 1)
-            .await
-            .unwrap();
-        control
-            .launcher_failed("api", &release.digest, "err")
-            .await
-            .unwrap();
-        control.failed("api", &release, "err").await.unwrap();
+        for result in [
+            control.observe_launcher("api", 1).await,
+            control.baked_launcher("api", "hash", 1).await,
+            control.launcher_running("api", &release, "hash", 1).await,
+            control.launcher_failed("api", &release.digest, "err").await,
+            control.failed("api", &release, "err").await,
+        ] {
+            let error =
+                result.expect_err("a read-only launcher must not pretend a receipt was saved");
+            assert!(
+                error.downcast_ref::<crate::db::ReceiptNotSaved>().is_some(),
+                "{error:#}"
+            );
+        }
         control.upgrade_error("missing", "err").await.unwrap();
         let after = control.component("api").await.unwrap();
         assert_eq!(

@@ -160,6 +160,47 @@ pub enum ControlOp {
         failed: ComponentRelease,
         error: String,
     },
+    RecordComponentRollback {
+        component: String,
+        failed: ComponentRelease,
+        previous: Option<ComponentRelease>,
+        observation: ComponentObservation,
+        error: String,
+        now: i64,
+    },
+    ObserveLauncher {
+        component: String,
+        revision: u32,
+    },
+    ClearSupersededLauncher {
+        component: String,
+        release: ComponentRelease,
+    },
+    ClearUncontractedLauncher {
+        component: String,
+        release: ComponentRelease,
+    },
+    RecordLauncherRunning {
+        component: String,
+        release: ComponentRelease,
+        hash: String,
+        now: i64,
+    },
+    RecordBakedLauncher {
+        component: String,
+        hash: String,
+        now: i64,
+    },
+    RecordLauncherFailure {
+        component: String,
+        digest: String,
+        error: String,
+    },
+    /// `operation` must be absent. Paired upgrades are refused.
+    SelectRequiredLauncher {
+        release: ComponentRelease,
+        operation: Option<String>,
+    },
     RecordWebuiDrift {
         error: String,
     },
@@ -299,6 +340,14 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::RecordBakedComponentRunning { .. }
         | ControlOp::LookupResult
         | ControlOp::RecordComponentFailure { .. }
+        | ControlOp::RecordComponentRollback { .. }
+        | ControlOp::ObserveLauncher { .. }
+        | ControlOp::ClearSupersededLauncher { .. }
+        | ControlOp::ClearUncontractedLauncher { .. }
+        | ControlOp::RecordLauncherRunning { .. }
+        | ControlOp::RecordBakedLauncher { .. }
+        | ControlOp::RecordLauncherFailure { .. }
+        | ControlOp::SelectRequiredLauncher { .. }
         | ControlOp::RecordWebuiDrift { .. }
         | ControlOp::RecordWebuiInstalledVerified { .. }
         | ControlOp::TrackWebuiAssets { .. }
@@ -646,6 +695,65 @@ async fn apply_control_inner(
             error,
         } => {
             record_component_failure(db, &component, &failed, &error).await?;
+            saved_null()
+        }
+        ControlOp::RecordComponentRollback {
+            component,
+            failed,
+            previous,
+            observation,
+            error,
+            now,
+        } => {
+            record_component_rollback(db, &component, &failed, previous, observation, &error, now)
+                .await?;
+            saved_null()
+        }
+        ControlOp::ObserveLauncher {
+            component,
+            revision,
+        } => {
+            record_launcher_observation(db, &component, revision).await?;
+            saved_null()
+        }
+        ControlOp::ClearSupersededLauncher { component, release } => {
+            record_clear_superseded_launcher(db, &component, &release).await?;
+            saved_null()
+        }
+        ControlOp::ClearUncontractedLauncher { component, release } => {
+            record_clear_uncontracted_launcher(db, &component, &release).await?;
+            saved_null()
+        }
+        ControlOp::RecordLauncherRunning {
+            component,
+            release,
+            hash,
+            now,
+        } => {
+            record_launcher_running(db, &component, &release, &hash, now).await?;
+            saved_null()
+        }
+        ControlOp::RecordBakedLauncher {
+            component,
+            hash,
+            now,
+        } => {
+            record_baked_launcher(db, &component, &hash, now).await?;
+            saved_null()
+        }
+        ControlOp::RecordLauncherFailure {
+            component,
+            digest,
+            error,
+        } => {
+            record_launcher_failure(db, &component, &digest, &error).await?;
+            saved_null()
+        }
+        ControlOp::SelectRequiredLauncher { release, operation } => {
+            if operation.is_some() {
+                anyhow::bail!(PAIRED_UPGRADES_DISABLED);
+            }
+            record_required_launcher(db, &release, None).await?;
             saved_null()
         }
         ControlOp::RecordWebuiDrift { error } => {
