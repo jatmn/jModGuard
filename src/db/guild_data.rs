@@ -463,7 +463,15 @@ impl GuildDataStore {
 
     /// Bot/API tenant runtimes attach the core database so persisted write fences fail closed on
     /// guild-store mutations, not only at `TenantRuntime::live` handle acquisition.
+    ///
+    /// When the core pool has an armed writer, every guild mutation commit re-reads the core
+    /// `active_bot_lease` row. An empty owner slot does not query and does not change commits.
     pub fn with_core_write_fence(self, core: Db) -> Self {
+        let probe_core = core.clone();
+        self.db
+            .install_commit_lease_probe(std::sync::Arc::new(move || {
+                Self::confirm_core_writer_lease(&probe_core)
+            }));
         Self {
             core: Some(core),
             ..self
@@ -472,6 +480,24 @@ impl GuildDataStore {
 
     /// Re-read the captured enrollment on the core primary while a guild
     /// transaction is already open. Missing core (unit stores) skips the check.
+    fn confirm_core_writer_lease(core: &Db) -> Result<()> {
+        let Some(expected) = core.leased_owner() else {
+            return Ok(());
+        };
+        core.with_conn_sync(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let value: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key='active_bot_lease'",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+                .optional()?;
+            tx.finish_read()?;
+            crate::db_compat::reject_active_bot_lease(value.as_deref(), &expected)
+        })
+    }
+
     pub(super) fn confirm_captured_enrollment(
         core: &Option<Db>,
         scope: &GuildDataScope,

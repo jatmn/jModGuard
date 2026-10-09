@@ -349,3 +349,117 @@ async fn moderation_read_keeps_prior_membership_without_waiting_for_the_writer()
             .is::<EnrollmentChanged>()
     );
 }
+
+#[tokio::test]
+async fn stale_active_ban_is_replaced_and_the_same_dispatch_is_not_inserted_twice() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    record_enrolled_ban_with_identity(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(1),
+        None,
+        "old reason",
+        Some("2020-01-01T00:00:00+00:00"),
+    )
+    .await
+    .unwrap();
+    let occurred = "2024-02-02T00:00:00+00:00";
+    let id = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "new reason",
+        Some(occurred),
+    )
+    .await
+    .unwrap();
+    assert!(id.is_some());
+    let rows = list_enrolled_bans(&f.db, scope.clone(), 10).await.unwrap();
+    let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, id.unwrap());
+    assert_eq!(active[0].reason.as_deref(), Some("new reason"));
+    assert_eq!(active[0].moderator_id, Some(9));
+    assert!(
+        rows.iter()
+            .any(|row| !row.active && row.reason.as_deref() == Some("old reason"))
+    );
+    let again = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "new reason",
+        Some(occurred),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, None);
+    assert_eq!(
+        list_enrolled_bans(&f.db, scope.clone(), 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.active)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ended_ban_does_not_block_a_new_insert() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    record_enrolled_ban_with_identity(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(1),
+        None,
+        "ended",
+        Some("2020-01-01T00:00:00+00:00"),
+    )
+    .await
+    .unwrap();
+    mark_enrolled_unbanned(&f.db, Some(scope.clone()), 55)
+        .await
+        .unwrap();
+    let id = record_enrolled_ban_if_absent(
+        &f.db,
+        Some(scope.clone()),
+        55,
+        None,
+        None,
+        Some(9),
+        None,
+        "fresh",
+        Some("2024-03-03T00:00:00+00:00"),
+    )
+    .await
+    .unwrap();
+    assert!(id.is_some());
+    let rows = list_enrolled_bans(&f.db, scope, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.active)
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("fresh")
+    );
+}

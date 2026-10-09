@@ -1769,6 +1769,7 @@ mod tests {
             .await
             .unwrap();
         let sink = LeaveSink::default();
+        app.activation.mark_lock_held(true);
         for (id, present) in [(7, false), (8, true)] {
             let observation = MemberObservation {
                 user_id: id,

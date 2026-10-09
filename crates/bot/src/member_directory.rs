@@ -1123,4 +1123,82 @@ mod tests {
         assert!(helper.contains("reserve_ban_marker(save)"));
         assert!(helper.contains("BAN_MARKER_SAVE_DEADLINE"));
     }
+
+    #[tokio::test]
+    async fn stale_active_ban_is_replaced_when_discord_has_no_ban() {
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Missing, DiscordBanView::Absent, true),
+            BanContinuation::BanThenRecord
+        );
+        let path =
+            std::env::temp_dir().join(format!("stale_ban_{:032x}.db", rand::random::<u128>()));
+        let database = db::Db::open(&path, 2).unwrap();
+        let enrollment = db::enroll_guild(&database, 10, 100).await.unwrap().unwrap();
+        db::record_enrolled_ban_with_identity(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(1),
+            None,
+            "old reason",
+            Some("2020-01-01T00:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        let occurred = "2024-02-02T00:00:00+00:00";
+        let id = db::record_enrolled_ban_if_absent(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(9),
+            None,
+            "new reason",
+            Some(occurred),
+        )
+        .await
+        .unwrap();
+        assert!(id.is_some(), "a new ban must not be suppressed");
+        let rows = db::list_enrolled_bans(&database, enrollment.clone(), 10)
+            .await
+            .unwrap();
+        let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reason.as_deref(), Some("new reason"));
+        assert_eq!(active[0].moderator_id, Some(9));
+        assert!(
+            rows.iter()
+                .any(|row| !row.active && row.moderator_id == Some(1))
+        );
+        let again = db::record_enrolled_ban_if_absent(
+            &database,
+            Some(enrollment.clone()),
+            55,
+            None,
+            None,
+            Some(9),
+            None,
+            "new reason",
+            Some(occurred),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, None);
+        assert_eq!(
+            db::list_enrolled_bans(&database, enrollment, 10)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row.active)
+                .count(),
+            1
+        );
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

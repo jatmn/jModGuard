@@ -707,11 +707,36 @@ pub struct Connection {
     read_only: bool,
     /// Copied from the pool at checkout. `None` leaves commits unchanged.
     expected_lease_owner: Option<String>,
+    /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
+    commit_lease_probe: Option<CommitLeaseProbe>,
 }
 
 /// The active-bot lease row is not this instance, or it has expired.
 #[derive(Debug)]
 pub struct ActiveBotLeaseRejected;
+
+/// Re-read of `meta.active_bot_lease`. Missing, foreign, and expired rows fail.
+pub(crate) fn reject_active_bot_lease(value: Option<&str>, expected: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Err(ActiveBotLeaseRejected.into());
+    };
+    let mut parts = value.split_whitespace();
+    let owner = parts.next().unwrap_or("");
+    let expires = parts
+        .next()
+        .and_then(|text| text.parse::<i64>().ok())
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    if owner != expected || expires <= now_ms {
+        return Err(ActiveBotLeaseRejected.into());
+    }
+    Ok(())
+}
+
+pub(crate) type CommitLeaseProbe = std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 impl std::fmt::Display for ActiveBotLeaseRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1051,6 +1076,7 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            commit_lease_probe: None,
         })
     }
 
@@ -1064,11 +1090,16 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            commit_lease_probe: None,
         })
     }
 
     pub(crate) fn set_expected_lease_owner(&mut self, owner: Option<String>) {
         self.expected_lease_owner = owner;
+    }
+
+    pub(crate) fn set_commit_lease_probe(&mut self, probe: Option<CommitLeaseProbe>) {
+        self.commit_lease_probe = probe;
     }
 
     pub(crate) fn set_read_only(&mut self, read_only: bool) {
@@ -1234,6 +1265,7 @@ impl Connection {
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
             expected_lease_owner: self.expected_lease_owner.clone(),
+            commit_lease_probe: self.commit_lease_probe.clone(),
         }
     }
 
@@ -1438,6 +1470,7 @@ pub struct Transaction {
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
     expected_lease_owner: Option<String>,
+    commit_lease_probe: Option<CommitLeaseProbe>,
 }
 
 #[derive(Clone, Copy)]
@@ -1805,23 +1838,7 @@ impl Transaction {
                 |row| Ok(row.get(0)?),
             )
             .optional()?;
-        let Some(value) = value else {
-            return Err(ActiveBotLeaseRejected.into());
-        };
-        let mut parts = value.split_whitespace();
-        let owner = parts.next().unwrap_or("");
-        let expires = parts
-            .next()
-            .and_then(|text| text.parse::<i64>().ok())
-            .unwrap_or(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-        if owner != expected || expires <= now_ms {
-            return Err(ActiveBotLeaseRejected.into());
-        }
-        Ok(())
+        reject_active_bot_lease(value.as_deref(), expected)
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -1847,6 +1864,9 @@ impl Transaction {
         }
         if let Some(expected) = self.expected_lease_owner.as_deref() {
             self.reject_unless_active_lease(expected)?;
+        }
+        if let Some(probe) = self.commit_lease_probe.clone() {
+            probe()?;
         }
         if self.capacity_dirty.load(Ordering::Acquire) {
             let actual = crate::capacity::sample(&self)?;

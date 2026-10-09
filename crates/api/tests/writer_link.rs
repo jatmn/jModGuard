@@ -177,3 +177,33 @@ async fn missing_control_secret_does_not_start_the_listener() {
     drop(bot);
     cleanup(&path);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn normal_api_routes_and_startup_do_not_open_a_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let path = temp_db("router");
+    let schema = Db::open(&path, 2).unwrap();
+    drop(schema);
+    let mut cfg = ApiProcessConfig::default();
+    cfg.db.path = path.clone();
+    cfg.db.pool_size = 2;
+    let opts = cfg.db_open_options();
+    assert!(opts.read_only);
+    assert!(!opts.migrate);
+    let flag = Arc::new(AtomicBool::new(false));
+    db::arm_writer_open_tripwire(Arc::clone(&flag));
+    let db = jmodguard_api::startup::open_database(&cfg).await.unwrap();
+    assert!(db.is_read_only());
+    assert!(
+        !flag.load(Ordering::SeqCst),
+        "startup open must stay read-only"
+    );
+    let app = ApiState::new(cfg, db).unwrap();
+    assert!(app.db.is_read_only());
+    let _router = jmodguard_api::web::router(Arc::clone(&app));
+    assert!(
+        !flag.load(Ordering::SeqCst),
+        "building the normal router must not open a writer"
+    );
+    cleanup(&path);
+}

@@ -906,12 +906,33 @@ impl Fixture {
         let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = 1;
         cfg.log.discord_timeout_secs = timeout_secs;
-        Self {
-            app: BotState::new(cfg, db).unwrap(),
-            path,
-        }
+        let app = BotState::new(cfg, db).unwrap();
+        app.activation.mark_lock_held(true);
+        Self { app, path }
     }
 }
+#[tokio::test]
+async fn cutoff_drops_configured_log_delivery() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 456)
+        .await
+        .unwrap();
+    f.app.activation.cut_off();
+    let sink = Sink::default();
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "message_edit",
+            BTreeMap::new()
+        )
+        .await,
+        Delivery::Dropped
+    );
+    assert!(sink.messages.lock().unwrap().is_empty());
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         for suffix in ["", "-wal", "-shm"] {

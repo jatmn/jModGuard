@@ -7,6 +7,14 @@ use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
 use super::{Args, BehaviorOutcome, CmdEnv, refuse_fenced_discord_mutation};
+
+fn lease_held(env: &CmdEnv<'_>) -> Result<()> {
+    if env.app.activation.may_record() {
+        Ok(())
+    } else {
+        Err(anyhow!("writer lease is not held"))
+    }
+}
 use crate::types::Behavior;
 use crate::{db, logging};
 
@@ -152,6 +160,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             // Discord is authoritative; local bans table is a mirror healed by
             // GUILD_BAN_REMOVE. Do not fail the command after Discord succeeds.
             refuse_fenced_discord_mutation(env).await?;
+            lease_held(env)?;
             let suppression = env.app.suppress_next_gateway_case(
                 crate::state::GatewayCaseAction::Unban,
                 env.guild_id.get(),
@@ -166,6 +175,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed) {
                 env.app.release_gateway_case_suppression(suppression);
             }
+            lease_held(env)?;
             crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
@@ -217,8 +227,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|g| g.members.get(&target).cloned())
                 .ok_or_else(|| anyhow!("target is not in this server"))?;
             refuse_fenced_discord_mutation(env).await?;
+            lease_held(env)?;
             let discord = member.kick_with_reason(&env.ctx.http, &reason).await;
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            lease_held(env)?;
             crate::cases::record_application(
                 env.app,
                 enrollment.clone(),
@@ -281,6 +293,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 )
             };
             refuse_fenced_discord_mutation(env).await?;
+            lease_held(env)?;
             let discord = if let Some(until) = until {
                 member
                     .disable_communication_until_datetime(&env.ctx.http, until)
@@ -289,6 +302,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 member.enable_communication(&env.ctx.http).await
             };
             let outcome = crate::cases::classify_discord(discord.as_ref().err());
+            lease_held(env)?;
             crate::cases::record(
                 env.app,
                 enrollment.clone(),
@@ -351,6 +365,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 args.rest()
             };
             let target_user = user_lookup(env, target).await?;
+            lease_held(env)?;
             let warn_result = db::add_enrolled_warn(
                 &env.app.db,
                 enrollment.clone(),
@@ -359,6 +374,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 &reason,
             )
             .await;
+            lease_held(env)?;
             let outcome = crate::cases::classify_db_commit(&warn_result);
             crate::cases::record(
                 env.app,
@@ -508,6 +524,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 msgs.iter().filter(|m| !m.pinned).map(|m| m.id).collect();
             let n = ids.len();
             refuse_fenced_discord_mutation(env).await?;
+            if n > 0 {
+                lease_held(env)?;
+            }
             if n > 1 {
                 let _ = env.channel_id.delete_messages(&env.ctx.http, &ids).await;
             } else if n == 1 {
@@ -531,6 +550,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Say => {
             let (target, text) = say_target_and_text(&env.args, env.channel_id)?;
+            lease_held(env)?;
             target.say(&env.ctx.http, &text).await?;
             vars.insert("channel".into(), format!("<#{}>", target));
             Ok(BehaviorOutcome {
@@ -548,6 +568,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(*default_seconds);
             refuse_fenced_discord_mutation(env).await?;
+            lease_held(env)?;
             env.channel_id
                 .edit(
                     &env.ctx.http,
@@ -613,6 +634,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 .next_arg()
                 .ok_or_else(|| anyhow!("missing prefix"))?;
             // Patch only prefix so other fields keep inheriting from global.
+            lease_held(env)?;
             db::patch_settings(
                 &env.app.db,
                 env.guild_id.get() as i64,

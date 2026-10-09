@@ -388,10 +388,16 @@ pub async fn execute_pending(
         "log" => {}
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
+                if !app.activation.may_record() {
+                    return;
+                }
                 let _ = ctx.http.delete_message(ch.into(), id.into(), None).await;
             }
         }
         "warn" => {
+            if !app.activation.may_record() {
+                return;
+            }
             let warn_result = db::add_enrolled_warn(
                 &app.db,
                 enrollment.clone(),
@@ -400,6 +406,9 @@ pub async fn execute_pending(
                 &format!("[automod:{}] {}", pending.rule_id, reason),
             )
             .await;
+            if !app.activation.may_record() {
+                return;
+            }
             let outcome = crate::cases::classify_db_commit(&warn_result);
             crate::cases::record(
                 app,
@@ -434,6 +443,9 @@ pub async fn execute_pending(
                 if let Ok(until) =
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
                 {
+                    if !app.activation.may_record() {
+                        return;
+                    }
                     discord_err = member
                         .disable_communication_until_datetime(&ctx.http, until)
                         .await
@@ -444,6 +456,9 @@ pub async fn execute_pending(
                 }
             } else {
                 tracing::warn!("automod timeout: no guild member for {}", target.id);
+            }
+            if !app.activation.may_record() {
+                return;
             }
             if let Some(outcome) =
                 crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
@@ -476,6 +491,9 @@ pub async fn execute_pending(
                 target.id,
             );
             let (called, discord_err) = if let Some(member) = member {
+                if !app.activation.may_record() {
+                    return;
+                }
                 (
                     true,
                     member.kick_with_reason(&ctx.http, &reason).await.err(),
@@ -484,6 +502,9 @@ pub async fn execute_pending(
                 tracing::warn!("automod kick: no guild member for {}", target.id);
                 (false, None)
             };
+            if !app.activation.may_record() {
+                return;
+            }
             if let Some(outcome) =
                 crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
@@ -619,6 +640,9 @@ pub async fn execute_pending(
     // Log-only/delete-only observations are routine Discord reports. Retain
     // selected moderation records until the typed case model replaces this table.
     if matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
+        if !app.activation.may_record() {
+            return;
+        }
         let evidence = serde_json::json!({
             "rule": pending.rule_id, "action": rule.action,
             "reason": reason, "evidence": pending.evidence,

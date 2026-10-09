@@ -307,6 +307,26 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
     }
 }
 
+/// Every scope a copy must authorize. Other operations keep a single need.
+pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
+    match op {
+        ControlOp::CopyGuildConfig {
+            source,
+            destination,
+            ..
+        } => {
+            let source_need = scope_actor_need(source);
+            let destination_need = scope_actor_need(destination);
+            if source_need == destination_need {
+                vec![destination_need]
+            } else {
+                vec![source_need, destination_need]
+            }
+        }
+        other => vec![control_actor_need(other)],
+    }
+}
+
 fn scope_actor_need(scope: &ScopeWire) -> ControlActorNeed {
     if scope.global {
         ControlActorNeed::Owner
@@ -360,11 +380,12 @@ fn guild_actor(
 
 struct LeaseFence<'a> {
     db: &'a Db,
+    previous: Option<String>,
 }
 
 impl Drop for LeaseFence<'_> {
     fn drop(&mut self) {
-        self.db.clear_lease_owner();
+        self.db.restore_lease_owner(self.previous.take());
     }
 }
 
@@ -375,8 +396,9 @@ pub async fn apply_control(
     instance: Option<&str>,
 ) -> Result<ControlReply> {
     let _fence = instance.map(|owner| {
+        let previous = db.leased_owner();
         db.arm_lease_owner(owner);
-        LeaseFence { db }
+        LeaseFence { db, previous }
     });
     match apply_control_inner(db, tenant, op).await {
         Err(error) if lease_rejected(&error) => Ok(ControlReply::Waiting),
@@ -899,6 +921,60 @@ mod tests {
             ControlReply::Saved { .. } | ControlReply::Unchanged { .. }
         ));
         assert_eq!(get_settings(&db, 0).await.unwrap().prefix, "?");
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_owner_rejects_commits_after_the_lease_is_released() {
+        let path =
+            std::env::temp_dir().join(format!("armed_lease_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn(|conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "INSERT INTO meta (key, value) VALUES ('lease_probe', 'open')",
+                params![],
+                4096,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let owner = "cd".repeat(16);
+        assert!(
+            claim_active_bot(
+                &db,
+                &owner,
+                crate::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        release_active_bot(&db, &owner).await.unwrap();
+        let error = db
+            .with_conn(|conn| {
+                let mut tx = conn.transaction_primary_read()?;
+                tx.ensure_mutation_receipt()?;
+                tx.execute_bounded(
+                    "UPDATE meta SET value='closed' WHERE key='lease_probe'",
+                    params![],
+                    4096,
+                )?;
+                tx.commit()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
+                .is_some()),
+            "{error:#}"
+        );
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

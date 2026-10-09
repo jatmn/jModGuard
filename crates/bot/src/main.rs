@@ -229,6 +229,7 @@ async fn main() -> Result<()> {
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
     app.install_discord_cache(Arc::clone(&cache));
+    app.install_http_member_lookup(Arc::clone(&http));
 
     // One process-wide importer shares its Discord request budget across all
     // enrolled guilds. The job claim/cursor lives in the guild store.
@@ -258,6 +259,9 @@ async fn main() -> Result<()> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = shutdown_signal() => break, _ = tick.tick() => {} }
+                if !app.activation.may_record() {
+                    continue;
+                }
                 let Some(source) =
                     jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                 else {
@@ -298,6 +302,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         let Some(membership) =
                             jmodguard_bot::enrollment_repair::DiscordMembership::from_cache(&http, &cache)
                         else {
@@ -315,6 +322,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ = cleanup.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await {
                             tracing::warn!("bot action history cleanup failed: {error:#}");
                         }
@@ -333,6 +343,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         jmodguard_bot::cases::retry_deferred_discord_audit_links(&app, None).await;
                     }
                 }
@@ -349,6 +362,9 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
+                        if !app.activation.may_record() {
+                            continue;
+                        }
                         loop {
                             match app.tenant.drive_erasure().await {
                                 Ok(true) => {}
@@ -376,6 +392,9 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if !app.activation.may_record() {
+                    continue;
+                }
                 drain_nickname_reconciles(&app, &http, &identity).await;
             }
         });
@@ -406,6 +425,9 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                if !app.activation.may_record() {
+                    continue;
+                }
                 // Peek slash registry every tick (not gated on config_version) so a
                 // future slash-only bump cannot be missed. Do not commit the observed
                 // version until Discord re-sync has nothing left to retry — otherwise

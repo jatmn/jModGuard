@@ -498,8 +498,12 @@ pub async fn add_enrolled_warn(
     .await
 }
 
-/// Insert the active ban row only when one is not already stored.
-/// Returns the new id, or `None` when the row was already present and nothing was written.
+/// Insert an active ban row for this dispatch.
+///
+/// The same reason, moderator, and `created_at` returns `None` and writes nothing.
+/// Any other active row for the guild and user is marked inactive in the same transaction,
+/// then the new row is inserted and its id is returned. An ended row does not block the insert.
+/// `Some` means a row was inserted.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_enrolled_ban_if_absent(
     db: &Db,
@@ -525,18 +529,25 @@ pub async fn record_enrolled_ban_if_absent(
         let mut tx = conn.transaction_primary_read()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-        let existing: Option<i64> = tx
+        let same_dispatch: Option<i64> = tx
             .query_row(
-                "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 ORDER BY id DESC LIMIT 1",
-                params![guild_id, user_id],
+                "SELECT id FROM bans
+                 WHERE guild_id=?1 AND user_id=?2 AND active=1
+                   AND reason IS ?3 AND created_at=?4 AND moderator_id IS ?5
+                 ORDER BY id DESC LIMIT 1",
+                params![guild_id, user_id, reason.clone(), now.clone(), moderator_id],
                 |row| Ok(row.get(0)?),
             )
             .optional()?;
-        if existing.is_some() {
+        if same_dispatch.is_some() {
             tx.finish_read()?;
             return Ok(None);
         }
         tx.ensure_mutation_receipt()?;
+        tx.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+            params![guild_id, user_id],
+        )?;
         tx.execute_rows(
             "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",

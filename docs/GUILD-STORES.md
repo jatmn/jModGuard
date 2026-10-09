@@ -78,14 +78,14 @@ do not invent historical phase counts.
 Version13 preserves exact, dated bot-executor audit actions while their local case
 source association remains unresolved; a later exact source link consumes the staged
 action without creating a duplicate case. Version14 lets case-retention updates
-preserve in-flight member import pages. There are no core
+preserve in-flight member import pages. Version 15 is the local write fence checked before guild-store mutations. There are no core
 configuration/default/enrollment tables or general event archives. Core bootstrap
 never applies this schema; the existing core version is 17.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to version14, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current version14 schema, identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 15, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current schema 15 identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

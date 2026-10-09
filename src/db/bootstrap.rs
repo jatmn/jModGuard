@@ -468,24 +468,33 @@ pub async fn claim_active_bot(
 ) -> Result<bool> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_read()?;
-        if refuse.load(std::sync::atomic::Ordering::Acquire) {
-            tx.finish_read()?;
-            return Ok(false);
-        }
-        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
-        if lease_blocks(current.as_deref(), &instance, now_ms) {
-            tx.finish_read()?;
-            return Ok(false);
-        }
-        let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
-        tx.ensure_mutation_receipt()?;
-        write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
-        tx.commit()?;
-        Ok(true)
-    })
-    .await
+    let armed = instance.clone();
+    let claimed = db
+        .with_conn(move |conn| {
+            // This transaction writes the lease row. It must commit even when a
+            // previous owner is still armed on the pool.
+            conn.set_expected_lease_owner(None);
+            let mut tx = conn.transaction_primary_read()?;
+            if refuse.load(std::sync::atomic::Ordering::Acquire) {
+                tx.finish_read()?;
+                return Ok(false);
+            }
+            let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+            if lease_blocks(current.as_deref(), &instance, now_ms) {
+                tx.finish_read()?;
+                return Ok(false);
+            }
+            let expires = now_ms.saturating_add(ACTIVE_BOT_LEASE_TTL_MS);
+            tx.ensure_mutation_receipt()?;
+            write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await?;
+    if claimed {
+        db.arm_lease_owner(&armed);
+    }
+    Ok(claimed)
 }
 
 /// Drop the lease only when this instance still owns the row.
@@ -493,6 +502,9 @@ pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
     db.with_conn(move |conn| {
+        // The delete removes the row this commit would re-read. Ownership is
+        // checked below; the pool stays armed so later commits fail.
+        conn.set_expected_lease_owner(None);
         let mut tx = conn.transaction_primary_read()?;
         let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
         let owned = current

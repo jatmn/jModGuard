@@ -157,6 +157,9 @@ impl UpdateControl {
     /// any managed selections, where the baked bot may finish initialization.
     /// An error never authorizes fallback to a baked application.
     pub fn open(opts: &DbOpenOptions) -> Result<Option<Self>> {
+        if !opts.read_only {
+            super::note_writable_open();
+        }
         let empty = std::cell::Cell::new(false);
         let db = Db::open_with_bootstrap(
             opts,

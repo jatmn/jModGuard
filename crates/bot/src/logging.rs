@@ -863,6 +863,9 @@ async fn emit_to_observed_with_audit(
             .unwrap_or_else(|| default_template(event));
         templates::format_log_timestamps(&mut vars);
         let rendered = render_log_template(event, template, &mut vars);
+        if !app.activation.may_record() {
+            return Ok(Delivery::Dropped);
+        }
         sink.send(channel_id, log_message(&rendered)).await?;
         Ok::<_, anyhow::Error>(Delivery::Sent)
     })
@@ -1759,6 +1762,9 @@ pub async fn emit_mod_action(
     source_channel_id: u64,
     reason: &str,
 ) {
+    if !app.activation.may_record() {
+        return;
+    }
     let mut vars = templates::user_vars(target_id, target_name, target_display);
     vars.insert("actor".into(), format!("{} (<@{}>)", actor_name, actor_id));
     vars.insert("actor_id".into(), actor_id.to_string());

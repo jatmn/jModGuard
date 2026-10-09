@@ -7,13 +7,13 @@ jModGuard runs as **two processes** that share one database:
 | `jmodguard-bot` | Discord gateway, automod, commands, migrations (`migrate=true`) |
 | `jmodguard-api` | OAuth WebUI + JSON API (`migrate=false`; requires feature `web`) |
 
-Neither process calls the other. The **database is the source of truth**.
+Steady state, the API is read-only and sends mutations to the bot over the private control link. The bot writes the database.
 
 ```
-jmodguard-bot  ──writes──►  SQLite / libSQL  ◄──writes──  jmodguard-api
-       │                           │                           │
-       └──── polls config_version ─┴── both processes poll ────┘
+jmodguard-api  ──control link──►  jmodguard-bot  ──writes──►  SQLite / libSQL
 ```
+
+Maintenance recovery still opens a writer until the maintainer chooses among: the bot applies recovery at startup before taking the lease; a minimal control-only bot writer started while both apps are down; updater-owned writes.
 
 For a single-host install, both processes open the same local SQLite file. For
 distributed deployment, both connect to one remote libSQL database. Bunny

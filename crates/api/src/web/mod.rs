@@ -1012,12 +1012,7 @@ where
 }
 
 fn recovery_control(app: &ApiState) -> crate::db::UpdateControl {
-    let mut opts = app.cfg.db_open_options();
-    opts.read_only = false;
-    match crate::db::UpdateControl::open(&opts) {
-        Ok(Some(control)) => control,
-        _ => crate::db::UpdateControl::from_application(&app.db),
-    }
+    crate::db::UpdateControl::from_application(&app.db)
 }
 
 pub fn router(app: Arc<ApiState>) -> Router {

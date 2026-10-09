@@ -192,9 +192,18 @@ fn submit_blocking(
 }
 
 pub(crate) fn seal(key: &[u8], op: &ControlOp, actor_user_id: i64) -> Result<Vec<u8>> {
+    seal_with_expiry(key, op, actor_user_id, now_ms().saturating_add(MAX_AGE_MS))
+}
+
+pub fn seal_with_expiry(
+    key: &[u8],
+    op: &ControlOp,
+    actor_user_id: i64,
+    expires_ms: i64,
+) -> Result<Vec<u8>> {
     let wire = Wire {
         nonce: random_nonce()?,
-        expires_ms: now_ms().saturating_add(MAX_AGE_MS),
+        expires_ms,
         actor_user_id,
         op: op.clone(),
     };
@@ -215,7 +224,7 @@ pub fn open_frame(
     key: &[u8],
     body: &[u8],
     nonces: &Mutex<NonceWindow>,
-) -> Result<(ControlOp, i64)> {
+) -> Result<(ControlOp, i64, i64)> {
     if body.len() < MAC_HEX || body.len() > BODY_LIMIT {
         anyhow::bail!("write failed");
     }
@@ -231,7 +240,7 @@ pub fn open_frame(
     if !guard.accept(&wire.nonce, wire.expires_ms, now_ms()) {
         anyhow::bail!("write failed");
     }
-    Ok((wire.op, wire.actor_user_id))
+    Ok((wire.op, wire.actor_user_id, wire.expires_ms))
 }
 
 pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
@@ -413,7 +422,8 @@ mod tests {
     fn matching_control_secret_seals_and_opens() {
         let key = load_writer_key(&fixture_secret()).unwrap();
         let frame = seal(&key, &sample_op(), 4).unwrap();
-        let (op, actor) = open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        let (op, actor, _) =
+            open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 4);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
     }
@@ -440,7 +450,8 @@ mod tests {
         assert_ne!(left.as_slice(), token_a.as_bytes());
         assert_ne!(right.as_slice(), token_b.as_bytes());
         let frame = seal(&left, &sample_op(), 0).unwrap();
-        let (op, actor) = open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        let (op, actor, _) =
+            open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 0);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { .. }));
         assert!(

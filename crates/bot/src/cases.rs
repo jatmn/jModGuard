@@ -78,7 +78,7 @@ fn durable_audit_link_conflict(error: &anyhow::Error) -> bool {
 }
 
 async fn link_discord_audit(app: &BotState, ready: crate::state::PendingAuditReady) {
-    if ready.entry_id <= 0 {
+    if ready.entry_id <= 0 || !app.activation.may_record() {
         return;
     }
     let link = ready.link.clone();
@@ -432,6 +432,7 @@ mod tests {
             std::env::temp_dir().join(format!("audit_sources_{:032x}.db", rand::random::<u128>()));
         let database = db::Db::open(&path, 2).unwrap();
         let app = BotState::new(Default::default(), database).unwrap();
+        app.activation.mark_lock_held(true);
         let enrollment = db::enroll_guild(&app.db, guild, 100)
             .await
             .unwrap()

@@ -136,6 +136,7 @@ impl HranaFixture {
                 read_only: false,
                 busy_timeout_ms: 5_000,
                 lease_owner: Arc::clone(&lease_owner),
+                commit_lease_probe: Arc::new(Mutex::new(None)),
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             permit_timeout: Some(Duration::from_secs(3)),

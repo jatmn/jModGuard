@@ -448,3 +448,107 @@ async fn identity_verification_uses_one_catalog_read_and_rechecks_schema() {
     drop(store);
     assert!(GuildDataStore::open(f.options(), reg).is_err());
 }
+
+#[tokio::test]
+async fn guild_mutation_commit_rechecks_the_core_lease() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let open = f.placement(&reg, 10).await;
+    let live = f.placement(&reg, 11).await;
+    let released = f.placement(&reg, 12).await;
+    let expired = f.placement(&reg, 13).await;
+    let empty = f.placement(&reg, 14).await;
+    store.bind_initial_placement(open.clone()).await.unwrap();
+    store.verify_placement(open).await.unwrap();
+
+    let owner = "ab".repeat(16);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &owner,
+            crate::control::now_ms(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    store.bind_initial_placement(live.clone()).await.unwrap();
+    store.verify_placement(live).await.unwrap();
+
+    release_active_bot(&f.catalog, &owner).await.unwrap();
+    let error = store
+        .bind_initial_placement(released.clone())
+        .await
+        .unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert!(matches!(
+        store
+            .verify_placement(released)
+            .await
+            .unwrap_err()
+            .downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Unbound)
+    ));
+
+    f.catalog.clear_lease_owner();
+    write_core_lease(
+        &f.catalog,
+        Some(format!("{owner} {}", crate::control::now_ms() - 1_000)),
+    )
+    .await;
+    f.catalog.arm_lease_owner(&owner);
+    let error = store
+        .bind_initial_placement(expired.clone())
+        .await
+        .unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert!(matches!(
+        store
+            .verify_placement(expired)
+            .await
+            .unwrap_err()
+            .downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Unbound)
+    ));
+
+    f.catalog.clear_lease_owner();
+    write_core_lease(&f.catalog, None).await;
+    store.bind_initial_placement(empty.clone()).await.unwrap();
+    store.verify_placement(empty).await.unwrap();
+}
+
+fn lease_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
+            .is_some()
+    })
+}
+
+async fn write_core_lease(db: &Db, value: Option<String>) {
+    db.with_conn(move |conn| {
+        conn.set_expected_lease_owner(None);
+        let mut tx = conn.transaction_primary_read()?;
+        tx.ensure_mutation_receipt()?;
+        if let Some(value) = value {
+            tx.execute_bounded(
+                "INSERT INTO meta (key, value) VALUES ('active_bot_lease', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![value],
+                4096,
+            )?;
+        } else {
+            tx.execute_bounded(
+                "DELETE FROM meta WHERE key='active_bot_lease'",
+                params![],
+                4096,
+            )?;
+        }
+        tx.commit()
+    })
+    .await
+    .unwrap();
+}

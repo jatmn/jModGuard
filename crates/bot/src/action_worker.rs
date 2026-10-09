@@ -315,6 +315,9 @@ async fn execute_inner(
                         crate::db::guild_data::MemberSyncAction::Reconcile
                     }
                 };
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
                 mutation_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 let Some(bot_id) = discord.bot_user_id() else {
                     return Outcome::failed("bot_identity_unavailable");
@@ -377,6 +380,9 @@ async fn execute_inner(
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
                 }
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
                 let suppression = app.map(|app| {
                     app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Unban,
@@ -419,6 +425,9 @@ async fn execute_inner(
                 Outcome::failed("validation_timed_out")
             }
         });
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Err(anyhow::anyhow!("writer lease is not held"));
+    }
     if mutation_started.load(std::sync::atomic::Ordering::Relaxed)
         && let Some(tenant) = tenant
         && let Action::Unban { user_id, reason } = &job.action
@@ -489,6 +498,9 @@ async fn execute_inner(
                 "selected unban case not recorded: invalid captured action identity"
             );
         }
+    }
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Err(anyhow::anyhow!("writer lease is not held"));
     }
     if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
         tracing::warn!(

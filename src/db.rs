@@ -419,8 +419,8 @@ pub struct Db {
     config_floor_lock: Arc<parking_lot::Mutex<()>>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Expected active-bot instance copied onto connections at checkout.
-    /// Empty means commits are not fenced. Control apply sets this only for
-    /// the duration of that call.
+    /// Empty means commits are not fenced. Claiming the writer lease arms this
+    /// and leaves it armed. Control apply restores the previous value.
     lease_owner: Arc<Mutex<Option<String>>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
@@ -473,17 +473,34 @@ impl Db {
     }
 
     pub(crate) fn arm_lease_owner(&self, owner: &str) {
-        *self
-            .lease_owner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner.to_owned());
+        self.restore_lease_owner(Some(owner.to_owned()));
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_lease_owner(&self) {
+        self.restore_lease_owner(None);
+    }
+
+    pub(crate) fn leased_owner(&self) -> Option<String> {
+        self.lease_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn restore_lease_owner(&self, owner: Option<String>) {
         *self
             .lease_owner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner;
+    }
+
+    pub(crate) fn install_commit_lease_probe(&self, probe: crate::db_compat::CommitLeaseProbe) {
+        *self
+            .connections
+            .commit_lease_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
     }
 }
 
@@ -502,6 +519,7 @@ struct ConnectionPool {
     read_only: bool,
     busy_timeout_ms: u32,
     lease_owner: Arc<Mutex<Option<String>>>,
+    commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
 }
 
 struct ConnectionLease {
@@ -546,6 +564,12 @@ impl ConnectionLease {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         connection.set_expected_lease_owner(owner);
+        let probe = pool
+            .commit_lease_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        connection.set_commit_lease_probe(probe);
         Ok(Self {
             connection: Some(connection),
             pool,
@@ -632,6 +656,9 @@ impl Db {
     }
 
     pub fn open_with(opts: DbOpenOptions) -> Result<Self> {
+        if !opts.read_only {
+            note_writable_open();
+        }
         let startup_deferred = std::cell::Cell::new(false);
         let opts_defaults = GuildSettings {
             prefix: opts.default_prefix.clone(),
@@ -810,6 +837,7 @@ impl Db {
             ready(bootstrap)?;
 
             let lease_owner = Arc::new(Mutex::new(None));
+            let commit_lease_probe = Arc::new(Mutex::new(None));
             Ok(Self {
                 path: opts.path.clone(),
                 remote,
@@ -825,6 +853,7 @@ impl Db {
                     read_only: opts.read_only,
                     busy_timeout_ms,
                     lease_owner: Arc::clone(&lease_owner),
+                    commit_lease_probe,
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 permit_timeout: remote.then_some(if opts.migrate {
@@ -986,6 +1015,7 @@ impl Db {
 
     async fn open_with_on_worker(opts: DbOpenOptions) -> Result<Self> {
         let probe = current_startup_probe();
+        let tripwire = writer_open_tripwire();
         let (send, receive) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("jmodguard-db-open".into())
@@ -993,6 +1023,9 @@ impl Db {
                 // The receiver can be dropped on shutdown. The worker still
                 // finishes the synchronous open; process exit reaps it.
                 let _probe = enter_startup_probe(probe);
+                if let Some(flag) = tripwire {
+                    arm_writer_open_tripwire(flag);
+                }
                 let _ = send.send(Self::open_with(opts));
             })
             .context("failed to start database-open worker")?;
@@ -1159,5 +1192,29 @@ impl Db {
 }
 
 // ---------------------------------------------------------------------------
+
+std::thread_local! {
+    static WRITER_OPEN_FLAG: std::cell::Cell<Option<Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arms a thread-local flag that records writable `Db::open_with` and
+/// `UpdateControl::open` calls. Other tests leave it unset.
+pub fn arm_writer_open_tripwire(flag: Arc<std::sync::atomic::AtomicBool>) {
+    WRITER_OPEN_FLAG.with(|slot| slot.set(Some(flag)));
+}
+
+pub(crate) fn writer_open_tripwire() -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    WRITER_OPEN_FLAG
+        .with(|slot| slot.take())
+        .inspect(|flag| WRITER_OPEN_FLAG.with(|slot| slot.set(Some(Arc::clone(flag)))))
+}
+
+fn note_writable_open() {
+    if let Some(flag) = writer_open_tripwire() {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests;

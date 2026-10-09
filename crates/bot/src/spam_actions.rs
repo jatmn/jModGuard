@@ -353,6 +353,9 @@ async fn enforce(
     let http = ctx.http.as_ref();
     let mut delete_notes = Vec::new();
     for (channel, message) in &found.messages {
+        if !app.activation.may_record() {
+            break;
+        }
         if !app
             .spam_gate
             .claim_delete(found.guild, found.author, *channel, *message, now)
@@ -383,6 +386,9 @@ async fn enforce(
             matches!(outcome, CaseOutcome::Succeeded),
         );
         delete_notes.push(format!("{channel}/{message} {outcome:?}"));
+        if !app.activation.may_record() {
+            break;
+        }
         crate::cases::record(
             app,
             Some(enrollment.clone()),

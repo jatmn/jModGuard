@@ -83,6 +83,9 @@ pub async fn reconcile_nickname_job(
         return;
     };
     let guild = serenity::model::id::GuildId::new(guild_id_u64);
+    if !app.activation.may_record() {
+        return;
+    }
     let edit = tokio::time::timeout(
         crate::discord::DISCORD_REST_TIMEOUT,
         guild.edit_member(&http, me, EditMember::new().nickname(job.nickname.clone())),
@@ -90,6 +93,9 @@ pub async fn reconcile_nickname_job(
     .await;
     match edit {
         Err(_) => {
+            if !app.activation.may_record() {
+                return;
+            }
             let now = chrono::Utc::now().timestamp();
             let message = "Discord nickname request timed out";
             if let Err(error) =
@@ -102,6 +108,9 @@ pub async fn reconcile_nickname_job(
             }
         }
         Ok(Ok(_)) => {
+            if !app.activation.may_record() {
+                return;
+            }
             if let Err(error) = db::acknowledge_nickname_reconcile(&app.db, &job).await {
                 tracing::warn!(
                     guild_id = job.guild_id,
@@ -110,6 +119,9 @@ pub async fn reconcile_nickname_job(
             }
         }
         Ok(Err(error)) => {
+            if !app.activation.may_record() {
+                return;
+            }
             let now = chrono::Utc::now().timestamp();
             use crate::discord::NicknameFailureClass;
             let (class, code) = crate::discord::classify_nickname_failure(&error);
