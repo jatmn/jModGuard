@@ -309,6 +309,10 @@ while the bot process is stopped. Schema and base changes ship in new images.
 Self-update stays off by default and is owner-triggered only. Signing is
 tracked in issue 188.
 
+This release requires launcher revision 3. A live install cannot pick it up
+through the in-app updater. Deploy it with new images for both the bot and
+the API.
+
 ### Bot container
 
 ```dotenv

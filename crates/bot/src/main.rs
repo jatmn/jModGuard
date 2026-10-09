@@ -120,6 +120,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(message) = jmodguard::launcher_child::refusal_message() {
+        tracing::error!("{message}");
+        shutdown_signal().await;
+        jmodguard::log_shutdown_finished("bot");
+        tracing::info!("bot process stopped");
+        return Ok(());
+    }
+
     jmodguard::cgroup::spawn_container_usage_sampler();
 
     let db = tokio::select! {

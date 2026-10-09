@@ -12,6 +12,7 @@ mod db_compat;
 pub mod defaults;
 #[cfg(unix)]
 pub mod evidence_transfer;
+pub mod launcher_child;
 pub use jmodguard_runtime::cgroup;
 pub use jmodguard_runtime::health;
 pub use jmodguard_runtime::log_shutdown_finished;

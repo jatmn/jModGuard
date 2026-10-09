@@ -113,6 +113,10 @@ async fn launch_mode(
             "JMODGUARD_UPDATE_MAINTENANCE",
             if maintenance { "1" } else { "0" },
         )
+        .env(
+            "JMODGUARD_LAUNCHER_REVISION",
+            db::LAUNCHER_REVISION.to_string(),
+        )
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to launch {}", path.display()))?;

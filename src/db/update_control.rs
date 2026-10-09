@@ -8,8 +8,8 @@ pub const PAIRED_UPGRADES_DISABLED: &str =
     "paired bot and API upgrades are disabled until signed, launcher-routed upgrades land (#188)";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 2;
-pub const REQUIRED_LAUNCHER_REVISION: u32 = 1;
+pub const LAUNCHER_REVISION: u32 = 3;
+pub const REQUIRED_LAUNCHER_REVISION: u32 = 3;
 const UPGRADE_KEY: &str = "component_upgrade_v1";
 
 /// A controller restarted, or an owner replaced/cancelled the operation while
