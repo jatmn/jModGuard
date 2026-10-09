@@ -2,8 +2,7 @@
 //! API can serve this same page after a newer application schema is installed.
 use super::*;
 use crate::config::ApiProcessConfig;
-use crate::db::{self, UpdateControl};
-use anyhow::Context as _;
+use crate::db::UpdateControl;
 use axum::extract::State;
 use axum::response::Html;
 use serde::Deserialize;

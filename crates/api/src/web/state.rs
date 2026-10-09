@@ -118,12 +118,6 @@ impl ApiState {
         changed
     }
 
-    /// Dashboard writes go through the bot when this process is read-only.
-    /// A writable connection, used by in-process fixtures, applies locally.
-    pub(crate) fn writer_link(&self) -> Option<jmodguard::control::WriterLink> {
-        self.writer.clone()
-    }
-
     pub async fn commit(&self, op: db::ControlOp) -> Result<db::ControlReply> {
         self.commit_actor(0, op).await
     }
