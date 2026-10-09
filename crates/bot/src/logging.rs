@@ -1209,6 +1209,29 @@ fn bound_proving_hash_list(hashes: &str, budget: usize) -> String {
     String::new()
 }
 
+/// Clip a non-hash tail. Keep the display marker only when the marker and
+/// `clip`'s ellipsis both fit; otherwise return a clip that fits, or nothing
+/// when even the ellipsis would exceed the budget (a zero limit).
+fn bound_plain_automod_tail(tail: &str, budget: usize) -> String {
+    if tail.encode_utf16().count() <= budget {
+        return tail.to_string();
+    }
+    let marker = " [display clipped]";
+    let with_marker = format!(
+        "{}{marker}",
+        clip(tail, budget.saturating_sub(marker.encode_utf16().count()))
+    );
+    if with_marker.encode_utf16().count() <= budget {
+        return with_marker;
+    }
+    let clipped = clip(tail, budget);
+    if clipped.encode_utf16().count() <= budget {
+        clipped
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn bound_automod_content_var(
     template: &str,
     vars: &mut BTreeMap<String, String>,
@@ -1240,22 +1263,19 @@ pub(crate) fn bound_automod_content_var(
             } else if tail.encode_utf16().count() <= budget.saturating_sub(hash_units + sep_units) {
                 format!("{hashes}{sep}{tail}")
             } else {
+                // `clip` still emits an ellipsis when the tail budget is zero, and the
+                // marker is longer than that remainder. Drop the tail instead of
+                // returning a string `render_bounded` would have to cut through a digest.
                 let tail_budget = budget.saturating_sub(hash_units + sep_units + marker_units);
-                format!("{hashes}{sep}{}{marker}", clip(&tail, tail_budget))
+                let clipped = format!("{hashes}{sep}{}{marker}", clip(&tail, tail_budget));
+                if clipped.encode_utf16().count() <= budget {
+                    clipped
+                } else {
+                    bound_proving_hash_list(&hashes, budget)
+                }
             }
         }
-        (None, tail) => {
-            if tail.encode_utf16().count() <= budget {
-                tail
-            } else {
-                let marker = " [display clipped]";
-                format!(
-                    "{}{}",
-                    clip(&tail, budget.saturating_sub(marker.encode_utf16().count())),
-                    marker
-                )
-            }
-        }
+        (None, tail) => bound_plain_automod_tail(&tail, budget),
     };
     vars.insert("content".into(), bounded);
 }
