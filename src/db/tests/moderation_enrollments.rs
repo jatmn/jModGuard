@@ -204,6 +204,7 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
     assert_eq!(json["moderator_id"], "1800882749273538599");
     assert_eq!(json["reason"], "No reason provided");
     let api = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: f.path.clone(),
         url: String::new(),
         token: String::new(),

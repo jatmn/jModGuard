@@ -30,6 +30,7 @@ impl Fixture {
             .unwrap();
         let db = GuildDataStore::initialize(
             GuildStoreOptions {
+                read_only: false,
                 path: base.join("guild.db"),
                 url: String::new(),
                 token: String::new(),

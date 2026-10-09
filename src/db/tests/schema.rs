@@ -2,6 +2,7 @@ use super::*;
 
 fn options(path: &Path, migrate: bool) -> DbOpenOptions {
     DbOpenOptions {
+        read_only: false,
         path: path.to_owned(),
         url: String::new(),
         token: String::new(),

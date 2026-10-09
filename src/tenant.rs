@@ -305,17 +305,36 @@ impl TenantRuntime {
         }
         let mut default_shared = None;
         for store in &credentials {
-            let registered = register_store(
-                core,
-                store.registration.id().clone(),
-                store.registration.policy(),
-            )
-            .await?;
-            anyhow::ensure!(
-                registered == store.registration,
-                "configured guild store ownership conflicts with the catalog"
-            );
-            open_runtime_store(core, store).await?;
+            if core.is_read_only() {
+                if let Some(existing) =
+                    crate::db::guild_stores::store_registration(core, store.registration.id())
+                        .await?
+                {
+                    anyhow::ensure!(
+                        existing == store.registration,
+                        "configured guild store ownership conflicts with the catalog"
+                    );
+                }
+            } else {
+                let registered = register_store(
+                    core,
+                    store.registration.id().clone(),
+                    store.registration.policy(),
+                )
+                .await?;
+                anyhow::ensure!(
+                    registered == store.registration,
+                    "configured guild store ownership conflicts with the catalog"
+                );
+            }
+            if let Err(error) = open_runtime_store(core, store).await {
+                let unpublished = core.is_read_only()
+                    && crate::db::is_schema_not_ready(&error)
+                    && error.to_string().contains("guild store is not ready");
+                if !unpublished {
+                    return Err(error);
+                }
+            }
             if matches!(store.registration.policy(), StorePolicy::Shared) {
                 default_shared.get_or_insert_with(|| store.registration.id().clone());
             }
@@ -899,7 +918,8 @@ impl TenantRuntime {
 }
 
 async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDataStore> {
-    if GuildDataStore::existing_registration(store.options.clone())?.is_none() {
+    let stamped = GuildDataStore::existing_registration(store.options.clone())?;
+    if stamped.is_none() {
         use crate::db::SqlExecutor;
         let id = store.registration.id().as_str().to_owned();
         let owned: bool = core.with_conn(move |conn| {
@@ -916,10 +936,28 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
             "owned guild store is missing or empty; restore its original database before retrying"
         );
     }
-    Ok(
-        GuildDataStore::initialize(store.options.clone(), store.registration.clone())?
-            .with_core_write_fence(core.clone()),
-    )
+    let expected = if store.options.read_only {
+        let Some(stamped) = stamped else {
+            return Err(crate::db::SchemaNotReady(
+                "guild store is not ready. Start the bot so it can create the store, then start the API."
+                    .into(),
+            )
+            .into());
+        };
+        anyhow::ensure!(
+            stamped.policy() == store.registration.policy(),
+            "configured guild store ownership conflicts with the store identity"
+        );
+        stamped
+    } else {
+        store.registration.clone()
+    };
+    let opened = if store.options.read_only {
+        GuildDataStore::open(store.options.clone(), expected)?
+    } else {
+        GuildDataStore::initialize(store.options.clone(), expected)?
+    };
+    Ok(opened.with_core_write_fence(core.clone()))
 }
 
 async fn resolve_configured(
@@ -944,6 +982,7 @@ async fn resolve_configured(
         url: configured.url.clone(),
         token: configured.token.clone(),
         pool_size: pool,
+        read_only: core.is_read_only(),
     };
     let id = if configured.id.is_empty() {
         discover_store_id(core, &options, policy).await?
@@ -978,6 +1017,7 @@ async fn default_shared(
         url: String::new(),
         token: String::new(),
         pool_size: pool,
+        read_only: core.is_read_only(),
     };
     let id = discover_store_id(core, &options, StorePolicy::Shared).await?;
     Ok(ResolvedStore {
@@ -1044,6 +1084,13 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
             #[cfg(unix)]
             {
                 let root = evidence_root(core, evidence)?;
+                if core.is_read_only()
+                    && db::existing_evidence_storage_id(core, &evidence.storage_id)
+                        .await?
+                        .is_none()
+                {
+                    return Ok(EvidenceBackend::None);
+                }
                 let first_install = db::existing_evidence_storage_id(core, &evidence.storage_id)
                     .await?
                     .is_none();

@@ -177,25 +177,23 @@ pub async fn add_note(
     Json(body): Json<NoteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
-    let (store, scope) = live(&app, enrollment).await?;
+    let _ = live(&app, enrollment).await?;
     let text = body.text.trim();
     if text.is_empty() {
         return Err(ApiError(anyhow::anyhow!("note cannot be empty")));
     }
     let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
-    let recorded = store
-        .append_case_note(
-            scope,
-            parse_case_id(&case_id)?,
-            parse_case_id(&body.entry_id)?,
-            (actor > 0).then_some(actor),
-            text.to_owned(),
-            tenant::history_limits(),
-        )
+    let (_, recorded_body) = app
+        .commit_json(crate::db::ControlOp::AppendCaseNote {
+            guild_id: i64::try_from(guild_id).unwrap_or(0),
+            case_id: case_id.clone(),
+            entry_id: body.entry_id.clone(),
+            actor_id: (actor > 0).then_some(actor),
+            text: text.to_owned(),
+        })
         .await?;
-    Ok(Json(
-        serde_json::json!({ "result": format!("{recorded:?}") }),
-    ))
+    let recorded: String = serde_json::from_value(recorded_body)?;
+    Ok(Json(serde_json::json!({ "result": recorded })))
 }
 
 pub async fn delete_case(
@@ -210,28 +208,14 @@ pub async fn delete_case(
             "you cannot remove cases in this server (needs Administrator permission or server ownership)"
         )));
     }
-    let (store, scope) = live(&app, enrollment).await?;
-    let id = parse_case_id(&case_id)?;
-    let removed = store.remove_case(scope.clone(), id.clone()).await?;
-    // Journal removal is the user-visible delete. Object-backend cleanup is a
-    // separate worker step; pending jobs remain retryable. Do not map worker I/O
-    // failure onto the administrator-facing delete outcome.
-    let cleanup_pending = match app.tenant.cleanup_owned_evidence(&store, &scope).await {
-        Ok(()) => false,
-        Err(error) => {
-            tracing::warn!(
-                guild_id,
-                case_id = %id.as_str(),
-                "case record removed; private evidence cleanup is still pending: {error:#}"
-            );
-            true
-        }
-    };
-    Ok(Json(serde_json::json!({
-        "removed": removed,
-        "cleanup_pending": cleanup_pending,
-        "discord_action_reversed": false,
-    })))
+    let _ = live(&app, enrollment).await?;
+    let (_, body) = app
+        .commit_json(crate::db::ControlOp::RemoveCase {
+            guild_id: i64::try_from(guild_id).unwrap_or(0),
+            case_id,
+        })
+        .await?;
+    Ok(Json(body))
 }
 
 pub async fn list_evidence(
@@ -313,7 +297,7 @@ pub async fn put_case_delete_roles(
             "you cannot change case-removal roles (needs Administrator permission or server ownership)"
         )));
     }
-    let (store, scope) = live(&app, enrollment).await?;
+    let _ = live(&app, enrollment).await?;
     let mut roles = Vec::new();
     for raw in body.roles {
         let id = raw
@@ -321,10 +305,15 @@ pub async fn put_case_delete_roles(
             .map_err(|_| ApiError(anyhow::anyhow!("invalid role id")))?;
         roles.push(id);
     }
-    let revision = store
-        .set_case_delete_roles(scope, &body.revision, roles)
+    let (_, revision_body) = app
+        .commit_json(crate::db::ControlOp::SetCaseDeleteRoles {
+            guild_id: i64::try_from(guild_id).unwrap_or(0),
+            revision: body.revision,
+            roles,
+        })
         .await
-        .map_err(ApiError)?;
+        .map_err(ApiError::from)?;
+    let revision: String = serde_json::from_value(revision_body).map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "revision": revision })))
 }
 

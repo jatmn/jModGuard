@@ -97,12 +97,45 @@ pub async fn write_shared_config(cfg: ApiProcessConfig) -> Result<()> {
     let dir = PathBuf::from(std::env::var("JMODGUARD_PROBE_DIR").context("JMODGUARD_PROBE_DIR")?);
     let migrate = cfg.db_open_options().migrate;
     write_probe_marker(&dir, "api-migrate", if migrate { "true" } else { "false" })?;
+    let port = std::fs::read_to_string(dir.join("writer-port")).context("writer-port")?;
+    let scope_id = std::fs::read_to_string(dir.join("writer-scope")).context("writer-scope")?;
+    let mut cfg = cfg;
+    cfg.bot.control_bind = format!("127.0.0.1:{}", port.trim());
     let db = open_database(&cfg).await?;
     let app = ApiState::new(cfg, db)?;
-    db::patch_settings(&app.db, guild_id, Some(Some(prefix)), None, None).await?;
-    let seen = db::get_settings(&app.db, guild_id).await?;
-    write_probe_marker(&dir, "api-wrote", &seen.prefix)?;
+    let reply = app
+        .commit(db::ControlOp::PatchSettings {
+            scope: db::ScopeWire {
+                global: false,
+                guild_id,
+                enrollment_id: scope_id.trim().to_owned(),
+                joined_at_ns: 1,
+            },
+            prefix: db::FieldPatch::Set(prefix),
+            bot_name: db::FieldPatch::Absent,
+            reconcile: false,
+        })
+        .await?;
+    // The marker is the bot's write result. A following read on this process
+    // can miss that commit on a replica.
+    let seen = prefix_shown_after_write(&reply)?;
+    write_probe_marker(&dir, "api-wrote", &seen)?;
     Ok(())
+}
+
+/// Value to show after a settings write. This is the bot's response, not a
+/// later read of this process's database connection.
+pub fn prefix_shown_after_write(reply: &db::ControlReply) -> Result<String> {
+    match reply {
+        db::ControlReply::Saved { body } | db::ControlReply::Unchanged { body } => body
+            .get("prefix")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .context("write failed"),
+        db::ControlReply::Failed { message } => anyhow::bail!(message.clone()),
+        db::ControlReply::Waiting | db::ControlReply::StillWaiting => anyhow::bail!("waiting"),
+        db::ControlReply::Busy => anyhow::bail!("busy"),
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +165,11 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}.guild.db{suffix}", path.display()));
         }
         jmodguard::tenant::remove_sidecars(path);
+        if let Some(name) = path.file_name() {
+            let mut key = name.to_os_string();
+            key.push(".writer-link");
+            let _ = std::fs::remove_file(path.with_file_name(key));
+        }
     }
 
     fn prepare_bot(path: &Path) -> Db {
@@ -139,6 +177,7 @@ mod tests {
         let mut cfg = BotProcessConfig::default();
         cfg.db.path = path.to_path_buf();
         let _tenant = TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence).unwrap();
+        jmodguard::control::load_writer_key(&cfg.db, true).unwrap();
         db
     }
 

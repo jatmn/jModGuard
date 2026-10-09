@@ -66,6 +66,8 @@ pub struct BotConfig {
     pub config_poll_secs: u64,
     /// Automatically retain eligible guild messages unless explicitly disabled.
     pub message_capture_enabled: bool,
+    /// Private API-to-bot writer link. Not the public health or web bind.
+    pub control_bind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +279,7 @@ impl Default for BotConfig {
             status: "moderating".into(),
             config_poll_secs: 5,
             message_capture_enabled: true,
+            control_bind: "127.0.0.1:8791".into(),
         }
     }
 }
@@ -494,6 +497,7 @@ impl DbConfig {
             token: self.token.clone(),
             pool_size: self.pool_size,
             migrate,
+            read_only: !migrate,
             default_prefix: bot.default_prefix.clone(),
             retention_days: bot.retention_days,
         }

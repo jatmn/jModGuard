@@ -4,14 +4,23 @@ pub(super) fn configure_connection(
     connection: &Connection,
     remote: bool,
     busy_timeout_ms: u32,
+    read_only: bool,
 ) -> Result<()> {
     if remote {
         // Hrana opens a new stream for each transaction, so a connection-level
         // foreign_keys pragma would not carry into transactional writes. The
         // current schema has no FOREIGN KEY clauses; add per-transaction stream
         // setup if a future migration introduces them. Remote busy timeout is
-        // not honored; the client operation deadline is the bound.
+        // not honored; the client operation deadline is the bound. A read-only
+        // client refuses writer-lock transactions before any BEGIN is sent.
+        let _ = read_only;
         Ok(())
+    } else if read_only {
+        connection.execute_batch(&format!(
+            "PRAGMA busy_timeout={busy_timeout_ms};
+             PRAGMA foreign_keys=ON;
+             PRAGMA query_only=ON;"
+        ))
     } else {
         connection.execute_batch(&format!(
             "PRAGMA busy_timeout={busy_timeout_ms};
@@ -494,9 +503,10 @@ pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
             return Ok(());
         }
         tx.ensure_mutation_receipt()?;
+        let owner_prefix = format!("{instance} ");
         tx.execute_rows(
-            "DELETE FROM meta WHERE key = ?1",
-            params![ACTIVE_BOT_LEASE],
+            "DELETE FROM meta WHERE key = ?1 AND substr(value, 1, length(?2)) = ?2",
+            params![ACTIVE_BOT_LEASE, owner_prefix],
             1,
         )?;
         tx.commit()?;

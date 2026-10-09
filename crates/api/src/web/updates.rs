@@ -1,6 +1,7 @@
 //! Owner-only independent release discovery and on-demand application.
 use super::state::ApiState;
 use super::{session_owner, trusted_web_origin};
+use anyhow::Context as _;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -19,6 +20,136 @@ fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
 }
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+macro_rules! via_bot {
+    ($app:expr, $direct:expr, $op:expr) => {{
+        if $app.db.is_read_only() {
+            commit_typed($app, $op).await
+        } else {
+            $direct.await
+        }
+    }};
+}
+
+async fn record_running(
+    app: &ApiState,
+    component: &str,
+    release: Option<ComponentRelease>,
+    observation: ComponentObservation,
+    now: i64,
+) -> anyhow::Result<()> {
+    if app.db.is_read_only() {
+        commit_typed(
+            app,
+            db::ControlOp::RecordComponentRunning {
+                component: component.to_owned(),
+                release,
+                observation,
+                now,
+            },
+        )
+        .await
+    } else {
+        db::record_component_running(&app.db, component, release, observation, now).await
+    }
+}
+
+async fn record_verified(
+    app: &ApiState,
+    release: &ComponentRelease,
+    observation: ComponentObservation,
+    now: i64,
+) -> anyhow::Result<()> {
+    if app.db.is_read_only() {
+        commit_typed(
+            app,
+            db::ControlOp::RecordWebuiInstalledVerified {
+                release: release.clone(),
+                observation,
+                now,
+            },
+        )
+        .await
+    } else {
+        db::record_webui_installed_verified(&app.db, release, observation, now).await
+    }
+}
+
+async fn commit_typed<T: serde::de::DeserializeOwned>(
+    app: &ApiState,
+    op: db::ControlOp,
+) -> anyhow::Result<T> {
+    let (_, body) = app.commit_json(op).await?;
+    Ok(serde_json::from_value(body)?)
+}
+
+async fn claim_any(
+    app: Option<&ApiState>,
+    db: &Db,
+    component: &str,
+    owner: &str,
+    now: i64,
+    ttl: i64,
+) -> anyhow::Result<bool> {
+    if db.is_read_only() {
+        commit_typed(
+            app.context("waiting")?,
+            db::ControlOp::ClaimUpdateLease {
+                component: component.to_owned(),
+                owner: owner.to_owned(),
+                now,
+                ttl,
+            },
+        )
+        .await
+    } else {
+        db::claim_update_lease(db, component, owner, now, ttl).await
+    }
+}
+
+async fn renew_any(
+    app: Option<&ApiState>,
+    db: &Db,
+    component: &str,
+    owner: &str,
+    now: i64,
+    ttl: i64,
+) -> anyhow::Result<bool> {
+    if db.is_read_only() {
+        commit_typed(
+            app.context("waiting")?,
+            db::ControlOp::RenewUpdateLease {
+                component: component.to_owned(),
+                owner: owner.to_owned(),
+                now,
+                ttl,
+            },
+        )
+        .await
+    } else {
+        db::renew_update_lease(db, component, owner, now, ttl).await
+    }
+}
+
+async fn release_any(
+    app: Option<&ApiState>,
+    db: &Db,
+    component: &str,
+    owner: &str,
+) -> anyhow::Result<()> {
+    if db.is_read_only() {
+        commit_typed(
+            app.context("waiting")?,
+            db::ControlOp::ReleaseUpdateLease {
+                component: component.to_owned(),
+                owner: owner.to_owned(),
+            },
+        )
+        .await
+    } else {
+        db::release_update_lease(db, component, owner).await
+    }
+}
 
 async fn owner(app: &Arc<ApiState>, session: &Session) -> Result<(), (StatusCode, Json<Value>)> {
     match session_owner(app, session).await {
@@ -42,11 +173,34 @@ fn enabled(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
 }
 
+/// The component this request just wrote replaces the replica row. A plain
+/// read can still be behind that commit.
+pub(crate) fn overlay_written_component(
+    mut rows: Vec<db::ComponentUpdate>,
+    written: &db::ComponentUpdate,
+) -> Vec<db::ComponentUpdate> {
+    match rows
+        .iter()
+        .position(|row| row.component == written.component)
+    {
+        Some(index) => rows[index] = written.clone(),
+        None => rows.push(written.clone()),
+    }
+    rows
+}
+
 pub async fn status(State(app): State<Arc<ApiState>>, session: Session) -> Reply {
     owner(&app, &session).await?;
-    let updates = db::component_updates(&app.db)
+    status_response(&app, None).await
+}
+
+async fn status_response(app: &Arc<ApiState>, written: Option<db::ComponentUpdate>) -> Reply {
+    let mut updates = db::component_updates(&app.db)
         .await
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "update state unavailable"))?;
+    if let Some(written) = written.as_ref() {
+        updates = overlay_written_component(updates, written);
+    }
     let mut compatibility = serde_json::Map::new();
     let mut launchers = serde_json::Map::new();
     let now = chrono::Utc::now().timestamp();
@@ -105,51 +259,77 @@ pub async fn check(
     if !matches!(input.component.as_str(), "bot" | "api" | "webui") {
         return Err(error(StatusCode::BAD_REQUEST, "invalid component"));
     }
-    check_one(&app, &input.component)
+    let written = check_one(&app, &input.component)
         .await
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "release check failed"))?;
-    status(State(app), session).await
+    status_response(&app, Some(written)).await
 }
 
-pub async fn check_one(app: &Arc<ApiState>, component: &str) -> anyhow::Result<()> {
+pub async fn check_one(
+    app: &Arc<ApiState>,
+    component: &str,
+) -> anyhow::Result<db::ComponentUpdate> {
     let lease = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp();
-    if !db::claim_update_lease(&app.db, component, &lease, now, 240).await? {
+    if !claim_any(Some(app), &app.db, component, &lease, now, 240).await? {
         anyhow::bail!("another update operation is running");
     }
-    with_update_lease(&app.db, component, &lease, 240, async {
+    with_update_lease(Some(app), &app.db, component, &lease, 240, async {
         let state = db::component_update(&app.db, component).await?;
         let registry = Registry::ghcr()?;
         let checked = match registry.discover(component, &state.channel).await {
-            Ok(candidate) => {
+            Ok(candidate) => via_bot!(
+                app,
                 db::record_update_check(
                     &app.db,
                     component,
                     &state.channel,
-                    Some(candidate),
+                    Some(candidate.clone()),
                     None,
                     now,
-                )
-                .await
-            }
+                ),
+                db::ControlOp::RecordUpdateCheck {
+                    component: component.to_owned(),
+                    channel: state.channel.clone(),
+                    candidate: Some(candidate),
+                    error: None,
+                    now,
+                }
+            )?,
             Err(error) => {
-                db::record_update_check(
-                    &app.db,
-                    component,
-                    &state.channel,
-                    None,
-                    Some(format!("{error:#}")),
-                    now,
-                )
-                .await?;
-                Err(error)
+                let message = format!("{error:#}");
+                via_bot!(
+                    app,
+                    db::record_update_check(
+                        &app.db,
+                        component,
+                        &state.channel,
+                        None,
+                        Some(message.clone()),
+                        now,
+                    ),
+                    db::ControlOp::RecordUpdateCheck {
+                        component: component.to_owned(),
+                        channel: state.channel.clone(),
+                        candidate: None,
+                        error: Some(message),
+                        now,
+                    }
+                )?;
+                return Err(error);
             }
         };
         if component == "webui" {
             match reconcile_webui(app).await {
                 Ok(()) => {
-                    if let Some(desired) = db::component_update(&app.db, "webui").await?.desired {
-                        db::settle_interrupted_webui(&app.db, &desired).await?;
+                    if let Some(desired) = checked.desired.clone() {
+                        via_bot!(
+                            app,
+                            db::settle_interrupted_webui(&app.db, &desired),
+                            db::ControlOp::SettleInterruptedWebui {
+                                release: desired.clone(),
+                            }
+                        )?;
                     }
                 }
                 Err(error) => tracing::warn!("WebUI Storage reconciliation failed: {error:#}"),
@@ -160,12 +340,13 @@ pub async fn check_one(app: &Arc<ApiState>, component: &str) -> anyhow::Result<(
                 tracing::warn!("WebUI managed asset cleanup failed: {error:#}");
             }
         }
-        checked
+        Ok(checked)
     })
     .await
 }
 
 async fn with_update_lease<T, F>(
+    app: Option<&ApiState>,
     db: &Db,
     component: &str,
     lease: &str,
@@ -176,7 +357,15 @@ where
     F: Future<Output = anyhow::Result<T>>,
 {
     anyhow::ensure!(
-        db::renew_update_lease(db, component, lease, chrono::Utc::now().timestamp(), ttl).await?,
+        renew_any(
+            app,
+            db,
+            component,
+            lease,
+            chrono::Utc::now().timestamp(),
+            ttl
+        )
+        .await?,
         "update lease expired before work began"
     );
     let watchdog = async {
@@ -184,7 +373,7 @@ where
             tokio::time::sleep(Duration::from_secs((ttl / 4).max(1) as u64)).await;
             let now = chrono::Utc::now().timestamp();
             anyhow::ensure!(
-                db::renew_update_lease(db, component, lease, now, ttl).await?,
+                renew_any(app, db, component, lease, now, ttl).await?,
                 "update lease expired or changed"
             );
         }
@@ -197,8 +386,8 @@ where
         result = work => result,
     };
     let now = chrono::Utc::now().timestamp();
-    let owned = db::renew_update_lease(db, component, lease, now, ttl).await?;
-    db::release_update_lease(db, component, lease).await?;
+    let owned = renew_any(app, db, component, lease, now, ttl).await?;
+    release_any(app, db, component, lease).await?;
     anyhow::ensure!(owned, "update lease expired or changed");
     result
 }
@@ -223,8 +412,8 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
             if let Some((root_hash, admin_hash)) =
                 storage.verify_release(&registry, release).await?
             {
-                db::record_component_running(
-                    &app.db,
+                record_running(
+                    app,
                     "webui",
                     Some(release.clone()),
                     ComponentObservation {
@@ -253,8 +442,8 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
         let registry = Registry::ghcr()?;
         if let Some((root_hash, admin_hash)) = storage.verify_release(&registry, installed).await? {
             let now = chrono::Utc::now().timestamp();
-            db::record_webui_installed_verified(
-                &app.db,
+            record_verified(
+                app,
                 installed,
                 ComponentObservation {
                     guild_schema: None,
@@ -278,7 +467,13 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
         }
     }
     if state.observed.is_some() {
-        db::record_webui_drift(&app.db, "Storage files differ from the installed release").await?;
+        via_bot!(
+            app,
+            db::record_webui_drift(&app.db, "Storage files differ from the installed release"),
+            db::ControlOp::RecordWebuiDrift {
+                error: "Storage files differ from the installed release".to_owned(),
+            }
+        )?;
     }
     Ok(())
 }
@@ -305,7 +500,11 @@ async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow:
                 .any(|part| part == referenced.as_bytes());
         if !keep {
             storage.prune_release(&sha).await?;
-            db::untrack_webui_assets(&app.db, &sha).await?;
+            via_bot!(
+                app,
+                db::untrack_webui_assets(&app.db, &sha),
+                db::ControlOp::UntrackWebuiAssets { sha: sha.clone() }
+            )?;
         }
     }
     Ok(())
@@ -383,26 +582,34 @@ async fn automatic_install(app: &Arc<ApiState>, component: &str) -> anyhow::Resu
     jmodguard_updater::compatible(&app.db, &candidate, now).await?;
     let lease = if component == "webui" {
         let lease = format!("{:032x}", rand::random::<u128>());
-        if !db::claim_update_lease(&app.db, component, &lease, now, 600).await? {
+        if !claim_any(Some(app), &app.db, component, &lease, now, 600).await? {
             return Ok(());
         }
         Some(lease)
     } else {
         None
     };
-    let requested =
-        db::request_due_automatic_install(&app.db, component, &candidate.digest, now, true).await;
+    let requested = via_bot!(
+        app,
+        db::request_due_automatic_install(&app.db, component, &candidate.digest, now, true),
+        db::ControlOp::RequestDueAutomaticInstall {
+            component: component.to_owned(),
+            expected_digest: candidate.digest.clone(),
+            now,
+            unattended_allowed: true,
+        }
+    );
     let release = match requested {
         Ok(Some(release)) => release,
         Ok(None) => {
             if let Some(lease) = &lease {
-                db::release_update_lease(&app.db, component, lease).await?;
+                release_any(Some(app), &app.db, component, lease).await?;
             }
             return Ok(());
         }
         Err(error) => {
             if let Some(lease) = &lease {
-                db::release_update_lease(&app.db, component, lease).await?;
+                release_any(Some(app), &app.db, component, lease).await?;
             }
             return Err(error);
         }
@@ -434,16 +641,24 @@ pub async fn policy(
 ) -> Reply {
     owner(&app, &session).await?;
     origin(&app, &headers)?;
-    db::set_update_policy(
-        &app.db,
-        &input.component,
-        &input.channel,
-        &input.cadence,
-        enabled("JMODGUARD_UNATTENDED_UPDATES"),
+    let written = via_bot!(
+        app.as_ref(),
+        db::set_update_policy(
+            &app.db,
+            &input.component,
+            &input.channel,
+            &input.cadence,
+            enabled("JMODGUARD_UNATTENDED_UPDATES"),
+        ),
+        db::ControlOp::SetUpdatePolicy {
+            component: input.component.clone(),
+            channel: input.channel.clone(),
+            cadence: input.cadence.clone(),
+            unattended_allowed: enabled("JMODGUARD_UNATTENDED_UPDATES"),
+        }
     )
-    .await
     .map_err(|problem| error(StatusCode::BAD_REQUEST, &format!("{problem:#}")))?;
-    status(State(app), session).await
+    status_response(&app, Some(written)).await
 }
 
 #[derive(Deserialize)]
@@ -455,19 +670,33 @@ pub struct InstallRequest {
 }
 
 async fn queue_webui_install(
+    app: Option<&ApiState>,
     db: &Db,
     digest: &str,
     now: i64,
 ) -> anyhow::Result<(ComponentRelease, String)> {
     let lease = format!("{:032x}", rand::random::<u128>());
     anyhow::ensure!(
-        db::claim_update_lease(db, "webui", &lease, now, 600).await?,
+        claim_any(app, db, "webui", &lease, now, 600).await?,
         "another WebUI operation is running"
     );
-    match db::request_component_install(db, "webui", digest, now).await {
+    let requested = if db.is_read_only() {
+        commit_typed(
+            app.context("waiting")?,
+            db::ControlOp::RequestComponentInstall {
+                component: "webui".to_owned(),
+                digest: digest.to_owned(),
+                now,
+            },
+        )
+        .await
+    } else {
+        db::request_component_install(db, "webui", digest, now).await
+    };
+    match requested {
         Ok(release) => Ok((release, lease)),
         Err(error) => {
-            db::release_update_lease(db, "webui", &lease).await?;
+            release_any(app, db, "webui", &lease).await?;
             Err(error)
         }
     }
@@ -582,7 +811,7 @@ pub async fn install(
         ));
     }
     let (release, lease) = if input.component == "webui" {
-        let (release, lease) = queue_webui_install(&app.db, &input.digest, now)
+        let (release, lease) = queue_webui_install(Some(app.as_ref()), &app.db, &input.digest, now)
             .await
             .map_err(|_| {
                 error(
@@ -593,26 +822,40 @@ pub async fn install(
         (release, Some(lease))
     } else if input.launcher {
         (
-            db::request_launcher_install(&app.db, &input.component, &input.digest, now)
-                .await
-                .map_err(|_| {
-                    error(
-                        StatusCode::CONFLICT,
-                        "candidate check changed or launcher already installed; check again",
-                    )
-                })?,
+            via_bot!(
+                app.as_ref(),
+                db::request_launcher_install(&app.db, &input.component, &input.digest, now),
+                db::ControlOp::RequestLauncherInstall {
+                    component: input.component.clone(),
+                    digest: input.digest.clone(),
+                    now,
+                }
+            )
+            .map_err(|_| {
+                error(
+                    StatusCode::CONFLICT,
+                    "candidate check changed or launcher already installed; check again",
+                )
+            })?,
             None,
         )
     } else {
         (
-            db::request_component_install(&app.db, &input.component, &input.digest, now)
-                .await
-                .map_err(|_| {
-                    error(
-                        StatusCode::CONFLICT,
-                        "candidate check changed or application already installed; check again",
-                    )
-                })?,
+            via_bot!(
+                app.as_ref(),
+                db::request_component_install(&app.db, &input.component, &input.digest, now),
+                db::ControlOp::RequestComponentInstall {
+                    component: input.component.clone(),
+                    digest: input.digest.clone(),
+                    now,
+                }
+            )
+            .map_err(|_| {
+                error(
+                    StatusCode::CONFLICT,
+                    "candidate check changed or application already installed; check again",
+                )
+            })?,
             None,
         )
     };
@@ -635,10 +878,18 @@ async fn run_webui_install(
     release: ComponentRelease,
     lease: &str,
 ) -> anyhow::Result<()> {
-    with_update_lease(&app.db, "webui", lease, 600, async {
+    with_update_lease(Some(app), &app.db, "webui", lease, 600, async {
         let result = apply_webui(app, &release).await;
         if let Err(error) = &result {
-            db::record_component_failure(&app.db, "webui", &release, &format!("{error:#}")).await?;
+            via_bot!(
+                app,
+                db::record_component_failure(&app.db, "webui", &release, &format!("{error:#}")),
+                db::ControlOp::RecordComponentFailure {
+                    component: "webui".to_owned(),
+                    failed: release.clone(),
+                    error: format!("{error:#}"),
+                }
+            )?;
             if let Err(reconcile_error) = reconcile_webui(app).await {
                 tracing::warn!("WebUI failure reconciliation deferred: {reconcile_error:#}");
             }
@@ -652,7 +903,14 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
     let storage = storage()?;
     let now = chrono::Utc::now().timestamp();
     let result = async {
-        db::track_webui_assets(&app.db, &release.source_sha, now).await?;
+        via_bot!(
+            app,
+            db::track_webui_assets(&app.db, &release.source_sha, now),
+            db::ControlOp::TrackWebuiAssets {
+                sha: release.source_sha.clone(),
+                now,
+            }
+        )?;
         let registry = Registry::ghcr()?;
         let _files = storage.publish(&registry, release).await?;
         let index = storage
@@ -678,8 +936,8 @@ async fn apply_webui(app: &Arc<ApiState>, release: &ComponentRelease) -> anyhow:
             self_update_enabled: true,
             base_abi: "static-webui-v1".into(),
         };
-        db::record_component_running(
-            &app.db,
+        record_running(
+            app,
             "webui",
             Some(release.clone()),
             observation,
@@ -714,7 +972,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        with_update_lease(&db, "webui", &first, 4, async {
+        with_update_lease(None, &db, "webui", &first, 4, async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             assert!(
                 !db::claim_update_lease(&db, "webui", &second, chrono::Utc::now().timestamp(), 4,)
@@ -731,7 +989,7 @@ mod tests {
         );
         let started = std::cell::Cell::new(false);
         assert!(
-            with_update_lease(&db, "webui", &first, 4, async {
+            with_update_lease(None, &db, "webui", &first, 4, async {
                 started.set(true);
                 Ok(())
             })
@@ -787,7 +1045,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            queue_webui_install(&db, &release.digest, 101)
+            queue_webui_install(None, &db, &release.digest, 101)
                 .await
                 .is_err()
         );
@@ -801,7 +1059,7 @@ mod tests {
         db::release_update_lease(&db, "webui", &check_lease)
             .await
             .unwrap();
-        let (queued, lease) = queue_webui_install(&db, &release.digest, 102)
+        let (queued, lease) = queue_webui_install(None, &db, &release.digest, 102)
             .await
             .unwrap();
         assert_eq!(queued.digest, release.digest);
@@ -817,6 +1075,75 @@ mod tests {
         db::release_update_lease(&db, "webui", &lease)
             .await
             .unwrap();
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn shown_policy_uses_the_write_row_when_a_snapshot_is_stale() {
+        use jmodguard::db::SqlExecutor;
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_replica_read_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = jmodguard::db::Db::open(&path, 2).unwrap();
+        let before = db::component_update(&db, "api").await.unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = db.clone();
+        let held = tokio::spawn(async move {
+            reader
+                .with_conn(move |conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let stale: String = tx.query_row(
+                        "SELECT cadence FROM component_updates WHERE component='api'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )?;
+                    let _ = ready_tx.send(());
+                    let _ = release_rx.recv();
+                    let still: String = tx.query_row(
+                        "SELECT cadence FROM component_updates WHERE component='api'",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )?;
+                    tx.finish_read()?;
+                    Ok((stale, still))
+                })
+                .await
+        });
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if ready_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                ready_deadline > std::time::Instant::now(),
+                "snapshot reader did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            db::set_update_policy(&db, "api", "stable", "daily", true),
+        )
+        .await
+        .expect("the write must not wait on the stale read")
+        .unwrap();
+        let _ = release_tx.send(());
+        let (stale, still) = held.await.unwrap().unwrap();
+        assert_eq!(stale, before.cadence);
+        assert_eq!(
+            still, before.cadence,
+            "a read started before the write must not observe that commit"
+        );
+        assert_ne!(written.cadence, still);
+        let shown = super::overlay_written_component(vec![before], &written);
+        assert_eq!(shown[0].channel, "stable");
+        assert_eq!(shown[0].cadence, "daily");
+        assert_eq!(shown[0].cadence, written.cadence);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

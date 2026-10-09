@@ -362,6 +362,8 @@ pub enum SlashResyncPlan {
 /// ```
 pub struct BotState {
     pub db: Db,
+    /// Pure reads. Rule writes stay on [`Self::db`].
+    pub reads: Db,
     pub activation: Arc<crate::activation::Activation>,
     pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<BotProcessConfig>,
@@ -439,8 +441,18 @@ impl BotState {
         let primed = db::get_primary_versions_sync(&db)
             .context("failed to read primary version baselines while building BotState")?;
         db.require_config_version(primed.config);
+        let mut read_opts = cfg.db_open_options();
+        if !db.is_remote() {
+            read_opts.path = db.path().to_path_buf();
+            read_opts.url.clear();
+            read_opts.token.clear();
+        }
+        read_opts.read_only = true;
+        read_opts.migrate = false;
+        let reads = Db::open_with(read_opts).context("failed to open the read-only database")?;
         Ok(Arc::new(Self {
             db,
+            reads,
             activation: crate::activation::Activation::new(),
             tenant,
             cfg: Arc::new(cfg),
@@ -1113,6 +1125,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1333,6 +1346,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1343,6 +1357,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1383,6 +1398,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1393,6 +1409,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1444,6 +1461,7 @@ mod tests {
                 .as_nanos()
         ));
         let bot_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1454,6 +1472,7 @@ mod tests {
         })
         .unwrap();
         let api_db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1521,6 +1540,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1561,6 +1581,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1627,6 +1648,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -1685,6 +1707,7 @@ mod tests {
                 .as_nanos()
         ));
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),

@@ -1016,6 +1016,7 @@ mod capture_tests {
         let registration = StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared);
         let store = GuildDataStore::initialize(
             GuildStoreOptions {
+                read_only: false,
                 path: path.clone(),
                 url: String::new(),
                 token: String::new(),

@@ -12,12 +12,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const RENEW_EVERY: Duration = Duration::from_secs(5);
+/// In-flight rule work must finish inside the observed shutdown grace.
+pub const HANDOFF_DEADLINE: Duration = Duration::from_secs(8);
 
 pub struct Activation {
     instance: String,
     lock_held: AtomicBool,
     discord_connected: AtomicBool,
     shutting_down: Arc<AtomicBool>,
+    cut_off: AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    moderation_depth: std::sync::atomic::AtomicUsize,
+}
+
+pub struct RuleHold {
+    activation: Arc<Activation>,
+}
+
+impl Drop for RuleHold {
+    fn drop(&mut self) {
+        self.activation
+            .moderation_depth
+            .fetch_sub(1, Ordering::Release);
+        self.activation.in_flight.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +51,9 @@ impl Activation {
             lock_held: AtomicBool::new(false),
             discord_connected: AtomicBool::new(false),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            cut_off: AtomicBool::new(false),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            moderation_depth: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -54,6 +75,32 @@ impl Activation {
             && !self.is_shutting_down()
     }
 
+    /// In-flight work may still record until cut-off or lease loss.
+    /// New intake uses [`Self::allows_rule_trigger`] and stops at shutdown.
+    pub fn may_record(&self) -> bool {
+        self.lock_held.load(Ordering::Acquire) && !self.cut_off.load(Ordering::Acquire)
+    }
+
+    pub fn hold_rule(self: &Arc<Self>) -> RuleHold {
+        self.in_flight.fetch_add(1, Ordering::Release);
+        self.moderation_depth.fetch_add(1, Ordering::Release);
+        RuleHold {
+            activation: Arc::clone(self),
+        }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn moderation_depth(&self) -> usize {
+        self.moderation_depth.load(Ordering::Acquire)
+    }
+
+    pub fn cut_off(&self) {
+        self.cut_off.store(true, Ordering::Release);
+    }
+
     pub fn note_discord_connected(&self) {
         self.discord_connected.store(true, Ordering::Release);
     }
@@ -66,10 +113,15 @@ impl Activation {
         self.shutting_down.load(Ordering::Acquire)
     }
 
-    /// Stop acting immediately. The lease itself stays until the shutdown
-    /// notice has been posted.
+    /// Stop new intake. In-flight work may finish until [`Self::cut_off`].
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+    }
+
+    /// Lease loss or a killed renewal. No further record, ban, or log.
+    pub fn note_lease_lost(&self) {
+        self.mark_lock_held(false);
+        self.cut_off();
     }
 
     pub fn publish_process_ready(&self) {
@@ -161,7 +213,7 @@ pub fn spawn_renewal(db: Db, activation: Arc<Activation>) -> tokio::task::JoinHa
             {
                 Ok(true) => activation.mark_lock_held(true),
                 Ok(false) => {
-                    activation.mark_lock_held(false);
+                    activation.note_lease_lost();
                     set_process_ready(false);
                     if !activation.is_shutting_down() {
                         tracing::warn!("active-bot lease lost");
@@ -178,6 +230,13 @@ pub fn spawn_renewal(db: Db, activation: Arc<Activation>) -> tokio::task::JoinHa
     })
 }
 
+pub async fn finish_in_flight(activation: &Activation) {
+    let deadline = Instant::now() + HANDOFF_DEADLINE;
+    while activation.in_flight() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn fresh_instance() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let tick = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
@@ -192,6 +251,7 @@ fn fresh_instance() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jmodguard::db::SqlExecutor;
     use std::time::Instant;
 
     fn temp_db(label: &str) -> (std::path::PathBuf, Db) {
@@ -268,10 +328,107 @@ mod tests {
         assert!(challenger.allows_started_notice());
         assert!(challenger.allows_rule_trigger());
 
+        assert!(challenger.may_record());
         challenger.begin_shutdown();
         assert!(!challenger.allows_discord_connect());
         assert!(!challenger.allows_started_notice());
         assert!(!challenger.allows_rule_trigger());
+        assert!(
+            challenger.may_record(),
+            "shutdown stops intake and still lets in-flight work record"
+        );
+        let hold = challenger.hold_rule();
+        assert_eq!(challenger.in_flight(), 1);
+        drop(hold);
+        assert_eq!(challenger.in_flight(), 0);
+        challenger.cut_off();
+        assert!(!challenger.may_record());
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn release_cannot_clear_another_owners_lease() {
+        let (path, db) = temp_db("release");
+        let holder = Activation::new();
+        assert!(wait_for_writer_lock(&db, &holder).await.unwrap());
+        let other = Activation::new();
+        db::release_active_bot(&db, other.instance()).await.unwrap();
+        assert!(
+            holder.may_record()
+                || poll_writer_lock(&db, &holder).await.unwrap() == WriterLockPoll::Ready,
+            "a different instance must not clear the held lease"
+        );
+        assert_eq!(
+            poll_writer_lock(&db, &other).await.unwrap(),
+            WriterLockPoll::Waiting
+        );
+        assert!(!other.may_record());
+        db::release_active_bot(&db, holder.instance())
+            .await
+            .unwrap();
+        holder.note_lease_lost();
+        assert!(!holder.may_record());
+        assert_eq!(
+            poll_writer_lock(&db, &other).await.unwrap(),
+            WriterLockPoll::Ready
+        );
+        assert!(other.may_record());
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn expired_lease_takes_no_further_action() {
+        let (path, db) = temp_db("expire");
+        let holder = Activation::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            db::claim_active_bot(&db, holder.instance(), now, holder.refuse_flag())
+                .await
+                .unwrap()
+        );
+        holder.mark_lock_held(true);
+        let challenger = Activation::new();
+        let later = now.saturating_add(21_000);
+        assert!(
+            db::claim_active_bot(&db, challenger.instance(), later, challenger.refuse_flag())
+                .await
+                .unwrap()
+        );
+        holder.note_lease_lost();
+        assert!(!holder.may_record());
+        assert!(!holder.allows_rule_trigger());
+        db::release_active_bot(&db, holder.instance())
+            .await
+            .unwrap();
+        let stored = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key = 'active_bot_lease'",
+                    db::params![],
+                    |row| {
+                        let value: String =
+                            row.get(0).map_err(|error| anyhow::anyhow!("{error}"))?;
+                        Ok(value)
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            stored.starts_with(&format!("{} ", challenger.instance())),
+            "a late release must leave the new owner's lease in place"
+        );
+        assert!(
+            db::claim_active_bot(&db, challenger.instance(), later, challenger.refuse_flag())
+                .await
+                .unwrap(),
+            "the expired owner must not have cleared the new lease"
+        );
+        challenger.mark_lock_held(true);
+        challenger.note_discord_connected();
+        assert!(challenger.allows_rule_trigger());
         drop(db);
         cleanup(&path);
     }

@@ -5,6 +5,7 @@ use jmodguard::db::{Db, GuildEnrollment, test_drop_next_commit_response};
 
 fn remote_options() -> GuildStoreOptions {
     GuildStoreOptions {
+        read_only: false,
         path: "unused-remote-guild-store.db".into(),
         url: std::env::var("JMODGUARD_REMOTE_TEST_URL").expect("disposable empty libSQL URL"),
         token: std::env::var("JMODGUARD_REMOTE_TEST_TOKEN").expect("test token"),

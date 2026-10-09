@@ -141,7 +141,7 @@ pub struct ComponentObservation {
     pub launcher_revision: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentUpdate {
     pub component: String,
     pub channel: String,
@@ -206,6 +206,17 @@ pub(super) fn row_update(row: &Row) -> Result<ComponentUpdate> {
     })
 }
 
+/// Status text reads one autocommit SELECT. It does not start a transaction.
+pub async fn component_updates_status(db: &Db) -> Result<Vec<ComponentUpdate>> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLS} FROM component_updates ORDER BY component"
+        ))?;
+        stmt.query_map((), row_update)?.collect()
+    })
+    .await
+}
+
 pub async fn component_updates(db: &Db) -> Result<Vec<ComponentUpdate>> {
     db.with_conn(|conn| {
         let tx = conn.transaction_primary_snapshot()?;
@@ -245,7 +256,7 @@ pub async fn record_update_check(
     candidate: Option<ComponentRelease>,
     error: Option<String>,
     now: i64,
-) -> Result<()> {
+) -> Result<ComponentUpdate> {
     validate_component(component)?;
     if let Some(release) = &candidate {
         release.validate()?;
@@ -255,6 +266,7 @@ pub async fn record_update_check(
         );
     }
     let (component, channel) = (component.to_owned(), channel.to_owned());
+    let component_id = component.clone();
     let candidate = candidate.map(|r| serde_json::to_string(&r)).transpose()?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
@@ -264,8 +276,15 @@ pub async fn record_update_check(
             tx.execute_rows("UPDATE component_updates SET candidate=?2,checked_at=?3,check_error=NULL WHERE component=?1 AND channel=?4", params![component,candidate,now,channel], 1)?
         };
         anyhow::ensure!(changed == 1, "release channel changed during check; check again");
+        // The row is read in this write transaction. A later read on another
+        // connection can miss the commit until that replica catches up.
+        let updated = tx.query_row(
+            &format!("SELECT {COLS} FROM component_updates WHERE component=?1"),
+            params![component_id],
+            row_update,
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(updated)
     }).await
 }
 
@@ -643,7 +662,7 @@ pub async fn set_update_policy(
     channel: &str,
     cadence: &str,
     unattended_allowed: bool,
-) -> Result<()> {
+) -> Result<ComponentUpdate> {
     validate_component(component)?;
     anyhow::ensure!(
         matches!(channel, "latest" | "stable" | "nightly"),
@@ -663,12 +682,20 @@ pub async fn set_update_policy(
     );
     let (component, channel, cadence) =
         (component.to_owned(), channel.to_owned(), cadence.to_owned());
+    let component_id = component.clone();
     db.with_conn(move |conn| {
-        conn.execute_rows(
+        let tx = conn.transaction_immediate()?;
+        tx.execute_rows(
             "UPDATE component_updates SET channel=?2,cadence=?3,candidate=CASE WHEN channel=?2 THEN candidate ELSE NULL END,checked_at=CASE WHEN channel=?2 THEN checked_at ELSE NULL END,check_error=CASE WHEN channel=?2 THEN check_error ELSE NULL END WHERE component=?1",
             params![component, channel, cadence], 1,
         )?;
-        Ok(())
+        let updated = tx.query_row(
+            &format!("SELECT {COLS} FROM component_updates WHERE component=?1"),
+            params![component_id],
+            row_update,
+        )?;
+        tx.commit()?;
+        Ok(updated)
     })
     .await
 }

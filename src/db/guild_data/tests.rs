@@ -46,6 +46,7 @@ fn clean(path: &Path) {
 }
 fn options(path: &Path) -> GuildStoreOptions {
     GuildStoreOptions {
+        read_only: false,
         path: path.to_owned(),
         url: String::new(),
         token: String::new(),
@@ -84,8 +85,8 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
         assert_eq!(
             count,
-            24,
-            "store contains tenant tables, transient snapshots, and member-directory tables"
+            25,
+            "store contains tenant tables, transient snapshots, member-directory tables, and the local write fence"
         );
         Ok(())
     }).await.unwrap();

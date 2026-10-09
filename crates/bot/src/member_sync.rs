@@ -957,8 +957,7 @@ async fn run_loop(
                 .filter(|joined| *joined > 0);
             let (store, scope) = match scope_cache.hit(gid, joined_at) {
                 Some(Some(cached)) => {
-                    // Skip fences visible to this scan. Core and guild stores
-                    // are separate databases; this is not a cross-store lease.
+                    // The snapshot only skips fences already visible. It is not a lease.
                     if fenced.contains(&gid) {
                         continue;
                     }
@@ -996,6 +995,17 @@ async fn run_loop(
             let (newly_initialized, session_replaced) =
                 ready_coverage.pending(&key, ready_generation);
             probe.status_read();
+            match db::guild_stores::guild_is_write_fenced(&app.db, gid).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        guild_id = gid,
+                        "member sync fence re-check failed: {error:#}"
+                    );
+                    continue;
+                }
+            }
             let status = if newly_initialized {
                 match store
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
@@ -1016,6 +1026,7 @@ async fn run_loop(
                     .await
                 {
                     Ok(status) => status,
+                    Err(error) if error.is::<db::guild_stores::GuildWriteFenced>() => continue,
                     Err(error) => {
                         tracing::warn!(
                             guild_id = gid,
@@ -2237,6 +2248,29 @@ mod tests {
         app.tenant.activate(enrollment.clone()).await.unwrap();
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         (directory, app, store, scope)
+    }
+
+    #[tokio::test]
+    async fn local_fence_blocks_status_when_the_scheduling_snapshot_is_empty() {
+        let (directory, app, store, scope) = enrolled_directory_for(10).await;
+        let guild = scope.guild_id();
+        let snapshot = db::guild_stores::write_fenced_guilds(&app.db, vec![guild])
+            .await
+            .unwrap();
+        assert!(
+            !snapshot.contains(&guild),
+            "the core fence snapshot is not a lease for the guild store"
+        );
+        store
+            .record_local_write_fence(guild, 1_700_000_000_000)
+            .await
+            .unwrap();
+        let error = store
+            .member_sync_worker_status(scope, 42, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+        assert!(error.is::<db::guild_stores::GuildWriteFenced>());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test(start_paused = true)]

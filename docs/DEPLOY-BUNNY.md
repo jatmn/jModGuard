@@ -37,9 +37,11 @@ The pages never open the database from the browser. A database token in
 the webpage would be public. The browser talks to the API; the API (and
 the bot) are what open SQL.
 
-The bot and the API also never call each other. They share the database.
-The bot’s extra outbound is the Discord gateway. The API’s extra outbound
-is Discord OAuth, guild listing, and unban.
+The bot and the API share the database. Only the bot opens it for writing.
+The API reads, and sends settings and other changes to the bot on a private
+link that is not published to the internet. The bot’s extra outbound is the
+Discord gateway. The API’s extra outbound is Discord OAuth, guild listing,
+and unban.
 
 Local `cargo run` still embeds `frontend/` in the API for SETUP.md. That
 is a laptop / self-host convenience. It is not the Bunny deploy.
@@ -47,8 +49,9 @@ is a laptop / self-host convenience. It is not the Bunny deploy.
 ## 1. Create the core and guild databases
 
 Create a Bunny Database. In **Access**, generate full-access credentials
-for each container. Both need write access: the bot writes moderation
-state and migrations; the API writes configuration changes from the UI.
+for each container. Only the bot credential can write: it writes moderation
+state and migrations, and it applies configuration changes the API sends it.
+The API credential is read-only.
 
 Bunny can inject:
 

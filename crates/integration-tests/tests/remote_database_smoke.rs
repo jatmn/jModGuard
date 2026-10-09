@@ -9,6 +9,7 @@ use std::time::Duration;
 
 fn remote_options(migrate: bool) -> DbOpenOptions {
     DbOpenOptions {
+        read_only: false,
         // Ignored by the remote backend, but retained for the common config contract.
         path: PathBuf::from("data/jmodguard.db"),
         url: std::env::var("JMODGUARD_REMOTE_TEST_URL")

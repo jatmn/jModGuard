@@ -232,6 +232,10 @@ impl UpdateControl {
         Self { db: db.clone() }
     }
 
+    pub fn writes_locally(&self) -> bool {
+        !self.db.is_read_only()
+    }
+
     pub async fn schema_version(&self) -> Result<i64> {
         core_schema_version(&self.db).await
     }
@@ -256,7 +260,9 @@ impl UpdateControl {
     }
 
     pub async fn set_channel(&self, role: &str, channel: &str) -> Result<()> {
-        set_update_policy(&self.db, role, channel, "off", false).await
+        set_update_policy(&self.db, role, channel, "off", false)
+            .await
+            .map(|_| ())
     }
 
     pub async fn checked(
@@ -267,7 +273,9 @@ impl UpdateControl {
         error: Option<String>,
         now: i64,
     ) -> Result<()> {
-        record_update_check(&self.db, component, channel, candidate, error, now).await
+        record_update_check(&self.db, component, channel, candidate, error, now)
+            .await
+            .map(|_| ())
     }
 
     /// Hold both service check leases before registry work. A failure to take
@@ -810,6 +818,7 @@ mod tests {
                 .join(format!("paired-control-{:032x}.db", rand::random::<u128>()));
             let db = Db::open(&path, 2).unwrap();
             let opts = DbOpenOptions {
+                read_only: false,
                 path: path.clone(),
                 url: String::new(),
                 token: String::new(),
@@ -1196,6 +1205,7 @@ mod tests {
                 rand::random::<u128>()
             ));
             let opts = DbOpenOptions {
+                read_only: false,
                 path: path.clone(),
                 url: String::new(),
                 token: String::new(),

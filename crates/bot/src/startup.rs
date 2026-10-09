@@ -9,6 +9,7 @@ use crate::db::{self, Db};
 use crate::state::BotState;
 use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn write_probe_marker(dir: &Path, name: &str, contents: &str) -> Result<()> {
@@ -38,6 +39,16 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     write_probe_marker(&dir, "bot-migrate", if migrate { "true" } else { "false" })?;
     let db = open_database(&cfg).await?;
     let app = BotState::new(cfg, db)?;
+    if !crate::activation::wait_for_writer_lock(&app.db, &app.activation).await? {
+        bail!("bot probe stopped before it held the writer lease");
+    }
+    let _renewal = crate::activation::spawn_renewal(app.db.clone(), Arc::clone(&app.activation));
+    let bound = crate::control_server::spawn(Arc::clone(&app))?;
+    write_probe_marker(&dir, "writer-port", &bound.port().to_string())?;
+    let enrolled = db::enroll_guild(&app.db, guild_id as i64, 1)
+        .await?
+        .context("probe guild was not enrolled")?;
+    write_probe_marker(&dir, "writer-scope", &enrolled.id)?;
     let before = app.configs.get(&app.db, guild_id).await?;
     write_probe_marker(&dir, "bot-ready", &before.settings.prefix)?;
     let deadline = Instant::now() + Duration::from_secs(60);

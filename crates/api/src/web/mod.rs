@@ -1205,6 +1205,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             oauth: Arc::clone(&app.oauth),
             control: crate::db::UpdateControl::from_application(&app.db),
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+            writer: app.writer_link(),
         })))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(

@@ -221,7 +221,7 @@ pub struct PendingBan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MarkerSave {
+pub(crate) enum MarkerSave {
     /// The insert committed before the ban.
     Saved,
     /// The insert failed and will not commit.
@@ -267,6 +267,74 @@ pub async fn begin_ban_attempt(app: &BotState, guild_id: u64, user_id: u64) -> P
             .into_inner()
             .unwrap_or_else(|error| error.into_inner()),
         save,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscordBanView {
+    Absent,
+    Present,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BanContinuation {
+    Stop,
+    AlreadyFinished,
+    RecordOnly,
+    BanThenRecord,
+}
+
+/// Lease loss stops the attempt, including a marker that may still commit.
+/// A ban Discord already shows is recorded once and never sent again.
+pub(crate) async fn observe_ban_handoff(
+    app: &BotState,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    user_id: u64,
+    save: MarkerSave,
+) -> BanContinuation {
+    if !app.activation.may_record() {
+        return BanContinuation::Stop;
+    }
+    let view = discord_ban_view(http, guild_id, user_id).await;
+    let row_exists = db::active_ban_recorded(&app.reads, guild_id as i64, user_id as i64)
+        .await
+        .unwrap_or(true);
+    ban_continuation(app.activation.may_record(), save, view, row_exists)
+}
+
+async fn discord_ban_view(
+    http: &serenity::http::Http,
+    guild_id: u64,
+    user_id: u64,
+) -> DiscordBanView {
+    let guild = serenity::model::id::GuildId::new(guild_id);
+    let user = serenity::model::id::UserId::new(user_id);
+    match tokio::time::timeout(Duration::from_secs(5), http.get_ban(guild, user)).await {
+        Ok(Ok(ban)) if ban.is_some() => DiscordBanView::Present,
+        Ok(Ok(_)) => DiscordBanView::Absent,
+        Ok(Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+            response,
+        )))) if response.status_code.as_u16() == 404 => DiscordBanView::Absent,
+        _ => DiscordBanView::Unknown,
+    }
+}
+
+pub(crate) fn ban_continuation(
+    may_record: bool,
+    _save: MarkerSave,
+    view: DiscordBanView,
+    row_exists: bool,
+) -> BanContinuation {
+    if !may_record {
+        return BanContinuation::Stop;
+    }
+    match view {
+        DiscordBanView::Unknown => BanContinuation::Stop,
+        DiscordBanView::Present if row_exists => BanContinuation::AlreadyFinished,
+        DiscordBanView::Present => BanContinuation::RecordOnly,
+        DiscordBanView::Absent => BanContinuation::BanThenRecord,
     }
 }
 
@@ -638,8 +706,40 @@ mod tests {
     use crate::{db, tenant};
 
     use super::{
-        BAN_MARKER_SAVE_DEADLINE, MarkerSave, PendingBan, begin_ban_attempt, reserve_ban_marker,
+        BAN_MARKER_SAVE_DEADLINE, BanContinuation, DiscordBanView, MarkerSave, PendingBan,
+        ban_continuation, begin_ban_attempt, reserve_ban_marker,
     };
+
+    #[test]
+    fn expired_lease_ignores_a_late_marker_and_cutoff_does_not_double_ban() {
+        assert_eq!(
+            ban_continuation(false, MarkerSave::MaybeLate, DiscordBanView::Absent, false),
+            BanContinuation::Stop,
+            "a late marker after lease loss must not authorize a ban or a log"
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::MaybeLate, DiscordBanView::Absent, false),
+            BanContinuation::BanThenRecord
+        );
+        assert_eq!(
+            ban_continuation(false, MarkerSave::Saved, DiscordBanView::Present, false),
+            BanContinuation::Stop
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Present, false),
+            BanContinuation::RecordOnly,
+            "a successor records the missing row and does not ban again"
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Present, true),
+            BanContinuation::AlreadyFinished,
+            "a recorded ban is not logged a second time"
+        );
+        assert_eq!(
+            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Unknown, false),
+            BanContinuation::Stop
+        );
+    }
 
     const GUILD: i64 = 10;
     const USER: i64 = 91;

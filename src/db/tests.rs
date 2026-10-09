@@ -38,6 +38,7 @@ async fn api_write_fails_fast_while_the_bot_holds_the_write_lock() {
     let tmp = tmp_db_path("api_write_yields");
     let bot = Db::open(&tmp, 2).unwrap();
     let api = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -383,6 +384,7 @@ fn config_version_bumps_on_settings_write() {
     assert_eq!(v1, v0 + 1);
     // A remote database must never be opened without credentials.
     let err = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: "libsql://example.invalid".into(),
         token: String::new(),
@@ -398,6 +400,7 @@ fn config_version_bumps_on_settings_write() {
         "unexpected: {err:#}"
     );
     let err = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: "configured-token".into(),
@@ -420,6 +423,7 @@ fn api_open_refuses_unmigrated_db() {
     let tmp = tmp_db_path("unmigrated");
     Connection::open(&tmp).unwrap();
     let err = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -444,6 +448,7 @@ fn api_open_retries_until_bot_migrates() {
     let tmp = tmp_db_path("api_retry_migrate");
     Connection::open(&tmp).unwrap();
     let api_opts = DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -453,6 +458,7 @@ fn api_open_retries_until_bot_migrates() {
         retention_days: 7,
     };
     let bot_opts = DbOpenOptions {
+        read_only: false,
         migrate: true,
         ..api_opts.clone()
     };
@@ -489,6 +495,7 @@ fn api_waits_for_completed_bot_bootstrap() {
     write_terminal_defaults_meta(&conn, &GuildSettings::default()).unwrap();
 
     let api_opts = DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -507,6 +514,7 @@ fn api_waits_for_completed_bot_bootstrap() {
     );
 
     Db::open_with(DbOpenOptions {
+        read_only: false,
         migrate: true,
         ..api_opts.clone()
     })
@@ -537,6 +545,7 @@ fn api_open_retries_while_bot_holds_sqlite_lock() {
 
     tokio_test_block_on(Db::open_with_until_ready(
         DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -559,6 +568,7 @@ fn api_open_until_ready_times_out_without_bot() {
     Connection::open(&tmp).unwrap();
     let err = tokio_test_block_on(Db::open_with_until_ready(
         DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -603,6 +613,7 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
     locked_rx.recv().unwrap();
     let err = tokio_test_block_on(Db::open_with_until_ready(
         DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -638,6 +649,7 @@ fn migrate_open_until_ready_timeout_is_not_an_api_wait() {
 #[test]
 fn remote_startup_budget_is_wall_clock_and_backs_off() {
     let remote = startup_open_retry(&DbOpenOptions {
+        read_only: false,
         path: tmp_db_path("remote_budget_unused"),
         url: "libsql://database.example".into(),
         token: "token".into(),
@@ -662,6 +674,7 @@ fn remote_startup_budget_is_wall_clock_and_backs_off() {
         remote.max_backoff
     );
     let local = startup_open_retry(&DbOpenOptions {
+        read_only: false,
         path: tmp_db_path("local_budget_unused"),
         url: String::new(),
         token: String::new(),
@@ -940,6 +953,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     drop(empty);
 
     let bot = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -959,6 +973,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     .unwrap();
 
     Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -979,6 +994,7 @@ fn migrate_open_fences_only_when_bootstrap_is_incomplete() {
     })
     .unwrap();
     let err = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -1292,6 +1308,7 @@ fn dual_process_local_share_config_version() {
     // Bot migrates; API opens migrate=false; writer bump visible to both.
     let tmp = tmp_db_path("dual");
     let bot = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -1302,6 +1319,7 @@ fn dual_process_local_share_config_version() {
     })
     .unwrap();
     let api = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -1333,6 +1351,7 @@ fn dual_process_local_share_config_version() {
 fn completed_core_opens_for_inspection_and_reclaim_above_scaled_growth_stop() {
     let path = tmp_db_path("pressure_reconnect");
     let bot_options = DbOpenOptions {
+        read_only: false,
         path: path.clone(),
         url: String::new(),
         token: String::new(),
@@ -1366,6 +1385,7 @@ fn completed_core_opens_for_inspection_and_reclaim_above_scaled_growth_stop() {
             let bot = Db::open_with(bot_options.clone()).expect("completed bot reconnect");
             assert!(bot.capacity_runtime_status().startup_deferred);
             let api = Db::open_with(DbOpenOptions {
+                read_only: false,
                 migrate: false,
                 ..bot_options.clone()
             })
@@ -1838,6 +1858,7 @@ fn heal_normalizes_global_and_clears_corrupt_rows() {
 fn seed_globals_writes_parent_relative_partial_override() {
     let tmp = tmp_db_path("settings_seed_partial");
     let db = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2222,6 +2243,7 @@ fn api_open_leaves_healing_to_bot_authority() {
     }
 
     let db = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2318,6 +2340,7 @@ fn terminal_defaults_come_from_durable_meta_not_process_config() {
     // Bot migrate-open writes meta terminal defaults from its config.
     {
         let db = Db::open_with(DbOpenOptions {
+            read_only: false,
             path: tmp.clone(),
             url: String::new(),
             token: String::new(),
@@ -2342,6 +2365,7 @@ fn terminal_defaults_come_from_durable_meta_not_process_config() {
     }
     // API opens with *different* process config — must still use bot's meta.
     let api = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2404,6 +2428,7 @@ fn runtime_read_ignores_corrupt_settings_and_bot_heals_atomically() {
     let v_before_heal = tokio_test_block_on(crate::db::get_config_version(&db)).unwrap();
     drop(db);
     let db2 = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2436,6 +2461,7 @@ fn api_open_refuses_missing_terminal_defaults_meta() {
     .unwrap();
     drop(db);
     let err = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2466,6 +2492,7 @@ fn heal_skips_when_guild_settings_unchanged() {
         .unwrap();
     drop(db);
     let db2 = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2858,6 +2885,7 @@ fn badword_view_stringifies_guild_snowflake() {
 fn bot_terminal_defaults_update_visible_without_api_restart() {
     let tmp = tmp_db_path("terminal_defaults_live");
     let db = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2877,6 +2905,7 @@ fn bot_terminal_defaults_update_visible_without_api_restart() {
     }))
     .unwrap();
     let api = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),
@@ -2895,6 +2924,7 @@ fn bot_terminal_defaults_update_visible_without_api_restart() {
     drop(db);
     // Bot migrate-open rewrites terminal defaults; keep handle only for side effect.
     let _bot = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: tmp.clone(),
         url: String::new(),
         token: String::new(),

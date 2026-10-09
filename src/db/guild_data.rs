@@ -25,6 +25,8 @@ const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
     include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
 const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
     include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
+const LOCAL_WRITE_FENCE_SCHEMA: &str =
+    include_str!("../../migrations/guild/0015_local_write_fence.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -54,6 +56,8 @@ pub struct GuildStoreOptions {
     pub url: String,
     pub token: String,
     pub pool_size: u32,
+    /// Readers never take the writer lock. The API sets this when its core pool is read-only.
+    pub read_only: bool,
 }
 
 /// Keeps the raw pool private so core schema operations cannot accidentally target it.
@@ -213,6 +217,7 @@ fn verify_identity_version(
             "trigger",
             "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
         ),
+        (15, "table", "guild_local_write_fence"),
     ];
     for (version, kind, names) in required {
         if wanted >= *version {
@@ -333,6 +338,9 @@ fn initialize_store(
         if version < 14 {
             tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
         }
+        if version < 15 {
+            tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -355,6 +363,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -410,6 +419,7 @@ impl GuildDataStore {
             token: options.token,
             pool_size: options.pool_size,
             migrate: false,
+            read_only: options.read_only,
             default_prefix: String::new(),
             retention_days: 0,
         };
@@ -435,6 +445,7 @@ impl GuildDataStore {
             pool_size: options.pool_size,
             // Not consumed by this schema's bootstrap. No core defaults are seeded.
             migrate: false,
+            read_only: options.read_only,
             default_prefix: String::new(),
             retention_days: 0,
         };

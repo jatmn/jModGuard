@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
     }
     let _renewal =
         jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
+    jmodguard_bot::control_server::spawn(Arc::clone(&app))?;
 
     // --- Discord client (needed for slash re-sync after config polls) --------
     // Guild voice states is not a privileged intent. Voice join, leave, and
@@ -482,6 +483,7 @@ async fn main() -> Result<()> {
     if !jmodguard_bot::gateway_budget::wait_for_gateway_identify(&http, &app.db).await? {
         tracing::info!("shutdown before gateway identify");
         activation.begin_shutdown();
+        activation.cut_off();
         jmodguard::set_process_ready(false);
         if let Err(error) = db::release_active_bot(&app.db, activation.instance()).await {
             tracing::warn!("active-bot lease release failed: {error:#}");
@@ -502,6 +504,13 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
         jmodguard::set_process_ready(false);
+        jmodguard_bot::activation::finish_in_flight(&shutdown_activation).await;
+        shutdown_activation.cut_off();
+        if let Err(error) =
+            db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
+        {
+            tracing::warn!("active-bot lease release failed: {error:#}");
+        }
         shutdown_app.stop_startup_notice_task().await;
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
@@ -509,11 +518,6 @@ async fn main() -> Result<()> {
         let sent =
             logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content).await;
         tracing::info!(sent, attempted, "shutdown notice phase complete");
-        if let Err(error) =
-            db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
-        {
-            tracing::warn!("active-bot lease release failed: {error:#}");
-        }
         tracing::info!("stopping Discord shards");
         shard_manager.shutdown_all().await;
     });

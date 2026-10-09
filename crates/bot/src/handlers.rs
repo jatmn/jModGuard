@@ -148,6 +148,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         self.app.snapshots.install_collector(&self.app, &_ctx);
         self.app.snapshots.gap();
     }
@@ -246,6 +247,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         self.app.member_joins.clear_guild(guild.id.get());
         let app = Arc::clone(self.app());
         let gid = guild.id;
@@ -285,6 +287,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         self.app.invalidate_member_sync_scope();
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
@@ -322,6 +325,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let app = Arc::clone(self.app());
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
@@ -355,6 +359,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         self.app
             .image_spam
             .invalidate_author(guild_id.get(), user.id.get());
@@ -397,6 +402,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
             guild_id.get(),
@@ -533,6 +539,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let observed = chrono::Utc::now();
         let observation = self.app.member_audits.observe_event(
             guild_id.get(),
@@ -605,6 +612,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let Some(action) = audit_case_action(entry.action) else {
             return;
         };
@@ -664,6 +672,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
@@ -802,6 +811,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
@@ -894,6 +904,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let Some(guild_id) = guild_id else { return };
         let hooked = self.app.snapshots.collector_active(&ctx);
         if !hooked {
@@ -924,6 +935,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let Some(guild_id) = guild_id else { return };
         let hooked = self.app.snapshots.collector_active(&ctx);
         if !hooked {
@@ -961,6 +973,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         self.app
             .image_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
@@ -1154,6 +1167,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        let _rule_hold = self.app.activation.hold_rule();
         let app = Arc::clone(self.app());
         commands::handle_interaction(&app, &ctx, interaction).await;
     }

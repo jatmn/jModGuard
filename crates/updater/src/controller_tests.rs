@@ -214,6 +214,7 @@ async fn paired_processes_restore_across_every_phase_and_recover_forward_after_f
     let path = root.join("core.db");
     let db = Db::open(&path, 2).unwrap();
     let opts = DbOpenOptions {
+        read_only: false,
         path,
         url: String::new(),
         token: String::new(),
@@ -1270,6 +1271,7 @@ async fn open_launcher_db(root: &Path) -> (Db, UpdateControl) {
     let path = root.join("core.db");
     let db = Db::open(&path, 2).unwrap();
     let opts = DbOpenOptions {
+        read_only: false,
         path,
         url: String::new(),
         token: String::new(),

@@ -19,6 +19,7 @@ pub struct ApiState {
     pub tenant: crate::tenant::TenantRuntime,
     pub cfg: Arc<ApiProcessConfig>,
     pub oauth: Arc<OAuthClient>,
+    writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -37,6 +38,17 @@ impl ApiState {
             }
         }
         oauth.attach_retry_store(db.clone());
+        let writer = if db.is_read_only() {
+            match jmodguard::control::try_writer_link(&cfg.bot.control_bind, &cfg.db)? {
+                Some(link) => {
+                    oauth.attach_writer(link.clone());
+                    Some(link)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let oauth = Arc::new(oauth);
         let primed =
             db::get_primary_versions_sync(&db).context("failed to prime API config observation")?;
@@ -48,6 +60,7 @@ impl ApiState {
             tenant,
             cfg: Arc::new(cfg),
             oauth,
+            writer,
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
@@ -91,6 +104,40 @@ impl ApiState {
         *previous = (primary.config, primary.config_revision);
         changed
     }
+
+    /// Dashboard writes go through the bot when this process is read-only.
+    /// A writable connection, used by in-process fixtures, applies locally.
+    pub(crate) fn writer_link(&self) -> Option<jmodguard::control::WriterLink> {
+        self.writer.clone()
+    }
+
+    pub async fn commit(&self, op: db::ControlOp) -> Result<db::ControlReply> {
+        if self.db.is_read_only() {
+            let writer = if let Some(link) = &self.writer {
+                link.clone()
+            } else {
+                let link =
+                    jmodguard::control::try_writer_link(&self.cfg.bot.control_bind, &self.cfg.db)?
+                        .context("writer link is unusable")?;
+                self.oauth.attach_writer(link.clone());
+                link
+            };
+            writer.submit(op).await
+        } else {
+            db::apply_control(&self.db, Some(&self.tenant), op).await
+        }
+    }
+
+    pub async fn commit_json(&self, op: db::ControlOp) -> Result<(bool, serde_json::Value)> {
+        match self.commit(op).await? {
+            db::ControlReply::Saved { body } => Ok((false, body)),
+            db::ControlReply::Unchanged { body } => Ok((true, body)),
+            db::ControlReply::Waiting => anyhow::bail!("waiting"),
+            db::ControlReply::Busy => anyhow::bail!("busy"),
+            db::ControlReply::StillWaiting => anyhow::bail!("still_waiting"),
+            db::ControlReply::Failed { message } => anyhow::bail!(message),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,7 +159,11 @@ mod tests {
             let mut cfg = ApiProcessConfig::default();
             cfg.db.path = path.clone();
             cfg.db.pool_size = 2;
-            let db = Db::open_with(cfg.db_open_options()).unwrap();
+            let mut opts = cfg.db_open_options();
+            // This fixture writes on the API pool to prove generation floors.
+            // Production `db_open_options` stays read-only.
+            opts.read_only = false;
+            let db = Db::open_with(opts).unwrap();
             let api = ApiState::new(cfg, db).unwrap();
             Self { writer, api, path }
         }

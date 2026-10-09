@@ -10,6 +10,7 @@ pub mod activity_log;
 pub mod automod;
 pub mod cases;
 pub mod commands;
+pub mod control_server;
 pub mod discord;
 pub mod enrollment_repair;
 pub mod gateway_budget;

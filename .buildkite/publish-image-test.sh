@@ -234,7 +234,7 @@ for component in bot api webui; do
 done
 
 # Migration origins are distinct from exact application runtime ranges.
-for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=14; do
+for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=15; do
   contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
 done
 

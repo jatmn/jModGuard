@@ -714,6 +714,7 @@ async fn measure_sustained_snapshot_workload_and_cleanup_reuse() {
                 .registration(StoreId::new(), StorePolicy::Shared)
                 .await;
             let options = GuildStoreOptions {
+                read_only: false,
                 path: fixture.store_path.clone(),
                 url,
                 token,

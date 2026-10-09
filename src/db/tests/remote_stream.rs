@@ -123,6 +123,7 @@ impl HranaFixture {
         Db {
             path: PathBuf::new(),
             remote: true,
+            read_only: false,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
             startup_deferred: false,
@@ -131,6 +132,7 @@ impl HranaFixture {
                 database,
                 runtime,
                 remote: true,
+                read_only: false,
                 busy_timeout_ms: 5_000,
             }),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),

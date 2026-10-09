@@ -704,6 +704,7 @@ pub struct Connection {
     tainted: Arc<AtomicBool>,
     config_version: Arc<std::sync::atomic::AtomicU64>,
     capacity_limits: CapacityLimits,
+    read_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1034,6 +1035,7 @@ impl Connection {
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
+            read_only: false,
         })
     }
 
@@ -1045,7 +1047,20 @@ impl Connection {
             tainted: Arc::new(AtomicBool::new(false)),
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
+            read_only: false,
         })
+    }
+
+    pub(crate) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    fn refuse_writer_lock(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only,
+            "read-only connection cannot start a write transaction"
+        );
+        Ok(())
     }
 
     /// Start a pooled remote operation without the previous operation's
@@ -1106,6 +1121,7 @@ impl Connection {
     }
 
     pub fn transaction_immediate(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
@@ -1136,6 +1152,7 @@ impl Connection {
     /// writer can invalidate promotion; the capture owner must restart the
     /// entire operation on a proven busy error, never reuse the read results.
     pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin capture transaction",
             libsql::TransactionBehavior::Deferred,
@@ -1166,6 +1183,7 @@ impl Connection {
     /// a mutation receipt. Before non-migration writes, enable a mutation receipt
     /// on the returned transaction so lost COMMIT responses remain recoverable.
     pub fn transaction_primary_read(&self) -> Result<Transaction> {
+        self.refuse_writer_lock()?;
         let inner = self.open_remote_transaction(
             "begin primary read transaction",
             libsql::TransactionBehavior::Immediate,

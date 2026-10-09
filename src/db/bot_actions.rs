@@ -1,23 +1,33 @@
 //! Durable action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotAction {
     pub id: String,
-    #[serde(serialize_with = "crate::ids::ser_i64_str")]
+    #[serde(
+        serialize_with = "crate::ids::ser_i64_str",
+        deserialize_with = "crate::ids::de_i64"
+    )]
     pub guild_id: i64,
-    #[serde(serialize_with = "crate::ids::ser_i64_str")]
+    #[serde(
+        serialize_with = "crate::ids::ser_i64_str",
+        deserialize_with = "crate::ids::de_i64"
+    )]
     pub actor_id: i64,
     pub action: Action,
     pub state: String,
     pub outcome: Option<String>,
     pub enrollment_id: Option<String>,
-    #[serde(serialize_with = "crate::ids::ser_opt_i64_str")]
+    #[serde(
+        serialize_with = "crate::ids::ser_opt_i64_str",
+        deserialize_with = "crate::ids::de_opt_i64"
+    )]
     pub joined_at_ns: Option<i64>,
     pub created_at: i64,
     pub expires_at: i64,
-    #[serde(skip)]
+    #[serde(default, skip)]
     pub(crate) claim: Option<String>,
 }
 impl BotAction {

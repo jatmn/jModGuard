@@ -399,60 +399,106 @@ async fn enforce(
     let mut ban_outcome = None;
     let mut ban_case = None;
     if app.spam_gate.claim_ban(found.guild, found.author, now) {
-        let pending_ban =
-            crate::member_directory::begin_ban_attempt(app, found.guild, found.author).await;
-        let suppression = app.suppress_next_gateway_case(
-            crate::state::GatewayCaseAction::Ban,
-            found.guild,
-            found.author,
-        );
-        let discord = tokio::time::timeout(
-            Duration::from_secs(10),
-            GuildId::new(found.guild).ban_with_reason(
-                http,
-                UserId::new(found.author),
-                0,
-                &found.reason,
-            ),
-        )
-        .await;
-        let outcome = match discord {
-            Ok(Ok(())) => CaseOutcome::Succeeded,
-            Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
-            Err(_) => CaseOutcome::Uncertain,
-        };
-        app.spam_gate.finish_ban(
-            found.guild,
-            found.author,
-            now,
-            matches!(outcome, CaseOutcome::Succeeded),
-        );
-        if release_gateway_ban_suppression(&outcome) {
-            app.release_gateway_case_suppression(suppression);
-        }
-        if matches!(outcome, CaseOutcome::Succeeded) {
-            let _ = crate::db::record_enrolled_ban(
-                &app.db,
-                Some(enrollment.clone()),
-                found.author as i64,
-                None,
-                &format!("[automod:{rule}] {}", found.reason),
-            )
-            .await;
-        }
-        ban_outcome = Some(outcome.clone());
-        ban_case = crate::cases::record_application(
+        let decision = crate::member_directory::observe_ban_handoff(
             app,
-            Some(enrollment.clone()),
-            CaseAction::Ban,
-            outcome.clone(),
+            http,
+            found.guild,
             found.author,
-            None,
-            Some(found.reason.clone()),
-            evidence(found.excerpts.clone()),
+            crate::member_directory::MarkerSave::Missing,
         )
         .await;
-        pending_ban.finish(app, outcome).await;
+        match decision {
+            crate::member_directory::BanContinuation::Stop
+            | crate::member_directory::BanContinuation::AlreadyFinished => {}
+            crate::member_directory::BanContinuation::RecordOnly => {
+                if app.activation.may_record()
+                    && crate::db::record_enrolled_ban_if_absent(
+                        &app.db,
+                        Some(enrollment.clone()),
+                        found.author as i64,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &format!("[automod:{rule}] {}", found.reason),
+                        None,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    ban_outcome = Some(CaseOutcome::Succeeded);
+                }
+            }
+            crate::member_directory::BanContinuation::BanThenRecord => {
+                if app.activation.may_record() {
+                    let pending_ban =
+                        crate::member_directory::begin_ban_attempt(app, found.guild, found.author)
+                            .await;
+                    if app.activation.may_record() {
+                        let suppression = app.suppress_next_gateway_case(
+                            crate::state::GatewayCaseAction::Ban,
+                            found.guild,
+                            found.author,
+                        );
+                        let discord = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            GuildId::new(found.guild).ban_with_reason(
+                                http,
+                                UserId::new(found.author),
+                                0,
+                                &found.reason,
+                            ),
+                        )
+                        .await;
+                        let outcome = match discord {
+                            Ok(Ok(())) => CaseOutcome::Succeeded,
+                            Ok(Err(error)) => crate::cases::classify_discord(Some(&error)),
+                            Err(_) => CaseOutcome::Uncertain,
+                        };
+                        app.spam_gate.finish_ban(
+                            found.guild,
+                            found.author,
+                            now,
+                            matches!(outcome, CaseOutcome::Succeeded),
+                        );
+                        if release_gateway_ban_suppression(&outcome) {
+                            app.release_gateway_case_suppression(suppression);
+                        }
+                        if app.activation.may_record() {
+                            if matches!(outcome, CaseOutcome::Succeeded) {
+                                let _ = crate::db::record_enrolled_ban_if_absent(
+                                    &app.db,
+                                    Some(enrollment.clone()),
+                                    found.author as i64,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    &format!("[automod:{rule}] {}", found.reason),
+                                    None,
+                                )
+                                .await;
+                            }
+                            ban_outcome = Some(outcome.clone());
+                            ban_case = crate::cases::record_application(
+                                app,
+                                Some(enrollment.clone()),
+                                CaseAction::Ban,
+                                outcome.clone(),
+                                found.author,
+                                None,
+                                Some(found.reason.clone()),
+                                evidence(found.excerpts.clone()),
+                            )
+                            .await;
+                            pending_ban.finish(app, outcome).await;
+                        }
+                    }
+                }
+            }
+        }
     }
     if found.kind == Kind::Image
         && let Some(case_id) = ban_case

@@ -121,8 +121,11 @@ Non-reusable revision tokens also distinguish counters that
 return to the same numeric value after rollback (the ABA case). Mutating read-modify-write paths also use `IMMEDIATE`
 transactions so they begin on the primary and serialize with other writers. Web, API,
 and status reads use the deferred snapshot or a read-only transaction instead, so they
-cannot take that lock. API writes keep a short busy and operation timeout and fail
-retriably rather than waiting out a bot write.
+cannot take that lock. The API process opens its database read-only. Settings and
+other dashboard changes are sent to the bot over a private authenticated link.
+The bot applies them only while it holds the writer lease, and settings wait
+behind in-flight rule actions. A full queue or a lost lease returns a clear
+error to the API. The API never starts a write transaction.
 
 Nickname changes commit a durable outbox row in the settings transaction, capturing the
 nickname, random request ID and active membership. The bot drains primary-routed due work,
@@ -134,9 +137,10 @@ Only a confirmed matching membership can resume its own dormant request. New joi
 migrated unbound jobs require a fresh save or Re-sync; no automatic initial nickname edit
 is issued. See [nickname reconciliation](ENROLLMENTS.md#nickname-reconciliation).
 
-These checks cannot recall an already-sent Discord edit or provide exclusive bot-replica
-ownership. Configuration API scope is implemented below; writer coordination remains
-separate work. Use one bot worker for this implementation.
+These checks cannot recall an already-sent Discord edit. One bot process holds
+the writer lease. A replacement waits until that lease expires or the owner
+releases it, and a release cannot clear another owner's row. Use one bot
+worker for this implementation.
 
 Captured configuration data operations now retain the original guild membership through
 the primary write transaction, including both sides of a copy and the guild context of a

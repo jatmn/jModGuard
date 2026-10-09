@@ -50,6 +50,8 @@ mod tenant_lifecycle;
 pub use tenant_lifecycle::*;
 mod settings;
 pub use settings::*;
+mod control_apply;
+pub use control_apply::*;
 mod updates;
 pub use updates::*;
 mod update_control;
@@ -124,8 +126,7 @@ impl std::fmt::Display for RemoteTokenCannotWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "remote database token cannot write. The API needs a full-access token \
-             (Bunny Database Access → full access, not read-only). Original error: {}",
+            "database connection cannot write. Original error: {}",
             self.0
         )
     }
@@ -315,7 +316,13 @@ pub fn startup_retry_kind(err: &anyhow::Error, remote: bool) -> Option<StartupRe
     {
         return None;
     }
-    if is_schema_not_ready(err) {
+    if is_schema_not_ready(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::control::WriterLinkNotReady>()
+                .is_some()
+        })
+    {
         return Some(StartupRetryKind::Schema);
     }
     if is_sqlite_startup_lock(err) {
@@ -388,6 +395,8 @@ pub struct DbOpenOptions {
     pub pool_size: u32,
     /// When true, apply migrations + seed globals. Bot uses true; API uses false.
     pub migrate: bool,
+    /// Readers never take the writer lock. The API and pure bot reads set this.
+    pub read_only: bool,
     /// Seeded into the global settings row on first boot (`bot.default_prefix`).
     pub default_prefix: String,
     /// Seeded into the global settings row on first boot (`bot.retention_days`).
@@ -398,6 +407,7 @@ pub struct DbOpenOptions {
 pub struct Db {
     path: PathBuf,
     remote: bool,
+    read_only: bool,
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
     startup_deferred: bool,
@@ -447,8 +457,15 @@ impl Db {
     pub fn sqlite_path(&self) -> Option<&Path> {
         (!self.remote).then_some(self.path.as_path())
     }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn is_remote(&self) -> bool {
         self.remote
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -464,6 +481,7 @@ struct ConnectionPool {
     database: Arc<libsql::Database>,
     runtime: DbRuntime,
     remote: bool,
+    read_only: bool,
     busy_timeout_ms: u32,
 }
 
@@ -483,10 +501,16 @@ impl ConnectionLease {
         let connection = match connection {
             Some(connection) => connection,
             None => {
-                let connection =
+                let mut connection =
                     Connection::from_database(Arc::clone(&pool.database), pool.runtime.clone())
                         .context("failed to replace discarded database connection")?;
-                configure_connection(&connection, pool.remote, pool.busy_timeout_ms)?;
+                connection.set_read_only(pool.read_only);
+                configure_connection(
+                    &connection,
+                    pool.remote,
+                    pool.busy_timeout_ms,
+                    pool.read_only,
+                )?;
                 connection
             }
         };
@@ -571,6 +595,7 @@ impl Db {
             token: String::new(),
             pool_size,
             migrate: true,
+            read_only: false,
             default_prefix: GuildSettings::default().prefix,
             retention_days: GuildSettings::default().retention_days,
         })
@@ -674,7 +699,11 @@ impl Db {
                     .build(),
             )?
         } else {
-            runtime.block_on(libsql::Builder::new_local(opts.path.clone()).build())?
+            let mut builder = libsql::Builder::new_local(opts.path.clone());
+            if opts.read_only {
+                builder = builder.flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY);
+            }
+            runtime.block_on(builder.build())?
         };
         let database = Arc::new(database);
         let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -684,10 +713,13 @@ impl Db {
         // on the database runtime, including the error path.
         {
             let mut held = CloseBootstrap {
-                connection: Some(
-                    Connection::from_database(Arc::clone(&database), runtime.clone())
-                        .context("failed to connect to database")?,
-                ),
+                connection: Some({
+                    let mut connection =
+                        Connection::from_database(Arc::clone(&database), runtime.clone())
+                            .context("failed to connect to database")?;
+                    connection.set_read_only(opts.read_only);
+                    connection
+                }),
                 runtime: runtime.clone(),
             };
             let bootstrap = held
@@ -696,12 +728,20 @@ impl Db {
                 .expect("bootstrap connection is installed");
             let step_started = Instant::now();
             if !remote {
-                bootstrap.execute_batch(
-                    "PRAGMA busy_timeout=5000;
-                     PRAGMA journal_mode=WAL;
-                     PRAGMA synchronous=NORMAL;
-                     PRAGMA foreign_keys=ON;",
-                )?;
+                if opts.read_only {
+                    bootstrap.execute_batch(
+                        "PRAGMA busy_timeout=5000;
+                         PRAGMA foreign_keys=ON;
+                         PRAGMA query_only=ON;",
+                    )?;
+                } else {
+                    bootstrap.execute_batch(
+                        "PRAGMA busy_timeout=5000;
+                         PRAGMA journal_mode=WAL;
+                         PRAGMA synchronous=NORMAL;
+                         PRAGMA foreign_keys=ON;",
+                    )?;
+                }
             } else {
                 bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
             }
@@ -730,10 +770,11 @@ impl Db {
             };
             let mut connections = Vec::with_capacity(pool_size);
             for _ in 0..pool_size {
-                let connection =
+                let mut connection =
                     Connection::from_database(Arc::clone(&database), pool_runtime.clone())
                         .context("failed to create pooled database connection")?;
-                configure_connection(&connection, remote, busy_timeout_ms)?;
+                connection.set_read_only(opts.read_only);
+                configure_connection(&connection, remote, busy_timeout_ms, opts.read_only)?;
                 connections.push(connection);
             }
 
@@ -746,6 +787,7 @@ impl Db {
             Ok(Self {
                 path: opts.path.clone(),
                 remote,
+                read_only: opts.read_only,
                 _database: Arc::clone(&database),
                 runtime: runtime.clone(),
                 startup_deferred: false,
@@ -754,6 +796,7 @@ impl Db {
                     database,
                     runtime: pool_runtime,
                     remote,
+                    read_only: opts.read_only,
                     busy_timeout_ms,
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),

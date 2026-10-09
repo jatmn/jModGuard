@@ -6,6 +6,7 @@ pub mod bot_actions;
 pub mod bunny_evidence;
 pub mod capacity;
 pub mod config;
+pub mod control;
 pub mod db;
 mod db_compat;
 pub mod defaults;

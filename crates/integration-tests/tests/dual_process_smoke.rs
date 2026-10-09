@@ -31,6 +31,7 @@ fn cleanup_db(path: &std::path::Path) {
 
 fn open_dual(path: &Path) -> (Db, Db) {
     let bot = Db::open_with(DbOpenOptions {
+        read_only: false,
         path: path.to_path_buf(),
         url: String::new(),
         token: String::new(),
@@ -41,6 +42,7 @@ fn open_dual(path: &Path) -> (Db, Db) {
     })
     .expect("bot (migrate=true) must open shared DB");
     let api = Db::open_with(DbOpenOptions {
+        read_only: true,
         path: path.to_path_buf(),
         url: String::new(),
         token: String::new(),
@@ -60,9 +62,18 @@ async fn smoke_dual_process_config_sync() {
         let (bot_db, api_db) = open_dual(&tmp);
 
         let mut cfg = BotProcessConfig::default();
+        cfg.db.path = tmp.clone();
         cfg.bot.config_poll_secs = 1;
+        cfg.bot.control_bind = "127.0.0.1:0".into();
         let bot = BotState::new(cfg, bot_db).expect("BotState");
-        let api = ApiState::new(ApiProcessConfig::default(), api_db).expect("ApiState");
+        bot.activation.mark_lock_held(true);
+        let bound = jmodguard_bot::control_server::spawn(std::sync::Arc::clone(&bot))
+            .expect("control server");
+        let mut api_cfg = ApiProcessConfig::default();
+        api_cfg.db.path = tmp.clone();
+        api_cfg.bot.control_bind = bound.to_string();
+        assert!(api_db.is_read_only());
+        let api = ApiState::new(api_cfg, api_db).expect("ApiState");
 
         let guild_id: u64 = 55_555;
 
@@ -79,16 +90,26 @@ async fn smoke_dual_process_config_sync() {
         let before = bot.configs.get(&bot.db, guild_id).await.unwrap();
         assert_eq!(before.settings.prefix, "!");
 
-        // --- check 2: API write → version bump → bot cache refresh ------------
-        db::patch_settings(
-            &api.db,
-            guild_id as i64,
-            Some(Some("!from-api".into())),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        // --- check 2: API save goes through the bot; the API connection cannot write
+        let enrollment = db::enroll_guild(&bot.db, guild_id as i64, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = api
+            .commit(db::ControlOp::PatchSettings {
+                scope: db::ScopeWire {
+                    global: false,
+                    guild_id: guild_id as i64,
+                    enrollment_id: enrollment.id,
+                    joined_at_ns: 1,
+                },
+                prefix: db::FieldPatch::Set("!from-api".into()),
+                bot_name: db::FieldPatch::Absent,
+                reconcile: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, db::ControlReply::Saved { .. }));
 
         assert_eq!(db::get_config_version(&bot.db).await.unwrap(), baseline + 1);
         assert!(
@@ -181,7 +202,7 @@ async fn smoke_bot_and_api_executables_share_sqlite() {
     std::fs::write(
         &config,
         format!(
-            "[db]\npath={:?}\npool_size=2\n[bot]\nconfig_poll_secs=1\ndefault_prefix='!'\n[web]\nbind='127.0.0.1:9'\nbase_url='http://127.0.0.1:9'\noauth_client_id='fixture'\noauth_client_secret='fixture'\n[log]\ndirectory=''\n",
+            "[db]\npath={:?}\npool_size=2\n[bot]\nconfig_poll_secs=1\ndefault_prefix='!'\ncontrol_bind='127.0.0.1:0'\n[web]\nbind='127.0.0.1:9'\nbase_url='http://127.0.0.1:9'\noauth_client_id='fixture'\noauth_client_secret='fixture'\n[log]\ndirectory=''\n",
             database.to_string_lossy()
         ),
     )
