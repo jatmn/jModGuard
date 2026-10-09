@@ -496,11 +496,12 @@ impl TenantRuntime {
         &self,
         enrollment: GuildEnrollment,
         subject: u64,
+        discord_reason: &str,
     ) -> Result<Vec<(CaseId, crate::db::guild_data::CaseData)>> {
         let subject = i64::try_from(subject).map_err(|_| anyhow!("invalid ban subject"))?;
         let (store, scope) = self.live(enrollment).await?;
         store
-            .settle_pending_application_bans(scope, subject, case_limits())
+            .settle_matching_application_ban(scope, subject, discord_reason, case_limits())
             .await
     }
 

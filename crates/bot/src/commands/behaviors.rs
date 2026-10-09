@@ -49,8 +49,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 crate::member_directory::BanContinuation::Stop => {
                     return Err(anyhow!("writer lease is not held"));
                 }
-                crate::member_directory::BanContinuation::AlreadyFinished => {}
-                crate::member_directory::BanContinuation::RecordOnly => {
+                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
+                    crate::cases::settle_present_application_ban(
+                        env.app,
+                        enrollment.clone(),
+                        target.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                }
+                crate::member_directory::BanContinuation::RecordOnly {
+                    reason: discord_reason,
+                } => {
                     if continue_present_command_ban(
                         env.app,
                         enrollment.clone(),
@@ -60,6 +70,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         env.actor.get() as i64,
                         &env.actor_member.user.name,
                         &reason,
+                        discord_reason.as_deref(),
                     )
                     .await?
                     {
@@ -87,16 +98,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     if !env.app.activation.may_record() {
                         return Err(anyhow!("writer lease is not held"));
                     }
-                    let attempted = crate::cases::begin_application_attempt(
-                        env.app,
-                        enrollment.clone(),
-                        crate::db::guild_data::CaseAction::Ban,
-                        target.get(),
-                        Some(env.actor.get()),
-                        Some(reason.clone()),
-                        crate::db::guild_data::CaseEvidence::Unavailable,
-                    )
-                    .await;
+                    let attempted = match crate::db::guild_data::CaseId::try_from(
+                        pending_ban.operation_id().to_owned(),
+                    ) {
+                        Ok(operation_id) => {
+                            crate::cases::begin_application_attempt(
+                                env.app,
+                                enrollment.clone(),
+                                crate::db::guild_data::CaseAction::Ban,
+                                target.get(),
+                                Some(env.actor.get()),
+                                Some(reason.clone()),
+                                crate::db::guild_data::CaseEvidence::Unavailable,
+                                operation_id,
+                            )
+                            .await
+                        }
+                        Err(_) => None,
+                    };
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -133,14 +152,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     if !env.app.activation.may_record() {
                         return Err(anyhow!("writer lease is not held"));
                     }
-                    if let Some(case_id) = attempted {
-                        crate::cases::settle_application_attempt(
-                            env.app,
-                            enrollment.clone(),
-                            case_id,
-                            outcome.clone(),
-                        )
-                        .await;
+                    if let Some(attempt) = attempted {
+                        attempt.finish(env.app, outcome.clone()).await;
                     }
                     pending_ban.finish(env.app, outcome.clone()).await;
                     match outcome {
@@ -941,9 +954,11 @@ pub(crate) async fn continue_present_command_ban(
     actor: i64,
     actor_name: &str,
     reason: &str,
+    discord_reason: Option<&str>,
 ) -> Result<bool> {
     let subject = u64::try_from(target).unwrap_or(0);
-    crate::cases::settle_present_application_ban(app, enrollment.clone(), subject).await;
+    crate::cases::settle_present_application_ban(app, enrollment.clone(), subject, discord_reason)
+        .await;
     if !app.activation.may_record() {
         return Ok(false);
     }

@@ -328,12 +328,21 @@ async fn run_step(
                 crate::member_directory::BanContinuation::Stop => {
                     anyhow::bail!("writer lease is not held");
                 }
-                crate::member_directory::BanContinuation::AlreadyFinished => {}
-                crate::member_directory::BanContinuation::RecordOnly => {
+                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
                     crate::cases::settle_present_application_ban(
                         env.app,
                         enrollment.clone(),
                         target.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                }
+                crate::member_directory::BanContinuation::RecordOnly { reason } => {
+                    crate::cases::settle_present_application_ban(
+                        env.app,
+                        enrollment.clone(),
+                        target.get(),
+                        reason.as_deref(),
                     )
                     .await;
                     if env.app.activation.may_record() {
@@ -365,16 +374,24 @@ async fn run_step(
                     if !env.app.activation.may_record() {
                         anyhow::bail!("writer lease is not held");
                     }
-                    let attempted = crate::cases::begin_application_attempt(
-                        env.app,
-                        enrollment.clone(),
-                        crate::db::guild_data::CaseAction::Ban,
-                        target.get(),
-                        Some(env.actor.get()),
-                        Some("custom command".into()),
-                        crate::db::guild_data::CaseEvidence::Unavailable,
-                    )
-                    .await;
+                    let attempted = match crate::db::guild_data::CaseId::try_from(
+                        pending_ban.operation_id().to_owned(),
+                    ) {
+                        Ok(operation_id) => {
+                            crate::cases::begin_application_attempt(
+                                env.app,
+                                enrollment.clone(),
+                                crate::db::guild_data::CaseAction::Ban,
+                                target.get(),
+                                Some(env.actor.get()),
+                                Some("custom command".into()),
+                                crate::db::guild_data::CaseEvidence::Unavailable,
+                                operation_id,
+                            )
+                            .await
+                        }
+                        Err(_) => None,
+                    };
                     let suppression = env.app.suppress_next_gateway_case(
                         crate::state::GatewayCaseAction::Ban,
                         env.guild_id.get(),
@@ -408,14 +425,13 @@ async fn run_step(
                     if !env.app.activation.may_record() {
                         anyhow::bail!("writer lease is not held");
                     }
-                    if let Some(case_id) = attempted {
-                        crate::cases::settle_application_attempt(
-                            env.app,
-                            enrollment.clone(),
-                            case_id,
-                            crate::cases::classify_discord(result.as_ref().err()),
-                        )
-                        .await;
+                    if let Some(attempt) = attempted {
+                        attempt
+                            .finish(
+                                env.app,
+                                crate::cases::classify_discord(result.as_ref().err()),
+                            )
+                            .await;
                     }
                     pending_ban
                         .finish(

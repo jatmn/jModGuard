@@ -557,15 +557,27 @@ pub async fn execute_pending(
             )
             .await;
             match decision {
-                crate::member_directory::BanContinuation::Stop
-                | crate::member_directory::BanContinuation::AlreadyFinished => {
+                crate::member_directory::BanContinuation::Stop => {
                     publish_report = false;
                 }
-                crate::member_directory::BanContinuation::RecordOnly => {
+                crate::member_directory::BanContinuation::AlreadyFinished { reason } => {
                     crate::cases::settle_present_application_ban(
                         app,
                         enrollment.clone(),
                         target.id.get(),
+                        reason.as_deref(),
+                    )
+                    .await;
+                    publish_report = false;
+                }
+                crate::member_directory::BanContinuation::RecordOnly {
+                    reason: discord_reason,
+                } => {
+                    crate::cases::settle_present_application_ban(
+                        app,
+                        enrollment.clone(),
+                        target.id.get(),
+                        discord_reason.as_deref(),
                     )
                     .await;
                     publish_report = app.activation.may_record()
@@ -599,21 +611,29 @@ pub async fn execute_pending(
                         if !app.activation.may_record() {
                             publish_report = false;
                         } else {
-                            let attempted = crate::cases::begin_application_attempt(
-                                app,
-                                enrollment.clone(),
-                                crate::db::guild_data::CaseAction::Ban,
-                                target.id.get(),
-                                None,
-                                Some(reason.clone()),
-                                crate::cases::text_excerpt(
-                                    msg_channel.unwrap_or(0),
-                                    msg_id.unwrap_or(0),
-                                    target.id.get(),
-                                    pending.evidence["content"].as_str().unwrap_or(""),
-                                ),
-                            )
-                            .await;
+                            let attempted = match crate::db::guild_data::CaseId::try_from(
+                                pending_ban.operation_id().to_owned(),
+                            ) {
+                                Ok(operation_id) => {
+                                    crate::cases::begin_application_attempt(
+                                        app,
+                                        enrollment.clone(),
+                                        crate::db::guild_data::CaseAction::Ban,
+                                        target.id.get(),
+                                        None,
+                                        Some(reason.clone()),
+                                        crate::cases::text_excerpt(
+                                            msg_channel.unwrap_or(0),
+                                            msg_id.unwrap_or(0),
+                                            target.id.get(),
+                                            pending.evidence["content"].as_str().unwrap_or(""),
+                                        ),
+                                        operation_id,
+                                    )
+                                    .await
+                                }
+                                Err(_) => None,
+                            };
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
                                 guild_id.get(),
@@ -643,6 +663,12 @@ pub async fn execute_pending(
                                     {
                                         app.release_gateway_case_suppression(suppression);
                                     }
+                                    if app.activation.may_record() {
+                                        if let Some(attempt) = attempted {
+                                            attempt.finish(app, outcome.clone()).await;
+                                        }
+                                        pending_ban.finish(app, outcome.clone()).await;
+                                    }
                                     if !app.activation.may_record() {
                                         publish_report = false;
                                     } else if matches!(
@@ -665,18 +691,6 @@ pub async fn execute_pending(
                                         .ok()
                                         .flatten()
                                         .is_some();
-                                    }
-                                    if app.activation.may_record() {
-                                        if let Some(case_id) = attempted.clone() {
-                                            crate::cases::settle_application_attempt(
-                                                app,
-                                                enrollment.clone(),
-                                                case_id,
-                                                outcome.clone(),
-                                            )
-                                            .await;
-                                        }
-                                        pending_ban.finish(app, outcome).await;
                                     }
                                 }
                             }

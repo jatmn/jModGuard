@@ -242,6 +242,10 @@ impl GuildDataStore {
         );
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
+            #[cfg(any(test, feature = "test-support"))]
+            if stall_case_source(&source) {
+                std::thread::sleep(std::time::Duration::from_millis(1_500));
+            }
             let mut tx = conn.transaction_primary_read()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let matched = super::case_sources::source_match(&tx, &scope, &source)?;
@@ -460,18 +464,24 @@ impl GuildDataStore {
         }).await
     }
 
-    /// Settle every Attempted application ban for this subject. Already-final cases stay put.
-    pub async fn settle_pending_application_bans(
+    /// Settle the newest Attempted application ban whose stored reason matches the
+    /// reason Discord kept. Older attempts and foreign bans stay attempted.
+    pub async fn settle_matching_application_ban(
         &self,
         scope: GuildDataScope,
         subject_id: i64,
+        discord_reason: &str,
         limits: CaseLimits,
     ) -> Result<Vec<(CaseId, CaseData)>> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         anyhow::ensure!(subject_id > 0, CaseError::Invalid);
+        let wanted = discord_audit_reason(discord_reason);
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
         let expected = self.expected.clone();
-        let ids = self
+        let chosen = self
             .db
             .with_conn({
                 let scope = scope.clone();
@@ -480,39 +490,73 @@ impl GuildDataStore {
                     let tx = conn.transaction_primary_snapshot()?;
                     verify_scope(&tx, &expected, &scope, true)?;
                     let mut stmt = tx.prepare(
-                        "SELECT case_id FROM guild_cases
+                        "SELECT case_id, json_extract(payload, '$.reason') FROM guild_cases
                      WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 AND json_valid(payload)
                        AND json_extract(payload, '$.action')='ban'
                        AND json_extract(payload, '$.outcome')='attempted'
                        AND CAST(json_extract(payload, '$.subject_id') AS INTEGER)=?3
                        AND json_type(payload, '$.source.application') IS NOT NULL
-                     ORDER BY CAST(json_extract(payload, '$.occurred_at_ms') AS INTEGER), case_id",
+                     ORDER BY CAST(json_extract(payload, '$.occurred_at_ms') AS INTEGER) DESC, case_id DESC",
                     )?;
                     let rows = stmt.query_map(
                         params![scope.guild_id(), scope.enrollment.id.as_str(), subject_id],
-                        |row| Ok(row.get::<String>(0)?),
+                        |row| Ok((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
                     )?;
-                    let mut ids = Vec::new();
+                    let mut chosen = None;
                     for row in rows {
-                        ids.push(CaseId::try_from(row?)?);
+                        let (id, reason) = row?;
+                        let Some(reason) = reason else {
+                            continue;
+                        };
+                        if discord_audit_reason(&reason) == wanted {
+                            chosen = Some(CaseId::try_from(id)?);
+                            break;
+                        }
                     }
                     drop(stmt);
                     tx.finish_read()?;
-                    Ok(ids)
+                    Ok(chosen)
                 }
             })
             .await?;
+        let Some(id) = chosen else {
+            return Ok(Vec::new());
+        };
         let mut settled = Vec::new();
-        for id in ids {
-            if let Some(data) = self
-                .settle_case_outcome(scope.clone(), id.clone(), CaseOutcome::Succeeded, limits)
-                .await?
-            {
-                settled.push((id, data));
-            }
+        if let Some(data) = self
+            .settle_case_outcome(scope, id.clone(), CaseOutcome::Succeeded, limits)
+            .await?
+        {
+            settled.push((id, data));
         }
         Ok(settled)
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) static STALL_CASE_SOURCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Hold one source-key insert inside the blocking database call.
+/// Bot tests use this to prove the ban deadline does not wait for the insert.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_case_record_stall(source: Option<String>) {
+    if let Ok(mut guard) = STALL_CASE_SOURCE.lock() {
+        *guard = source;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn stall_case_source(source: &str) -> bool {
+    STALL_CASE_SOURCE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .is_some_and(|stalled| stalled == source)
+}
+
+/// Discord stores at most 512 characters of an audit reason.
+fn discord_audit_reason(reason: &str) -> String {
+    reason.chars().take(512).collect()
 }
 
 fn outcome_sql(outcome: &CaseOutcome) -> Result<&'static str> {

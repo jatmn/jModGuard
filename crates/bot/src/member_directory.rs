@@ -270,18 +270,24 @@ pub async fn begin_ban_attempt(app: &BotState, guild_id: u64, user_id: u64) -> P
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl PendingBan {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiscordBanView {
     Absent,
-    Present,
+    Present { reason: Option<String> },
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BanContinuation {
     Stop,
-    AlreadyFinished,
-    RecordOnly,
+    AlreadyFinished { reason: Option<String> },
+    RecordOnly { reason: Option<String> },
     BanThenRecord,
 }
 
@@ -312,7 +318,7 @@ async fn discord_ban_view(
     let guild = serenity::model::id::GuildId::new(guild_id);
     let user = serenity::model::id::UserId::new(user_id);
     match tokio::time::timeout(Duration::from_secs(5), http.get_ban(guild, user)).await {
-        Ok(Ok(ban)) if ban.is_some() => DiscordBanView::Present,
+        Ok(Ok(Some(ban))) => DiscordBanView::Present { reason: ban.reason },
         Ok(Ok(_)) => DiscordBanView::Absent,
         Ok(Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
             response,
@@ -332,8 +338,10 @@ pub(crate) fn ban_continuation(
     }
     match view {
         DiscordBanView::Unknown => BanContinuation::Stop,
-        DiscordBanView::Present if row_exists => BanContinuation::AlreadyFinished,
-        DiscordBanView::Present => BanContinuation::RecordOnly,
+        DiscordBanView::Present { reason } if row_exists => {
+            BanContinuation::AlreadyFinished { reason }
+        }
+        DiscordBanView::Present { reason } => BanContinuation::RecordOnly { reason },
         DiscordBanView::Absent => BanContinuation::BanThenRecord,
     }
 }
@@ -722,17 +730,32 @@ mod tests {
             BanContinuation::BanThenRecord
         );
         assert_eq!(
-            ban_continuation(false, MarkerSave::Saved, DiscordBanView::Present, false),
+            ban_continuation(
+                false,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
             BanContinuation::Stop
         );
         assert_eq!(
-            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Present, false),
-            BanContinuation::RecordOnly,
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
+            BanContinuation::RecordOnly { reason: None },
             "a successor records the missing row and does not ban again"
         );
         assert_eq!(
-            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Present, true),
-            BanContinuation::AlreadyFinished,
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                true
+            ),
+            BanContinuation::AlreadyFinished { reason: None },
             "a recorded ban is not logged a second time"
         );
         assert_eq!(
@@ -1305,8 +1328,13 @@ mod tests {
             "uncertain settlement leaves the pending marker"
         );
         assert_eq!(
-            ban_continuation(true, MarkerSave::Saved, DiscordBanView::Present, false),
-            BanContinuation::RecordOnly
+            ban_continuation(
+                true,
+                MarkerSave::Saved,
+                DiscordBanView::Present { reason: None },
+                false
+            ),
+            BanContinuation::RecordOnly { reason: None }
         );
         let inserted = db::record_enrolled_ban_if_absent(
             &app.db,

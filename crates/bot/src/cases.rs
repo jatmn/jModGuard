@@ -241,8 +241,45 @@ pub async fn record_application(
     Some(case_id)
 }
 
+/// One dispatch, shared with the ban marker. The payload is fixed here so a
+/// late insert and the post-ban record compare as the same source key.
+pub(crate) struct ApplicationAttempt {
+    pub case_id: Option<db::guild_data::CaseId>,
+    data: CaseData,
+    enrollment: db::GuildEnrollment,
+}
+
+impl ApplicationAttempt {
+    /// Record the original payload if the pre-ban insert was not confirmed, then settle it.
+    pub(crate) async fn finish(self, app: &BotState, outcome: CaseOutcome) -> Option<CaseId> {
+        if !app.activation.may_record() {
+            return None;
+        }
+        let id = match self.case_id.clone() {
+            Some(id) => id,
+            None => record_data(&app.tenant, self.enrollment.clone(), self.data.clone()).await?,
+        };
+        if settle_application_attempt(
+            app,
+            Some(self.enrollment.clone()),
+            id.clone(),
+            outcome.clone(),
+        )
+        .await
+        .is_some()
+        {
+            return Some(id);
+        }
+        let id = record_data(&app.tenant, self.enrollment.clone(), self.data).await?;
+        settle_application_attempt(app, Some(self.enrollment), id.clone(), outcome).await;
+        Some(id)
+    }
+}
+
 /// Persist the original application facts before Discord is called.
 /// An attempted case is not an audit binding; settlement does that.
+/// The insert is bounded by the ban-marker deadline and does not hold the ban.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn begin_application_attempt(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
@@ -251,20 +288,42 @@ pub(crate) async fn begin_application_attempt(
     actor: Option<u64>,
     reason: Option<String>,
     evidence: CaseEvidence,
-) -> Option<db::guild_data::CaseId> {
-    let operation_id = CaseId::new();
-    record(
-        app,
-        enrollment,
+    operation_id: CaseId,
+) -> Option<ApplicationAttempt> {
+    let enrollment = enrollment?;
+    let occurred_at_ms = chrono::Utc::now().timestamp_millis();
+    if occurred_at_ms <= 0 {
+        return None;
+    }
+    let data = CaseData {
+        source: CaseSource::Application { operation_id },
         action,
-        CaseOutcome::Attempted,
-        subject,
-        actor,
+        outcome: CaseOutcome::Attempted,
+        subject_id: subject as i64,
+        actor_id: actor
+            .and_then(|id| i64::try_from(id).ok())
+            .filter(|id| *id > 0),
+        occurred_at_ms,
         reason,
         evidence,
-        CaseSource::Application { operation_id },
+    };
+    let recorded = tokio::time::timeout(
+        crate::member_directory::BAN_MARKER_SAVE_DEADLINE,
+        record_data(&app.tenant, enrollment.clone(), data.clone()),
     )
-    .await
+    .await;
+    let case_id = match recorded {
+        Ok(id) => id,
+        Err(_elapsed) => {
+            tracing::warn!("attempted case was not confirmed before the ban deadline");
+            None
+        }
+    };
+    Some(ApplicationAttempt {
+        case_id,
+        data,
+        enrollment,
+    })
 }
 
 /// Move one attempted case to its final outcome. An already-final case is left as it is.
@@ -299,15 +358,24 @@ pub(crate) async fn settle_application_attempt(
     }
 }
 
-/// Settle the pending attempted application ban for a ban Discord already shows.
-/// No pending case keeps the caller's mirror-only behavior.
+/// Settle the one attempted application ban that matches the ban Discord shows.
+/// No reason match leaves every attempt attempted.
 pub(crate) async fn settle_present_application_ban(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
     subject: u64,
+    discord_reason: Option<&str>,
 ) {
     let Some(enrollment) = enrollment else {
         tracing::warn!(subject, "present ban has no enrollment; mirror only");
+        return;
+    };
+    let Some(discord_reason) = discord_reason.filter(|reason| !reason.is_empty()) else {
+        tracing::warn!(
+            guild_id = enrollment.guild_id,
+            subject,
+            "present ban reason does not match an attempted application case"
+        );
         return;
     };
     if !app.activation.may_record() {
@@ -315,14 +383,14 @@ pub(crate) async fn settle_present_application_ban(
     }
     match app
         .tenant
-        .settle_pending_application_ban(enrollment.clone(), subject)
+        .settle_pending_application_ban(enrollment.clone(), subject, discord_reason)
         .await
     {
         Ok(settled) if settled.is_empty() => {
             tracing::warn!(
                 guild_id = enrollment.guild_id,
                 subject,
-                "present ban has no attempted application case; mirror only"
+                "present ban reason does not match an attempted application case"
             );
         }
         Ok(settled) => {
@@ -1092,8 +1160,11 @@ mod tests {
             Some(42),
             Some("raid".into()),
             CaseEvidence::Unavailable,
+            CaseId::new(),
         )
         .await
+        .unwrap()
+        .case_id
         .unwrap();
         let settled = settle_application_attempt(
             &app,
@@ -1130,8 +1201,11 @@ mod tests {
             Some(42),
             Some("raid".into()),
             CaseEvidence::Unavailable,
+            CaseId::new(),
         )
         .await
+        .unwrap()
+        .case_id
         .unwrap();
         let settled = settle_application_attempt(
             &app,
@@ -1174,8 +1248,11 @@ mod tests {
             Some(42),
             Some("raid".into()),
             CaseEvidence::Unavailable,
+            CaseId::new(),
         )
         .await
+        .unwrap()
+        .case_id
         .unwrap();
         claim(
             &successor,
@@ -1207,6 +1284,7 @@ mod tests {
                 42,
                 "mod",
                 "raid",
+                Some("raid"),
             )
             .await
             .unwrap()
@@ -1242,8 +1320,11 @@ mod tests {
             None,
             Some("spam wave".into()),
             evidence.clone(),
+            CaseId::new(),
         )
         .await
+        .unwrap()
+        .case_id
         .unwrap();
         claim(
             &successor,
@@ -1267,6 +1348,7 @@ mod tests {
                 99,
                 "image-spam",
                 "spam wave",
+                Some("spam wave"),
             )
             .await
         );
@@ -1280,6 +1362,215 @@ mod tests {
         assert_eq!(active_bans(&successor, 99).await, 1);
         drop(original);
         drop(successor);
+        cleanup(&path);
+    }
+
+    fn operation_of(data: &CaseData) -> Option<&CaseId> {
+        match &data.source {
+            CaseSource::Application { operation_id } => Some(operation_id),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_discord_reason_settles_only_the_dispatched_attempt() {
+        let path =
+            std::env::temp_dir().join(format!("ban_match_{:032x}.db", rand::random::<u128>()));
+        let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
+        claim(&app, jmodguard::control::now_ms()).await;
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let abandoned = CaseId::new();
+        let dispatched = CaseId::new();
+        begin_application_attempt(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            99,
+            Some(42),
+            Some("abandoned before dispatch".into()),
+            CaseEvidence::Unavailable,
+            abandoned.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        begin_application_attempt(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            99,
+            None,
+            Some("raid wave".into()),
+            CaseEvidence::Unavailable,
+            dispatched.clone(),
+        )
+        .await
+        .unwrap();
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some("raid wave")).await;
+        let cases = stored_cases(&app, enrollment).await;
+        assert_eq!(cases.len(), 2);
+        let older = cases
+            .iter()
+            .find(|data| operation_of(data) == Some(&abandoned))
+            .unwrap();
+        let newer = cases
+            .iter()
+            .find(|data| operation_of(data) == Some(&dispatched))
+            .unwrap();
+        assert_eq!(older.outcome, CaseOutcome::Attempted);
+        assert_eq!(newer.outcome, CaseOutcome::Succeeded);
+        assert_eq!(newer.reason.as_deref(), Some("raid wave"));
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn foreign_ban_reason_settles_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("ban_foreign_{:032x}.db", rand::random::<u128>()));
+        let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
+        claim(&app, jmodguard::control::now_ms()).await;
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        begin_application_attempt(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            99,
+            Some(42),
+            Some("abandoned before dispatch".into()),
+            CaseEvidence::Unavailable,
+            CaseId::new(),
+        )
+        .await
+        .unwrap();
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, Some("manual ban"))
+            .await;
+        settle_present_application_ban(&app, Some(enrollment.clone()), 99, None).await;
+        let cases = stored_cases(&app, enrollment).await;
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].outcome, CaseOutcome::Attempted);
+        assert_eq!(
+            cases[0].reason.as_deref(),
+            Some("abandoned before dispatch")
+        );
+        drop(app);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn already_finished_successor_settles_the_attempt_without_a_second_mirror() {
+        let (path, original, successor, enrollment) = open_pair().await;
+        let operation = CaseId::new();
+        begin_application_attempt(
+            &original,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            99,
+            None,
+            Some("spam wave".into()),
+            CaseEvidence::Unavailable,
+            operation.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db::record_enrolled_ban_if_absent(
+                &original.db,
+                Some(enrollment.clone()),
+                99,
+                None,
+                None,
+                None,
+                None,
+                "[automod:attachment_flood] spam wave",
+                None,
+                db::BanRecord::Fresh,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(active_bans(&original, 99).await, 1);
+        claim(
+            &successor,
+            jmodguard::control::now_ms().saturating_add(21_000),
+        )
+        .await;
+        settle_present_application_ban(&successor, Some(enrollment.clone()), 99, Some("spam wave"))
+            .await;
+        let cases = stored_cases(&successor, enrollment.clone()).await;
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].outcome, CaseOutcome::Succeeded);
+        assert_eq!(operation_of(&cases[0]), Some(&operation));
+        assert_eq!(active_bans(&successor, 99).await, 1);
+        let reports: i64 = successor
+            .db
+            .with_conn(|conn| {
+                use db::SqlExecutor;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE guild_id=?1 AND event_type='mod_action'",
+                    db::params![10_i64],
+                    |row| {
+                        let count: i64 = row.get(0).map_err(|error| anyhow::anyhow!("{error}"))?;
+                        Ok(count)
+                    },
+                )?;
+                Ok(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reports, 0);
+        drop(original);
+        drop(successor);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn stalled_attempted_case_insert_does_not_delay_the_ban_and_settles_once() {
+        struct ClearStall;
+        impl Drop for ClearStall {
+            fn drop(&mut self) {
+                db::guild_data::set_case_record_stall(None);
+            }
+        }
+        let _clear = ClearStall;
+        let path =
+            std::env::temp_dir().join(format!("ban_stall_{:032x}.db", rand::random::<u128>()));
+        let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
+        claim(&app, jmodguard::control::now_ms()).await;
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let operation = CaseId::new();
+        db::guild_data::set_case_record_stall(Some(format!("app:{}", operation.as_str())));
+        let started = std::time::Instant::now();
+        let attempt = begin_application_attempt(
+            &app,
+            Some(enrollment.clone()),
+            CaseAction::Ban,
+            99,
+            Some(42),
+            Some("raid".into()),
+            CaseEvidence::Unavailable,
+            operation.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_400),
+            "the ban deadline must not wait for the stalled case insert"
+        );
+        assert!(attempt.case_id.is_none());
+        db::guild_data::set_case_record_stall(None);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        attempt.finish(&app, CaseOutcome::Succeeded).await.unwrap();
+        let cases = stored_cases(&app, enrollment).await;
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].outcome, CaseOutcome::Succeeded);
+        assert_eq!(operation_of(&cases[0]), Some(&operation));
+        assert_eq!(cases[0].reason.as_deref(), Some("raid"));
+        drop(app);
         cleanup(&path);
     }
 }
