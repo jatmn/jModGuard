@@ -458,7 +458,7 @@ mod tests {
             )?;
             let mut value: serde_json::Value = serde_json::from_str(&raw)?;
             value["irreversible"] = serde_json::json!(true);
-            let mut tx = conn.transaction_immediate()?;
+            let tx = conn.transaction_immediate()?;
             tx.execute_bounded(
                 "UPDATE meta SET value=?1 WHERE key='component_upgrade_v1'",
                 db::params![value.to_string()],
