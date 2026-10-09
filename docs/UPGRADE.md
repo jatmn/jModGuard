@@ -147,9 +147,11 @@ database backup unless a release note says otherwise.
 
 ## Bunny / dual-container notes
 
-Same order: migrate with the bot app, then roll the API app. Both must keep
-using the same Bunny Database. Upload matching `frontend/` to Storage and purge
-the Pull Zone when the page needs the new API. CSS-only UI updates do not
+Both containers ship together in one app update. The bot container migrates,
+and the API container keeps `/health` at 200 and `/ready` at 503 until the
+schema matches. Both must keep using the same Bunny Database. Upload
+matching `frontend/` to Storage and purge the Pull Zone when the page needs
+the new API. CSS-only UI updates do not
 require new images. Topology: [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). Origin-pull
 the API with **Override Origin URL** (`OriginUrl`), not OriginMagicContainers.
 

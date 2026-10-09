@@ -71,8 +71,9 @@ serves them at `http://localhost:8080`.
 4. Point `/api`, `/login`, `/logout`, `/oauth`, and `/health` on that Pull
    Zone at the API container with **Override Origin URL** (`OriginUrl`) to
    the API endpoint Pull Zone host (you must create a CDN endpoint on the
-   API app first; sticky sessions are set on that endpoint after it
-   exists, not on the add-endpoint screen; see DEPLOY-BUNNY.md). Do not
+   API container's port in the app first; sticky sessions are set on that
+   endpoint after it exists, not on the add-endpoint screen; see
+   DEPLOY-BUNNY.md). Do not
    use Override Origin: Magic Containers on a Storage Pull Zone. Leave
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
    (Caching → General; `DisableCookies=false`).
