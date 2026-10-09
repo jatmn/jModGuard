@@ -471,7 +471,7 @@ async fn enforce(
         } else if evidence.is_empty() {
             notes
         } else {
-            format!("{notes}; {evidence}")
+            format!("{evidence}; {notes}")
         }
     } else {
         notes
@@ -714,6 +714,12 @@ mod tests {
         assert!(evidence.contains("channel 10, message 100"));
         assert!(evidence.contains("channel 11, message 101"));
         assert!(evidence.contains("sha256 "));
+        let sha = evidence.find("sha256 ").expect("hash marker");
+        let first_channel = evidence.find("channel ").expect("location");
+        assert!(
+            sha < first_channel,
+            "proving hashes must precede locations in delivered evidence: {evidence}"
+        );
         assert!(evidence.contains(&"01".repeat(32)));
         assert!(!evidence.contains("http"));
         assert!(!evidence.contains("cdn"));

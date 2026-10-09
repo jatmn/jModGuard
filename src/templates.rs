@@ -277,6 +277,19 @@ pub fn render_bounded(template: &str, vars: &BTreeMap<String, String>, max_units
     out
 }
 
+/// UTF-16 units still available for one template substitution after rendering the rest.
+pub fn substitution_budget(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    key: &str,
+    max_units: usize,
+) -> usize {
+    let mut without = vars.clone();
+    without.insert(key.to_string(), String::new());
+    let used = render_bounded(template, &without, max_units).encode_utf16().count();
+    max_units.saturating_sub(used)
+}
+
 /// Builds the standard variable map for a user.
 pub fn user_vars(user_id: u64, username: &str, display_name: &str) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();

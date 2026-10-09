@@ -864,6 +864,9 @@ async fn emit_to_observed_with_audit(
         templates::format_log_timestamps(&mut vars);
         if template == default_template(event) {
             bound_default_message_vars(event, &mut vars);
+            if event == "automod" {
+                bound_automod_content_var(template, &mut vars, 2000);
+            }
         }
         let rendered = templates::render_bounded(template, &vars, 2000);
         sink.send(channel_id, log_message(&rendered)).await?;
@@ -1114,6 +1117,93 @@ fn bound_default_message_vars(event: &str, vars: &mut BTreeMap<String, String>) 
         }
         _ => {}
     }
+}
+
+const AUTOMOD_SHA256_PREFIX: &str = "sha256 ";
+
+fn split_automod_proving_content(content: &str) -> (Option<String>, String) {
+    if let Some(rest) = content.strip_prefix(AUTOMOD_SHA256_PREFIX) {
+        let hash_value: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_hexdigit() || *ch == ',')
+            .collect();
+        let mut tail = rest[hash_value.len()..].trim_start();
+        if let Some(stripped) = tail.strip_prefix(';') {
+            tail = stripped.trim_start();
+        }
+        return (
+            Some(format!("{AUTOMOD_SHA256_PREFIX}{hash_value}")),
+            tail.to_string(),
+        );
+    }
+    if let Some(idx) = content.rfind("; sha256 ") {
+        let hashes = content[idx + 2..].trim().to_string();
+        let head = content[..idx].trim().to_string();
+        return (Some(hashes), head);
+    }
+    (None, content.to_string())
+}
+
+pub(crate) fn bound_automod_content_var(
+    template: &str,
+    vars: &mut BTreeMap<String, String>,
+    max_units: usize,
+) {
+    let Some(content) = vars.remove("content") else {
+        return;
+    };
+    if content.is_empty() {
+        vars.insert("content".into(), content);
+        return;
+    }
+    let budget = templates::substitution_budget(template, vars, "content", max_units);
+    let bounded = match split_automod_proving_content(&content) {
+        (Some(hashes), tail) if tail.is_empty() => {
+            if hashes.encode_utf16().count() <= budget {
+                hashes
+            } else {
+                clip(&hashes, budget)
+            }
+        }
+        (Some(hashes), tail) => {
+            let hash_units = hashes.encode_utf16().count();
+            let marker = " [display clipped]";
+            let marker_units = marker.encode_utf16().count();
+            let sep = "; ";
+            let sep_units = sep.encode_utf16().count();
+            if hash_units.saturating_add(sep_units) >= budget {
+                if hash_units <= budget {
+                    hashes
+                } else {
+                    clip(&hashes, budget)
+                }
+            } else if tail.encode_utf16().count()
+                <= budget.saturating_sub(hash_units + sep_units)
+            {
+                format!("{hashes}{sep}{tail}")
+            } else {
+                let tail_budget = budget
+                    .saturating_sub(hash_units + sep_units + marker_units);
+                format!("{hashes}{sep}{}{marker}", clip(&tail, tail_budget))
+            }
+        }
+        (None, tail) => {
+            if tail.encode_utf16().count() <= budget {
+                tail
+            } else {
+                let marker = " [display clipped]";
+                format!(
+                    "{}{}",
+                    clip(
+                        &tail,
+                        budget.saturating_sub(marker.encode_utf16().count())
+                    ),
+                    marker
+                )
+            }
+        }
+    };
+    vars.insert("content".into(), bounded);
 }
 
 pub(crate) fn apply_retained_edit(

@@ -2095,3 +2095,49 @@ async fn readable_leave_preview_and_supplied_edit_timestamp_reach_discord() {
         cfg.find_command("STATUS").unwrap()
     ));
 }
+
+#[test]
+fn automod_default_template_preserves_proving_hashes_under_discord_budget() {
+    use crate::image_spam::image_notice_evidence;
+    let snowflake = |n: u64| 1_000_000_000_000_000_000u64 + n;
+    let messages: Vec<_> = (0..16)
+        .map(|i| (snowflake(i * 2), snowflake(i * 2 + 1)))
+        .collect();
+    let proving = vec![[0xcd_u8; 32]];
+    let hash_hex = proving[0]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let evidence = image_notice_evidence(&messages, &proving);
+    let delete_notes = messages
+        .iter()
+        .map(|(channel, message)| format!("{channel}/{message} Succeeded"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut vars = BTreeMap::from([
+        ("rule".into(), "Exact image spam".into()),
+        ("mention".into(), format!("<@{}>", snowflake(99))),
+        ("user_id".into(), snowflake(99).to_string()),
+        ("source_channel_id".into(), snowflake(0).to_string()),
+        ("channel".into(), format!("<#{}>", snowflake(0))),
+        (
+            "action".into(),
+            "delete matched messages; ban Succeeded".into(),
+        ),
+        (
+            "reason".into(),
+            "Verified identical image bytes: at least 2 common distinct images across 3 channels in 1m".into(),
+        ),
+        ("content".into(), format!("{evidence}; {delete_notes}")),
+        ("time".into(), "2026-10-09T00:00:00+00:00".into()),
+    ]);
+    let template = default_template("automod");
+    bound_default_message_vars("automod", &mut vars);
+    bound_automod_content_var(template, &mut vars, 2000);
+    let rendered = templates::render_bounded(template, &vars, 2000);
+    assert!(
+        rendered.contains(&hash_hex),
+        "expected full proving digest: {rendered}"
+    );
+    assert!(rendered.encode_utf16().count() <= 2000);
+}

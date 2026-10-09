@@ -1448,7 +1448,7 @@ pub(crate) fn image_notice_evidence(messages: &[(u64, u64)], proving: &[Hash]) -
     } else if locations.is_empty() {
         format!("sha256 {hashes}")
     } else {
-        format!("{locations}; sha256 {hashes}")
+        format!("sha256 {hashes}; {locations}")
     }
 }
 fn report_vars(
@@ -2291,6 +2291,17 @@ mod tests {
         crate::templates::render(template, vars)
     }
 
+    fn automod_notice_bounded(vars: &BTreeMap<String, String>) -> String {
+        let template = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "automod")
+            .map(|(_, template)| template)
+            .expect("automod template");
+        let mut vars = vars.clone();
+        crate::logging::bound_automod_content_var(template, &mut vars, 2000);
+        crate::templates::render_bounded(template, &vars, 2000)
+    }
+
     #[test]
     fn proven_hashes_keep_a_match_reason_and_evidence_when_download_is_marked_failed() {
         let now = Instant::now();
@@ -2363,6 +2374,59 @@ mod tests {
         assert!(
             !notice.contains("Verified identical image bytes"),
             "{notice}"
+        );
+    }
+
+    #[test]
+    fn large_enforcement_notice_keeps_full_proving_hashes_within_budget() {
+        let snowflake = |n: u64| 1_000_000_000_000_000_000u64 + n;
+        let messages: Vec<_> = (0..16)
+            .map(|i| (snowflake(i * 2), snowflake(i * 2 + 1)))
+            .collect();
+        let proving = vec![[0xab_u8; 32]];
+        let hash_hex = proving[0]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let evidence = super::image_notice_evidence(&messages, &proving);
+        let delete_notes = messages
+            .iter()
+            .map(|(channel, message)| format!("{channel}/{message} Succeeded"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let content = format!("{evidence}; {delete_notes}");
+        let policy = policy();
+        let vars = BTreeMap::from([
+            ("rule".into(), "Exact image spam".into()),
+            ("mention".into(), format!("<@{}>", snowflake(99))),
+            ("user_id".into(), snowflake(99).to_string()),
+            ("source_channel_id".into(), snowflake(0).to_string()),
+            ("channel".into(), format!("<#{}>", snowflake(0))),
+            (
+                "action".into(),
+                "delete matched messages; ban Succeeded".into(),
+            ),
+            ("reason".into(), verified_reason(&policy)),
+            ("content".into(), content),
+            ("time".into(), "2026-10-09T00:00:00+00:00".into()),
+        ]);
+        let notice = automod_notice_bounded(&vars);
+        assert!(
+            notice.contains(&hash_hex),
+            "expected full sha256 digest in notice: {notice}"
+        );
+        assert!(
+            notice.contains("sha256"),
+            "expected hash marker in notice: {notice}"
+        );
+        assert!(
+            notice.encode_utf16().count() <= 2000,
+            "notice exceeded Discord budget: {}",
+            notice.encode_utf16().count()
+        );
+        assert!(
+            !notice.ends_with('…') || notice.contains(&hash_hex),
+            "truncation must not drop proving hashes: {notice}"
         );
     }
 
