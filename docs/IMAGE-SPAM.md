@@ -71,6 +71,15 @@ remaining matched messages can still be deleted. Cases store proving message IDs
 hashes or trimmed text. Test reports stay Discord logs only, with no SQL cases and no
 object capture.
 
+A verified image match, in either mode, uses a reason that describes the
+identical-image match. The automod Evidence field lists the matched channel and
+message ids and the proving SHA-256 hashes. It does not include image bytes or
+the attachment address. If a download, request budget, or comparison work budget
+stops analysis before a match is proven, the notice says analysis did not finish
+and is not a spam hit. It does not use the dry-run success action. Hashes already
+stored for those posts still count, and an in-flight result that proves the match
+is reported as that match.
+
 After a ban case is recorded for an image match, the bot re-fetches proving
 attachments through the same Hasher CDN contract (no arbitrary URLs, redirects,
 credentials or retries) into a temporary file, then streams that file into the

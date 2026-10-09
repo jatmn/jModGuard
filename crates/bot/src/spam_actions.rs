@@ -223,15 +223,7 @@ pub(crate) async fn report(app: &Arc<BotState>, ctx: &Context, found: Match) -> 
             ("channel".into(), format!("<#{}>", found.channel)),
             ("action".into(), "log only; no punishment".into()),
             ("reason".into(), found.reason.clone()),
-            (
-                "content".into(),
-                found
-                    .messages
-                    .iter()
-                    .map(|(c, m)| format!("channel {c}, message {m}"))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
+            ("content".into(), automod_evidence(&found)),
         ]);
         crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
         return ReportDisposition::Consumed;
@@ -471,6 +463,19 @@ async fn enforce(
         None => "delete remaining; ban already applied this window".into(),
         Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
     };
+    let notes = delete_notes.join("; ");
+    let content = if found.kind == Kind::Image {
+        let evidence = automod_evidence(&found);
+        if notes.is_empty() {
+            evidence
+        } else if evidence.is_empty() {
+            notes
+        } else {
+            format!("{evidence}; {notes}")
+        }
+    } else {
+        notes
+    };
     let vars = BTreeMap::from([
         ("rule".into(), name.into()),
         ("mention".into(), format!("<@{}>", found.author)),
@@ -479,7 +484,7 @@ async fn enforce(
         ("channel".into(), format!("<#{}>", found.channel)),
         ("action".into(), action),
         ("reason".into(), found.reason),
-        ("content".into(), delete_notes.join("; ")),
+        ("content".into(), content),
     ]);
     crate::logging::emit(app, ctx, GuildId::new(found.guild), "automod", vars).await;
     ReportDisposition::Consumed
@@ -499,6 +504,31 @@ fn delete_outcome(error: &serenity::Error) -> CaseOutcome {
         return CaseOutcome::Succeeded;
     }
     crate::cases::classify_discord(Some(error))
+}
+
+fn proving_hashes(found: &Match) -> Vec<jmodguard::image_spam::Hash> {
+    let mut hashes: Vec<_> = found
+        .attachments
+        .iter()
+        .map(|item| item.proving_hash)
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
+}
+
+fn automod_evidence(found: &Match) -> String {
+    match found.kind {
+        Kind::Text => found
+            .messages
+            .iter()
+            .map(|(channel, message)| format!("channel {channel}, message {message}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        Kind::Image => {
+            crate::image_spam::image_notice_evidence(&found.messages, &proving_hashes(found))
+        }
+    }
 }
 
 fn message_evidence(
@@ -646,6 +676,69 @@ async fn capture_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_notice_evidence_uses_hash_and_locations_without_a_url() {
+        let hash = [1u8; 32];
+        let found = Match {
+            kind: Kind::Image,
+            guild: 1,
+            author: 2,
+            channel: 10,
+            policy: MatchPolicy::Image(jmodguard::image_spam::Policy {
+                mode: "exact_image_test".into(),
+                window_secs: 60,
+                min_channels: 3,
+                min_attachments: 2,
+                enforce: false,
+            }),
+            token: (0, 0),
+            messages: vec![(10, 100), (11, 101)],
+            excerpts: vec![],
+            attachments: vec![ProvingAttachment {
+                channel: 10,
+                message: 100,
+                file: jmodguard::image_spam::Attachment::new(
+                    10,
+                    1,
+                    3,
+                    "https://cdn.discordapp.com/attachments/10/1/a.png",
+                    10,
+                )
+                .unwrap(),
+                proving_hash: hash,
+            }],
+            reason: "Verified identical image bytes".into(),
+        };
+        let evidence = automod_evidence(&found);
+        assert!(evidence.contains("channel 10, message 100"));
+        assert!(evidence.contains("channel 11, message 101"));
+        assert!(evidence.contains("sha256 "));
+        let sha = evidence.find("sha256 ").expect("hash marker");
+        let first_channel = evidence.find("channel ").expect("location");
+        assert!(
+            sha < first_channel,
+            "proving hashes must precede locations in delivered evidence: {evidence}"
+        );
+        assert!(evidence.contains(&"01".repeat(32)));
+        assert!(!evidence.contains("http"));
+        assert!(!evidence.contains("cdn"));
+        let mut text = found;
+        text.kind = Kind::Text;
+        text.policy = MatchPolicy::Text(jmodguard::text_spam::Policy {
+            mode: "exact_text".into(),
+            window_secs: 60,
+            min_channels: 3,
+            min_length: 20,
+            enforce: false,
+        });
+        let text_evidence = automod_evidence(&text);
+        assert_eq!(
+            text_evidence,
+            "channel 10, message 100; channel 11, message 101"
+        );
+        assert!(!text_evidence.contains("sha256"));
+    }
 
     #[test]
     fn re_fetch_digest_must_match_proving_hash() {

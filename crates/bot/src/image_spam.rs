@@ -58,6 +58,8 @@ struct Bucket {
     posts: Vec<Post>,
     budget: Budget,
     reported_until: Instant,
+    /// `reported_until` was reserved because analysis was blocked, not because a hit was logged.
+    blocked_notice: bool,
 }
 /// Replay/rate tombstone after posts are gone; does not occupy live author slots.
 struct Watermark {
@@ -616,6 +618,7 @@ impl Detector {
                 .map(|w| w.budget.clone())
                 .unwrap_or_else(|| Budget::new(now)),
             reported_until: watermark.as_ref().map(|w| w.reported_until).unwrap_or(now),
+            blocked_notice: false,
         });
         b.token = token;
         if b.posts.len() >= self.limits.max_posts_per_author {
@@ -693,7 +696,12 @@ impl Detector {
     fn complete(&self, job: Job, policy: &Policy, failed: bool, now: Instant) -> Option<Report> {
         let mut s = self.state.lock();
         let b = s.guilds.get_mut(&job.guild)?.authors.get_mut(&job.author)?;
-        if b.token != job.token || now < b.reported_until {
+        if b.token != job.token {
+            return None;
+        }
+        // A verified hit owns the window. A blocked-analysis notice does not, so an
+        // in-flight job that later proves the same posts can still report the match.
+        if now < b.reported_until && !b.blocked_notice {
             return None;
         }
         // Every participating observation must still be the same live post.
@@ -711,16 +719,27 @@ impl Detector {
             }
         }
         let posts: Vec<_> = b.posts.iter().filter(|p| live(p, policy, now)).collect();
-        let report = if failed {
-            Report::Unverified
-        } else {
-            match common_images(&posts, policy, self.limits.comparison_steps) {
-                Ok(Some(matched)) => Report::Verified(matched),
-                Ok(None) => return None,
-                Err(()) => Report::Unverified,
-            }
+        let compared = common_images(&posts, policy, self.limits.comparison_steps);
+        // Hashes that already prove the common set win over a download or budget failure
+        // on some other file. The failure notice is used only when no match was proven.
+        let report = match compared {
+            Ok(Some(matched)) => Report::Verified(matched),
+            Ok(None) if !failed => return None,
+            Ok(None) | Err(()) => Report::Unverified,
         };
-        b.reported_until = now + Duration::from_secs(policy.window_secs);
+        match &report {
+            Report::Verified(_) => {
+                b.blocked_notice = false;
+                b.reported_until = now + Duration::from_secs(policy.window_secs);
+            }
+            Report::Unverified => {
+                if b.blocked_notice && now < b.reported_until {
+                    return None;
+                }
+                b.blocked_notice = true;
+                b.reported_until = now + Duration::from_secs(policy.window_secs);
+            }
+        }
         Some(report)
     }
     fn abort_report_window(
@@ -1383,10 +1402,7 @@ async fn run_job(
                     messages: messages.clone(),
                     excerpts,
                     attachments,
-                    reason: format!(
-                        "Verified identical image bytes: at least {} common distinct images across {} channels in {}",
-                        policy.min_attachments, policy.min_channels, crate::templates::format_duration(policy.window_secs)
-                    ),
+                    reason: verified_reason(&policy),
                 },
             )
             .await;
@@ -1408,40 +1424,60 @@ fn format_hashes(hashes: &[Hash]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+fn verified_reason(policy: &Policy) -> String {
+    format!(
+        "Verified identical image bytes: at least {} common distinct images across {} channels in {}",
+        policy.min_attachments,
+        policy.min_channels,
+        crate::templates::format_duration(policy.window_secs)
+    )
+}
+/// Safe automod evidence: message locations and proving hashes. Never image bytes or URLs.
+pub(crate) fn image_notice_evidence(messages: &[(u64, u64)], proving: &[Hash]) -> String {
+    let locations = messages
+        .iter()
+        .map(|(channel, message)| format!("channel {channel}, message {message}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut hashes = proving.to_vec();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let hashes = format_hashes(&hashes);
+    if hashes.is_empty() {
+        locations
+    } else if locations.is_empty() {
+        format!("sha256 {hashes}")
+    } else {
+        format!("sha256 {hashes}; {locations}")
+    }
+}
 fn report_vars(
     report: Report,
     author: u64,
     channel: u64,
     policy: &Policy,
 ) -> BTreeMap<String, String> {
-    let (reason, content) = match report {
+    let (rule, action, reason, content) = match report {
         Report::Verified(image_match) => (
-            format!(
-                "Verified identical image bytes: at least {} common distinct images across {} channels in {}",
-                policy.min_attachments,
-                policy.min_channels,
-                crate::templates::format_duration(policy.window_secs)
-            ),
-            image_match
-                .messages
-                .iter()
-                .map(|(c, m)| format!("channel {c}, message {m}"))
-                .collect::<Vec<_>>()
-                .join("; "),
+            "Exact image spam test".to_string(),
+            "log only; no punishment".to_string(),
+            verified_reason(policy),
+            image_notice_evidence(&image_match.messages, &image_match.proving),
         ),
         Report::Unverified => (
-            "Unverified image candidate: download or work budget unavailable; no match established"
-                .into(),
+            "Exact image spam".to_string(),
+            "not a spam hit".to_string(),
+            "Download or work budget unavailable; image analysis did not finish. No spam match was established and no spam action was taken.".to_string(),
             String::new(),
         ),
     };
     BTreeMap::from([
-        ("rule".into(), "Exact image spam test".into()),
+        ("rule".into(), rule),
         ("mention".into(), format!("<@{author}>")),
         ("user_id".into(), author.to_string()),
         ("source_channel_id".into(), channel.to_string()),
         ("channel".into(), format!("<#{}>", channel)),
-        ("action".into(), "log only; no punishment".into()),
+        ("action".into(), action),
         ("reason".into(), reason),
         ("content".into(), content),
     ])
@@ -2116,16 +2152,21 @@ mod tests {
     fn reports_are_throttled_and_failures_never_claim_a_match() {
         let now = Instant::now();
         let d = Detector::new(Limits::default()).unwrap();
-        let j = job(&d, now);
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+            post.file_hashes = None;
+        }
         assert_eq!(
-            d.complete(j, &policy(), true, now),
+            d.complete(pending, &policy(), true, now),
             Some(Report::Unverified)
         );
         assert!(admit(&d, 13, 103, now).is_none());
         let vars = report_vars(Report::Unverified, 2, 100, &policy());
-        assert!(vars["action"].contains("no punishment"));
+        assert!(vars["action"].contains("not a spam hit"));
+        assert!(!vars["action"].contains("log only"));
         assert!(vars["content"].is_empty());
-        assert!(vars["reason"].contains("no match established"));
+        assert!(vars["reason"].contains("No spam match was established"));
     }
     #[test]
     fn rate_and_memory_caps_fail_closed_without_reset_on_settings_change() {
@@ -2239,5 +2280,208 @@ mod tests {
         rule.whitelist_roles.push(9);
         assert!(!may_admit(&rule, 1, 2, None));
         assert!(may_admit(&rule, 1, 2, Some(&[])));
+    }
+
+    fn automod_notice(vars: &BTreeMap<String, String>) -> String {
+        let template = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "automod")
+            .map(|(_, template)| template)
+            .expect("automod template");
+        crate::templates::render(template, vars)
+    }
+
+    fn automod_notice_bounded(vars: &BTreeMap<String, String>) -> String {
+        let template = crate::defaults::default_templates()
+            .into_iter()
+            .find(|(event, _)| *event == "automod")
+            .map(|(_, template)| template)
+            .expect("automod template");
+        let mut vars = vars.clone();
+        crate::logging::bound_automod_content_var(template, &mut vars, 2000);
+        crate::templates::render_bounded(template, &vars, 2000)
+    }
+
+    #[test]
+    fn proven_hashes_keep_a_match_reason_and_evidence_when_download_is_marked_failed() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let Report::Verified(image_match) = d
+            .complete(job(&d, now), &policy(), true, now)
+            .expect("a hash-proven match is a hit")
+        else {
+            panic!("download failure must not replace a proven match with an unverified notice");
+        };
+        let vars = report_vars(Report::Verified(image_match), 2, 100, &policy());
+        let notice = automod_notice(&vars);
+        assert!(
+            notice.contains("Verified identical image bytes"),
+            "{notice}"
+        );
+        assert!(!notice.contains("no match established"), "{notice}");
+        assert!(!notice.contains("budget"), "{notice}");
+        assert!(
+            notice.contains("**Evidence:**") && notice.contains("sha256"),
+            "{notice}"
+        );
+        assert!(!notice.contains("http"), "{notice}");
+        assert!(vars["action"].contains("log only"));
+    }
+
+    #[test]
+    fn blocked_download_is_not_a_successful_spam_hit() {
+        let now = Instant::now();
+        let d = Detector::new(Limits::default()).unwrap();
+        let mut pending = job(&d, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+            post.file_hashes = None;
+        }
+        let report = d
+            .complete(pending, &policy(), true, now)
+            .expect("a blocked analysis still explains itself");
+        let vars = report_vars(report, 2, 100, &policy());
+        let notice = automod_notice(&vars);
+        assert!(vars["action"].contains("not a spam hit"), "{notice}");
+        assert!(!vars["action"].contains("log only"), "{notice}");
+        assert!(notice.contains("did not finish"), "{notice}");
+        assert!(notice.contains("budget"), "{notice}");
+        assert!(
+            !notice.contains("Verified identical image bytes"),
+            "{notice}"
+        );
+        assert!(vars["content"].is_empty(), "{notice}");
+        assert!(admit(&d, 13, 103, now).is_none());
+    }
+
+    #[test]
+    fn comparison_budget_block_is_not_a_spam_hit() {
+        let now = Instant::now();
+        let detector = Detector::new(Limits {
+            comparison_steps: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert_eq!(
+            detector.complete(job(&detector, now), &policy(), false, now),
+            Some(Report::Unverified)
+        );
+        let vars = report_vars(Report::Unverified, 2, 100, &policy());
+        let notice = automod_notice(&vars);
+        assert!(vars["action"].contains("not a spam hit"), "{notice}");
+        assert!(vars["content"].is_empty(), "{notice}");
+        assert!(notice.contains("work budget"), "{notice}");
+        assert!(
+            !notice.contains("Verified identical image bytes"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn large_enforcement_notice_keeps_full_proving_hashes_within_budget() {
+        let snowflake = |n: u64| 1_000_000_000_000_000_000u64 + n;
+        let messages: Vec<_> = (0..16)
+            .map(|i| (snowflake(i * 2), snowflake(i * 2 + 1)))
+            .collect();
+        let proving = vec![[0xab_u8; 32]];
+        let hash_hex = proving[0]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let evidence = super::image_notice_evidence(&messages, &proving);
+        let delete_notes = messages
+            .iter()
+            .map(|(channel, message)| format!("{channel}/{message} Succeeded"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let content = format!("{evidence}; {delete_notes}");
+        let policy = policy();
+        let vars = BTreeMap::from([
+            ("rule".into(), "Exact image spam".into()),
+            ("mention".into(), format!("<@{}>", snowflake(99))),
+            ("user_id".into(), snowflake(99).to_string()),
+            ("source_channel_id".into(), snowflake(0).to_string()),
+            ("channel".into(), format!("<#{}>", snowflake(0))),
+            (
+                "action".into(),
+                "delete matched messages; ban Succeeded".into(),
+            ),
+            ("reason".into(), verified_reason(&policy)),
+            ("content".into(), content),
+            ("time".into(), "2026-10-09T00:00:00+00:00".into()),
+        ]);
+        let notice = automod_notice_bounded(&vars);
+        assert!(
+            notice.contains(&hash_hex),
+            "expected full sha256 digest in notice: {notice}"
+        );
+        assert!(
+            notice.contains("sha256"),
+            "expected hash marker in notice: {notice}"
+        );
+        assert!(
+            notice.encode_utf16().count() <= 2000,
+            "notice exceeded Discord budget: {}",
+            notice.encode_utf16().count()
+        );
+        assert!(
+            !notice.ends_with('…') || notice.contains(&hash_hex),
+            "truncation must not drop proving hashes: {notice}"
+        );
+    }
+
+    #[test]
+    fn in_flight_proven_match_replaces_a_blocked_notice_window() {
+        let now = Instant::now();
+        let detector = Detector::new(Limits::default()).unwrap();
+        let mut pending = job(&detector, now);
+        for post in &mut pending.posts {
+            post.hashes = None;
+            post.file_hashes = None;
+        }
+        assert_eq!(
+            detector.complete(pending, &policy(), true, now),
+            Some(Report::Unverified)
+        );
+        let mut posts = detector.state.lock().guilds[&1].authors[&2].posts.clone();
+        for post in &mut posts {
+            post.hashes = Some(vec![[1; 32], [2; 32]]);
+            post.file_hashes = Some(vec![[1; 32], [2; 32]]);
+        }
+        let Report::Verified(image_match) = detector
+            .complete(
+                Job {
+                    guild: 1,
+                    author: 2,
+                    token: (0, 0),
+                    posts,
+                },
+                &policy(),
+                false,
+                now,
+            )
+            .expect("in-flight hashes prove the match")
+        else {
+            panic!("a blocked window must not hide a later proven match");
+        };
+        let vars = report_vars(Report::Verified(image_match), 2, 100, &policy());
+        assert!(vars["reason"].contains("Verified identical image bytes"));
+        assert!(vars["content"].contains("sha256"));
+        assert!(!vars["reason"].contains("budget"));
+        let posts = detector.state.lock().guilds[&1].authors[&2].posts.clone();
+        assert_eq!(
+            detector.complete(
+                Job {
+                    guild: 1,
+                    author: 2,
+                    token: (0, 0),
+                    posts,
+                },
+                &policy(),
+                true,
+                now,
+            ),
+            None
+        );
     }
 }
