@@ -1183,7 +1183,7 @@ fn evidence_retry_cap() -> std::time::Duration {
         let ms = EVIDENCE_RETRY_CAP_MS
             .load(std::sync::atomic::Ordering::Relaxed)
             .clamp(1, 60_000);
-        return std::time::Duration::from_millis(ms);
+        std::time::Duration::from_millis(ms)
     }
     #[cfg(not(test))]
     {

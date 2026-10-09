@@ -354,6 +354,8 @@ pub enum SlashResyncPlan {
     Sync { guilds: Vec<u64>, invalidate: bool },
 }
 
+type ControlActorLookup = dyn Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync;
+
 /// Discord runtime state has no dashboard OAuth client.
 /// ```compile_fail
 /// fn dashboard(state: &jmodguard_bot::state::BotState) {
@@ -415,9 +417,7 @@ pub struct BotState {
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
     /// Test seam. Production reads [`Self::discord_cache`] instead.
-    control_actor_lookup: Mutex<
-        Option<Arc<dyn Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync>>,
-    >,
+    control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
 }
 
