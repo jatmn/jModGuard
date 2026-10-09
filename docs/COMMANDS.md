@@ -30,7 +30,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
 | `!about` | Utility | everyone | Bot info |
-| `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, and bot/API/WebUI release state (alias: `!status`) |
+| `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
 
 Slash equivalents exist for the mod/admin commands (`/ban`, `/kick`, `/timeout`,
 `/warn`, `/warns`, `/warnclear`, `/purge`, `/say`, `/slowmode`, `/unban`,
@@ -110,7 +110,15 @@ days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
 rounded down to whole seconds; a newly started process shows `0s`. Release
 availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source matches
 but the image digest is unverified, ❓ unknown. A component with no cached
-release row is `❓` and has no SHA or age. Prefix `!status`
+release row is `❓` and has no SHA or age. Container use is this bot
+process's own cgroup. Memory is real program use (`memory.current` minus
+`inactive_file`) shown against `memory.max` (`max` means no limit). CPU is the
+latest background sample. `!status` does not wait for one; until a sample
+exists that row is `unavailable`. The API CPU and memory rows stay
+`unavailable` until a private reading is supplied. A missing reading is
+`unavailable`, never `0`.
+
+Prefix `!status`
 uses the same stats command, permissions and response; the slash name remains
 `/stats`. On upgrade, untouched saved stats definitions gain the alias once.
 Customized definitions remain unchanged; add `status` in the Commands editor if

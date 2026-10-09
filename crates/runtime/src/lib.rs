@@ -1,5 +1,6 @@
 //! Shared process utilities. No application state, database, Discord or provider client.
 
+pub mod cgroup;
 pub mod health;
 
 /// The launcher uses this separate signal after database/bootstrap work has

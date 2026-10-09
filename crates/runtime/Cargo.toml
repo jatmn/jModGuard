@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Small shared process lifecycle and health utilities for jModGuard"
+description = "Small shared process lifecycle, health, and cgroup usage utilities for jModGuard"
 
 [dependencies]
 anyhow = "1"

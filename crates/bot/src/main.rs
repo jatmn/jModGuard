@@ -120,6 +120,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    jmodguard::cgroup::spawn_container_usage_sampler();
+
     let db = tokio::select! {
         db = jmodguard_bot::startup::open_database(&cfg) => db.with_context(|| {
             if cfg.is_remote_db() {

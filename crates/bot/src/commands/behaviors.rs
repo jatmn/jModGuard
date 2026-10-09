@@ -700,18 +700,25 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
 // ---------------------------------------------------------------------------
 
 async fn stats_response(db: &db::Db, guild_id: i64, uptime_seconds: u64) -> Result<String> {
+    // Cached by the background sampler. This does not open cgroup files or wait.
+    let bot_use = jmodguard::cgroup::latest_container_sample();
     let s = db::guild_stats(db, guild_id).await?;
     let updates = db::component_updates(db)
         .await
         .inspect_err(|error| tracing::warn!("release-status lookup failed: {error:#}"))
         .ok();
-    Ok(crate::templates::stats_response_with_update_availability(
-        uptime_seconds,
-        s.events,
-        s.warns,
-        s.bans,
-        updates.as_deref(),
-        chrono::Utc::now().timestamp(),
+    Ok(crate::templates::stats_with_container_use(
+        crate::templates::stats_response_with_update_availability(
+            uptime_seconds,
+            s.events,
+            s.warns,
+            s.bans,
+            updates.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ),
+        &bot_use,
+        // API numbers stay unavailable until a private reading can be passed here.
+        None,
     ))
 }
 
@@ -1213,6 +1220,11 @@ mod tests {
         }).await.unwrap();
         let healthy = stats_response(&db, 10, 20).await.unwrap();
         assert!(healthy.contains("**⚠️ Warns:** `1`"), "{healthy}");
+        assert!(healthy.contains("**Bot CPU:** `unavailable`"), "{healthy}");
+        assert!(
+            healthy.contains("**API memory (real program use):** `unavailable`"),
+            "{healthy}"
+        );
         for component in ["bot", "api", "webui"] {
             assert!(
                 healthy.contains(&format!("**{component}:** ❓")),
@@ -1236,8 +1248,44 @@ mod tests {
             unavailable.contains("**⏱️ Uptime:** `20s`"),
             "{unavailable}"
         );
+        assert!(
+            unavailable.contains("**Bot CPU:** `unavailable`"),
+            "{unavailable}"
+        );
+        assert!(
+            unavailable.contains("**Bot memory (real program use):** `unavailable`"),
+            "{unavailable}"
+        );
+        assert!(
+            unavailable.contains("**API CPU:** `unavailable`"),
+            "{unavailable}"
+        );
+        assert!(!unavailable.contains("0.0%"), "{unavailable}");
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn status_does_not_wait_for_a_cpu_sample() {
+        let started = std::time::Instant::now();
+        let text = crate::templates::stats_with_container_use(
+            "stats".into(),
+            &jmodguard::cgroup::latest_container_sample(),
+            None,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**Bot memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        assert!(
+            text.contains("**API memory (real program use):** `unavailable`"),
+            "{text}"
+        );
+        assert!(!text.contains("0.0%"), "{text}");
+        assert!(!text.contains("0 B"), "{text}");
     }
 
     #[test]
