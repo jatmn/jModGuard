@@ -413,8 +413,7 @@ mod tests {
     fn matching_control_secret_seals_and_opens() {
         let key = load_writer_key(&fixture_secret()).unwrap();
         let frame = seal(&key, &sample_op(), 4).unwrap();
-        let (op, actor) =
-            open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        let (op, actor) = open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 4);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
     }
@@ -441,8 +440,7 @@ mod tests {
         assert_ne!(left.as_slice(), token_a.as_bytes());
         assert_ne!(right.as_slice(), token_b.as_bytes());
         let frame = seal(&left, &sample_op(), 0).unwrap();
-        let (op, actor) =
-            open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        let (op, actor) = open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
         assert_eq!(actor, 0);
         assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { .. }));
         assert!(

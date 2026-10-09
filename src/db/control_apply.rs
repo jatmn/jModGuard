@@ -277,9 +277,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::DeleteTemplate { target, .. }
         | ControlOp::PutLogFilter { target, .. } => scope_actor_need(target),
         ControlOp::CopyGuildConfig { destination, .. } => scope_actor_need(destination),
-        ControlOp::AppendCaseNote { scope, .. } => {
-            ControlActorNeed::ManageGuild(scope.guild_id)
-        }
+        ControlOp::AppendCaseNote { scope, .. } => ControlActorNeed::ManageGuild(scope.guild_id),
         ControlOp::RemoveCase { scope, .. }
         | ControlOp::SetCaseDeleteRoles { scope, .. }
         | ControlOp::CleanupEvidence { scope } => ControlActorNeed::GuildAdmin(scope.guild_id),
@@ -387,9 +385,11 @@ pub async fn apply_control(
 }
 
 fn lease_rejected(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>().is_some())
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
+            .is_some()
+    })
 }
 
 async fn apply_control_inner(
@@ -854,7 +854,9 @@ mod tests {
         assert!(decide_control_actor(ControlActorNeed::Owner, 4, 9, None).is_err());
         assert!(decide_control_actor(ControlActorNeed::Owner, 9, 9, None).is_ok());
         assert!(decide_control_actor(ControlActorNeed::Owner, 9, 0, None).is_err());
-        assert!(decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(allowed)).is_err());
+        assert!(
+            decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(allowed)).is_err()
+        );
         let admin = CachedGuildActor {
             guild_owner_id: 1,
             permissions: ADMINISTRATOR_BIT,
@@ -865,10 +867,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_commit_rejects_foreign_or_expired_lease() {
-        let path = std::env::temp_dir().join(format!(
-            "control_lease_{:032x}.db",
-            rand::random::<u128>()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("control_lease_{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
         let owner = "a".repeat(32);
         let other = "b".repeat(32);

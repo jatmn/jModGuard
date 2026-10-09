@@ -107,16 +107,17 @@ pub async fn write_shared_config(cfg: ApiProcessConfig) -> Result<()> {
         .commit_actor(
             1,
             db::ControlOp::PatchSettings {
-            scope: db::ScopeWire {
-                global: false,
-                guild_id,
-                enrollment_id: scope_id.trim().to_owned(),
-                joined_at_ns: 1,
+                scope: db::ScopeWire {
+                    global: false,
+                    guild_id,
+                    enrollment_id: scope_id.trim().to_owned(),
+                    joined_at_ns: 1,
+                },
+                prefix: db::FieldPatch::Set(prefix),
+                bot_name: db::FieldPatch::Absent,
+                reconcile: false,
             },
-            prefix: db::FieldPatch::Set(prefix),
-            bot_name: db::FieldPatch::Absent,
-            reconcile: false,
-        })
+        )
         .await?;
     // The marker is the bot's write result. A following read on this process
     // can miss that commit on a replica.

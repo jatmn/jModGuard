@@ -187,7 +187,9 @@ mod tests {
             }
         };
         assert!(!applied);
-        assert!(matches!(reply, ControlReply::Failed { message } if message == "actor is not allowed"));
+        assert!(
+            matches!(reply, ControlReply::Failed { message } if message == "actor is not allowed")
+        );
         let mut applied = false;
         let reply = match reject_unauthorized_control(Ok(())) {
             Some(reply) => reply,

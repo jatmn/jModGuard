@@ -115,17 +115,20 @@ async fn smoke_dual_process_config_sync() {
             .unwrap()
             .unwrap();
         let reply = api
-            .commit_actor(1, db::ControlOp::PatchSettings {
-                scope: db::ScopeWire {
-                    global: false,
-                    guild_id: guild_id as i64,
-                    enrollment_id: enrollment.id,
-                    joined_at_ns: 1,
+            .commit_actor(
+                1,
+                db::ControlOp::PatchSettings {
+                    scope: db::ScopeWire {
+                        global: false,
+                        guild_id: guild_id as i64,
+                        enrollment_id: enrollment.id,
+                        joined_at_ns: 1,
+                    },
+                    prefix: db::FieldPatch::Set("!from-api".into()),
+                    bot_name: db::FieldPatch::Absent,
+                    reconcile: false,
                 },
-                prefix: db::FieldPatch::Set("!from-api".into()),
-                bot_name: db::FieldPatch::Absent,
-                reconcile: false,
-            })
+            )
             .await
             .unwrap();
         assert!(matches!(reply, db::ControlReply::Saved { .. }));

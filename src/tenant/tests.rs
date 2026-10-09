@@ -1875,13 +1875,23 @@ async fn case_control_rejects_replaced_enrollment() {
         "{error:#}"
     );
     let (store, scope) = f.tenant.live(next).await.unwrap();
-    assert_eq!(store.case_count(scope, case_limits()).await.unwrap(), before);
+    assert_eq!(
+        store.case_count(scope, case_limits()).await.unwrap(),
+        before
+    );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn read_only_evidence_retries_until_storage_id_appears() {
     set_evidence_retry_cap_for_test(20);
+    struct RestoreCap;
+    impl Drop for RestoreCap {
+        fn drop(&mut self) {
+            set_evidence_retry_cap_for_test(60_000);
+        }
+    }
+    let _restore_cap = RestoreCap;
     let path = std::env::temp_dir().join(format!(
         "jmodguard_evidence_retry_{:032x}.db",
         rand::random::<u128>()

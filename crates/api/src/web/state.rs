@@ -128,7 +128,11 @@ impl ApiState {
         self.commit_actor(0, op).await
     }
 
-    pub async fn commit_actor(&self, actor_user_id: i64, op: db::ControlOp) -> Result<db::ControlReply> {
+    pub async fn commit_actor(
+        &self,
+        actor_user_id: i64,
+        op: db::ControlOp,
+    ) -> Result<db::ControlReply> {
         if self.db.is_read_only() {
             if let Some(message) = &self.writer_error {
                 anyhow::bail!("{message}");

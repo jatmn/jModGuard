@@ -112,17 +112,20 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
         "!revoked"
     );
     let reply = app
-        .commit_actor(7, db::ControlOp::PatchSettings {
-            scope: db::ScopeWire {
-                global: false,
-                guild_id: 55_555,
-                enrollment_id: enrollment.id,
-                joined_at_ns: 1,
+        .commit_actor(
+            7,
+            db::ControlOp::PatchSettings {
+                scope: db::ScopeWire {
+                    global: false,
+                    guild_id: 55_555,
+                    enrollment_id: enrollment.id,
+                    joined_at_ns: 1,
+                },
+                prefix: db::FieldPatch::Set("!saved".into()),
+                bot_name: db::FieldPatch::Absent,
+                reconcile: false,
             },
-            prefix: db::FieldPatch::Set("!saved".into()),
-            bot_name: db::FieldPatch::Absent,
-            reconcile: false,
-        })
+        )
         .await
         .unwrap();
     assert!(matches!(reply, db::ControlReply::Saved { .. }));

@@ -104,13 +104,13 @@ async fn check(
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
     let owner = recovery_value(state.control.acquire_pair_check(now))
-    .await
-    .map_err(|e| {
-        problem(
-            StatusCode::CONFLICT,
-            format!("matching pair unavailable: {e:#}"),
-        )
-    })?;
+        .await
+        .map_err(|e| {
+            problem(
+                StatusCode::CONFLICT,
+                format!("matching pair unavailable: {e:#}"),
+            )
+        })?;
     let result = async {
         let registry = jmodguard_updater::oci::Registry::ghcr()?;
         let bot = registry.discover("bot", &input.channel).await?;
@@ -129,9 +129,7 @@ async fn check(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = recovery_value(state.control.release_pair_check(&owner))
-    .await
-    {
+    if let Err(error) = recovery_value(state.control.release_pair_check(&owner)).await {
         tracing::warn!("paired check lease release failed: {error:#}");
     }
     result.map_err(|e| {
@@ -165,11 +163,12 @@ async fn apply(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    let operation = recovery_value(
-        state
-            .control
-            .request_upgrade(&input.bot_digest, &input.api_digest, input.recover, now),
-    )
+    let operation = recovery_value(state.control.request_upgrade(
+        &input.bot_digest,
+        &input.api_digest,
+        input.recover,
+        now,
+    ))
     .await
     .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(Json(json!({"operation":operation})))
@@ -187,8 +186,8 @@ async fn cancel(
 ) -> Reply {
     mutation(&state, &session, &headers).await?;
     recovery_value(state.control.abort_upgrade(&input.id))
-    .await
-    .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
+        .await
+        .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
     status(State(state), session).await
 }
 
@@ -219,7 +218,9 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
             let opts = opts.clone();
             match tokio::task::spawn_blocking(move || UpdateControl::open(&opts)).await? {
                 Ok(Some(control)) => break Ok::<_, anyhow::Error>(Some(control)),
-                Ok(None) => tracing::warn!("maintenance update control is not ready: database is empty"),
+                Ok(None) => {
+                    tracing::warn!("maintenance update control is not ready: database is empty")
+                }
                 Err(error) => {
                     return Err(anyhow::anyhow!(
                         "maintenance update control could not be opened writable: {error:#}"
@@ -476,9 +477,7 @@ mod tests {
                     .header("cookie", &owner_cookie)
                     .header("origin", "https://api.example.test")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"id": upgrade_id}).to_string(),
-                    ))
+                    .body(Body::from(json!({"id": upgrade_id}).to_string()))
                     .unwrap(),
             )
             .await

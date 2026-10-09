@@ -361,11 +361,7 @@ impl TenantRuntime {
                         && core.is_read_only()
                         && matches!(*slot.read(), EvidenceBackend::None)
                     {
-                        start_evidence_id_retry(
-                            core.clone(),
-                            evidence.clone(),
-                            Arc::clone(&slot),
-                        );
+                        start_evidence_id_retry(core.clone(), evidence.clone(), Arc::clone(&slot));
                     }
                     slot
                 },

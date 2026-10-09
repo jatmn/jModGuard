@@ -188,12 +188,12 @@ pub async fn add_note(
         .commit_json_actor(
             actor,
             crate::db::ControlOp::AppendCaseNote {
-            scope,
-            case_id: case_id.clone(),
-            entry_id: body.entry_id.clone(),
-            actor_id: (actor > 0).then_some(actor),
-            text: text.to_owned(),
-        },
+                scope,
+                case_id: case_id.clone(),
+                entry_id: body.entry_id.clone(),
+                actor_id: (actor > 0).then_some(actor),
+                text: text.to_owned(),
+            },
         )
         .await?;
     let recorded: String = serde_json::from_value(recorded_body)?;
@@ -216,10 +216,7 @@ pub async fn delete_case(
     let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
     let _ = live(&app, enrollment).await?;
     let (_, body) = app
-        .commit_json_actor(
-            actor,
-            crate::db::ControlOp::RemoveCase { scope, case_id },
-        )
+        .commit_json_actor(actor, crate::db::ControlOp::RemoveCase { scope, case_id })
         .await?;
     Ok(Json(body))
 }
@@ -317,10 +314,10 @@ pub async fn put_case_delete_roles(
         .commit_json_actor(
             actor,
             crate::db::ControlOp::SetCaseDeleteRoles {
-            scope,
-            revision: body.revision,
-            roles,
-        },
+                scope,
+                revision: body.revision,
+                roles,
+            },
         )
         .await
         .map_err(ApiError::from)?;

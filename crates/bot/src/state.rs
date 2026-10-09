@@ -558,7 +558,9 @@ fn cached_actor_from_discord(
             permissions: 0,
         });
     }
-    let member = guild.members.get(&serenity::model::id::UserId::new(actor_user_id as u64))?;
+    let member = guild
+        .members
+        .get(&serenity::model::id::UserId::new(actor_user_id as u64))?;
     let permissions = guild.member_permissions(member);
     let mut bits = 0u64;
     if permissions.administrator() {
