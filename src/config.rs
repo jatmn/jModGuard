@@ -73,15 +73,9 @@ pub struct BotConfig {
 }
 
 /// Dedicated writer-link secret. Debug output never includes the value.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub struct ControlSecret(String);
-
-impl Default for ControlSecret {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 impl std::fmt::Debug for ControlSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
