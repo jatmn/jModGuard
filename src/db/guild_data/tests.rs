@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::guild_stores::*;
+use crate::db_compat::OptionalExtension;
 
 struct Fixture {
     catalog: Db,
@@ -85,8 +86,8 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
         assert_eq!(
             count,
-            25,
-            "store contains tenant tables, transient snapshots, member-directory tables, and the local write fence"
+            26,
+            "store contains tenant tables, transient snapshots, member-directory tables, the local write fence, and the writer epoch"
         );
         Ok(())
     }).await.unwrap();
@@ -475,6 +476,7 @@ async fn guild_mutation_commit_rechecks_the_core_lease() {
         .await
         .unwrap()
     );
+    raise_held(&store, &f.catalog).await;
     store.bind_initial_placement(live.clone()).await.unwrap();
     store.verify_placement(live).await.unwrap();
 
@@ -599,6 +601,7 @@ async fn slow_guild_commit_still_lets_the_same_owner_renew() {
         .await
         .unwrap()
     );
+    raise_held(&store, &f.catalog).await;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     f.catalog.arm_during_leased_guild_commit(move || {
         let _ = ready_tx.send(());
@@ -651,6 +654,7 @@ async fn guild_commit_stays_ok_when_only_core_cleanup_fails() {
         .await
         .unwrap()
     );
+    raise_held(&store, &f.catalog).await;
     f.catalog.arm_lease_cleanup_failure();
     store
         .bind_initial_placement(placement.clone())
@@ -659,12 +663,199 @@ async fn guild_commit_stays_ok_when_only_core_cleanup_fails() {
     store.verify_placement(placement).await.unwrap();
 }
 
+#[tokio::test]
+async fn replacement_epoch_rejects_a_stale_guild_commit() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 31).await;
+    let old_core = Db::open(&f.catalog_path, 2).unwrap();
+    let new_core = Db::open(&f.catalog_path, 2).unwrap();
+    let old_store = GuildDataStore::initialize(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(old_core.clone());
+    let new_store = GuildDataStore::open(f.options(), reg.clone())
+        .unwrap()
+        .with_core_write_fence(new_core.clone());
+    let old_owner = "ab".repeat(16);
+    let new_owner = "cd".repeat(16);
+    let now = crate::control::now_ms();
+    let refuse = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(&old_core, &old_owner, now, refuse())
+            .await
+            .unwrap()
+    );
+    raise_held(&old_store, &old_core).await;
+    assert!(
+        claim_active_bot(&new_core, &new_owner, now.saturating_add(21_000), refuse(),)
+            .await
+            .unwrap()
+    );
+    raise_held(&new_store, &new_core).await;
+    assert_eq!(epoch_generation(&new_store).await, 2);
+    // BEGIN IMMEDIATE already holds the guild writer lock when the core
+    // re-read hooks run, so the replacement cannot raise until that
+    // transaction ends. Start the stale commit after the raise, and put the
+    // lease row back so the core re-read passes and the epoch rejects it.
+    write_core_lease(
+        &old_core,
+        Some(format!(
+            "{old_owner} {}",
+            crate::control::now_ms().saturating_add(60_000)
+        )),
+    )
+    .await;
+    let error = old_store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains("active bot lease")),
+        "{error:#}"
+    );
+    assert!(matches!(
+        old_store
+            .verify_placement(placement.clone())
+            .await
+            .unwrap_err()
+            .downcast_ref::<StoreCheckError>(),
+        Some(StoreCheckError::Unbound)
+    ));
+    write_core_lease(
+        &new_core,
+        Some(format!(
+            "{new_owner} {}",
+            crate::control::now_ms().saturating_add(60_000)
+        )),
+    )
+    .await;
+    new_store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    new_store.verify_placement(placement).await.unwrap();
+}
+
+#[tokio::test]
+async fn older_epoch_raise_does_not_lower_the_stored_generation() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg)
+        .unwrap()
+        .with_core_write_fence(f.catalog.clone());
+    let now = crate::control::now_ms();
+    let refuse = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(&f.catalog, &"ab".repeat(16), now, refuse())
+            .await
+            .unwrap()
+    );
+    raise_held(&store, &f.catalog).await;
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &"cd".repeat(16),
+            now.saturating_add(21_000),
+            refuse(),
+        )
+        .await
+        .unwrap()
+    );
+    raise_held(&store, &f.catalog).await;
+    assert_eq!(epoch_generation(&store).await, 2);
+    let error = store.raise_writer_epoch(1).await.unwrap_err();
+    assert!(lease_rejected(&error), "{error:#}");
+    assert_eq!(epoch_generation(&store).await, 2);
+}
+
+#[tokio::test]
+async fn renewal_keeps_the_generation_and_a_fresh_claim_increments_it() {
+    let f = Fixture::new();
+    let owner = "ab".repeat(16);
+    let now = crate::control::now_ms();
+    let refuse = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    assert!(
+        claim_active_bot(&f.catalog, &owner, now, refuse())
+            .await
+            .unwrap()
+    );
+    assert_eq!(f.catalog.leased_generation(), Some(1));
+    assert_eq!(stored_generation(&f.catalog).await, 1);
+    assert!(
+        claim_active_bot(&f.catalog, &owner, now.saturating_add(1_000), refuse())
+            .await
+            .unwrap()
+    );
+    assert_eq!(f.catalog.leased_generation(), Some(1));
+    assert_eq!(stored_generation(&f.catalog).await, 1);
+    assert!(
+        claim_active_bot(
+            &f.catalog,
+            &"cd".repeat(16),
+            now.saturating_add(21_000),
+            refuse(),
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(f.catalog.leased_generation(), Some(2));
+    assert_eq!(stored_generation(&f.catalog).await, 2);
+}
+
+async fn raise_held(store: &GuildDataStore, catalog: &Db) {
+    store
+        .raise_writer_epoch(
+            catalog
+                .leased_generation()
+                .expect("claim arms a generation"),
+        )
+        .await
+        .unwrap();
+}
+
 fn lease_rejected(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>()
             .is_some()
     })
+}
+
+async fn epoch_generation(store: &GuildDataStore) -> i64 {
+    store
+        .db
+        .with_conn(|conn| {
+            let tx = conn.transaction_primary_snapshot()?;
+            let value: Option<i64> = tx
+                .query_row(
+                    "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+                .optional()?;
+            tx.finish_read()?;
+            Ok(value.unwrap_or(0))
+        })
+        .await
+        .unwrap()
+}
+
+async fn stored_generation(db: &Db) -> i64 {
+    db.with_conn(|conn| {
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='active_bot_generation'",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        Ok(value.as_deref().unwrap_or("0").parse::<i64>().unwrap_or(0))
+    })
+    .await
+    .unwrap()
 }
 
 async fn write_core_lease(db: &Db, value: Option<String>) {

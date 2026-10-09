@@ -707,6 +707,8 @@ pub struct Connection {
     read_only: bool,
     /// Copied from the pool at checkout. `None` leaves commits unchanged.
     expected_lease_owner: Option<String>,
+    /// Guild-store writer generation snapshotted at checkout. `None` skips the epoch check.
+    expected_writer_generation: Option<i64>,
     /// Bot-launcher fence. Independent of the application writer lease.
     expected_launcher: Option<String>,
     /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
@@ -1082,6 +1084,7 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            expected_writer_generation: None,
             expected_launcher: None,
             commit_lease_probe: None,
         })
@@ -1097,6 +1100,7 @@ impl Connection {
             capacity_limits: CapacityLimits::default(),
             read_only: false,
             expected_lease_owner: None,
+            expected_writer_generation: None,
             expected_launcher: None,
             commit_lease_probe: None,
         })
@@ -1104,6 +1108,10 @@ impl Connection {
 
     pub(crate) fn set_expected_lease_owner(&mut self, owner: Option<String>) {
         self.expected_lease_owner = owner;
+    }
+
+    pub(crate) fn set_expected_writer_generation(&mut self, generation: Option<i64>) {
+        self.expected_writer_generation = generation;
     }
 
     pub(crate) fn set_expected_launcher(&mut self, instance: Option<String>) {
@@ -1277,6 +1285,7 @@ impl Connection {
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
             expected_lease_owner: self.expected_lease_owner.clone(),
+            expected_writer_generation: self.expected_writer_generation,
             expected_launcher: self.expected_launcher.clone(),
             commit_lease_probe: self.commit_lease_probe.clone(),
         }
@@ -1483,6 +1492,7 @@ pub struct Transaction {
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
     expected_lease_owner: Option<String>,
+    expected_writer_generation: Option<i64>,
     expected_launcher: Option<String>,
     commit_lease_probe: Option<CommitLeaseProbe>,
 }
@@ -1885,6 +1895,21 @@ impl Transaction {
         reject_active_bot_lease(value.as_deref(), expected)
     }
 
+    /// The guild transaction already holds its write lock. A mismatch rolls back.
+    fn reject_unless_writer_epoch(&self, generation: i64) -> Result<()> {
+        let stored: Option<i64> = self
+            .query_row(
+                "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        if stored != Some(generation) {
+            return Err(ActiveBotLeaseRejected.into());
+        }
+        Ok(())
+    }
+
     pub fn commit(mut self) -> Result<()> {
         anyhow::ensure!(
             !self.capacity_poisoned.load(Ordering::Acquire),
@@ -1920,9 +1945,12 @@ impl Transaction {
         self.commit_after_lease_probe()
     }
 
-    /// Capacity check and `COMMIT`. A guild lease probe calls this while it
-    /// still holds the core writer lock.
+    /// Capacity check and `COMMIT`. A guild lease probe calls this after the
+    /// short core lease re-read has released the core writer lock.
     fn commit_after_lease_probe(&mut self) -> Result<()> {
+        if let Some(generation) = self.expected_writer_generation {
+            self.reject_unless_writer_epoch(generation)?;
+        }
         if self.capacity_dirty.load(Ordering::Acquire) {
             let actual = crate::capacity::sample(&*self)?;
             let expected = self

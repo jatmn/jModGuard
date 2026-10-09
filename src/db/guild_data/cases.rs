@@ -404,4 +404,122 @@ impl GuildDataStore {
             Ok(removed)
         }).await
     }
+
+    /// Move one Attempted case to a final outcome. An already-final case is left unchanged.
+    pub async fn settle_case_outcome(
+        &self,
+        scope: GuildDataScope,
+        id: CaseId,
+        outcome: CaseOutcome,
+        limits: CaseLimits,
+    ) -> Result<Option<CaseData>> {
+        self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
+        let outcome_sql = outcome_sql(&outcome)?;
+        let expected = self.expected.clone();
+        self.db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            verify_scope(&tx, &expected, &scope, true)?;
+            let payload: Option<String> = tx.query_row(
+                "SELECT payload FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0",
+                params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str()],
+                |row| Ok(row.get(0)?),
+            ).optional()?;
+            let Some(payload) = payload else {
+                tx.finish_read()?;
+                return Ok(None);
+            };
+            let current: CaseData = serde_json::from_str(&payload)?;
+            if current.outcome != CaseOutcome::Attempted {
+                tx.finish_read()?;
+                return Ok(None);
+            }
+            tx.ensure_mutation_receipt()?;
+            tx.execute_rows(
+                "UPDATE guild_cases SET payload=json_set(payload, '$.outcome', ?4)
+                 WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0
+                   AND json_extract(payload, '$.outcome')='attempted'",
+                params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str(), outcome_sql],
+                1,
+            )?;
+            let updated: Option<String> = tx.query_row(
+                "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN payload ELSE NULL END
+                 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0",
+                params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str(), limits.max_record_bytes as i64],
+                |row| Ok(row.get(0)?),
+            ).optional()?;
+            let Some(updated) = updated else {
+                tx.finish_read()?;
+                return Err(CaseError::Limit.into());
+            };
+            let data: CaseData = serde_json::from_str(&updated)?;
+            validate_data(&data, limits)?;
+            anyhow::ensure!(data.outcome == outcome, CaseError::Conflict);
+            tx.commit()?;
+            Ok(Some(data))
+        }).await
+    }
+
+    /// Settle every Attempted application ban for this subject. Already-final cases stay put.
+    pub async fn settle_pending_application_bans(
+        &self,
+        scope: GuildDataScope,
+        subject_id: i64,
+        limits: CaseLimits,
+    ) -> Result<Vec<(CaseId, CaseData)>> {
+        self.check_target(&scope.placement)?;
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
+        anyhow::ensure!(subject_id > 0, CaseError::Invalid);
+        let expected = self.expected.clone();
+        let ids = self
+            .db
+            .with_conn({
+                let scope = scope.clone();
+                let expected = expected.clone();
+                move |conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    verify_scope(&tx, &expected, &scope, true)?;
+                    let mut stmt = tx.prepare(
+                        "SELECT case_id FROM guild_cases
+                     WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0 AND json_valid(payload)
+                       AND json_extract(payload, '$.action')='ban'
+                       AND json_extract(payload, '$.outcome')='attempted'
+                       AND CAST(json_extract(payload, '$.subject_id') AS INTEGER)=?3
+                       AND json_type(payload, '$.source.application') IS NOT NULL
+                     ORDER BY CAST(json_extract(payload, '$.occurred_at_ms') AS INTEGER), case_id",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![scope.guild_id(), scope.enrollment.id.as_str(), subject_id],
+                        |row| Ok(row.get::<String>(0)?),
+                    )?;
+                    let mut ids = Vec::new();
+                    for row in rows {
+                        ids.push(CaseId::try_from(row?)?);
+                    }
+                    drop(stmt);
+                    tx.finish_read()?;
+                    Ok(ids)
+                }
+            })
+            .await?;
+        let mut settled = Vec::new();
+        for id in ids {
+            if let Some(data) = self
+                .settle_case_outcome(scope.clone(), id.clone(), CaseOutcome::Succeeded, limits)
+                .await?
+            {
+                settled.push((id, data));
+            }
+        }
+        Ok(settled)
+    }
+}
+
+fn outcome_sql(outcome: &CaseOutcome) -> Result<&'static str> {
+    match outcome {
+        CaseOutcome::Succeeded => Ok("succeeded"),
+        CaseOutcome::Failed => Ok("failed"),
+        CaseOutcome::Uncertain => Ok("uncertain"),
+        CaseOutcome::Attempted => Err(CaseError::Invalid.into()),
+    }
 }

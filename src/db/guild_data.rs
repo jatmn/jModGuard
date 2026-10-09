@@ -217,7 +217,8 @@ fn verify_identity_version(
             "trigger",
             "guild_member_unresolved_audit_insert guild_member_unresolved_audit_update guild_member_unresolved_audit_delete",
         ),
-        (15, "table", "guild_local_write_fence"),
+        (15, "table", "guild_local_write_fence guild_writer_epoch"),
+        (15, "trigger", "guild_case_settle_retain"),
     ];
     for (version, kind, names) in required {
         if wanted >= *version {
@@ -466,8 +467,11 @@ impl GuildDataStore {
     ///
     /// When the core pool has an armed writer, every guild mutation commit re-reads the core
     /// `active_bot_lease` row under a short writer lock, then commits after that lock is
-    /// released. An empty owner slot does not query and does not change commits.
+    /// released. The guild transaction also requires `guild_writer_epoch` to equal the
+    /// generation snapshotted for that commit. An empty owner slot does not query and does
+    /// not change commits.
     pub fn with_core_write_fence(self, core: Db) -> Self {
+        self.db.follow_writer_generation(&core);
         let probe_core = core.clone();
         self.db
             .install_commit_lease_probe(std::sync::Arc::new(move |commit| {
@@ -479,10 +483,57 @@ impl GuildDataStore {
         }
     }
 
-    /// Re-read the core lease, then release the writer lock before the guild `COMMIT`.
-    /// An empty owner slot does not query. The in-memory fence keeps a commit from
-    /// landing after the lease moves: renewal of the same owner does not wait, and
-    /// release or another claimant waits until this commit finishes.
+    /// Raise this store's epoch to `generation` when the stored value is absent or lower.
+    /// A higher stored value is left unchanged and reported as a lost lease.
+    pub async fn raise_writer_epoch(&self, generation: i64) -> Result<()> {
+        anyhow::ensure!(generation > 0, "active bot generation is corrupt");
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_read()?;
+                let stored: Option<i64> = tx
+                    .query_row(
+                        "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                if stored == Some(generation) {
+                    tx.finish_read()?;
+                    return Ok(());
+                }
+                if stored.is_some_and(|value| value > generation) {
+                    tx.finish_read()?;
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                }
+                tx.ensure_mutation_receipt()?;
+                tx.execute_rows(
+                    "INSERT INTO guild_writer_epoch(singleton, generation) VALUES(1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
+                     WHERE guild_writer_epoch.generation < excluded.generation",
+                    params![generation],
+                    1,
+                )?;
+                let raised: Option<i64> = tx
+                    .query_row(
+                        "SELECT generation FROM guild_writer_epoch WHERE singleton=1",
+                        (),
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                if raised != Some(generation) {
+                    tx.finish_read()?;
+                    return Err(crate::db_compat::ActiveBotLeaseRejected.into());
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Re-read the core lease, then release that writer lock before the guild `COMMIT`.
+    /// An empty owner slot does not query. The guild epoch check inside the guild
+    /// transaction is what rejects a stale holder. Renewal of the same owner does not
+    /// take a new generation and does not wait on the guild commit.
     fn confirm_core_writer_lease(core: &Db, commit: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         let Some(expected) = core.leased_owner() else {
             return commit();
@@ -501,26 +552,8 @@ impl GuildDataStore {
                 let _ = tx.finish_read();
                 return Err(error);
             }
-            let owner = value
-                .as_deref()
-                .and_then(|text| text.split_whitespace().next())
-                .unwrap_or(expected.as_str());
-            core.begin_guild_commit(owner);
-            match tx.finish_read() {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    core.end_guild_commit();
-                    Err(error)
-                }
-            }
+            tx.finish_read()
         })?;
-        struct EndFence<'a>(&'a Db);
-        impl Drop for EndFence<'_> {
-            fn drop(&mut self) {
-                self.0.end_guild_commit();
-            }
-        }
-        let _end = EndFence(core);
         core.with_conn_sync(|conn| {
             // Deferred snapshot: it does not reserve the writer lock, so renewal
             // can commit while the remote guild COMMIT is still in flight.

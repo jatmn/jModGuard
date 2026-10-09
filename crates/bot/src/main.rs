@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
         app.cfg.bot.control_secret.as_str(),
         &app.db,
         &activation,
+        Some(&app.tenant),
     )
     .await
     {
@@ -170,8 +171,11 @@ async fn main() -> Result<()> {
     if !activation.allows_discord_connect() {
         anyhow::bail!("active-bot lease was not held");
     }
-    let _renewal =
-        jmodguard_bot::activation::spawn_renewal(app.db.clone(), Arc::clone(&activation));
+    let _renewal = jmodguard_bot::activation::spawn_renewal(
+        app.db.clone(),
+        Arc::clone(&activation),
+        app.tenant.clone(),
+    );
     if jmodguard_bot::control_server::spawn(Arc::clone(&app))?.is_none() {
         tracing::error!(
             "control listener is off; moderation continues and API writes are unavailable"

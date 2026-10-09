@@ -19,7 +19,20 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochRaise {
+    Current,
+    Deferred,
+}
+
+fn writer_lease_rejected(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("active bot lease"))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TenantError {
@@ -52,6 +65,7 @@ struct Inner {
     evidence: Arc<parking_lot::RwLock<EvidenceBackend>>,
     erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    epoch_retry: AtomicI64,
 }
 
 struct HandleCache {
@@ -367,6 +381,7 @@ impl TenantRuntime {
                 },
                 erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
+                epoch_retry: AtomicI64::new(0),
             }),
         })
     }
@@ -463,6 +478,169 @@ impl TenantRuntime {
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub async fn settle_selected_case(
+        &self,
+        enrollment: GuildEnrollment,
+        case_id: CaseId,
+        outcome: crate::db::guild_data::CaseOutcome,
+    ) -> Result<Option<crate::db::guild_data::CaseData>> {
+        let (store, scope) = self.live(enrollment).await?;
+        store
+            .settle_case_outcome(scope, case_id, outcome, case_limits())
+            .await
+    }
+
+    pub async fn settle_pending_application_ban(
+        &self,
+        enrollment: GuildEnrollment,
+        subject: u64,
+    ) -> Result<Vec<(CaseId, crate::db::guild_data::CaseData)>> {
+        let subject = i64::try_from(subject).map_err(|_| anyhow!("invalid ban subject"))?;
+        let (store, scope) = self.live(enrollment).await?;
+        store
+            .settle_pending_application_bans(scope, subject, case_limits())
+            .await
+    }
+
+    /// Raise the writer epoch in every catalog store this process can open.
+    /// A higher stored epoch is a lost lease. A store that cannot be reached is
+    /// retried later; leased writes to it fail until the raise lands.
+    pub async fn raise_held_writer_epoch(&self) -> Result<()> {
+        let Some(generation) = self.core.leased_generation() else {
+            return Ok(());
+        };
+        if !matches!(
+            self.raise_writer_epochs(generation).await?,
+            EpochRaise::Deferred
+        ) {
+            return Ok(());
+        }
+        self.schedule_epoch_retry(generation);
+        Ok(())
+    }
+
+    async fn ensure_writer_epoch(&self, handle: &GuildDataStore) -> Result<()> {
+        if self.core.is_read_only() {
+            return Ok(());
+        }
+        let Some(generation) = self.core.leased_generation() else {
+            return Ok(());
+        };
+        match handle.raise_writer_epoch(generation).await {
+            Ok(()) => Ok(()),
+            Err(error) if writer_lease_rejected(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!("guild writer epoch raise deferred: {error:#}");
+                self.schedule_epoch_retry(generation);
+                Ok(())
+            }
+        }
+    }
+
+    async fn raise_writer_epochs(&self, generation: i64) -> Result<EpochRaise> {
+        if self.core.is_read_only() || self.core.leased_generation() != Some(generation) {
+            return Ok(EpochRaise::Current);
+        }
+        let catalog = self.usage_catalog().await?;
+        let mut pending = false;
+        let mut seen = Vec::new();
+        for registration in catalog {
+            seen.push(registration.id().clone());
+            if self.raise_one_store(registration.id(), generation).await? == EpochRaise::Deferred {
+                pending = true;
+            }
+        }
+        for store in &self.inner.credentials {
+            if seen.iter().any(|id| id == store.registration.id()) {
+                continue;
+            }
+            if self
+                .raise_one_store(store.registration.id(), generation)
+                .await?
+                == EpochRaise::Deferred
+            {
+                pending = true;
+            }
+        }
+        Ok(if pending {
+            EpochRaise::Deferred
+        } else {
+            EpochRaise::Current
+        })
+    }
+
+    async fn raise_one_store(&self, id: &StoreId, generation: i64) -> Result<EpochRaise> {
+        let Some(resolved) = self
+            .inner
+            .credentials
+            .iter()
+            .find(|store| store.registration.id() == id)
+        else {
+            tracing::warn!(
+                store_id = %id.as_str(),
+                "guild writer epoch not raised; this process cannot open the store"
+            );
+            return Ok(EpochRaise::Current);
+        };
+        let handle = match open_runtime_store(&self.core, resolved).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(
+                    store_id = %id.as_str(),
+                    "guild writer epoch raise deferred: {error:#}"
+                );
+                return Ok(EpochRaise::Deferred);
+            }
+        };
+        match handle.raise_writer_epoch(generation).await {
+            Ok(()) => Ok(EpochRaise::Current),
+            Err(error) if writer_lease_rejected(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    store_id = %id.as_str(),
+                    "guild writer epoch raise deferred: {error:#}"
+                );
+                Ok(EpochRaise::Deferred)
+            }
+        }
+    }
+
+    fn schedule_epoch_retry(&self, generation: i64) {
+        if self.inner.epoch_retry.swap(generation, Ordering::AcqRel) == generation {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0_u32;
+            loop {
+                if runtime.core.leased_generation() != Some(generation) {
+                    return;
+                }
+                attempt = attempt.saturating_add(1);
+                let delay = crate::db::startup_backoff(
+                    attempt,
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(30),
+                );
+                tokio::time::sleep(delay).await;
+                if runtime.core.leased_generation() != Some(generation) {
+                    return;
+                }
+                match runtime.raise_writer_epochs(generation).await {
+                    Ok(EpochRaise::Current) => return,
+                    Ok(EpochRaise::Deferred) => {}
+                    Err(error) if writer_lease_rejected(&error) => {
+                        tracing::warn!("guild writer epoch is newer; active bot lease is not held");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!("guild writer epoch raise deferred: {error:#}");
+                    }
+                }
+            }
+        });
     }
 
     /// Bind a Discord audit entry to an already-recorded application case.
@@ -847,6 +1025,7 @@ impl TenantRuntime {
             .find(|store| store.registration.id() == id)
             .ok_or(TenantError::Offline)?;
         let handle = open_runtime_store(&self.core, resolved).await?;
+        self.ensure_writer_epoch(&handle).await?;
         let mut cache = self.inner.handles.lock().await;
         if let Some(existing) = cache.map.get(id.as_str()).cloned() {
             return Ok(existing);
