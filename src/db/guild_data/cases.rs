@@ -363,8 +363,13 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
+        let core = self.core.clone();
         self.db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_read()?;
+            if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
+                tx.finish_read()?;
+                return Err(error);
+            }
             verify_scope(&tx, &expected, &scope, true)?;
             let present = tx.query_row("SELECT deleted=0 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()], |r| Ok(r.get::<bool>(0)?)).optional()?.unwrap_or(false);
             if !present { tx.finish_read()?; return Ok(false); }

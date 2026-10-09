@@ -14,26 +14,12 @@ pub struct RecoveryState {
     pub oauth: Arc<oauth::OAuthClient>,
     pub control: UpdateControl,
     pub apply_enabled: bool,
-    pub(crate) writer: Option<jmodguard::control::WriterLink>,
 }
 
-async fn recovery_value<T: serde::de::DeserializeOwned>(
-    state: &RecoveryState,
-    op: db::ControlOp,
+async fn recovery_value<T>(
     local: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    if state.control.writes_locally() {
-        return local.await;
-    }
-    let link = state.writer.as_ref().context("waiting")?;
-    match link.submit(op).await? {
-        db::ControlReply::Saved { body } | db::ControlReply::Unchanged { body } => {
-            Ok(serde_json::from_value(body)?)
-        }
-        db::ControlReply::Waiting | db::ControlReply::StillWaiting => anyhow::bail!("waiting"),
-        db::ControlReply::Busy => anyhow::bail!("busy"),
-        db::ControlReply::Failed { message } => anyhow::bail!(message),
-    }
+    local.await
 }
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -117,11 +103,7 @@ async fn check(
     let now = chrono::Utc::now().timestamp();
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
-    let owner = recovery_value::<String>(
-        &state,
-        db::ControlOp::AcquirePairCheck { now },
-        state.control.acquire_pair_check(now),
-    )
+    let owner = recovery_value(state.control.acquire_pair_check(now))
     .await
     .map_err(|e| {
         problem(
@@ -138,15 +120,7 @@ async fn check(
         // Both images must resolve before either channel or candidate changes.
         // One transaction commits the pair; a missing counterpart or a failed
         // second write leaves the previous selection in place.
-        recovery_value::<()>(
-            &state,
-            db::ControlOp::RecordPairCheck {
-                owner: owner.clone(),
-                channel: input.channel.clone(),
-                bot: bot.clone(),
-                api: api.clone(),
-                now,
-            },
+        recovery_value(
             state
                 .control
                 .record_pair_check(&owner, &input.channel, bot, api, now),
@@ -155,13 +129,7 @@ async fn check(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if let Err(error) = recovery_value::<()>(
-        &state,
-        db::ControlOp::ReleasePairCheck {
-            owner: owner.clone(),
-        },
-        state.control.release_pair_check(&owner),
-    )
+    if let Err(error) = recovery_value(state.control.release_pair_check(&owner))
     .await
     {
         tracing::warn!("paired check lease release failed: {error:#}");
@@ -197,14 +165,7 @@ async fn apply(
         ));
     }
     let now = chrono::Utc::now().timestamp();
-    let operation = recovery_value::<crate::db::ServiceUpgrade>(
-        &state,
-        db::ControlOp::RequestUpgrade {
-            bot_digest: input.bot_digest.clone(),
-            api_digest: input.api_digest.clone(),
-            recover: input.recover,
-            now,
-        },
+    let operation = recovery_value(
         state
             .control
             .request_upgrade(&input.bot_digest, &input.api_digest, input.recover, now),
@@ -225,13 +186,7 @@ async fn cancel(
     Json(input): Json<Cancel>,
 ) -> Reply {
     mutation(&state, &session, &headers).await?;
-    recovery_value::<()>(
-        &state,
-        db::ControlOp::AbortUpgrade {
-            id: input.id.clone(),
-        },
-        state.control.abort_upgrade(&input.id),
-    )
+    recovery_value(state.control.abort_upgrade(&input.id))
     .await
     .map_err(|e| problem(StatusCode::CONFLICT, format!("{e:#}")))?;
     status(State(state), session).await
@@ -257,20 +212,19 @@ async fn maintenance_callback(
 pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
     crate::set_shutdown_context("temporary maintenance API; the application has not started");
     let listener = crate::health::bind(&cfg.web.bind).await?;
-    let opts = cfg.db_open_options();
+    let mut opts = cfg.db_open_options();
+    opts.read_only = false;
     let control = crate::health::serve_while(&listener, async {
         loop {
             let opts = opts.clone();
             match tokio::task::spawn_blocking(move || UpdateControl::open(&opts)).await? {
                 Ok(Some(control)) => break Ok::<_, anyhow::Error>(Some(control)),
-                result => tracing::warn!(
-                    "maintenance update control is not ready: {}",
-                    match result {
-                        Ok(None) => "database is empty".to_owned(),
-                        Err(e) => format!("{e:#}"),
-                        _ => unreachable!(),
-                    }
-                ),
+                Ok(None) => tracing::warn!("maintenance update control is not ready: database is empty"),
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "maintenance update control could not be opened writable: {error:#}"
+                    ));
+                }
             }
             tokio::select! {
                 _ = crate::shutdown_signal() => {
@@ -289,17 +243,11 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
         return Ok(());
     };
     let oauth = Arc::new(oauth::OAuthClient::from_config(&cfg)?);
-    let writer = if control.writes_locally() {
-        None
-    } else {
-        jmodguard::control::try_writer_link(&cfg.bot.control_bind, &cfg.db)?
-    };
     let state = Arc::new(RecoveryState {
         cfg: Arc::new(cfg),
         oauth,
         control,
         apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
-        writer,
     });
     let app = maintenance_router(state, MemoryStore::default());
     axum::serve(listener, app)
@@ -372,6 +320,7 @@ mod tests {
         let mut writable = cfg.db_open_options();
         writable.read_only = false;
         let control = UpdateControl::open(&writable).unwrap().unwrap();
+        assert!(control.writes_locally());
         let now = chrono::Utc::now().timestamp();
         for (role, digit) in [("bot", 'a'), ("api", 'b')] {
             let release = ComponentRelease {
@@ -433,7 +382,6 @@ mod tests {
             cfg: Arc::new(cfg),
             control: control.clone(),
             apply_enabled: true,
-            writer: None,
         });
         let store = MemoryStore::default();
         let owner_cookie = cookie(&store, 123).await;
@@ -499,6 +447,43 @@ mod tests {
             );
         }
         assert!(control.upgrade().await.unwrap().is_some());
+        let upgrade_id = control.upgrade().await.unwrap().unwrap().id;
+        db.with_conn(|conn| {
+            let raw: String = conn.query_row(
+                "SELECT value FROM meta WHERE key='component_upgrade_v1'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+            value["irreversible"] = serde_json::json!(true);
+            let mut tx = conn.transaction_immediate()?;
+            tx.execute_bounded(
+                "UPDATE meta SET value=?1 WHERE key='component_upgrade_v1'",
+                db::params![value.to_string()],
+                65_536,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let cancel = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/service-upgrade/cancel")
+                    .header("cookie", &owner_cookie)
+                    .header("origin", "https://api.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"id": upgrade_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::CONFLICT);
         // The HTML and OAuth return both use the existing public /api* proxy.
         let page = router
             .clone()

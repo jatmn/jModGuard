@@ -414,6 +414,11 @@ pub struct BotState {
     ban_observations: Mutex<HashMap<(u64, u64), usize>>,
     /// Shards that have already delivered READY in this process.
     ready_shards: Mutex<HashSet<u32>>,
+    /// Test seam. Production reads [`Self::discord_cache`] instead.
+    control_actor_lookup: Mutex<
+        Option<Arc<dyn Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync>>,
+    >,
+    discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
 }
 
 impl BotState {
@@ -487,9 +492,88 @@ impl BotState {
             member_sync_wake: tokio::sync::Notify::new(),
             ban_observations: Mutex::new(HashMap::new()),
             ready_shards: Mutex::new(HashSet::new()),
+            control_actor_lookup: Mutex::new(None),
+            discord_cache: Mutex::new(None),
         }))
     }
 
+    pub fn install_discord_cache(&self, cache: Arc<serenity::cache::Cache>) {
+        *self.discord_cache.lock() = Some(cache);
+    }
+
+    /// Process probes and tests supply a cache view without a live Discord gateway.
+    pub fn install_control_actor_lookup(
+        &self,
+        lookup: impl Fn(i64, &db::ControlOp) -> Option<db::CachedGuildActor> + Send + Sync + 'static,
+    ) {
+        *self.control_actor_lookup.lock() = Some(Arc::new(lookup));
+    }
+
+    pub fn authorize_control_actor(
+        &self,
+        op: &db::ControlOp,
+        actor_user_id: i64,
+    ) -> Result<(), &'static str> {
+        let cached = self.cached_control_actor(actor_user_id, op);
+        db::decide_control_actor(
+            db::control_actor_need(op),
+            actor_user_id,
+            self.cfg.bot.owner_id,
+            cached,
+        )
+    }
+
+    fn cached_control_actor(
+        &self,
+        actor_user_id: i64,
+        op: &db::ControlOp,
+    ) -> Option<db::CachedGuildActor> {
+        if let Some(lookup) = self.control_actor_lookup.lock().clone() {
+            return lookup(actor_user_id, op);
+        }
+        let cache = self.discord_cache.lock().clone()?;
+        cached_actor_from_discord(&cache, actor_user_id, op)
+    }
+}
+
+fn cached_actor_from_discord(
+    cache: &serenity::cache::Cache,
+    actor_user_id: i64,
+    op: &db::ControlOp,
+) -> Option<db::CachedGuildActor> {
+    let guild_id = match db::control_actor_need(op) {
+        db::ControlActorNeed::ManageGuild(id) | db::ControlActorNeed::GuildAdmin(id) if id > 0 => {
+            id as u64
+        }
+        _ => return None,
+    };
+    if actor_user_id <= 0 {
+        return None;
+    }
+    let guild = cache.guild(serenity::model::id::GuildId::new(guild_id))?;
+    let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
+    if owner == actor_user_id {
+        return Some(db::CachedGuildActor {
+            guild_owner_id: owner,
+            permissions: 0,
+        });
+    }
+    let member = guild.members.get(&serenity::model::id::UserId::new(actor_user_id as u64))?;
+    let permissions = guild.member_permissions(member);
+    let mut bits = 0u64;
+    if permissions.administrator() {
+        bits |= 1 << 3;
+    }
+    if permissions.manage_guild() {
+        bits |= 1 << 5;
+    }
+    Some(db::CachedGuildActor {
+        guild_owner_id: owner,
+        permissions: bits,
+    })
+}
+
+impl BotState {
     /// Register Ready work only while this process can still send start notices.
     pub async fn spawn_startup_notice_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut startup = self.startup_notice_task.lock().await;

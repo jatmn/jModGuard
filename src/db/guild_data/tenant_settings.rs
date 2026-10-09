@@ -64,9 +64,14 @@ impl GuildDataStore {
         parse_roles(&serde_json::to_string(&roles)?)?;
         let revision = revision.to_owned();
         let expected = self.expected.clone();
+        let core = self.core.clone();
         self.db
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_read()?;
+                if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
+                    tx.finish_read()?;
+                    return Err(error);
+                }
                 let (_, current) = verify_scope(&tx, &expected, &scope, true)?;
                 anyhow::ensure!(revision == current, TenantDataError::Revision);
                 let existing = tx

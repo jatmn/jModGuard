@@ -20,6 +20,7 @@ pub struct ApiState {
     pub cfg: Arc<ApiProcessConfig>,
     pub oauth: Arc<OAuthClient>,
     writer: Option<jmodguard::control::WriterLink>,
+    writer_error: Option<String>,
     /// Display caches only. Authorization must refresh the guild list.
     pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
@@ -38,16 +39,27 @@ impl ApiState {
             }
         }
         oauth.attach_retry_store(db.clone());
-        let writer = if db.is_read_only() {
-            match jmodguard::control::try_writer_link(&cfg.bot.control_bind, &cfg.db)? {
-                Some(link) => {
-                    oauth.attach_writer(link.clone());
-                    Some(link)
+        let (writer, writer_error) = if db.is_read_only() {
+            match jmodguard::control::load_writer_key(cfg.bot.control_secret.as_str()) {
+                Err(error) => (None, Some(error.to_string())),
+                Ok(_) => {
+                    match jmodguard::control::try_writer_link(
+                        &cfg.bot.control_bind,
+                        cfg.bot.control_secret.as_str(),
+                    )? {
+                        Some(link) => {
+                            oauth.attach_writer(link.clone());
+                            (Some(link), None)
+                        }
+                        None => (
+                            None,
+                            Some(jmodguard::control::ControlSecretError.to_string()),
+                        ),
+                    }
                 }
-                None => None,
             }
         } else {
-            None
+            (None, None)
         };
         let oauth = Arc::new(oauth);
         let primed =
@@ -61,6 +73,7 @@ impl ApiState {
             cfg: Arc::new(cfg),
             oauth,
             writer,
+            writer_error,
             guild_cache: DashMap::new(),
             user_cache: DashMap::new(),
             preview: DashMap::new(),
@@ -112,24 +125,41 @@ impl ApiState {
     }
 
     pub async fn commit(&self, op: db::ControlOp) -> Result<db::ControlReply> {
+        self.commit_actor(0, op).await
+    }
+
+    pub async fn commit_actor(&self, actor_user_id: i64, op: db::ControlOp) -> Result<db::ControlReply> {
         if self.db.is_read_only() {
+            if let Some(message) = &self.writer_error {
+                anyhow::bail!("{message}");
+            }
             let writer = if let Some(link) = &self.writer {
                 link.clone()
             } else {
-                let link =
-                    jmodguard::control::try_writer_link(&self.cfg.bot.control_bind, &self.cfg.db)?
-                        .context("writer link is unusable")?;
+                let link = jmodguard::control::try_writer_link(
+                    &self.cfg.bot.control_bind,
+                    self.cfg.bot.control_secret.as_str(),
+                )?
+                .ok_or_else(|| anyhow::anyhow!("{}", jmodguard::control::ControlSecretError))?;
                 self.oauth.attach_writer(link.clone());
                 link
             };
-            writer.submit(op).await
+            writer.submit(op, actor_user_id).await
         } else {
-            db::apply_control(&self.db, Some(&self.tenant), op).await
+            db::apply_control(&self.db, Some(&self.tenant), op, None).await
         }
     }
 
     pub async fn commit_json(&self, op: db::ControlOp) -> Result<(bool, serde_json::Value)> {
-        match self.commit(op).await? {
+        self.commit_json_actor(0, op).await
+    }
+
+    pub async fn commit_json_actor(
+        &self,
+        actor_user_id: i64,
+        op: db::ControlOp,
+    ) -> Result<(bool, serde_json::Value)> {
+        match self.commit_actor(actor_user_id, op).await? {
             db::ControlReply::Saved { body } => Ok((false, body)),
             db::ControlReply::Unchanged { body } => Ok((true, body)),
             db::ControlReply::Waiting => anyhow::bail!("waiting"),

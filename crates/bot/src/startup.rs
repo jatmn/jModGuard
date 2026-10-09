@@ -43,7 +43,15 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
         bail!("bot probe stopped before it held the writer lease");
     }
     let _renewal = crate::activation::spawn_renewal(app.db.clone(), Arc::clone(&app.activation));
-    let bound = crate::control_server::spawn(Arc::clone(&app))?;
+    app.install_control_actor_lookup(|_actor, _op| {
+        Some(db::CachedGuildActor {
+            guild_owner_id: 0,
+            permissions: 1 << 5,
+        })
+    });
+    let Some(bound) = crate::control_server::spawn(Arc::clone(&app))? else {
+        bail!("{}", jmodguard::control::ControlSecretError);
+    };
     write_probe_marker(&dir, "writer-port", &bound.port().to_string())?;
     let enrolled = db::enroll_guild(&app.db, guild_id as i64, 1)
         .await?

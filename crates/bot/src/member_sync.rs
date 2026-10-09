@@ -996,7 +996,15 @@ async fn run_loop(
                 ready_coverage.pending(&key, ready_generation);
             probe.status_read();
             match db::guild_stores::guild_is_write_fenced(&app.db, gid).await {
-                Ok(true) => continue,
+                Ok(true) => {
+                    if let Err(error) = store.record_local_write_fence(gid, now_ms.max(1)).await {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member sync could not record the local write fence: {error:#}"
+                        );
+                    }
+                    continue;
+                }
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -2263,6 +2271,36 @@ mod tests {
         );
         store
             .record_local_write_fence(guild, 1_700_000_000_000)
+            .await
+            .unwrap();
+        let error = store
+            .member_sync_worker_status(scope, 42, 1_700_000_000_000)
+            .await
+            .unwrap_err();
+        assert!(error.is::<db::guild_stores::GuildWriteFenced>());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn published_guild_fence_blocks_member_sync_when_snapshot_was_empty() {
+        let (directory, app, store, scope) = enrolled_directory_for(11).await;
+        let guild = scope.guild_id();
+        let snapshot = db::guild_stores::write_fenced_guilds(&app.db, vec![guild])
+            .await
+            .unwrap();
+        assert!(
+            !snapshot.contains(&guild),
+            "the scheduling snapshot is taken before the fence is published"
+        );
+        let destination = scope.placement().store_id().as_str().to_owned();
+        store
+            .publish_guild_write_fence(
+                guild,
+                1_700_000_000_000,
+                &"c".repeat(32),
+                &destination,
+                &"d".repeat(32),
+            )
             .await
             .unwrap();
         let error = store

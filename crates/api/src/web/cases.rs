@@ -177,6 +177,7 @@ pub async fn add_note(
     Json(body): Json<NoteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let scope = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
     let _ = live(&app, enrollment).await?;
     let text = body.text.trim();
     if text.is_empty() {
@@ -184,13 +185,16 @@ pub async fn add_note(
     }
     let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
     let (_, recorded_body) = app
-        .commit_json(crate::db::ControlOp::AppendCaseNote {
-            guild_id: i64::try_from(guild_id).unwrap_or(0),
+        .commit_json_actor(
+            actor,
+            crate::db::ControlOp::AppendCaseNote {
+            scope,
             case_id: case_id.clone(),
             entry_id: body.entry_id.clone(),
             actor_id: (actor > 0).then_some(actor),
             text: text.to_owned(),
-        })
+        },
+        )
         .await?;
     let recorded: String = serde_json::from_value(recorded_body)?;
     Ok(Json(serde_json::json!({ "result": recorded })))
@@ -208,12 +212,14 @@ pub async fn delete_case(
             "you cannot remove cases in this server (needs Administrator permission or server ownership)"
         )));
     }
+    let scope = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
+    let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
     let _ = live(&app, enrollment).await?;
     let (_, body) = app
-        .commit_json(crate::db::ControlOp::RemoveCase {
-            guild_id: i64::try_from(guild_id).unwrap_or(0),
-            case_id,
-        })
+        .commit_json_actor(
+            actor,
+            crate::db::ControlOp::RemoveCase { scope, case_id },
+        )
         .await?;
     Ok(Json(body))
 }
@@ -297,6 +303,8 @@ pub async fn put_case_delete_roles(
             "you cannot change case-removal roles (needs Administrator permission or server ownership)"
         )));
     }
+    let scope = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
+    let actor = i64::try_from(auth.discord_user_id()).unwrap_or(0);
     let _ = live(&app, enrollment).await?;
     let mut roles = Vec::new();
     for raw in body.roles {
@@ -306,11 +314,14 @@ pub async fn put_case_delete_roles(
         roles.push(id);
     }
     let (_, revision_body) = app
-        .commit_json(crate::db::ControlOp::SetCaseDeleteRoles {
-            guild_id: i64::try_from(guild_id).unwrap_or(0),
+        .commit_json_actor(
+            actor,
+            crate::db::ControlOp::SetCaseDeleteRoles {
+            scope,
             revision: body.revision,
             roles,
-        })
+        },
+        )
         .await
         .map_err(ApiError::from)?;
     let revision: String = serde_json::from_value(revision_body).map_err(ApiError::from)?;

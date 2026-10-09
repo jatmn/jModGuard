@@ -228,6 +228,7 @@ async fn main() -> Result<()> {
 
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);
+    app.install_discord_cache(Arc::clone(&cache));
 
     // One process-wide importer shares its Discord request budget across all
     // enrolled guilds. The job claim/cursor lives in the guild store.

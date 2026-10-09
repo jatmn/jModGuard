@@ -1011,6 +1011,15 @@ where
         ))
 }
 
+fn recovery_control(app: &ApiState) -> crate::db::UpdateControl {
+    let mut opts = app.cfg.db_open_options();
+    opts.read_only = false;
+    match crate::db::UpdateControl::open(&opts) {
+        Ok(Some(control)) => control,
+        _ => crate::db::UpdateControl::from_application(&app.db),
+    }
+}
+
 pub fn router(app: Arc<ApiState>) -> Router {
     // In-memory sessions are intentional for a single API replica.
     // Sessions are lost on API restart; multi-replica needs a shared store.
@@ -1203,9 +1212,8 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .merge(recovery::routes(Arc::new(recovery::RecoveryState {
             cfg: Arc::clone(&app.cfg),
             oauth: Arc::clone(&app.oauth),
-            control: crate::db::UpdateControl::from_application(&app.db),
+            control: recovery_control(&app),
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
-            writer: app.writer_link(),
         })))
         .layer(session_layer)
         .layer(axum::middleware::from_fn_with_state(

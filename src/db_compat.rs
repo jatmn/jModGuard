@@ -705,7 +705,21 @@ pub struct Connection {
     config_version: Arc<std::sync::atomic::AtomicU64>,
     capacity_limits: CapacityLimits,
     read_only: bool,
+    /// Copied from the pool at checkout. `None` leaves commits unchanged.
+    expected_lease_owner: Option<String>,
 }
+
+/// The active-bot lease row is not this instance, or it has expired.
+#[derive(Debug)]
+pub struct ActiveBotLeaseRejected;
+
+impl std::fmt::Display for ActiveBotLeaseRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("active bot lease is not held")
+    }
+}
+
+impl std::error::Error for ActiveBotLeaseRejected {}
 
 #[derive(Clone, Copy)]
 struct CapacityLimits {
@@ -1036,6 +1050,7 @@ impl Connection {
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
             read_only: false,
+            expected_lease_owner: None,
         })
     }
 
@@ -1048,7 +1063,12 @@ impl Connection {
             config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity_limits: CapacityLimits::default(),
             read_only: false,
+            expected_lease_owner: None,
         })
+    }
+
+    pub(crate) fn set_expected_lease_owner(&mut self, owner: Option<String>) {
+        self.expected_lease_owner = owner;
     }
 
     pub(crate) fn set_read_only(&mut self, read_only: bool) {
@@ -1213,6 +1233,7 @@ impl Connection {
             client_deadline: AtomicBool::new(false),
             capacity_reservation: Mutex::new(None),
             capacity_limits: self.capacity_limits,
+            expected_lease_owner: self.expected_lease_owner.clone(),
         }
     }
 
@@ -1416,6 +1437,7 @@ pub struct Transaction {
     client_deadline: AtomicBool,
     capacity_reservation: Mutex<Option<CapacityReservation>>,
     capacity_limits: CapacityLimits,
+    expected_lease_owner: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1775,6 +1797,33 @@ impl Transaction {
         self.inner().last_insert_rowid()
     }
 
+    fn reject_unless_active_lease(&self, expected: &str) -> Result<()> {
+        let value: Option<String> = self
+            .query_row(
+                "SELECT value FROM meta WHERE key='active_bot_lease'",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        let Some(value) = value else {
+            return Err(ActiveBotLeaseRejected.into());
+        };
+        let mut parts = value.split_whitespace();
+        let owner = parts.next().unwrap_or("");
+        let expires = parts
+            .next()
+            .and_then(|text| text.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        if owner != expected || expires <= now_ms {
+            return Err(ActiveBotLeaseRejected.into());
+        }
+        Ok(())
+    }
+
     pub fn commit(mut self) -> Result<()> {
         anyhow::ensure!(
             !self.capacity_poisoned.load(Ordering::Acquire),
@@ -1795,6 +1844,9 @@ impl Transaction {
                 params![receipt],
             )?;
             self.capacity_dirty.store(true, Ordering::Release);
+        }
+        if let Some(expected) = self.expected_lease_owner.as_deref() {
+            self.reject_unless_active_lease(expected)?;
         }
         if self.capacity_dirty.load(Ordering::Acquire) {
             let actual = crate::capacity::sample(&self)?;

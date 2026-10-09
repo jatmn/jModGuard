@@ -13,17 +13,24 @@ const QUEUE: usize = 8;
 
 struct Job {
     op: db::ControlOp,
+    actor_user_id: i64,
     reply: std::sync::mpsc::Sender<ControlReply>,
 }
 
-pub fn spawn(app: Arc<BotState>) -> anyhow::Result<std::net::SocketAddr> {
+pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let key = match control::load_writer_key(app.cfg.bot.control_secret.as_str()) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!("{error}");
+            return Ok(None);
+        }
+    };
     let bind = control::parse_private_bind(&app.cfg.bot.control_bind)?;
     let listener =
         TcpListener::bind(bind).map_err(|_| anyhow::anyhow!("control bind is not private"))?;
     let bound = listener
         .local_addr()
         .map_err(|_| anyhow::anyhow!("control bind is not private"))?;
-    let key = control::load_writer_key(&app.cfg.db, true)?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(QUEUE);
     let worker = Arc::clone(&app);
     tokio::spawn(async move {
@@ -31,10 +38,20 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<std::net::SocketAddr> {
             while worker.activation.moderation_depth() > 0 && worker.activation.may_record() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            let decision = worker.authorize_control_actor(&job.op, job.actor_user_id);
             let reply = if !worker.activation.may_record() {
                 ControlReply::Waiting
+            } else if let Some(rejected) = reject_unauthorized_control(decision) {
+                rejected
             } else {
-                match db::apply_control(&worker.db, Some(&worker.tenant), job.op).await {
+                match db::apply_control(
+                    &worker.db,
+                    Some(&worker.tenant),
+                    job.op,
+                    Some(worker.activation.instance()),
+                )
+                .await
+                {
                     Ok(reply) => reply,
                     Err(error) => ControlReply::Failed {
                         message: control::public_error(&error),
@@ -51,7 +68,17 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<std::net::SocketAddr> {
         .name("writer-link".into())
         .spawn(move || accept_loop(listener, key, tx, nonces, inflight, activation))
         .map_err(|_| anyhow::anyhow!("control bind is not private"))?;
-    Ok(bound)
+    Ok(Some(bound))
+}
+
+/// `Some` means the actor check failed and apply must not run.
+fn reject_unauthorized_control(decision: Result<(), &'static str>) -> Option<ControlReply> {
+    match decision {
+        Err(message) => Some(ControlReply::Failed {
+            message: message.to_owned(),
+        }),
+        Ok(()) => None,
+    }
 }
 
 fn accept_loop(
@@ -94,7 +121,7 @@ fn handle(
     key: &[u8],
     tx: &tokio::sync::mpsc::Sender<Job>,
     nonces: &Mutex<NonceWindow>,
-    activation: &crate::activation::Activation,
+    activation: &Arc<crate::activation::Activation>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -102,8 +129,8 @@ fn handle(
         Ok(body) => body,
         Err(_) => return,
     };
-    let op = match control::open_frame(key, &body, nonces) {
-        Ok(op) => op,
+    let (op, actor_user_id) = match control::open_frame(key, &body, nonces) {
+        Ok(opened) => opened,
         Err(error) => {
             let _ = reply(
                 stream,
@@ -114,12 +141,19 @@ fn handle(
             return;
         }
     };
-    if !activation.may_record() {
+    let Some(_hold) = activation.hold_control() else {
         let _ = reply(stream, &ControlReply::Waiting);
         return;
-    }
+    };
     let (send, recv) = std::sync::mpsc::channel();
-    if tx.try_send(Job { op, reply: send }).is_err() {
+    if tx
+        .try_send(Job {
+            op,
+            actor_user_id,
+            reply: send,
+        })
+        .is_err()
+    {
         let _ = reply(stream, &ControlReply::Busy);
         return;
     }
@@ -134,4 +168,37 @@ fn reply(mut stream: std::net::TcpStream, done: &ControlReply) -> anyhow::Result
     control::write_frame(&mut stream, done)?;
     stream.flush().ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_actor_is_not_applied() {
+        let mut applied = false;
+        let reply = match reject_unauthorized_control(Err("actor is not allowed")) {
+            Some(reply) => reply,
+            None => {
+                applied = true;
+                ControlReply::Saved {
+                    body: serde_json::Value::Null,
+                }
+            }
+        };
+        assert!(!applied);
+        assert!(matches!(reply, ControlReply::Failed { message } if message == "actor is not allowed"));
+        let mut applied = false;
+        let reply = match reject_unauthorized_control(Ok(())) {
+            Some(reply) => reply,
+            None => {
+                applied = true;
+                ControlReply::Saved {
+                    body: serde_json::Value::Null,
+                }
+            }
+        };
+        assert!(applied);
+        assert!(matches!(reply, ControlReply::Saved { .. }));
+    }
 }

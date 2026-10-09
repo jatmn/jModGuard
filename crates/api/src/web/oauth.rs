@@ -737,7 +737,7 @@ impl OAuthClient {
                     tracing::warn!("discord retry deadline is waiting for the bot writer");
                     return;
                 };
-                link.submit(crate::db::ControlOp::StoreRetryDeadlines { json })
+                link.submit(crate::db::ControlOp::StoreRetryDeadlines { json }, 0)
                     .await
                     .map(|reply| {
                         matches!(

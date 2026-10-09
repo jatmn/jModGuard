@@ -49,7 +49,7 @@ struct Inner {
     max_handles: usize,
     handles: Mutex<HandleCache>,
     handle_open_locks: parking_lot::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    evidence: EvidenceBackend,
+    evidence: Arc<parking_lot::RwLock<EvidenceBackend>>,
     erasure_cursor: Mutex<Option<i64>>,
     locks: parking_lot::Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
@@ -64,6 +64,7 @@ struct ResolvedStore {
     options: GuildStoreOptions,
 }
 
+#[derive(Clone)]
 enum EvidenceBackend {
     None,
     #[cfg(unix)]
@@ -352,7 +353,22 @@ impl TenantRuntime {
                     map: HashMap::new(),
                 }),
                 handle_open_locks: parking_lot::Mutex::new(HashMap::new()),
-                evidence: open_evidence(core, evidence).await?,
+                evidence: {
+                    let opened = open_evidence(core, evidence).await?;
+                    let slot = Arc::new(parking_lot::RwLock::new(opened));
+                    #[cfg(unix)]
+                    if evidence.backend == "local"
+                        && core.is_read_only()
+                        && matches!(*slot.read(), EvidenceBackend::None)
+                    {
+                        start_evidence_id_retry(
+                            core.clone(),
+                            evidence.clone(),
+                            Arc::clone(&slot),
+                        );
+                    }
+                    slot
+                },
                 erasure_cursor: Mutex::new(None),
                 locks: parking_lot::Mutex::new(HashMap::new()),
             }),
@@ -492,7 +508,7 @@ impl TenantRuntime {
         store: GuildDataStore,
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<EvidenceState> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => backend.reconcile(store, target).await,
             EvidenceBackend::Bunny(backend) => backend.reconcile(store, target).await,
@@ -505,7 +521,7 @@ impl TenantRuntime {
         store: GuildDataStore,
         target: crate::evidence_transfer::EvidenceTarget,
     ) -> Result<()> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => bail!("evidence backend is not configured"),
             EvidenceBackend::Local(backend) => {
                 backend.cleanup(store, target).await?;
@@ -594,7 +610,7 @@ impl TenantRuntime {
         }
         #[cfg(unix)]
         {
-            if matches!(self.inner.evidence, EvidenceBackend::None) {
+            if matches!(self.evidence_backend(), EvidenceBackend::None) {
                 return Ok(None);
             }
             let guild_id = enrollment.guild_id;
@@ -631,7 +647,7 @@ impl TenantRuntime {
                 request,
                 limits: evidence_limits(),
             };
-            let state = match &self.inner.evidence {
+            let state = match self.evidence_backend() {
                 EvidenceBackend::None => return Ok(None),
                 EvidenceBackend::Local(backend) => {
                     let file = std::fs::File::open(&source)
@@ -651,7 +667,7 @@ impl TenantRuntime {
 
     #[cfg(unix)]
     fn evidence_storage_id(&self) -> Option<CaseId> {
-        match &self.inner.evidence {
+        match self.evidence_backend() {
             EvidenceBackend::None => None,
             EvidenceBackend::Local(store) => Some(store.storage_id().clone()),
             EvidenceBackend::Bunny(store) => Some(store.storage_id().clone()),
@@ -755,7 +771,7 @@ impl TenantRuntime {
                 break;
             }
             for job in &jobs {
-                match &self.inner.evidence {
+                match self.evidence_backend() {
                     EvidenceBackend::None => {
                         anyhow::bail!("private evidence cleanup requires its configured backend");
                     }
@@ -860,21 +876,25 @@ impl TenantRuntime {
     }
 
     pub fn evidence_enabled(&self) -> bool {
-        !matches!(self.inner.evidence, EvidenceBackend::None)
+        !matches!(self.evidence_backend(), EvidenceBackend::None)
+    }
+
+    fn evidence_backend(&self) -> EvidenceBackend {
+        self.inner.evidence.read().clone()
     }
 
     #[cfg(unix)]
-    pub fn local_evidence(&self) -> Option<&crate::evidence_transfer::LocalEvidenceStore> {
-        match &self.inner.evidence {
+    pub fn local_evidence(&self) -> Option<crate::evidence_transfer::LocalEvidenceStore> {
+        match self.evidence_backend() {
             EvidenceBackend::Local(store) => Some(store),
             _ => None,
         }
     }
 
     #[cfg(unix)]
-    pub fn bunny_evidence(&self) -> Option<&crate::bunny_evidence::BunnyEvidenceStore> {
-        match &self.inner.evidence {
-            EvidenceBackend::Bunny(store) => Some(store.as_ref()),
+    pub fn bunny_evidence(&self) -> Option<crate::bunny_evidence::BunnyEvidenceStore> {
+        match self.evidence_backend() {
+            EvidenceBackend::Bunny(store) => Some(*store),
             _ => None,
         }
     }
@@ -895,7 +915,7 @@ impl TenantRuntime {
         let Some(available) = store.available_case_evidence(scope, case, evidence).await? else {
             return Ok(None);
         };
-        let bytes = match &self.inner.evidence {
+        let bytes = match self.evidence_backend() {
             EvidenceBackend::None => {
                 anyhow::bail!("evidence backend is not configured")
             }
@@ -1150,6 +1170,71 @@ async fn open_evidence(core: &Db, evidence: &EvidenceConfig) -> Result<EvidenceB
         }
         _ => bail!("unsupported evidence backend"),
     }
+}
+
+#[cfg(test)]
+static EVIDENCE_RETRY_CAP_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(60_000);
+
+#[cfg(test)]
+pub fn set_evidence_retry_cap_for_test(ms: u64) {
+    EVIDENCE_RETRY_CAP_MS.store(ms.min(60_000), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn evidence_retry_cap() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = EVIDENCE_RETRY_CAP_MS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(1, 60_000);
+        return std::time::Duration::from_millis(ms);
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+#[cfg(unix)]
+fn start_evidence_id_retry(
+    core: Db,
+    evidence: EvidenceConfig,
+    slot: Arc<parking_lot::RwLock<EvidenceBackend>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("evidence-id-retry".into())
+        .spawn(move || {
+            let mut delay = std::time::Duration::from_millis(20);
+            let cap = evidence_retry_cap();
+            loop {
+                let found = core.with_conn_sync(|conn| {
+                    let tx = conn.transaction_primary_snapshot()?;
+                    let existing = tx
+                        .query_row(
+                            "SELECT value FROM meta WHERE key='evidence_storage_id'",
+                            (),
+                            |row| Ok(row.get::<String>(0)?),
+                        )
+                        .optional()?;
+                    tx.finish_read()?;
+                    Ok(existing)
+                });
+                if let Ok(Some(raw)) = found
+                    && let Ok(id) = CaseId::try_from(raw)
+                    && let Ok(root) = evidence_root(&core, &evidence)
+                    && let Ok(store) = crate::evidence_transfer::LocalEvidenceStore::open(
+                        root,
+                        id,
+                        evidence.buffer_bytes,
+                    )
+                {
+                    *slot.write() = EvidenceBackend::Local(store);
+                    return;
+                }
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(cap);
+            }
+        });
 }
 
 #[cfg(test)]

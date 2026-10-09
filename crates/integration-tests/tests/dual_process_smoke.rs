@@ -65,13 +65,32 @@ async fn smoke_dual_process_config_sync() {
         cfg.db.path = tmp.clone();
         cfg.bot.config_poll_secs = 1;
         cfg.bot.control_bind = "127.0.0.1:0".into();
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         let bot = BotState::new(cfg, bot_db).expect("BotState");
         bot.activation.mark_lock_held(true);
+        assert!(
+            db::claim_active_bot(
+                &bot.db,
+                bot.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        bot.install_control_actor_lookup(|_actor, _op| {
+            Some(db::CachedGuildActor {
+                guild_owner_id: 0,
+                permissions: 1 << 5,
+            })
+        });
         let bound = jmodguard_bot::control_server::spawn(std::sync::Arc::clone(&bot))
-            .expect("control server");
+            .expect("control server")
+            .expect("control listener");
         let mut api_cfg = ApiProcessConfig::default();
         api_cfg.db.path = tmp.clone();
         api_cfg.bot.control_bind = bound.to_string();
+        api_cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         assert!(api_db.is_read_only());
         let api = ApiState::new(api_cfg, api_db).expect("ApiState");
 
@@ -96,7 +115,7 @@ async fn smoke_dual_process_config_sync() {
             .unwrap()
             .unwrap();
         let reply = api
-            .commit(db::ControlOp::PatchSettings {
+            .commit_actor(1, db::ControlOp::PatchSettings {
                 scope: db::ScopeWire {
                     global: false,
                     guild_id: guild_id as i64,
@@ -236,6 +255,7 @@ async fn smoke_bot_and_api_executables_share_sqlite() {
             let mut cmd = Command::new(bin);
             cmd.env_clear()
                 .env("JMODGUARD_CONFIG", &config)
+                .env("JMODGUARD_CONTROL_SECRET", "x".repeat(32))
                 .env("JMODGUARD_PROCESS_PROBE", probe)
                 .env("JMODGUARD_PROBE_DIR", &root)
                 .env("JMODGUARD_PROBE_GUILD", "55555")

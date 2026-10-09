@@ -194,23 +194,23 @@ pub enum ControlOp {
         release: ComponentRelease,
     },
     AppendCaseNote {
-        guild_id: i64,
+        scope: ScopeWire,
         case_id: String,
         entry_id: String,
         actor_id: Option<i64>,
         text: String,
     },
     RemoveCase {
-        guild_id: i64,
+        scope: ScopeWire,
         case_id: String,
     },
     SetCaseDeleteRoles {
-        guild_id: i64,
+        scope: ScopeWire,
         revision: String,
         roles: Vec<i64>,
     },
     CleanupEvidence {
-        guild_id: i64,
+        scope: ScopeWire,
     },
     AcquirePairCheck {
         now: i64,
@@ -247,7 +247,152 @@ pub enum ControlReply {
     Failed { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedGuildActor {
+    pub guild_owner_id: i64,
+    pub permissions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlActorNeed {
+    Process,
+    Owner,
+    ManageGuild(i64),
+    GuildAdmin(i64),
+}
+
+const MANAGE_GUILD_BIT: u64 = 1 << 5;
+const ADMINISTRATOR_BIT: u64 = 1 << 3;
+
+pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
+    match op {
+        ControlOp::PatchSettings { scope, .. } => scope_actor_need(scope),
+        ControlOp::UpsertRule { target, .. }
+        | ControlOp::DeleteRule { target, .. }
+        | ControlOp::AddBadword { target, .. }
+        | ControlOp::DeleteBadword { target, .. }
+        | ControlOp::UpsertCommand { target, .. }
+        | ControlOp::DeleteCommand { target, .. }
+        | ControlOp::UpsertTemplate { target, .. }
+        | ControlOp::DeleteTemplate { target, .. }
+        | ControlOp::PutLogFilter { target, .. } => scope_actor_need(target),
+        ControlOp::CopyGuildConfig { destination, .. } => scope_actor_need(destination),
+        ControlOp::AppendCaseNote { scope, .. } => {
+            ControlActorNeed::ManageGuild(scope.guild_id)
+        }
+        ControlOp::RemoveCase { scope, .. }
+        | ControlOp::SetCaseDeleteRoles { scope, .. }
+        | ControlOp::CleanupEvidence { scope } => ControlActorNeed::GuildAdmin(scope.guild_id),
+        ControlOp::EnqueueBotAction { .. }
+        | ControlOp::CancelBotAction { .. }
+        | ControlOp::StoreRetryDeadlines { .. }
+        | ControlOp::ClaimUpdateLease { .. }
+        | ControlOp::RenewUpdateLease { .. }
+        | ControlOp::ReleaseUpdateLease { .. }
+        | ControlOp::RecordUpdateCheck { .. }
+        | ControlOp::RecordComponentRunning { .. }
+        | ControlOp::RecordComponentFailure { .. }
+        | ControlOp::RecordWebuiDrift { .. }
+        | ControlOp::RecordWebuiInstalledVerified { .. }
+        | ControlOp::TrackWebuiAssets { .. }
+        | ControlOp::UntrackWebuiAssets { .. }
+        | ControlOp::SetUpdatePolicy { .. }
+        | ControlOp::RequestDueAutomaticInstall { .. }
+        | ControlOp::RequestComponentInstall { .. }
+        | ControlOp::RequestLauncherInstall { .. }
+        | ControlOp::SettleInterruptedWebui { .. }
+        | ControlOp::AcquirePairCheck { .. }
+        | ControlOp::RecordPairCheck { .. }
+        | ControlOp::ReleasePairCheck { .. }
+        | ControlOp::RequestUpgrade { .. }
+        | ControlOp::AbortUpgrade { .. } => ControlActorNeed::Process,
+    }
+}
+
+fn scope_actor_need(scope: &ScopeWire) -> ControlActorNeed {
+    if scope.global {
+        ControlActorNeed::Owner
+    } else {
+        ControlActorNeed::ManageGuild(scope.guild_id)
+    }
+}
+
+pub fn decide_control_actor(
+    need: ControlActorNeed,
+    actor_user_id: i64,
+    owner_id: u64,
+    cached: Option<CachedGuildActor>,
+) -> Result<(), &'static str> {
+    match need {
+        ControlActorNeed::Process => Ok(()),
+        ControlActorNeed::Owner => {
+            if owner_id != 0 && actor_user_id > 0 && actor_user_id as u64 == owner_id {
+                Ok(())
+            } else {
+                Err("owner is required")
+            }
+        }
+        ControlActorNeed::ManageGuild(_) => guild_actor(actor_user_id, cached, true),
+        ControlActorNeed::GuildAdmin(_) => guild_actor(actor_user_id, cached, false),
+    }
+}
+
+fn guild_actor(
+    actor_user_id: i64,
+    cached: Option<CachedGuildActor>,
+    manage_guild: bool,
+) -> Result<(), &'static str> {
+    if actor_user_id <= 0 {
+        return Err("actor is not allowed");
+    }
+    let Some(cached) = cached else {
+        return Err("actor is not allowed");
+    };
+    if cached.guild_owner_id == actor_user_id {
+        return Ok(());
+    }
+    if cached.permissions & ADMINISTRATOR_BIT != 0 {
+        return Ok(());
+    }
+    if manage_guild && cached.permissions & MANAGE_GUILD_BIT != 0 {
+        return Ok(());
+    }
+    Err("actor is not allowed")
+}
+
+struct LeaseFence<'a> {
+    db: &'a Db,
+}
+
+impl Drop for LeaseFence<'_> {
+    fn drop(&mut self) {
+        self.db.clear_lease_owner();
+    }
+}
+
 pub async fn apply_control(
+    db: &Db,
+    tenant: Option<&TenantRuntime>,
+    op: ControlOp,
+    instance: Option<&str>,
+) -> Result<ControlReply> {
+    let _fence = instance.map(|owner| {
+        db.arm_lease_owner(owner);
+        LeaseFence { db }
+    });
+    match apply_control_inner(db, tenant, op).await {
+        Err(error) if lease_rejected(&error) => Ok(ControlReply::Waiting),
+        other => other,
+    }
+}
+
+fn lease_rejected(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<crate::db_compat::ActiveBotLeaseRejected>().is_some())
+}
+
+async fn apply_control_inner(
     db: &Db,
     tenant: Option<&TenantRuntime>,
     op: ControlOp,
@@ -490,13 +635,13 @@ pub async fn apply_control(
             saved_null()
         }
         ControlOp::AppendCaseNote {
-            guild_id,
+            scope,
             case_id,
             entry_id,
             actor_id,
             text,
         } => {
-            let (store, scope) = live_guild(db, tenant, guild_id).await?;
+            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
             let recorded = store
                 .append_case_note(
                     scope,
@@ -506,13 +651,17 @@ pub async fn apply_control(
                     text,
                     crate::tenant::history_limits(),
                 )
-                .await?;
+                .await
+                .map_err(as_enrollment)?;
             saved_value(format!("{recorded:?}"))
         }
-        ControlOp::RemoveCase { guild_id, case_id } => {
-            let (store, scope) = live_guild(db, tenant, guild_id).await?;
+        ControlOp::RemoveCase { scope, case_id } => {
+            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
             let id: crate::db::guild_data::CaseId = case_id.try_into()?;
-            let removed = store.remove_case(scope.clone(), id.clone()).await?;
+            let removed = store
+                .remove_case(scope.clone(), id.clone())
+                .await
+                .map_err(as_enrollment)?;
             let cleanup_pending = match tenant
                 .context("write failed")?
                 .cleanup_owned_evidence(&store, &scope)
@@ -533,15 +682,24 @@ pub async fn apply_control(
             }))
         }
         ControlOp::SetCaseDeleteRoles {
-            guild_id,
+            scope,
             revision,
             roles,
         } => {
-            let (store, scope) = live_guild(db, tenant, guild_id).await?;
-            saved_value(store.set_case_delete_roles(scope, &revision, roles).await?)
+            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            saved_value(
+                store
+                    .set_case_delete_roles(scope, &revision, roles)
+                    .await
+                    .map_err(as_enrollment)?,
+            )
         }
-        ControlOp::CleanupEvidence { guild_id } => {
-            let (store, scope) = live_guild(db, tenant, guild_id).await?;
+        ControlOp::CleanupEvidence { scope } => {
+            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            store
+                .confirm_active_enrollment(scope.clone())
+                .await
+                .map_err(as_enrollment)?;
             tenant
                 .context("write failed")?
                 .cleanup_owned_evidence(&store, &scope)
@@ -596,7 +754,7 @@ pub async fn apply_control_bytes(
     bytes: &[u8],
 ) -> Result<ControlReply> {
     let op: ControlOp = serde_json::from_slice(bytes).context("write failed")?;
-    apply_control(db, tenant, op).await
+    apply_control(db, tenant, op, None).await
 }
 
 fn scope_of(wire: ScopeWire) -> Result<ConfigurationScope> {
@@ -615,19 +773,35 @@ fn write_scope(request: ScopeWire, target: ScopeWire) -> Result<ConfigurationWri
     ConfigurationWriteScope::new(scope_of(request)?, scope_of(target)?)
 }
 
-async fn live_guild(
-    db: &Db,
+async fn captured_guild(
     tenant: Option<&TenantRuntime>,
-    guild_id: i64,
+    scope: ScopeWire,
 ) -> Result<(
     crate::db::guild_data::GuildDataStore,
     crate::db::guild_data::GuildDataScope,
 )> {
     let tenant = tenant.context("write failed")?;
-    let enrollment = guild_enrollment(db, guild_id)
-        .await?
-        .context("bot membership is not enrolled")?;
-    tenant.live(enrollment).await
+    let ConfigurationScope::Guild(enrollment) = scope_of(scope)? else {
+        return Err(EnrollmentChanged.into());
+    };
+    let scope = tenant.scope(enrollment).await?;
+    let store = tenant.store(&scope).await?;
+    Ok((store, scope))
+}
+
+fn as_enrollment(error: anyhow::Error) -> anyhow::Error {
+    let changed = error.chain().any(|cause| {
+        cause.downcast_ref::<EnrollmentChanged>().is_some()
+            || matches!(
+                cause.downcast_ref::<crate::db::guild_data::TenantDataError>(),
+                Some(crate::db::guild_data::TenantDataError::Membership)
+            )
+    });
+    if changed {
+        anyhow::Error::from(EnrollmentChanged)
+    } else {
+        error
+    }
 }
 
 async fn store_retry_deadlines(db: &Db, json: String) -> Result<()> {
@@ -657,4 +831,95 @@ fn saved_value(value: impl Serialize) -> Result<ControlReply> {
     Ok(ControlReply::Saved {
         body: serde_json::to_value(value)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revoked_actor_is_rejected_and_owner_gates_global_ops() {
+        let manage = ControlActorNeed::ManageGuild(10);
+        let allowed = CachedGuildActor {
+            guild_owner_id: 1,
+            permissions: MANAGE_GUILD_BIT,
+        };
+        assert!(decide_control_actor(manage, 5, 9, Some(allowed)).is_ok());
+        let revoked = CachedGuildActor {
+            guild_owner_id: 1,
+            permissions: 0,
+        };
+        assert!(decide_control_actor(manage, 5, 9, Some(revoked)).is_err());
+        assert!(decide_control_actor(manage, 5, 9, None).is_err());
+        assert!(decide_control_actor(ControlActorNeed::Owner, 4, 9, None).is_err());
+        assert!(decide_control_actor(ControlActorNeed::Owner, 9, 9, None).is_ok());
+        assert!(decide_control_actor(ControlActorNeed::Owner, 9, 0, None).is_err());
+        assert!(decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(allowed)).is_err());
+        let admin = CachedGuildActor {
+            guild_owner_id: 1,
+            permissions: ADMINISTRATOR_BIT,
+        };
+        assert!(decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(admin)).is_ok());
+        assert!(decide_control_actor(ControlActorNeed::Process, 0, 0, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_commit_rejects_foreign_or_expired_lease() {
+        let path = std::env::temp_dir().join(format!(
+            "control_lease_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let owner = "a".repeat(32);
+        let other = "b".repeat(32);
+        let op = ControlOp::PatchSettings {
+            scope: ConfigurationScope::Global.to_wire(),
+            prefix: FieldPatch::Set("?".into()),
+            bot_name: FieldPatch::Absent,
+            reconcile: false,
+        };
+        write_lease(&db, &other, crate::control::now_ms() + 60_000).await;
+        let reply = apply_control(&db, None, op.clone(), Some(&owner))
+            .await
+            .unwrap();
+        assert!(matches!(reply, ControlReply::Waiting));
+        assert_ne!(get_settings(&db, 0).await.unwrap().prefix, "?");
+
+        write_lease(&db, &owner, crate::control::now_ms() - 1_000).await;
+        let reply = apply_control(&db, None, op.clone(), Some(&owner))
+            .await
+            .unwrap();
+        assert!(matches!(reply, ControlReply::Waiting));
+        assert_ne!(get_settings(&db, 0).await.unwrap().prefix, "?");
+
+        write_lease(&db, &owner, crate::control::now_ms() + 60_000).await;
+        let reply = apply_control(&db, None, op, Some(&owner)).await.unwrap();
+        assert!(matches!(
+            reply,
+            ControlReply::Saved { .. } | ControlReply::Unchanged { .. }
+        ));
+        assert_eq!(get_settings(&db, 0).await.unwrap().prefix, "?");
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    async fn write_lease(db: &Db, owner: &str, expires: i64) {
+        let value = format!("{owner} {expires}");
+        db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "INSERT INTO meta (key, value) VALUES ('active_bot_lease', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![value],
+                4096,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 }

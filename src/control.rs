@@ -1,9 +1,9 @@
 //! Private API-to-bot writer link. The API never opens a write connection.
 //!
 //! The bot listens on a loopback or private address. Each request carries a
-//! short-lived HMAC over the nonce, expiry, and operation. The key is the
-//! database token when one is configured, otherwise a mode-0600 file beside
-//! the local database that the bot creates and the API only reads.
+//! short-lived HMAC over the nonce, expiry, actor, and operation. The key is
+//! the dedicated control secret shared by the bot and the API. It is not a
+//! database token.
 
 use anyhow::{Context as _, Result};
 use ring::hmac;
@@ -12,15 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::DbConfig;
 use crate::db::{ControlOp, ControlReply};
 
 const BODY_LIMIT: usize = 256 * 1024;
 const MAC_HEX: usize = 64;
+const MIN_SECRET_LEN: usize = 32;
 const MAX_AGE_MS: i64 = 60_000;
 const SKEW_MS: i64 = 5_000;
 const SEEN_LIMIT: usize = 4096;
@@ -35,6 +34,20 @@ impl std::fmt::Display for WriterLinkNotReady {
 }
 
 impl std::error::Error for WriterLinkNotReady {}
+
+/// Missing or too-short control secret. The display text is safe to log.
+#[derive(Debug)]
+pub struct ControlSecretError;
+
+impl std::fmt::Display for ControlSecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "JMODGUARD_CONTROL_SECRET is required on the bot and the API, must be the same value, and must be at least 32 bytes. It is separate from both database tokens.",
+        )
+    }
+}
+
+impl std::error::Error for ControlSecretError {}
 
 #[derive(Clone)]
 pub struct WriterLink {
@@ -55,43 +68,31 @@ impl WriterLink {
         Ok(Self { addr, key })
     }
 
-    pub async fn submit(&self, op: ControlOp) -> Result<ControlReply> {
+    pub async fn submit(&self, op: ControlOp, actor_user_id: i64) -> Result<ControlReply> {
         let addr = self.addr;
         let key = self.key.clone();
-        tokio::task::spawn_blocking(move || submit_blocking(addr, &key, &op))
+        tokio::task::spawn_blocking(move || submit_blocking(addr, &key, &op, actor_user_id))
             .await
             .context("write failed")?
     }
 }
 
-pub fn try_writer_link(bind: &str, db: &DbConfig) -> Result<Option<WriterLink>> {
+pub fn try_writer_link(bind: &str, secret: &str) -> Result<Option<WriterLink>> {
+    let key = match load_writer_key(secret) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
     let addr = parse_private_bind(bind)?;
-    match load_writer_key(db, false) {
-        Ok(key) => Ok(Some(WriterLink::connect(addr, key)?)),
-        Err(error) if writer_link_not_ready(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
+    Ok(Some(WriterLink::connect(addr, key)?))
 }
 
-fn writer_link_not_ready(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<WriterLinkNotReady>().is_some())
-}
-
-pub fn load_writer_key(db: &DbConfig, create: bool) -> Result<Vec<u8>> {
-    if !db.token.is_empty() {
-        return Ok(db.token.as_bytes().to_vec());
+/// HMAC key bytes from the dedicated control secret. Database tokens are ignored.
+pub fn load_writer_key(secret: &str) -> Result<Vec<u8>, ControlSecretError> {
+    if secret.len() < MIN_SECRET_LEN {
+        Err(ControlSecretError)
+    } else {
+        Ok(secret.as_bytes().to_vec())
     }
-    let path = writer_link_path(&db.path);
-    if create && !path.exists() {
-        write_key_file(&path)?;
-    }
-    let bytes = std::fs::read(&path).map_err(|_| WriterLinkNotReady)?;
-    if bytes.len() != 32 {
-        return Err(WriterLinkNotReady.into());
-    }
-    Ok(bytes)
 }
 
 pub fn parse_private_bind(raw: &str) -> Result<SocketAddr> {
@@ -166,7 +167,12 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn submit_blocking(addr: SocketAddr, key: &[u8], op: &ControlOp) -> Result<ControlReply> {
+fn submit_blocking(
+    addr: SocketAddr,
+    key: &[u8],
+    op: &ControlOp,
+    actor_user_id: i64,
+) -> Result<ControlReply> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|_| anyhow::anyhow!("waiting"))?;
     stream
@@ -175,7 +181,7 @@ fn submit_blocking(addr: SocketAddr, key: &[u8], op: &ControlOp) -> Result<Contr
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| anyhow::anyhow!("write failed"))?;
-    let frame = seal(key, op)?;
+    let frame = seal(key, op, actor_user_id)?;
     stream
         .write_all(&frame)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
@@ -185,10 +191,11 @@ fn submit_blocking(addr: SocketAddr, key: &[u8], op: &ControlOp) -> Result<Contr
     }
 }
 
-pub(crate) fn seal(key: &[u8], op: &ControlOp) -> Result<Vec<u8>> {
+pub(crate) fn seal(key: &[u8], op: &ControlOp, actor_user_id: i64) -> Result<Vec<u8>> {
     let wire = Wire {
         nonce: random_nonce()?,
         expires_ms: now_ms().saturating_add(MAX_AGE_MS),
+        actor_user_id,
         op: op.clone(),
     };
     let json = serde_json::to_vec(&wire).context("write failed")?;
@@ -204,7 +211,11 @@ pub(crate) fn seal(key: &[u8], op: &ControlOp) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-pub fn open_frame(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Result<ControlOp> {
+pub fn open_frame(
+    key: &[u8],
+    body: &[u8],
+    nonces: &Mutex<NonceWindow>,
+) -> Result<(ControlOp, i64)> {
     if body.len() < MAC_HEX || body.len() > BODY_LIMIT {
         anyhow::bail!("write failed");
     }
@@ -220,7 +231,7 @@ pub fn open_frame(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Resul
     if !guard.accept(&wire.nonce, wire.expires_ms, now_ms()) {
         anyhow::bail!("write failed");
     }
-    Ok(wire.op)
+    Ok((wire.op, wire.actor_user_id))
 }
 
 pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
@@ -229,7 +240,7 @@ pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
         .read_exact(&mut len_buf)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if !(MAC_HEX..=BODY_LIMIT).contains(&len) {
+    if !(1..=BODY_LIMIT).contains(&len) {
         anyhow::bail!("write failed");
     }
     let mut body = vec![0u8; len];
@@ -249,40 +260,6 @@ pub fn write_frame(stream: &mut impl Write, reply: &ControlReply) -> Result<()> 
     stream
         .write_all(&json)
         .map_err(|_| anyhow::anyhow!("write failed"))?;
-    Ok(())
-}
-
-fn writer_link_path(db_path: &Path) -> PathBuf {
-    let mut name = db_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("store"))
-        .to_os_string();
-    name.push(".writer-link");
-    db_path.with_file_name(name)
-}
-
-fn write_key_file(path: &Path) -> Result<()> {
-    let mut bytes = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("writer link is unusable"))?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|_| anyhow::anyhow!("writer link is unusable"))?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| anyhow::anyhow!("writer link is unusable"))?;
-    file.write_all(&bytes)
-        .map_err(|_| anyhow::anyhow!("writer link is unusable"))?;
     Ok(())
 }
 
@@ -355,6 +332,7 @@ fn is_unique_local(v6: Ipv6Addr) -> bool {
 struct Wire {
     nonce: String,
     expires_ms: i64,
+    actor_user_id: i64,
     op: ControlOp,
 }
 
@@ -385,5 +363,103 @@ mod tests {
     #[test]
     fn unspecified_v4_is_not_private() {
         assert!(!is_private_ip(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+    }
+
+    fn fixture_secret() -> String {
+        "x".repeat(32)
+    }
+
+    fn sample_op() -> crate::db::ControlOp {
+        crate::db::ControlOp::AbortUpgrade { id: "1".into() }
+    }
+
+    #[test]
+    fn short_control_replies_round_trip() {
+        for reply in [
+            ControlReply::Waiting,
+            ControlReply::Saved {
+                body: serde_json::Value::Null,
+            },
+        ] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &reply).unwrap();
+            assert!(buf.len() < MAC_HEX, "a short reply must still be a frame");
+            let body = read_frame(&mut std::io::Cursor::new(&buf)).unwrap();
+            let got: ControlReply = serde_json::from_slice(&body).unwrap();
+            assert_eq!(got, reply);
+        }
+    }
+
+    #[test]
+    fn truncated_control_frame_is_rejected() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &ControlReply::Waiting).unwrap();
+        buf.pop();
+        assert!(read_frame(&mut std::io::Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn forged_control_mac_is_rejected() {
+        let key = load_writer_key(&fixture_secret()).unwrap();
+        let frame = seal(&key, &sample_op(), 7).unwrap();
+        let mut body = frame[4..].to_vec();
+        body[0] ^= 0x01;
+        let nonces = Mutex::new(NonceWindow::new());
+        assert!(open_frame(&key, &body, &nonces).is_err());
+        assert!(open_frame(&key, b"short", &Mutex::new(NonceWindow::new())).is_err());
+    }
+
+    #[test]
+    fn matching_control_secret_seals_and_opens() {
+        let key = load_writer_key(&fixture_secret()).unwrap();
+        let frame = seal(&key, &sample_op(), 4).unwrap();
+        let (op, actor) =
+            open_frame(&key, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        assert_eq!(actor, 4);
+        assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { id } if id == "1"));
+    }
+
+    #[test]
+    fn mismatched_control_secret_is_rejected() {
+        let left = load_writer_key(&fixture_secret()).unwrap();
+        let right = load_writer_key(&"y".repeat(32)).unwrap();
+        let frame = seal(&left, &sample_op(), 0).unwrap();
+        assert!(open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).is_err());
+        let text = load_writer_key("short").unwrap_err().to_string();
+        assert!(text.contains("JMODGUARD_CONTROL_SECRET"));
+        assert!(!text.contains("short"));
+        assert!(!text.contains('/'));
+    }
+
+    #[test]
+    fn different_database_tokens_still_authenticate_when_the_secret_matches() {
+        let secret = fixture_secret();
+        let token_a = "token-a-not-used-as-the-control-key";
+        let token_b = "token-b-not-used-as-the-control-key";
+        let left = load_writer_key(&secret).unwrap();
+        let right = load_writer_key(&secret).unwrap();
+        assert_ne!(left.as_slice(), token_a.as_bytes());
+        assert_ne!(right.as_slice(), token_b.as_bytes());
+        let frame = seal(&left, &sample_op(), 0).unwrap();
+        let (op, actor) =
+            open_frame(&right, &frame[4..], &Mutex::new(NonceWindow::new())).unwrap();
+        assert_eq!(actor, 0);
+        assert!(matches!(op, crate::db::ControlOp::AbortUpgrade { .. }));
+        assert!(
+            open_frame(
+                token_a.as_bytes(),
+                &frame[4..],
+                &Mutex::new(NonceWindow::new())
+            )
+            .is_err()
+        );
+        assert!(
+            open_frame(
+                token_b.as_bytes(),
+                &frame[4..],
+                &Mutex::new(NonceWindow::new())
+            )
+            .is_err()
+        );
     }
 }

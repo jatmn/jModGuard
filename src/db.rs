@@ -418,6 +418,10 @@ pub struct Db {
     config_write_generation: Arc<std::sync::atomic::AtomicU64>,
     config_floor_lock: Arc<parking_lot::Mutex<()>>,
     settings_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Expected active-bot instance copied onto connections at checkout.
+    /// Empty means commits are not fenced. Control apply sets this only for
+    /// the duration of that call.
+    lease_owner: Arc<Mutex<Option<String>>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -467,6 +471,20 @@ impl Db {
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
+
+    pub(crate) fn arm_lease_owner(&self, owner: &str) {
+        *self
+            .lease_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner.to_owned());
+    }
+
+    pub(crate) fn clear_lease_owner(&self) {
+        *self
+            .lease_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -483,6 +501,7 @@ struct ConnectionPool {
     remote: bool,
     read_only: bool,
     busy_timeout_ms: u32,
+    lease_owner: Arc<Mutex<Option<String>>>,
 }
 
 struct ConnectionLease {
@@ -498,7 +517,7 @@ impl ConnectionLease {
             .lock()
             .map_err(|_| anyhow::anyhow!("database connection pool lock poisoned"))?
             .pop();
-        let connection = match connection {
+        let mut connection = match connection {
             Some(connection) => connection,
             None => {
                 let mut connection =
@@ -521,6 +540,12 @@ impl ConnectionLease {
             // it may contain writes whose outcome cannot safely be replayed.
             connection.reset_remote_stream()?;
         }
+        let owner = pool
+            .lease_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        connection.set_expected_lease_owner(owner);
         Ok(Self {
             connection: Some(connection),
             pool,
@@ -784,6 +809,7 @@ impl Db {
             // API that already passed the gate is serving.
             ready(bootstrap)?;
 
+            let lease_owner = Arc::new(Mutex::new(None));
             Ok(Self {
                 path: opts.path.clone(),
                 remote,
@@ -798,6 +824,7 @@ impl Db {
                     remote,
                     read_only: opts.read_only,
                     busy_timeout_ms,
+                    lease_owner: Arc::clone(&lease_owner),
                 }),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 permit_timeout: remote.then_some(if opts.migrate {
@@ -809,6 +836,7 @@ impl Db {
                 config_write_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 config_floor_lock: Arc::new(parking_lot::Mutex::new(())),
                 settings_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                lease_owner,
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })

@@ -38,6 +38,17 @@ impl Drop for RuleHold {
     }
 }
 
+/// Control work is in flight, but it does not block moderation.
+pub struct ControlHold {
+    activation: Arc<Activation>,
+}
+
+impl Drop for ControlHold {
+    fn drop(&mut self) {
+        self.activation.in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterLockPoll {
     Waiting,
@@ -87,6 +98,22 @@ impl Activation {
         RuleHold {
             activation: Arc::clone(self),
         }
+    }
+
+    /// Admit one control job. `None` means recording has stopped, and `in_flight`
+    /// is left unchanged. This does not increment moderation depth.
+    pub fn hold_control(self: &Arc<Self>) -> Option<ControlHold> {
+        if !self.may_record() {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::Release);
+        if !self.may_record() {
+            self.in_flight.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(ControlHold {
+            activation: Arc::clone(self),
+        })
     }
 
     pub fn in_flight(&self) -> usize {
@@ -343,6 +370,8 @@ mod tests {
         assert_eq!(challenger.in_flight(), 0);
         challenger.cut_off();
         assert!(!challenger.may_record());
+        assert!(challenger.hold_control().is_none());
+        assert_eq!(challenger.in_flight(), 0);
         drop(db);
         cleanup(&path);
     }
@@ -431,5 +460,22 @@ mod tests {
         assert!(challenger.allows_rule_trigger());
         drop(db);
         cleanup(&path);
+    }
+
+    #[test]
+    fn control_hold_does_not_raise_moderation_depth() {
+        let activation = Activation::new();
+        assert!(activation.hold_control().is_none());
+        assert_eq!(activation.in_flight(), 0);
+        activation.mark_lock_held(true);
+        let hold = activation.hold_control().expect("control admission");
+        assert_eq!(activation.in_flight(), 1);
+        assert_eq!(activation.moderation_depth(), 0);
+        drop(hold);
+        assert_eq!(activation.in_flight(), 0);
+        activation.note_lease_lost();
+        assert!(activation.hold_control().is_none());
+        assert_eq!(activation.in_flight(), 0);
+        assert_eq!(activation.moderation_depth(), 0);
     }
 }

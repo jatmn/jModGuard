@@ -19,6 +19,10 @@ use crate::bot_actions::Action;
 use crate::db;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
 
+fn dashboard_actor(auth: &AuthCtx) -> i64 {
+    i64::try_from(auth.discord_user_id()).unwrap_or(0)
+}
+
 /// Authorizes an endpoint that operates on a real Discord guild. Global
 /// configuration (`guild_id = 0`) is intentionally handled by configuration
 /// routes, but it must never reach Discord REST or guild-local audit tables.
@@ -231,7 +235,7 @@ pub async fn update_settings(
     let prefix_patch = body.prefix.clone();
     let bot_name_patch = body.bot_name.clone();
     let (unchanged, settings_body) = app
-        .commit_json(db::ControlOp::PatchSettings {
+        .commit_json_actor(dashboard_actor(&auth), db::ControlOp::PatchSettings {
             scope: super::configuration_scope(&app, &auth, guild_id)?.to_wire(),
             prefix: db::FieldPatch::from_settings(body.prefix),
             bot_name: db::FieldPatch::from_settings(body.bot_name),
@@ -313,7 +317,7 @@ pub async fn put_rule(
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::UpsertRule {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::UpsertRule {
         request,
         target,
         id: rule_id.clone(),
@@ -348,7 +352,7 @@ pub async fn delete_rule(
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::DeleteRule {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::DeleteRule {
         request,
         target,
         id: rule_id.clone(),
@@ -419,7 +423,7 @@ pub async fn add_badword(
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     let (_, id_body) = app
-        .commit_json(db::ControlOp::AddBadword {
+        .commit_json_actor(dashboard_actor(&auth), db::ControlOp::AddBadword {
             request,
             target,
             pattern: body.pattern.clone(),
@@ -471,7 +475,7 @@ pub async fn delete_badword(
     let write = super::configuration_write_scope(&app, &auth, guild_id, word.guild_id)?;
     let (request, target) = write.to_wires();
     match app
-        .commit_json(db::ControlOp::DeleteBadword {
+        .commit_json_actor(dashboard_actor(&auth), db::ControlOp::DeleteBadword {
             request,
             target,
             id: word_id,
@@ -575,7 +579,7 @@ pub async fn put_command(
     validate_command_descriptor(&data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::UpsertCommand {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::UpsertCommand {
         request,
         target,
         name: name.clone(),
@@ -609,7 +613,7 @@ pub async fn create_command(
     validate_command_descriptor(&data)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::UpsertCommand {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::UpsertCommand {
         request,
         target,
         name: name.clone(),
@@ -640,7 +644,7 @@ pub async fn delete_command(
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::DeleteCommand {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::DeleteCommand {
         request,
         target,
         name: name.to_lowercase(),
@@ -711,7 +715,7 @@ pub async fn put_template(
     }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::UpsertTemplate {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::UpsertTemplate {
         request,
         target,
         event: event.clone(),
@@ -741,7 +745,7 @@ pub async fn delete_template(
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json(db::ControlOp::DeleteTemplate {
+    app.commit_json_actor(dashboard_actor(&auth), db::ControlOp::DeleteTemplate {
         request,
         target,
         event: event.clone(),
@@ -774,7 +778,7 @@ pub async fn put_log_filter(
     let scope = super::configuration_write_scope(&app, &auth, guild_id, guild_id as i64)?;
     let (request, target) = scope.to_wires();
     let (_, body) = app
-        .commit_json(db::ControlOp::PutLogFilter {
+        .commit_json_actor(dashboard_actor(&auth), db::ControlOp::PutLogFilter {
             request,
             target,
             event: event.clone(),
@@ -958,7 +962,7 @@ pub async fn copy_config(
     // the bot applies Discord from that durable state.
     let nickname_queued = wants_settings && guild_id != 0;
     let (_, copied) = app
-        .commit_json(db::ControlOp::CopyGuildConfig {
+        .commit_json_actor(dashboard_actor(&dest), db::ControlOp::CopyGuildConfig {
             source: super::configuration_scope(&app, &source, body.from_guild_id)?.to_wire(),
             destination: super::configuration_scope(&app, &dest, guild_id)?.to_wire(),
             sections: body.sections,

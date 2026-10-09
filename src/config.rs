@@ -68,6 +68,35 @@ pub struct BotConfig {
     pub message_capture_enabled: bool,
     /// Private API-to-bot writer link. Not the public health or web bind.
     pub control_bind: String,
+    /// Shared HMAC secret for the private writer link. Not a database token.
+    pub control_secret: ControlSecret,
+}
+
+/// Dedicated writer-link secret. Debug output never includes the value.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct ControlSecret(String);
+
+impl Default for ControlSecret {
+    fn default() -> Self {
+        Self(String::new())
+    }
+}
+
+impl std::fmt::Debug for ControlSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ControlSecret(<redacted>)")
+    }
+}
+
+impl ControlSecret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +309,7 @@ impl Default for BotConfig {
             config_poll_secs: 5,
             message_capture_enabled: true,
             control_bind: "127.0.0.1:8791".into(),
+            control_secret: ControlSecret::default(),
         }
     }
 }
@@ -761,6 +791,9 @@ impl Config {
                     .collect();
             }
         }
+        if let Ok(value) = env::var("JMODGUARD_CONTROL_SECRET") {
+            self.bot.control_secret = ControlSecret(value);
+        }
         if let Ok(v) = env::var("JMODGUARD_OWNER_ID") {
             let v = v.trim();
             if !v.is_empty() {
@@ -1126,6 +1159,23 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn control_secret_loads_for_bot_and_api() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_CONTROL_SECRET"]);
+        let secret = "x".repeat(32);
+        unsafe { std::env::set_var("JMODGUARD_CONTROL_SECRET", &secret) };
+        let mut bot = Config::default();
+        bot.apply_env_for(false).unwrap();
+        let mut api = Config::default();
+        api.apply_env_for(true).unwrap();
+        assert_eq!(bot.bot.control_secret.as_str(), secret);
+        assert_eq!(api.bot.control_secret.as_str(), secret);
+        let rendered = format!("{:?}", bot.bot.control_secret);
+        assert!(!rendered.contains(&secret));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]

@@ -470,6 +470,73 @@ impl GuildDataStore {
         }
     }
 
+    /// Re-read the captured enrollment on the core primary while a guild
+    /// transaction is already open. Missing core (unit stores) skips the check.
+    pub(super) fn confirm_captured_enrollment(
+        core: &Option<Db>,
+        scope: &GuildDataScope,
+    ) -> Result<()> {
+        let Some(core) = core else {
+            return Ok(());
+        };
+        core.with_conn_sync(|conn| {
+            super::enrollments::verify_enrollment_conn(conn, scope.enrollment())
+        })
+    }
+
+    pub async fn confirm_active_enrollment(&self, scope: GuildDataScope) -> Result<()> {
+        let core = self.core.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_read()?;
+                if let Err(error) = Self::confirm_captured_enrollment(&core, &scope) {
+                    tx.finish_read()?;
+                    return Err(error);
+                }
+                tx.finish_read()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Record the guild-local fence first, then the core fence row.
+    pub async fn publish_guild_write_fence(
+        &self,
+        guild: i64,
+        fenced_at_ms: i64,
+        generation: &str,
+        destination_store_id: &str,
+        destination_revision: &str,
+    ) -> Result<()> {
+        self.record_local_write_fence(guild, fenced_at_ms).await?;
+        let Some(core) = self.core.clone() else {
+            anyhow::bail!("guild write fence requires the core database");
+        };
+        let generation = generation.to_owned();
+        let destination_store_id = destination_store_id.to_owned();
+        let destination_revision = destination_revision.to_owned();
+        core.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_read()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "INSERT INTO guild_write_fences(
+                    guild_id, generation, phase, destination_store_id, destination_revision, created_at
+                 ) VALUES(?1, ?2, 'freeze', ?3, ?4, ?5)",
+                params![
+                    guild,
+                    generation,
+                    destination_store_id,
+                    destination_revision,
+                    fenced_at_ms
+                ],
+                8192,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(super) async fn refuse_fenced_guild_write(&self, guild: i64) -> Result<()> {
         if let Some(core) = &self.core
             && super::guild_stores::guild_is_write_fenced(core, guild).await?

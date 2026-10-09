@@ -104,7 +104,9 @@ pub async fn write_shared_config(cfg: ApiProcessConfig) -> Result<()> {
     let db = open_database(&cfg).await?;
     let app = ApiState::new(cfg, db)?;
     let reply = app
-        .commit(db::ControlOp::PatchSettings {
+        .commit_actor(
+            1,
+            db::ControlOp::PatchSettings {
             scope: db::ScopeWire {
                 global: false,
                 guild_id,
@@ -177,7 +179,6 @@ mod tests {
         let mut cfg = BotProcessConfig::default();
         cfg.db.path = path.to_path_buf();
         let _tenant = TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence).unwrap();
-        jmodguard::control::load_writer_key(&cfg.db, true).unwrap();
         db
     }
 

@@ -69,7 +69,7 @@ Create a **separate** Bunny Database for the shared guild store. Configure both
 containers with credentials for that same guild database, in addition to the core
 credentials above. Never point the guild store at the core database or the frontend
 Storage Zone. The guild database must be empty on first initialization or already have
-the matching `jmodguard-guild-1` identity; runtime upgrades it to version 14.
+the matching `jmodguard-guild-1` identity; runtime upgrades it to version 15.
 
 ```dotenv
 JMODGUARD_GUILD_STORE_URL=libsql://GUILD_DATABASE_ID.lite.bunnydb.net
@@ -289,6 +289,11 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+Set `JMODGUARD_CONTROL_SECRET` on this container. It is required, must be the
+same value as the API container, is independent of both database tokens, and
+must be at least 32 bytes. The API database token can be read-only. The bot
+database token can write.
+
 Optional when you have no `config.toml` on the bot container (typical):
 `JMODGUARD_DB_POOL_SIZE` (this process's pool), `JMODGUARD_DEFAULT_PREFIX`,
 and `JMODGUARD_BOT_STATUS`. Prefix is written on migrate-open into durable
@@ -353,6 +358,10 @@ JMODGUARD_LOG_LEVEL=info
 JMODGUARD_LOG_DIRECTORY=
 ```
 
+Set `JMODGUARD_CONTROL_SECRET` on this container to the same value as the bot.
+It is required, independent of both database tokens, and must be at least 32
+bytes. The API database token can be read-only while the bot token can write.
+
 With the shared-store/evidence environment above, no `config.toml` is required. Optional:
 `JMODGUARD_DB_POOL_SIZE` (this process's pool; the bot has its own). Prefix
 and bot status are bot-owned — set those on the bot app.
@@ -374,9 +383,9 @@ for the bot and return receipts. Deploy matching bot/API/frontend builds and rel
 old pages. See [action settings and status](BOT-ACTIONS.md); set the same `[actions]`
 storage policy in both processes, and worker controls only on the bot.
 
-Both containers need **full-access** database tokens. A read-only Bunny
-token will fail API startup (the API probes a no-op write after schema
-open).
+The bot database token can write. The API database token can be read-only.
+A read-only token on the bot will fail startup, because only the bot applies
+migrations and dashboard writes.
 
 The API never applies migrations. It waits for the bot bootstrap marker
 (about six minutes on a remote database), then exits if that wait
