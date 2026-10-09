@@ -193,6 +193,40 @@ test('large PR and issue commands use the original snapshot and fit action input
   }
 });
 
+function codeLines(source, commentMarker) {
+  return source.split('\n').filter((line) => {
+    const trimmed = line.trim();
+    return trimmed.length > 0 && !trimmed.startsWith(commentMarker);
+  }).join('\n');
+}
+
+test('fixed admin authorPermission stays coupled to the owner checks', () => {
+  const helper = codeLines(readFileSync(new URL('./pullfrog-command-check.mjs', import.meta.url), 'utf8'), '//');
+  const workflow = codeLines(readFileSync(new URL('../.github/workflows/pullfrog.yml', import.meta.url), 'utf8'), '#');
+  const payload = ownerCommandPayload('issue_comment', 'jatmn', ownerComment);
+  assert.equal(payload.event.authorPermission, 'admin');
+  assert.match(helper, /authorPermission: 'admin'/);
+  // These are the checks that make the fixed value safe. Removing any of them
+  // while that value remains is a failure.
+  for (const pattern of [
+    /github\.actor == 'jatmn'/,
+    /github\.event\.comment\.user\.id == 12479882/,
+    /github\.triggering_actor == 'jatmn'/,
+    /github\.run_attempt == 1/,
+  ]) {
+    assert.match(workflow, pattern);
+  }
+  for (const pattern of [
+    /actor !== 'jatmn'/,
+    /event\?\.sender\?\.id !== OWNER_ID/,
+    /event\?\.comment\?\.user\?\.id !== OWNER_ID/,
+    /GITHUB_TRIGGERING_ACTOR !== 'jatmn'/,
+    /GITHUB_RUN_ATTEMPT !== '1'/,
+  ]) {
+    assert.match(helper, pattern);
+  }
+});
+
 test('workflow uses the verified payload, matching pinned action, and owner-only trigger', () => {
   const workflow = readFileSync(new URL('../.github/workflows/pullfrog.yml', import.meta.url), 'utf8');
   assert.ok(workflow.includes('prompt: ${{ steps.authorize.outputs.payload }}'));

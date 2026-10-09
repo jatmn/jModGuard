@@ -43,6 +43,8 @@ export function ownerCommandPayload(eventName, actor, event, eventPath) {
       `Follow AGENTS.md and CONTRIBUTING.md. The command is at ${url}. Post your result in that thread.`,
     event: {
       trigger: 'issue_comment_created',
+      // Safe only because the workflow and this helper already require the
+      // owner's account, the triggering actor, and the first run attempt.
       authorPermission: 'admin',
       comment_type: 'issue',
       comment_id: commentId,
