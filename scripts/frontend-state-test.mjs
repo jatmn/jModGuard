@@ -2585,6 +2585,42 @@ test('changing only a rule action through Headless UI marks unsaved edits', asyn
   assert.equal(h.app.isDirty(), true);
 });
 
+test('activity-log events from the config payload render template and log-channel cards', async () => {
+  const h = harness();
+  h.app.state.config = {
+    templates: [
+      { event: 'voice_join', effective: '**:loud_sound: {user} joined voice**\n\n**Channel:** {channel}\n**Time:** `{time}`' },
+      { event: 'member_role_update', effective: '**:label: {user} roles updated**\n\n**Added:** {added}\n**Removed:** {removed}' },
+    ],
+    log_channels: [
+      { event: 'voice_join', effective: '0', guild_override: null, global: null, ignore: { users: [], channels: [] } },
+      { event: 'thread_create', effective: '222', guild_override: '222', global: null, ignore: { users: ['42'], channels: [] } },
+    ],
+  };
+  h.app.navigate('templates');
+  await settle();
+  const reference = h.document.querySelector('.reference-panel');
+  assert.match(reference.textContent, /\{added\}/);
+  assert.match(reference.textContent, /do not supply message text/);
+  const cards = [...h.document.querySelectorAll('.template-card')];
+  assert.equal(cards.length, 2);
+  assert.match(cards[0].textContent, /Voice join/);
+  assert.match(cards[0].textContent, /voice_join/);
+  assert.match(cards[0].querySelector('pre').textContent, /Alice/);
+  assert.match(cards[0].querySelector('pre').textContent, /#general/);
+  assert.match(cards[1].textContent, /Member role update/);
+  assert.match(cards[1].querySelector('pre').textContent, /\{added\}/);
+  h.app.navigate('logchannels');
+  await settle();
+  const logs = [...h.document.querySelectorAll('.log-channel-card')];
+  assert.equal(logs.length, 2);
+  assert.match(logs[0].textContent, /Voice join/);
+  assert.equal(logs[0].querySelector('input').value, '');
+  assert.match(logs[1].textContent, /Thread create/);
+  assert.equal(logs[1].querySelector('input').value, '222');
+  assert.match(logs[1].querySelector('textarea').value, /^42$/);
+});
+
 test('native server selection restores the selected server and draft when navigation is cancelled', async () => {
   const calls = [];
   const h = harness(async url => { calls.push(url); return response({}); }, new Map(), new Map(), () => false);
