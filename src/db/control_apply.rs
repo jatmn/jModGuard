@@ -641,7 +641,7 @@ async fn apply_control_inner(
             actor_id,
             text,
         } => {
-            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            let (store, scope) = captured_guild(tenant, scope).await.map_err(as_enrollment)?;
             let recorded = store
                 .append_case_note(
                     scope,
@@ -656,7 +656,7 @@ async fn apply_control_inner(
             saved_value(format!("{recorded:?}"))
         }
         ControlOp::RemoveCase { scope, case_id } => {
-            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            let (store, scope) = captured_guild(tenant, scope).await.map_err(as_enrollment)?;
             let id: crate::db::guild_data::CaseId = case_id.try_into()?;
             let removed = store
                 .remove_case(scope.clone(), id.clone())
@@ -686,7 +686,7 @@ async fn apply_control_inner(
             revision,
             roles,
         } => {
-            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            let (store, scope) = captured_guild(tenant, scope).await.map_err(as_enrollment)?;
             saved_value(
                 store
                     .set_case_delete_roles(scope, &revision, roles)
@@ -695,7 +695,7 @@ async fn apply_control_inner(
             )
         }
         ControlOp::CleanupEvidence { scope } => {
-            let (store, scope) = captured_guild(tenant, scope).map_err(as_enrollment)?;
+            let (store, scope) = captured_guild(tenant, scope).await.map_err(as_enrollment)?;
             store
                 .confirm_active_enrollment(scope.clone())
                 .await
