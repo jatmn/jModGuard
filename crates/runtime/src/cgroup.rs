@@ -2,7 +2,8 @@
 //!
 //! Readings come from cgroup v2 (`memory.current`, `memory.stat`,
 //! `memory.max`, `cpu.stat`) or the v1 files when those are absent.
-//! Membership is `/proc/self/cgroup`. Host-wide memory and processor totals
+//! Membership is `/proc/self/cgroup` resolved with mount roots from
+//! `/proc/self/mountinfo`. Host-wide memory and processor totals
 //! are not consulted. Nothing here writes a database or calls a provider.
 
 use std::io::Read;
@@ -75,8 +76,13 @@ pub fn read_cgroup(memory_dir: Option<&Path>, cpu_dir: Option<&Path>) -> CgroupR
 
 /// Read this process's cgroup. Unreadable layouts yield an empty reading.
 pub fn read_process_cgroup() -> CgroupReading {
-    let text = read_limited(Path::new("/proc/self/cgroup"));
-    read_at_mount(text.as_deref(), Path::new("/sys/fs/cgroup"))
+    let Some(text) = read_limited(Path::new("/proc/self/cgroup")) else {
+        return read_mount_root(Path::new("/sys/fs/cgroup"));
+    };
+    let Some(mountinfo) = read_limited(Path::new("/proc/self/mountinfo")) else {
+        return CgroupReading::default();
+    };
+    read_mounted_cgroup(&text, &mountinfo)
 }
 
 /// Latest sample for this process.
@@ -99,11 +105,6 @@ pub fn spawn_container_usage_sampler() {
     STARTED.call_once(|| {
         tokio::spawn(sample_loop());
     });
-}
-
-struct CandidateDirs {
-    memory: Vec<PathBuf>,
-    cpu: Vec<PathBuf>,
 }
 
 struct Observation {
@@ -215,63 +216,288 @@ async fn sample_loop() {
     }
 }
 
-fn read_at_mount(proc_text: Option<&str>, mount: &Path) -> CgroupReading {
-    if let Some(text) = proc_text {
-        let candidates = candidates_from_proc(text, mount);
-        return CgroupReading {
-            memory: candidates.memory.iter().find_map(|dir| read_memory(dir)),
-            cpu: candidates.cpu.iter().find_map(|dir| read_cpu(dir)),
-        };
-    }
+/// Counters at a cgroup mount when `/proc/self/cgroup` itself cannot be read.
+fn read_mount_root(mount: &Path) -> CgroupReading {
     CgroupReading {
         memory: read_memory(mount),
         cpu: read_cpu(mount),
     }
 }
 
-fn candidates_from_proc(text: &str, mount: &Path) -> CandidateDirs {
-    let mut memory = Vec::new();
-    let mut cpu = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((id, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let Some((controllers, path)) = rest.split_once(':') else {
-            continue;
-        };
-        let Some(unified) = join_cgroup(mount, path) else {
-            continue;
-        };
-        if id == "0" && controllers.is_empty() {
-            memory.push(unified.clone());
-            cpu.push(unified);
-            continue;
-        }
-        let names: Vec<&str> = controllers
-            .split(',')
-            .filter(|name| !name.is_empty())
-            .collect();
-        if names.contains(&"memory") {
-            if let Some(v1) = join_cgroup(&mount.join("memory"), path) {
-                memory.push(v1);
-            }
-            memory.push(unified.clone());
-        }
-        if names.contains(&"cpu") || names.contains(&"cpuacct") {
-            if let Some(acct) = join_cgroup(&mount.join("cpuacct"), path) {
-                cpu.push(acct);
-            }
-            if let Some(combined) = join_cgroup(&mount.join("cpu,cpuacct"), path) {
-                cpu.push(combined);
-            }
-            cpu.push(unified);
+enum MountKind {
+    Unified,
+    Controllers {
+        memory: bool,
+        cpu: bool,
+        cpuacct: bool,
+    },
+}
+
+struct MountedCgroup {
+    root: String,
+    point: PathBuf,
+    kind: MountKind,
+}
+
+impl MountedCgroup {
+    fn is_unified(&self) -> bool {
+        matches!(self.kind, MountKind::Unified)
+    }
+
+    fn is_v1_memory(&self) -> bool {
+        matches!(self.kind, MountKind::Controllers { memory: true, .. })
+    }
+
+    fn is_v1_cpu(&self) -> bool {
+        match self.kind {
+            MountKind::Controllers { cpu, cpuacct, .. } => cpu || cpuacct,
+            MountKind::Unified => false,
         }
     }
-    CandidateDirs { memory, cpu }
+
+    fn has_cpuacct(&self) -> bool {
+        matches!(self.kind, MountKind::Controllers { cpuacct: true, .. })
+    }
+}
+
+struct CgroupEntry {
+    unified: bool,
+    memory: bool,
+    cpu: bool,
+    path: String,
+}
+
+fn read_mounted_cgroup(cgroup_text: &str, mountinfo: &str) -> CgroupReading {
+    let mounts = parse_mountinfo(mountinfo);
+    let mut memory_dirs = Vec::new();
+    let mut cpu_dirs = Vec::new();
+    for raw in cgroup_text.lines() {
+        let Some(entry) = parse_cgroup_line(raw) else {
+            continue;
+        };
+        if entry.unified {
+            let matched = longest_root_mounts(&mounts, &entry.path, MountedCgroup::is_unified);
+            let dirs = mount_dirs(&matched, &entry.path);
+            memory_dirs.extend_from_slice(&dirs);
+            cpu_dirs.extend(dirs);
+            continue;
+        }
+        if entry.memory {
+            let matched = longest_root_mounts(&mounts, &entry.path, MountedCgroup::is_v1_memory);
+            memory_dirs.extend(mount_dirs(&matched, &entry.path));
+        }
+        if entry.cpu {
+            let matched = longest_root_mounts(&mounts, &entry.path, MountedCgroup::is_v1_cpu);
+            let ordered = prefer_cpuacct(&matched);
+            cpu_dirs.extend(mount_dirs(&ordered, &entry.path));
+        }
+    }
+    CgroupReading {
+        memory: memory_dirs.iter().find_map(|dir| read_memory(dir)),
+        cpu: cpu_dirs.iter().find_map(|dir| read_cpu(dir)),
+    }
+}
+
+fn parse_mountinfo(text: &str) -> Vec<MountedCgroup> {
+    let mut mounts = Vec::new();
+    for raw in text.lines() {
+        if let Some(mount) = parse_mount_line(raw) {
+            mounts.push(mount);
+        }
+    }
+    mounts
+}
+
+// Field 4 is the root and field 5 is the mount point. Optional fields end at "-".
+fn parse_mount_line(raw: &str) -> Option<MountedCgroup> {
+    let fields: Vec<&str> = raw.split_whitespace().collect();
+    let dash = fields.iter().position(|field| *field == "-")?;
+    if dash < 6 || dash + 3 >= fields.len() {
+        return None;
+    }
+    let root_raw = unescape_mount_field(fields[3])?;
+    let point_raw = unescape_mount_field(fields[4])?;
+    let root = normalize_mount_path(&root_raw)?;
+    let point = normalize_mount_path(&point_raw)?;
+    if !root.starts_with('/') || !point.starts_with('/') {
+        return None;
+    }
+    let kind = match fields[dash + 1] {
+        "cgroup2" => MountKind::Unified,
+        "cgroup" => {
+            let (memory, cpu, cpuacct) = super_controllers(fields[dash + 3]);
+            MountKind::Controllers {
+                memory,
+                cpu,
+                cpuacct,
+            }
+        }
+        _ => return None,
+    };
+    Some(MountedCgroup {
+        root,
+        point: PathBuf::from(point),
+        kind,
+    })
+}
+
+fn unescape_mount_field(field: &str) -> Option<String> {
+    let bytes = field.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let digits = bytes.get(index + 1..index + 4)?;
+        let mut value = 0u16;
+        for digit in digits {
+            if !matches!(*digit, b'0'..=b'7') {
+                return None;
+            }
+            value = value * 8 + u16::from(*digit - b'0');
+        }
+        decoded.push(u8::try_from(value).ok()?);
+        index += 4;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn normalize_mount_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    if path == "/" {
+        return Some("/".to_string());
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+// Controllers are exact super-option tokens, not mount-point path names.
+fn super_controllers(opts: &str) -> (bool, bool, bool) {
+    let mut memory = false;
+    let mut cpu = false;
+    let mut cpuacct = false;
+    for token in opts.split(',') {
+        match token {
+            "memory" => memory = true,
+            "cpu" => cpu = true,
+            "cpuacct" => cpuacct = true,
+            _ => {}
+        }
+    }
+    (memory, cpu, cpuacct)
+}
+
+fn parse_cgroup_line(raw: &str) -> Option<CgroupEntry> {
+    let line = raw.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (id, rest) = line.split_once(':')?;
+    let (controllers, path) = rest.split_once(':')?;
+    if id == "0" && controllers.is_empty() {
+        return Some(CgroupEntry {
+            unified: true,
+            memory: false,
+            cpu: false,
+            path: path.to_string(),
+        });
+    }
+    let memory = controller_listed(controllers, "memory");
+    let cpu = controller_listed(controllers, "cpu") || controller_listed(controllers, "cpuacct");
+    if !(memory || cpu) {
+        return None;
+    }
+    Some(CgroupEntry {
+        unified: false,
+        memory,
+        cpu,
+        path: path.to_string(),
+    })
+}
+
+fn controller_listed(controllers: &str, wanted: &str) -> bool {
+    for name in controllers.split(',') {
+        if name == wanted {
+            return true;
+        }
+    }
+    false
+}
+
+fn cgroup_relative<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let path = path.trim();
+    if !path.starts_with('/') || !root.starts_with('/') {
+        return None;
+    }
+    if root == "/" {
+        return Some(path);
+    }
+    if path == root {
+        return Some("/");
+    }
+    let rest = path.strip_prefix(root)?;
+    rest.starts_with('/').then_some(rest)
+}
+
+// Only the longest matching root. A shorter root is not a fallback.
+fn longest_root_mounts<'a>(
+    mounts: &'a [MountedCgroup],
+    cgroup_path: &str,
+    mut accept: impl FnMut(&MountedCgroup) -> bool,
+) -> Vec<&'a MountedCgroup> {
+    let mut best_len = 0usize;
+    let mut matched = Vec::new();
+    for mount in mounts {
+        if !accept(mount) || cgroup_relative(cgroup_path, &mount.root).is_none() {
+            continue;
+        }
+        let len = mount.root.len();
+        if len > best_len {
+            best_len = len;
+            matched.clear();
+        }
+        if len == best_len {
+            matched.push(mount);
+        }
+    }
+    matched
+}
+
+// Same-root CPU mounts: cpuacct before a cpu-only mount, in mountinfo order.
+fn prefer_cpuacct<'a>(mounts: &[&'a MountedCgroup]) -> Vec<&'a MountedCgroup> {
+    let mut preferred = Vec::new();
+    let mut rest = Vec::new();
+    for mount in mounts {
+        if mount.has_cpuacct() {
+            preferred.push(*mount);
+        } else {
+            rest.push(*mount);
+        }
+    }
+    preferred.extend(rest);
+    preferred
+}
+
+fn mount_dirs(mounts: &[&MountedCgroup], cgroup_path: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for mount in mounts {
+        let Some(relative) = cgroup_relative(cgroup_path, &mount.root) else {
+            continue;
+        };
+        if let Some(dir) = join_cgroup(&mount.point, relative) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 fn join_cgroup(mount: &Path, proc_path: &str) -> Option<PathBuf> {
@@ -420,6 +646,20 @@ mod tests {
         }
     }
 
+    fn v2_mount_line(root: &str, point: &Path) -> String {
+        let point = point.to_str().unwrap();
+        format!(
+            "21 1 0:21 {root} {point} rw,nosuid,nodev,noexec,relatime shared:1 master:2 - cgroup2 cgroup rw,nsdelegate"
+        )
+    }
+
+    fn v1_mount_line(root: &str, point: &Path, controllers: &str) -> String {
+        let point = point.to_str().unwrap();
+        format!(
+            "36 35 0:31 {root} {point} rw,nosuid,nodev,noexec,relatime shared:1 master:2 - cgroup cgroup rw,{controllers}"
+        )
+    }
+
     #[test]
     fn v2_layout_parses_max_and_subtracts_inactive_file() {
         let tree = temp_tree();
@@ -565,11 +805,12 @@ mod tests {
                 ("cpu.stat", "usage_usec 1\n"),
             ],
         );
-        let reading = read_at_mount(Some("0::/app\n"), &tree.path);
+        let info = format!("{}\n", v2_mount_line("/", &tree.path));
+        let reading = read_mounted_cgroup("0::/app\n", &info);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
 
-        let elsewhere = read_at_mount(Some("0::/other\n"), &tree.path);
+        let elsewhere = read_mounted_cgroup("0::/other\n", &info);
         assert_eq!(elsewhere, CgroupReading::default());
     }
 
@@ -585,7 +826,12 @@ mod tests {
                 ("cpuacct/app/cpuacct.usage", "2000\n"),
             ],
         );
-        let reading = read_at_mount(Some("2:cpu,cpuacct:/app\n1:memory:/app\n"), &tree.path);
+        let info = format!(
+            "{}\n{}\n",
+            v1_mount_line("/", &tree.path.join("memory"), "memory"),
+            v1_mount_line("/", &tree.path.join("cpuacct"), "cpuacct"),
+        );
+        let reading = read_mounted_cgroup("2:cpu,cpuacct:/app\n1:memory:/app\n", &info);
         assert_eq!(reading.memory.unwrap().program_bytes, 50);
         assert_eq!(reading.memory.unwrap().limit, MemoryLimit::Bytes(4096));
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
@@ -602,7 +848,8 @@ mod tests {
                 ("memory.max", "max\n"),
             ],
         );
-        let reading = read_at_mount(Some("0::/../outside\n"), &tree.path);
+        let info = format!("{}\n", v2_mount_line("/", &tree.path));
+        let reading = read_mounted_cgroup("0::/../outside\n", &info);
         assert_eq!(reading, CgroupReading::default());
     }
 
@@ -617,7 +864,7 @@ mod tests {
                 ("memory.max", "max\n"),
             ],
         );
-        let reading = read_at_mount(None, &tree.path);
+        let reading = read_mount_root(&tree.path);
         assert_eq!(reading.memory.unwrap().program_bytes, 30);
     }
 
@@ -694,5 +941,365 @@ mod tests {
     #[test]
     fn process_cgroup_read_does_not_panic() {
         let _ = read_process_cgroup();
+    }
+
+    #[test]
+    fn v2_private_namespace_reads_the_mount_point() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path.join("self"),
+            &[
+                ("memory.current", "4000\n"),
+                ("memory.stat", "inactive_file 0\n"),
+                ("memory.max", "10\n"),
+                ("cpu.stat", "usage_usec 3\n"),
+            ],
+        );
+        let info = format!("{}\n", v2_mount_line("/", &tree.path));
+        let reading = read_mounted_cgroup("0::/\n", &info);
+        assert_eq!(reading.memory.unwrap().program_bytes, 900);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
+    }
+
+    #[test]
+    fn v1_docker_bind_resolves_to_the_mount_point() {
+        let tree = temp_tree();
+        let memory = tree.path.join("memory");
+        let cpuacct = tree.path.join("cpuacct");
+        write_files(
+            &memory,
+            &[
+                ("memory.usage_in_bytes", "3000\n"),
+                ("memory.stat", "inactive_file 250\n"),
+                ("memory.limit_in_bytes", "max\n"),
+            ],
+        );
+        write_files(&cpuacct, &[("cpuacct.usage", "1500000\n")]);
+        write_files(
+            &memory.join("docker/0123456789abcdef"),
+            &[
+                ("memory.usage_in_bytes", "9000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.limit_in_bytes", "4096\n"),
+            ],
+        );
+        write_files(
+            &cpuacct.join("docker/0123456789abcdef"),
+            &[("cpuacct.usage", "42\n")],
+        );
+        let info = format!(
+            "{}\n{}\n",
+            v1_mount_line("/docker/0123456789abcdef", &memory, "memory"),
+            v1_mount_line("/docker/0123456789abcdef", &cpuacct, "cpuacct"),
+        );
+        let reading = read_mounted_cgroup(
+            "1:memory:/docker/0123456789abcdef\n2:cpuacct:/docker/0123456789abcdef\n",
+            &info,
+        );
+        let got = reading.memory.unwrap();
+        assert_eq!(got.program_bytes, 2_750);
+        assert_eq!(got.limit, MemoryLimit::Unlimited);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(1_500_000));
+    }
+
+    #[test]
+    fn v2_subtree_strips_the_mount_root() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path.join("bot"),
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "5\n"),
+                ("memory.stat", "inactive_file 0\n"),
+                ("memory.max", "9\n"),
+                ("cpu.stat", "usage_usec 1\n"),
+            ],
+        );
+        write_files(
+            &tree.path.join("workload/bot"),
+            &[
+                ("memory.current", "50\n"),
+                ("memory.stat", "inactive_file 5\n"),
+                ("memory.max", "99\n"),
+                ("cpu.stat", "usage_usec 7\n"),
+            ],
+        );
+        let info = format!("{}\n", v2_mount_line("/workload", &tree.path));
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &info);
+        assert_eq!(reading.memory.unwrap().program_bytes, 900);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
+    }
+
+    #[test]
+    fn v2_path_outside_mount_root_is_unavailable() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path.join("other"),
+            &[
+                ("memory.current", "50\n"),
+                ("memory.stat", "inactive_file 5\n"),
+                ("memory.max", "99\n"),
+                ("cpu.stat", "usage_usec 7\n"),
+            ],
+        );
+        let info = format!("{}\n", v2_mount_line("/workload", &tree.path));
+        let reading = read_mounted_cgroup("0::/other\n", &info);
+        assert_eq!(reading, CgroupReading::default());
+    }
+
+    #[test]
+    fn mountinfo_without_cgroup_mount_is_unavailable() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path.join("workload/bot"),
+            &[
+                ("memory.current", "50\n"),
+                ("memory.stat", "inactive_file 5\n"),
+                ("memory.max", "99\n"),
+                ("cpu.stat", "usage_usec 7\n"),
+            ],
+        );
+        let point = tree.path.to_str().unwrap();
+        let info =
+            format!("21 1 8:1 / {point} rw,relatime shared:1 master:2 - ext4 /dev/sda1 rw\n");
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &info);
+        assert_eq!(reading, CgroupReading::default());
+        assert_eq!(
+            read_mounted_cgroup("0::/workload/bot\n", ""),
+            CgroupReading::default()
+        );
+    }
+
+    #[test]
+    fn v1_memory_path_outside_mount_root_is_unavailable() {
+        let tree = temp_tree();
+        let memory = tree.path.join("memory");
+        write_files(
+            &memory,
+            &[
+                ("memory.usage_in_bytes", "3000\n"),
+                ("memory.stat", "inactive_file 250\n"),
+                ("memory.limit_in_bytes", "max\n"),
+            ],
+        );
+        write_files(
+            &memory.join("other"),
+            &[
+                ("memory.usage_in_bytes", "9000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.limit_in_bytes", "4096\n"),
+            ],
+        );
+        let info = format!(
+            "{}\n",
+            v1_mount_line("/docker/0123456789abcdef", &memory, "memory")
+        );
+        let reading = read_mounted_cgroup("1:memory:/other\n", &info);
+        assert!(reading.memory.is_none());
+        assert_eq!(reading, CgroupReading::default());
+    }
+
+    #[test]
+    fn unreadable_longest_mount_root_does_not_fall_back() {
+        let tree = temp_tree();
+        let parent = tree.path.join("parent");
+        let specific = tree.path.join("specific");
+        write_files(
+            &parent.join("workload/bot"),
+            &[
+                ("memory.current", "5000\n"),
+                ("memory.stat", "inactive_file 0\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 4\n"),
+            ],
+        );
+        std::fs::create_dir_all(&specific).unwrap();
+        let longest_first = format!(
+            "{}\n{}\n",
+            v2_mount_line("/workload", &specific),
+            v2_mount_line("/", &parent),
+        );
+        let missing = read_mounted_cgroup("0::/workload/bot\n", &longest_first);
+        assert_eq!(missing, CgroupReading::default());
+
+        write_files(
+            &specific.join("bot"),
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        let longest_second = format!(
+            "{}\n{}\n",
+            v2_mount_line("/", &parent),
+            v2_mount_line("/workload", &specific),
+        );
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &longest_second);
+        assert_eq!(reading.memory.unwrap().program_bytes, 900);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
+    }
+
+    #[test]
+    fn cpuacct_mount_is_preferred_over_an_earlier_cpu_mount() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path.join("cpu/app"),
+            &[("cpu.stat", "usage_usec 111\n")],
+        );
+        write_files(
+            &tree.path.join("cpuacct/app"),
+            &[("cpuacct.usage", "1500000\n")],
+        );
+        let preferred = format!(
+            "{}\n{}\n",
+            v1_mount_line("/", &tree.path.join("cpu"), "cpu"),
+            v1_mount_line("/", &tree.path.join("cpuacct"), "cpuacct"),
+        );
+        let reading = read_mounted_cgroup("2:cpu:/app\n", &preferred);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(1_500_000));
+
+        std::fs::create_dir_all(tree.path.join("empty-acct")).unwrap();
+        let fallback = format!(
+            "{}\n{}\n",
+            v1_mount_line("/", &tree.path.join("empty-acct"), "cpuacct"),
+            v1_mount_line("/", &tree.path.join("cpu"), "cpu"),
+        );
+        let reading = read_mounted_cgroup("2:cpu:/app\n", &fallback);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(111));
+    }
+
+    #[test]
+    fn mountinfo_octal_escapes_are_decoded() {
+        let tree = temp_tree();
+        let spaced = tree.path.join("a b");
+        write_files(
+            &spaced,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "5\n"),
+                ("memory.stat", "inactive_file 0\n"),
+                ("memory.max", "9\n"),
+                ("cpu.stat", "usage_usec 1\n"),
+            ],
+        );
+        let point = tree.path.to_str().unwrap();
+        let info = format!(
+            "21 1 0:21 /work\\040load/ {point}/a\\040b rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n"
+        );
+        let reading = read_mounted_cgroup("0::/work load\n", &info);
+        assert_eq!(reading.memory.unwrap().program_bytes, 900);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
+    }
+
+    #[test]
+    fn truncated_or_non_octal_mountinfo_escape_skips_the_line() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path,
+            &[
+                ("memory.current", "1000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.max", "max\n"),
+                ("cpu.stat", "usage_usec 9\n"),
+            ],
+        );
+        write_files(
+            &tree.path.join("decoy"),
+            &[
+                ("memory.current", "5\n"),
+                ("memory.stat", "inactive_file 0\n"),
+                ("memory.max", "9\n"),
+                ("cpu.stat", "usage_usec 1\n"),
+            ],
+        );
+        let point = tree.path.to_str().unwrap();
+        let decoy_path = tree.path.join("decoy");
+        let decoy = decoy_path.to_str().unwrap();
+        let only_truncated =
+            format!("21 1 0:21 /\\04 {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n");
+        assert_eq!(
+            read_mounted_cgroup("0::/\n", &only_truncated),
+            CgroupReading::default()
+        );
+        let only_non_octal =
+            format!("21 1 0:21 /\\018 {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n");
+        assert_eq!(
+            read_mounted_cgroup("0::/\n", &only_non_octal),
+            CgroupReading::default()
+        );
+        let mixed = format!(
+            "20 1 0:20 /\\04 {decoy} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n\
+             21 1 0:21 /\\018 {decoy} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n\
+             22 1 0:22 / {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n"
+        );
+        let reading = read_mounted_cgroup("0::/\n", &mixed);
+        assert_eq!(reading.memory.unwrap().program_bytes, 900);
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
+    }
+
+    #[test]
+    fn controller_is_super_option_not_mount_point_name() {
+        let tree = temp_tree();
+        write_files(
+            &tree.path.join("memory/app"),
+            &[
+                ("memory.usage_in_bytes", "9000\n"),
+                ("memory.stat", "inactive_file 100\n"),
+                ("memory.limit_in_bytes", "4096\n"),
+                ("cpuacct.usage", "2000\n"),
+            ],
+        );
+        let info = format!(
+            "{}\n",
+            v1_mount_line("/", &tree.path.join("memory"), "cpuacct")
+        );
+        let reading = read_mounted_cgroup("1:memory:/app\n2:cpuacct:/app\n", &info);
+        assert!(reading.memory.is_none());
+        assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
     }
 }
